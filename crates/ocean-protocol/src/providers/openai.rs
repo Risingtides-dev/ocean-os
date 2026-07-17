@@ -199,16 +199,47 @@ impl Default for OpenAiProvider {
     }
 }
 
+fn persisted_model_id(requested: &str, response: Option<&str>, preserve_requested: bool) -> String {
+    if preserve_requested {
+        requested.to_string()
+    } else {
+        response.unwrap_or(requested).to_string()
+    }
+}
+
+fn tool_wire(t: &crate::types::Tool) -> Value {
+    json!({
+        "type": "function",
+        "function": {
+            "name": t.name,
+            "description": t.description,
+            "parameters": t.parameters,
+        }
+    })
+}
+
 fn convert_messages(
     system_prompt: Option<&str>,
     messages: &[Message],
-    supports_images: bool,
+    model: &Model,
+    dynamic_declarations: &[crate::types::DynamicToolDeclaration],
 ) -> Vec<Value> {
+    let supports_images = model.supports_images;
+    let replay_kimi_reasoning = model.supports_dynamic_tools();
     let mut out: Vec<Value> = Vec::new();
     if let Some(sp) = system_prompt {
         out.push(json!({"role": "system", "content": sp}));
     }
-    for m in messages {
+    for (message_index, m) in messages.iter().enumerate() {
+        for declaration in dynamic_declarations
+            .iter()
+            .filter(|declaration| declaration.before_message == message_index)
+        {
+            out.push(json!({
+                "role": "system",
+                "tools": declaration.tools.iter().map(tool_wire).collect::<Vec<_>>()
+            }));
+        }
         match m {
             Message::User { content, .. } => {
                 // If any image is present AND the model takes image parts, emit
@@ -258,6 +289,7 @@ fn convert_messages(
             }
             Message::Assistant(a) => {
                 let mut text = String::new();
+                let mut reasoning = String::new();
                 let mut tool_calls: Vec<Value> = Vec::new();
                 for c in &a.content {
                     match c {
@@ -276,22 +308,27 @@ fn convert_messages(
                                 }
                             }));
                         }
-                        // OCEAN-140: the Chat Completions API has no input shape
-                        // for assistant reasoning — reasoning is output-only on
-                        // this API, and replaying chain-of-thought across tool
-                        // round-trips is only supported on the Responses API via
-                        // opaque `reasoning.encrypted_content` items (which
-                        // Ocean's Content::Thinking does not carry). An
-                        // Anthropic-style thinking block (text + signature) has no
-                        // valid Chat Completions assistant representation, so it is
-                        // dropped EXPLICITLY here rather than via a silent
-                        // `_ => {}` (kills the OCEAN-101 silent-drop class).
+                        // Kimi K3 requires the complete prior assistant message,
+                        // including `reasoning_content`, on multi-round tool calls.
+                        // Reconstruct it only for same-provider, same-model K3
+                        // history; every other Chat Completions backend retains
+                        // Ocean's explicit private-reasoning drop.
+                        Content::Thinking { thinking, .. }
+                            if replay_kimi_reasoning
+                                && a.provider == "kimi"
+                                && a.model == "kimi-k3" =>
+                        {
+                            reasoning.push_str(thinking);
+                        }
                         Content::Thinking { .. } => {}
                         // Images never appear in assistant content on this API.
                         Content::Image { .. } => {}
                     }
                 }
                 let mut msg = json!({"role": "assistant", "content": text});
+                if !reasoning.is_empty() {
+                    msg["reasoning_content"] = json!(reasoning);
+                }
                 if !tool_calls.is_empty() {
                     msg["tool_calls"] = json!(tool_calls);
                 }
@@ -356,6 +393,15 @@ fn convert_messages(
                 }
             }
         }
+    }
+    for declaration in dynamic_declarations
+        .iter()
+        .filter(|declaration| declaration.before_message == messages.len())
+    {
+        out.push(json!({
+            "role": "system",
+            "tools": declaration.tools.iter().map(tool_wire).collect::<Vec<_>>()
+        }));
     }
     out
 }
@@ -426,6 +472,13 @@ fn apply_reasoning(body: &mut Value, model: &Model, level: ThinkingLevel) {
                 body["reasoning_effort"] = json!(effort);
             }
         }
+        "kimi" if model.supports_dynamic_tools() => {
+            if level != ThinkingLevel::Off {
+                // K3 currently accepts only `max`; omit the field when Ocean's
+                // thinking control is Off rather than inventing a disable value.
+                body["reasoning_effort"] = json!("max");
+            }
+        }
         "deepseek" => match deepseek_reasoning_effort(level) {
             Some(effort) => {
                 body["thinking"] = json!({"type": "enabled", "reasoning_effort": effort});
@@ -443,19 +496,61 @@ fn apply_reasoning(body: &mut Value, model: &Model, level: ThinkingLevel) {
     }
 }
 
-fn build_body(model: &Model, context: &Context, options: &StreamOptions) -> Value {
+fn build_body(model: &Model, context: &Context, options: &StreamOptions) -> Result<Value> {
+    if !context.dynamic_tool_declarations.is_empty() && !model.supports_dynamic_tools() {
+        return Err(Error::UnsupportedProvider(format!(
+            "dynamic tool declarations require exact kimi-k3 route, got {}/{}",
+            model.provider, model.id
+        )));
+    }
+    let mut previous_index = 0usize;
+    let mut declared_names = std::collections::HashSet::new();
+    let mut declared_count = 0usize;
+    let mut declared_bytes = 0usize;
+    for (position, declaration) in context.dynamic_tool_declarations.iter().enumerate() {
+        if declaration.tools.is_empty()
+            || declaration.before_message > context.messages.len()
+            || (position > 0 && declaration.before_message < previous_index)
+        {
+            return Err(Error::Other(
+                "dynamic tool declarations require nonempty groups in stable transcript order"
+                    .into(),
+            ));
+        }
+        previous_index = declaration.before_message;
+        for tool in &declaration.tools {
+            if !declared_names.insert(tool.name.as_str()) {
+                return Err(Error::Other(format!(
+                    "dynamic tool `{}` is declared more than once",
+                    tool.name
+                )));
+            }
+            declared_count = declared_count.saturating_add(1);
+            declared_bytes = declared_bytes.saturating_add(serde_json::to_vec(tool)?.len());
+        }
+    }
+    if declared_count > 16 || declared_bytes > 512 * 1024 {
+        return Err(Error::Other(
+            "dynamic tool declarations exceed the 16-tool/512-KiB request bounds".into(),
+        ));
+    }
+    let messages = convert_messages(
+        context.system_prompt.as_deref(),
+        &context.messages,
+        model,
+        &context.dynamic_tool_declarations,
+    );
     let mut body = json!({
         "model": model.id,
-        "messages": convert_messages(
-            context.system_prompt.as_deref(),
-            &context.messages,
-            model.supports_images,
-        ),
+        "messages": messages,
         "stream": true,
         "stream_options": {"include_usage": true},
     });
     if let Some(t) = options.temperature {
-        body["temperature"] = json!(t);
+        // K3 fixes temperature at 1.0 and documents that clients should omit it.
+        if !model.supports_dynamic_tools() {
+            body["temperature"] = json!(t);
+        }
     }
     if let Some(m) = options.max_tokens {
         // OCEAN-141: real api.openai.com models (o-series, gpt-5-class) on the
@@ -469,6 +564,7 @@ fn build_body(model: &Model, context: &Context, options: &StreamOptions) -> Valu
         // than blasting one param everywhere.
         let cap_param = match model.provider.as_str() {
             "openai" => "max_completion_tokens",
+            "kimi" if model.supports_dynamic_tools() => "max_completion_tokens",
             _ => "max_tokens",
         };
         body[cap_param] = json!(m);
@@ -477,23 +573,13 @@ fn build_body(model: &Model, context: &Context, options: &StreamOptions) -> Valu
         apply_reasoning(&mut body, model, level);
     }
     if !context.tools.is_empty() {
-        let tools: Vec<Value> = context
-            .tools
-            .iter()
-            .map(|t| {
-                json!({
-                    "type": "function",
-                    "function": {
-                        "name": t.name,
-                        "description": t.description,
-                        "parameters": t.parameters,
-                    }
-                })
-            })
-            .collect();
+        let tools: Vec<Value> = context.tools.iter().map(tool_wire).collect();
         body["tools"] = json!(tools);
     }
-    body
+    if context.tool_choice != crate::types::ToolChoice::Auto {
+        body["tool_choice"] = json!(context.tool_choice.as_str());
+    }
+    Ok(body)
 }
 
 #[derive(Default)]
@@ -548,8 +634,15 @@ impl Provider for OpenAiProvider {
             .base_url
             .clone()
             .unwrap_or_else(|| model.base_url.clone());
+        if model.supports_dynamic_tools()
+            && base_url.trim_end_matches('/') != "https://api.moonshot.ai/v1"
+        {
+            return Err(Error::UnsupportedProvider(
+                "Kimi K3 dynamic tools require the official Moonshot endpoint".into(),
+            ));
+        }
         let url = format!("{}/chat/completions", base_url.trim_end_matches('/'));
-        let body = build_body(model, context, options);
+        let body = build_body(model, context, options)?;
         crate::prompt_capture::capture_request_body(&model.api, &model.provider, &model.id, &body);
         let cancel = options.cancel.clone();
         let extra_headers: BTreeMap<String, String> = options.headers.clone();
@@ -610,6 +703,10 @@ impl Provider for OpenAiProvider {
         let api = model.api.clone();
         let provider = model.provider.clone();
         let model_id = model.id.clone();
+        // K3 lifecycle reconstruction keys durable search evidence to the exact
+        // routed model. Persist that route identity even if Moonshot reports a
+        // dated/snapshot response model string.
+        let preserve_requested_model = model.supports_dynamic_tools();
         let cancel_for_stream = cancel.clone();
 
         let s = stream! {
@@ -667,7 +764,11 @@ impl Provider for OpenAiProvider {
                         content: vec![],
                         api: api.clone(),
                         provider: provider.clone(),
-                        model: response_model.clone().unwrap_or_else(|| model_id.clone()),
+                        model: persisted_model_id(
+                        &model_id,
+                        response_model.as_deref(),
+                        preserve_requested_model,
+                    ),
                         usage: usage.clone(),
                         stop_reason: StopReason::Error,
                         error_message: Some(msg),
@@ -851,7 +952,11 @@ impl Provider for OpenAiProvider {
                     content: vec![],
                     api: api.clone(),
                     provider: provider.clone(),
-                    model: response_model.clone().unwrap_or_else(|| model_id.clone()),
+                    model: persisted_model_id(
+                        &model_id,
+                        response_model.as_deref(),
+                        preserve_requested_model,
+                    ),
                     usage: usage.clone(),
                     stop_reason: StopReason::Error,
                     error_message: Some(
@@ -901,7 +1006,11 @@ impl Provider for OpenAiProvider {
                 content: out_content,
                 api,
                 provider,
-                model: response_model.unwrap_or(model_id),
+                model: persisted_model_id(
+                    &model_id,
+                    response_model.as_deref(),
+                    preserve_requested_model,
+                ),
                 usage,
                 stop_reason: stop,
                 error_message: None,
@@ -917,6 +1026,10 @@ impl Provider for OpenAiProvider {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn test_body(model: &Model, context: &Context, options: &StreamOptions) -> Value {
+        super::build_body(model, context, options).expect("request body should build")
+    }
     use crate::types::now_ms;
 
     // OCEAN-99: vision parity. A user message carrying a Content::Image must
@@ -935,7 +1048,7 @@ mod tests {
             timestamp: now_ms(),
         }];
 
-        let out = convert_messages(None, &messages, true);
+        let out = convert_messages(None, &messages, &openai_model(), &[]);
         assert_eq!(out.len(), 1);
         let content = &out[0]["content"];
         // Must be the array form, not a bare string.
@@ -961,7 +1074,7 @@ mod tests {
     #[test]
     fn text_only_user_stays_string() {
         let messages = vec![Message::user_text("hello")];
-        let out = convert_messages(None, &messages, true);
+        let out = convert_messages(None, &messages, &openai_model(), &[]);
         assert_eq!(out[0]["content"], "hello");
     }
 
@@ -986,7 +1099,7 @@ mod tests {
             timestamp: now_ms(),
         })];
 
-        let out = convert_messages(None, &messages, true);
+        let out = convert_messages(None, &messages, &openai_model(), &[]);
         // Two messages: the tool message, then a following user image message.
         assert_eq!(
             out.len(),
@@ -1033,7 +1146,7 @@ mod tests {
             timestamp: now_ms(),
         }];
 
-        let out = convert_messages(None, &messages, false);
+        let out = convert_messages(None, &messages, &deepseek_model(), &[]);
         assert_eq!(out.len(), 1);
         let content = &out[0]["content"];
         let text = content.as_str().expect("expected string content form");
@@ -1067,7 +1180,7 @@ mod tests {
             timestamp: now_ms(),
         })];
 
-        let out = convert_messages(None, &messages, false);
+        let out = convert_messages(None, &messages, &deepseek_model(), &[]);
         assert_eq!(out.len(), 1, "no follow-up image message: {out:?}");
         assert_eq!(out[0]["role"], "tool");
         let text = out[0]["content"].as_str().expect("tool text");
@@ -1094,7 +1207,7 @@ mod tests {
             timestamp: now_ms(),
         })];
 
-        let out = convert_messages(None, &messages, true);
+        let out = convert_messages(None, &messages, &openai_model(), &[]);
         assert_eq!(
             out.len(),
             1,
@@ -1133,7 +1246,7 @@ mod tests {
             timestamp: now_ms(),
         })];
 
-        let out = convert_messages(None, &messages, true);
+        let out = convert_messages(None, &messages, &openai_model(), &[]);
         assert_eq!(out.len(), 1, "expected a single assistant message");
         let msg = &out[0];
         assert_eq!(msg["role"], "assistant");
@@ -1247,9 +1360,330 @@ mod tests {
         )
     }
 
+    fn kimi_model(id: &str) -> Model {
+        Model::openai_compat(
+            "kimi",
+            id,
+            "https://api.moonshot.ai/v1",
+            if id == "kimi-k3" { 1_000_000 } else { 256_000 },
+            8_192,
+        )
+    }
+
+    fn dynamic_tool(name: &str) -> crate::types::Tool {
+        crate::types::Tool {
+            name: name.into(),
+            description: format!("{name} description"),
+            parameters: json!({"type": "object", "properties": {}}),
+        }
+    }
+
+    #[test]
+    fn kimi_k3_persists_exact_requested_route_over_response_snapshot() {
+        assert_eq!(
+            persisted_model_id("kimi-k3", Some("kimi-k3-2026-07-16"), true),
+            "kimi-k3"
+        );
+        assert_eq!(
+            persisted_model_id("gpt-4o", Some("gpt-4o-2024-08-06"), false),
+            "gpt-4o-2024-08-06"
+        );
+    }
+
+    #[test]
+    fn kimi_k3_dynamic_tools_are_a_contentless_system_message() {
+        let context = Context {
+            messages: vec![Message::user_text("use a calculator")],
+            tools: vec![dynamic_tool("search_tools")],
+            dynamic_tool_declarations: vec![crate::types::DynamicToolDeclaration {
+                tools: vec![dynamic_tool("calculator")],
+                before_message: 1,
+            }],
+            ..Default::default()
+        };
+        let body = test_body(&kimi_model("kimi-k3"), &context, &StreamOptions::default());
+        assert_eq!(body["tools"][0]["function"]["name"], "search_tools");
+        let messages = body["messages"].as_array().expect("messages array");
+        let injected = messages.last().expect("dynamic system message");
+        assert_eq!(injected["role"], "system");
+        assert_eq!(injected["tools"][0]["function"]["name"], "calculator");
+        assert!(
+            injected.get("content").is_none(),
+            "Kimi rejects content: {injected}"
+        );
+        assert_eq!(
+            injected.as_object().expect("system object").len(),
+            2,
+            "dynamic declaration must contain only role and tools: {injected}"
+        );
+    }
+
+    #[test]
+    fn kimi_k3_retains_dynamic_declaration_before_historical_target_call() {
+        let assistant_call = |id: &str, name: &str| {
+            Message::Assistant(AssistantMessage {
+                content: vec![Content::ToolCall {
+                    id: id.into(),
+                    name: name.into(),
+                    arguments: json!({}),
+                }],
+                api: "openai-completions".into(),
+                provider: "kimi".into(),
+                model: "kimi-k3".into(),
+                usage: Usage::default(),
+                stop_reason: StopReason::ToolUse,
+                error_message: None,
+                timestamp: now_ms(),
+            })
+        };
+        let tool_result = |id: &str, name: &str| {
+            Message::ToolResult(crate::types::ToolResultMessage {
+                tool_call_id: id.into(),
+                tool_name: name.into(),
+                content: vec![Content::text("ok")],
+                is_error: false,
+                timestamp: now_ms(),
+            })
+        };
+        let context = Context {
+            messages: vec![
+                Message::user_text("calculate"),
+                assistant_call("search-1", "search_tools"),
+                tool_result("search-1", "search_tools"),
+                assistant_call("calc-1", "calculator"),
+                tool_result("calc-1", "calculator"),
+            ],
+            tools: vec![dynamic_tool("search_tools")],
+            dynamic_tool_declarations: vec![crate::types::DynamicToolDeclaration {
+                tools: vec![dynamic_tool("calculator")],
+                before_message: 3,
+            }],
+            ..Default::default()
+        };
+
+        let body = test_body(&kimi_model("kimi-k3"), &context, &StreamOptions::default());
+        let messages = body["messages"].as_array().expect("messages array");
+        assert_eq!(messages[2]["role"], "tool");
+        assert_eq!(messages[2]["tool_call_id"], "search-1");
+        assert_eq!(messages[3]["role"], "system");
+        assert_eq!(messages[3]["tools"][0]["function"]["name"], "calculator");
+        assert!(messages[3].get("content").is_none());
+        assert_eq!(messages[4]["role"], "assistant");
+        assert_eq!(
+            messages[4]["tool_calls"][0]["function"]["name"],
+            "calculator"
+        );
+        assert_eq!(messages[5]["tool_call_id"], "calc-1");
+    }
+
+    #[test]
+    fn kimi_k3_serializes_multiple_declaration_epochs_and_tool_choice_none() {
+        let assistant_call = |id: &str, name: &str| {
+            Message::Assistant(AssistantMessage {
+                content: vec![Content::ToolCall {
+                    id: id.into(),
+                    name: name.into(),
+                    arguments: json!({}),
+                }],
+                api: "openai-completions".into(),
+                provider: "kimi".into(),
+                model: "kimi-k3".into(),
+                usage: Usage::default(),
+                stop_reason: StopReason::ToolUse,
+                error_message: None,
+                timestamp: now_ms(),
+            })
+        };
+        let tool_result = |id: &str, name: &str| {
+            Message::ToolResult(crate::types::ToolResultMessage {
+                tool_call_id: id.into(),
+                tool_name: name.into(),
+                content: vec![Content::text("ok")],
+                is_error: false,
+                timestamp: now_ms(),
+            })
+        };
+        let context = Context {
+            messages: vec![
+                Message::user_text("run two tools"),
+                assistant_call("search-1", "search_tools"),
+                tool_result("search-1", "search_tools"),
+                assistant_call("echo-1", "echo"),
+                tool_result("echo-1", "echo"),
+                assistant_call("search-2", "search_tools"),
+                tool_result("search-2", "search_tools"),
+                assistant_call("gated-1", "gated"),
+            ],
+            dynamic_tool_declarations: vec![
+                crate::types::DynamicToolDeclaration {
+                    tools: vec![dynamic_tool("echo")],
+                    before_message: 3,
+                },
+                crate::types::DynamicToolDeclaration {
+                    tools: vec![dynamic_tool("gated")],
+                    before_message: 7,
+                },
+            ],
+            tool_choice: crate::types::ToolChoice::None,
+            ..Default::default()
+        };
+
+        let body = test_body(&kimi_model("kimi-k3"), &context, &StreamOptions::default());
+        let messages = body["messages"].as_array().expect("messages array");
+        assert_eq!(body["tool_choice"], "none");
+        assert_eq!(messages[3]["role"], "system");
+        assert_eq!(messages[3]["tools"][0]["function"]["name"], "echo");
+        assert!(messages[3].get("content").is_none());
+        assert_eq!(messages[8]["role"], "system");
+        assert_eq!(messages[8]["tools"][0]["function"]["name"], "gated");
+        assert!(messages[8].get("content").is_none());
+    }
+
+    #[test]
+    fn invalid_dynamic_declaration_groups_fail_closed() {
+        let model = kimi_model("kimi-k3");
+        let invalid = [
+            vec![crate::types::DynamicToolDeclaration {
+                tools: Vec::new(),
+                before_message: 0,
+            }],
+            vec![crate::types::DynamicToolDeclaration {
+                tools: vec![dynamic_tool("echo")],
+                before_message: 1,
+            }],
+            vec![
+                crate::types::DynamicToolDeclaration {
+                    tools: vec![dynamic_tool("echo")],
+                    before_message: 1,
+                },
+                crate::types::DynamicToolDeclaration {
+                    tools: vec![dynamic_tool("gated")],
+                    before_message: 0,
+                },
+            ],
+        ];
+        for declarations in invalid {
+            let messages = if declarations.len() == 1 && !declarations[0].tools.is_empty() {
+                Vec::new()
+            } else {
+                vec![Message::user_text("one")]
+            };
+            let context = Context {
+                messages,
+                dynamic_tool_declarations: declarations,
+                ..Default::default()
+            };
+            super::build_body(&model, &context, &StreamOptions::default())
+                .expect_err("invalid declaration group must fail closed");
+        }
+
+        let duplicate = Context {
+            dynamic_tool_declarations: vec![
+                crate::types::DynamicToolDeclaration {
+                    tools: vec![dynamic_tool("echo")],
+                    before_message: 0,
+                },
+                crate::types::DynamicToolDeclaration {
+                    tools: vec![dynamic_tool("echo")],
+                    before_message: 0,
+                },
+            ],
+            ..Default::default()
+        };
+        super::build_body(&model, &duplicate, &StreamOptions::default())
+            .expect_err("duplicate declaration must fail closed");
+    }
+
+    #[test]
+    fn dynamic_tools_fail_closed_for_kimi_k2_and_other_models() {
+        let context = Context {
+            dynamic_tool_declarations: vec![crate::types::DynamicToolDeclaration {
+                tools: vec![dynamic_tool("calculator")],
+                before_message: 0,
+            }],
+            ..Default::default()
+        };
+        for model in [kimi_model("kimi-k2.6"), openai_model()] {
+            let error = super::build_body(&model, &context, &StreamOptions::default())
+                .expect_err("unsupported dynamic declaration must fail closed");
+            assert!(matches!(error, Error::UnsupportedProvider(_)));
+        }
+    }
+
+    #[test]
+    fn kimi_k2_wire_stays_unchanged_without_dynamic_tools() {
+        let options = StreamOptions {
+            temperature: Some(0.6),
+            reasoning: Some(ThinkingLevel::High),
+            ..Default::default()
+        };
+        let body = test_body(&kimi_model("kimi-k2.6"), &Context::default(), &options);
+        assert!(
+            (body["temperature"].as_f64().expect("temperature") - 0.6).abs() < 1e-6,
+            "K2 temperature remains on the wire: {body}"
+        );
+        assert!(body.get("reasoning_effort").is_none());
+        assert!(body.get("thinking").is_none());
+        assert!(body.get("tool_choice").is_none());
+        assert!(body["messages"].as_array().expect("messages").is_empty());
+    }
+
+    #[test]
+    fn kimi_k3_omits_temperature_sets_max_reasoning_and_replays_same_model_thinking() {
+        let history = Message::Assistant(AssistantMessage {
+            content: vec![
+                Content::Thinking {
+                    thinking: "preserved reasoning".into(),
+                    thinking_signature: None,
+                },
+                Content::text("visible"),
+            ],
+            api: "openai-completions".into(),
+            provider: "kimi".into(),
+            model: "kimi-k3".into(),
+            usage: Usage::default(),
+            stop_reason: StopReason::Stop,
+            error_message: None,
+            timestamp: now_ms(),
+        });
+        let context = Context {
+            messages: vec![history],
+            ..Default::default()
+        };
+        let options = StreamOptions {
+            temperature: Some(0.2),
+            max_tokens: Some(8_192),
+            reasoning: Some(ThinkingLevel::Low),
+            ..Default::default()
+        };
+        let body = test_body(&kimi_model("kimi-k3"), &context, &options);
+        assert!(
+            body.get("temperature").is_none(),
+            "K3 temperature is fixed: {body}"
+        );
+        assert_eq!(body["reasoning_effort"], "max");
+        assert_eq!(body["max_completion_tokens"], 8_192);
+        assert!(body.get("max_tokens").is_none());
+        assert_eq!(
+            body["messages"][0]["reasoning_content"],
+            "preserved reasoning"
+        );
+        assert_eq!(body["messages"][0]["content"], "visible");
+
+        let k2_body = test_body(
+            &kimi_model("kimi-k2.6"),
+            &context,
+            &StreamOptions::default(),
+        );
+        assert!(
+            k2_body["messages"][0].get("reasoning_content").is_none(),
+            "K3 reasoning must not replay cross-model: {k2_body}"
+        );
+    }
+
     #[test]
     fn build_body_omits_reasoning_when_unset() {
-        let body = build_body(
+        let body = test_body(
             &openai_model(),
             &Context::default(),
             &StreamOptions::default(),
@@ -1270,7 +1704,7 @@ mod tests {
             reasoning: Some(ThinkingLevel::Off),
             ..Default::default()
         };
-        let body = build_body(&openai_model(), &Context::default(), &opts);
+        let body = test_body(&openai_model(), &Context::default(), &opts);
         assert!(
             body.get("reasoning_effort").is_none(),
             "ThinkingLevel::Off must not emit reasoning_effort: {body}"
@@ -1283,7 +1717,7 @@ mod tests {
             reasoning: Some(ThinkingLevel::High),
             ..Default::default()
         };
-        let body = build_body(&openai_model(), &Context::default(), &opts);
+        let body = test_body(&openai_model(), &Context::default(), &opts);
         assert_eq!(
             body["reasoning_effort"], "high",
             "OpenAI o-series must receive top-level reasoning_effort: {body}"
@@ -1308,7 +1742,7 @@ mod tests {
                 reasoning: Some(level),
                 ..Default::default()
             };
-            let body = build_body(&openai_model(), &Context::default(), &opts);
+            let body = test_body(&openai_model(), &Context::default(), &opts);
             assert_eq!(
                 body["reasoning_effort"], expected,
                 "level {level:?} mismapped: {body}"
@@ -1326,7 +1760,7 @@ mod tests {
             reasoning: Some(ThinkingLevel::Low),
             ..Default::default()
         };
-        let body = build_body(&deepseek_model(), &Context::default(), &opts);
+        let body = test_body(&deepseek_model(), &Context::default(), &opts);
         assert_eq!(
             body["thinking"]["type"], "enabled",
             "DeepSeek must enable the thinking toggle: {body}"
@@ -1348,7 +1782,7 @@ mod tests {
             reasoning: Some(ThinkingLevel::Xhigh),
             ..Default::default()
         };
-        let body = build_body(&deepseek_model(), &Context::default(), &opts);
+        let body = test_body(&deepseek_model(), &Context::default(), &opts);
         assert_eq!(
             body["thinking"]["reasoning_effort"], "max",
             "DeepSeek xhigh must map to max: {body}"
@@ -1365,7 +1799,7 @@ mod tests {
             reasoning: Some(ThinkingLevel::Off),
             ..Default::default()
         };
-        let body = build_body(&deepseek_model(), &Context::default(), &opts);
+        let body = test_body(&deepseek_model(), &Context::default(), &opts);
         assert_eq!(
             body["thinking"]["type"], "disabled",
             "DeepSeek thinking-off must be explicit, not an omitted param: {body}"
@@ -1412,7 +1846,7 @@ mod tests {
             reasoning: Some(ThinkingLevel::Off),
             ..Default::default()
         };
-        let body = build_body(&openai_model(), &Context::default(), &opts);
+        let body = test_body(&openai_model(), &Context::default(), &opts);
         assert!(
             body.get("reasoning_effort").is_none() && body.get("thinking").is_none(),
             "OpenAI must receive no reasoning params when off: {body}"
@@ -1434,7 +1868,7 @@ mod tests {
             reasoning: Some(ThinkingLevel::High),
             ..Default::default()
         };
-        let body = build_body(&model, &Context::default(), &opts);
+        let body = test_body(&model, &Context::default(), &opts);
         assert!(
             body.get("reasoning_effort").is_none(),
             "unknown backend must not receive reasoning_effort: {body}"
@@ -1456,7 +1890,7 @@ mod tests {
             max_tokens: Some(1024),
             ..Default::default()
         };
-        let body = build_body(&openai_model(), &Context::default(), &opts);
+        let body = test_body(&openai_model(), &Context::default(), &opts);
         assert_eq!(
             body["max_completion_tokens"], 1024,
             "OpenAI must receive max_completion_tokens: {body}"
@@ -1477,7 +1911,7 @@ mod tests {
             max_tokens: Some(2048),
             ..Default::default()
         };
-        let body = build_body(&deepseek_model(), &Context::default(), &opts);
+        let body = test_body(&deepseek_model(), &Context::default(), &opts);
         assert_eq!(
             body["max_tokens"], 2048,
             "openai-compatible backends must keep the legacy max_tokens: {body}"
@@ -1491,7 +1925,7 @@ mod tests {
     // No token cap set → neither param is emitted.
     #[test]
     fn build_body_omits_token_cap_when_unset() {
-        let body = build_body(
+        let body = test_body(
             &openai_model(),
             &Context::default(),
             &StreamOptions::default(),

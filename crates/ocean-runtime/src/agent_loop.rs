@@ -20,6 +20,360 @@ use crate::types::{
     AgentConfig, AgentEvent, AgentTool, AgentToolResult, PermissionDecision, ToolSideEffect,
 };
 
+const DYNAMIC_SEARCH_TOOL: &str = "search_tools";
+const MAX_DYNAMIC_TOOLS: usize = 16;
+const MAX_DYNAMIC_SEARCH_RESULTS: usize = 8;
+const MAX_DYNAMIC_SEARCH_QUERY_CHARS: usize = 256;
+const MAX_DYNAMIC_SEARCH_TEXT_CHARS: usize = 4_096;
+const MAX_DYNAMIC_SEARCH_CATALOG_TOOLS: usize = 4_096;
+const MAX_DYNAMIC_TOOL_SCHEMA_BYTES: usize = 128 * 1024;
+const MAX_DYNAMIC_DECLARATION_BYTES: usize = 512 * 1024;
+
+fn search_tool_def() -> ocean_protocol::Tool {
+    ocean_protocol::Tool {
+        name: DYNAMIC_SEARCH_TOOL.into(),
+        description: "Search the available Ocean tools by keyword. Matching full tool definitions become callable on the next provider round.".into(),
+        parameters: serde_json::json!({
+            "type": "object",
+            "properties": {
+                "query": {
+                    "type": "string",
+                    "description": "Tool name, capability, or domain keyword"
+                }
+            },
+            "required": ["query"],
+            "additionalProperties": false
+        }),
+    }
+}
+
+fn tool_search_score(tool: &ocean_protocol::Tool, query: &str) -> u32 {
+    let query = query.trim().to_ascii_lowercase();
+    if query.is_empty() {
+        return 0;
+    }
+    let name: String = tool
+        .name
+        .chars()
+        .take(MAX_DYNAMIC_SEARCH_TEXT_CHARS)
+        .collect::<String>()
+        .to_ascii_lowercase();
+    let description: String = tool
+        .description
+        .chars()
+        .take(MAX_DYNAMIC_SEARCH_TEXT_CHARS)
+        .collect::<String>()
+        .to_ascii_lowercase();
+    let mut score = 0u32;
+    if name == query {
+        score = score.saturating_add(1_000);
+    } else if name.starts_with(&query) {
+        score = score.saturating_add(500);
+    } else if name.contains(&query) {
+        score = score.saturating_add(250);
+    }
+    for term in query.split(|c: char| !c.is_ascii_alphanumeric()) {
+        if term.is_empty() {
+            continue;
+        }
+        if name.contains(term) {
+            score = score.saturating_add(100);
+        }
+        if description.contains(term) {
+            score = score.saturating_add(10);
+        }
+    }
+    score
+}
+
+#[derive(Default)]
+struct LoadedDynamicTools {
+    names: Vec<String>,
+    names_set: HashSet<String>,
+    schema_bytes: usize,
+}
+
+impl LoadedDynamicTools {
+    fn try_add(&mut self, name: &str, tool_defs: &HashMap<&str, &ocean_protocol::Tool>) -> bool {
+        if self.names_set.contains(name) {
+            return true;
+        }
+        let Some(tool) = tool_defs.get(name).copied() else {
+            return false;
+        };
+        if self.names.len() >= MAX_DYNAMIC_TOOLS {
+            return false;
+        }
+        let Ok(schema) = serde_json::to_vec(tool) else {
+            return false;
+        };
+        if schema.len() > MAX_DYNAMIC_TOOL_SCHEMA_BYTES
+            || self.schema_bytes.saturating_add(schema.len()) > MAX_DYNAMIC_DECLARATION_BYTES
+        {
+            return false;
+        }
+        self.schema_bytes = self.schema_bytes.saturating_add(schema.len());
+        self.names.push(name.to_string());
+        self.names_set.insert(name.to_string());
+        true
+    }
+}
+
+fn kimi_k3_search_call_ids(messages: &[Message]) -> HashSet<&str> {
+    messages
+        .iter()
+        .filter_map(|message| match message {
+            Message::Assistant(assistant)
+                if assistant.provider == "kimi" && assistant.model == "kimi-k3" =>
+            {
+                Some(assistant)
+            }
+            _ => None,
+        })
+        .flat_map(|assistant| assistant.content.iter())
+        .filter_map(|content| match content {
+            Content::ToolCall { id, name, .. } if name == DYNAMIC_SEARCH_TOOL => Some(id.as_str()),
+            _ => None,
+        })
+        .collect()
+}
+
+fn search_result_matches(
+    message: &Message,
+    valid_search_call_ids: &HashSet<&str>,
+) -> Option<Vec<(String, bool)>> {
+    let Message::ToolResult(result) = message else {
+        return None;
+    };
+    if result.tool_name != DYNAMIC_SEARCH_TOOL
+        || result.is_error
+        || !valid_search_call_ids.contains(result.tool_call_id.as_str())
+    {
+        return None;
+    }
+    let text = result
+        .content
+        .iter()
+        .filter_map(Content::as_text)
+        .collect::<String>();
+    let value: Value = serde_json::from_str(&text).ok()?;
+    let matches = value.get("matches")?.as_array()?;
+    Some(
+        matches
+            .iter()
+            .filter(|entry| entry.get("loaded").and_then(Value::as_bool) != Some(false))
+            .filter_map(|entry| {
+                let name = entry.get("name")?.as_str()?.to_string();
+                let already_loaded = entry
+                    .get("already_loaded")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false);
+                Some((name, already_loaded))
+            })
+            .collect(),
+    )
+}
+
+fn after_tool_result_batch(messages: &[Message], result_index: usize) -> usize {
+    let mut index = result_index.saturating_add(1);
+    while matches!(messages.get(index), Some(Message::ToolResult(_))) {
+        index = index.saturating_add(1);
+    }
+    index
+}
+
+fn reconstruct_loaded_dynamic_tools(
+    messages: &[Message],
+    all_tools: &[ocean_protocol::Tool],
+) -> LoadedDynamicTools {
+    let tool_defs: HashMap<&str, &ocean_protocol::Tool> = all_tools
+        .iter()
+        .map(|tool| (tool.name.as_str(), tool))
+        .collect();
+    let valid_search_call_ids = kimi_k3_search_call_ids(messages);
+    let mut loaded = LoadedDynamicTools::default();
+
+    // Durable successful K3 search results are authoritative. Names only are
+    // persisted; current full schemas are resolved from this turn's registry.
+    for message in messages {
+        let Some(matches) = search_result_matches(message, &valid_search_call_ids) else {
+            continue;
+        };
+        for (name, _) in matches {
+            let _ = loaded.try_add(&name, &tool_defs);
+        }
+    }
+
+    // Compaction may remove a search result while retaining a later historical
+    // call. That surviving provider-authored call is the fallback evidence that
+    // the tool had previously been loaded.
+    for message in messages {
+        let Message::Assistant(assistant) = message else {
+            continue;
+        };
+        if assistant.provider != "kimi" || assistant.model != "kimi-k3" {
+            continue;
+        }
+        for content in &assistant.content {
+            if let Content::ToolCall { name, .. } = content {
+                if name != DYNAMIC_SEARCH_TOOL {
+                    let _ = loaded.try_add(name, &tool_defs);
+                }
+            }
+        }
+    }
+    loaded
+}
+
+fn dynamic_declarations_for_messages(
+    messages: &[Message],
+    loaded: &LoadedDynamicTools,
+    all_tools: &[ocean_protocol::Tool],
+) -> Vec<ocean_protocol::DynamicToolDeclaration> {
+    let tool_defs: HashMap<&str, &ocean_protocol::Tool> = all_tools
+        .iter()
+        .map(|tool| (tool.name.as_str(), tool))
+        .collect();
+    let valid_search_call_ids = kimi_k3_search_call_ids(messages);
+    let mut declared = HashSet::new();
+    let mut declarations = Vec::new();
+
+    // Preserve each retained search epoch as its own unchanged group.
+    for (message_index, message) in messages.iter().enumerate() {
+        let Some(matches) = search_result_matches(message, &valid_search_call_ids) else {
+            continue;
+        };
+        let tools: Vec<ocean_protocol::Tool> = matches
+            .into_iter()
+            .filter(|(_, already_loaded)| !already_loaded)
+            .filter_map(|(name, _)| {
+                if !loaded.names_set.contains(&name) || !declared.insert(name.clone()) {
+                    return None;
+                }
+                tool_defs.get(name.as_str()).copied().cloned()
+            })
+            .collect();
+        if !tools.is_empty() {
+            declarations.push(ocean_protocol::DynamicToolDeclaration {
+                tools,
+                before_message: after_tool_result_batch(messages, message_index),
+            });
+        }
+    }
+
+    // If an epoch was compacted, anchor its tool immediately before the first
+    // surviving historical call. If no call survives, append at the end so a
+    // resumed turn still restores the loaded capability.
+    for name in &loaded.names {
+        if declared.contains(name) {
+            continue;
+        }
+        let before_message = messages
+            .iter()
+            .position(|message| {
+                match message {
+                Message::Assistant(assistant)
+                    if assistant.provider == "kimi" && assistant.model == "kimi-k3" =>
+                {
+                    assistant.content.iter().any(|content| {
+                        matches!(content, Content::ToolCall { name: called, .. } if called == name)
+                    })
+                }
+                _ => false,
+            }
+            })
+            .unwrap_or(messages.len());
+        let Some(tool) = tool_defs.get(name.as_str()).copied().cloned() else {
+            continue;
+        };
+        declared.insert(name.clone());
+        declarations.push(ocean_protocol::DynamicToolDeclaration {
+            tools: vec![tool],
+            before_message,
+        });
+    }
+
+    // Search epochs are discovered in transcript order; fallback declarations
+    // may point earlier. Stable sorting preserves epoch order at equal indices.
+    declarations.sort_by_key(|declaration| declaration.before_message);
+    declarations
+}
+
+fn search_dynamic_tools(
+    all_tools: &[ocean_protocol::Tool],
+    loaded: &mut HashSet<String>,
+    args: &Value,
+) -> std::result::Result<String, String> {
+    let query = args
+        .get("query")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|query| !query.is_empty())
+        .ok_or_else(|| "search_tools requires a non-empty string `query`".to_string())?;
+
+    if query.chars().count() > MAX_DYNAMIC_SEARCH_QUERY_CHARS {
+        return Err(format!(
+            "search_tools query exceeds {MAX_DYNAMIC_SEARCH_QUERY_CHARS} characters"
+        ));
+    }
+
+    let mut ranked: Vec<(u32, &ocean_protocol::Tool)> = all_tools
+        .iter()
+        .take(MAX_DYNAMIC_SEARCH_CATALOG_TOOLS)
+        .filter(|tool| tool.name != DYNAMIC_SEARCH_TOOL)
+        .filter_map(|tool| {
+            let score = tool_search_score(tool, query);
+            (score > 0).then_some((score, tool))
+        })
+        .collect();
+    ranked.sort_by(|(left_score, left), (right_score, right)| {
+        right_score
+            .cmp(left_score)
+            .then_with(|| left.name.cmp(&right.name))
+    });
+    ranked.truncate(MAX_DYNAMIC_SEARCH_RESULTS);
+
+    let mut loaded_bytes = all_tools
+        .iter()
+        .filter(|tool| loaded.contains(&tool.name))
+        .filter_map(|tool| serde_json::to_vec(tool).ok().map(|bytes| bytes.len()))
+        .fold(0usize, usize::saturating_add);
+    let mut matches = Vec::with_capacity(ranked.len());
+    for (_, tool) in ranked {
+        let was_loaded = loaded.contains(&tool.name);
+        if !was_loaded {
+            if loaded.len() >= MAX_DYNAMIC_TOOLS {
+                continue;
+            }
+            let schema_bytes = serde_json::to_vec(tool)
+                .map_err(|error| format!("failed to size tool schema: {error}"))?
+                .len();
+            if schema_bytes > MAX_DYNAMIC_TOOL_SCHEMA_BYTES
+                || loaded_bytes.saturating_add(schema_bytes) > MAX_DYNAMIC_DECLARATION_BYTES
+            {
+                continue;
+            }
+            loaded_bytes = loaded_bytes.saturating_add(schema_bytes);
+            loaded.insert(tool.name.clone());
+        }
+        // Do not persist descriptions in the synthetic ToolResult. The full
+        // schema is supplied only in the request-scoped declaration on the next
+        // round, while durable history records only the selected public name.
+        matches.push(serde_json::json!({
+            "name": tool.name,
+            "loaded": true,
+            "already_loaded": was_loaded
+        }));
+    }
+    serde_json::to_string(&serde_json::json!({
+        "query": query,
+        "matches": matches,
+        "loaded_count": loaded.len(),
+        "loaded_limit": MAX_DYNAMIC_TOOLS
+    }))
+    .map_err(|error| format!("failed to encode search result: {error}"))
+}
+
 pub struct AgentRun {
     pub messages: Vec<Message>,
     pub stopped_at_turn_limit: bool,
@@ -90,6 +444,13 @@ pub async fn run_agent_with_history(
         .iter()
         .map(|t| crate::types::tool_def(t.as_ref()))
         .collect();
+    let reserved_search_collision = tool_index.contains_key(DYNAMIC_SEARCH_TOOL);
+    if config.model.supports_dynamic_tools() && reserved_search_collision {
+        return Err(AgentError::Other(format!(
+            "tool name `{DYNAMIC_SEARCH_TOOL}` is reserved for Kimi K3 dynamic discovery"
+        )));
+    }
+    let dynamic_tool_mode = config.model.supports_dynamic_tools() && !tool_defs.is_empty();
 
     let mut session_allowed: HashSet<String> = HashSet::new();
     let mut turn: u32 = 0;
@@ -140,21 +501,67 @@ pub async fn run_agent_with_history(
                  Reply to the user now with a concise text summary of what you found or did.]",
                 config.system_prompt
             )
+        } else if dynamic_tool_mode {
+            format!(
+                "{}\n\n[Ocean runtime: most tools are loaded on demand. Call search_tools with a \
+                 capability or domain keyword before using a non-core tool. Matching tools become \
+                 callable on the next provider round; do not call a newly found tool in the same batch.]",
+                config.system_prompt
+            )
         } else {
             config.system_prompt.clone()
         };
+        // Reconstruct loaded names from durable transcript truth on every
+        // provider round. A resumed run therefore starts with the same tool
+        // visibility as the prior run without persisting request-only schemas.
+        let loaded_state = if dynamic_tool_mode {
+            reconstruct_loaded_dynamic_tools(&messages, &tool_defs)
+        } else {
+            LoadedDynamicTools::default()
+        };
+        let mut loaded_tool_names = loaded_state.names_set.clone();
+        let round_tools = if final_answer_round {
+            Vec::new()
+        } else if dynamic_tool_mode {
+            vec![search_tool_def()]
+        } else {
+            tool_defs.clone()
+        };
+        let trimmed_messages = trim_to_context_window(
+            &messages,
+            &system_prompt,
+            config.model.context_window,
+            config.model.max_tokens,
+        );
+        let dynamic_tool_declarations = if dynamic_tool_mode {
+            dynamic_declarations_for_messages(&trimmed_messages, &loaded_state, &tool_defs)
+        } else {
+            Vec::new()
+        };
+        // Final synthesis keeps historical declarations so Kimi can tokenize
+        // retained calls, but tool_choice none and an empty offered set make
+        // every new tool call non-executable.
+        let offered_this_round: HashSet<String> =
+            if final_answer_round {
+                HashSet::new()
+            } else {
+                round_tools
+                    .iter()
+                    .map(|tool| tool.name.clone())
+                    .chain(dynamic_tool_declarations.iter().flat_map(|declaration| {
+                        declaration.tools.iter().map(|tool| tool.name.clone())
+                    }))
+                    .collect()
+            };
         let ctx = Context {
             system_prompt: Some(system_prompt.clone()),
-            messages: trim_to_context_window(
-                &messages,
-                &system_prompt,
-                config.model.context_window,
-                config.model.max_tokens,
-            ),
-            tools: if final_answer_round {
-                Vec::new()
+            messages: trimmed_messages,
+            tools: round_tools,
+            dynamic_tool_declarations,
+            tool_choice: if final_answer_round && dynamic_tool_mode {
+                ocean_protocol::ToolChoice::None
             } else {
-                tool_defs.clone()
+                ocean_protocol::ToolChoice::Auto
             },
         };
 
@@ -421,6 +828,31 @@ pub async fn run_agent_with_history(
         // Phase 1 — permission gate, in order.
         let mut gated: Vec<Gated> = Vec::with_capacity(tool_calls.len());
         for (id, name, args) in tool_calls {
+            if dynamic_tool_mode && !offered_this_round.contains(&name) {
+                gated.push(Gated::ReadyResult {
+                    id,
+                    name: name.clone(),
+                    content: format!(
+                        "tool `{name}` was not offered in this provider round; call search_tools first and wait for the next round"
+                    ),
+                    is_error: true,
+                });
+                continue;
+            }
+            if dynamic_tool_mode && name == DYNAMIC_SEARCH_TOOL {
+                let result = search_dynamic_tools(&tool_defs, &mut loaded_tool_names, &args);
+                let (content, is_error) = match result {
+                    Ok(content) => (content, false),
+                    Err(error) => (error, true),
+                };
+                gated.push(Gated::ReadyResult {
+                    id,
+                    name,
+                    content,
+                    is_error,
+                });
+                continue;
+            }
             let tool_obj = tool_index.get(&name).cloned();
             let needs_perm = tool_obj
                 .as_ref()
@@ -469,20 +901,38 @@ pub async fn run_agent_with_history(
         let mut any_terminate = false;
         let mut i = 0usize;
         while i < gated.len() {
-            // A denied slot never executes: emit nothing new (PermissionDenied
-            // already fired) and drop its ready error result in place so the
-            // transcript stays call/result-paired.
-            if let Gated::Denied { id, name, reason } = &gated[i] {
-                let tr = ToolResultMessage {
-                    tool_call_id: id.clone(),
-                    tool_name: name.clone(),
-                    content: vec![Content::text(format!("permission denied: {reason}"))],
-                    is_error: true,
-                    timestamp: ocean_protocol::now_ms(),
-                };
-                messages.push(Message::ToolResult(tr));
-                i += 1;
-                continue;
+            // Ready slots never execute. Permission denials and synthetic
+            // dynamic-search results still land in place so the transcript
+            // remains call/result-paired.
+            match &gated[i] {
+                Gated::Denied { id, name, reason } => {
+                    messages.push(Message::ToolResult(ToolResultMessage {
+                        tool_call_id: id.clone(),
+                        tool_name: name.clone(),
+                        content: vec![Content::text(format!("permission denied: {reason}"))],
+                        is_error: true,
+                        timestamp: ocean_protocol::now_ms(),
+                    }));
+                    i += 1;
+                    continue;
+                }
+                Gated::ReadyResult {
+                    id,
+                    name,
+                    content,
+                    is_error,
+                } => {
+                    messages.push(Message::ToolResult(ToolResultMessage {
+                        tool_call_id: id.clone(),
+                        tool_name: name.clone(),
+                        content: vec![Content::text(content.clone())],
+                        is_error: *is_error,
+                        timestamp: ocean_protocol::now_ms(),
+                    }));
+                    i += 1;
+                    continue;
+                }
+                Gated::Run { .. } => {}
             }
 
             // A shared run: gather the maximal run of consecutive Shared calls.
@@ -612,6 +1062,20 @@ pub async fn run_agent_with_history(
                                 timestamp: ocean_protocol::now_ms(),
                             }));
                         }
+                        Gated::ReadyResult {
+                            id,
+                            name,
+                            content,
+                            is_error,
+                        } => {
+                            messages.push(Message::ToolResult(ToolResultMessage {
+                                tool_call_id: id.clone(),
+                                tool_name: name.clone(),
+                                content: vec![Content::text(content.clone())],
+                                is_error: *is_error,
+                                timestamp: ocean_protocol::now_ms(),
+                            }));
+                        }
                         Gated::Run { id, name, .. } => {
                             let cancelled =
                                 cancelled_tool_outcome("cancelled before tool execution started");
@@ -722,6 +1186,12 @@ enum Gated {
         id: String,
         name: String,
         reason: String,
+    },
+    ReadyResult {
+        id: String,
+        name: String,
+        content: String,
+        is_error: bool,
     },
     Run {
         id: String,
@@ -1286,6 +1756,117 @@ mod tests {
             is_error: false,
             timestamp: 0,
         })
+    }
+
+    #[test]
+    fn dynamic_tool_search_is_deterministic_and_enforces_both_caps() {
+        let tools: Vec<ocean_protocol::Tool> = (0..20)
+            .map(|index| ocean_protocol::Tool {
+                name: format!("tool{index:02}"),
+                description: "common capability".into(),
+                parameters: serde_json::json!({"type": "object"}),
+            })
+            .collect();
+        let mut loaded = HashSet::new();
+        let result =
+            search_dynamic_tools(&tools, &mut loaded, &serde_json::json!({"query": "tool"}))
+                .expect("search succeeds");
+        let json: Value = serde_json::from_str(&result).expect("JSON result");
+        let matches = json["matches"].as_array().expect("matches");
+        let names: Vec<&str> = matches
+            .iter()
+            .map(|entry| entry["name"].as_str().expect("name"))
+            .collect();
+        assert!(
+            matches
+                .iter()
+                .all(|entry| entry.get("description").is_none()),
+            "durable search results retain names, never schema descriptions"
+        );
+        assert_eq!(
+            names,
+            vec!["tool00", "tool01", "tool02", "tool03", "tool04", "tool05", "tool06", "tool07"],
+            "equal-score search results use name order and stop at eight"
+        );
+
+        for index in 8..20 {
+            let _ = search_dynamic_tools(
+                &tools,
+                &mut loaded,
+                &serde_json::json!({"query": format!("tool{index:02}")}),
+            )
+            .expect("exact-name search succeeds");
+        }
+        assert_eq!(
+            loaded.len(),
+            MAX_DYNAMIC_TOOLS,
+            "loaded registry is capped at 16"
+        );
+        assert!(
+            !loaded.contains("tool19"),
+            "later matches cannot exceed the cap"
+        );
+    }
+
+    #[test]
+    fn dynamic_tool_search_enforces_the_512_kib_schema_budget() {
+        let tools: Vec<ocean_protocol::Tool> = (0..8)
+            .map(|index| ocean_protocol::Tool {
+                name: format!("large{index:02}"),
+                description: "x".repeat(120_000),
+                parameters: serde_json::json!({"type": "object"}),
+            })
+            .collect();
+        let mut loaded = HashSet::new();
+        search_dynamic_tools(&tools, &mut loaded, &serde_json::json!({"query": "large"}))
+            .expect("bounded search succeeds");
+        let bytes = tools
+            .iter()
+            .filter(|tool| loaded.contains(&tool.name))
+            .map(|tool| serde_json::to_vec(tool).expect("schema serializes").len())
+            .sum::<usize>();
+        assert!(bytes <= MAX_DYNAMIC_DECLARATION_BYTES);
+        assert_eq!(loaded.len(), 4, "the fifth 120-KiB schema exceeds 512 KiB");
+    }
+
+    #[test]
+    fn compacted_search_result_falls_back_immediately_before_surviving_call() {
+        let tools = vec![ocean_protocol::Tool {
+            name: "echo".into(),
+            description: "echo".into(),
+            parameters: serde_json::json!({"type": "object"}),
+        }];
+        let messages = vec![
+            Message::user_text("old turn"),
+            Message::Assistant(AssistantMessage {
+                content: vec![Content::ToolCall {
+                    id: "echo-1".into(),
+                    name: "echo".into(),
+                    arguments: serde_json::json!({}),
+                }],
+                api: "openai-completions".into(),
+                provider: "kimi".into(),
+                model: "kimi-k3".into(),
+                usage: Usage::default(),
+                stop_reason: StopReason::ToolUse,
+                error_message: None,
+                timestamp: 0,
+            }),
+            Message::ToolResult(ToolResultMessage {
+                tool_call_id: "echo-1".into(),
+                tool_name: "echo".into(),
+                content: vec![Content::text("ok")],
+                is_error: false,
+                timestamp: 0,
+            }),
+            Message::user_text("resumed"),
+        ];
+        let loaded = reconstruct_loaded_dynamic_tools(&messages, &tools);
+        let declarations = dynamic_declarations_for_messages(&messages, &loaded, &tools);
+        assert_eq!(loaded.names, vec!["echo"]);
+        assert_eq!(declarations.len(), 1);
+        assert_eq!(declarations[0].before_message, 1);
+        assert_eq!(declarations[0].tools[0].name, "echo");
     }
 
     #[derive(Default)]

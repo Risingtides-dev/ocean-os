@@ -150,11 +150,49 @@ pub struct Tool {
     pub parameters: Value,
 }
 
+/// One request-only dynamic tool declaration and its transcript position.
+///
+/// Groups remain separate because Kimi visibility begins at the declaration's
+/// position. Merging later discoveries into an earlier declaration would mutate
+/// the cached prefix and falsely make tools visible before they were loaded.
+#[derive(Debug, Clone)]
+pub struct DynamicToolDeclaration {
+    pub tools: Vec<Tool>,
+    /// Transcript-message index before which this content-less system message
+    /// is inserted. The index excludes the ordinary leading system prompt.
+    pub before_message: usize,
+}
+
+/// Provider request policy for model-authored tool calls.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ToolChoice {
+    /// Preserve provider default selection behavior.
+    #[default]
+    Auto,
+    /// Forbid model-authored tool calls for this request.
+    None,
+}
+
+impl ToolChoice {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Auto => "auto",
+            Self::None => "none",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct Context {
     pub system_prompt: Option<String>,
     pub messages: Vec<Message>,
+    /// Tools declared globally at the request top level.
     pub tools: Vec<Tool>,
+    /// Ordered full tool-declaration epochs injected for this request. This is
+    /// never persisted directly; the runtime reconstructs it from transcript
+    /// search results and surviving historical calls.
+    pub dynamic_tool_declarations: Vec<DynamicToolDeclaration>,
+    pub tool_choice: ToolChoice,
 }
 
 /// How a provider should present its credential on the request wire.
@@ -222,6 +260,16 @@ pub struct Model {
 }
 
 impl Model {
+    /// Whether this exact route supports request-scoped dynamic tool
+    /// declarations. Moonshot currently exposes the message shape only on K3;
+    /// K2.x rejects it during tokenization.
+    pub fn supports_dynamic_tools(&self) -> bool {
+        self.api == "openai-completions"
+            && self.provider == "kimi"
+            && self.id == "kimi-k3"
+            && self.base_url.trim_end_matches('/') == "https://api.moonshot.ai/v1"
+    }
+
     /// Anthropic Claude Sonnet 5 — current Sonnet generation. Verified live
     /// against api.anthropic.com (2026-07-08): the undated id is recognized on
     /// both API-key and Claude-subscription OAuth auth.

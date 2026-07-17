@@ -45,6 +45,7 @@ type Turn = Vec<AssistantMessageEvent>;
 /// script panics (a test bug — the loop asked for more turns than scripted).
 struct MockProvider {
     turns: std::sync::Mutex<std::collections::VecDeque<Turn>>,
+    contexts: std::sync::Mutex<Vec<Context>>,
     calls: AtomicUsize,
     saw_bound_session_id: AtomicBool,
 }
@@ -53,6 +54,7 @@ impl MockProvider {
     fn new(turns: Vec<Turn>) -> Self {
         Self {
             turns: std::sync::Mutex::new(turns.into()),
+            contexts: std::sync::Mutex::new(Vec::new()),
             calls: AtomicUsize::new(0),
             saw_bound_session_id: AtomicBool::new(false),
         }
@@ -65,14 +67,18 @@ impl MockProvider {
     fn saw_bound_session_id(&self) -> bool {
         self.saw_bound_session_id.load(Ordering::SeqCst)
     }
+
+    fn contexts(&self) -> Vec<Context> {
+        self.contexts.lock().unwrap().clone()
+    }
 }
 
 #[async_trait]
 impl Provider for MockProvider {
     async fn stream(
         &self,
-        _model: &Model,
-        _context: &Context,
+        model: &Model,
+        context: &Context,
         options: &StreamOptions,
     ) -> ocean_protocol::Result<AssistantMessageEventStream> {
         self.saw_bound_session_id.store(
@@ -80,11 +86,26 @@ impl Provider for MockProvider {
             Ordering::SeqCst,
         );
         self.calls.fetch_add(1, Ordering::SeqCst);
+        self.contexts.lock().unwrap().push(context.clone());
         let turn = self.turns.lock().unwrap().pop_front().expect(
             "MockProvider ran out of scripted turns — loop requested more rounds than scripted",
         );
-        let events: Vec<ocean_protocol::Result<AssistantMessageEvent>> =
-            turn.into_iter().map(Ok).collect();
+        let events: Vec<ocean_protocol::Result<AssistantMessageEvent>> = turn
+            .into_iter()
+            .map(|mut event| {
+                let message = match &mut event {
+                    AssistantMessageEvent::Done { message, .. }
+                    | AssistantMessageEvent::Error { error: message, .. } => Some(message),
+                    _ => None,
+                };
+                if let Some(message) = message {
+                    message.api.clone_from(&model.api);
+                    message.provider.clone_from(&model.provider);
+                    message.model.clone_from(&model.id);
+                }
+                Ok(event)
+            })
+            .collect();
         Ok(Box::pin(stream::iter(events)))
     }
 }
@@ -287,6 +308,35 @@ fn base_config(provider: Arc<MockProvider>) -> AgentConfig {
     AgentConfig::new(Model::anthropic_claude_sonnet_4_6(), "test system")
         .with_session_id("e2e")
         .with_provider(provider)
+}
+
+fn dynamic_declaration_names(context: &Context) -> Vec<Vec<&str>> {
+    context
+        .dynamic_tool_declarations
+        .iter()
+        .map(|declaration| {
+            declaration
+                .tools
+                .iter()
+                .map(|tool| tool.name.as_str())
+                .collect()
+        })
+        .collect()
+}
+
+fn kimi_k3_config(provider: Arc<MockProvider>) -> AgentConfig {
+    AgentConfig::new(
+        Model::openai_compat(
+            "kimi",
+            "kimi-k3",
+            "https://api.moonshot.ai/v1",
+            1_000_000,
+            8_192,
+        ),
+        "test system",
+    )
+    .with_session_id("e2e")
+    .with_provider(provider)
 }
 
 #[tokio::test]
@@ -1283,4 +1333,401 @@ async fn manual_policy_can_check_every_tool_call() {
 
     assert_eq!(checks.load(Ordering::SeqCst), 1);
     assert_eq!(ran.load(Ordering::SeqCst), 1);
+}
+
+// ===========================================================================
+// Kimi K3 dynamic tools. The first round sees only search_tools; a successful
+// search loads full schemas for the next request, never the current batch.
+// ===========================================================================
+#[tokio::test]
+async fn kimi_k3_without_real_tools_preserves_the_no_tools_boundary() {
+    let provider = Arc::new(MockProvider::new(vec![vec![done(
+        vec![Content::text("no tools")],
+        StopReason::Stop,
+    )]]));
+    let cfg = kimi_k3_config(provider.clone());
+
+    ocean_runtime::run_agent(&cfg, user("answer directly"), None)
+        .await
+        .expect("tool-free K3 run succeeds");
+
+    let contexts = provider.contexts();
+    assert_eq!(contexts.len(), 1);
+    assert!(contexts[0].tools.is_empty());
+    assert!(contexts[0].dynamic_tool_declarations.is_empty());
+    assert!(
+        !contexts[0]
+            .system_prompt
+            .as_deref()
+            .unwrap_or_default()
+            .contains("search_tools"),
+        "without real tools, Ocean must not advertise a synthetic tool"
+    );
+}
+
+#[tokio::test]
+async fn kimi_k3_reserved_search_tool_collision_fails_closed() {
+    struct CollisionTool;
+
+    #[async_trait]
+    impl AgentTool for CollisionTool {
+        fn name(&self) -> &str {
+            "search_tools"
+        }
+        fn description(&self) -> &str {
+            "must not shadow Ocean's synthetic discovery tool"
+        }
+        fn parameters(&self) -> Value {
+            serde_json::json!({"type": "object"})
+        }
+        fn requires_permission(&self) -> bool {
+            false
+        }
+        async fn execute(&self, _id: &str, _args: Value) -> Result<AgentToolResult, String> {
+            panic!("colliding tool must never execute")
+        }
+    }
+
+    let provider = Arc::new(MockProvider::new(vec![vec![done(
+        vec![Content::text("must not be reached")],
+        StopReason::Stop,
+    )]]));
+    let cfg = kimi_k3_config(provider.clone()).with_tools(vec![Arc::new(CollisionTool)]);
+
+    let error = match ocean_runtime::run_agent(&cfg, user("test collision"), None).await {
+        Ok(_) => panic!("reserved collision must fail closed"),
+        Err(error) => error,
+    };
+    assert!(error.to_string().contains("reserved"));
+    assert_eq!(
+        provider.call_count(),
+        0,
+        "no eager fallback request is sent"
+    );
+}
+
+#[tokio::test]
+async fn kimi_k3_search_loads_then_executes_target_on_next_round() {
+    let ran = Arc::new(AtomicUsize::new(0));
+    let provider = Arc::new(MockProvider::new(vec![
+        vec![done(
+            vec![tool_call(
+                "search-1",
+                "search_tools",
+                serde_json::json!({"query": "echo"}),
+            )],
+            StopReason::ToolUse,
+        )],
+        vec![done(
+            vec![tool_call(
+                "echo-1",
+                "echo",
+                serde_json::json!({"value": "hello"}),
+            )],
+            StopReason::ToolUse,
+        )],
+        vec![done(vec![Content::text("finished")], StopReason::Stop)],
+    ]));
+    let cfg =
+        kimi_k3_config(provider.clone()).with_tools(vec![Arc::new(EchoTool { ran: ran.clone() })]);
+
+    let run = ocean_runtime::run_agent(&cfg, user("echo hello"), None)
+        .await
+        .expect("dynamic tool run succeeds");
+
+    assert_eq!(ran.load(Ordering::SeqCst), 1, "loaded target executes once");
+    assert_no_orphan_tool_use(&run.messages);
+    let contexts = provider.contexts();
+    assert_eq!(contexts.len(), 3);
+    assert_eq!(
+        contexts[0]
+            .tools
+            .iter()
+            .map(|tool| tool.name.as_str())
+            .collect::<Vec<_>>(),
+        vec!["search_tools"]
+    );
+    assert!(contexts[0].dynamic_tool_declarations.is_empty());
+    assert_eq!(contexts[1].dynamic_tool_declarations.len(), 1);
+    assert_eq!(
+        contexts[1].dynamic_tool_declarations[0]
+            .tools
+            .iter()
+            .map(|tool| tool.name.as_str())
+            .collect::<Vec<_>>(),
+        vec!["echo"],
+        "search result injects the full target schema on the next round"
+    );
+    assert_eq!(
+        contexts[1].dynamic_tool_declarations[0].before_message,
+        contexts[1].messages.len(),
+        "the first declaration follows the completed search result"
+    );
+    assert_eq!(
+        contexts[2].dynamic_tool_declarations[0].before_message, 3,
+        "later requests retain the declaration before the historical target call"
+    );
+    assert!(matches!(
+        &contexts[2].messages[3],
+        Message::Assistant(message)
+            if message.content.iter().any(|content| matches!(
+                content,
+                Content::ToolCall { name, .. } if name == "echo"
+            ))
+    ));
+}
+
+#[tokio::test]
+async fn kimi_k3_rejects_unloaded_target_smuggled_beside_search_in_same_batch() {
+    let ran = Arc::new(AtomicUsize::new(0));
+    let provider = Arc::new(MockProvider::new(vec![
+        vec![done(
+            vec![
+                tool_call(
+                    "search-1",
+                    "search_tools",
+                    serde_json::json!({"query": "echo"}),
+                ),
+                tool_call("echo-early", "echo", serde_json::json!({"value": "no"})),
+            ],
+            StopReason::ToolUse,
+        )],
+        vec![done(vec![Content::text("stopped")], StopReason::Stop)],
+    ]));
+    let cfg =
+        kimi_k3_config(provider.clone()).with_tools(vec![Arc::new(EchoTool { ran: ran.clone() })]);
+
+    let run = ocean_runtime::run_agent(&cfg, user("try both"), None)
+        .await
+        .expect("unoffered target becomes a paired error result");
+
+    assert_eq!(
+        ran.load(Ordering::SeqCst),
+        0,
+        "same-batch target must not execute"
+    );
+    assert_no_orphan_tool_use(&run.messages);
+    let rejected = run.messages.iter().find_map(|message| match message {
+        Message::ToolResult(result) if result.tool_call_id == "echo-early" => Some(result),
+        _ => None,
+    });
+    let rejected = rejected.expect("same-batch call has a result");
+    assert!(rejected.is_error);
+    assert!(rejected.content[0]
+        .as_text()
+        .expect("text error")
+        .contains("not offered in this provider round"));
+    assert_eq!(
+        provider.contexts()[1].dynamic_tool_declarations[0].tools[0].name,
+        "echo",
+        "the search still loads echo for later, without authorizing the current batch"
+    );
+}
+
+#[tokio::test]
+async fn kimi_k3_search_bypasses_permission_but_loaded_real_tool_keeps_gate() {
+    let ran = Arc::new(AtomicUsize::new(0));
+    let provider = Arc::new(MockProvider::new(vec![
+        vec![done(
+            vec![tool_call(
+                "search-1",
+                "search_tools",
+                serde_json::json!({"query": "gated"}),
+            )],
+            StopReason::ToolUse,
+        )],
+        vec![done(
+            vec![tool_call("gated-1", "gated", serde_json::json!({}))],
+            StopReason::ToolUse,
+        )],
+        vec![done(vec![Content::text("denied safely")], StopReason::Stop)],
+    ]));
+    let (policy, checks) = ScriptedPolicy::always_check(PermissionDecision::Deny {
+        reason: "operator denied".into(),
+    });
+    let cfg = kimi_k3_config(provider)
+        .with_tools(vec![Arc::new(GatedTool { ran: ran.clone() })])
+        .with_permission(policy);
+
+    let run = ocean_runtime::run_agent(&cfg, user("use gated"), None)
+        .await
+        .expect("permission denial stays provider-valid");
+
+    assert_eq!(
+        checks.load(Ordering::SeqCst),
+        1,
+        "synthetic search_tools must bypass permission; only the real target is checked"
+    );
+    assert_eq!(
+        ran.load(Ordering::SeqCst),
+        0,
+        "denied target never executes"
+    );
+    assert_no_orphan_tool_use(&run.messages);
+    assert!(run.messages.iter().any(|message| matches!(
+        message,
+        Message::ToolResult(result)
+            if result.tool_call_id == "gated-1" && result.is_error
+    )));
+}
+
+#[tokio::test]
+async fn resumed_kimi_k3_turn_restores_declarations_on_its_first_request() {
+    let ran = Arc::new(AtomicUsize::new(0));
+    let first_provider = Arc::new(MockProvider::new(vec![
+        vec![done(
+            vec![tool_call(
+                "search-1",
+                "search_tools",
+                serde_json::json!({"query": "echo"}),
+            )],
+            StopReason::ToolUse,
+        )],
+        vec![done(
+            vec![tool_call("echo-1", "echo", serde_json::json!({}))],
+            StopReason::ToolUse,
+        )],
+        vec![done(vec![Content::text("first done")], StopReason::Stop)],
+    ]));
+    let first_cfg =
+        kimi_k3_config(first_provider).with_tools(vec![Arc::new(EchoTool { ran: ran.clone() })]);
+    let first = ocean_runtime::run_agent(&first_cfg, user("load and use echo"), None)
+        .await
+        .expect("first K3 turn succeeds");
+
+    let mut resumed_history = first.messages;
+    resumed_history.push(user("use the retained context"));
+    let resumed_provider = Arc::new(MockProvider::new(vec![vec![done(
+        vec![Content::text("resumed")],
+        StopReason::Stop,
+    )]]));
+    let resumed_cfg =
+        kimi_k3_config(resumed_provider.clone()).with_tools(vec![Arc::new(EchoTool { ran })]);
+    ocean_runtime::run_agent_with_history(&resumed_cfg, resumed_history, None)
+        .await
+        .expect("resumed K3 turn succeeds");
+
+    let contexts = resumed_provider.contexts();
+    assert_eq!(contexts.len(), 1);
+    assert_eq!(dynamic_declaration_names(&contexts[0]), vec![vec!["echo"]]);
+    assert_eq!(contexts[0].dynamic_tool_declarations[0].before_message, 3);
+    assert_eq!(contexts[0].tool_choice, ocean_protocol::ToolChoice::Auto);
+}
+
+#[tokio::test]
+async fn kimi_k3_multiple_search_epochs_remain_separate_and_position_stable() {
+    let echo_ran = Arc::new(AtomicUsize::new(0));
+    let gated_ran = Arc::new(AtomicUsize::new(0));
+    let provider = Arc::new(MockProvider::new(vec![
+        vec![done(
+            vec![tool_call(
+                "search-1",
+                "search_tools",
+                serde_json::json!({"query": "echo"}),
+            )],
+            StopReason::ToolUse,
+        )],
+        vec![done(
+            vec![tool_call("echo-1", "echo", serde_json::json!({}))],
+            StopReason::ToolUse,
+        )],
+        vec![done(
+            vec![tool_call(
+                "search-2",
+                "search_tools",
+                serde_json::json!({"query": "gated"}),
+            )],
+            StopReason::ToolUse,
+        )],
+        vec![done(
+            vec![tool_call("gated-1", "gated", serde_json::json!({}))],
+            StopReason::ToolUse,
+        )],
+        vec![done(vec![Content::text("all done")], StopReason::Stop)],
+    ]));
+    let cfg = kimi_k3_config(provider.clone()).with_tools(vec![
+        Arc::new(EchoTool {
+            ran: echo_ran.clone(),
+        }),
+        Arc::new(GatedTool {
+            ran: gated_ran.clone(),
+        }),
+    ]);
+    ocean_runtime::run_agent(&cfg, user("use both"), None)
+        .await
+        .expect("multi-epoch K3 run succeeds");
+
+    assert_eq!(echo_ran.load(Ordering::SeqCst), 1);
+    assert_eq!(gated_ran.load(Ordering::SeqCst), 1);
+    let contexts = provider.contexts();
+    assert_eq!(contexts.len(), 5);
+    assert_eq!(
+        dynamic_declaration_names(&contexts[3]),
+        vec![vec!["echo"], vec!["gated"]]
+    );
+    assert_eq!(
+        contexts[3]
+            .dynamic_tool_declarations
+            .iter()
+            .map(|declaration| declaration.before_message)
+            .collect::<Vec<_>>(),
+        vec![3, 7]
+    );
+    assert_eq!(
+        dynamic_declaration_names(&contexts[4]),
+        dynamic_declaration_names(&contexts[3]),
+        "later request must not merge or rewrite prior epochs"
+    );
+    assert_eq!(
+        contexts[4]
+            .dynamic_tool_declarations
+            .iter()
+            .map(|declaration| declaration.before_message)
+            .collect::<Vec<_>>(),
+        vec![3, 7]
+    );
+}
+
+#[tokio::test]
+async fn kimi_k3_final_synthesis_retains_history_declarations_with_tool_choice_none() {
+    let ran = Arc::new(AtomicUsize::new(0));
+    let provider = Arc::new(MockProvider::new(vec![
+        vec![done(
+            vec![tool_call(
+                "search-1",
+                "search_tools",
+                serde_json::json!({"query": "echo"}),
+            )],
+            StopReason::ToolUse,
+        )],
+        vec![done(
+            vec![tool_call("echo-1", "echo", serde_json::json!({}))],
+            StopReason::ToolUse,
+        )],
+        // Deliberately violate tool_choice none. Runtime dispatch must still
+        // reject the call because final synthesis offered no executable name.
+        vec![done(
+            vec![tool_call("echo-final", "echo", serde_json::json!({}))],
+            StopReason::ToolUse,
+        )],
+    ]));
+    let cfg = kimi_k3_config(provider.clone())
+        .with_tools(vec![Arc::new(EchoTool { ran: ran.clone() })])
+        .with_max_turns(3);
+    let run = ocean_runtime::run_agent(&cfg, user("load then synthesize"), None)
+        .await
+        .expect("final synthesis succeeds");
+
+    assert_eq!(ran.load(Ordering::SeqCst), 1);
+    assert!(run.messages.iter().any(|message| matches!(
+        message,
+        Message::ToolResult(result)
+            if result.tool_call_id == "echo-final" && result.is_error
+    )));
+    let contexts = provider.contexts();
+    let final_context = &contexts[2];
+    assert!(final_context.tools.is_empty());
+    assert_eq!(dynamic_declaration_names(final_context), vec![vec!["echo"]]);
+    assert_eq!(final_context.dynamic_tool_declarations[0].before_message, 3);
+    assert_eq!(final_context.tool_choice, ocean_protocol::ToolChoice::None);
 }

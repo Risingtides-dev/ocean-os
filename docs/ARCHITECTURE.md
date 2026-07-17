@@ -94,6 +94,23 @@ runtime tools plus configured MCP and plugin providers. `ocean-runtime` exposes
 schemas to the selected model, executes calls, records results, and applies
 permission/cancellation policy.
 
+The exact `kimi-k3` route uses Moonshot's request-scoped dynamic declarations
+instead of sending the complete registry globally. A synthetic `search_tools`
+call deterministically loads up to eight matches at a time. Durable results keep
+names but omit schemas/descriptions; each runtime invocation reconstructs the
+session's ordered declaration epochs from transcript truth under a sixteen-tool,
+512-KiB ceiling. Epochs remain separate after their search result and before
+later calls so resumed turns preserve visibility and cached prefixes. If
+compaction removed a result but retained a historical call, its schema is
+fallback-anchored immediately before that call. Final synthesis retains those
+historical declarations for provider-valid replay while `tool_choice: "none"`
+and runtime dispatch expose no executable tool. The runtime rejects calls that
+were not actually offered in that round, so a model cannot search and execute a
+newly discovered target in one batch. Loaded real tools still cross the ordinary
+permission, cancellation, concurrency, and result-persistence boundaries. Other
+models retain the static tool request shape and fail closed if given K3-only
+dynamic declarations.
+
 Mutating tools are gated by default. A client may carry a per-turn decision
 token so approvals cannot be replayed by an unrelated localhost observer.
 Trusted bypass modes are explicit operator choices; documentation and surfaces

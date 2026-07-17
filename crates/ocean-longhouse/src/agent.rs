@@ -113,6 +113,8 @@ impl ModelHandle {
             system_prompt: Some(system.to_string()),
             messages: vec![Message::user_text(user)],
             tools: Vec::new(),
+            dynamic_tool_declarations: Vec::new(),
+            tool_choice: ocean_protocol::ToolChoice::Auto,
         };
         let options = StreamOptions {
             // Intentionally leave `temperature` unset: some cheap models

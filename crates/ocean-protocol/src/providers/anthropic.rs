@@ -816,6 +816,8 @@ mod tests {
                 Message::user_text("newest turn"),
             ],
             tools: vec![tool("read_file"), tool("write_file")],
+            dynamic_tool_declarations: Vec::new(),
+            tool_choice: crate::types::ToolChoice::Auto,
         }
     }
 
@@ -1198,6 +1200,8 @@ mod tests {
                 Message::user_text("newest turn"),
             ],
             tools: vec![],
+            dynamic_tool_declarations: Vec::new(),
+            tool_choice: crate::types::ToolChoice::Auto,
         };
 
         let body = build_body(&anthropic_model(), &ctx, &StreamOptions::default());
@@ -1221,6 +1225,8 @@ mod tests {
             system_prompt: Some("sys".into()),
             messages: vec![Message::user_text("only turn")],
             tools: vec![tool("read_file")],
+            dynamic_tool_declarations: Vec::new(),
+            tool_choice: crate::types::ToolChoice::Auto,
         };
         let body = build_body(&anthropic_model(), &ctx, &StreamOptions::default());
         let msgs = body["messages"].as_array().expect("messages array");
@@ -1333,6 +1339,8 @@ mod tests {
             system_prompt: None,
             messages: vec![Message::user_text("only turn")],
             tools: vec![],
+            dynamic_tool_declarations: Vec::new(),
+            tool_choice: crate::types::ToolChoice::Auto,
         };
         let options = StreamOptions {
             auth: AuthMethod::Bearer,
