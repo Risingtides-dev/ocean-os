@@ -145,9 +145,11 @@ use metrics::{InFlightGuard, TurnMetrics};
 use model_catalog::{model_get, model_set, models_list};
 use model_roles::{load_model_roles, resolve_advisor_alias, resolve_effective_model_id};
 use persistent_rooms::{
-    resolve_named_agent, room_create, room_db_path, room_events, room_get, room_join, room_leave,
-    room_post_message, room_retry_outbox, room_snapshot, room_transcript, rooms_list_persistent,
-    with_rooms, with_rooms_handle, RoomAccessWakeBus, RoomStoreHandle, RoomWakeBus,
+    resolve_named_agent, room_create, room_create_invite, room_db_path, room_events, room_get,
+    room_join, room_leave, room_post_message, room_redeem_invite, room_register_agents,
+    room_retry_outbox, room_snapshot, room_transcript, rooms_list_persistent,
+    run_federated_trigger_dispatcher, with_rooms, with_rooms_handle, RoomAccessWakeBus,
+    RoomStoreHandle, RoomWakeBus,
 };
 use project_registry::{
     canonical_git_common_dir, discover_project_worktrees, project_create, project_delete,
@@ -795,10 +797,13 @@ async fn main() -> anyhow::Result<()> {
     let room_wakes = RoomWakeBus::default();
     let room_access_wakes = RoomAccessWakeBus::default();
     let shutdown = CancellationToken::new();
+    let (federated_trigger_tx, federated_trigger_rx) = tokio::sync::mpsc::unbounded_channel();
+    let federated_dispatch_cancel = CancellationToken::new();
     let room_federation = FederationSupervisor::from_env(
         rooms.clone(),
         room_wakes.clone(),
         room_access_wakes.clone(),
+        federated_trigger_tx,
         shutdown.clone(),
     );
 
@@ -836,6 +841,15 @@ async fn main() -> anyhow::Result<()> {
         turn_limiter: Arc::new(tokio::sync::Semaphore::new(max_concurrent_turns())),
         advisor_limiter: Arc::new(tokio::sync::Semaphore::new(ADVISOR_CONCURRENCY_LIMIT)),
     };
+
+    // The sovereign trigger receiver must exist before federation startup can
+    // ingest and claim a confirmed mention. It only validates and spawns; agent
+    // turns never block the ordered SSE ingest loop.
+    let federated_dispatch_handle = tokio::spawn(run_federated_trigger_dispatcher(
+        state.clone(),
+        federated_trigger_rx,
+        federated_dispatch_cancel.clone(),
+    ));
 
     // Start restart-safe room federation only after AppState owns the handle.
     // Missing/invalid client config cannot leave credentialed rooms stale Live:
@@ -977,6 +991,13 @@ async fn main() -> anyhow::Result<()> {
     // their handles explicitly so no sender/receiver is runtime-aborted mid-
     // bookkeeping when main returns.
     federation_shutdown.shutdown().await;
+    federated_dispatch_cancel.cancel();
+    if federated_dispatch_handle.await.is_err() {
+        tracing::warn!(
+            outcome = "federated_dispatch_join_failed",
+            "federated trigger dispatcher ended unexpectedly"
+        );
+    }
 
     // OCEAN-301: the drain is now supervised. A wedged, non-cancellable turn
     // handle must never hang the process past a hard ceiling, and a SECOND
@@ -1201,6 +1222,9 @@ fn banner_routes() -> &'static [&'static str] {
         "POST /v1/rooms/persistent/{key}/participants",
         "DELETE /v1/rooms/persistent/{key}/participants/{participant_id}",
         "POST /v1/rooms/persistent/{key}/messages",
+        "POST /v1/rooms/persistent/{key}/invites",
+        "POST /v1/rooms/persistent/invites/redeem",
+        "POST /v1/rooms/persistent/{key}/members/agents",
         "GET /v1/rooms/persistent/{key}/transcript",
         "GET /v1/rooms/persistent/{key}/snapshot",
         "GET /v1/rooms/persistent/{key}/events",
@@ -2252,6 +2276,18 @@ fn room_routes() -> Router<AppState> {
         .route(
             "/v1/rooms/persistent/{key}/messages",
             post(room_post_message),
+        )
+        .route(
+            "/v1/rooms/persistent/{key}/invites",
+            post(room_create_invite),
+        )
+        .route(
+            "/v1/rooms/persistent/invites/redeem",
+            post(room_redeem_invite),
+        )
+        .route(
+            "/v1/rooms/persistent/{key}/members/agents",
+            post(room_register_agents),
         )
         .route(
             "/v1/rooms/persistent/{key}/transcript",
@@ -19302,6 +19338,44 @@ mod tests {
             );
         }
 
+        let redeem = app
+            .clone()
+            .oneshot(
+                Request::post("/v1/rooms/persistent/invites/redeem")
+                    .header("content-type", "application/json")
+                    .body(Body::from("{}"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            redeem.status(),
+            StatusCode::BAD_REQUEST,
+            "static redeem route must win over dynamic room routes"
+        );
+        let invite = app
+            .clone()
+            .oneshot(
+                Request::post("/v1/rooms/persistent/missing/invites")
+                    .header("content-type", "application/json")
+                    .body(Body::from("{}"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(invite.status(), StatusCode::NOT_FOUND);
+        let agents = app
+            .clone()
+            .oneshot(
+                Request::post("/v1/rooms/persistent/missing/members/agents")
+                    .header("content-type", "application/json")
+                    .body(Body::from("{}"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(agents.status(), StatusCode::BAD_REQUEST);
+
         let livekit = app
             .oneshot(
                 Request::get("/v1/rooms/call-room/livekit-token")
@@ -19522,7 +19596,7 @@ mod tests {
         );
         assert_eq!(
             banner.len(),
-            77,
+            80,
             "route baseline changed; review the manifest"
         );
 

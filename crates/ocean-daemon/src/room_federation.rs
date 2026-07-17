@@ -18,11 +18,11 @@ use std::{
 
 use eventsource_stream::Eventsource;
 use ocean_core::{
-    FederatedActorType, FederatedRoomMemberProjection, FederatedRoomRole, MemberPresence,
-    PublicAgentDescriptor, RoomAccessProjection, RoomAccessState, RoomKey, RoomMessageKind,
-    RoomOutboxItem, RoomParticipantKind,
+    evaluate_trigger_policy, FederatedActorType, FederatedRoomMemberProjection, FederatedRoomRole,
+    InviteResponse, MemberPresence, PublicAgentDescriptor, RoomAccessProjection, RoomAccessState,
+    RoomKey, RoomMessageKind, RoomOutboxItem, RoomParticipantKind, RoomTriggerEvent,
 };
-use ocean_store::{ConfirmedEvent, IngestOutcome, RoomCredential};
+use ocean_store::{ConfirmedEvent, IngestOutcome, PendingRedemption, RoomCredential, RoomStore};
 use reqwest::{redirect::Policy, Client, StatusCode, Url};
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use serde_json::Value;
@@ -40,6 +40,9 @@ use crate::persistent_rooms::{
 };
 
 const FEDERATION_URL_ENV: &str = "OCEAN_FEDERATION_URL";
+const FEDERATION_OWNER_TOKEN_ENV: &str = "OCEAN_FEDERATION_OWNER_TOKEN";
+const RECOVERY_CONCURRENCY: usize = 4;
+const REVOKED_STORE_SENTINEL: &str = "room access revoked";
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 const READ_TIMEOUT: Duration = Duration::from_secs(35);
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(15);
@@ -54,6 +57,126 @@ enum BridgeError {
     Protocol,
     Store,
     Revoked,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum IntentError {
+    Invalid,
+    NotFound,
+    Conflict,
+    Forbidden,
+    InviteForbidden,
+    Unavailable,
+    Protocol,
+    Store,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GuardedMutationError {
+    Generation,
+    NotFound,
+    Store,
+}
+
+#[derive(Clone)]
+pub(super) struct AgentRegistrationInput {
+    pub(super) agent_name: String,
+    pub(super) registration_key: String,
+    pub(super) descriptor: PublicAgentDescriptor,
+}
+
+#[derive(Debug, Clone)]
+pub(super) struct FederatedTriggerDispatch {
+    pub(super) room: RoomKey,
+    pub(super) ledger_event_id: String,
+    pub(super) local_seq: u64,
+    pub(super) target_member_id: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct ControlEnvelopeMember {
+    member_id: String,
+    #[serde(default)]
+    owner_member_id: Option<String>,
+    actor_type: FederatedActorType,
+    role_in_room: FederatedRoomRole,
+    display_name: String,
+    #[serde(default)]
+    public_agent_descriptor: Option<PublicAgentDescriptor>,
+}
+
+#[derive(Debug, Deserialize)]
+struct RegisterEnvelope {
+    room_id: String,
+    owner: ControlEnvelopeMember,
+}
+
+#[derive(Deserialize)]
+struct InviteEnvelope {
+    code: String,
+    invite: InviteRecord,
+}
+
+#[derive(Debug, Deserialize)]
+struct InviteRecord {
+    role: String,
+    scopes: Vec<String>,
+    #[serde(rename = "expiresAt")]
+    expires_at: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct RedeemEnvelope {
+    invite: InviteRecord,
+    record: TokenRecord,
+    /// Presence is forbidden even when Bedrock sends `"token": null`.
+    #[serde(
+        default,
+        rename = "token",
+        deserialize_with = "deserialize_present_field"
+    )]
+    token_present: bool,
+}
+
+fn deserialize_present_field<'de, D>(deserializer: D) -> Result<bool, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let _ = Value::deserialize(deserializer)?;
+    Ok(true)
+}
+
+#[derive(Debug, Deserialize)]
+struct TokenRecord {
+    role: String,
+    scopes: Vec<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct SelfJoinEnvelope {
+    member: ControlEnvelopeMember,
+}
+
+#[derive(Debug, Deserialize)]
+struct AgentMembersEnvelope {
+    members: Vec<ControlEnvelopeMember>,
+}
+
+#[derive(Serialize)]
+struct AgentRegistrationWire<'a> {
+    registration_key: &'a str,
+    display_name: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    description: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    model_alias: Option<&'a str>,
+    skills_count: u32,
+    subagent_names: &'a [String],
+}
+
+#[derive(Serialize)]
+struct AgentRegistrationBatch<'a> {
+    agents: Vec<AgentRegistrationWire<'a>>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -178,22 +301,50 @@ pub(super) struct FederationSupervisor {
     inner: Arc<SupervisorInner>,
 }
 
-struct SupervisorInner {
+struct SupervisorInit {
     client: Option<FederationClient>,
+    owner_token: Option<String>,
     invalid_config: bool,
     rooms: RoomStoreHandle,
     room_wakes: RoomWakeBus,
     access_wakes: RoomAccessWakeBus,
+    trigger_tx: mpsc::UnboundedSender<FederatedTriggerDispatch>,
+    shutdown: CancellationToken,
+    scan_interval: Duration,
+}
+
+struct SupervisorInner {
+    client: Option<FederationClient>,
+    owner_token: Option<String>,
+    invalid_config: bool,
+    rooms: RoomStoreHandle,
+    room_wakes: RoomWakeBus,
+    access_wakes: RoomAccessWakeBus,
+    trigger_tx: mpsc::UnboundedSender<FederatedTriggerDispatch>,
     shutdown: CancellationToken,
     slots: Mutex<HashMap<RoomKey, Arc<RoomSlot>>>,
+    recovery: Mutex<Option<JoinHandle<()>>>,
     shutting_down: AtomicBool,
     next_generation: AtomicU64,
     scan_interval: Duration,
 }
 
-#[derive(Default)]
 struct RoomSlot {
     state: Mutex<Option<RunningRoom>>,
+    control: Arc<AdmissionGate>,
+    generation: AtomicU64,
+    credential_lock: Mutex<()>,
+}
+
+impl Default for RoomSlot {
+    fn default() -> Self {
+        Self {
+            state: Mutex::new(None),
+            control: Arc::new(AdmissionGate::new()),
+            generation: AtomicU64::new(0),
+            credential_lock: Mutex::new(()),
+        }
+    }
 }
 
 struct AdmissionGate {
@@ -270,25 +421,33 @@ impl FederationSupervisor {
         rooms: RoomStoreHandle,
         room_wakes: RoomWakeBus,
         access_wakes: RoomAccessWakeBus,
+        trigger_tx: mpsc::UnboundedSender<FederatedTriggerDispatch>,
         shutdown: CancellationToken,
     ) -> Self {
         let (client, invalid_config) = match FederationClient::from_env() {
             Ok(client) => (client, false),
             Err(_) => (None, true),
         };
-        Self::new_inner(
+        let owner_token = std::env::var(FEDERATION_OWNER_TOKEN_ENV)
+            .ok()
+            .filter(|token| {
+                !token.is_empty() && token == token.trim() && !token.chars().any(char::is_control)
+            });
+        Self::new_inner(SupervisorInit {
             client,
+            owner_token,
             invalid_config,
             rooms,
             room_wakes,
             access_wakes,
+            trigger_tx,
             shutdown,
-            SENDER_SCAN_INTERVAL,
-        )
+            scan_interval: SENDER_SCAN_INTERVAL,
+        })
     }
 
     #[cfg(test)]
-    fn for_test(
+    pub(super) fn for_test(
         base: &str,
         rooms: RoomStoreHandle,
         room_wakes: RoomWakeBus,
@@ -296,15 +455,39 @@ impl FederationSupervisor {
         shutdown: CancellationToken,
         scan_interval: Duration,
     ) -> Self {
-        Self::new_inner(
-            Some(FederationClient::new(base).expect("test URL")),
-            false,
+        let (trigger_tx, _) = mpsc::unbounded_channel();
+        Self::for_test_with_trigger(
+            base,
             rooms,
             room_wakes,
             access_wakes,
+            trigger_tx,
             shutdown,
             scan_interval,
         )
+    }
+
+    #[cfg(test)]
+    fn for_test_with_trigger(
+        base: &str,
+        rooms: RoomStoreHandle,
+        room_wakes: RoomWakeBus,
+        access_wakes: RoomAccessWakeBus,
+        trigger_tx: mpsc::UnboundedSender<FederatedTriggerDispatch>,
+        shutdown: CancellationToken,
+        scan_interval: Duration,
+    ) -> Self {
+        Self::new_inner(SupervisorInit {
+            client: Some(FederationClient::new(base).expect("test URL")),
+            owner_token: Some("test-owner-token".into()),
+            invalid_config: false,
+            rooms,
+            room_wakes,
+            access_wakes,
+            trigger_tx,
+            shutdown,
+            scan_interval,
+        })
     }
 
     #[cfg(test)]
@@ -314,38 +497,36 @@ impl FederationSupervisor {
         access_wakes: RoomAccessWakeBus,
         shutdown: CancellationToken,
     ) -> Self {
-        Self::new_inner(
-            None,
-            false,
+        let (trigger_tx, _) = mpsc::unbounded_channel();
+        Self::new_inner(SupervisorInit {
+            client: None,
+            owner_token: None,
+            invalid_config: false,
             rooms,
             room_wakes,
             access_wakes,
+            trigger_tx,
             shutdown,
-            SENDER_SCAN_INTERVAL,
-        )
+            scan_interval: SENDER_SCAN_INTERVAL,
+        })
     }
 
-    fn new_inner(
-        client: Option<FederationClient>,
-        invalid_config: bool,
-        rooms: RoomStoreHandle,
-        room_wakes: RoomWakeBus,
-        access_wakes: RoomAccessWakeBus,
-        shutdown: CancellationToken,
-        scan_interval: Duration,
-    ) -> Self {
+    fn new_inner(init: SupervisorInit) -> Self {
         Self {
             inner: Arc::new(SupervisorInner {
-                client,
-                invalid_config,
-                rooms,
-                room_wakes,
-                access_wakes,
-                shutdown,
+                client: init.client,
+                owner_token: init.owner_token,
+                invalid_config: init.invalid_config,
+                rooms: init.rooms,
+                room_wakes: init.room_wakes,
+                access_wakes: init.access_wakes,
+                trigger_tx: init.trigger_tx,
+                shutdown: init.shutdown,
                 slots: Mutex::new(HashMap::new()),
+                recovery: Mutex::new(None),
                 shutting_down: AtomicBool::new(false),
                 next_generation: AtomicU64::new(1),
-                scan_interval,
+                scan_interval: init.scan_interval,
             }),
         }
     }
@@ -394,6 +575,44 @@ impl FederationSupervisor {
         if self.inner.invalid_config {
             tracing::warn!("federation client configuration is invalid; rooms set Recovering");
         }
+        let pending =
+            with_rooms_handle(&self.inner.rooms, |store| store.list_pending_redemptions());
+        if let Ok(pending) = pending {
+            let supervisor = self.clone();
+            let recovery = tokio::spawn(async move {
+                let semaphore = Arc::new(tokio::sync::Semaphore::new(RECOVERY_CONCURRENCY));
+                let mut joins = tokio::task::JoinSet::new();
+                for row in pending {
+                    let Ok(permit) = semaphore.clone().acquire_owned().await else {
+                        break;
+                    };
+                    if supervisor.inner.shutdown.is_cancelled() {
+                        break;
+                    }
+                    let task_supervisor = supervisor.clone();
+                    joins.spawn(async move {
+                        let _permit = permit;
+                        if let Err(error) = task_supervisor.recover_pending(row).await {
+                            tracing::warn!(outcome = ?error, "pending federation redemption deferred");
+                        }
+                    });
+                }
+                while let Some(result) = joins.join_next().await {
+                    if result.is_err() {
+                        tracing::warn!(
+                            outcome = "pending_redemption_task_failed",
+                            "federation redemption recovery task ended unexpectedly"
+                        );
+                    }
+                }
+            });
+            *self.inner.recovery.lock().await = Some(recovery);
+        } else {
+            tracing::warn!(
+                outcome = "pending_redemption_enumeration_failed",
+                "federation redemption recovery deferred"
+            );
+        }
     }
 
     /// Idempotently start one room. A start arriving while stop is joining
@@ -426,6 +645,14 @@ impl FederationSupervisor {
             return;
         }
         let generation = self.inner.next_generation.fetch_add(1, Ordering::AcqRel);
+        if slot
+            .control
+            .mutate(|| slot.generation.store(generation, Ordering::Release))
+            .await
+            .is_none()
+        {
+            return;
+        }
         let cancel = self.inner.shutdown.child_token();
         let sender_notify = Arc::new(Notify::new());
         let inner = self.inner.clone();
@@ -469,6 +696,17 @@ impl FederationSupervisor {
 
     pub(super) async fn shutdown(&self) {
         self.inner.shutting_down.store(true, Ordering::Release);
+        self.inner.shutdown.cancel();
+        let recovery = { self.inner.recovery.lock().await.take() };
+        if let Some(mut recovery) = recovery {
+            if tokio::time::timeout(Duration::from_secs(20), &mut recovery)
+                .await
+                .is_err()
+            {
+                recovery.abort();
+                let _ = recovery.await;
+            }
+        }
         let slots: Vec<_> = self.inner.slots.lock().await.values().cloned().collect();
         let mut joins = Vec::new();
         // Cancel every room first so bounded network operations unwind in
@@ -489,9 +727,709 @@ impl FederationSupervisor {
         }
     }
 
+    async fn send_unadmitted(
+        &self,
+        request: reqwest::RequestBuilder,
+    ) -> Result<reqwest::Response, IntentError> {
+        if self.inner.shutting_down.load(Ordering::Acquire) || self.inner.shutdown.is_cancelled() {
+            return Err(IntentError::Unavailable);
+        }
+        tokio::select! {
+            biased;
+            _ = self.inner.shutdown.cancelled() => Err(IntentError::Unavailable),
+            response = request.send() => response.map_err(|_| IntentError::Unavailable),
+        }
+    }
+
+    async fn slot_for(&self, key: &RoomKey) -> Arc<RoomSlot> {
+        self.inner
+            .slots
+            .lock()
+            .await
+            .entry(key.clone())
+            .or_insert_with(|| Arc::new(RoomSlot::default()))
+            .clone()
+    }
+
+    pub(super) async fn enqueue_federated_message(
+        &self,
+        key: &RoomKey,
+        author_member_id: Option<&str>,
+        body: &str,
+    ) -> Result<RoomAccessProjection, IntentError> {
+        let slot = self.slot_for(key).await;
+        let result = slot
+            .control
+            .mutate(|| {
+                with_rooms_handle(&self.inner.rooms, |store| {
+                    if store.get(key)?.is_none() {
+                        return Err(ocean_store::RoomStoreError::UnknownRoom(key.clone()));
+                    }
+                    let credential = store.room_credential(key)?.ok_or_else(|| {
+                        ocean_store::RoomStoreError::RoomNotFederated(key.clone())
+                    })?;
+                    let access = store.room_access(key)?;
+                    if access.state == RoomAccessState::Revoked {
+                        return Err(ocean_store::RoomStoreError::FederationCorruption(
+                            REVOKED_STORE_SENTINEL.into(),
+                        ));
+                    }
+                    let author = author_member_id.unwrap_or(&credential.local_human_member_id);
+                    let member_ids: HashSet<_> = access
+                        .members
+                        .iter()
+                        .map(|member| member.member_id.as_str())
+                        .collect();
+                    let mentions = crate::persistent_rooms::parse_mentions(body)
+                        .into_iter()
+                        .filter(|id| member_ids.contains(id.as_str()))
+                        .collect();
+                    let client_event_id = uuid::Uuid::new_v4().to_string();
+                    store.allocate_outbox_pending(
+                        key,
+                        author,
+                        &client_event_id,
+                        "message",
+                        serde_json::json!({"body": body}),
+                        mentions,
+                    )?;
+                    store.room_access(key)
+                })
+            })
+            .await
+            .ok_or(IntentError::Forbidden)?;
+        let projection = result.map_err(|error| match error {
+            ocean_store::RoomStoreError::UnknownRoom(_) => IntentError::NotFound,
+            ocean_store::RoomStoreError::RoomNotFederated(_) => IntentError::Conflict,
+            ocean_store::RoomStoreError::FederationCorruption(ref message)
+                if message == REVOKED_STORE_SENTINEL =>
+            {
+                IntentError::Forbidden
+            }
+            _ => IntentError::Store,
+        })?;
+        publish_room_access_wake_on(&self.inner.access_wakes, key);
+        self.wake_sender(key).await;
+        Ok(projection)
+    }
+
+    pub(super) async fn create_invite(
+        &self,
+        key: &RoomKey,
+        recipient_name: Option<String>,
+        ttl_minutes: u32,
+    ) -> Result<InviteResponse, IntentError> {
+        let open = with_rooms_handle(&self.inner.rooms, |store| {
+            store.get(key).map(|record| record.is_some())
+        })
+        .map_err(|_| IntentError::Store)?;
+        if !open {
+            return Err(IntentError::NotFound);
+        }
+        let slot = self.slot_for(key).await;
+        let _credential_guard = slot.credential_lock.lock().await;
+        let (room, access, existing) = with_rooms_handle(&self.inner.rooms, |store| {
+            let room = store
+                .get(key)?
+                .ok_or_else(|| ocean_store::RoomStoreError::UnknownRoom(key.clone()))?;
+            let access = store.room_access(key)?;
+            let credential = store.room_credential(key)?;
+            Ok::<_, ocean_store::RoomStoreError>((room.room, access, credential))
+        })
+        .map_err(|error| match error {
+            ocean_store::RoomStoreError::UnknownRoom(_) => IntentError::NotFound,
+            _ => IntentError::Store,
+        })?;
+        if access.state == RoomAccessState::Revoked {
+            return Err(IntentError::Forbidden);
+        }
+        if existing.is_none() {
+            if access.state != RoomAccessState::Local {
+                return Err(IntentError::Conflict);
+            }
+            if !canonical_room_key(key.as_str()) {
+                return Err(IntentError::Invalid);
+            }
+        }
+        let client = self.inner.client.clone().ok_or(IntentError::Unavailable)?;
+        let credential = if let Some(credential) = existing {
+            credential
+        } else {
+            let owner_token = self
+                .inner
+                .owner_token
+                .clone()
+                .ok_or(IntentError::Unavailable)?;
+            let url = client
+                .room_endpoint(key, "register")
+                .map_err(|_| IntentError::Unavailable)?;
+            let response = self
+                .send_unadmitted(
+                    client
+                        .http
+                        .post(url)
+                        .timeout(REQUEST_TIMEOUT)
+                        .bearer_auth(&owner_token)
+                        .json(&serde_json::json!({"title": room.name})),
+                )
+                .await?;
+            match response.status() {
+                StatusCode::OK | StatusCode::CREATED => {}
+                StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN => {
+                    return Err(IntentError::Forbidden)
+                }
+                StatusCode::CONFLICT => return Err(IntentError::Conflict),
+                s if s == StatusCode::TOO_MANY_REQUESTS || s.is_server_error() => {
+                    return Err(IntentError::Unavailable)
+                }
+                _ => return Err(IntentError::Protocol),
+            }
+            let envelope: RegisterEnvelope = read_bounded_json(response, BODY_LIMIT)
+                .await
+                .map_err(control_body_error)?;
+            if envelope.room_id != key.as_str()
+                || !valid_human_member(&envelope.owner, FederatedRoomRole::Owner)
+            {
+                return Err(IntentError::Protocol);
+            }
+            let credential = RoomCredential {
+                room_id: key.clone(),
+                bearer_token: owner_token,
+                local_human_member_id: envelope.owner.member_id,
+            };
+            with_rooms_handle(&self.inner.rooms, |store| {
+                if store.get(key)?.is_none() {
+                    return Err(ocean_store::RoomStoreError::UnknownRoom(key.clone()));
+                }
+                match store.room_credential(key)? {
+                    None => store.install_room_credential(
+                        key,
+                        &credential.bearer_token,
+                        &credential.local_human_member_id,
+                    )?,
+                    Some(current)
+                        if current.bearer_token == credential.bearer_token
+                            && current.local_human_member_id
+                                == credential.local_human_member_id => {}
+                    Some(_) => {
+                        return Err(ocean_store::RoomStoreError::FederationCorruption(
+                            "credential conflict".into(),
+                        ))
+                    }
+                }
+                store.update_room_access_safe(
+                    key,
+                    Some(RoomAccessState::Connecting),
+                    None,
+                    None,
+                )?;
+                Ok::<_, ocean_store::RoomStoreError>(())
+            })
+            .map_err(|error| match error {
+                ocean_store::RoomStoreError::UnknownRoom(_) => IntentError::NotFound,
+                ocean_store::RoomStoreError::FederationCorruption(_) => IntentError::Conflict,
+                _ => IntentError::Store,
+            })?;
+            publish_room_access_wake_on(&self.inner.access_wakes, key);
+            self.start_room(key.clone()).await;
+            credential
+        };
+        let generation = slot.generation.load(Ordering::Acquire);
+        let url = client
+            .endpoint(&["api", "v1", "invites"])
+            .map_err(|_| IntentError::Unavailable)?;
+        let mut body = serde_json::json!({"room_id": key.as_str(), "ttl_minutes": ttl_minutes});
+        if let Some(name) = recipient_name {
+            body["recipient_name"] = Value::String(name);
+        }
+        let response = match slot
+            .control
+            .send(
+                client
+                    .http
+                    .post(url)
+                    .timeout(REQUEST_TIMEOUT)
+                    .bearer_auth(&credential.bearer_token)
+                    .json(&body),
+                &self.inner.shutdown,
+            )
+            .await
+        {
+            AdmittedSend::Response(Ok(response)) => response,
+            AdmittedSend::Response(Err(_)) | AdmittedSend::Cancelled => {
+                return Err(IntentError::Unavailable)
+            }
+            AdmittedSend::Closed => return Err(IntentError::Forbidden),
+        };
+        match response.status() {
+            StatusCode::CREATED => {}
+            StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN => {
+                self.revoke_control(key).await;
+                return Err(IntentError::Forbidden);
+            }
+            StatusCode::CONFLICT => return Err(IntentError::Conflict),
+            s if s == StatusCode::TOO_MANY_REQUESTS || s.is_server_error() => {
+                return Err(IntentError::Unavailable)
+            }
+            _ => return Err(IntentError::Protocol),
+        }
+        let envelope: InviteEnvelope = read_bounded_json(response, BODY_LIMIT)
+            .await
+            .map_err(control_body_error)?;
+        if slot
+            .control
+            .mutate(|| slot.generation.load(Ordering::Acquire) == generation)
+            .await
+            != Some(true)
+        {
+            return Err(IntentError::Forbidden);
+        }
+        if envelope.code.is_empty()
+            || envelope.invite.role != "contributor"
+            || envelope.invite.scopes != vec![format!("/rooms/{}", key.as_str())]
+            || envelope.invite.expires_at.is_empty()
+        {
+            return Err(IntentError::Protocol);
+        }
+        Ok(InviteResponse {
+            code: envelope.code,
+            expires_at: envelope.invite.expires_at,
+            room_key: key.as_str().into(),
+            room_name: room.name,
+        })
+    }
+
+    pub(super) async fn redeem_invite(
+        &self,
+        code: &str,
+    ) -> Result<RoomAccessProjection, IntentError> {
+        let code = code.trim();
+        if code.is_empty() {
+            return Err(IntentError::Invalid);
+        }
+        let mut bytes = [0u8; 32];
+        getrandom::fill(&mut bytes).map_err(|_| IntentError::Store)?;
+        use base64::Engine as _;
+        let bearer = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes);
+        let redemption_id = uuid::Uuid::new_v4().to_string();
+        let (pending, _) = with_rooms_handle(&self.inner.rooms, |store| {
+            store.get_or_insert_pending_redemption(
+                code,
+                &redemption_id,
+                &bearer,
+                chrono::Utc::now(),
+            )
+        })
+        .map_err(|_| IntentError::Store)?;
+        self.recover_pending(pending).await
+    }
+
+    async fn recover_pending(
+        &self,
+        pending: PendingRedemption,
+    ) -> Result<RoomAccessProjection, IntentError> {
+        let client = self.inner.client.clone().ok_or(IntentError::Unavailable)?;
+        let url = client
+            .endpoint(&["api", "v1", "invites", "redeem"])
+            .map_err(|_| IntentError::Unavailable)?;
+        let response = self
+            .send_unadmitted(client.http.post(url).timeout(REQUEST_TIMEOUT).json(
+                &serde_json::json!({
+                    "code": pending.invite_code,
+                    "redemption_id": pending.redemption_id,
+                    "token": pending.bearer_token
+                }),
+            ))
+            .await?;
+        match response.status() {
+            StatusCode::OK | StatusCode::CREATED => {}
+            StatusCode::FORBIDDEN => {
+                self.remove_pending(&pending)?;
+                return Err(IntentError::InviteForbidden);
+            }
+            StatusCode::CONFLICT => return Err(IntentError::Conflict),
+            s if s == StatusCode::TOO_MANY_REQUESTS || s.is_server_error() => {
+                return Err(IntentError::Unavailable)
+            }
+            _ => return Err(IntentError::Protocol),
+        }
+        let envelope: RedeemEnvelope = read_bounded_json(response, BODY_LIMIT)
+            .await
+            .map_err(control_body_error)?;
+        if envelope.token_present
+            || envelope.record.role != "contributor"
+            || envelope.invite.role != "contributor"
+            || envelope.record.scopes.len() != 1
+            || envelope.invite.scopes != envelope.record.scopes
+        {
+            return Err(IntentError::Protocol);
+        }
+        let scope = &envelope.record.scopes[0];
+        let room_id = scope
+            .strip_prefix("/rooms/")
+            .filter(|id| canonical_room_key(id))
+            .ok_or(IntentError::Protocol)?;
+        let key = RoomKey::new(room_id);
+        let url = client
+            .endpoint(&["api", "v1", "rooms", key.as_str(), "members", "self"])
+            .map_err(|_| IntentError::Unavailable)?;
+        let response = self
+            .send_unadmitted(
+                client
+                    .http
+                    .post(url)
+                    .timeout(REQUEST_TIMEOUT)
+                    .bearer_auth(&pending.bearer_token),
+            )
+            .await?;
+        match response.status() {
+            StatusCode::OK | StatusCode::CREATED => {}
+            StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN => {
+                self.remove_pending(&pending)?;
+                return Err(IntentError::InviteForbidden);
+            }
+            StatusCode::CONFLICT => return Err(IntentError::Conflict),
+            s if s == StatusCode::TOO_MANY_REQUESTS || s.is_server_error() => {
+                return Err(IntentError::Unavailable)
+            }
+            _ => return Err(IntentError::Protocol),
+        }
+        let joined: SelfJoinEnvelope = read_bounded_json(response, BODY_LIMIT)
+            .await
+            .map_err(control_body_error)?;
+        if !valid_human_member(&joined.member, FederatedRoomRole::Member) {
+            return Err(IntentError::Protocol);
+        }
+        let slot = self.slot_for(&key).await;
+        let _guard = slot.credential_lock.lock().await;
+        with_rooms_handle(&self.inner.rooms, |store| {
+            match (store.get(&key)?, store.get_including_closed(&key)?) {
+                (None, Some(_)) => {
+                    return Err(ocean_store::RoomStoreError::AlreadyExists(key.clone()))
+                }
+                (None, None) => {
+                    store.create(key.clone(), key.as_str(), None, chrono::Utc::now())?;
+                }
+                (Some(_), _) => {}
+            }
+            if store.room_access(&key)?.state == RoomAccessState::Revoked {
+                return Err(ocean_store::RoomStoreError::FederationCorruption(
+                    REVOKED_STORE_SENTINEL.into(),
+                ));
+            }
+            if let Some(current) = store.room_credential(&key)? {
+                if current.bearer_token != pending.bearer_token
+                    || current.local_human_member_id != joined.member.member_id
+                {
+                    return Err(ocean_store::RoomStoreError::FederationCorruption(
+                        "credential conflict".into(),
+                    ));
+                }
+            }
+            store.promote_pending_redemption(
+                &pending.redemption_id,
+                &key,
+                &pending.bearer_token,
+                &joined.member.member_id,
+            )?;
+            store.update_room_access_safe(&key, Some(RoomAccessState::Connecting), None, None)
+        })
+        .map_err(|error| match error {
+            ocean_store::RoomStoreError::FederationCorruption(ref message)
+                if message == REVOKED_STORE_SENTINEL =>
+            {
+                IntentError::Forbidden
+            }
+            ocean_store::RoomStoreError::AlreadyExists(_)
+            | ocean_store::RoomStoreError::FederationCorruption(_) => IntentError::Conflict,
+            _ => IntentError::Store,
+        })?;
+        publish_room_access_wake_on(&self.inner.access_wakes, &key);
+        self.start_room(key.clone()).await;
+        with_rooms_handle(&self.inner.rooms, |store| store.room_access(&key))
+            .map_err(|_| IntentError::Store)
+    }
+
+    fn remove_pending(&self, pending: &PendingRedemption) -> Result<(), IntentError> {
+        with_rooms_handle(&self.inner.rooms, |store| {
+            store.remove_pending_redemption(&pending.redemption_id)
+        })
+        .map(|_| ())
+        .map_err(|_| IntentError::Store)
+    }
+
+    pub(super) async fn register_agents(
+        &self,
+        key: &RoomKey,
+        agents: Vec<AgentRegistrationInput>,
+    ) -> Result<RoomAccessProjection, IntentError> {
+        let slot = self.slot_for(key).await;
+        let (credential, access) = with_rooms_handle(&self.inner.rooms, |store| {
+            if store.get(key)?.is_none() {
+                return Err(ocean_store::RoomStoreError::UnknownRoom(key.clone()));
+            }
+            Ok::<_, ocean_store::RoomStoreError>((
+                store.room_credential(key)?,
+                store.room_access(key)?,
+            ))
+        })
+        .map_err(|error| match error {
+            ocean_store::RoomStoreError::UnknownRoom(_) => IntentError::NotFound,
+            _ => IntentError::Store,
+        })?;
+        let credential = credential.ok_or(IntentError::Conflict)?;
+        if access.state == RoomAccessState::Revoked {
+            return Err(IntentError::Forbidden);
+        }
+        let client = self.inner.client.clone().ok_or(IntentError::Unavailable)?;
+        let request = AgentRegistrationBatch {
+            agents: agents
+                .iter()
+                .map(|agent| AgentRegistrationWire {
+                    registration_key: &agent.registration_key,
+                    display_name: &agent.descriptor.display_name,
+                    description: agent.descriptor.description.as_deref(),
+                    model_alias: agent.descriptor.model_alias.as_deref(),
+                    skills_count: agent.descriptor.skills_count,
+                    subagent_names: &agent.descriptor.subagent_names,
+                })
+                .collect(),
+        };
+        let url = client
+            .endpoint(&["api", "v1", "rooms", key.as_str(), "members", "agents"])
+            .map_err(|_| IntentError::Unavailable)?;
+        let generation = slot.generation.load(Ordering::Acquire);
+        let response = match slot
+            .control
+            .send(
+                client
+                    .http
+                    .post(url)
+                    .timeout(REQUEST_TIMEOUT)
+                    .bearer_auth(&credential.bearer_token)
+                    .json(&request),
+                &self.inner.shutdown,
+            )
+            .await
+        {
+            AdmittedSend::Response(Ok(response)) => response,
+            AdmittedSend::Response(Err(_)) | AdmittedSend::Cancelled => {
+                return Err(IntentError::Unavailable)
+            }
+            AdmittedSend::Closed => return Err(IntentError::Forbidden),
+        };
+        match response.status() {
+            StatusCode::OK | StatusCode::CREATED => {}
+            StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN => {
+                self.revoke_control(key).await;
+                return Err(IntentError::Forbidden);
+            }
+            StatusCode::CONFLICT => return Err(IntentError::Conflict),
+            s if s == StatusCode::TOO_MANY_REQUESTS || s.is_server_error() => {
+                return Err(IntentError::Unavailable)
+            }
+            _ => return Err(IntentError::Protocol),
+        }
+        let envelope: AgentMembersEnvelope = read_bounded_json(response, BODY_LIMIT)
+            .await
+            .map_err(control_body_error)?;
+        if envelope.members.len() != agents.len() {
+            return Err(IntentError::Protocol);
+        }
+        let mut ids = HashSet::new();
+        for (member, agent) in envelope.members.iter().zip(&agents) {
+            if !valid_agent_member(member, &credential.local_human_member_id, &agent.agent_name)
+                || !ids.insert(member.member_id.clone())
+            {
+                return Err(IntentError::Protocol);
+            }
+        }
+        let binding_result = slot
+            .control
+            .mutate(|| {
+                if slot.generation.load(Ordering::Acquire) != generation {
+                    return Err(GuardedMutationError::Generation);
+                }
+                let result = with_rooms_handle(&self.inner.rooms, |store| {
+                    if store.get(key)?.is_none() {
+                        return Err(ocean_store::RoomStoreError::UnknownRoom(key.clone()));
+                    }
+                    for (member, agent) in envelope.members.iter().zip(&agents) {
+                        store.bind_room_agent(
+                            key,
+                            &member.member_id,
+                            &agent.agent_name,
+                            &agent.registration_key,
+                        )?;
+                    }
+                    Ok::<_, ocean_store::RoomStoreError>(())
+                });
+                match result {
+                    Ok(()) => Ok(()),
+                    Err(ocean_store::RoomStoreError::UnknownRoom(_)) => {
+                        Err(GuardedMutationError::NotFound)
+                    }
+                    Err(_) => Err(GuardedMutationError::Store),
+                }
+            })
+            .await
+            .ok_or(IntentError::Forbidden)?;
+        match binding_result {
+            Ok(()) => {}
+            Err(GuardedMutationError::Generation) => return Err(IntentError::Forbidden),
+            Err(GuardedMutationError::NotFound) => return Err(IntentError::NotFound),
+            Err(GuardedMutationError::Store) => return Err(IntentError::Store),
+        }
+        let members = self
+            .fetch_roster_control(&slot, &client, &credential, generation)
+            .await?;
+        let projection = slot
+            .control
+            .mutate(|| {
+                if slot.generation.load(Ordering::Acquire) != generation {
+                    return Err(GuardedMutationError::Generation);
+                }
+                let result = with_rooms_handle(&self.inner.rooms, |store| {
+                    if store.get(key)?.is_none() {
+                        return Err(ocean_store::RoomStoreError::UnknownRoom(key.clone()));
+                    }
+                    store.update_room_access_safe(key, None, Some(&members), None)
+                });
+                match result {
+                    Ok(projection) => Ok(projection),
+                    Err(ocean_store::RoomStoreError::UnknownRoom(_)) => {
+                        Err(GuardedMutationError::NotFound)
+                    }
+                    Err(_) => Err(GuardedMutationError::Store),
+                }
+            })
+            .await
+            .ok_or(IntentError::Forbidden)?
+            .map_err(|error| match error {
+                GuardedMutationError::Generation => IntentError::Forbidden,
+                GuardedMutationError::NotFound => IntentError::NotFound,
+                GuardedMutationError::Store => IntentError::Store,
+            })?;
+        publish_room_access_wake_on(&self.inner.access_wakes, key);
+        Ok(projection)
+    }
+
+    async fn fetch_roster_control(
+        &self,
+        slot: &Arc<RoomSlot>,
+        client: &FederationClient,
+        credential: &RoomCredential,
+        generation: u64,
+    ) -> Result<Vec<FederatedRoomMemberProjection>, IntentError> {
+        let url = client
+            .room_endpoint(&credential.room_id, "members")
+            .map_err(|_| IntentError::Unavailable)?;
+        let response = match slot
+            .control
+            .send(
+                client
+                    .http
+                    .get(url)
+                    .timeout(REQUEST_TIMEOUT)
+                    .bearer_auth(&credential.bearer_token),
+                &self.inner.shutdown,
+            )
+            .await
+        {
+            AdmittedSend::Response(Ok(response)) => response,
+            AdmittedSend::Response(Err(_)) | AdmittedSend::Cancelled => {
+                return Err(IntentError::Unavailable)
+            }
+            AdmittedSend::Closed => return Err(IntentError::Forbidden),
+        };
+        match response.status() {
+            StatusCode::OK => {}
+            StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN => {
+                self.revoke_control(&credential.room_id).await;
+                return Err(IntentError::Forbidden);
+            }
+            s if s == StatusCode::TOO_MANY_REQUESTS || s.is_server_error() => {
+                return Err(IntentError::Unavailable)
+            }
+            _ => return Err(IntentError::Protocol),
+        }
+        let envelope: MembersEnvelope = read_bounded_json(response, BODY_LIMIT)
+            .await
+            .map_err(control_body_error)?;
+        if slot
+            .control
+            .mutate(|| slot.generation.load(Ordering::Acquire) == generation)
+            .await
+            != Some(true)
+        {
+            return Err(IntentError::Forbidden);
+        }
+        let members = project_roster(&self.inner, credential, envelope, true).map_err(|error| {
+            if error == BridgeError::Store {
+                IntentError::Store
+            } else {
+                IntentError::Protocol
+            }
+        })?;
+        if slot
+            .control
+            .mutate(|| slot.generation.load(Ordering::Acquire) == generation)
+            .await
+            != Some(true)
+        {
+            return Err(IntentError::Forbidden);
+        }
+        Ok(members)
+    }
+
+    async fn revoke_control(&self, key: &RoomKey) {
+        let slot = self.slot_for(key).await;
+        slot.control.close().await;
+        self.stop_room(key).await;
+        revoke_room(&self.inner, key).await;
+    }
+
     fn persist_lease_lost(&self, key: &RoomKey, state: RoomAccessState) -> Result<(), BridgeError> {
         persist_lease_lost(&self.inner, key, state)
     }
+}
+
+fn control_body_error(error: BridgeError) -> IntentError {
+    match error {
+        BridgeError::Transport => IntentError::Unavailable,
+        _ => IntentError::Protocol,
+    }
+}
+
+fn canonical_room_key(value: &str) -> bool {
+    let bytes = value.as_bytes();
+    !bytes.is_empty()
+        && bytes.len() <= 128
+        && (bytes[0].is_ascii_lowercase() || bytes[0].is_ascii_digit())
+        && bytes.iter().all(|byte| {
+            byte.is_ascii_lowercase() || byte.is_ascii_digit() || matches!(byte, b'.' | b'_' | b'-')
+        })
+}
+
+fn valid_human_member(member: &ControlEnvelopeMember, role: FederatedRoomRole) -> bool {
+    member.actor_type == FederatedActorType::User
+        && member.role_in_room == role
+        && !member.member_id.is_empty()
+        && !member.display_name.is_empty()
+        && member.owner_member_id.is_none()
+        && member.public_agent_descriptor.is_none()
+}
+
+fn valid_agent_member(member: &ControlEnvelopeMember, owner: &str, name: &str) -> bool {
+    member.actor_type == FederatedActorType::Agent
+        && member.role_in_room == FederatedRoomRole::Member
+        && !member.member_id.is_empty()
+        && member.display_name == name
+        && member.owner_member_id.as_deref() == Some(owner)
+        && member
+            .public_agent_descriptor
+            .as_ref()
+            .is_some_and(|descriptor| descriptor.display_name == name)
 }
 
 async fn run_room(
@@ -533,6 +1471,12 @@ async fn run_room(
         match outcome {
             EpochOutcome::Stopped => return,
             EpochOutcome::Revoked => {
+                // Wire revocation closes the P2-C producer/control gate before
+                // Pending cleanup, matching route-observed denial ordering.
+                let slot = inner.slots.lock().await.get(&key).cloned();
+                if let Some(slot) = slot {
+                    slot.control.close().await;
+                }
                 revoke_room(&inner, &key).await;
                 return;
             }
@@ -1101,6 +2045,15 @@ async fn fetch_roster(
     let envelope: MembersEnvelope = read_bounded_json(response, BODY_LIMIT)
         .await
         .map_err(|_| EpochOutcome::Recover)?;
+    project_roster(inner, credential, envelope, lease_healthy).map_err(|_| EpochOutcome::Recover)
+}
+
+fn project_roster(
+    inner: &Arc<SupervisorInner>,
+    credential: &RoomCredential,
+    envelope: MembersEnvelope,
+    lease_healthy: bool,
+) -> Result<Vec<FederatedRoomMemberProjection>, BridgeError> {
     let mut members = Vec::with_capacity(envelope.members.len());
     let mut member_ids = HashSet::with_capacity(envelope.members.len());
     for member in envelope.members {
@@ -1109,13 +2062,13 @@ async fn fetch_roster(
             || member.joined_at.is_empty()
             || !member_ids.insert(member.member_id.clone())
         {
-            return Err(EpochOutcome::Recover);
+            return Err(BridgeError::Protocol);
         }
         let binding = if member.actor_type == FederatedActorType::Agent {
             with_rooms_handle(&inner.rooms, |store| {
                 store.resolve_room_agent(&credential.room_id, &member.member_id)
             })
-            .map_err(|_| EpochOutcome::Recover)?
+            .map_err(|_| BridgeError::Store)?
             .is_some()
         } else {
             false
@@ -1180,9 +2133,9 @@ async fn ingest_message_row(
     {
         return Err(BridgeError::Protocol);
     }
-    let (author_kind, refreshed_roster) =
-        match author_kind(inner, &credential.room_id, &payload.author_member_id) {
-            Some(kind) => (kind, None),
+    let (author_kind, trigger_eligible, refreshed_roster) =
+        match author_kind(inner, &credential.room_id, &payload.author_member_id)? {
+            Some(kind) => (kind, kind == RoomParticipantKind::Human, None),
             None => {
                 // One immediate current-epoch roster fetch, then conservative
                 // Human. Do NOT commit/wake yet: Duplicate must remain a total
@@ -1195,11 +2148,37 @@ async fn ingest_message_row(
                         EpochOutcome::Revoked => BridgeError::Revoked,
                         _ => BridgeError::Protocol,
                     })?;
-                let kind = author_kind_from_members(&members, &payload.author_member_id)
-                    .unwrap_or(RoomParticipantKind::Human);
-                (kind, Some((current_state, members)))
+                let mapped = author_kind_from_members(&members, &payload.author_member_id);
+                let kind = mapped.unwrap_or(RoomParticipantKind::Human);
+                (
+                    kind,
+                    mapped == Some(RoomParticipantKind::Human),
+                    Some((current_state, members)),
+                )
             }
         };
+    let trigger_targets = if trigger_eligible {
+        let policy = with_rooms_handle(&inner.rooms, |store| {
+            store.trigger_policy(&credential.room_id)
+        })
+        .map_err(|_| BridgeError::Store)?;
+        payload
+            .mention_member_ids
+            .iter()
+            .filter(|target| {
+                evaluate_trigger_policy(
+                    policy.as_ref(),
+                    &RoomTriggerEvent::Mention {
+                        participant_id: (*target).clone(),
+                    },
+                )
+                .should_convene
+            })
+            .cloned()
+            .collect()
+    } else {
+        Vec::new()
+    };
     let event = ConfirmedEvent {
         ledger_event_id: row.id,
         global_sequence: sequence,
@@ -1212,7 +2191,7 @@ async fn ingest_message_row(
         author_kind,
         kind: RoomMessageKind::Message,
         body: payload.body,
-        trigger_targets: payload.mention_member_ids,
+        trigger_targets,
     };
     let outcome = with_rooms_handle(&inner.rooms, |store| {
         store.ingest_confirmed_event(&credential.room_id, &event, chrono::Utc::now())
@@ -1245,9 +2224,20 @@ async fn ingest_message_row(
             }
             publish_room_wake_on(&inner.room_wakes, &credential.room_id, &commit.message);
             publish_room_access_wake_on(&inner.access_wakes, &credential.room_id);
-            // P2-B-era trigger claims are VOID BY DESIGN. P2-C owns dispatch
-            // from its own boot forward and never backfills these claims.
-            let _ = commit.claimed_trigger_targets;
+            for target_member_id in commit.claimed_trigger_targets {
+                if inner
+                    .trigger_tx
+                    .send(FederatedTriggerDispatch {
+                        room: credential.room_id.clone(),
+                        ledger_event_id: event.ledger_event_id.clone(),
+                        local_seq: commit.message.seq,
+                        target_member_id,
+                    })
+                    .is_err()
+                {
+                    tracing::warn!(room = %credential.room_id, outcome = "dispatch_receiver_closed", "federated trigger suppressed");
+                }
+            }
             Ok(IngestDisposition::Committed)
         }
     }
@@ -1276,9 +2266,10 @@ fn author_kind(
     inner: &Arc<SupervisorInner>,
     key: &RoomKey,
     member_id: &str,
-) -> Option<RoomParticipantKind> {
-    let projection = with_rooms_handle(&inner.rooms, |store| store.room_access(key)).ok()?;
-    author_kind_from_members(&projection.members, member_id)
+) -> Result<Option<RoomParticipantKind>, BridgeError> {
+    let projection = with_rooms_handle(&inner.rooms, |store| store.room_access(key))
+        .map_err(|_| BridgeError::Store)?;
+    Ok(author_kind_from_members(&projection.members, member_id))
 }
 
 fn author_kind_from_members(
@@ -1476,10 +2467,14 @@ mod tests {
     use super::*;
     use std::{
         convert::Infallible,
-        sync::{atomic::AtomicU16, Mutex as StdMutex},
+        sync::{
+            atomic::{AtomicU16, AtomicUsize},
+            Mutex as StdMutex,
+        },
     };
 
     use axum::{
+        body::Bytes,
         extract::{Path, State},
         http::{HeaderMap, Uri},
         response::{sse::Event, IntoResponse, Sse},
@@ -1491,6 +2486,49 @@ mod tests {
     use tokio_stream::wrappers::ReceiverStream;
 
     static ENV_LOCK: StdMutex<()> = StdMutex::new(());
+
+    #[test]
+    fn p2c_room_keys_and_control_member_invariants_are_strict() {
+        assert!(canonical_room_key("room-a_1.test"));
+        for bad in ["", "Room", "-room", "room/path", "room%2fchild"] {
+            assert!(!canonical_room_key(bad), "accepted {bad}");
+        }
+        let human = ControlEnvelopeMember {
+            member_id: "11111111-1111-4111-8111-111111111111".into(),
+            owner_member_id: None,
+            actor_type: FederatedActorType::User,
+            role_in_room: FederatedRoomRole::Member,
+            display_name: "Human".into(),
+            public_agent_descriptor: None,
+        };
+        assert!(valid_human_member(&human, FederatedRoomRole::Member));
+        assert!(!valid_human_member(&human, FederatedRoomRole::Owner));
+        let clean: RedeemEnvelope = serde_json::from_value(json!({
+            "invite":{"role":"contributor","scopes":["/rooms/room"],"expiresAt":"later"},
+            "record":{"role":"contributor","scopes":["/rooms/room"]}
+        }))
+        .unwrap();
+        assert!(!clean.token_present);
+        let leaked: RedeemEnvelope = serde_json::from_value(json!({
+            "invite":{"role":"contributor","scopes":["/rooms/room"],"expiresAt":"later"},
+            "record":{"role":"contributor","scopes":["/rooms/room"]},
+            "token":null
+        }))
+        .unwrap();
+        assert!(leaked.token_present, "even a null token field is forbidden");
+    }
+
+    #[test]
+    fn p2c_control_body_transport_is_unavailable_not_protocol() {
+        assert_eq!(
+            control_body_error(BridgeError::Transport),
+            IntentError::Unavailable
+        );
+        assert_eq!(
+            control_body_error(BridgeError::Protocol),
+            IntentError::Protocol
+        );
+    }
 
     #[test]
     fn canonical_u64_is_lossless_and_strict() {
@@ -1934,6 +2972,1774 @@ mod tests {
         (format!("http://{addr}"), task)
     }
 
+    #[derive(Clone)]
+    struct ControlCall {
+        path: String,
+        authorization: Option<String>,
+        content_type: Option<String>,
+        body: Vec<u8>,
+    }
+
+    #[derive(Clone)]
+    struct ControlBedrock {
+        room: Arc<String>,
+        calls: Arc<Mutex<Vec<ControlCall>>>,
+        register_status: Arc<AtomicU16>,
+        invite_status: Arc<AtomicU16>,
+        redeem_status: Arc<AtomicU16>,
+        self_status: Arc<AtomicU16>,
+        agents_status: Arc<AtomicU16>,
+        redeem_active: Arc<AtomicUsize>,
+        redeem_peak: Arc<AtomicUsize>,
+        hold_redeem: Arc<AtomicBool>,
+        release_redeem: Arc<tokio::sync::Semaphore>,
+        hold_invite: Arc<AtomicBool>,
+        release_invite: Arc<tokio::sync::Semaphore>,
+        hold_agents: Arc<AtomicBool>,
+        release_agents: Arc<tokio::sync::Semaphore>,
+        hold_members: Arc<AtomicBool>,
+        release_members: Arc<tokio::sync::Semaphore>,
+        roster: Arc<Mutex<Value>>,
+    }
+
+    impl ControlBedrock {
+        fn new(room: &str) -> Self {
+            Self {
+                room: Arc::new(room.to_string()),
+                calls: Arc::new(Mutex::new(Vec::new())),
+                register_status: Arc::new(AtomicU16::new(201)),
+                invite_status: Arc::new(AtomicU16::new(201)),
+                redeem_status: Arc::new(AtomicU16::new(201)),
+                self_status: Arc::new(AtomicU16::new(201)),
+                agents_status: Arc::new(AtomicU16::new(201)),
+                redeem_active: Arc::new(AtomicUsize::new(0)),
+                redeem_peak: Arc::new(AtomicUsize::new(0)),
+                hold_redeem: Arc::new(AtomicBool::new(false)),
+                release_redeem: Arc::new(tokio::sync::Semaphore::new(0)),
+                hold_invite: Arc::new(AtomicBool::new(false)),
+                release_invite: Arc::new(tokio::sync::Semaphore::new(0)),
+                hold_agents: Arc::new(AtomicBool::new(false)),
+                release_agents: Arc::new(tokio::sync::Semaphore::new(0)),
+                hold_members: Arc::new(AtomicBool::new(false)),
+                release_members: Arc::new(tokio::sync::Semaphore::new(0)),
+                roster: Arc::new(Mutex::new(json!({"members":[]}))),
+            }
+        }
+
+        async fn record(&self, path: &str, headers: &HeaderMap, body: &Bytes) {
+            self.calls.lock().await.push(ControlCall {
+                path: path.to_string(),
+                authorization: bearer(headers),
+                content_type: headers
+                    .get(reqwest::header::CONTENT_TYPE)
+                    .and_then(|value| value.to_str().ok())
+                    .map(str::to_owned),
+                body: body.to_vec(),
+            });
+        }
+    }
+
+    fn control_error(status: StatusCode) -> axum::response::Response {
+        (status, Json(json!({"ok":false,"error":"control_error"}))).into_response()
+    }
+
+    async fn control_register(
+        State(state): State<ControlBedrock>,
+        Path(room): Path<String>,
+        headers: HeaderMap,
+        body: Bytes,
+    ) -> axum::response::Response {
+        state.record("register", &headers, &body).await;
+        if room != *state.room || bearer(&headers).as_deref() != Some("Bearer test-owner-token") {
+            return control_error(StatusCode::UNAUTHORIZED);
+        }
+        let status = StatusCode::from_u16(state.register_status.load(Ordering::Acquire)).unwrap();
+        if !matches!(status, StatusCode::OK | StatusCode::CREATED) {
+            return control_error(status);
+        }
+        (
+            status,
+            Json(json!({
+                "room_id":room,
+                "owner":{
+                    "member_id":"11111111-1111-4111-8111-111111111111",
+                    "actor_type":"user",
+                    "role_in_room":"owner",
+                    "display_name":"Owner"
+                }
+            })),
+        )
+            .into_response()
+    }
+
+    async fn control_invite(
+        State(state): State<ControlBedrock>,
+        headers: HeaderMap,
+        body: Bytes,
+    ) -> axum::response::Response {
+        state.record("invite", &headers, &body).await;
+        if state.hold_invite.load(Ordering::Acquire) {
+            let permit = state.release_invite.acquire().await.unwrap();
+            permit.forget();
+        }
+        if bearer(&headers).as_deref() != Some("Bearer test-owner-token") {
+            return control_error(StatusCode::UNAUTHORIZED);
+        }
+        let status = StatusCode::from_u16(state.invite_status.load(Ordering::Acquire)).unwrap();
+        if status != StatusCode::CREATED {
+            return control_error(status);
+        }
+        (
+            status,
+            Json(json!({
+                "code":"share-code",
+                "invite":{
+                    "role":"contributor",
+                    "scopes":[format!("/rooms/{}", state.room)],
+                    "expiresAt":"2026-07-18T00:00:00Z"
+                }
+            })),
+        )
+            .into_response()
+    }
+
+    async fn control_redeem(
+        State(state): State<ControlBedrock>,
+        headers: HeaderMap,
+        body: Bytes,
+    ) -> axum::response::Response {
+        state.record("redeem", &headers, &body).await;
+        let active = state.redeem_active.fetch_add(1, Ordering::AcqRel) + 1;
+        state.redeem_peak.fetch_max(active, Ordering::AcqRel);
+        if state.hold_redeem.load(Ordering::Acquire) {
+            let permit = state.release_redeem.acquire().await.unwrap();
+            permit.forget();
+        }
+        state.redeem_active.fetch_sub(1, Ordering::AcqRel);
+        let status = StatusCode::from_u16(state.redeem_status.load(Ordering::Acquire)).unwrap();
+        if !matches!(status, StatusCode::OK | StatusCode::CREATED) {
+            return control_error(status);
+        }
+        let response = json!({
+            "invite":{
+                "role":"contributor",
+                "scopes":[format!("/rooms/{}", state.room)],
+                "expiresAt":"2026-07-18T00:00:00Z"
+            },
+            "record":{
+                "role":"contributor",
+                "scopes":[format!("/rooms/{}", state.room)]
+            }
+        });
+        (status, Json(response)).into_response()
+    }
+
+    async fn control_self_join(
+        State(state): State<ControlBedrock>,
+        Path(room): Path<String>,
+        headers: HeaderMap,
+        body: Bytes,
+    ) -> axum::response::Response {
+        state.record("self", &headers, &body).await;
+        let status = StatusCode::from_u16(state.self_status.load(Ordering::Acquire)).unwrap();
+        if room != *state.room || !matches!(status, StatusCode::OK | StatusCode::CREATED) {
+            return control_error(status);
+        }
+        (
+            status,
+            Json(json!({
+                "member":{
+                    "member_id":"22222222-2222-4222-8222-222222222222",
+                    "actor_type":"user",
+                    "role_in_room":"member",
+                    "display_name":"Joined Human"
+                }
+            })),
+        )
+            .into_response()
+    }
+
+    async fn control_agents(
+        State(state): State<ControlBedrock>,
+        Path(room): Path<String>,
+        headers: HeaderMap,
+        body: Bytes,
+    ) -> axum::response::Response {
+        state.record("agents", &headers, &body).await;
+        if state.hold_agents.load(Ordering::Acquire) {
+            let permit = state.release_agents.acquire().await.unwrap();
+            permit.forget();
+        }
+        if room != *state.room {
+            return control_error(StatusCode::BAD_REQUEST);
+        }
+        let status = StatusCode::from_u16(state.agents_status.load(Ordering::Acquire)).unwrap();
+        if !matches!(status, StatusCode::OK | StatusCode::CREATED) {
+            return control_error(status);
+        }
+        let request: Value = serde_json::from_slice(&body).unwrap();
+        let requested = request["agents"].as_array().unwrap();
+        let members: Vec<Value> = requested
+            .iter()
+            .enumerate()
+            .map(|(index, agent)| {
+                json!({
+                    "member_id":format!("33333333-3333-4333-8333-{index:012}"),
+                    "owner_member_id":"22222222-2222-4222-8222-222222222222",
+                    "actor_type":"agent",
+                    "role_in_room":"member",
+                    "display_name":agent["display_name"],
+                    "public_agent_descriptor":{
+                        "display_name":agent["display_name"],
+                        "description":agent.get("description"),
+                        "model_alias":agent.get("model_alias"),
+                        "skills_count":agent["skills_count"],
+                        "subagent_names":agent["subagent_names"]
+                    },
+                    "joined_at":"2026-07-17T00:00:00Z"
+                })
+            })
+            .collect();
+        let mut roster = vec![json!({
+            "member_id":"22222222-2222-4222-8222-222222222222",
+            "actor_type":"user",
+            "role_in_room":"member",
+            "display_name":"Joined Human",
+            "joined_at":"2026-07-17T00:00:00Z"
+        })];
+        roster.extend(members.iter().cloned());
+        *state.roster.lock().await = json!({"members":roster});
+        (status, Json(json!({"members":members}))).into_response()
+    }
+
+    async fn control_members(
+        State(state): State<ControlBedrock>,
+        Path(room): Path<String>,
+        headers: HeaderMap,
+    ) -> axum::response::Response {
+        state.record("members", &headers, &Bytes::new()).await;
+        if state.hold_members.load(Ordering::Acquire) {
+            let permit = state.release_members.acquire().await.unwrap();
+            permit.forget();
+        }
+        if room != *state.room {
+            return control_error(StatusCode::BAD_REQUEST);
+        }
+        Json(state.roster.lock().await.clone()).into_response()
+    }
+
+    async fn start_control_bedrock(state: ControlBedrock) -> (String, JoinHandle<()>) {
+        let app = Router::new()
+            .route("/api/v1/rooms/{room}/register", post(control_register))
+            .route("/api/v1/invites", post(control_invite))
+            .route("/api/v1/invites/redeem", post(control_redeem))
+            .route("/api/v1/rooms/{room}/members/self", post(control_self_join))
+            .route("/api/v1/rooms/{room}/members/agents", post(control_agents))
+            .route("/api/v1/rooms/{room}/members", get(control_members))
+            .with_state(state);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let task = tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        (format!("http://{addr}"), task)
+    }
+
+    async fn wait_for_control_call(fake: &ControlBedrock, path: &str) {
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if fake.calls.lock().await.iter().any(|call| call.path == path) {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .unwrap_or_else(|_| panic!("control call {path} did not arrive"));
+    }
+
+    fn test_control_supervisor(base: &str, rooms: RoomStoreHandle) -> FederationSupervisor {
+        FederationSupervisor::for_test(
+            base,
+            rooms,
+            RoomWakeBus::default(),
+            RoomAccessWakeBus::default(),
+            CancellationToken::new(),
+            Duration::from_millis(20),
+        )
+    }
+
+    #[tokio::test]
+    async fn p2c_enqueue_is_outbox_only_filters_mentions_and_rejects_closed() {
+        let key = RoomKey::new("enqueue-room");
+        let human = "11111111-1111-4111-8111-111111111111";
+        let agent = "33333333-3333-4333-8333-333333333333";
+        let mut store = ocean_store::SqliteRoomStore::open_in_memory().unwrap();
+        store
+            .create(key.clone(), "Enqueue", None, chrono::Utc::now())
+            .unwrap();
+        store
+            .install_room_credential(&key, "enqueue-bearer", human)
+            .unwrap();
+        store
+            .update_room_access_safe(
+                &key,
+                Some(RoomAccessState::Live),
+                Some(&[
+                    FederatedRoomMemberProjection {
+                        member_id: human.into(),
+                        owner_member_id: None,
+                        actor_type: FederatedActorType::User,
+                        role_in_room: FederatedRoomRole::Owner,
+                        display_name: "Owner".into(),
+                        public_agent_descriptor: None,
+                        joined_at: "2026-07-17T00:00:00Z".into(),
+                        derived_presence: Some(MemberPresence::Live),
+                        local_binding_available: None,
+                    },
+                    FederatedRoomMemberProjection {
+                        member_id: agent.into(),
+                        owner_member_id: Some(human.into()),
+                        actor_type: FederatedActorType::Agent,
+                        role_in_room: FederatedRoomRole::Member,
+                        display_name: "Agent".into(),
+                        public_agent_descriptor: Some(PublicAgentDescriptor {
+                            display_name: "Agent".into(),
+                            description: None,
+                            model_alias: None,
+                            skills_count: 0,
+                            subagent_names: vec![],
+                        }),
+                        joined_at: "2026-07-17T00:00:00Z".into(),
+                        derived_presence: Some(MemberPresence::Live),
+                        local_binding_available: Some(true),
+                    },
+                ]),
+                None,
+            )
+            .unwrap();
+        let rooms = Arc::new(std::sync::Mutex::new(store));
+        let access_wakes = RoomAccessWakeBus::default();
+        let mut access_rx = access_wakes.subscribe();
+        let supervisor = FederationSupervisor::test_disabled(
+            rooms.clone(),
+            RoomWakeBus::default(),
+            access_wakes,
+            CancellationToken::new(),
+        );
+
+        let projection = supervisor
+            .enqueue_federated_message(&key, None, &format!("hello @{agent} @unknown @{agent}"))
+            .await
+            .unwrap();
+        assert_eq!(projection.outbox.len(), 1);
+        assert_eq!(projection.outbox[0].author_member_id, human);
+        assert_eq!(projection.outbox[0].mention_member_ids, vec![agent]);
+        assert_eq!(
+            projection.outbox[0].payload,
+            json!({"body":format!("hello @{agent} @unknown @{agent}")})
+        );
+        assert!(with_rooms_handle(&rooms, |s| s.transcript(&key, None))
+            .unwrap()
+            .is_empty());
+        access_rx.recv().await.unwrap();
+
+        with_rooms_handle(&rooms, |s| s.close(&key)).unwrap();
+        assert_eq!(
+            supervisor
+                .enqueue_federated_message(&key, None, "after close")
+                .await,
+            Err(IntentError::NotFound)
+        );
+        assert!(access_rx.try_recv().is_err());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn p2c_enqueue_revoke_race_leaves_no_pending_after_revoked() {
+        let key = RoomKey::new("enqueue-revoke-race");
+        let human = "11111111-1111-4111-8111-111111111111";
+        let mut store = ocean_store::SqliteRoomStore::open_in_memory().unwrap();
+        store
+            .create(key.clone(), "Enqueue Revoke", None, chrono::Utc::now())
+            .unwrap();
+        store
+            .install_room_credential(&key, "race-bearer", human)
+            .unwrap();
+        store
+            .update_room_access_safe(&key, Some(RoomAccessState::Live), None, None)
+            .unwrap();
+        let rooms = Arc::new(std::sync::Mutex::new(store));
+        let supervisor = FederationSupervisor::test_disabled(
+            rooms.clone(),
+            RoomWakeBus::default(),
+            RoomAccessWakeBus::default(),
+            CancellationToken::new(),
+        );
+        let slot = supervisor.slot_for(&key).await;
+        let barrier = Arc::new(tokio::sync::Barrier::new(3));
+
+        let enqueue = tokio::spawn({
+            let supervisor = supervisor.clone();
+            let key = key.clone();
+            let barrier = barrier.clone();
+            async move {
+                barrier.wait().await;
+                supervisor
+                    .enqueue_federated_message(&key, None, "racing intent")
+                    .await
+            }
+        });
+        let revoke = tokio::spawn({
+            let inner = supervisor.inner.clone();
+            let key = key.clone();
+            let barrier = barrier.clone();
+            async move {
+                barrier.wait().await;
+                slot.control.close().await;
+                revoke_room(&inner, &key).await;
+            }
+        });
+        barrier.wait().await;
+        let (enqueue, revoke) = tokio::join!(enqueue, revoke);
+        let enqueue = enqueue.unwrap();
+        revoke.unwrap();
+        assert!(matches!(enqueue, Ok(_) | Err(IntentError::Forbidden)));
+        assert_eq!(
+            with_rooms_handle(&rooms, |s| s.room_access(&key))
+                .unwrap()
+                .state,
+            RoomAccessState::Revoked
+        );
+        assert!(
+            with_rooms_handle(&rooms, |s| s.pending_outbox(&key))
+                .unwrap()
+                .is_empty(),
+            "an admitted pre-revoke row must be Failed and a post-close enqueue must be rejected"
+        );
+    }
+
+    fn p2c_message_row(
+        key: &RoomKey,
+        id: &str,
+        sequence: u64,
+        author: &str,
+        mentions: Vec<String>,
+    ) -> WireLedgerRow {
+        WireLedgerRow {
+            id: id.into(),
+            sequence: sequence.to_string(),
+            event_type: "message".into(),
+            correlation_id: key.as_str().into(),
+            virtual_path: format!("/rooms/{}", key.as_str()),
+            actor_id: Some("principal".into()),
+            actor_member_id: Some(author.into()),
+            source_id: Some(format!(
+                "room:{}:member:{author}:producer:test",
+                key.as_str()
+            )),
+            source_sequence: Some(sequence.to_string()),
+            payload: json!({
+                "client_event_id":format!("client-{sequence}"),
+                "author_member_id":author,
+                "body":"trigger test",
+                "mention_member_ids":mentions
+            }),
+        }
+    }
+
+    fn p2c_projected_member(
+        id: &str,
+        actor_type: FederatedActorType,
+        owner: Option<&str>,
+    ) -> FederatedRoomMemberProjection {
+        FederatedRoomMemberProjection {
+            member_id: id.into(),
+            owner_member_id: owner.map(str::to_owned),
+            actor_type,
+            role_in_room: if owner.is_some() {
+                FederatedRoomRole::Member
+            } else {
+                FederatedRoomRole::Owner
+            },
+            display_name: id.into(),
+            public_agent_descriptor: (actor_type == FederatedActorType::Agent).then(|| {
+                PublicAgentDescriptor {
+                    display_name: id.into(),
+                    description: None,
+                    model_alias: None,
+                    skills_count: 0,
+                    subagent_names: vec![],
+                }
+            }),
+            joined_at: "2026-07-17T00:00:00Z".into(),
+            derived_presence: Some(MemberPresence::Live),
+            local_binding_available: (actor_type == FederatedActorType::Agent).then_some(true),
+        }
+    }
+
+    #[tokio::test]
+    async fn p2c_positive_user_dispatches_once_and_receiver_closure_suppresses_replay() {
+        let key = RoomKey::new("trigger-user-room");
+        let human = "11111111-1111-4111-8111-111111111111";
+        let target = "33333333-3333-4333-8333-333333333333";
+        let mut store = ocean_store::SqliteRoomStore::open_in_memory().unwrap();
+        store
+            .create(
+                key.clone(),
+                "Trigger User",
+                Some(ocean_core::RoomTriggerPolicy {
+                    on_mention: true,
+                    ..Default::default()
+                }),
+                chrono::Utc::now(),
+            )
+            .unwrap();
+        store
+            .install_room_credential(&key, "bearer", human)
+            .unwrap();
+        store.bind_room_agent(&key, target, "sage", "key").unwrap();
+        store
+            .update_room_access_safe(
+                &key,
+                Some(RoomAccessState::Live),
+                Some(&[
+                    p2c_projected_member(human, FederatedActorType::User, None),
+                    p2c_projected_member(target, FederatedActorType::Agent, Some(human)),
+                ]),
+                None,
+            )
+            .unwrap();
+        let rooms = Arc::new(std::sync::Mutex::new(store));
+        let (trigger_tx, mut trigger_rx) = mpsc::unbounded_channel();
+        let supervisor = FederationSupervisor::for_test_with_trigger(
+            "http://127.0.0.1:1",
+            rooms,
+            RoomWakeBus::default(),
+            RoomAccessWakeBus::default(),
+            trigger_tx,
+            CancellationToken::new(),
+            Duration::from_secs(60),
+        );
+        let credential = RoomCredential {
+            room_id: key.clone(),
+            bearer_token: "bearer".into(),
+            local_human_member_id: human.into(),
+        };
+        let outcome = ingest_message_row(
+            &supervisor.inner,
+            supervisor.inner.client.as_ref().unwrap(),
+            &credential,
+            p2c_message_row(&key, "ledger-user", 1, human, vec![target.into()]),
+        )
+        .await
+        .unwrap();
+        assert_eq!(outcome, IngestDisposition::Committed);
+        let dispatch = trigger_rx.try_recv().unwrap();
+        assert_eq!(dispatch.target_member_id, target);
+        assert!(trigger_rx.try_recv().is_err());
+        drop(trigger_rx);
+        let outcome = ingest_message_row(
+            &supervisor.inner,
+            supervisor.inner.client.as_ref().unwrap(),
+            &credential,
+            p2c_message_row(
+                &key,
+                "ledger-closed-receiver",
+                2,
+                human,
+                vec![target.into()],
+            ),
+        )
+        .await
+        .unwrap();
+        assert_eq!(outcome, IngestDisposition::Committed);
+        assert_eq!(
+            with_rooms_handle(&supervisor.inner.rooms, |s| s.transcript(&key, None))
+                .unwrap()
+                .len(),
+            2,
+            "closed dispatch receiver suppresses execution but never rolls back confirmed ingest"
+        );
+    }
+
+    #[tokio::test]
+    async fn p2c_unknown_human_fallback_and_agent_author_claim_nothing() {
+        let key = RoomKey::new("trigger-suppressed-room");
+        let human = "11111111-1111-4111-8111-111111111111";
+        let unknown = "22222222-2222-4222-8222-222222222222";
+        let target = "33333333-3333-4333-8333-333333333333";
+        let mut store = ocean_store::SqliteRoomStore::open_in_memory().unwrap();
+        store
+            .create(
+                key.clone(),
+                "Trigger Suppressed",
+                Some(ocean_core::RoomTriggerPolicy {
+                    on_mention: true,
+                    ..Default::default()
+                }),
+                chrono::Utc::now(),
+            )
+            .unwrap();
+        store
+            .install_room_credential(&key, "bearer", human)
+            .unwrap();
+        store.bind_room_agent(&key, target, "sage", "key").unwrap();
+        store
+            .update_room_access_safe(
+                &key,
+                Some(RoomAccessState::Live),
+                Some(&[
+                    p2c_projected_member(human, FederatedActorType::User, None),
+                    p2c_projected_member(target, FederatedActorType::Agent, Some(human)),
+                ]),
+                None,
+            )
+            .unwrap();
+        let rooms = Arc::new(std::sync::Mutex::new(store));
+        let fake = FakeBedrock::new(key.as_str(), "bearer");
+        *fake.members.lock().await = json!({"members":[
+            {
+                "member_id":human,
+                "actor_type":"user",
+                "role_in_room":"owner",
+                "display_name":"Human",
+                "joined_at":"2026-07-17T00:00:00Z"
+            },
+            {
+                "member_id":target,
+                "owner_member_id":human,
+                "actor_type":"agent",
+                "role_in_room":"member",
+                "display_name":"sage",
+                "public_agent_descriptor":{"display_name":"sage","skills_count":0},
+                "joined_at":"2026-07-17T00:00:00Z"
+            }
+        ]});
+        let (base, server) = start_fake_bedrock(fake).await;
+        let (trigger_tx, mut trigger_rx) = mpsc::unbounded_channel();
+        let supervisor = FederationSupervisor::for_test_with_trigger(
+            &base,
+            rooms.clone(),
+            RoomWakeBus::default(),
+            RoomAccessWakeBus::default(),
+            trigger_tx,
+            CancellationToken::new(),
+            Duration::from_secs(60),
+        );
+        let credential = RoomCredential {
+            room_id: key.clone(),
+            bearer_token: "bearer".into(),
+            local_human_member_id: human.into(),
+        };
+
+        ingest_message_row(
+            &supervisor.inner,
+            supervisor.inner.client.as_ref().unwrap(),
+            &credential,
+            p2c_message_row(&key, "ledger-unknown", 1, unknown, vec![target.into()]),
+        )
+        .await
+        .unwrap();
+        assert!(trigger_rx.try_recv().is_err());
+        let last = with_rooms_handle(&rooms, |s| s.transcript(&key, None))
+            .unwrap()
+            .pop()
+            .unwrap();
+        assert_eq!(last.author_kind, RoomParticipantKind::Human);
+
+        ingest_message_row(
+            &supervisor.inner,
+            supervisor.inner.client.as_ref().unwrap(),
+            &credential,
+            p2c_message_row(&key, "ledger-agent", 2, target, vec![target.into()]),
+        )
+        .await
+        .unwrap();
+        assert!(trigger_rx.try_recv().is_err());
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn p2c_policy_off_human_and_unbound_remote_targets_dispatch_nowhere() {
+        let key = RoomKey::new("trigger-negative-room");
+        let human = "11111111-1111-4111-8111-111111111111";
+        let remote_human = "22222222-2222-4222-8222-222222222222";
+        let bound_agent = "33333333-3333-4333-8333-333333333333";
+        let remote_agent = "44444444-4444-4444-8444-444444444444";
+        let mut store = ocean_store::SqliteRoomStore::open_in_memory().unwrap();
+        store
+            .create(key.clone(), "Trigger Negatives", None, chrono::Utc::now())
+            .unwrap();
+        store
+            .install_room_credential(&key, "negative-bearer", human)
+            .unwrap();
+        store
+            .bind_room_agent(&key, bound_agent, "sage", "bound-key")
+            .unwrap();
+        store
+            .update_room_access_safe(
+                &key,
+                Some(RoomAccessState::Live),
+                Some(&[
+                    p2c_projected_member(human, FederatedActorType::User, None),
+                    p2c_projected_member(remote_human, FederatedActorType::User, None),
+                    p2c_projected_member(bound_agent, FederatedActorType::Agent, Some(human)),
+                    p2c_projected_member(
+                        remote_agent,
+                        FederatedActorType::Agent,
+                        Some(remote_human),
+                    ),
+                ]),
+                None,
+            )
+            .unwrap();
+        let rooms = Arc::new(std::sync::Mutex::new(store));
+        let (trigger_tx, mut trigger_rx) = mpsc::unbounded_channel();
+        let supervisor = FederationSupervisor::for_test_with_trigger(
+            "http://127.0.0.1:1",
+            rooms.clone(),
+            RoomWakeBus::default(),
+            RoomAccessWakeBus::default(),
+            trigger_tx,
+            CancellationToken::new(),
+            Duration::from_secs(60),
+        );
+        let credential = RoomCredential {
+            room_id: key.clone(),
+            bearer_token: "negative-bearer".into(),
+            local_human_member_id: human.into(),
+        };
+
+        ingest_message_row(
+            &supervisor.inner,
+            supervisor.inner.client.as_ref().unwrap(),
+            &credential,
+            p2c_message_row(&key, "policy-off", 1, human, vec![bound_agent.into()]),
+        )
+        .await
+        .unwrap();
+        with_rooms_handle(&rooms, |store| {
+            store.update(
+                &key,
+                None,
+                Some(Some(ocean_core::RoomTriggerPolicy {
+                    on_mention: true,
+                    ..Default::default()
+                })),
+                chrono::Utc::now(),
+            )
+        })
+        .unwrap();
+        ingest_message_row(
+            &supervisor.inner,
+            supervisor.inner.client.as_ref().unwrap(),
+            &credential,
+            p2c_message_row(&key, "human-target", 2, human, vec![remote_human.into()]),
+        )
+        .await
+        .unwrap();
+        ingest_message_row(
+            &supervisor.inner,
+            supervisor.inner.client.as_ref().unwrap(),
+            &credential,
+            p2c_message_row(
+                &key,
+                "remote-unbound-target",
+                3,
+                human,
+                vec![remote_agent.into()],
+            ),
+        )
+        .await
+        .unwrap();
+
+        assert!(trigger_rx.try_recv().is_err());
+        let transcript = with_rooms_handle(&rooms, |store| store.transcript(&key, None)).unwrap();
+        assert_eq!(transcript.len(), 3);
+        assert!(transcript
+            .iter()
+            .all(|message| message.kind == RoomMessageKind::Message));
+    }
+
+    #[tokio::test]
+    async fn p2c_invite_bootstrap_uses_owner_bearer_and_exact_envelope() {
+        let key = RoomKey::new("invite-room");
+        let mut store = ocean_store::SqliteRoomStore::open_in_memory().unwrap();
+        store
+            .create(key.clone(), "Invite Room", None, chrono::Utc::now())
+            .unwrap();
+        let rooms = Arc::new(std::sync::Mutex::new(store));
+        let fake = ControlBedrock::new(key.as_str());
+        let (base, server) = start_control_bedrock(fake.clone()).await;
+        let supervisor = test_control_supervisor(&base, rooms.clone());
+
+        let invite = supervisor
+            .create_invite(&key, Some("Peer".into()), 1440)
+            .await
+            .unwrap();
+        assert!(invite.code == "share-code", "invite code mismatch");
+        assert_eq!(invite.room_key, key.as_str());
+        assert_eq!(invite.room_name, "Invite Room");
+        let credential = with_rooms_handle(&rooms, |s| s.room_credential(&key))
+            .unwrap()
+            .unwrap();
+        assert_eq!(credential.bearer_token, "test-owner-token");
+        assert_eq!(
+            credential.local_human_member_id,
+            "11111111-1111-4111-8111-111111111111"
+        );
+        let calls = fake.calls.lock().await.clone();
+        let register = calls.iter().find(|call| call.path == "register").unwrap();
+        assert_eq!(
+            register.authorization.as_deref(),
+            Some("Bearer test-owner-token")
+        );
+        assert_eq!(
+            serde_json::from_slice::<Value>(&register.body).unwrap(),
+            json!({"title":"Invite Room"})
+        );
+        let invite_call = calls.iter().find(|call| call.path == "invite").unwrap();
+        assert_eq!(
+            serde_json::from_slice::<Value>(&invite_call.body).unwrap(),
+            json!({"room_id":"invite-room","recipient_name":"Peer","ttl_minutes":1440})
+        );
+
+        supervisor.shutdown().await;
+        server.abort();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn p2c_bootstrap_and_redeem_install_race_never_overwrites_winner() {
+        let key = RoomKey::new("credential-install-race");
+        let mut store = ocean_store::SqliteRoomStore::open_in_memory().unwrap();
+        store
+            .create(key.clone(), "Install Race", None, chrono::Utc::now())
+            .unwrap();
+        let rooms = Arc::new(std::sync::Mutex::new(store));
+        let fake = ControlBedrock::new(key.as_str());
+        fake.hold_invite.store(true, Ordering::Release);
+        let (base, server) = start_control_bedrock(fake.clone()).await;
+        let supervisor = test_control_supervisor(&base, rooms.clone());
+
+        let invite = tokio::spawn({
+            let supervisor = supervisor.clone();
+            let key = key.clone();
+            async move { supervisor.create_invite(&key, None, 1440).await }
+        });
+        wait_for_control_call(&fake, "invite").await;
+        let installed = with_rooms_handle(&rooms, |store| store.room_credential(&key))
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            installed.local_human_member_id,
+            "11111111-1111-4111-8111-111111111111"
+        );
+        assert!(
+            installed.bearer_token == "test-owner-token",
+            "owner bearer mismatch"
+        );
+
+        let redeem = tokio::spawn({
+            let supervisor = supervisor.clone();
+            async move { supervisor.redeem_invite("install-race-code").await }
+        });
+        wait_for_control_call(&fake, "self").await;
+        assert_eq!(
+            with_rooms_handle(&rooms, |store| store.list_pending_redemptions())
+                .unwrap()
+                .len(),
+            1
+        );
+
+        fake.release_invite.add_permits(1);
+        assert!(invite.await.unwrap().is_ok());
+        assert_eq!(redeem.await.unwrap(), Err(IntentError::Conflict));
+        let final_credential = with_rooms_handle(&rooms, |store| store.room_credential(&key))
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            final_credential.local_human_member_id,
+            "11111111-1111-4111-8111-111111111111"
+        );
+        assert!(
+            final_credential.bearer_token == "test-owner-token",
+            "losing redemption must not overwrite the owner bearer"
+        );
+        assert_eq!(
+            with_rooms_handle(&rooms, |store| store.list_pending_redemptions())
+                .unwrap()
+                .len(),
+            1,
+            "credential conflict retains the durable redemption triple"
+        );
+        supervisor.shutdown().await;
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn p2c_missing_invite_keys_do_not_grow_room_slots() {
+        let rooms = Arc::new(std::sync::Mutex::new(
+            ocean_store::SqliteRoomStore::open_in_memory().unwrap(),
+        ));
+        let supervisor = FederationSupervisor::test_disabled(
+            rooms,
+            RoomWakeBus::default(),
+            RoomAccessWakeBus::default(),
+            CancellationToken::new(),
+        );
+        for index in 0..64 {
+            assert!(matches!(
+                supervisor
+                    .create_invite(&RoomKey::new(format!("missing-{index}")), None, 1440)
+                    .await,
+                Err(IntentError::NotFound)
+            ));
+        }
+        assert!(
+            supervisor.inner.slots.lock().await.is_empty(),
+            "missing-key preflight must not allocate lifetime supervisor slots"
+        );
+    }
+
+    #[tokio::test]
+    async fn p2c_owner_register_denial_does_not_revoke_or_install() {
+        let key = RoomKey::new("owner-denied-room");
+        let mut store = ocean_store::SqliteRoomStore::open_in_memory().unwrap();
+        store
+            .create(key.clone(), "Owner Denied", None, chrono::Utc::now())
+            .unwrap();
+        let rooms = Arc::new(std::sync::Mutex::new(store));
+        let fake = ControlBedrock::new(key.as_str());
+        fake.register_status.store(403, Ordering::Release);
+        let (base, server) = start_control_bedrock(fake.clone()).await;
+        let supervisor = test_control_supervisor(&base, rooms.clone());
+
+        assert!(matches!(
+            supervisor.create_invite(&key, None, 1440).await,
+            Err(IntentError::Forbidden)
+        ));
+        assert!(with_rooms_handle(&rooms, |s| s.room_credential(&key))
+            .unwrap()
+            .is_none());
+        assert_eq!(
+            with_rooms_handle(&rooms, |s| s.room_access(&key))
+                .unwrap()
+                .state,
+            RoomAccessState::Local
+        );
+        assert!(!fake
+            .calls
+            .lock()
+            .await
+            .iter()
+            .any(|call| call.path == "invite"));
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn p2c_installed_credential_denial_runs_revoke_cleanup() {
+        let key = RoomKey::new("invite-revoked-room");
+        let human = "11111111-1111-4111-8111-111111111111";
+        let mut store = ocean_store::SqliteRoomStore::open_in_memory().unwrap();
+        store
+            .create(key.clone(), "Invite Revoked", None, chrono::Utc::now())
+            .unwrap();
+        store
+            .install_room_credential(&key, "test-owner-token", human)
+            .unwrap();
+        store
+            .update_room_access_safe(&key, Some(RoomAccessState::Live), None, None)
+            .unwrap();
+        let rooms = Arc::new(std::sync::Mutex::new(store));
+        let fake = ControlBedrock::new(key.as_str());
+        fake.invite_status.store(403, Ordering::Release);
+        let (base, server) = start_control_bedrock(fake).await;
+        let supervisor = test_control_supervisor(&base, rooms.clone());
+
+        assert!(matches!(
+            supervisor.create_invite(&key, None, 1440).await,
+            Err(IntentError::Forbidden)
+        ));
+        assert_eq!(
+            with_rooms_handle(&rooms, |s| s.room_access(&key))
+                .unwrap()
+                .state,
+            RoomAccessState::Revoked
+        );
+        server.abort();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn p2c_invite_response_after_revoke_cannot_return_success() {
+        let key = RoomKey::new("invite-response-race");
+        let human = "11111111-1111-4111-8111-111111111111";
+        let mut store = ocean_store::SqliteRoomStore::open_in_memory().unwrap();
+        store
+            .create(
+                key.clone(),
+                "Invite Response Race",
+                None,
+                chrono::Utc::now(),
+            )
+            .unwrap();
+        store
+            .install_room_credential(&key, "test-owner-token", human)
+            .unwrap();
+        store
+            .update_room_access_safe(&key, Some(RoomAccessState::Live), None, None)
+            .unwrap();
+        let rooms = Arc::new(std::sync::Mutex::new(store));
+        let fake = ControlBedrock::new(key.as_str());
+        fake.hold_invite.store(true, Ordering::Release);
+        let (base, server) = start_control_bedrock(fake.clone()).await;
+        let supervisor = test_control_supervisor(&base, rooms.clone());
+
+        let request = tokio::spawn({
+            let supervisor = supervisor.clone();
+            let key = key.clone();
+            async move { supervisor.create_invite(&key, None, 1440).await }
+        });
+        wait_for_control_call(&fake, "invite").await;
+        supervisor.revoke_control(&key).await;
+        fake.release_invite.add_permits(1);
+        assert!(matches!(
+            request.await.unwrap(),
+            Err(IntentError::Forbidden)
+        ));
+        assert_eq!(
+            with_rooms_handle(&rooms, |store| store.room_access(&key))
+                .unwrap()
+                .state,
+            RoomAccessState::Revoked
+        );
+        server.abort();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn p2c_agent_response_after_revoke_binds_nothing() {
+        let key = RoomKey::new("agent-response-race");
+        let human = "22222222-2222-4222-8222-222222222222";
+        let mut store = ocean_store::SqliteRoomStore::open_in_memory().unwrap();
+        store
+            .create(key.clone(), "Agent Response Race", None, chrono::Utc::now())
+            .unwrap();
+        store
+            .install_room_credential(&key, "agent-bearer", human)
+            .unwrap();
+        store
+            .update_room_access_safe(&key, Some(RoomAccessState::Live), None, None)
+            .unwrap();
+        let rooms = Arc::new(std::sync::Mutex::new(store));
+        let fake = ControlBedrock::new(key.as_str());
+        fake.hold_agents.store(true, Ordering::Release);
+        let (base, server) = start_control_bedrock(fake.clone()).await;
+        let supervisor = test_control_supervisor(&base, rooms.clone());
+
+        let request = tokio::spawn({
+            let supervisor = supervisor.clone();
+            let key = key.clone();
+            async move {
+                supervisor
+                    .register_agents(&key, vec![p2c_agent_input("sage", "race-key")])
+                    .await
+            }
+        });
+        wait_for_control_call(&fake, "agents").await;
+        supervisor.revoke_control(&key).await;
+        fake.release_agents.add_permits(1);
+        assert_eq!(request.await.unwrap(), Err(IntentError::Forbidden));
+        assert!(
+            with_rooms_handle(&rooms, |store| {
+                store.resolve_room_agent(&key, "33333333-3333-4333-8333-000000000000")
+            })
+            .unwrap()
+            .is_none(),
+            "post-revoke agent response must not bind locally"
+        );
+        assert_eq!(
+            with_rooms_handle(&rooms, |store| store.room_access(&key))
+                .unwrap()
+                .state,
+            RoomAccessState::Revoked
+        );
+        server.abort();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn p2c_roster_response_after_revoke_cannot_mutate_access() {
+        let key = RoomKey::new("roster-response-race");
+        let human = "22222222-2222-4222-8222-222222222222";
+        let member = "33333333-3333-4333-8333-000000000000";
+        let mut store = ocean_store::SqliteRoomStore::open_in_memory().unwrap();
+        store
+            .create(
+                key.clone(),
+                "Roster Response Race",
+                None,
+                chrono::Utc::now(),
+            )
+            .unwrap();
+        store
+            .install_room_credential(&key, "agent-bearer", human)
+            .unwrap();
+        store
+            .update_room_access_safe(&key, Some(RoomAccessState::Live), None, None)
+            .unwrap();
+        let rooms = Arc::new(std::sync::Mutex::new(store));
+        let fake = ControlBedrock::new(key.as_str());
+        fake.hold_members.store(true, Ordering::Release);
+        let (base, server) = start_control_bedrock(fake.clone()).await;
+        let supervisor = test_control_supervisor(&base, rooms.clone());
+
+        let request = tokio::spawn({
+            let supervisor = supervisor.clone();
+            let key = key.clone();
+            async move {
+                supervisor
+                    .register_agents(&key, vec![p2c_agent_input("sage", "roster-key")])
+                    .await
+            }
+        });
+        wait_for_control_call(&fake, "members").await;
+        assert_eq!(
+            with_rooms_handle(&rooms, |store| store.resolve_room_agent(&key, member))
+                .unwrap()
+                .as_deref(),
+            Some("sage"),
+            "the pre-close binding mutation may commit"
+        );
+        supervisor.revoke_control(&key).await;
+        fake.release_members.add_permits(1);
+        assert_eq!(request.await.unwrap(), Err(IntentError::Forbidden));
+        let projection = with_rooms_handle(&rooms, |store| store.room_access(&key)).unwrap();
+        assert_eq!(projection.state, RoomAccessState::Revoked);
+        assert!(
+            projection.members.is_empty(),
+            "late roster response must not repopulate revoked access"
+        );
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn p2c_redeem_is_restart_safe_and_self_join_is_bodyless() {
+        let key = RoomKey::new("redeem-room");
+        let rooms = Arc::new(std::sync::Mutex::new(
+            ocean_store::SqliteRoomStore::open_in_memory().unwrap(),
+        ));
+        let fake = ControlBedrock::new(key.as_str());
+        let (base, server) = start_control_bedrock(fake.clone()).await;
+        let supervisor = test_control_supervisor(&base, rooms.clone());
+
+        supervisor
+            .redeem_invite("  share-code  ")
+            .await
+            .expect("restart-safe redeem succeeds");
+        let calls = fake.calls.lock().await.clone();
+        let redeem = calls.iter().find(|call| call.path == "redeem").unwrap();
+        let redeem_body: Value = serde_json::from_slice(&redeem.body).unwrap();
+        assert!(redeem_body["code"] == "share-code", "redeem code mismatch");
+        let token = redeem_body["token"].as_str().unwrap();
+        assert_eq!(token.len(), 43);
+        assert!(token
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-')));
+        let self_join = calls.iter().find(|call| call.path == "self").unwrap();
+        assert!(self_join.body.is_empty());
+        assert!(self_join.content_type.is_none());
+        assert!(
+            self_join
+                .authorization
+                .as_deref()
+                .and_then(|value| value.strip_prefix("Bearer "))
+                .is_some_and(|value| value == token),
+            "self-join bearer header mismatch"
+        );
+        let credential = with_rooms_handle(&rooms, |s| s.room_credential(&key))
+            .unwrap()
+            .unwrap();
+        assert!(
+            credential.bearer_token == token,
+            "stored bearer must equal the caller-generated token"
+        );
+        assert_eq!(
+            credential.local_human_member_id,
+            "22222222-2222-4222-8222-222222222222"
+        );
+        assert!(with_rooms_handle(&rooms, |s| s.list_pending_redemptions())
+            .unwrap()
+            .is_empty());
+
+        supervisor.shutdown().await;
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn p2c_redeem_and_self_join_conflicts_are_409_class_and_retain_pending() {
+        let redeem_rooms = Arc::new(std::sync::Mutex::new(
+            ocean_store::SqliteRoomStore::open_in_memory().unwrap(),
+        ));
+        let redeem_fake = ControlBedrock::new("conflict-room");
+        redeem_fake.redeem_status.store(409, Ordering::Release);
+        let (redeem_base, redeem_server) = start_control_bedrock(redeem_fake).await;
+        let redeem_supervisor = test_control_supervisor(&redeem_base, redeem_rooms.clone());
+        assert_eq!(
+            redeem_supervisor.redeem_invite("redeem-conflict").await,
+            Err(IntentError::Conflict)
+        );
+        assert_eq!(
+            with_rooms_handle(&redeem_rooms, |s| s.list_pending_redemptions())
+                .unwrap()
+                .len(),
+            1
+        );
+        redeem_server.abort();
+
+        let self_rooms = Arc::new(std::sync::Mutex::new(
+            ocean_store::SqliteRoomStore::open_in_memory().unwrap(),
+        ));
+        let self_fake = ControlBedrock::new("self-conflict-room");
+        self_fake.self_status.store(409, Ordering::Release);
+        let (self_base, self_server) = start_control_bedrock(self_fake).await;
+        let self_supervisor = test_control_supervisor(&self_base, self_rooms.clone());
+        assert_eq!(
+            self_supervisor.redeem_invite("self-conflict").await,
+            Err(IntentError::Conflict)
+        );
+        assert_eq!(
+            with_rooms_handle(&self_rooms, |s| s.list_pending_redemptions())
+                .unwrap()
+                .len(),
+            1
+        );
+        self_server.abort();
+    }
+
+    #[tokio::test]
+    async fn p2c_terminal_self_join_denial_removes_pending() {
+        let rooms = Arc::new(std::sync::Mutex::new(
+            ocean_store::SqliteRoomStore::open_in_memory().unwrap(),
+        ));
+        let fake = ControlBedrock::new("denied-room");
+        fake.self_status.store(401, Ordering::Release);
+        let (base, server) = start_control_bedrock(fake).await;
+        let supervisor = test_control_supervisor(&base, rooms.clone());
+
+        assert_eq!(
+            supervisor.redeem_invite("denied-code").await,
+            Err(IntentError::InviteForbidden)
+        );
+        assert!(with_rooms_handle(&rooms, |s| s.list_pending_redemptions())
+            .unwrap()
+            .is_empty());
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn p2c_local_revoked_room_rejects_redeem_and_retains_pending() {
+        let key = RoomKey::new("revoked-redeem-room");
+        let member = "22222222-2222-4222-8222-222222222222";
+        let bearer = "R".repeat(43);
+        let mut store = ocean_store::SqliteRoomStore::open_in_memory().unwrap();
+        store
+            .create(key.clone(), "Revoked Redeem", None, chrono::Utc::now())
+            .unwrap();
+        let (pending, _) = store
+            .get_or_insert_pending_redemption(
+                "revoked-code",
+                "dddddddd-dddd-4ddd-8ddd-dddddddddddd",
+                &bearer,
+                chrono::Utc::now(),
+            )
+            .unwrap();
+        store
+            .install_room_credential(&key, &bearer, member)
+            .unwrap();
+        store
+            .update_room_access_safe(&key, Some(RoomAccessState::Revoked), None, None)
+            .unwrap();
+        let rooms = Arc::new(std::sync::Mutex::new(store));
+        let fake = ControlBedrock::new(key.as_str());
+        let (base, server) = start_control_bedrock(fake).await;
+        let supervisor = test_control_supervisor(&base, rooms.clone());
+
+        assert_eq!(
+            supervisor.recover_pending(pending).await,
+            Err(IntentError::Forbidden)
+        );
+        assert_eq!(
+            with_rooms_handle(&rooms, |s| s.list_pending_redemptions())
+                .unwrap()
+                .len(),
+            1
+        );
+        assert_eq!(
+            with_rooms_handle(&rooms, |s| s.room_access(&key))
+                .unwrap()
+                .state,
+            RoomAccessState::Revoked
+        );
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn p2c_exact_existing_credential_still_promotes_and_deletes_pending() {
+        let key = RoomKey::new("promote-room");
+        let member = "22222222-2222-4222-8222-222222222222";
+        let bearer = "P".repeat(43);
+        let mut store = ocean_store::SqliteRoomStore::open_in_memory().unwrap();
+        store
+            .create(key.clone(), "Promote", None, chrono::Utc::now())
+            .unwrap();
+        let (pending, _) = store
+            .get_or_insert_pending_redemption(
+                "promote-code",
+                "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+                &bearer,
+                chrono::Utc::now(),
+            )
+            .unwrap();
+        store
+            .install_room_credential(&key, &bearer, member)
+            .unwrap();
+        let rooms = Arc::new(std::sync::Mutex::new(store));
+        let fake = ControlBedrock::new(key.as_str());
+        let (base, server) = start_control_bedrock(fake).await;
+        let supervisor = test_control_supervisor(&base, rooms.clone());
+
+        supervisor.recover_pending(pending).await.unwrap();
+        assert!(with_rooms_handle(&rooms, |s| s.list_pending_redemptions())
+            .unwrap()
+            .is_empty());
+        let credential = with_rooms_handle(&rooms, |s| s.room_credential(&key))
+            .unwrap()
+            .unwrap();
+        assert_eq!(credential.bearer_token, bearer);
+        assert_eq!(credential.local_human_member_id, member);
+        supervisor.shutdown().await;
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn p2c_missing_pending_with_exact_credential_is_prior_commit_noop() {
+        let key = RoomKey::new("prior-promote-room");
+        let member = "22222222-2222-4222-8222-222222222222";
+        let bearer = "Q".repeat(43);
+        let mut store = ocean_store::SqliteRoomStore::open_in_memory().unwrap();
+        store
+            .create(key.clone(), "Prior Promote", None, chrono::Utc::now())
+            .unwrap();
+        store
+            .install_room_credential(&key, &bearer, member)
+            .unwrap();
+        let pending = PendingRedemption {
+            redemption_id: "cccccccc-cccc-4ccc-8ccc-cccccccccccc".into(),
+            bearer_token: bearer.clone(),
+            invite_code: "prior-code".into(),
+            created_at: chrono::Utc::now(),
+        };
+        let rooms = Arc::new(std::sync::Mutex::new(store));
+        let fake = ControlBedrock::new(key.as_str());
+        let (base, server) = start_control_bedrock(fake).await;
+        let supervisor = test_control_supervisor(&base, rooms.clone());
+
+        supervisor.recover_pending(pending).await.unwrap();
+        let credential = with_rooms_handle(&rooms, |s| s.room_credential(&key))
+            .unwrap()
+            .unwrap();
+        assert_eq!(credential.bearer_token, bearer);
+        assert_eq!(credential.local_human_member_id, member);
+        supervisor.shutdown().await;
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn p2c_different_existing_credential_is_conflict_and_retains_pending() {
+        let key = RoomKey::new("conflict-room");
+        let mut store = ocean_store::SqliteRoomStore::open_in_memory().unwrap();
+        store
+            .create(key.clone(), "Conflict", None, chrono::Utc::now())
+            .unwrap();
+        let (pending, _) = store
+            .get_or_insert_pending_redemption(
+                "conflict-code",
+                "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb",
+                "new-bearer",
+                chrono::Utc::now(),
+            )
+            .unwrap();
+        store
+            .install_room_credential(&key, "old-bearer", "11111111-1111-4111-8111-111111111111")
+            .unwrap();
+        let rooms = Arc::new(std::sync::Mutex::new(store));
+        let fake = ControlBedrock::new(key.as_str());
+        let (base, server) = start_control_bedrock(fake).await;
+        let supervisor = test_control_supervisor(&base, rooms.clone());
+
+        assert_eq!(
+            supervisor.recover_pending(pending).await,
+            Err(IntentError::Conflict)
+        );
+        assert_eq!(
+            with_rooms_handle(&rooms, |s| s.list_pending_redemptions())
+                .unwrap()
+                .len(),
+            1
+        );
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn p2c_agent_batch_omits_private_and_absent_fields_then_binds() {
+        let key = RoomKey::new("agents-room");
+        let member = "22222222-2222-4222-8222-222222222222";
+        let mut store = ocean_store::SqliteRoomStore::open_in_memory().unwrap();
+        store
+            .create(key.clone(), "Agents", None, chrono::Utc::now())
+            .unwrap();
+        store
+            .install_room_credential(&key, "agent-bearer", member)
+            .unwrap();
+        store
+            .update_room_access_safe(&key, Some(RoomAccessState::Connecting), None, None)
+            .unwrap();
+        let rooms = Arc::new(std::sync::Mutex::new(store));
+        let fake = ControlBedrock::new(key.as_str());
+        let (base, server) = start_control_bedrock(fake.clone()).await;
+        let supervisor = test_control_supervisor(&base, rooms.clone());
+        let input = AgentRegistrationInput {
+            agent_name: "sage".into(),
+            registration_key: "reg-key".into(),
+            descriptor: PublicAgentDescriptor {
+                display_name: "sage".into(),
+                description: None,
+                model_alias: None,
+                skills_count: 2,
+                subagent_names: vec![],
+            },
+        };
+
+        let projection = supervisor.register_agents(&key, vec![input]).await.unwrap();
+        let calls = fake.calls.lock().await.clone();
+        let agent_call = calls.iter().find(|call| call.path == "agents").unwrap();
+        let body: Value = serde_json::from_slice(&agent_call.body).unwrap();
+        let wire = &body["agents"][0];
+        assert!(
+            wire["registration_key"] == "reg-key",
+            "registration-key mismatch"
+        );
+        assert!(wire.get("description").is_none());
+        assert!(wire.get("model_alias").is_none());
+        assert!(wire.get("tools").is_none());
+        assert!(wire.get("path").is_none());
+        let bound_member = projection
+            .members
+            .iter()
+            .find(|projected| projected.actor_type == FederatedActorType::Agent)
+            .unwrap();
+        assert_eq!(bound_member.local_binding_available, Some(true));
+        assert_eq!(
+            with_rooms_handle(&rooms, |s| {
+                s.resolve_room_agent(&key, &bound_member.member_id)
+            })
+            .unwrap()
+            .as_deref(),
+            Some("sage")
+        );
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn p2c_agent_batch_accepts_exact_maximum_of_32() {
+        let key = RoomKey::new("agents-max-room");
+        let human = "22222222-2222-4222-8222-222222222222";
+        let mut store = ocean_store::SqliteRoomStore::open_in_memory().unwrap();
+        store
+            .create(key.clone(), "Agents Max", None, chrono::Utc::now())
+            .unwrap();
+        store
+            .install_room_credential(&key, "agent-bearer", human)
+            .unwrap();
+        store
+            .update_room_access_safe(&key, Some(RoomAccessState::Connecting), None, None)
+            .unwrap();
+        let rooms = Arc::new(std::sync::Mutex::new(store));
+        let fake = ControlBedrock::new(key.as_str());
+        let (base, server) = start_control_bedrock(fake.clone()).await;
+        let supervisor = test_control_supervisor(&base, rooms);
+        let inputs = (0..32)
+            .map(|index| p2c_agent_input(&format!("agent-{index}"), &format!("key-{index}")))
+            .collect();
+
+        let projection = supervisor.register_agents(&key, inputs).await.unwrap();
+        assert_eq!(
+            projection
+                .members
+                .iter()
+                .filter(|member| member.actor_type == FederatedActorType::Agent)
+                .count(),
+            32
+        );
+        let calls = fake.calls.lock().await;
+        let body: Value = serde_json::from_slice(
+            &calls
+                .iter()
+                .find(|call| call.path == "agents")
+                .unwrap()
+                .body,
+        )
+        .unwrap();
+        assert_eq!(body["agents"].as_array().unwrap().len(), 32);
+        server.abort();
+    }
+
+    fn p2c_agent_input(name: &str, key: &str) -> AgentRegistrationInput {
+        AgentRegistrationInput {
+            agent_name: name.into(),
+            registration_key: key.into(),
+            descriptor: PublicAgentDescriptor {
+                display_name: name.into(),
+                description: None,
+                model_alias: None,
+                skills_count: 0,
+                subagent_names: vec![],
+            },
+        }
+    }
+
+    #[tokio::test]
+    async fn p2c_agent_mixed_retry_heals_and_binding_mismatch_fails_closed() {
+        let key = RoomKey::new("agent-retry-room");
+        let human = "22222222-2222-4222-8222-222222222222";
+        let first_member = "33333333-3333-4333-8333-000000000000";
+        let second_member = "33333333-3333-4333-8333-000000000001";
+        let mut store = ocean_store::SqliteRoomStore::open_in_memory().unwrap();
+        store
+            .create(key.clone(), "Agent Retry", None, chrono::Utc::now())
+            .unwrap();
+        store
+            .install_room_credential(&key, "agent-bearer", human)
+            .unwrap();
+        store
+            .update_room_access_safe(&key, Some(RoomAccessState::Connecting), None, None)
+            .unwrap();
+        store
+            .bind_room_agent(&key, first_member, "sage", "reg-sage")
+            .unwrap();
+        let rooms = Arc::new(std::sync::Mutex::new(store));
+        let fake = ControlBedrock::new(key.as_str());
+        fake.agents_status.store(200, Ordering::Release);
+        let (base, server) = start_control_bedrock(fake).await;
+        let supervisor = test_control_supervisor(&base, rooms.clone());
+
+        let projection = supervisor
+            .register_agents(
+                &key,
+                vec![
+                    p2c_agent_input("sage", "reg-sage"),
+                    p2c_agent_input("scout", "reg-scout"),
+                ],
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            with_rooms_handle(&rooms, |s| s.resolve_room_agent(&key, first_member))
+                .unwrap()
+                .as_deref(),
+            Some("sage")
+        );
+        assert_eq!(
+            with_rooms_handle(&rooms, |s| s.resolve_room_agent(&key, second_member))
+                .unwrap()
+                .as_deref(),
+            Some("scout")
+        );
+        assert_eq!(
+            projection
+                .members
+                .iter()
+                .filter(|member| member.local_binding_available == Some(true))
+                .count(),
+            2
+        );
+
+        assert_eq!(
+            supervisor
+                .register_agents(&key, vec![p2c_agent_input("intruder", "reg-intruder")])
+                .await,
+            Err(IntentError::Store)
+        );
+        assert_eq!(
+            with_rooms_handle(&rooms, |s| s.resolve_room_agent(&key, first_member))
+                .unwrap()
+                .as_deref(),
+            Some("sage"),
+            "conflicting replay must not replace the private binding"
+        );
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn p2c_startup_recovery_never_exceeds_four_in_flight() {
+        let mut store = ocean_store::SqliteRoomStore::open_in_memory().unwrap();
+        for index in 0..5 {
+            store
+                .get_or_insert_pending_redemption(
+                    &format!("limited-code-{index}"),
+                    &format!("{index:08x}-dddd-4ddd-8ddd-{index:012x}"),
+                    &format!("{index:043}"),
+                    chrono::Utc::now(),
+                )
+                .unwrap();
+        }
+        let rooms = Arc::new(std::sync::Mutex::new(store));
+        let fake = ControlBedrock::new("unused-room");
+        fake.redeem_status.store(403, Ordering::Release);
+        fake.hold_redeem.store(true, Ordering::Release);
+        let (base, server) = start_control_bedrock(fake.clone()).await;
+        let supervisor = test_control_supervisor(&base, rooms.clone());
+
+        supervisor.startup().await;
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while fake.redeem_active.load(Ordering::Acquire) != 4 {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("first four recovery calls admitted");
+        assert_eq!(fake.redeem_peak.load(Ordering::Acquire), 4);
+        assert_eq!(
+            fake.calls
+                .lock()
+                .await
+                .iter()
+                .filter(|call| call.path == "redeem")
+                .count(),
+            4,
+            "fifth row must wait for a recovery permit"
+        );
+        fake.release_redeem.add_permits(4);
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let calls = fake
+                    .calls
+                    .lock()
+                    .await
+                    .iter()
+                    .filter(|call| call.path == "redeem")
+                    .count();
+                if calls == 5 {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("fifth row admitted after a permit releases");
+        fake.release_redeem.add_permits(1);
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while !with_rooms_handle(&rooms, |s| s.list_pending_redemptions())
+                .unwrap()
+                .is_empty()
+            {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("all limited rows finish");
+        assert_eq!(fake.redeem_peak.load(Ordering::Acquire), 4);
+        supervisor.shutdown().await;
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn p2c_shutdown_cancels_and_joins_recovery_before_starting_more_calls() {
+        let mut store = ocean_store::SqliteRoomStore::open_in_memory().unwrap();
+        for index in 0..5 {
+            store
+                .get_or_insert_pending_redemption(
+                    &format!("shutdown-code-{index}"),
+                    &format!("{index:08x}-eeee-4eee-8eee-{index:012x}"),
+                    &format!("{index:043}"),
+                    chrono::Utc::now(),
+                )
+                .unwrap();
+        }
+        let rooms = Arc::new(std::sync::Mutex::new(store));
+        let fake = ControlBedrock::new("unused-room");
+        fake.hold_redeem.store(true, Ordering::Release);
+        let (base, server) = start_control_bedrock(fake.clone()).await;
+        let supervisor = test_control_supervisor(&base, rooms);
+
+        supervisor.startup().await;
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while fake.redeem_active.load(Ordering::Acquire) != 4 {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("four recovery requests started");
+        tokio::time::timeout(Duration::from_secs(1), supervisor.shutdown())
+            .await
+            .expect("shutdown cancels and joins recovery requests");
+        tokio::time::sleep(Duration::from_millis(25)).await;
+        assert_eq!(
+            fake.calls
+                .lock()
+                .await
+                .iter()
+                .filter(|call| call.path == "redeem")
+                .count(),
+            4,
+            "shutdown must prevent the waiting fifth row from starting"
+        );
+        fake.release_redeem.add_permits(4);
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn p2c_startup_attempts_every_pending_row_beyond_128() {
+        let mut store = ocean_store::SqliteRoomStore::open_in_memory().unwrap();
+        for index in 0..129 {
+            store
+                .get_or_insert_pending_redemption(
+                    &format!("code-{index}"),
+                    &format!("{index:08x}-aaaa-4aaa-8aaa-{index:012x}"),
+                    &format!("{index:043}"),
+                    chrono::Utc::now(),
+                )
+                .unwrap();
+        }
+        let rooms = Arc::new(std::sync::Mutex::new(store));
+        let fake = ControlBedrock::new("unused-room");
+        fake.redeem_status.store(403, Ordering::Release);
+        let (base, server) = start_control_bedrock(fake.clone()).await;
+        let supervisor = test_control_supervisor(&base, rooms.clone());
+
+        supervisor.startup().await;
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let attempts = fake
+                    .calls
+                    .lock()
+                    .await
+                    .iter()
+                    .filter(|call| call.path == "redeem")
+                    .count();
+                if attempts == 129 {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("all pending rows attempted once");
+        assert!(with_rooms_handle(&rooms, |s| s.list_pending_redemptions())
+            .unwrap()
+            .is_empty());
+        supervisor.shutdown().await;
+        server.abort();
+    }
+
     async fn run_control_recovery(event_name: &str, data: Value) {
         let key = RoomKey::new(format!("control-{event_name}"));
         let human = "11111111-1111-4111-8111-111111111111";
@@ -2197,15 +5003,18 @@ mod tests {
         let room_wakes = RoomWakeBus::default();
         let access_wakes = RoomAccessWakeBus::default();
         let mut access_rx = access_wakes.test_subscribe();
-        let supervisor = FederationSupervisor::new_inner(
-            None,
-            true,
-            rooms.clone(),
+        let (trigger_tx, _) = mpsc::unbounded_channel();
+        let supervisor = FederationSupervisor::new_inner(SupervisorInit {
+            client: None,
+            owner_token: None,
+            invalid_config: true,
+            rooms: rooms.clone(),
             room_wakes,
             access_wakes,
-            CancellationToken::new(),
-            Duration::from_millis(20),
-        );
+            trigger_tx,
+            shutdown: CancellationToken::new(),
+            scan_interval: Duration::from_millis(20),
+        });
         supervisor.startup().await;
         let projection = with_rooms_handle(&rooms, |s| s.room_access(&key)).unwrap();
         assert_eq!(projection.state, RoomAccessState::Recovering);
@@ -3183,6 +5992,17 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(75)).await;
         assert_eq!(fake.posts.lock().await.len(), stable_posts);
         assert!(stable_posts >= posts_before);
+        let slot = supervisor.slot_for(&key).await;
+        assert!(
+            slot.control.mutate(|| ()).await.is_none(),
+            "wire revoke closes the stable P2-C producer/control gate"
+        );
+        assert_eq!(
+            supervisor
+                .enqueue_federated_message(&key, None, "post-revoke")
+                .await,
+            Err(IntentError::Forbidden)
+        );
 
         supervisor.shutdown().await;
         server.abort();

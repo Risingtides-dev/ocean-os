@@ -205,6 +205,12 @@ in owner-only `rooms.db`; requests use the Authorization header and never a
 query token. Missing or invalid configuration moves every credentialed,
 non-revoked room to `recovering` instead of leaving stale `live` chrome.
 
+Set daemon-only `OCEAN_FEDERATION_OWNER_TOKEN` when this daemon may bootstrap
+an existing Local room as its Bedrock owner and mint invites. The value is read
+once at startup, never accepted from a surface request, and after registration
+is retained only in owner-only `rooms.db`. Missing owner token disables Local
+bootstrap only; existing credentialed rooms and invite redemption still work.
+
 At startup, the AppState-owned federation supervisor enumerates durable room
 credentials and starts one cancellable task tree per room. The receiver
 reconnects the Bedrock room SSE from the persisted cursor, commits the roster
@@ -213,7 +219,10 @@ rail: a ledger POST `201` does not append a transcript row or remove outbox
 state. The sender scans durable Pending rows periodically (Notify only reduces
 latency), posts one row at a time, and suppresses immediate reposts while the
 same connection awaits SSE confirmation. Restart safely retries the exact
-producer tuple.
+producer tuple. Existing rooms start before a background recovery worker
+replays every durable pending-redemption triple once per boot with at most four
+network exchanges in flight; terminal redeem 403 or self-join 401/403 removes
+the triple, while retryable failures retain it.
 
 Operator-visible access states are `connecting`, `recovering`, `live`, and
 `revoked` for credentialed rooms (`local` for unfederated rooms). Presence
@@ -222,8 +231,23 @@ and locally-bound owned agents remain Live even while the state label is
 `recovering`; disconnect/resync/auth failure downgrades all projected members
 to Unavailable in the same access commit/wake. A room-level revoke closes new
 sender admission, fails local Pending rows, persists `revoked` last, emits one
-access wake, and stops retries. P2-B adds no HTTP routes; invite redemption,
-new-room startup, local outbox enqueue, and trigger dispatch remain P2-C.
+access wake, and stops retries. A Local message keeps the existing immediate
+201 transcript/trigger path. Once a room credential is installed, human posts
+and bound-agent replies return/enter a 202 Pending outbox only; browser author
+claims are ignored, and only ordered SSE appends the confirmed transcript.
+Confirmed mentions dispatch only under local policy with positive current User
+evidence and a current safe locally-owned Agent roster member plus private
+member→folder-agent binding. Claims commit before
+nonblocking local dispatch, so replay is at-most-once; federated auto-convene
+and failure rows never create divergent unconfirmed transcript entries.
+
+The daemon exposes owner invite creation, restart-safe idempotent redemption,
+and safe local-agent registration under `/v1/rooms/persistent`. Invite success
+is the only response that carries an invite code. Bearers cross only in
+Bedrock-bound daemon requests (Authorization or the durable redeem exchange),
+and deterministic registration keys cross only in the Bedrock agent batch.
+Neither enters a surface request, projection, transcript, log, or error; local
+paths, tools, provider credentials, and permission posture never cross Bedrock.
 
 ## Common commands
 
@@ -514,6 +538,9 @@ GET    /v1/rooms/persistent/{key}/transcript              read transcript (?afte
 GET    /v1/rooms/persistent/{key}/snapshot                hydrate: room+participants+transcript+last_seq+next_seq+has_more (?after_seq=N&limit=M)
 GET    /v1/rooms/persistent/{key}/events                  SSE: initial full room_access projection (no id) + id-bearing room_message frames via ?after_seq=N / Last-Event-ID replay, then post-commit access-update + message tail; open non-call rooms only
 POST   /v1/rooms/persistent/{key}/outbox/retry            retry a locally-authored federated event awaiting Bedrock confirmation { client_event_id }; 202 on success, 403 revoked, 404 unknown room/item, 409 pending/local, 400 malformed body, 500 sanitized store error
+POST   /v1/rooms/persistent/{key}/invites                 bootstrap owner if Local, then mint invite { recipient_name?, ttl_minutes? }; raw InviteResponse 201
+POST   /v1/rooms/persistent/invites/redeem                restart-safe redeem/self-join { code }; raw RoomAccessProjection 200
+POST   /v1/rooms/persistent/{key}/members/agents          register safe local agent descriptors { agent_names }; raw RoomAccessProjection 200
 
 # Room media — retained independently from the retired projection API
 POST   /v1/rooms/{room_id}/livekit-token                  mint a LiveKit join token for web in-room voice/video
