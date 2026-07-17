@@ -12,9 +12,12 @@ use axum::{
 use chrono::Utc;
 use ocean_agent_sdk::{AgentSessionId, AgentTurnEvent};
 use ocean_core::{
-    evaluate_trigger_policy, PermissionMode, PromptRequest, RequestState, RoomKey, RoomMessage,
-    RoomMessageKind, RoomParticipant, RoomParticipantKind, RoomTriggerEvent, RoomTriggerPolicy,
+    evaluate_trigger_policy, PermissionMode, PromptRequest, RequestState, RoomAccessProjection,
+    RoomKey, RoomMessage, RoomMessageKind, RoomParticipant, RoomParticipantKind, RoomTriggerEvent,
+    RoomTriggerPolicy,
 };
+#[cfg(test)]
+use ocean_core::{OutboxItemState, RoomAccessState, RoomOutboxItem};
 use ocean_store::RoomStore;
 use serde_json::json;
 use tokio::sync::{broadcast, mpsc, oneshot};
@@ -83,6 +86,55 @@ impl RoomWakeBus {
 /// are advisory and reconnect/recovery always pages the durable log.
 fn publish_room_wake(state: &AppState, room: &RoomKey, message: &RoomMessage) {
     state.room_wakes.publish(room, message);
+}
+
+// ── RoomAccessWakeBus: separate bounded channel for access projection hints ──
+
+/// A room access-projection wake hint. Carries no payload: SQLite remains the
+/// durable authority and every subscriber re-reads the access projection after
+/// a hint. Separate from transcript `RoomWakeBus` so a heavy transcript SSE tail
+/// does not back-pressure access-projection subscribers.
+#[derive(Debug, Clone)]
+pub(super) struct RoomAccessWakeHint {
+    room: RoomKey,
+}
+
+/// Daemon-wide bounded wake channel for room access projection changes.
+#[derive(Clone)]
+pub(super) struct RoomAccessWakeBus {
+    tx: broadcast::Sender<RoomAccessWakeHint>,
+}
+
+impl Default for RoomAccessWakeBus {
+    fn default() -> Self {
+        Self::new(64)
+    }
+}
+
+impl RoomAccessWakeBus {
+    pub(super) fn new(capacity: usize) -> Self {
+        let (tx, _) = broadcast::channel(capacity);
+        Self { tx }
+    }
+
+    fn subscribe(&self) -> broadcast::Receiver<RoomAccessWakeHint> {
+        self.tx.subscribe()
+    }
+
+    #[cfg(test)]
+    fn receiver_count(&self) -> usize {
+        self.tx.receiver_count()
+    }
+
+    fn publish(&self, room: &RoomKey) {
+        let _ = self.tx.send(RoomAccessWakeHint { room: room.clone() });
+    }
+}
+
+/// Publish an access-projection wake hint only after the store adapter has
+/// returned (the allocating SQLite transaction has committed).
+fn publish_room_access_wake(state: &AppState, room: &RoomKey) {
+    state.room_access_wakes.publish(room);
 }
 
 /// Append one durable transcript row and issue its post-commit wake hint.
@@ -356,7 +408,8 @@ pub(super) async fn rooms_list_persistent(
     }
 }
 
-/// `GET /v1/rooms/persistent/{key}` — one persistent room (with its transcript).
+/// `GET /v1/rooms/persistent/{key}` — one persistent room (with its transcript
+/// and access projection). Open rooms only; soft-closed rooms return 404.
 pub(super) async fn room_get(
     State(state): State<AppState>,
     Path(key): Path<String>,
@@ -369,10 +422,18 @@ pub(super) async fn room_get(
         );
     }
     let key = RoomKey::new(trimmed);
-    match with_rooms(&state, |reg| reg.get(&key)) {
-        Ok(Some(rec)) => (
+    match with_rooms(&state, |reg| {
+        let Some(record) = reg.get(&key)? else {
+            return Ok(None);
+        };
+        let access = reg.room_access(&key)?;
+        Ok(Some((record, access)))
+    }) {
+        Ok(Some((rec, access))) => (
             StatusCode::OK,
-            Json(json!({ "ok": true, "room": rec.room, "transcript": rec.transcript })),
+            Json(
+                json!({ "ok": true, "room": rec.room, "transcript": rec.transcript, "access": access }),
+            ),
         ),
         Ok(None) => (
             StatusCode::NOT_FOUND,
@@ -1082,10 +1143,13 @@ pub(super) async fn room_snapshot(
         };
         // First bounded page of the transcript (from the start of the log).
         let page = read_transcript_page(reg, &key, q.after_seq, q.limit)?;
-        Ok(Some((record, page)))
+        // Access projection (S2-P1): the room's federated state, outbox, and
+        // member roster (Local if no access row exists).
+        let access = reg.room_access(&key)?;
+        Ok(Some((record, page, access)))
     });
     match result {
-        Ok(Some((rec, page))) => {
+        Ok(Some((rec, page, access))) => {
             let last_seq = page.messages.last().map(|m| m.seq);
             (
                 StatusCode::OK,
@@ -1097,6 +1161,7 @@ pub(super) async fn room_snapshot(
                     "last_seq": last_seq,
                     "next_seq": page.next_seq,
                     "has_more": page.has_more,
+                    "access": access,
                 })),
             )
         }
@@ -1244,6 +1309,7 @@ async fn run_room_tail(
     }
 }
 
+#[allow(dead_code)]
 fn room_message_tail(
     state: AppState,
     room: RoomKey,
@@ -1257,9 +1323,13 @@ fn room_message_tail(
 }
 
 /// `GET /v1/rooms/persistent/{key}/events?after_seq=N` — durable replay plus a
-/// room-scoped live SSE tail. `Last-Event-ID` wins over `after_seq`. Every frame
-/// is `event: room_message`, `id: <seq>`, and the exact existing `RoomMessage`
-/// JSON. SQLite is authoritative; the bounded broadcast carries wake hints only.
+/// room-scoped live SSE tail. Every frame is `event: room_message`, `id: <seq>`
+/// with the exact existing `RoomMessage` JSON. SQLite is authoritative; the
+/// bounded broadcast carries wake hints only.
+///
+/// S2-P1 merged SSE: also carries `event: room_access` frames (no `id`) with
+/// RoomAccessProjection JSON. An initial access frame ships before any messages;
+/// a separate access-tail task re-reads on access wake hints.
 pub(super) async fn room_events(
     State(state): State<AppState>,
     Path(raw_key): Path<String>,
@@ -1284,9 +1354,19 @@ pub(super) async fn room_events(
         ));
     }
 
-    match with_rooms(&state, |store| store.get(&room)) {
-        Ok(Some(_)) => {}
-        Ok(None) | Err(ocean_store::RoomStoreError::UnknownRoom(_)) => {
+    // Subscribe to BOTH wake buses BEFORE the first replay query.
+    let message_hints = state.room_wakes.subscribe();
+    let access_hints = state.room_access_wakes.subscribe();
+
+    // Verify room exists (open rooms only) and read initial access snapshot.
+    let initial_access = match with_rooms(&state, |store| {
+        if store.get(&room)?.is_none() {
+            return Err(ocean_store::RoomStoreError::UnknownRoom(room.clone()));
+        }
+        store.room_access(&room)
+    }) {
+        Ok(proj) => proj,
+        Err(ocean_store::RoomStoreError::UnknownRoom(_)) => {
             return Err(room_events_error(
                 StatusCode::NOT_FOUND,
                 "room_not_found",
@@ -1294,21 +1374,167 @@ pub(super) async fn room_events(
             ));
         }
         Err(error) => return Err(room_store_error_response(error)),
-    }
+    };
 
-    // Subscribe BEFORE the first replay query. Hints arriving during replay stay
-    // buffered in this receiver; after replay, every hint (or Lagged signal)
-    // pages SQLite from `last_sent_seq`, which closes the seam without trusting
-    // channel retention.
-    let hints = state.room_wakes.subscribe();
-    let stream = room_message_tail(state.clone(), room, resume, hints, None).map(|message| {
-        let seq = message.seq.to_string();
-        let data = serde_json::to_string(&message)
-            .expect("RoomMessage contains only infallibly serializable fields");
-        Ok(Event::default().id(seq).event("room_message").data(data))
+    // Existing message tail as a stream of SSE events.
+    let msg_stream = room_message_tail(state.clone(), room.clone(), resume, message_hints, None)
+        .map(|message| -> Result<Event, Infallible> {
+            let seq = message.seq.to_string();
+            let data = serde_json::to_string(&message).expect("RoomMessage serializable");
+            Ok(Event::default().id(seq).event("room_message").data(data))
+        });
+
+    // Access tail.
+    let (access_tx, access_rx) = mpsc::channel::<RoomAccessProjection>(16);
+    tokio::spawn(run_room_access_tail(
+        state.clone(),
+        room.clone(),
+        Some(initial_access.clone()),
+        access_hints,
+        access_tx,
+    ));
+    let acc_stream = ReceiverStream::new(access_rx).map(|proj| -> Result<Event, Infallible> {
+        let data = serde_json::to_string(&proj).expect("RoomAccessProjection serializable");
+        Ok(Event::default().event("room_access").data(data))
     });
-    let stream = sse_until_shutdown(stream, state.shutdown.clone());
+
+    // Merge: initial access frame first, then interleave messages + access updates.
+    let init_data =
+        serde_json::to_string(&initial_access).expect("RoomAccessProjection serializable");
+    let init_event = Ok(Event::default().event("room_access").data(init_data));
+    let merged = tokio_stream::once(init_event).chain(msg_stream.merge(acc_stream));
+    let stream = sse_until_shutdown(merged, state.shutdown.clone());
     Ok(Sse::new(stream).keep_alive(KeepAlive::new().interval(SSE_KEEPALIVE_INTERVAL)))
+}
+
+// ── S2-P1 access projection SSE tail ─────────────────────────────────────────
+
+/// Run an access-projection tail: on every wake hint (or lag), re-read the
+/// durable access projection and send it downstream if changed. Selects
+/// `tx.closed()` while idle so client disconnect cleans up.
+async fn run_room_access_tail(
+    state: AppState,
+    room: RoomKey,
+    mut last_access: Option<RoomAccessProjection>,
+    mut hints: broadcast::Receiver<RoomAccessWakeHint>,
+    tx: mpsc::Sender<RoomAccessProjection>,
+) {
+    loop {
+        let should_read = tokio::select! {
+            _ = tx.closed() => return,
+            res = hints.recv() => match res {
+                Ok(hint) => hint.room == room,
+                Err(broadcast::error::RecvError::Lagged(_)) => true,
+                Err(broadcast::error::RecvError::Closed) => return,
+            },
+        };
+        if !should_read {
+            continue;
+        }
+        let proj = match with_rooms(&state, |store| store.room_access(&room)) {
+            Ok(p) => p,
+            Err(e) => {
+                tracing::warn!(room = %room, %e, "room access tail read failed");
+                return;
+            }
+        };
+        if last_access.as_ref() != Some(&proj) {
+            last_access = Some(proj.clone());
+            if tx.send(proj).await.is_err() {
+                return;
+            }
+        }
+    }
+}
+
+// ── S2-P1 outbox retry endpoint ─────────────────────────────────────────────
+
+#[derive(Debug, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct RetryOutboxRequest {
+    /// Outbox item to retry, identified by client_event_id. Must be non-empty;
+    /// empty string is rejected at the handler level.
+    pub(super) client_event_id: String,
+}
+
+/// Map a `RetryOutboxError` to an HTTP status + typed JSON body.
+fn retry_outbox_error_response(
+    err: ocean_store::RetryOutboxError,
+) -> (StatusCode, Json<serde_json::Value>) {
+    use ocean_store::RetryOutboxError::*;
+    let (status, code) = match &err {
+        RoomNotFound(_) => (StatusCode::NOT_FOUND, "room_not_found"),
+        RoomNotFederated(_) => (StatusCode::CONFLICT, "room_not_federated"),
+        RoomAccessRevoked(_) => (StatusCode::FORBIDDEN, "room_access_revoked"),
+        OutboxItemNotFound { .. } => (StatusCode::NOT_FOUND, "outbox_item_not_found"),
+        OutboxItemNotFailed { .. } => (StatusCode::CONFLICT, "outbox_item_not_failed"),
+        Store(se) => match se {
+            ocean_store::RoomStoreError::BadKey(_) => (StatusCode::BAD_REQUEST, "bad_key"),
+            ocean_store::RoomStoreError::UnknownRoom(_) => {
+                (StatusCode::NOT_FOUND, "room_not_found")
+            }
+            _ => (StatusCode::INTERNAL_SERVER_ERROR, "internal_error"),
+        },
+    };
+    let body = match &err {
+        Store(_) => json!({ "ok": false, "code": code, "error": "internal store error" }),
+        _ => json!({ "ok": false, "code": code, "error": err.to_string() }),
+    };
+    (status, Json(body))
+}
+
+/// `POST /v1/rooms/persistent/{key}/outbox/retry` — retry a failed outbox item.
+///
+/// Returns `202 Accepted` with the updated access projection on success.
+/// Mapping: 202 (retried), 400 (bad key / malformed body / empty id), 403 (revoked),
+/// 404 (room or item not found), 409 (not federated / item not in Failed state), 500 (store).
+pub(super) async fn room_retry_outbox(
+    State(state): State<AppState>,
+    Path(raw_key): Path<String>,
+    body: axum::body::Bytes,
+) -> (StatusCode, Json<serde_json::Value>) {
+    let req: RetryOutboxRequest = match serde_json::from_slice(&body) {
+        Ok(r) => r,
+        Err(e) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(
+                    json!({ "ok": false, "code": "invalid_retry_request", "error": e.to_string() }),
+                ),
+            );
+        }
+    };
+    // Reject whitespace-only ids, but pass the original nonempty opaque id.
+    let trimmed_id = req.client_event_id.trim();
+    if trimmed_id.is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(
+                json!({ "ok": false, "code": "invalid_retry_request", "error": "client_event_id must be non-empty" }),
+            ),
+        );
+    }
+    let trimmed = raw_key.trim();
+    if trimmed.is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "ok": false, "error": "invalid room key; must be non-empty" })),
+        );
+    }
+    let key = RoomKey::new(trimmed);
+    let result = with_rooms(&state, |store| {
+        store.retry_failed_outbox(&key, &req.client_event_id)
+    });
+    match result {
+        Ok(proj) => {
+            publish_room_access_wake(&state, &key);
+            (
+                StatusCode::ACCEPTED,
+                Json(json!({ "ok": true, "access": proj })),
+            )
+        }
+        Err(e) => retry_outbox_error_response(e),
+    }
 }
 
 #[cfg(test)]
@@ -1317,6 +1543,8 @@ mod tests {
     use crate::tests::{
         fake_convene_state, write_agent_fixture, TestEnvRestore, AUTO_CONVENE_ENV_LOCK,
     };
+    use axum::body::Body;
+    use tower::ServiceExt;
 
     fn clear_turn_captures() {
         ROOM_TURN_CAPTURES
@@ -1711,7 +1939,7 @@ mod tests {
             "exact JSON",
         )
         .unwrap();
-        let app = crate::room_routes().with_state(state);
+        let app = super::super::room_routes().with_state(state);
         let request = axum::http::Request::builder()
             .uri("/v1/rooms/persistent/wire-frame/events")
             .body(axum::body::Body::empty())
@@ -1723,9 +1951,21 @@ mod tests {
             "text/event-stream"
         );
         let mut body = response.into_body();
+        // First frame is always room_access (S2-P1 contract). Skip it.
         let frame = tokio::time::timeout(std::time::Duration::from_millis(250), body.frame())
             .await
-            .expect("SSE frame exceeded 250ms")
+            .expect("access frame exceeded 250ms")
+            .expect("SSE body ended")
+            .expect("SSE body error");
+        let access_wire = std::str::from_utf8(frame.data_ref().expect("SSE data frame")).unwrap();
+        assert!(
+            access_wire.contains("event: room_access"),
+            "expected room_access first, got: {access_wire:?}"
+        );
+        // Second frame: room_message.
+        let frame = tokio::time::timeout(std::time::Duration::from_millis(250), body.frame())
+            .await
+            .expect("message frame exceeded 250ms")
             .expect("SSE body ended")
             .expect("SSE body error");
         let wire = std::str::from_utf8(frame.data_ref().expect("SSE data frame")).unwrap();
@@ -1762,7 +2002,7 @@ mod tests {
             )
             .unwrap();
         }
-        let app = crate::room_routes().with_state(state);
+        let app = super::super::room_routes().with_state(state);
         let request = axum::http::Request::builder()
             .uri("/v1/rooms/persistent/header-resume/events?after_seq=0")
             .header("last-event-id", "1")
@@ -1771,6 +2011,18 @@ mod tests {
         let response = app.oneshot(request).await.unwrap();
         assert_eq!(response.status(), StatusCode::OK);
         let mut body = response.into_body();
+        // Skip initial room_access frame (S2-P1 contract).
+        let frame = tokio::time::timeout(std::time::Duration::from_millis(250), body.frame())
+            .await
+            .expect("access frame exceeded 250ms")
+            .expect("SSE body ended")
+            .expect("SSE body error");
+        let access_wire = std::str::from_utf8(frame.data_ref().expect("SSE data frame")).unwrap();
+        assert!(
+            access_wire.contains("event: room_access"),
+            "expected room_access first, got: {access_wire:?}"
+        );
+        // Next frame: room_message with resume from id 2.
         let frame = tokio::time::timeout(std::time::Duration::from_millis(250), body.frame())
             .await
             .expect("resume frame exceeded 250ms")
@@ -2077,5 +2329,1249 @@ env = { FIXTURE = "1" }
         assert!(state.requests.read().await.values().any(|request| {
             request.status.session_id == Some(core_sid(room_agent_session_id(&key, "data-only")))
         }));
+    }
+
+    // ── S2-P1: snapshot access, merged SSE via router, outbox/retry ──────────
+
+    use super::super::room_routes;
+    use std::time::Duration;
+
+    fn seed_access(state: &AppState, key: &RoomKey, access: RoomAccessProjection) {
+        with_rooms(state, |store| {
+            store
+                .create(key.clone(), key.as_str(), None, Utc::now())
+                .expect("room fixture");
+            store
+                .replace_room_access(key, &access)
+                .expect("seed access");
+        });
+    }
+
+    fn local_access() -> RoomAccessProjection {
+        RoomAccessProjection {
+            state: RoomAccessState::Local,
+            last_confirmed_global_sequence: None,
+            members: vec![],
+            outbox: vec![],
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn snapshot_open_room_includes_access() {
+        let _guard = AUTO_CONVENE_ENV_LOCK.lock().await;
+        let tmp = tempfile::TempDir::new().unwrap();
+        let state = fake_convene_state(&tmp);
+        let key = RoomKey::new("s2-snap-open");
+        seed_access(&state, &key, local_access());
+
+        let app = room_routes().with_state(state.clone());
+        let resp = app
+            .oneshot(
+                axum::http::Request::get(format!("/v1/rooms/persistent/{key}/snapshot"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body: serde_json::Value = serde_json::from_slice(
+            &axum::body::to_bytes(resp.into_body(), 1024 * 1024)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(body["ok"], json!(true));
+        assert!(body["room"].is_object());
+        // Local access serializes as {"state":"local"} (skip_serializing_if omits defaults).
+        assert_eq!(body["access"], json!({"state": "local"}));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn snapshot_soft_closed_room_returns_200_with_local_access() {
+        let _guard = AUTO_CONVENE_ENV_LOCK.lock().await;
+        let tmp = tempfile::TempDir::new().unwrap();
+        let state = fake_convene_state(&tmp);
+        let key = RoomKey::new("s2-snap-closed");
+        with_rooms(&state, |store| {
+            store
+                .create(key.clone(), "Closed", None, Utc::now())
+                .expect("create");
+            store.close(&key).expect("close");
+        });
+
+        let app = room_routes().with_state(state.clone());
+        let resp = app
+            .oneshot(
+                axum::http::Request::get(format!("/v1/rooms/persistent/{key}/snapshot"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body: serde_json::Value = serde_json::from_slice(
+            &axum::body::to_bytes(resp.into_body(), 1024 * 1024)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(body["ok"], json!(true));
+        assert_eq!(body["access"], json!({"state": "local"}));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn room_get_closed_is_404() {
+        let _guard = AUTO_CONVENE_ENV_LOCK.lock().await;
+        let tmp = tempfile::TempDir::new().unwrap();
+        let state = fake_convene_state(&tmp);
+        let key = RoomKey::new("s2-get-closed");
+        with_rooms(&state, |store| {
+            store
+                .create(key.clone(), "ClosedGet", None, Utc::now())
+                .expect("create");
+            store.close(&key).expect("close");
+        });
+
+        let app = room_routes().with_state(state.clone());
+        let resp = app
+            .oneshot(
+                axum::http::Request::get(format!("/v1/rooms/persistent/{key}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn room_get_open_includes_access() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let _guard = AUTO_CONVENE_ENV_LOCK.lock().await;
+        let state = fake_convene_state(&tmp);
+        let key = RoomKey::new("s2-get-open");
+        seed_access(&state, &key, local_access());
+
+        let app = room_routes().with_state(state.clone());
+        let resp = app
+            .oneshot(
+                axum::http::Request::get(format!("/v1/rooms/persistent/{key}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body: serde_json::Value = serde_json::from_slice(
+            &axum::body::to_bytes(resp.into_body(), 1024 * 1024)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(body["access"], json!({"state": "local"}));
+    }
+
+    // ── Merged SSE routed tests ──────────────────────────────────────────────
+
+    /// Read the next SSE frame from a streaming body (non-blocking).
+    async fn next_sse_frame(body: &mut Body) -> String {
+        use http_body_util::BodyExt as _;
+        let frame = tokio::time::timeout(Duration::from_millis(500), body.frame())
+            .await
+            .expect("frame timeout")
+            .expect("SSE body ended")
+            .expect("SSE body error");
+        let bytes = frame.into_data().unwrap_or_default();
+        String::from_utf8_lossy(&bytes).to_string()
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn merged_sse_initial_frame_is_room_access() {
+        let _guard = AUTO_CONVENE_ENV_LOCK.lock().await;
+        let tmp = tempfile::TempDir::new().unwrap();
+        let state = fake_convene_state(&tmp);
+        let key = RoomKey::new("s2-sse-init");
+        seed_access(&state, &key, local_access());
+
+        let app = room_routes().with_state(state.clone());
+        let resp = app
+            .oneshot(
+                axum::http::Request::get(format!("/v1/rooms/persistent/{key}/events"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let mut body = resp.into_body();
+        let frame = next_sse_frame(&mut body).await;
+        assert!(
+            frame.contains("event: room_access"),
+            "expected room_access, got: {frame}"
+        );
+        // No id line on the initial access frame.
+        assert!(
+            !frame.lines().any(|l| l.starts_with("id:")),
+            "initial frame must not carry id"
+        );
+        let data = frame
+            .lines()
+            .find_map(|l| l.strip_prefix("data: "))
+            .expect("data line");
+        let parsed: serde_json::Value = serde_json::from_str(data).expect("valid JSON");
+        assert_eq!(
+            parsed,
+            json!({"state": "local"}),
+            "exact access payload mismatch"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn merged_sse_unknown_room_is_404() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let _guard = AUTO_CONVENE_ENV_LOCK.lock().await;
+        let state = fake_convene_state(&tmp);
+
+        let app = room_routes().with_state(state.clone());
+        let resp = app
+            .oneshot(
+                axum::http::Request::get("/v1/rooms/persistent/nonexistent/events")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn merged_sse_room_isolation_message_not_leaked() {
+        use http_body_util::BodyExt as _;
+        let _guard = AUTO_CONVENE_ENV_LOCK.lock().await;
+        let tmp = tempfile::TempDir::new().unwrap();
+        let state = fake_convene_state(&tmp);
+        let room_a = RoomKey::new("s2-iso-a");
+        let room_b = RoomKey::new("s2-iso-b");
+        seed_access(&state, &room_a, local_access());
+        seed_access(&state, &room_b, local_access());
+
+        let app_a = room_routes().with_state(state.clone());
+        let resp_a = app_a
+            .oneshot(
+                axum::http::Request::get(format!("/v1/rooms/persistent/{room_a}/events"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp_a.status(), StatusCode::OK);
+
+        let _ = append_room_message(
+            &state,
+            &room_b,
+            "author",
+            RoomParticipantKind::Human,
+            RoomMessageKind::Message,
+            "only in B",
+        );
+
+        let mut body = resp_a.into_body();
+        let deadline = tokio::time::Instant::now() + Duration::from_millis(300);
+        let mut saw_b_message = false;
+        while tokio::time::Instant::now() < deadline {
+            let frame = tokio::time::timeout(Duration::from_millis(50), body.frame()).await;
+            if let Ok(Some(Ok(bytes))) = frame {
+                let data = bytes.into_data().unwrap_or_default();
+                let text = String::from_utf8_lossy(&data);
+                if text.contains("only in B") {
+                    saw_b_message = true;
+                    break;
+                }
+            }
+        }
+        assert!(!saw_b_message, "room_a stream leaked room_b's message");
+    }
+
+    // ── S2-P1 outbox/retry routed tests ──────────────────────────────────────
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn retry_outbox_returns_202_on_success() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let _guard = AUTO_CONVENE_ENV_LOCK.lock().await;
+        let state = fake_convene_state(&tmp);
+        let key = RoomKey::new("s2-retry-ok");
+        seed_access(
+            &state,
+            &key,
+            RoomAccessProjection {
+                state: RoomAccessState::Live,
+                last_confirmed_global_sequence: Some(1),
+                members: vec![],
+                outbox: vec![RoomOutboxItem {
+                    client_event_id: "evt-1".into(),
+                    source_id: "src".into(),
+                    source_sequence: 10,
+                    author_member_id: "auth".into(),
+                    event_type: "chat.message".into(),
+                    payload: json!({"text": "hi"}),
+                    mention_member_ids: vec![],
+                    state: OutboxItemState::Failed,
+                }],
+            },
+        );
+
+        let app = room_routes().with_state(state.clone());
+        let resp = app
+            .oneshot(
+                axum::http::Request::post(format!("/v1/rooms/persistent/{key}/outbox/retry"))
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"client_event_id":"evt-1"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::ACCEPTED);
+        let body: serde_json::Value = serde_json::from_slice(
+            &axum::body::to_bytes(resp.into_body(), 1024 * 1024)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(body["ok"], json!(true));
+        let outbox = body["access"]["outbox"].as_array().unwrap();
+        let item = outbox
+            .iter()
+            .find(|i| i["client_event_id"] == "evt-1")
+            .unwrap();
+        assert_eq!(item["state"], json!("pending"));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn retry_outbox_local_room_is_409_not_403() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let _guard = AUTO_CONVENE_ENV_LOCK.lock().await;
+        let state = fake_convene_state(&tmp);
+        let key = RoomKey::new("s2-retry-local");
+        with_rooms(&state, |store| {
+            store
+                .create(key.clone(), "Local", None, Utc::now())
+                .expect("create");
+        });
+
+        let app = room_routes().with_state(state.clone());
+        let resp = app
+            .oneshot(
+                axum::http::Request::post(format!("/v1/rooms/persistent/{key}/outbox/retry"))
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"client_event_id":"evt-1"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::CONFLICT);
+        let body: serde_json::Value = serde_json::from_slice(
+            &axum::body::to_bytes(resp.into_body(), 1024 * 1024)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(body["code"], json!("room_not_federated"));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn retry_outbox_malformed_json_is_400() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let _guard = AUTO_CONVENE_ENV_LOCK.lock().await;
+        let state = fake_convene_state(&tmp);
+        let key = RoomKey::new("s2-retry-mal");
+        seed_access(&state, &key, local_access());
+
+        let app = room_routes().with_state(state.clone());
+        let resp = app
+            .oneshot(
+                axum::http::Request::post(format!("/v1/rooms/persistent/{key}/outbox/retry"))
+                    .header("content-type", "application/json")
+                    .body(Body::from("not json"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let body: serde_json::Value = serde_json::from_slice(
+            &axum::body::to_bytes(resp.into_body(), 1024 * 1024)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(body["code"], json!("invalid_retry_request"));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn retry_outbox_empty_id_is_400() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let _guard = AUTO_CONVENE_ENV_LOCK.lock().await;
+        let state = fake_convene_state(&tmp);
+        let key = RoomKey::new("s2-retry-empty");
+        seed_access(&state, &key, local_access());
+
+        let app = room_routes().with_state(state.clone());
+        let resp = app
+            .oneshot(
+                axum::http::Request::post(format!("/v1/rooms/persistent/{key}/outbox/retry"))
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"client_event_id":""}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let body: serde_json::Value = serde_json::from_slice(
+            &axum::body::to_bytes(resp.into_body(), 1024 * 1024)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(body["code"], json!("invalid_retry_request"));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn retry_outbox_unknown_room_is_404() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let _guard = AUTO_CONVENE_ENV_LOCK.lock().await;
+        let state = fake_convene_state(&tmp);
+
+        let app = room_routes().with_state(state.clone());
+        let resp = app
+            .oneshot(
+                axum::http::Request::post("/v1/rooms/persistent/nonexistent/outbox/retry")
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"client_event_id":"evt-1"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+        let body: serde_json::Value = serde_json::from_slice(
+            &axum::body::to_bytes(resp.into_body(), 1024 * 1024)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(body["code"], json!("room_not_found"));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn retry_outbox_unknown_fields_is_400() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let _guard = AUTO_CONVENE_ENV_LOCK.lock().await;
+        let state = fake_convene_state(&tmp);
+        let key = RoomKey::new("s2-retry-unk");
+        seed_access(&state, &key, local_access());
+
+        let app = room_routes().with_state(state.clone());
+        let resp = app
+            .oneshot(
+                axum::http::Request::post(format!("/v1/rooms/persistent/{key}/outbox/retry"))
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"client_event_id":"evt-1","extra":true}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let body: serde_json::Value = serde_json::from_slice(
+            &axum::body::to_bytes(resp.into_body(), 1024 * 1024)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(body["code"], json!("invalid_retry_request"));
+    }
+
+    // ── S2-P1 advanced proofs ────────────────────────────────────────────────
+
+    use crate::tests::fake_convene_file_state;
+
+    /// Create a room with Live access and one Failed outbox item.
+    fn seed_live_with_failed(state: &AppState, key: &RoomKey, client_event_id: &str) {
+        seed_access(
+            state,
+            key,
+            RoomAccessProjection {
+                state: RoomAccessState::Live,
+                last_confirmed_global_sequence: Some(1),
+                members: vec![],
+                outbox: vec![RoomOutboxItem {
+                    client_event_id: client_event_id.into(),
+                    source_id: "src".into(),
+                    source_sequence: 10,
+                    author_member_id: "auth".into(),
+                    event_type: "chat.message".into(),
+                    payload: json!({"text": "hi"}),
+                    mention_member_ids: vec![],
+                    state: OutboxItemState::Failed,
+                }],
+            },
+        );
+    }
+
+    /// Read one SSE event+data from a streaming body.
+    async fn read_sse_frame(body: &mut Body) -> (String, serde_json::Value) {
+        use http_body_util::BodyExt as _;
+        let frame = tokio::time::timeout(Duration::from_millis(500), body.frame())
+            .await
+            .expect("frame timeout")
+            .expect("SSE body ended")
+            .expect("SSE body error");
+        let text = String::from_utf8_lossy(&frame.into_data().unwrap_or_default()).to_string();
+        let event_type = text
+            .lines()
+            .find_map(|line| line.strip_prefix("event: "))
+            .unwrap_or("")
+            .to_string();
+        let data: serde_json::Value = text
+            .lines()
+            .find_map(|line| line.strip_prefix("data: "))
+            .map(|d| serde_json::from_str(d).expect("valid JSON"))
+            .unwrap_or(serde_json::Value::Null);
+        (event_type, data)
+    }
+
+    /// Drain the body for `dur` and report whether any `room_access` frame arrived.
+    async fn saw_access(body: &mut Body, dur: Duration) -> bool {
+        use http_body_util::BodyExt as _;
+        let deadline = tokio::time::Instant::now() + dur;
+        while tokio::time::Instant::now() < deadline {
+            let frame = tokio::time::timeout(Duration::from_millis(50), body.frame()).await;
+            if let Ok(Some(Ok(bytes))) = frame {
+                let data = bytes.into_data().unwrap_or_default();
+                let text = String::from_utf8_lossy(&data);
+                if text.contains("event: room_access") {
+                    return true;
+                }
+            }
+        }
+        false
+    }
+
+    // ── Access SSE proofs ─────────────────────────────────────────────────────
+
+    /// (4) Two-subscriber: assert both bodies receive the exact full
+    /// committed projection after a retry-triggered wake.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn merged_sse_two_subscribers_both_receive_exact_access_update() {
+        let _guard = AUTO_CONVENE_ENV_LOCK.lock().await;
+        let tmp = tempfile::TempDir::new().unwrap();
+        let state = fake_convene_state(&tmp);
+        let key = RoomKey::new("s2-both-sub");
+        seed_live_with_failed(&state, &key, "evt-both");
+
+        let expected_proj = RoomAccessProjection {
+            state: RoomAccessState::Live,
+            last_confirmed_global_sequence: Some(1),
+            members: vec![],
+            outbox: vec![RoomOutboxItem {
+                client_event_id: "evt-both".into(),
+                source_id: "src".into(),
+                source_sequence: 10,
+                author_member_id: "auth".into(),
+                event_type: "chat.message".into(),
+                payload: json!({"text": "hi"}),
+                mention_member_ids: vec![],
+                state: OutboxItemState::Pending,
+            }],
+        };
+        let expected = serde_json::to_value(&expected_proj).unwrap();
+
+        let app1 = room_routes().with_state(state.clone());
+        let resp1 = app1
+            .oneshot(
+                axum::http::Request::get(format!("/v1/rooms/persistent/{key}/events"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp1.status(), StatusCode::OK);
+        let app2 = room_routes().with_state(state.clone());
+        let resp2 = app2
+            .oneshot(
+                axum::http::Request::get(format!("/v1/rooms/persistent/{key}/events"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp2.status(), StatusCode::OK);
+
+        let mut body1 = resp1.into_body();
+        let mut body2 = resp2.into_body();
+
+        // Both start with initial room_access.
+        let (ev1, _) = read_sse_frame(&mut body1).await;
+        assert_eq!(ev1, "room_access");
+        let (ev2, _) = read_sse_frame(&mut body2).await;
+        assert_eq!(ev2, "room_access");
+
+        // Retry triggers access change + wake.
+        let app_retry = room_routes().with_state(state.clone());
+        let resp = app_retry
+            .oneshot(
+                axum::http::Request::post(format!("/v1/rooms/persistent/{key}/outbox/retry"))
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"client_event_id":"evt-both"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::ACCEPTED);
+
+        // Both must receive a follow-up room_access frame.
+        let (ev1b, data1) = read_sse_frame(&mut body1).await;
+        assert_eq!(ev1b, "room_access");
+        assert_eq!(data1, expected, "subscriber 1 mismatched");
+        let (ev2b, data2) = read_sse_frame(&mut body2).await;
+        assert_eq!(ev2b, "room_access");
+        assert_eq!(data2, expected, "subscriber 2 mismatched");
+    }
+
+    /// (3) Dedup: same-room unchanged hint produces no access frame. Also proves
+    /// room isolation (cross-room wake does not leak).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn merged_sse_access_dedup_and_room_isolation() {
+        let _guard = AUTO_CONVENE_ENV_LOCK.lock().await;
+        let tmp = tempfile::TempDir::new().unwrap();
+        let state = fake_convene_state(&tmp);
+        let room_a = RoomKey::new("s2-acc-iso-a");
+        let room_b = RoomKey::new("s2-acc-iso-b");
+        seed_live_with_failed(&state, &room_a, "evt-a");
+        seed_live_with_failed(&state, &room_b, "evt-b");
+
+        let app_a = room_routes().with_state(state.clone());
+        let resp_a = app_a
+            .oneshot(
+                axum::http::Request::get(format!("/v1/rooms/persistent/{room_a}/events"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp_a.status(), StatusCode::OK);
+        let mut body_a = resp_a.into_body();
+
+        // Consume initial access frame.
+        let (ev, data) = read_sse_frame(&mut body_a).await;
+        assert_eq!(ev, "room_access");
+        assert_eq!(data["outbox"][0]["client_event_id"], json!("evt-a"));
+
+        // 1) Publish same-room unchanged hint → must produce NO access frame.
+        publish_room_access_wake(&state, &room_a);
+        assert!(
+            !saw_access(&mut body_a, Duration::from_millis(300)).await,
+            "same-room unchanged hint produced spurious access frame"
+        );
+
+        // 2) Retry on room_b → must NOT deliver access frame to room_a.
+        let app_retry = room_routes().with_state(state.clone());
+        let resp = app_retry
+            .oneshot(
+                axum::http::Request::post(format!("/v1/rooms/persistent/{room_b}/outbox/retry"))
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"client_event_id":"evt-b"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::ACCEPTED);
+        assert!(
+            !saw_access(&mut body_a, Duration::from_millis(300)).await,
+            "room_a received access frame from room_b retry"
+        );
+    }
+
+    /// (1) Lag recovery (direct mpsc, deterministic): pre-subscribe cap-1
+    /// receiver, capture initial=0, store 42, overflow BEFORE spawning tail,
+    /// spawn with last_access=0, assert mpsc = exact 42, no second frame.
+    #[tokio::test]
+    async fn merged_sse_access_lag_recovers_durable_no_rescue_hint() {
+        let _guard = AUTO_CONVENE_ENV_LOCK.lock().await;
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mut state = fake_convene_state(&tmp);
+        state.room_access_wakes = RoomAccessWakeBus::new(1);
+        let key = RoomKey::new("s2-acc-lag");
+
+        // Seed initial: seq=0.
+        let initial = RoomAccessProjection {
+            state: RoomAccessState::Live,
+            last_confirmed_global_sequence: Some(0),
+            members: vec![],
+            outbox: vec![],
+        };
+        seed_access(&state, &key, initial.clone());
+
+        // Pre-subscribe cap-1 receiver BEFORE spawning the tail.
+        let hints = state.room_access_wakes.subscribe();
+
+        // Store durable seq=42.
+        with_rooms(&state, |store| {
+            store
+                .replace_room_access(
+                    &key,
+                    &RoomAccessProjection {
+                        state: RoomAccessState::Live,
+                        last_confirmed_global_sequence: Some(42),
+                        members: vec![],
+                        outbox: vec![],
+                    },
+                )
+                .expect("replace");
+        });
+
+        // Overflow capacity-1 bus BEFORE spawning tail.
+        for _ in 0..10 {
+            state.room_access_wakes.publish(&key);
+        }
+
+        // Spawn tail with last_access=0 + pre-filled receiver.
+        let (tx, mut rx) = mpsc::channel::<RoomAccessProjection>(16);
+        tokio::spawn(run_room_access_tail(
+            state.clone(),
+            key.clone(),
+            Some(initial),
+            hints,
+            tx,
+        ));
+
+        // Tail must detect Lagged, re-read durable (seq=42), send it.
+        let proj = tokio::time::timeout(Duration::from_secs(2), rx.recv())
+            .await
+            .expect("timeout")
+            .expect("channel closed");
+        assert_eq!(
+            proj.last_confirmed_global_sequence,
+            Some(42),
+            "lag did not recover durable seq=42"
+        );
+
+        // No second hint.
+        let second = tokio::time::timeout(Duration::from_millis(100), rx.recv()).await;
+        assert!(second.is_err(), "spurious second projection after lag");
+    }
+
+    // ── Dual receiver cleanup ─────────────────────────────────────────────────
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn merged_sse_drop_releases_both_message_and_access_receivers() {
+        let _guard = AUTO_CONVENE_ENV_LOCK.lock().await;
+        let tmp = tempfile::TempDir::new().unwrap();
+        let state = fake_convene_state(&tmp);
+        let key = RoomKey::new("s2-cleanup");
+        seed_access(&state, &key, local_access());
+
+        assert_eq!(state.room_wakes.receiver_count(), 0);
+        assert_eq!(state.room_access_wakes.receiver_count(), 0);
+
+        let app = room_routes().with_state(state.clone());
+        let resp = app
+            .oneshot(
+                axum::http::Request::get(format!("/v1/rooms/persistent/{key}/events"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(state.room_wakes.receiver_count(), 1);
+        assert_eq!(state.room_access_wakes.receiver_count(), 1);
+
+        drop(resp);
+
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+        while tokio::time::Instant::now() < deadline {
+            if state.room_wakes.receiver_count() == 0
+                && state.room_access_wakes.receiver_count() == 0
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        assert_eq!(
+            state.room_wakes.receiver_count(),
+            0,
+            "message receiver not released"
+        );
+        assert_eq!(
+            state.room_access_wakes.receiver_count(),
+            0,
+            "access receiver not released"
+        );
+    }
+
+    // ── Retry-outbox advanced matrices ────────────────────────────────────────
+
+    fn seed_pending_outbox(state: &AppState, key: &RoomKey) {
+        seed_access(
+            state,
+            key,
+            RoomAccessProjection {
+                state: RoomAccessState::Live,
+                last_confirmed_global_sequence: Some(1),
+                members: vec![],
+                outbox: vec![RoomOutboxItem {
+                    client_event_id: "evt-pending".into(),
+                    source_id: "src".into(),
+                    source_sequence: 10,
+                    author_member_id: "auth".into(),
+                    event_type: "chat.message".into(),
+                    payload: json!({"text": "p"}),
+                    mention_member_ids: vec![],
+                    state: OutboxItemState::Pending,
+                }],
+            },
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn retry_outbox_pending_item_is_409() {
+        let _guard = AUTO_CONVENE_ENV_LOCK.lock().await;
+        let tmp = tempfile::TempDir::new().unwrap();
+        let state = fake_convene_state(&tmp);
+        let key = RoomKey::new("s2-retry-pending");
+        seed_pending_outbox(&state, &key);
+        let app = room_routes().with_state(state);
+        let resp = app
+            .oneshot(
+                axum::http::Request::post(format!("/v1/rooms/persistent/{key}/outbox/retry"))
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"client_event_id":"evt-pending"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::CONFLICT);
+        let body: serde_json::Value = serde_json::from_slice(
+            &axum::body::to_bytes(resp.into_body(), 1024 * 1024)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(body["code"], json!("outbox_item_not_failed"));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn retry_outbox_unknown_item_is_404() {
+        let _guard = AUTO_CONVENE_ENV_LOCK.lock().await;
+        let tmp = tempfile::TempDir::new().unwrap();
+        let state = fake_convene_state(&tmp);
+        let key = RoomKey::new("s2-retry-noitem");
+        seed_live_with_failed(&state, &key, "evt-known");
+        let app = room_routes().with_state(state);
+        let resp = app
+            .oneshot(
+                axum::http::Request::post(format!("/v1/rooms/persistent/{key}/outbox/retry"))
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"client_event_id":"evt-nope"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+        let body: serde_json::Value = serde_json::from_slice(
+            &axum::body::to_bytes(resp.into_body(), 1024 * 1024)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(body["code"], json!("outbox_item_not_found"));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn retry_outbox_revoked_is_403() {
+        let _guard = AUTO_CONVENE_ENV_LOCK.lock().await;
+        let tmp = tempfile::TempDir::new().unwrap();
+        let state = fake_convene_state(&tmp);
+        let key = RoomKey::new("s2-retry-revoked");
+        seed_access(
+            &state,
+            &key,
+            RoomAccessProjection {
+                state: RoomAccessState::Revoked,
+                last_confirmed_global_sequence: Some(1),
+                members: vec![],
+                outbox: vec![RoomOutboxItem {
+                    client_event_id: "evt-rev".into(),
+                    source_id: "src".into(),
+                    source_sequence: 10,
+                    author_member_id: "auth".into(),
+                    event_type: "chat.message".into(),
+                    payload: json!({"text": "rev"}),
+                    mention_member_ids: vec![],
+                    state: OutboxItemState::Failed,
+                }],
+            },
+        );
+        let app = room_routes().with_state(state);
+        let resp = app
+            .oneshot(
+                axum::http::Request::post(format!("/v1/rooms/persistent/{key}/outbox/retry"))
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"client_event_id":"evt-rev"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+        let body: serde_json::Value = serde_json::from_slice(
+            &axum::body::to_bytes(resp.into_body(), 1024 * 1024)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(body["code"], json!("room_access_revoked"));
+    }
+
+    /// (8) Opaque-id preservation: whitespace-trim rejects empty,
+    /// but original nonempty spaced id passes through and matches.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn retry_outbox_whitespace_trim_rejects_empty_preserves_opaque() {
+        let _guard = AUTO_CONVENE_ENV_LOCK.lock().await;
+        let tmp = tempfile::TempDir::new().unwrap();
+        let state = fake_convene_state(&tmp);
+        let key = RoomKey::new("s2-retry-ws");
+        // Empty trimmed id → 400.
+        seed_access(&state, &key, local_access());
+        let app = room_routes().with_state(state.clone());
+        let resp = app
+            .oneshot(
+                axum::http::Request::post(format!("/v1/rooms/persistent/{key}/outbox/retry"))
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"client_event_id":"   "}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let body: serde_json::Value = serde_json::from_slice(
+            &axum::body::to_bytes(resp.into_body(), 1024 * 1024)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(body["code"], json!("invalid_retry_request"));
+
+        // Spaced nonempty id must be preserved and match stored item.
+        let key2 = RoomKey::new("s2-retry-opaque");
+        seed_live_with_failed(&state, &key2, "  evt-with-spaces  ");
+        let app2 = room_routes().with_state(state);
+        let resp2 = app2
+            .oneshot(
+                axum::http::Request::post(format!("/v1/rooms/persistent/{key2}/outbox/retry"))
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"client_event_id":"  evt-with-spaces  "}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp2.status(), StatusCode::ACCEPTED);
+        let body2: serde_json::Value = serde_json::from_slice(
+            &axum::body::to_bytes(resp2.into_body(), 1024 * 1024)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        let item = body2["access"]["outbox"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|i| i["client_event_id"] == "  evt-with-spaces  ")
+            .unwrap();
+        assert_eq!(item["state"], json!("pending"));
+    }
+
+    /// (6) Non-object body: table-driven null / array / string / number / bool.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn retry_outbox_non_object_bodies_are_400() {
+        let _guard = AUTO_CONVENE_ENV_LOCK.lock().await;
+        let tmp = tempfile::TempDir::new().unwrap();
+        let state = fake_convene_state(&tmp);
+        let key = RoomKey::new("s2-retry-nonobj");
+        seed_access(&state, &key, local_access());
+
+        let cases: &[(&str, &str)] = &[
+            ("null", "null"),
+            ("array", r#"["a","b"]"#),
+            ("string", r#""not-an-object""#),
+            ("number", "42"),
+            ("bool", "true"),
+        ];
+        for (label, body_str) in cases {
+            let app = room_routes().with_state(state.clone());
+            let resp = app
+                .oneshot(
+                    axum::http::Request::post(format!("/v1/rooms/persistent/{key}/outbox/retry"))
+                        .header("content-type", "application/json")
+                        .body(Body::from(*body_str))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                resp.status(),
+                StatusCode::BAD_REQUEST,
+                "{label}: expected 400, got {}",
+                resp.status()
+            );
+            let body_json: serde_json::Value = serde_json::from_slice(
+                &axum::body::to_bytes(resp.into_body(), 1024 * 1024)
+                    .await
+                    .unwrap(),
+            )
+            .unwrap();
+            assert_eq!(
+                body_json["code"],
+                json!("invalid_retry_request"),
+                "{label}: wrong code"
+            );
+        }
+    }
+
+    /// (5) Exact 202 envelope: compare whole JSON against expected projection.
+    /// Also asserts exactly one access wake on success.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn retry_outbox_success_has_exact_202_envelope_and_one_wake() {
+        let _guard = AUTO_CONVENE_ENV_LOCK.lock().await;
+        let tmp = tempfile::TempDir::new().unwrap();
+        let state = fake_convene_state(&tmp);
+        let key = RoomKey::new("s2-202-env");
+        seed_live_with_failed(&state, &key, "evt-env");
+
+        let mut pre_rx = state.room_access_wakes.subscribe();
+
+        let app = room_routes().with_state(state.clone());
+        let resp = app
+            .oneshot(
+                axum::http::Request::post(format!("/v1/rooms/persistent/{key}/outbox/retry"))
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"client_event_id":"evt-env"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::ACCEPTED);
+        let body: serde_json::Value = serde_json::from_slice(
+            &axum::body::to_bytes(resp.into_body(), 1024 * 1024)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+
+        // Build expected from typed projection (matches serde serialization exactly).
+        let expected_proj = RoomAccessProjection {
+            state: RoomAccessState::Live,
+            last_confirmed_global_sequence: Some(1),
+            members: vec![],
+            outbox: vec![RoomOutboxItem {
+                client_event_id: "evt-env".into(),
+                source_id: "src".into(),
+                source_sequence: 10,
+                author_member_id: "auth".into(),
+                event_type: "chat.message".into(),
+                payload: json!({"text": "hi"}),
+                mention_member_ids: vec![],
+                state: OutboxItemState::Pending,
+            }],
+        };
+        let expected_access = serde_json::to_value(&expected_proj).unwrap();
+        let expected = json!({ "ok": true, "access": expected_access });
+        assert_eq!(body, expected, "exact 202 envelope mismatch");
+
+        // Exactly one wake, no second.
+        let _ = tokio::time::timeout(Duration::from_millis(500), pre_rx.recv())
+            .await
+            .expect("first wake timeout")
+            .expect("first wake not sent");
+        let second = tokio::time::timeout(Duration::from_millis(100), pre_rx.recv()).await;
+        assert!(second.is_err(), "woke more than once on single success");
+    }
+
+    /// (7) No-wake on every error class: prove zero access hints for
+    /// 400 / 403 / 404 / 409 / 500 paths.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn retry_outbox_no_access_wake_any_error_class() {
+        use tokio::sync::broadcast::error::TryRecvError;
+        let _guard = AUTO_CONVENE_ENV_LOCK.lock().await;
+
+        // --- 400: malformed body ---
+        {
+            let tmp = tempfile::TempDir::new().unwrap();
+            let state = fake_convene_state(&tmp);
+            let key = RoomKey::new("s2-nw-400");
+            seed_access(&state, &key, local_access());
+            let mut rx = state.room_access_wakes.subscribe();
+            let _keep = state.clone(); // survives router move
+            let app = room_routes().with_state(state);
+            let resp = app
+                .oneshot(
+                    axum::http::Request::post(format!("/v1/rooms/persistent/{key}/outbox/retry"))
+                        .header("content-type", "application/json")
+                        .body(Body::from("not json"))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+            // Only Err(Empty) proves no wake was published.
+            assert!(
+                matches!(rx.try_recv(), Err(TryRecvError::Empty)),
+                "wake on 400"
+            );
+        }
+
+        // --- 403: revoked ---
+        {
+            let tmp = tempfile::TempDir::new().unwrap();
+            let state = fake_convene_state(&tmp);
+            let key = RoomKey::new("s2-nw-403");
+            seed_access(
+                &state,
+                &key,
+                RoomAccessProjection {
+                    state: RoomAccessState::Revoked,
+                    last_confirmed_global_sequence: Some(1),
+                    members: vec![],
+                    outbox: vec![RoomOutboxItem {
+                        client_event_id: "evt-403".into(),
+                        source_id: "s".into(),
+                        source_sequence: 1,
+                        author_member_id: "a".into(),
+                        event_type: "chat.message".into(),
+                        payload: json!({}),
+                        mention_member_ids: vec![],
+                        state: OutboxItemState::Failed,
+                    }],
+                },
+            );
+            let mut rx = state.room_access_wakes.subscribe();
+            let _keep = state.clone();
+            let app = room_routes().with_state(state);
+            let resp = app
+                .oneshot(
+                    axum::http::Request::post(format!("/v1/rooms/persistent/{key}/outbox/retry"))
+                        .header("content-type", "application/json")
+                        .body(Body::from(r#"{"client_event_id":"evt-403"}"#))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+            assert!(
+                matches!(rx.try_recv(), Err(TryRecvError::Empty)),
+                "wake on 403"
+            );
+        }
+
+        // --- 404: unknown room ---
+        {
+            let tmp = tempfile::TempDir::new().unwrap();
+            let state = fake_convene_state(&tmp);
+            let mut rx = state.room_access_wakes.subscribe();
+            let _keep = state.clone();
+            let app = room_routes().with_state(state);
+            let resp = app
+                .oneshot(
+                    axum::http::Request::post("/v1/rooms/persistent/nonexistent/outbox/retry")
+                        .header("content-type", "application/json")
+                        .body(Body::from(r#"{"client_event_id":"x"}"#))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+            assert!(
+                matches!(rx.try_recv(), Err(TryRecvError::Empty)),
+                "wake on 404"
+            );
+        }
+
+        // --- 409: local room ---
+        {
+            let tmp = tempfile::TempDir::new().unwrap();
+            let state = fake_convene_state(&tmp);
+            let key = RoomKey::new("s2-nw-409");
+            with_rooms(&state, |store| {
+                store
+                    .create(key.clone(), "Local", None, Utc::now())
+                    .expect("create");
+            });
+            let mut rx = state.room_access_wakes.subscribe();
+            let _keep = state.clone();
+            let app = room_routes().with_state(state);
+            let resp = app
+                .oneshot(
+                    axum::http::Request::post(format!("/v1/rooms/persistent/{key}/outbox/retry"))
+                        .header("content-type", "application/json")
+                        .body(Body::from(r#"{"client_event_id":"evt-1"}"#))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), StatusCode::CONFLICT);
+            assert!(
+                matches!(rx.try_recv(), Err(TryRecvError::Empty)),
+                "wake on 409"
+            );
+        }
+
+        // --- 500: real store error via rusqlite corruption ---
+        {
+            let tmp = tempfile::TempDir::new().unwrap();
+            let (state, db_path) = fake_convene_file_state(&tmp);
+            let key = RoomKey::new("s2-nw-500");
+            seed_live_with_failed(&state, &key, "evt-500");
+            let mut rx = state.room_access_wakes.subscribe();
+
+            // Corrupt: drop the room_access table via a separate connection.
+            let conn = rusqlite::Connection::open(&db_path).unwrap();
+            conn.execute_batch("DROP TABLE IF EXISTS room_access")
+                .unwrap();
+            conn.close().ok();
+
+            let _keep = state.clone();
+            let app = room_routes().with_state(state);
+            let resp = app
+                .oneshot(
+                    axum::http::Request::post(format!("/v1/rooms/persistent/{key}/outbox/retry"))
+                        .header("content-type", "application/json")
+                        .body(Body::from(r#"{"client_event_id":"evt-500"}"#))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                resp.status(),
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "expected 500 from store error, got {}",
+                resp.status()
+            );
+            // Exact sanitized body: Store errors always produce this fixed message.
+            let body: serde_json::Value = serde_json::from_slice(
+                &axum::body::to_bytes(resp.into_body(), 1024 * 1024)
+                    .await
+                    .unwrap(),
+            )
+            .unwrap();
+            let expected = json!({
+                "ok": false,
+                "code": "internal_error",
+                "error": "internal store error"
+            });
+            assert_eq!(body, expected, "500 body not exact sanitized form");
+
+            // Zero wake on 500.
+            assert!(
+                matches!(rx.try_recv(), Err(TryRecvError::Empty)),
+                "wake on 500"
+            );
+        }
     }
 }

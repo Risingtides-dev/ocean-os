@@ -144,8 +144,8 @@ use model_catalog::{model_get, model_set, models_list};
 use model_roles::{load_model_roles, resolve_advisor_alias, resolve_effective_model_id};
 use persistent_rooms::{
     resolve_named_agent, room_create, room_db_path, room_events, room_get, room_join, room_leave,
-    room_post_message, room_snapshot, room_transcript, rooms_list_persistent, with_rooms,
-    with_rooms_handle, RoomStoreHandle, RoomWakeBus,
+    room_post_message, room_retry_outbox, room_snapshot, room_transcript, rooms_list_persistent,
+    with_rooms, with_rooms_handle, RoomAccessWakeBus, RoomStoreHandle, RoomWakeBus,
 };
 use project_registry::{
     canonical_git_common_dir, discover_project_worktrees, project_create, project_delete,
@@ -230,6 +230,10 @@ struct AppState {
     /// payload is only `(room, seq)`; SQLite remains authoritative for replay,
     /// live delivery, lag recovery, ordering, and deduplication.
     room_wakes: RoomWakeBus,
+    /// Bounded room-scoped wake hints for access projection changes (S2-P1).
+    /// Separate from `room_wakes` so a heavy transcript tail does not
+    /// back-pressure access-projection subscribers.
+    room_access_wakes: RoomAccessWakeBus,
     /// The **persisted Longhouse title registry** (OCEAN-246/272). Holds firekeeper
     /// and validator titles durably across turns, storing only a salt+SHA-256
     /// *verifier* per title (never the raw token). Convene mints into it; the
@@ -791,6 +795,7 @@ async fn main() -> anyhow::Result<()> {
         longhouse,
         rooms: Arc::new(Mutex::new(room_store)),
         room_wakes: RoomWakeBus::default(),
+        room_access_wakes: RoomAccessWakeBus::default(),
         titles: Arc::new(Mutex::new(title_registry)),
         revoker: Arc::new(ocean_longhouse::Revoker::new()),
         recalls: new_recall_registry(),
@@ -1170,6 +1175,7 @@ fn banner_routes() -> &'static [&'static str] {
         "GET /v1/rooms/persistent/{key}/transcript",
         "GET /v1/rooms/persistent/{key}/snapshot",
         "GET /v1/rooms/persistent/{key}/events",
+        "POST /v1/rooms/persistent/{key}/outbox/retry",
         "GET /v1/sessions",
         "GET /v1/sessions/{id}",
         "GET /v1/agents",
@@ -2223,7 +2229,13 @@ fn room_routes() -> Router<AppState> {
             get(room_transcript),
         )
         .route("/v1/rooms/persistent/{key}/snapshot", get(room_snapshot))
+        // Merged SSE: room_message + room_access frames, with durable replay
+        // and access-projection tail (S2-P1).
         .route("/v1/rooms/persistent/{key}/events", get(room_events))
+        .route(
+            "/v1/rooms/persistent/{key}/outbox/retry",
+            post(room_retry_outbox),
+        )
         .route(
             "/v1/rooms/{room_id}/livekit-token",
             post(room_livekit_token),
@@ -10867,13 +10879,18 @@ mod tests {
         .await;
         assert_eq!(status, StatusCode::OK);
         let detail = persistent_room_http_json(&raw);
-        assert_json_object_keys(&detail, &["ok", "room", "transcript"]);
+        assert_json_object_keys(&detail, &["access", "ok", "room", "transcript"]);
         assert_eq!(detail["ok"], true);
         assert_eq!(detail["room"]["id"], "lifecycle-room");
         assert_eq!(detail["room"]["name"], "  Verbatim Room Name  ");
         assert!(detail["room"].get("workspace_root").is_none());
         assert!(detail["room"].get("trigger_policy").is_none());
         assert_eq!(detail["transcript"], json!([]));
+        assert_eq!(
+            detail["access"],
+            json!({"state": "local"}),
+            "fresh room must show Local access"
+        );
 
         let (status, _, raw) = persistent_room_http_request(
             app.clone(),
@@ -11797,6 +11814,7 @@ mod tests {
             longhouse: Arc::new(Mutex::new(ocean_longhouse::LonghouseRegistry::new())),
             rooms: Arc::new(Mutex::new(store)),
             room_wakes: RoomWakeBus::default(),
+            room_access_wakes: RoomAccessWakeBus::default(),
             titles: Arc::new(Mutex::new(
                 ocean_longhouse::SqliteTitleRegistry::open_in_memory().expect("in-mem titles"),
             )),
@@ -13185,6 +13203,7 @@ mod tests {
             longhouse: Arc::new(Mutex::new(ocean_longhouse::LonghouseRegistry::new())),
             rooms: Arc::new(Mutex::new(store)),
             room_wakes: RoomWakeBus::default(),
+            room_access_wakes: RoomAccessWakeBus::default(),
             titles: Arc::new(Mutex::new(
                 ocean_longhouse::SqliteTitleRegistry::open_in_memory().expect("in-mem titles"),
             )),
@@ -13203,6 +13222,45 @@ mod tests {
             turn_limiter: Arc::new(tokio::sync::Semaphore::new(256)),
             advisor_limiter: Arc::new(tokio::sync::Semaphore::new(ADVISOR_CONCURRENCY_LIMIT)),
         }
+    }
+
+    /// Build a file-backed `AppState` so tests can induce real rusqlite errors.
+    pub(super) fn fake_convene_file_state(
+        tmp: &tempfile::TempDir,
+    ) -> (AppState, std::path::PathBuf) {
+        std::env::set_var("OCEAN_CONFIG_DIR", tmp.path());
+        std::env::set_var("OCEAN_MODEL", "fake-ok");
+        std::env::set_var("OCEAN_YOLO", "1");
+        let runtime = Arc::new(AgentRuntime::from_env().expect("fake runtime"));
+        let db_path = tmp.path().join("rooms.db");
+        let store = ocean_store::SqliteRoomStore::open(&db_path).expect("file-backed store");
+        let state = AppState {
+            runtime,
+            roles: Arc::new(std::collections::HashMap::new()),
+            events: EventBus::new(1024),
+            agent_events: AgentEventBus::new(1024),
+            requests: Arc::new(RwLock::new(HashMap::new())),
+            permissions: Arc::new(RwLock::new(HashMap::new())),
+            longhouse: Arc::new(Mutex::new(ocean_longhouse::LonghouseRegistry::new())),
+            rooms: Arc::new(Mutex::new(store)),
+            room_wakes: RoomWakeBus::default(),
+            room_access_wakes: RoomAccessWakeBus::default(),
+            titles: Arc::new(Mutex::new(
+                ocean_longhouse::SqliteTitleRegistry::open_in_memory().expect("in-mem titles"),
+            )),
+            revoker: Arc::new(ocean_longhouse::Revoker::new()),
+            recalls: new_recall_registry(),
+            persist_failures: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            gc_failures: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            sse_lag_events: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            sse_events_dropped: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            canvas_fulfillments: Arc::new(Mutex::new(HashMap::new())),
+            shutdown: CancellationToken::new(),
+            metrics: Arc::new(TurnMetrics::default()),
+            turn_limiter: Arc::new(tokio::sync::Semaphore::new(256)),
+            advisor_limiter: Arc::new(tokio::sync::Semaphore::new(ADVISOR_CONCURRENCY_LIMIT)),
+        };
+        (state, db_path)
     }
 
     /// Poll the room transcript until `pred` matches a message or the deadline
@@ -13944,6 +14002,7 @@ mod tests {
             longhouse: Arc::new(Mutex::new(ocean_longhouse::LonghouseRegistry::new())),
             rooms: Arc::new(Mutex::new(store)),
             room_wakes: RoomWakeBus::default(),
+            room_access_wakes: RoomAccessWakeBus::default(),
             titles: Arc::new(Mutex::new(titles)),
             revoker: Arc::new(ocean_longhouse::Revoker::new()),
             recalls: new_recall_registry(),
@@ -15076,6 +15135,7 @@ mod tests {
         assert_json_object_keys(
             &snapshot,
             &[
+                "access",
                 "ok",
                 "room",
                 "participants",
@@ -15088,6 +15148,8 @@ mod tests {
         assert_eq!(snapshot["ok"], true);
         assert_eq!(snapshot["room"]["id"], "closed-audit");
         assert_eq!(snapshot["room"]["name"], "Closed Audit");
+        // Closed room shows exact Local access projection (no extra keys).
+        assert_eq!(snapshot["access"], json!({"state": "local"}));
         let expected_participants = json!([{
             "id": "alice",
             "kind": "human",
@@ -19387,7 +19449,7 @@ mod tests {
         );
         assert_eq!(
             banner.len(),
-            76,
+            77,
             "route baseline changed; review the manifest"
         );
 
