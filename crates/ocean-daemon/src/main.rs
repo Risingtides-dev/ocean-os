@@ -5187,10 +5187,13 @@ async fn compact_session(
     match state.runtime.compact_session(session_id).await {
         Ok(response) => (StatusCode::OK, Json(response)),
         Err(error) => {
+            // Sanitized 500 (the AGENTS.md contract): anyhow contexts from
+            // storage failures carry filesystem paths — log the detail, return
+            // the same fixed string sibling session handlers use.
             tracing::warn!(%session_id, error = %error, "compact: failed");
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
-                Json(fail(error.to_string())),
+                Json(fail("internal server error".into())),
             )
         }
     }
