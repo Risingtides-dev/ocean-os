@@ -1327,6 +1327,148 @@ impl AgentRuntime {
         Ok(Some(session::session_detail(session)))
     }
 
+    /// Compact a session: replace the transcript with a model-generated summary
+    /// plus a protected recent window. Uses the currently configured model in a
+    /// one-shot no-tools call. The session is saved atomically; if interrupted
+    /// mid-compact the prior state survives.
+    pub async fn compact_session(
+        &self,
+        id: SessionId,
+    ) -> anyhow::Result<ocean_core::CompactResponse> {
+        use futures::StreamExt as _;
+        use ocean_protocol::{stream_simple, AssistantMessageEvent, Context, StreamOptions};
+        let start = std::time::Instant::now();
+
+        // Lock the session against concurrent turns.
+        let lock = self.session_lock(id);
+        let _guard = lock.lock().await;
+
+        let Some(session) = session::load_resumable(&self.config_dir, id)? else {
+            return Ok(ocean_core::CompactResponse {
+                ok: false,
+                session_id: id,
+                wall_ms: start.elapsed().as_millis() as u64,
+                stderr: "session not found".into(),
+            });
+        };
+
+        if session.messages.is_empty() {
+            return Ok(ocean_core::CompactResponse {
+                ok: true,
+                session_id: id,
+                wall_ms: start.elapsed().as_millis() as u64,
+                stderr: "nothing to compact".into(),
+            });
+        }
+
+        let snapshot = self.snapshot();
+        let model = &snapshot.model;
+
+        // Build a one-shot no-tools summarization request.
+        let ctx = Context {
+            system_prompt: Some(
+                "You are a compact assistant. Summarize this conversation concisely, \
+                 preserving key facts, decisions, open tasks, and the user's goals. \
+                 Output a plain text summary without markdown formatting."
+                    .into(),
+            ),
+            messages: session.messages.clone(),
+            tools: Vec::new(),
+            dynamic_tool_declarations: Vec::new(),
+            tool_choice: Default::default(),
+        };
+
+        let options = StreamOptions {
+            max_tokens: Some(model.max_tokens / 4),
+            api_key: snapshot.api_key.clone(),
+            ..Default::default()
+        };
+        // Cross-provider thinking is not needed for a summary and may waste
+        // tokens; leave reasoning unset so each provider uses its default.
+
+        let mut summary = String::new();
+        let mut stream = stream_simple(model, &ctx, &options).await?;
+        while let Some(event) = stream.next().await {
+            match event? {
+                AssistantMessageEvent::TextDelta { delta, .. } => {
+                    summary.push_str(&delta);
+                }
+                AssistantMessageEvent::Done { .. } => break,
+                AssistantMessageEvent::Error { error, .. } => {
+                    let msg = error
+                        .error_message
+                        .unwrap_or_else(|| "compact: provider error".into());
+                    return Ok(ocean_core::CompactResponse {
+                        ok: false,
+                        session_id: id,
+                        wall_ms: start.elapsed().as_millis() as u64,
+                        stderr: msg,
+                    });
+                }
+                _ => {}
+            }
+        }
+
+        if summary.is_empty() {
+            return Ok(ocean_core::CompactResponse {
+                ok: false,
+                session_id: id,
+                wall_ms: start.elapsed().as_millis() as u64,
+                stderr: "compact: model returned empty summary".into(),
+            });
+        }
+
+        // Compute the protected recent window: at most 20 messages AND at most
+        // 20% of the context window in estimated tokens, whichever is tighter.
+        let protect_tokens = (model.context_window as usize).saturating_mul(20) / 100;
+        let mut kept_tokens = 0usize;
+        let mut protected_count = 0usize;
+        for msg in session.messages.iter().rev() {
+            if protected_count >= 20 {
+                break;
+            }
+            kept_tokens = kept_tokens.saturating_add(estimate_tokens(msg));
+            if kept_tokens > protect_tokens {
+                break;
+            }
+            protected_count += 1;
+        }
+        let split = session.messages.len().saturating_sub(protected_count);
+        let protected = &session.messages[split..];
+
+        // Build the replacement transcript: summary marker + summary + protected window.
+        let mut new_messages = vec![
+            Message::user_text(
+                "The session was compacted. Below is a summary of the \
+                 conversation that was replaced to save context.",
+            ),
+            Message::Assistant(ocean_protocol::AssistantMessage {
+                content: vec![Content::text(summary)],
+                api: model.api.clone(),
+                provider: model.provider.clone(),
+                model: model.id.clone(),
+                usage: ocean_protocol::Usage::default(),
+                stop_reason: ocean_protocol::StopReason::Stop,
+                error_message: None,
+                timestamp: ocean_protocol::now_ms(),
+            }),
+        ];
+        new_messages.extend_from_slice(protected);
+
+        // Atomically replace the session transcript.
+        let mut updated = session;
+        updated.messages = new_messages;
+        updated.updated_ms = ocean_protocol::now_ms();
+        session::save(&self.config_dir, &updated)?;
+
+        Ok(ocean_core::CompactResponse {
+            ok: true,
+            session_id: id,
+            wall_ms: start.elapsed().as_millis() as u64,
+            stderr: String::new(),
+        })
+    }
+
     /// Explicitly mint a session container *before* any turn is run, per the
     /// ecosystem contract. Mirrors the implicit create-on-turn path's session
     /// setup (mint id → `bind_workspace(cwd)` → persist) but runs no agent loop

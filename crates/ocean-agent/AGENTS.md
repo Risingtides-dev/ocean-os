@@ -37,6 +37,10 @@ This crate owns Ocean's agent session/history layer and project prompt loading. 
   gpt-5.x into malformed tool calls across tool rounds). Kimi K2.x and other
   OpenAI-compatible routes retain the existing thinking-strip boundary;
   provider encoders still drop cross-provider thinking.
+- `compact_session` is owned here: one-shot no-tools model call, atomically
+  replaces session transcript with summary + protected recent window. The
+  session lock must be held for the entire load-call-save cycle. Only
+  current-runtime model is used; session-historical model is ignored.
 
 ## Work Guidance
 

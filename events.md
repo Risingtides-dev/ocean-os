@@ -4307,3 +4307,11 @@ type:      [merge]: publish Longhouse topic projection extraction
 area:      [backend]: ocean-daemon Phase 2C governance observability
 
 PR #305 passed hosted default-parallel macOS and Ubuntu repository/feature/release gates, pinned Rust 1.88 MSRV, and cargo-deny in CI run `29615843464`, then merged the exact reviewed head `ba1a599` over `9177598` as `9676b18`. The private `src/longhouse_topics.rs` boundary is published with only the scripted demo and topic list/detail adapters; real convene/title/control remains the next separate security-sensitive manifest. No daemon restart, deployment, process kill, LaunchAgent change, or binary installation was performed from the refactor worktree.
+_________________________________________________________________________________
+time:      [23:13] [17-07-26]
+agent:     [pi] [gpt-5.6] [worker]
+worktree:  [feat/compact-session]
+type:      [feature-request]
+area:      [backend]
+
+Added POST /v1/sessions/{id}/compact: one-shot no-tools model call that replaces a session transcript with a model-generated summary plus protected recent window (20% of context or 20 messages, whichever is tighter). Session is locked for load-call-save; the existing temp+rename atomic persistence ensures interrupted compacts leave the prior state intact. New CompactResponse type in ocean-core; compact_session method on AgentRuntime in ocean-agent. Workspace, core, agent, and daemon compilation clean; ocean-core 48 tests, ocean-agent 164 tests pass.

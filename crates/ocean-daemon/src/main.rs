@@ -28,7 +28,7 @@ use ocean_agent_sdk::{
     ContextUsage, Federation, LonghouseEvent, Mark, MarkKind, ToolCall, ToolCallId, ToolResult,
 };
 use ocean_core::{
-    EventEnvelope, HealthResponse, OceanEvent, PermissionControlResponse,
+    CompactResponse, EventEnvelope, HealthResponse, OceanEvent, PermissionControlResponse,
     PermissionDecision as PermissionDecisionBody, PermissionDecisionRequest, PermissionId,
     PermissionMode, PermissionStatus, PermissionsResponse, ProjectRef, PromptRequest,
     RequestControlResponse, RequestCreateResponse, RequestId, RequestState, RequestStatus,
@@ -648,6 +648,7 @@ fn app_router(cors: CorsLayer) -> Router<AppState> {
         .merge(room_routes())
         .route("/v1/sessions", get(sessions))
         .route("/v1/sessions/{id}", get(session))
+        .route("/v1/sessions/{id}/compact", post(compact_session))
         // Folder-as-agent classification (read-only): list + resolve agents from
         // the agents root. See docs/specs/folder-as-agent.md.
         .route("/v1/agents", get(agents_list))
@@ -1343,6 +1344,7 @@ fn banner_routes() -> &'static [&'static str] {
         "POST /v1/rooms/persistent/{key}/outbox/retry",
         "GET /v1/sessions",
         "GET /v1/sessions/{id}",
+        "POST /v1/sessions/{id}/compact",
         "GET /v1/agents",
         "GET /v1/agents/{name}",
         "GET /v1/projects",
@@ -5122,6 +5124,61 @@ async fn enrich_session_detail(state: &AppState, session: &mut SessionDetail) {
             }
         }
     });
+}
+
+/// `POST /v1/sessions/{id}/compact` — one-shot no-tools model-summary
+/// compaction of a session transcript. The session is replaced atomically;
+/// interrupted compacts leave the prior state intact.
+async fn compact_session(
+    State(state): State<AppState>,
+    Path(session_id): Path<SessionId>,
+) -> Json<CompactResponse> {
+    // Gate: same concurrency limiter as prompt/requests.
+    let _turn_permit = match state.turn_limiter.clone().try_acquire_owned() {
+        Ok(permit) => permit,
+        Err(_) => {
+            return Json(CompactResponse {
+                ok: false,
+                session_id,
+                wall_ms: 0,
+                stderr: "daemon at concurrent-turn capacity; try again shortly".into(),
+            });
+        }
+    };
+
+    // Pre-validate the session exists without locking it for the full duration.
+    // The compaction itself will take the session lock and re-validate.
+    match state.runtime.session_detail_optional(session_id) {
+        Ok(Some(_)) => {}
+        Ok(None) => {
+            return Json(CompactResponse {
+                ok: false,
+                session_id,
+                wall_ms: 0,
+                stderr: "session not found".into(),
+            });
+        }
+        Err(error) => {
+            tracing::warn!(%session_id, error = %error, "compact: failed to read session detail");
+            return Json(CompactResponse {
+                ok: false,
+                session_id,
+                wall_ms: 0,
+                stderr: "session could not be read".into(),
+            });
+        }
+    }
+
+    let res = state.runtime.compact_session(session_id).await;
+    match res {
+        Ok(response) => Json(response),
+        Err(error) => Json(CompactResponse {
+            ok: false,
+            session_id,
+            wall_ms: 0,
+            stderr: error.to_string(),
+        }),
+    }
 }
 
 fn session_run_state(state: RequestState) -> SessionRunState {
