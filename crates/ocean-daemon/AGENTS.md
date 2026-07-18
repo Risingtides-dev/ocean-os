@@ -38,6 +38,12 @@ This crate owns the long-running Ocean HTTP service on `:4780`, including API ro
   advertise only `propose_handoff`, and mutate only through the existing
   session/message/turn routes after an explicit Surface click.
 - Session behavior lives in `ocean-agent`; route changes must not create a separate session model.
+- `POST /v1/sessions/{id}/compact` is a thin adapter over
+  `AgentRuntime::compact_session`: it takes a turn permit from the shared
+  concurrent-turn limiter (429 at capacity, permit held for the whole
+  handler), maps only genuine session absence to 404 and unreadable storage
+  or internal failure to sanitized 500s, and returns provider-level failures
+  as `200 ok:false` like the prompt path. No compaction logic in the daemon.
 - Session-config RPC v1 is `GET/PATCH /v1/agent/sessions/{id}/config`;
   PATCH accepts strict model-only JSON (malformed or extra-key bodies return
   exact `400 {"ok":false,"error":"invalid_request"}`), persists the catalog
