@@ -1163,12 +1163,34 @@ impl Provider for CodexProvider {
                     thinking_signature,
                 }));
             }
+            // DSML salvage: gpt-5.6-family models (Sol observed live
+            // 2026-07-18) sometimes emit DeepSeek DSML tool-call markup as
+            // literal text instead of a structured function call. Same
+            // conservative rules as the OpenAI-compat collector: zero
+            // structured calls, well-formed tail block only.
+            let finalized_tool_calls: Vec<_> = tool_calls.finalize();
+            let mut salvaged_calls: Vec<(String, Value)> = Vec::new();
+            if finalized_tool_calls.is_empty() && model_id.starts_with("gpt-5.6") {
+                if let Some((cleaned, calls)) =
+                    super::openai::salvage_dsml_tool_calls(&text_buf)
+                {
+                    tracing::warn!(
+                        count = calls.len(),
+                        model = %model_id,
+                        "salvaged DSML tool calls leaked as text content"
+                    );
+                    text_buf = cleaned;
+                    salvaged_calls = calls;
+                    stop = StopReason::ToolUse;
+                }
+            }
+
             if let Some(i) = text_index {
                 if !text_buf.is_empty() {
                     pieces.push((i, Content::Text { text: text_buf.clone() }));
                 }
             }
-            for tc in tool_calls.finalize() {
+            for tc in finalized_tool_calls {
                 let args: Value = if tc.args.is_empty() {
                     Value::Object(Default::default())
                 } else {
@@ -1196,6 +1218,18 @@ impl Provider for CodexProvider {
                     name: tc.name,
                     arguments: args,
                 }));
+            }
+            let salvage_base = pieces.iter().map(|(i, _)| *i + 1).max().unwrap_or(0);
+            for (i, (name, arguments)) in salvaged_calls.into_iter().enumerate() {
+                let id = format!("dsml-salvage-{i}");
+                let block_index = salvage_base + i;
+                yield Ok(AssistantMessageEvent::ToolCallEnd {
+                    content_index: block_index,
+                    id: id.clone(),
+                    name: name.clone(),
+                    arguments: arguments.clone(),
+                });
+                pieces.push((block_index, Content::ToolCall { id, name, arguments }));
             }
             pieces.sort_by_key(|(i, _)| *i);
             let out_content: Vec<Content> = pieces.into_iter().map(|(_, c)| c).collect();

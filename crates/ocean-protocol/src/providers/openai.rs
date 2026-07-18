@@ -125,13 +125,15 @@ fn is_blocking_empty_turn(stop: StopReason, has_usable_content: bool) -> bool {
 /// - only called when ZERO structured tool calls arrived, and
 /// - only salvages a block at the TAIL of the text (nothing but whitespace
 ///   after it) — a quoted example mid-document never matches, and
-/// - the caller gates on `provider == "deepseek"`.
+/// - callers gate on the known leakers: the deepseek provider and the
+///   gpt-5.6 family (Sol observed emitting DSML in the wild 2026-07-18 —
+///   evidently trained on DeepSeek traces; official endpoint, no routing).
 ///
 /// Returns the text with the block removed plus `(name, arguments)` pairs.
 /// Both the true unicode token (`｜` U+FF5C) and the ASCII-pipe fallback some
 /// serving stacks detokenize to are recognized. A missing closing tag
 /// (truncated emission) still salvages: the block extends to end-of-text.
-fn salvage_dsml_tool_calls(text: &str) -> Option<(String, Vec<(String, Value)>)> {
+pub(crate) fn salvage_dsml_tool_calls(text: &str) -> Option<(String, Vec<(String, Value)>)> {
     const MARKS: [(&str, &str); 2] = [("<｜DSML｜", "</｜DSML｜"), ("<|DSML|", "</|DSML|")];
     for (open, close) in MARKS {
         let start_tag = format!("{open}tool_calls>");
@@ -1081,7 +1083,7 @@ impl Provider for OpenAiProvider {
             // dropping the call. Gated on zero structured tool calls so a
             // well-formed API response is never second-guessed.
             let mut salvaged_calls: Vec<(String, Value)> = Vec::new();
-            if !has_tool_calls && provider == "deepseek" {
+            if !has_tool_calls && (provider == "deepseek" || model_id.starts_with("gpt-5.6")) {
                 if let Some((cleaned, calls)) = salvage_dsml_tool_calls(&text_buf) {
                     tracing::warn!(
                         count = calls.len(),
