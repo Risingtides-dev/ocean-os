@@ -4315,3 +4315,11 @@ type:      [feature-request]
 area:      [backend]
 
 Added POST /v1/sessions/{id}/compact: one-shot no-tools model call that replaces a session transcript with a model-generated summary plus protected recent window (20% of context or 20 messages, whichever is tighter). Session is locked for load-call-save; the existing temp+rename atomic persistence ensures interrupted compacts leave the prior state intact. New CompactResponse type in ocean-core; compact_session method on AgentRuntime in ocean-agent. Workspace, core, agent, and daemon compilation clean; ocean-core 48 tests, ocean-agent 164 tests pass.
+_________________________________________________________________________________
+time:      [00:12] [18-07-26]
+agent:     [pi] [gpt-5.6] [worker]
+worktree:  [feat/compact-session]
+type:      [feature-request]
+area:      [backend]
+
+Corrective pass over the initial compact commit (c144c344), left uncommitted for review. CompactResponse now reports elided_messages. compact_session gained the missing production wiring: provider readiness preflight (fail closed), full credential options (base_url, auth method, codex account header, stable session_id for prompt caching), thinking-strip history shaping via the shared route predicate, a trailing user instruction for providers requiring user-last requests, and a 300-second wall-clock bound matching the turn budget. The protected window is computed before any model call (a fully-protected transcript is an ok no-op with zero provider spend), is bounded by 20 messages and 20% of context with always-keep-last, and never begins on an orphan tool result. Daemon handler now returns 429 at capacity, 404 only for genuine absence, sanitized 500 for unreadable storage, and 200 otherwise; the route baseline is 86 and the operator guide quick reference documents the route. Added six ocean-agent tests (split bounds, orphan pairing, scripted-provider happy path with on-disk verification, unknown session, corrupt-never-wiped, short-session no-op without model call, provider-error leaves transcript untouched) and two daemon route tests (404 unknown, 429 at capacity).

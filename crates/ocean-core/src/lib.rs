@@ -228,6 +228,10 @@ pub struct CompactResponse {
     pub ok: bool,
     pub session_id: SessionId,
     pub wall_ms: u64,
+    /// How many transcript messages were replaced by the summary. `0` on
+    /// failure and on the "nothing to compact" no-op.
+    #[serde(default)]
+    pub elided_messages: u64,
     pub stderr: String,
 }
 

@@ -39,8 +39,15 @@ This crate owns Ocean's agent session/history layer and project prompt loading. 
   provider encoders still drop cross-provider thinking.
 - `compact_session` is owned here: one-shot no-tools model call, atomically
   replaces session transcript with summary + protected recent window. The
-  session lock must be held for the entire load-call-save cycle. Only
-  current-runtime model is used; session-historical model is ignored.
+  session lock must be held for the entire load-call-save cycle. Only the
+  current-runtime model is used; session-historical model is ignored. The
+  protected window keeps at most 20 messages and at most 20% of the context
+  window (always the newest message) and never begins on an orphan tool
+  result. A fully-protected transcript is an `ok:true` no-op with no model
+  call. Provider readiness fails closed before the call; the call is bounded
+  by the 300-second turn budget; every failure path (not-ready, provider
+  error, timeout, empty summary) leaves the stored transcript untouched, and
+  corrupt storage is an `Err`, never a wipe.
 
 ## Work Guidance
 

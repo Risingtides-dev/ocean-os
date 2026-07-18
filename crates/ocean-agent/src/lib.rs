@@ -299,6 +299,24 @@ pub struct AgentRuntime {
     /// without mutating (and racing on) the global process environment.
     #[cfg(test)]
     test_env: Option<ProviderEnv>,
+    /// Test-only scripted provider for [`AgentRuntime::compact_session`]'s
+    /// one-shot summarize call, mirroring the `test_env` idiom: production
+    /// always dispatches through `ocean_protocol::stream_simple`.
+    #[cfg(test)]
+    test_compact_provider: Option<TestCompactProvider>,
+}
+
+/// Debug-opaque wrapper so the `dyn Provider` test seam doesn't break
+/// `AgentRuntime`'s `#[derive(Debug)]`.
+#[cfg(test)]
+#[derive(Clone)]
+struct TestCompactProvider(Arc<dyn ocean_protocol::Provider>);
+
+#[cfg(test)]
+impl std::fmt::Debug for TestCompactProvider {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("TestCompactProvider")
+    }
 }
 
 impl AgentRuntime {
@@ -327,6 +345,8 @@ impl AgentRuntime {
             hooks,
             #[cfg(test)]
             test_env: None,
+            #[cfg(test)]
+            test_compact_provider: None,
         };
         runtime.migrate_legacy_sessions();
         // Bound on-disk session growth: prune session files past the TTL once
@@ -1331,6 +1351,12 @@ impl AgentRuntime {
     /// plus a protected recent window. Uses the currently configured model in a
     /// one-shot no-tools call. The session is saved atomically; if interrupted
     /// mid-compact the prior state survives.
+    ///
+    /// Failure posture: unknown session, provider-not-ready, provider errors,
+    /// timeouts, and empty summaries all return `ok:false` WITHOUT touching the
+    /// stored transcript. Corrupt session storage is an `Err` (never wiped).
+    /// When the whole transcript already fits inside the protected window the
+    /// call is an `ok:true` no-op and no model call is made.
     pub async fn compact_session(
         &self,
         id: SessionId,
@@ -1338,103 +1364,160 @@ impl AgentRuntime {
         use futures::StreamExt as _;
         use ocean_protocol::{stream_simple, AssistantMessageEvent, Context, StreamOptions};
         let start = std::time::Instant::now();
+        let fail = |stderr: String, start: &std::time::Instant| ocean_core::CompactResponse {
+            ok: false,
+            session_id: id,
+            wall_ms: start.elapsed().as_millis() as u64,
+            elided_messages: 0,
+            stderr,
+        };
 
-        // Lock the session against concurrent turns.
+        // Hold the per-session lock across the whole load → summarize → save
+        // cycle so a concurrent turn cannot interleave and lose its update.
         let lock = self.session_lock(id);
         let _guard = lock.lock().await;
 
         let Some(session) = session::load_resumable(&self.config_dir, id)? else {
-            return Ok(ocean_core::CompactResponse {
-                ok: false,
-                session_id: id,
-                wall_ms: start.elapsed().as_millis() as u64,
-                stderr: "session not found".into(),
-            });
+            return Ok(fail("session not found".into(), &start));
         };
 
-        if session.messages.is_empty() {
+        let snapshot = self.snapshot();
+        let model = snapshot.model.clone();
+
+        // Protected window FIRST: if nothing would be elided (short session),
+        // compacting would only grow the transcript — return a no-op without
+        // spending a model call.
+        let split = compact_protected_split(&session.messages, model.context_window);
+        if split == 0 {
             return Ok(ocean_core::CompactResponse {
                 ok: true,
                 session_id: id,
                 wall_ms: start.elapsed().as_millis() as u64,
-                stderr: "nothing to compact".into(),
+                elided_messages: 0,
+                stderr: "nothing to compact: the transcript fits in the protected window".into(),
             });
         }
 
-        let snapshot = self.snapshot();
-        let model = &snapshot.model;
+        // Readiness preflight — fail closed with a clear reason instead of a
+        // raw transport error when the provider has no usable credential.
+        if let Some(reason) = Self::preflight_error_for(&snapshot) {
+            return Ok(fail(reason, &start));
+        }
 
-        // Build a one-shot no-tools summarization request.
+        // Shape the transcript for the one-shot summarize call exactly like a
+        // real turn would: strip stored assistant thinking on routes that must
+        // not see it replayed (provider encoders drop cross-provider thinking,
+        // this keeps the request minimal), then end on an explicit user
+        // instruction so providers that require a trailing user message accept
+        // the request.
+        let mut summarize_messages = session.messages.clone();
+        let selection = &snapshot.provider_config.selection;
+        if should_strip_assistant_thinking(&selection.provider, &selection.model) {
+            strip_assistant_thinking_content(&mut summarize_messages);
+        }
+        summarize_messages.push(Message::user_text(
+            "Summarize the conversation above now, following the system instructions.",
+        ));
+
         let ctx = Context {
             system_prompt: Some(
-                "You are a compact assistant. Summarize this conversation concisely, \
+                "You are a session summarizer. Summarize this conversation concisely, \
                  preserving key facts, decisions, open tasks, and the user's goals. \
                  Output a plain text summary without markdown formatting."
                     .into(),
             ),
-            messages: session.messages.clone(),
+            messages: summarize_messages,
             tools: Vec::new(),
             dynamic_tool_declarations: Vec::new(),
             tool_choice: Default::default(),
         };
 
-        let options = StreamOptions {
+        // Full credential wiring, mirroring `complete_once`: api key, provider
+        // base URL, auth method, and the codex account header when present.
+        // `session_id` keeps provider prompt-cache routing stable for the
+        // session being compacted.
+        let mut options = StreamOptions {
             max_tokens: Some(model.max_tokens / 4),
             api_key: snapshot.api_key.clone(),
+            base_url: Some(snapshot.provider_config.selection.base_url.clone()),
+            auth: auth_method_for(&snapshot.provider_config),
+            session_id: Some(id.to_string()),
             ..Default::default()
         };
-        // Cross-provider thinking is not needed for a summary and may waste
-        // tokens; leave reasoning unset so each provider uses its default.
-
-        let mut summary = String::new();
-        let mut stream = stream_simple(model, &ctx, &options).await?;
-        while let Some(event) = stream.next().await {
-            match event? {
-                AssistantMessageEvent::TextDelta { delta, .. } => {
-                    summary.push_str(&delta);
-                }
-                AssistantMessageEvent::Done { .. } => break,
-                AssistantMessageEvent::Error { error, .. } => {
-                    let msg = error
-                        .error_message
-                        .unwrap_or_else(|| "compact: provider error".into());
-                    return Ok(ocean_core::CompactResponse {
-                        ok: false,
-                        session_id: id,
-                        wall_ms: start.elapsed().as_millis() as u64,
-                        stderr: msg,
-                    });
-                }
-                _ => {}
-            }
+        if let Some(account_id) = &snapshot.provider_config.account_id {
+            options
+                .headers
+                .insert("chatgpt-account-id".into(), account_id.clone());
         }
+
+        // One-shot, no-tools, bounded by the same wall-clock budget as a
+        // provider round in a real turn. Provider trouble of any kind returns
+        // `ok:false` and leaves the stored transcript untouched.
+        let summarize = async {
+            #[cfg(test)]
+            let stream_res = match self.test_compact_provider.as_ref() {
+                Some(provider) => provider.0.stream(&model, &ctx, &options).await,
+                None => stream_simple(&model, &ctx, &options).await,
+            };
+            #[cfg(not(test))]
+            let stream_res = stream_simple(&model, &ctx, &options).await;
+
+            let mut stream = match stream_res {
+                Ok(stream) => stream,
+                Err(e) => return Err(format!("compact: provider dispatch failed: {e}")),
+            };
+            let mut text = String::new();
+            while let Some(event) = stream.next().await {
+                match event {
+                    Ok(AssistantMessageEvent::TextDelta { delta, .. }) => text.push_str(&delta),
+                    Ok(AssistantMessageEvent::Done { message, .. }) => {
+                        // Some providers emit only a terminal message and no
+                        // deltas — fall back to the finalized text.
+                        if text.is_empty() {
+                            for c in &message.content {
+                                if let Content::Text { text: t } = c {
+                                    text.push_str(t);
+                                }
+                            }
+                        }
+                        break;
+                    }
+                    Ok(AssistantMessageEvent::Error { error, .. }) => {
+                        return Err(error
+                            .error_message
+                            .unwrap_or_else(|| "compact: provider error".into()));
+                    }
+                    Ok(_) => {}
+                    Err(e) => return Err(format!("compact: provider stream failed: {e}")),
+                }
+            }
+            Ok(text)
+        };
+        let summary = match tokio::time::timeout(
+            std::time::Duration::from_secs(COMPACT_TIMEOUT_SECS),
+            summarize,
+        )
+        .await
+        {
+            Ok(Ok(text)) => text.trim().to_string(),
+            Ok(Err(stderr)) => return Ok(fail(stderr, &start)),
+            Err(_elapsed) => {
+                return Ok(fail(
+                    format!("compact: model call timed out after {COMPACT_TIMEOUT_SECS}s"),
+                    &start,
+                ))
+            }
+        };
 
         if summary.is_empty() {
-            return Ok(ocean_core::CompactResponse {
-                ok: false,
-                session_id: id,
-                wall_ms: start.elapsed().as_millis() as u64,
-                stderr: "compact: model returned empty summary".into(),
-            });
+            return Ok(fail(
+                "compact: model returned an empty summary".into(),
+                &start,
+            ));
         }
 
-        // Compute the protected recent window: at most 20 messages AND at most
-        // 20% of the context window in estimated tokens, whichever is tighter.
-        let protect_tokens = (model.context_window as usize).saturating_mul(20) / 100;
-        let mut kept_tokens = 0usize;
-        let mut protected_count = 0usize;
-        for msg in session.messages.iter().rev() {
-            if protected_count >= 20 {
-                break;
-            }
-            kept_tokens = kept_tokens.saturating_add(estimate_tokens(msg));
-            if kept_tokens > protect_tokens {
-                break;
-            }
-            protected_count += 1;
-        }
-        let split = session.messages.len().saturating_sub(protected_count);
         let protected = &session.messages[split..];
+        let elided_messages = split as u64;
 
         // Build the replacement transcript: summary marker + summary + protected window.
         let mut new_messages = vec![
@@ -1455,7 +1538,8 @@ impl AgentRuntime {
         ];
         new_messages.extend_from_slice(protected);
 
-        // Atomically replace the session transcript.
+        // Atomically replace the session transcript (temp + fsync + rename in
+        // `session::save`); a crash mid-save leaves the prior file intact.
         let mut updated = session;
         updated.messages = new_messages;
         updated.updated_ms = ocean_protocol::now_ms();
@@ -1465,6 +1549,7 @@ impl AgentRuntime {
             ok: true,
             session_id: id,
             wall_ms: start.elapsed().as_millis() as u64,
+            elided_messages,
             stderr: String::new(),
         })
     }
@@ -3059,6 +3144,55 @@ fn strip_assistant_thinking_content(messages: &mut [Message]) {
 /// cost, well above what any single coherent task needs.
 const MAX_SESSION_MESSAGES: usize = 200;
 
+/// Wall-clock bound on the operator-invoked `compact_session` model call — the
+/// same budget as one provider round in a real turn
+/// (`ocean_runtime::types::AgentConfig::DEFAULT_TURN_TIMEOUT_SECS`).
+const COMPACT_TIMEOUT_SECS: u64 = 300;
+
+/// Operator compaction keeps at most this many most-recent messages verbatim.
+const COMPACT_PROTECT_MAX_MESSAGES: usize = 20;
+
+/// Index where operator compaction (`compact_session`) splits the transcript:
+/// `messages[..split]` is replaced by the model summary, `messages[split..]`
+/// is the protected recent window kept verbatim. `0` means nothing would be
+/// elided (the whole transcript fits the protected window — compaction is a
+/// no-op).
+///
+/// The window is bounded by BOTH [`COMPACT_PROTECT_MAX_MESSAGES`] and 20% of
+/// the model context window (by the shared [`estimate_tokens`] heuristic),
+/// whichever is tighter — except the newest message, which is always
+/// protected (mirroring `trim_to_context_window`'s always-keep-last rule).
+/// The window never BEGINS on a `ToolResult`: a result whose originating
+/// assistant tool call was elided into the summary would be provider-invalid
+/// (Anthropic/OpenAI both 400 on an orphan result), so leading orphans are
+/// pushed out of the window and into the summarized region — the same
+/// direction `trim_to_context_window` resolves the split-pair hazard.
+fn compact_protected_split(messages: &[Message], context_window: u32) -> usize {
+    if messages.is_empty() {
+        return 0;
+    }
+    let protect_tokens = (context_window as usize) / 5;
+    let mut kept_tokens = 0usize;
+    let mut start = messages.len();
+    for (idx, msg) in messages.iter().enumerate().rev() {
+        if messages.len() - idx > COMPACT_PROTECT_MAX_MESSAGES {
+            break;
+        }
+        let cost = estimate_tokens(msg);
+        let is_last = idx == messages.len() - 1;
+        if !is_last && kept_tokens + cost > protect_tokens {
+            break;
+        }
+        kept_tokens += cost;
+        start = idx;
+    }
+    // Never start the protected window on an orphan tool result.
+    while start < messages.len() && matches!(messages[start], Message::ToolResult(_)) {
+        start += 1;
+    }
+    start
+}
+
 /// Marker replacing an elided tool-result body during compaction. Tells the
 /// model exactly what happened and how to recover, instead of silently
 /// vanishing content it may reference.
@@ -3620,6 +3754,293 @@ mod tests {
         // rewrites zero messages, so the prefix stays byte-identical.
         let again = compact_history(&mut msgs, 40_000);
         assert_eq!(again, 0, "second pass must not churn bytes");
+    }
+
+    // --- operator compaction: compact_protected_split ------------------------
+
+    fn big_user(chars: usize) -> Message {
+        Message::user_text("x".repeat(chars))
+    }
+
+    /// Window bounds: empty and short transcripts are fully protected (split
+    /// 0); a lone oversized message is still protected (always-keep-last); the
+    /// token bound tightens the window; the 20-message count cap binds when
+    /// tokens are plentiful.
+    #[test]
+    fn compact_protected_split_bounds_by_count_tokens_and_keeps_last() {
+        // Empty and small-session transcripts: nothing to elide.
+        assert_eq!(compact_protected_split(&[], 1_000), 0);
+        let small: Vec<Message> = (0..3).map(|_| big_user(10)).collect();
+        assert_eq!(compact_protected_split(&small, 1_000), 0);
+
+        // A single message larger than the whole budget is still protected.
+        let huge = vec![big_user(10_000)];
+        assert_eq!(compact_protected_split(&huge, 1_000), 0);
+
+        // Token bound: 6 × 600-char messages against a 1K window (200-token
+        // protect budget) protects only a newest suffix; the split is > 0 and
+        // the protected side stays within the budget plus the always-kept last.
+        let long: Vec<Message> = (0..6).map(|_| big_user(600)).collect();
+        let split = compact_protected_split(&long, 1_000);
+        assert!(split > 0, "a long transcript must have an elidable prefix");
+        assert!(split < long.len(), "the newest message must stay protected");
+
+        // Count cap: with an enormous token budget the 20-message cap binds.
+        let many: Vec<Message> = (0..30).map(|_| big_user(10)).collect();
+        assert_eq!(
+            compact_protected_split(&many, 1_000_000),
+            10,
+            "20-message cap must bound the protected window"
+        );
+    }
+
+    /// The protected window must never BEGIN on a tool result whose
+    /// originating assistant call was elided — that orphan pair split is
+    /// provider-invalid. Leading orphans are pushed into the summarized side.
+    #[test]
+    fn compact_protected_split_never_starts_on_an_orphan_tool_result() {
+        // Big user + BIG assistant tool-call + result + small tail. The token
+        // walk breaks inside the pair so the naive boundary lands on the
+        // ToolResult; the split must advance past it.
+        let call = Message::Assistant(ocean_protocol::AssistantMessage {
+            content: vec![ocean_protocol::Content::ToolCall {
+                id: "c1".into(),
+                name: "read".into(),
+                arguments: serde_json::json!({ "pad": "y".repeat(600) }),
+            }],
+            api: "test".into(),
+            provider: "test".into(),
+            model: "test".into(),
+            usage: Default::default(),
+            stop_reason: ocean_protocol::StopReason::ToolUse,
+            error_message: None,
+            timestamp: 0,
+        });
+        let result = Message::ToolResult(ocean_protocol::ToolResultMessage {
+            tool_call_id: "c1".into(),
+            tool_name: "read".into(),
+            content: vec![ocean_protocol::Content::text("z".repeat(300))],
+            is_error: false,
+            timestamp: 0,
+        });
+        let msgs = vec![big_user(600), call, result, Message::user_text("tail")];
+
+        let split = compact_protected_split(&msgs, 1_000);
+        assert!(
+            !matches!(msgs[split], Message::ToolResult(_)),
+            "protected window must not begin on an orphan tool result (split {split})"
+        );
+        assert_eq!(split, 3, "the orphan result joins the summarized region");
+    }
+
+    // --- operator compaction: compact_session end-to-end ----------------------
+
+    /// Scripted no-tools provider for `compact_session`: replays a fixed event
+    /// script and counts invocations (so no-op paths can prove the model was
+    /// never called).
+    struct ScriptedCompactProvider {
+        calls: Arc<std::sync::atomic::AtomicUsize>,
+        script: Vec<ocean_protocol::AssistantMessageEvent>,
+    }
+    #[async_trait]
+    impl ocean_protocol::Provider for ScriptedCompactProvider {
+        async fn stream(
+            &self,
+            _model: &ocean_protocol::Model,
+            _ctx: &ocean_protocol::Context,
+            _options: &ocean_protocol::StreamOptions,
+        ) -> ocean_protocol::Result<ocean_protocol::AssistantMessageEventStream> {
+            self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let events: Vec<ocean_protocol::Result<ocean_protocol::AssistantMessageEvent>> =
+                self.script.clone().into_iter().map(Ok).collect();
+            Ok(Box::pin(futures::stream::iter(events)))
+        }
+    }
+
+    fn scripted_assistant(text: &str) -> ocean_protocol::AssistantMessage {
+        ocean_protocol::AssistantMessage {
+            content: vec![Content::text(text)],
+            api: "test".into(),
+            provider: "test".into(),
+            model: "scripted".into(),
+            usage: Default::default(),
+            stop_reason: ocean_protocol::StopReason::Stop,
+            error_message: None,
+            timestamp: 0,
+        }
+    }
+
+    /// Runtime with a ready fake-provider config plus a scripted compact
+    /// provider; returns the call counter for no-op assertions.
+    fn compact_runtime(
+        name: &str,
+        script: Vec<ocean_protocol::AssistantMessageEvent>,
+    ) -> (AgentRuntime, Arc<std::sync::atomic::AtomicUsize>) {
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let mut rt = runtime(
+            temp_config_dir(name),
+            provider_config(ProviderId::Fake, "fake-ok", false),
+        );
+        rt.test_compact_provider = Some(TestCompactProvider(Arc::new(ScriptedCompactProvider {
+            calls: calls.clone(),
+            script,
+        })));
+        (rt, calls)
+    }
+
+    /// Persist a session with the given transcript under the runtime's config
+    /// dir, returning its id and on-disk path.
+    fn seeded_session(rt: &AgentRuntime, messages: Vec<Message>) -> (SessionId, PathBuf) {
+        let model = rt.snapshot().model.clone();
+        let mut session = session::Session::new(&model);
+        session.bind_workspace(Path::new("."));
+        session.messages = messages;
+        let path = session::save(&rt.config_dir, &session).expect("seed session");
+        (session.id, path)
+    }
+
+    #[tokio::test]
+    async fn compact_session_replaces_transcript_with_summary_and_protected_window() {
+        let (rt, calls) = compact_runtime(
+            "compact-happy",
+            vec![
+                ocean_protocol::AssistantMessageEvent::TextDelta {
+                    content_index: 0,
+                    delta: "SUMMARY OF THE OLD CONVERSATION".into(),
+                },
+                ocean_protocol::AssistantMessageEvent::Done {
+                    reason: ocean_protocol::StopReason::Stop,
+                    message: scripted_assistant(""),
+                },
+            ],
+        );
+        let original: Vec<Message> = (0..6).map(|_| big_user(600)).collect();
+        let expected_split = compact_protected_split(&original, rt.snapshot().model.context_window);
+        assert!(expected_split > 0, "fixture must actually need compaction");
+        let (id, _path) = seeded_session(&rt, original.clone());
+
+        let res = rt.compact_session(id).await.expect("compact runs");
+        assert!(res.ok, "compact must succeed: {}", res.stderr);
+        assert_eq!(res.elided_messages, expected_split as u64);
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+
+        // Reload FROM DISK: the atomic save is the observable contract.
+        let saved = session::load(&rt.config_dir, id).expect("reload compacted session");
+        assert_eq!(
+            saved.messages.len(),
+            2 + (original.len() - expected_split),
+            "marker + summary + protected window"
+        );
+        let Message::User { content, .. } = &saved.messages[0] else {
+            panic!("first message must be the compaction marker");
+        };
+        assert!(content[0]
+            .as_text()
+            .unwrap()
+            .contains("The session was compacted"));
+        let Message::Assistant(summary) = &saved.messages[1] else {
+            panic!("second message must carry the summary");
+        };
+        assert_eq!(
+            summary.content[0].as_text(),
+            Some("SUMMARY OF THE OLD CONVERSATION")
+        );
+        // The protected tail is the original suffix, verbatim.
+        let tail = &saved.messages[2..];
+        for (kept, orig) in tail.iter().zip(&original[expected_split..]) {
+            assert_eq!(
+                serde_json::to_string(kept).unwrap(),
+                serde_json::to_string(orig).unwrap(),
+                "protected messages must be byte-identical"
+            );
+        }
+        let _ = std::fs::remove_dir_all(&rt.config_dir);
+    }
+
+    #[tokio::test]
+    async fn compact_session_unknown_session_is_a_clean_error() {
+        let (rt, calls) = compact_runtime("compact-unknown", Vec::new());
+        let res = rt
+            .compact_session(SessionId::new_v4())
+            .await
+            .expect("unknown session is a response, not an Err");
+        assert!(!res.ok);
+        assert_eq!(res.stderr, "session not found");
+        assert_eq!(res.elided_messages, 0);
+        assert_eq!(
+            calls.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "no model call for an unknown session"
+        );
+        let _ = std::fs::remove_dir_all(&rt.config_dir);
+    }
+
+    #[tokio::test]
+    async fn compact_session_corrupt_session_errors_without_wiping() {
+        let (rt, calls) = compact_runtime("compact-corrupt", Vec::new());
+        let (id, path) = seeded_session(&rt, vec![big_user(600)]);
+        std::fs::write(&path, "{ not json").expect("corrupt the session file");
+
+        let err = rt
+            .compact_session(id)
+            .await
+            .expect_err("corrupt storage must be an Err, never a fresh session");
+        assert!(!err.to_string().is_empty());
+        assert_eq!(
+            std::fs::read_to_string(&path).expect("file still present"),
+            "{ not json",
+            "a corrupt session file must never be wiped or rewritten"
+        );
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 0);
+        let _ = std::fs::remove_dir_all(&rt.config_dir);
+    }
+
+    #[tokio::test]
+    async fn compact_session_short_session_is_a_noop_without_a_model_call() {
+        let (rt, calls) = compact_runtime("compact-short", Vec::new());
+        let original = vec![Message::user_text("hi"), Message::user_text("there")];
+        let (id, _path) = seeded_session(&rt, original.clone());
+
+        let res = rt.compact_session(id).await.expect("noop compact runs");
+        assert!(res.ok);
+        assert_eq!(res.elided_messages, 0);
+        assert!(res.stderr.contains("nothing to compact"));
+        assert_eq!(
+            calls.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "a fully-protected transcript must not spend a model call"
+        );
+        let saved = session::load(&rt.config_dir, id).expect("reload");
+        assert_eq!(saved.messages.len(), original.len(), "transcript untouched");
+        let _ = std::fs::remove_dir_all(&rt.config_dir);
+    }
+
+    #[tokio::test]
+    async fn compact_session_provider_error_leaves_transcript_untouched() {
+        let mut error = scripted_assistant("");
+        error.stop_reason = ocean_protocol::StopReason::Error;
+        error.error_message = Some("boom".into());
+        let (rt, _calls) = compact_runtime(
+            "compact-provider-error",
+            vec![ocean_protocol::AssistantMessageEvent::Error {
+                reason: ocean_protocol::StopReason::Error,
+                error,
+            }],
+        );
+        let original: Vec<Message> = (0..6).map(|_| big_user(600)).collect();
+        let (id, _path) = seeded_session(&rt, original.clone());
+
+        let res = rt.compact_session(id).await.expect("error is a response");
+        assert!(!res.ok);
+        assert_eq!(res.stderr, "boom");
+        assert_eq!(res.elided_messages, 0);
+        let saved = session::load(&rt.config_dir, id).expect("reload");
+        assert_eq!(
+            saved.messages.len(),
+            original.len(),
+            "a failed compact must leave the transcript untouched"
+        );
+        let _ = std::fs::remove_dir_all(&rt.config_dir);
     }
 
     #[cfg(unix)]
@@ -4185,6 +4606,7 @@ done
             session_locks: Arc::new(std::sync::Mutex::new(HashMap::new())),
             hooks: ocean_hooks::HooksConfig::default(),
             test_env,
+            test_compact_provider: None,
         }
     }
 
