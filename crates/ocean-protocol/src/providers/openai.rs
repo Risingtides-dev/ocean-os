@@ -110,6 +110,112 @@ fn is_blocking_empty_turn(stop: StopReason, has_usable_content: bool) -> bool {
     stop == StopReason::Error && !has_usable_content
 }
 
+/// DSML tool-call salvage for DeepSeek-family models.
+///
+/// DeepSeek V3.2+ models emit tool calls in DSML markup (`<｜DSML｜tool_calls>`
+/// blocks with `invoke`/`parameter` elements). The first-party API parses that
+/// server-side into structured `tool_calls` deltas — but when the serving
+/// stack fails to parse (sampling glitches, third-party hosts of DeepSeek
+/// weights without a DSML parser), the raw markup arrives as `content` text.
+/// Without salvage the runtime would render the markup verbatim in the
+/// transcript and silently drop the model's intended tool call.
+///
+/// Deliberately conservative to avoid firing on prose that merely *discusses*
+/// DSML (e.g. a transcript quoting leaked markup):
+/// - only called when ZERO structured tool calls arrived, and
+/// - only salvages a block at the TAIL of the text (nothing but whitespace
+///   after it) — a quoted example mid-document never matches, and
+/// - the caller gates on `provider == "deepseek"`.
+///
+/// Returns the text with the block removed plus `(name, arguments)` pairs.
+/// Both the true unicode token (`｜` U+FF5C) and the ASCII-pipe fallback some
+/// serving stacks detokenize to are recognized. A missing closing tag
+/// (truncated emission) still salvages: the block extends to end-of-text.
+fn salvage_dsml_tool_calls(text: &str) -> Option<(String, Vec<(String, Value)>)> {
+    const MARKS: [(&str, &str); 2] = [("<｜DSML｜", "</｜DSML｜"), ("<|DSML|", "</|DSML|")];
+    for (open, close) in MARKS {
+        let start_tag = format!("{open}tool_calls>");
+        let end_tag = format!("{close}tool_calls>");
+        let Some(start) = text.find(&start_tag) else {
+            continue;
+        };
+        let body_start = start + start_tag.len();
+        let (body, after) = match text[body_start..].find(&end_tag) {
+            Some(rel) => (
+                &text[body_start..body_start + rel],
+                &text[body_start + rel + end_tag.len()..],
+            ),
+            None => (&text[body_start..], ""),
+        };
+        // Refuse mid-document blocks: salvage only a trailing emission.
+        if !after.trim().is_empty() {
+            return None;
+        }
+        let calls = parse_dsml_invokes(body, open, close)?;
+        if calls.is_empty() {
+            return None;
+        }
+        let cleaned = text[..start].trim_end().to_string();
+        return Some((cleaned, calls));
+    }
+    None
+}
+
+/// Parse the `invoke` elements inside a DSML `tool_calls` block body.
+/// `string="false"` parameters are decoded as JSON scalars/objects
+/// (falling back to the raw string); everything else stays a string.
+/// Returns None on structurally broken markup (better to leave the text
+/// untouched than to guess).
+fn parse_dsml_invokes(body: &str, open: &str, close: &str) -> Option<Vec<(String, Value)>> {
+    let invoke_open = format!("{open}invoke name=\"");
+    let invoke_close = format!("{close}invoke>");
+    let param_open = format!("{open}parameter name=\"");
+    let param_close = format!("{close}parameter>");
+    let mut calls = Vec::new();
+    let mut rest = body;
+    while let Some(pos) = rest.find(invoke_open.as_str()) {
+        let after_name = &rest[pos + invoke_open.len()..];
+        let name_end = after_name.find('"')?;
+        let name = &after_name[..name_end];
+        let after_header = &after_name[name_end..];
+        let header_close = after_header.find('>')?;
+        let invoke_body_start = &after_header[header_close + 1..];
+        let (invoke_body, next_rest) = match invoke_body_start.find(invoke_close.as_str()) {
+            Some(rel) => (
+                &invoke_body_start[..rel],
+                &invoke_body_start[rel + invoke_close.len()..],
+            ),
+            None => (invoke_body_start, ""),
+        };
+        let mut args = serde_json::Map::new();
+        let mut prest = invoke_body;
+        while let Some(ppos) = prest.find(param_open.as_str()) {
+            let after_pname = &prest[ppos + param_open.len()..];
+            let pname_end = after_pname.find('"')?;
+            let pname = &after_pname[..pname_end];
+            let after_attr = &after_pname[pname_end..];
+            let tag_end = after_attr.find('>')?;
+            let is_string = !after_attr[..tag_end].contains("string=\"false\"");
+            let val_start = &after_attr[tag_end + 1..];
+            let (raw, nrest) = match val_start.find(param_close.as_str()) {
+                Some(rel) => (&val_start[..rel], &val_start[rel + param_close.len()..]),
+                None => (val_start, ""),
+            };
+            let value = if is_string {
+                Value::String(raw.to_string())
+            } else {
+                serde_json::from_str(raw.trim())
+                    .unwrap_or_else(|_| Value::String(raw.trim().to_string()))
+            };
+            args.insert(pname.to_string(), value);
+            prest = nrest;
+        }
+        calls.push((name.to_string(), Value::Object(args)));
+        rest = next_rest;
+    }
+    Some(calls)
+}
+
 #[derive(Deserialize, Debug, Default)]
 struct ChunkDelta {
     #[serde(default)]
@@ -969,6 +1075,28 @@ impl Provider for OpenAiProvider {
                 return;
             }
 
+            // DSML salvage (DeepSeek only): a serving stack that failed to
+            // parse the model's DSML markup hands us the tool call as literal
+            // text. Recover the intent instead of rendering markup and
+            // dropping the call. Gated on zero structured tool calls so a
+            // well-formed API response is never second-guessed.
+            let mut salvaged_calls: Vec<(String, Value)> = Vec::new();
+            if !has_tool_calls && provider == "deepseek" {
+                if let Some((cleaned, calls)) = salvage_dsml_tool_calls(&text_buf) {
+                    tracing::warn!(
+                        count = calls.len(),
+                        "salvaged DSML tool calls leaked as text content"
+                    );
+                    text_buf = cleaned;
+                    salvaged_calls = calls;
+                }
+            }
+            let stop = if salvaged_calls.is_empty() {
+                stop
+            } else {
+                StopReason::ToolUse
+            };
+
             let mut out_content: Vec<Content> = Vec::new();
             if !thinking_buf.is_empty() {
                 out_content.push(Content::Thinking {
@@ -1002,6 +1130,19 @@ impl Provider for OpenAiProvider {
                 });
             }
 
+            for (i, (name, arguments)) in salvaged_calls.into_iter().enumerate() {
+                let id = format!("dsml-salvage-{i}");
+                let block_index = next_block_index;
+                next_block_index += 1;
+                yield Ok(AssistantMessageEvent::ToolCallEnd {
+                    content_index: block_index,
+                    id: id.clone(),
+                    name: name.clone(),
+                    arguments: arguments.clone(),
+                });
+                out_content.push(Content::ToolCall { id, name, arguments });
+            }
+
             let message = AssistantMessage {
                 content: out_content,
                 api,
@@ -1026,6 +1167,71 @@ impl Provider for OpenAiProvider {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── DSML salvage (DeepSeek tool calls leaked as text) ────────────────
+
+    fn dsml_block() -> String {
+        [
+            "<｜DSML｜tool_calls>",
+            "<｜DSML｜invoke name=\"read\">",
+            "<｜DSML｜parameter name=\"limit\" string=\"false\">100</｜DSML｜parameter>",
+            "<｜DSML｜parameter name=\"offset\" string=\"false\">1793</｜DSML｜parameter>",
+            "<｜DSML｜parameter name=\"path\" string=\"true\">/tmp/x/src/components.rs</｜DSML｜parameter>",
+            "</｜DSML｜invoke>",
+            "</｜DSML｜tool_calls>",
+        ]
+        .join("\n")
+    }
+
+    #[test]
+    fn dsml_salvage_recovers_trailing_tool_call() {
+        let text = format!("Let me look at that file.\n\n{}", dsml_block());
+        let (cleaned, calls) = salvage_dsml_tool_calls(&text).expect("salvage fires");
+        assert_eq!(cleaned, "Let me look at that file.");
+        assert_eq!(calls.len(), 1);
+        let (name, args) = &calls[0];
+        assert_eq!(name, "read");
+        assert_eq!(args["limit"], serde_json::json!(100));
+        assert_eq!(args["offset"], serde_json::json!(1793));
+        assert_eq!(args["path"], serde_json::json!("/tmp/x/src/components.rs"));
+    }
+
+    #[test]
+    fn dsml_salvage_accepts_ascii_pipe_and_truncated_close() {
+        // ASCII-pipe detokenization, closing tool_calls tag lost to truncation.
+        let text = "<|DSML|tool_calls>\n<|DSML|invoke name=\"bash\">\n<|DSML|parameter name=\"command\" string=\"true\">ls -la</|DSML|parameter>\n</|DSML|invoke>";
+        let (cleaned, calls) = salvage_dsml_tool_calls(text).expect("salvage fires");
+        assert_eq!(cleaned, "");
+        assert_eq!(calls[0].0, "bash");
+        assert_eq!(calls[0].1["command"], serde_json::json!("ls -la"));
+    }
+
+    #[test]
+    fn dsml_salvage_refuses_mid_document_blocks() {
+        // A transcript QUOTING leaked markup, followed by prose, must not be
+        // rewritten into a live tool call.
+        let text = format!("Look at this leak:\n{}\nWild, right?", dsml_block());
+        assert!(salvage_dsml_tool_calls(&text).is_none());
+    }
+
+    #[test]
+    fn dsml_salvage_ignores_plain_text_and_empty_blocks() {
+        assert!(salvage_dsml_tool_calls("no markup here").is_none());
+        assert!(
+            salvage_dsml_tool_calls("<｜DSML｜tool_calls></｜DSML｜tool_calls>").is_none(),
+            "block without invokes must not fire"
+        );
+    }
+
+    #[test]
+    fn dsml_salvage_parses_multiple_invokes() {
+        let text = "<|DSML|tool_calls><|DSML|invoke name=\"a\"></|DSML|invoke><|DSML|invoke name=\"b\"><|DSML|parameter name=\"n\" string=\"false\">2</|DSML|parameter></|DSML|invoke></|DSML|tool_calls>";
+        let (_, calls) = salvage_dsml_tool_calls(text).expect("salvage fires");
+        assert_eq!(calls.len(), 2);
+        assert_eq!(calls[0].0, "a");
+        assert_eq!(calls[1].0, "b");
+        assert_eq!(calls[1].1["n"], serde_json::json!(2));
+    }
 
     fn test_body(model: &Model, context: &Context, options: &StreamOptions) -> Value {
         super::build_body(model, context, options).expect("request body should build")
