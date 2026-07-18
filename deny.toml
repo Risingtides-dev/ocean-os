@@ -35,9 +35,9 @@ unmaintained = "workspace"
 
 [licenses]
 version = 2
-# The workspace is MIT. Allow the common permissive Rust-ecosystem licenses;
-# anything NOT in this list is denied automatically (v2 has no separate deny
-# list), which is how copyleft (GPL/AGPL/LGPL) gets blocked.
+# The workspace is MIT OR Apache-2.0. Allow the common permissive
+# Rust-ecosystem licenses; anything NOT in this list is denied automatically.
+# Cargo-deny v2 has no separate deny list, so copyleft is blocked by omission.
 allow = [
     "MIT",
     "Apache-2.0",

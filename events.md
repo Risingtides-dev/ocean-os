@@ -4830,3 +4830,12 @@ intersection, acceptance ledger, budget ladder, staging artifact + flow-graph
 sidebar, all 12 acceptance items (a)-(i). Stage A (extension host readiness:
 Phase 1 acceptance gate, Phases 2-3 implementation) is now authorized. Stages B-E
 require their own implementation manifests before code.
+_________________________________________________________________________________
+time:      [23:22] [22-07-26]
+agent:     [pi] [gpt-5.6-sol] [thoth]
+worktree:  [pi/team-distribution-npm-release]
+type:      [gh actions]
+area:      [automations]
+
+Rebased the existing PR #309 packaging commit onto origin/main e088c37f with no conflicts and reconciled the tag-triggered release lane with PR #337's launch-license contract. The npm package now declares `MIT OR Apache-2.0`; its exact 12-file payload and the GitHub archive's exact nine-file payload both carry the root license texts, NOTICE, credits, trademark policy, and a generated full-text dependency-license inventory. Hosted validation exposed that a clean two-binary build had not hydrated every locked source Cargo metadata resolves, so the workflow now prefetches locked Cargo sources before the generator's frozen/offline pass. It downloads cargo-about 0.9.1 only after matching its pinned arm64 asset SHA-256, generates the exact TUI and daemon macOS arm64 normal/build/transitive graphs under `--frozen --fail` twice, requires byte-identical output, and reproduces the applicable Moka and LiveKit protocol NOTICE files discovered in those graphs. Payload tests byte-compare project legal files, inventory/notices, archive membership, checksums, npm/Bun installs, executable links, and sibling binaries. The existing fail-closed ruleset 19331797, artifact-digest-before-extraction, live-tag peel, retry-safe publication, monotonic npm latest, and installer-owned launchd boundary remain intact; `ocean-update` neither flips `~/.local/libexec/ocean-daemon/current` nor claims to hot-swap a running daemon.
+_________________________________________________________________________________
