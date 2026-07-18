@@ -2884,11 +2884,16 @@ pub fn lsp_servers(cwd: &std::path::Path) -> Vec<LspServerView> {
 }
 
 fn should_strip_assistant_thinking(provider: &ProviderId, model: &str) -> bool {
+    // OpenAiCodex is deliberately NOT in this list: the codex provider stores
+    // encrypted Responses `reasoning` items in thinking_signature and MUST get
+    // them back to replay them — stripping here is what degenerated gpt-5.x
+    // into malformed tool calls across tool rounds. The codex encoder itself
+    // drops any thinking block that isn't its own marked reasoning item, so the
+    // cross-provider privacy drop still holds on that route.
     matches!(
         provider,
         ProviderId::DeepSeek
             | ProviderId::OpenAi
-            | ProviderId::OpenAiCodex
             | ProviderId::OpenAiCompatible
             | ProviderId::MiniMax
     ) || (*provider == ProviderId::Kimi && model != "kimi-k3")

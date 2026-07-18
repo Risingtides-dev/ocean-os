@@ -26,6 +26,16 @@ This crate owns the multi-provider LLM wire protocol layer for Anthropic, OpenAI
 - Codex OAuth turns with a bound Ocean session must use that stable session id
   for both `prompt_cache_key` and the HTTP `session_id`; a fresh UUID is only
   valid for ad-hoc provider calls with no session.
+- Codex (Responses API, `store: false`) must round-trip `reasoning` output
+  items: always request `include: ["reasoning.encrypted_content"]`, capture each
+  item verbatim (minus `status`) behind the `codex-item:` marker in
+  `thinking_signature`, and replay it in stream order immediately before its
+  paired item. A trailing reasoning item with no follower is dropped (the API
+  400s otherwise), and other providers must never forward marker-signed
+  thinking. Dropping these items is the documented trigger for gpt-5.x
+  degeneration into malformed tool calls (harmony `to=functions.*` leakage,
+  token salad in argument strings). Malformed tool-call argument JSON still
+  fails open to `{}` but must WARN with the raw payload.
 - Dynamic tool declarations are ordered request-only Kimi K3 epochs. Only the
   exact `openai-completions`/`kimi`/`kimi-k3` route on Moonshot's official endpoint
   may encode nonempty groups, as content-less `role: system` messages at validated

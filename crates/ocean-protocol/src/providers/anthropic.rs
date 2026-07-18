@@ -208,15 +208,21 @@ fn content_to_block(c: &Content) -> Option<Value> {
         Content::Thinking {
             thinking,
             thinking_signature: Some(signature),
-        } if !signature.is_empty() => Some(json!({
-            "type": "thinking",
-            "thinking": thinking,
-            "signature": signature,
-        })),
+        } if !signature.is_empty()
+            && !signature.starts_with(crate::providers::codex::REASONING_ITEM_MARKER) =>
+        {
+            Some(json!({
+                "type": "thinking",
+                "thinking": thinking,
+                "signature": signature,
+            }))
+        }
         // Anthropic accepts replayed thinking only with its opaque signature.
         // Other providers legitimately produce unsigned reasoning in Ocean's
-        // shared history shape; forwarding it creates an invalid request, while
-        // converting it to text would leak hidden chain-of-thought.
+        // shared history shape — and Codex stores its encrypted reasoning items
+        // behind REASONING_ITEM_MARKER, which is not an Anthropic signature.
+        // Forwarding either creates an invalid request, while converting to
+        // text would leak hidden chain-of-thought.
         Content::Thinking { .. } => None,
         Content::Image { data, mime_type } => Some(json!({
             "type": "image",
@@ -852,6 +858,44 @@ mod tests {
             !serialized.contains("cross-provider private reasoning")
                 && !serialized.contains("reasoning with an empty signature"),
             "unsigned thinking must not reach Anthropic or leak as text: {serialized}"
+        );
+    }
+
+    // Codex stores encrypted Responses reasoning items behind its
+    // REASONING_ITEM_MARKER prefix in thinking_signature. That is NOT an
+    // Anthropic signature — replaying it would 400 the request (and leak
+    // another provider's reasoning payload). It must be dropped like unsigned
+    // thinking.
+    #[test]
+    fn codex_marked_thinking_is_not_replayed_to_anthropic() {
+        let messages = vec![Message::Assistant(AssistantMessage {
+            content: vec![
+                Content::Thinking {
+                    thinking: "codex summary".into(),
+                    thinking_signature: Some(format!(
+                        "{}{}",
+                        crate::providers::codex::REASONING_ITEM_MARKER,
+                        json!({"type": "reasoning", "id": "rs_1", "encrypted_content": "blob"})
+                    )),
+                },
+                Content::text("visible answer"),
+            ],
+            api: "responses".into(),
+            provider: "codex".into(),
+            model: "gpt-5.6".into(),
+            usage: Usage::default(),
+            stop_reason: StopReason::Stop,
+            error_message: None,
+            timestamp: now_ms(),
+        })];
+
+        let out = convert_messages(&messages);
+        let blocks = out[0]["content"].as_array().expect("content blocks");
+        assert_eq!(blocks, &[json!({"type": "text", "text": "visible answer"})]);
+        let serialized = serde_json::to_string(&out).unwrap();
+        assert!(
+            !serialized.contains("encrypted_content") && !serialized.contains("rs_1"),
+            "codex reasoning payload must not reach Anthropic: {serialized}"
         );
     }
 
