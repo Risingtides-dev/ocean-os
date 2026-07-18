@@ -28,7 +28,7 @@ use ocean_agent_sdk::{
     ContextUsage, Federation, LonghouseEvent, Mark, MarkKind, ToolCall, ToolCallId, ToolResult,
 };
 use ocean_core::{
-    EventEnvelope, HealthResponse, OceanEvent, PermissionControlResponse,
+    CompactResponse, EventEnvelope, HealthResponse, OceanEvent, PermissionControlResponse,
     PermissionDecision as PermissionDecisionBody, PermissionDecisionRequest, PermissionId,
     PermissionMode, PermissionStatus, PermissionsResponse, ProjectRef, PromptRequest,
     RequestControlResponse, RequestCreateResponse, RequestId, RequestState, RequestStatus,
@@ -648,6 +648,7 @@ fn app_router(cors: CorsLayer) -> Router<AppState> {
         .merge(room_routes())
         .route("/v1/sessions", get(sessions))
         .route("/v1/sessions/{id}", get(session))
+        .route("/v1/sessions/{id}/compact", post(compact_session))
         // Folder-as-agent classification (read-only): list + resolve agents from
         // the agents root. See docs/specs/folder-as-agent.md.
         .route("/v1/agents", get(agents_list))
@@ -1343,6 +1344,7 @@ fn banner_routes() -> &'static [&'static str] {
         "POST /v1/rooms/persistent/{key}/outbox/retry",
         "GET /v1/sessions",
         "GET /v1/sessions/{id}",
+        "POST /v1/sessions/{id}/compact",
         "GET /v1/agents",
         "GET /v1/agents/{name}",
         "GET /v1/projects",
@@ -5122,6 +5124,79 @@ async fn enrich_session_detail(state: &AppState, session: &mut SessionDetail) {
             }
         }
     });
+}
+
+/// `POST /v1/sessions/{id}/compact` — one-shot no-tools model-summary
+/// compaction of a session transcript. The session is replaced atomically;
+/// interrupted compacts leave the prior state intact.
+///
+/// Status mapping: `429` at concurrent-turn capacity (same limiter as
+/// `prompt`), `404` only for a genuinely absent session, `500` for
+/// unreadable/corrupt session storage or internal failure, `200` otherwise
+/// (including provider-level `ok:false` results, matching the prompt path).
+async fn compact_session(
+    State(state): State<AppState>,
+    Path(session_id): Path<SessionId>,
+) -> (StatusCode, Json<CompactResponse>) {
+    let fail = |stderr: String| CompactResponse {
+        ok: false,
+        session_id,
+        wall_ms: 0,
+        elided_messages: 0,
+        stderr,
+    };
+
+    // Gate: same concurrency limiter as prompt/requests. Reject-at-capacity,
+    // permit held for the whole handler so every exit path releases it.
+    let _turn_permit = match state.turn_limiter.clone().try_acquire_owned() {
+        Ok(permit) => permit,
+        Err(_) => {
+            tracing::warn!(
+                %session_id,
+                "compact: at concurrency cap; rejecting with 429"
+            );
+            return (
+                StatusCode::TOO_MANY_REQUESTS,
+                Json(fail(
+                    "daemon at concurrent-turn capacity; try again shortly".into(),
+                )),
+            );
+        }
+    };
+
+    // Pre-validate existence so a genuinely absent session maps to 404 (the
+    // AGENTS.md contract: only genuine absence is 404; unreadable is 500).
+    // The compaction itself re-validates under the session lock.
+    match state.runtime.session_detail_optional(session_id) {
+        Ok(Some(_)) => {}
+        Ok(None) => {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(fail("session not found".into())),
+            );
+        }
+        Err(error) => {
+            tracing::warn!(%session_id, error = %error, "compact: failed to read session detail");
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(fail("session could not be read".into())),
+            );
+        }
+    }
+
+    match state.runtime.compact_session(session_id).await {
+        Ok(response) => (StatusCode::OK, Json(response)),
+        Err(error) => {
+            // Sanitized 500 (the AGENTS.md contract): anyhow contexts from
+            // storage failures carry filesystem paths — log the detail, return
+            // the same fixed string sibling session handlers use.
+            tracing::warn!(%session_id, error = %error, "compact: failed");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(fail("internal server error".into())),
+            )
+        }
+    }
 }
 
 fn session_run_state(state: RequestState) -> SessionRunState {
@@ -12470,6 +12545,48 @@ mod tests {
             state.requests.read().await.is_empty(),
             "a rejected prompt must not be registered"
         );
+
+        // Free the slot — intake is open again.
+        drop(held);
+        assert_eq!(state.turn_limiter.available_permits(), cap);
+    }
+
+    /// `POST /v1/sessions/{id}/compact` on an unknown session id is a clean
+    /// 404 + `ok:false`, and never mints a session as a side effect.
+    #[tokio::test]
+    async fn compact_unknown_session_is_404_ok_false() {
+        let state = permission_test_state();
+        let ghost = SessionId::new_v4();
+
+        let (status, Json(body)) = compact_session(State(state.clone()), Path(ghost)).await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert!(!body.ok, "unknown session must report ok:false");
+        assert_eq!(body.session_id, ghost);
+        assert_eq!(body.elided_messages, 0);
+        assert!(body.stderr.contains("not found"), "stderr: {}", body.stderr);
+    }
+
+    /// Compact is gated by the same concurrent-turn limiter as `prompt`:
+    /// at capacity it rejects with 429 + `ok:false` and never consumes a
+    /// permit, so intake reopens as soon as the in-flight turn finishes.
+    #[tokio::test]
+    async fn compact_rejects_over_cap_with_429() {
+        let cap = 1usize;
+        let state = capped_turn_state(cap);
+
+        // Hold the only permit to simulate a turn in flight.
+        let held = state
+            .turn_limiter
+            .clone()
+            .try_acquire_owned()
+            .expect("one permit");
+        assert_eq!(state.turn_limiter.available_permits(), 0);
+
+        let (status, Json(body)) =
+            compact_session(State(state.clone()), Path(SessionId::new_v4())).await;
+        assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
+        assert!(!body.ok, "over-cap compact must report ok:false");
+        assert!(body.stderr.contains("capacity"));
 
         // Free the slot — intake is open again.
         drop(held);
@@ -21061,7 +21178,7 @@ mod tests {
         );
         assert_eq!(
             banner.len(),
-            85,
+            86,
             "route baseline changed; review the manifest"
         );
 

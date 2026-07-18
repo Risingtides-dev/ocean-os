@@ -555,6 +555,7 @@ POST   /v1/rooms/{room_id}/livekit-token                  mint a LiveKit join to
 # Sessions (legacy view)
 GET    /v1/sessions                       list sessions
 GET    /v1/sessions/{id}                  session detail / transcript
+POST   /v1/sessions/{id}/compact          replace transcript with model summary + protected recent window (404 unknown, 429 at capacity)
 
 # Folder-as-agent definitions
 GET    /v1/agents                         list discoverable agent folders

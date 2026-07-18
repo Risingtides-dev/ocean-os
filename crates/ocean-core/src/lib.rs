@@ -222,6 +222,19 @@ pub struct PromptResponse {
     pub usage: TokenUsage,
 }
 
+/// Response payload for `POST /v1/sessions/{id}/compact`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct CompactResponse {
+    pub ok: bool,
+    pub session_id: SessionId,
+    pub wall_ms: u64,
+    /// How many transcript messages were replaced by the summary. `0` on
+    /// failure and on the "nothing to compact" no-op.
+    #[serde(default)]
+    pub elided_messages: u64,
+    pub stderr: String,
+}
+
 /// Token usage for a turn, mirrored from `ocean_protocol::Usage` so `ocean-core`
 /// stays free of a protocol dependency. All counts sum across the turn's rounds.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
