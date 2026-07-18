@@ -25,6 +25,14 @@ use crate::types::{
     StreamOptions, ThinkingLevel, Usage,
 };
 
+/// Prefix marking a `thinking_signature` that carries a verbatim Responses API
+/// `reasoning` output item (JSON with `id` + `encrypted_content`). Stateless
+/// replay (`store: false`) must send these items back between tool rounds —
+/// dropping them degrades gpt-5.x into malformed tool calls (harmony-format
+/// leakage like `to=functions.edit` and token salad inside argument strings).
+/// Other providers must treat a signature with this prefix as not-theirs.
+pub(crate) const REASONING_ITEM_MARKER: &str = "codex-item:";
+
 const ORIGINATOR: &str = "codex_cli_rs";
 const OPENAI_BETA: &str = "responses=experimental";
 // ChatGPT's Codex backend version-gates newly released models. Keep this aligned
@@ -102,7 +110,7 @@ fn convert_input(messages: &[Message]) -> Vec<Value> {
             }
             Message::Assistant(a) => {
                 let mut text = String::new();
-                for c in &a.content {
+                for (i, c) in a.content.iter().enumerate() {
                     match c {
                         Content::Text { text: t } => text.push_str(t),
                         Content::ToolCall {
@@ -127,17 +135,48 @@ fn convert_input(messages: &[Message]) -> Vec<Value> {
                                 "call_id": id,
                             }));
                         }
-                        // OCEAN-140: the Responses API replays chain-of-thought
-                        // only via the original `reasoning` items, carried across
-                        // turns as opaque `reasoning.encrypted_content` blobs tied
-                        // to the item id the API emitted. A `reasoning` input item
-                        // cannot be synthesized from free-form text — the API
-                        // rejects reconstructed reasoning. Ocean's
-                        // Content::Thinking carries an Anthropic-style thinking
-                        // string + signature, not an encrypted Responses reasoning
-                        // item, so there is nothing valid to re-encode here. Drop
-                        // it EXPLICITLY rather than via a silent `_ => {}` (kills
-                        // the OCEAN-101 silent-drop class).
+                        // Replay the original Responses `reasoning` item verbatim.
+                        // The stream loop stores it (with `encrypted_content`)
+                        // behind REASONING_ITEM_MARKER in thinking_signature;
+                        // stateless replay needs it back or gpt-5.x degenerates
+                        // into malformed tool calls. The API pairs a reasoning
+                        // item with a FOLLOWING item from the same response, so a
+                        // trailing reasoning item (aborted turn) must be dropped
+                        // rather than 400 the whole request.
+                        Content::Thinking {
+                            thinking_signature: Some(sig),
+                            ..
+                        } if sig.starts_with(REASONING_ITEM_MARKER) => {
+                            let has_follower = a.content[i + 1..].iter().any(|c| {
+                                matches!(c, Content::ToolCall { .. })
+                                    || matches!(c, Content::Text { text } if !text.is_empty())
+                            });
+                            if !has_follower {
+                                continue;
+                            }
+                            if !text.is_empty() {
+                                out.push(json!({
+                                    "type": "message",
+                                    "role": "assistant",
+                                    "content": [{"type": "output_text", "text": text}],
+                                }));
+                                text = String::new();
+                            }
+                            match serde_json::from_str::<Value>(&sig[REASONING_ITEM_MARKER.len()..])
+                            {
+                                Ok(item) => out.push(item),
+                                Err(e) => tracing::warn!(
+                                    error = %e,
+                                    "dropping unparseable stored codex reasoning item"
+                                ),
+                            }
+                        }
+                        // OCEAN-140: any OTHER thinking block (Anthropic-signed,
+                        // unsigned cross-provider reasoning) cannot be re-encoded
+                        // as a Responses `reasoning` item — the API rejects
+                        // reconstructed reasoning. Drop it EXPLICITLY rather than
+                        // via a silent `_ => {}` (kills the OCEAN-101 silent-drop
+                        // class).
                         Content::Thinking { .. } => {}
                         // Images never appear in assistant content on this API.
                         Content::Image { .. } => {}
@@ -275,10 +314,15 @@ fn build_body(model: &Model, context: &Context, options: &StreamOptions) -> Valu
             .collect();
         body["tools"] = json!(tools);
     }
+    // Always request the encrypted reasoning payloads, not just when an explicit
+    // effort is set: gpt-5.x models reason at a server-side default effort even
+    // when Ocean sends no `reasoning` param, and stateless replay (store: false)
+    // needs the encrypted item back on the NEXT turn to keep tool calling
+    // coherent (see REASONING_ITEM_MARKER).
+    body["include"] = json!(["reasoning.encrypted_content"]);
     if let Some(level) = options.reasoning {
         if let Some(effort) = reasoning_effort(level) {
             body["reasoning"] = json!({"effort": effort, "summary": "auto"});
-            body["include"] = json!(["reasoning.encrypted_content"]);
         }
     }
     // OCEAN-176: Codex speaks the OpenAI Responses API, whose output cap is the
@@ -548,6 +592,196 @@ impl ToolCalls {
     }
 }
 
+#[derive(Default)]
+struct PartialReasoning {
+    block_index: usize,
+    /// Human-readable summary streamed via `reasoning_summary_text.delta`
+    /// frames (or pulled from the done item when nothing streamed).
+    summary: String,
+    /// The verbatim `reasoning` output item from `output_item.done`, minus its
+    /// transient `status` field. Replayed on the next turn (see
+    /// REASONING_ITEM_MARKER).
+    raw_item: Option<Value>,
+    started: bool,
+    /// Whether ThinkingStart was already emitted for this block.
+    visible: bool,
+}
+
+/// Item-id-keyed accumulator for streamed `reasoning` output items, sibling to
+/// [`ToolCalls`]. The Responses API emits each reasoning item (`rs_*`) before
+/// the function call(s) it drives; capturing them here (and replaying them in
+/// convert_input) is what keeps gpt-5.x coherent across tool rounds — dropping
+/// them is the documented trigger for malformed tool calls (harmony leakage,
+/// token salad in argument strings).
+#[derive(Default)]
+struct ReasoningItems {
+    by_item: std::collections::BTreeMap<String, PartialReasoning>,
+    order: Vec<String>,
+}
+
+/// What a frame did to the accumulator: which Thinking events to yield.
+struct ReasoningStep {
+    started_index: Option<usize>,
+    delta: Option<(usize, String)>,
+    ended: Option<(usize, String)>,
+}
+
+/// A finalized reasoning item, in stream order.
+struct FinalReasoning {
+    block_index: usize,
+    summary: String,
+    raw_item: Option<Value>,
+}
+
+impl ReasoningItems {
+    fn ensure(&mut self, item_id: &str, next_block_index: &mut usize) -> bool {
+        let exists = self
+            .by_item
+            .get(item_id)
+            .map(|e| e.started)
+            .unwrap_or(false);
+        if exists {
+            return false;
+        }
+        let entry = self.by_item.entry(item_id.to_string()).or_default();
+        entry.block_index = *next_block_index;
+        *next_block_index += 1;
+        entry.started = true;
+        self.order.push(item_id.to_string());
+        true
+    }
+
+    /// Handle `response.reasoning_summary_text.delta`.
+    fn on_summary_delta(
+        &mut self,
+        item_id: &str,
+        delta: &str,
+        next_block_index: &mut usize,
+    ) -> ReasoningStep {
+        self.ensure(item_id, next_block_index);
+        let entry = self.by_item.get_mut(item_id).unwrap();
+        let started_index = (!entry.visible).then_some(entry.block_index);
+        entry.visible = true;
+        entry.summary.push_str(delta);
+        ReasoningStep {
+            started_index,
+            delta: Some((entry.block_index, delta.to_string())),
+            ended: None,
+        }
+    }
+
+    /// Handle `response.reasoning_summary_part.added` for a SECOND (or later)
+    /// summary part: separate parts so their text doesn't jam together.
+    fn on_summary_part_added(
+        &mut self,
+        item_id: &str,
+        next_block_index: &mut usize,
+    ) -> ReasoningStep {
+        let needs_separator = self
+            .by_item
+            .get(item_id)
+            .map(|e| !e.summary.is_empty())
+            .unwrap_or(false);
+        if needs_separator {
+            self.on_summary_delta(item_id, "\n\n", next_block_index)
+        } else {
+            ReasoningStep {
+                started_index: None,
+                delta: None,
+                ended: None,
+            }
+        }
+    }
+
+    /// Handle `response.output_item.done` for a reasoning item: capture the
+    /// verbatim item for replay and close the visible thinking block.
+    fn on_done(&mut self, item: &Value, next_block_index: &mut usize) -> ReasoningStep {
+        let id = item.get("id").and_then(Value::as_str).unwrap_or("");
+        if id.is_empty() {
+            // Without its id the item can't be replayed; nothing to record.
+            return ReasoningStep {
+                started_index: None,
+                delta: None,
+                ended: None,
+            };
+        }
+        self.ensure(id, next_block_index);
+        let entry = self.by_item.get_mut(id).unwrap();
+        let mut raw = item.clone();
+        if let Some(obj) = raw.as_object_mut() {
+            obj.remove("status");
+        }
+        entry.raw_item = Some(raw);
+        // Nothing streamed → fall back to the summary text on the done item.
+        if entry.summary.is_empty() {
+            if let Some(parts) = item.get("summary").and_then(Value::as_array) {
+                let mut texts = parts
+                    .iter()
+                    .filter_map(|p| p.get("text").and_then(Value::as_str))
+                    .filter(|t| !t.is_empty());
+                if let Some(first) = texts.next() {
+                    entry.summary.push_str(first);
+                    for t in texts {
+                        entry.summary.push_str("\n\n");
+                        entry.summary.push_str(t);
+                    }
+                }
+            }
+        }
+        // Close the visible block: if summary deltas already opened it, just
+        // end it; if there's late summary text, open+end; a summary-less item
+        // stays invisible (captured for replay only, no empty thinking card).
+        if entry.visible {
+            ReasoningStep {
+                started_index: None,
+                delta: None,
+                ended: Some((entry.block_index, entry.summary.clone())),
+            }
+        } else if !entry.summary.is_empty() {
+            entry.visible = true;
+            ReasoningStep {
+                started_index: Some(entry.block_index),
+                delta: Some((entry.block_index, entry.summary.clone())),
+                ended: Some((entry.block_index, entry.summary.clone())),
+            }
+        } else {
+            ReasoningStep {
+                started_index: None,
+                delta: None,
+                ended: None,
+            }
+        }
+    }
+
+    /// Finalized reasoning items in stream order.
+    fn finalize(&self) -> Vec<FinalReasoning> {
+        self.order
+            .iter()
+            .filter_map(|k| self.by_item.get(k))
+            .map(|r| FinalReasoning {
+                block_index: r.block_index,
+                summary: r.summary.clone(),
+                raw_item: r.raw_item.clone(),
+            })
+            .collect()
+    }
+}
+
+/// Encode a captured reasoning item as the `thinking_signature` payload, but
+/// only when it carries a non-empty `encrypted_content` — without the blob the
+/// API rejects the replayed item under `store: false`.
+fn reasoning_signature(raw_item: &Option<Value>) -> Option<String> {
+    let item = raw_item.as_ref()?;
+    let encrypted = item
+        .get("encrypted_content")
+        .and_then(Value::as_str)
+        .unwrap_or("");
+    if encrypted.is_empty() {
+        return None;
+    }
+    Some(format!("{REASONING_ITEM_MARKER}{item}"))
+}
+
 #[async_trait]
 impl Provider for CodexProvider {
     async fn stream(
@@ -643,6 +877,9 @@ impl Provider for CodexProvider {
             // together by the Responses item id, so two in-flight calls never
             // collide and each `done` finalizes the exact block it belongs to.
             let mut tool_calls = ToolCalls::default();
+            // Sibling accumulator for `reasoning` output items — captured for
+            // verbatim replay on the next turn (see REASONING_ITEM_MARKER).
+            let mut reasoning = ReasoningItems::default();
             let mut stop = StopReason::Stop;
             let mut usage = Usage::default();
 
@@ -740,8 +977,58 @@ impl Provider for CodexProvider {
                             }
                         }
                     }
+                    // The model narrates its reasoning through summary frames;
+                    // surface them as Thinking events so the operator sees what
+                    // the model is doing between tool calls.
+                    "response.reasoning_summary_text.delta" => {
+                        if let Ok(d) = serde_json::from_value::<ArgsDeltaEvent>(value) {
+                            if d.item_id.is_empty() || d.delta.is_empty() {
+                                continue;
+                            }
+                            let step = reasoning.on_summary_delta(&d.item_id, &d.delta, &mut next_block_index);
+                            if let Some(idx) = step.started_index {
+                                yield Ok(AssistantMessageEvent::ThinkingStart { content_index: idx });
+                            }
+                            if let Some((idx, delta)) = step.delta {
+                                yield Ok(AssistantMessageEvent::ThinkingDelta { content_index: idx, delta });
+                            }
+                        }
+                    }
+                    "response.reasoning_summary_part.added" => {
+                        if let Ok(d) = serde_json::from_value::<ArgsDeltaEvent>(value) {
+                            if d.item_id.is_empty() {
+                                continue;
+                            }
+                            let step = reasoning.on_summary_part_added(&d.item_id, &mut next_block_index);
+                            if let Some((idx, delta)) = step.delta {
+                                yield Ok(AssistantMessageEvent::ThinkingDelta { content_index: idx, delta });
+                            }
+                        }
+                    }
                     "response.output_item.done" => {
-                        if let Ok(done) = serde_json::from_value::<OutputItemEnvelope>(value) {
+                        let item_type = value
+                            .get("item")
+                            .and_then(|i| i.get("type"))
+                            .and_then(Value::as_str)
+                            .unwrap_or("");
+                        if item_type == "reasoning" {
+                            // Capture the verbatim reasoning item (with its
+                            // encrypted_content) for next-turn replay. Dropping
+                            // it is what used to degenerate gpt-5.x into
+                            // malformed tool calls on later rounds.
+                            if let Some(item) = value.get("item") {
+                                let step = reasoning.on_done(item, &mut next_block_index);
+                                if let Some(idx) = step.started_index {
+                                    yield Ok(AssistantMessageEvent::ThinkingStart { content_index: idx });
+                                }
+                                if let Some((idx, delta)) = step.delta {
+                                    yield Ok(AssistantMessageEvent::ThinkingDelta { content_index: idx, delta });
+                                }
+                                if let Some((idx, content)) = step.ended {
+                                    yield Ok(AssistantMessageEvent::ThinkingEnd { content_index: idx, content });
+                                }
+                            }
+                        } else if let Ok(done) = serde_json::from_value::<OutputItemEnvelope>(value) {
                             let item = done.item;
                             if item.r#type == "function_call" {
                                 stop = StopReason::ToolUse;
@@ -864,15 +1151,39 @@ impl Provider for CodexProvider {
                 });
             }
 
-            let mut out_content: Vec<Content> = Vec::new();
-            if !text_buf.is_empty() {
-                out_content.push(Content::Text { text: text_buf.clone() });
+            // Assemble message content in STREAM order (reasoning items come
+            // before the function calls they drive; convert_input replays the
+            // content vec in order, and the API requires each reasoning item to
+            // precede its paired item).
+            let mut pieces: Vec<(usize, Content)> = Vec::new();
+            for r in reasoning.finalize() {
+                let thinking_signature = reasoning_signature(&r.raw_item);
+                pieces.push((r.block_index, Content::Thinking {
+                    thinking: r.summary,
+                    thinking_signature,
+                }));
+            }
+            if let Some(i) = text_index {
+                if !text_buf.is_empty() {
+                    pieces.push((i, Content::Text { text: text_buf.clone() }));
+                }
             }
             for tc in tool_calls.finalize() {
                 let args: Value = if tc.args.is_empty() {
                     Value::Object(Default::default())
                 } else {
-                    serde_json::from_str(&tc.args).unwrap_or(Value::Object(Default::default()))
+                    serde_json::from_str(&tc.args).unwrap_or_else(|e| {
+                        // Fail-open to {} so the turn survives, but LOUDLY: a
+                        // silently emptied call looks like a model bug ("why did
+                        // it call edit with no args?") when it's a parse fault.
+                        tracing::warn!(
+                            tool = %tc.name,
+                            error = %e,
+                            raw = %tc.args,
+                            "codex tool call arguments failed to parse; substituting empty object"
+                        );
+                        Value::Object(Default::default())
+                    })
                 };
                 yield Ok(AssistantMessageEvent::ToolCallEnd {
                     content_index: tc.block_index,
@@ -880,12 +1191,14 @@ impl Provider for CodexProvider {
                     name: tc.name.clone(),
                     arguments: args.clone(),
                 });
-                out_content.push(Content::ToolCall {
+                pieces.push((tc.block_index, Content::ToolCall {
                     id: tc.call_id,
                     name: tc.name,
                     arguments: args,
-                });
+                }));
             }
+            pieces.sort_by_key(|(i, _)| *i);
+            let out_content: Vec<Content> = pieces.into_iter().map(|(_, c)| c).collect();
 
             let message = AssistantMessage {
                 content: out_content,
@@ -1545,5 +1858,172 @@ mod tests {
             "the loop's function_call guard reads this type"
         );
         assert_ne!(env.item.r#type, "function_call");
+    }
+
+    // Stateless replay (store:false) needs the encrypted reasoning payloads on
+    // EVERY request — gpt-5.x reasons at a server default even when Ocean sends
+    // no explicit effort, and dropping the items across tool rounds is the
+    // documented trigger for malformed tool calls (harmony leakage, token salad
+    // in argument strings — observed live from gpt-5.6).
+    #[test]
+    fn build_body_always_requests_encrypted_reasoning() {
+        let body = build_body(
+            &codex_model(),
+            &Context::default(),
+            &StreamOptions::default(),
+        );
+        assert_eq!(
+            body["include"],
+            json!(["reasoning.encrypted_content"]),
+            "include must be requested even with no reasoning option set: {body}"
+        );
+        assert!(
+            body.get("reasoning").is_none(),
+            "no explicit effort → no reasoning param (server default): {body}"
+        );
+    }
+
+    // A thinking block whose signature carries REASONING_ITEM_MARKER holds the
+    // verbatim Responses `reasoning` output item. convert_input must replay it
+    // as-is, positioned BEFORE the function call it drives.
+    #[test]
+    fn codex_reasoning_item_replays_verbatim_before_function_call() {
+        let raw_item = json!({
+            "type": "reasoning",
+            "id": "rs_123",
+            "summary": [{"type": "summary_text", "text": "planning the edit"}],
+            "encrypted_content": "opaque-blob",
+        });
+        let messages = vec![Message::Assistant(AssistantMessage {
+            content: vec![
+                Content::Thinking {
+                    thinking: "planning the edit".into(),
+                    thinking_signature: Some(format!("{REASONING_ITEM_MARKER}{raw_item}")),
+                },
+                Content::ToolCall {
+                    id: "call_1".into(),
+                    name: "edit".into(),
+                    arguments: json!({"path": "/tmp/x"}),
+                },
+            ],
+            api: "responses".into(),
+            provider: "codex".into(),
+            model: "gpt-5.6".into(),
+            usage: Usage::default(),
+            stop_reason: StopReason::ToolUse,
+            error_message: None,
+            timestamp: now_ms(),
+        })];
+
+        let out = convert_input(&messages);
+        assert_eq!(out.len(), 2, "reasoning item + function_call: {out:?}");
+        assert_eq!(out[0], raw_item, "reasoning item must replay verbatim");
+        assert_eq!(out[1]["type"], "function_call");
+        assert_eq!(out[1]["call_id"], "call_1");
+    }
+
+    // The API pairs a reasoning item with a FOLLOWING item from the same
+    // response; a trailing reasoning item (e.g. an aborted turn persisted with
+    // only the thinking block) must be dropped, not 400 the whole request.
+    #[test]
+    fn trailing_reasoning_item_is_not_replayed() {
+        let raw_item = json!({
+            "type": "reasoning",
+            "id": "rs_9",
+            "encrypted_content": "blob",
+        });
+        let messages = vec![Message::Assistant(AssistantMessage {
+            content: vec![Content::Thinking {
+                thinking: String::new(),
+                thinking_signature: Some(format!("{REASONING_ITEM_MARKER}{raw_item}")),
+            }],
+            api: "responses".into(),
+            provider: "codex".into(),
+            model: "gpt-5.6".into(),
+            usage: Usage::default(),
+            stop_reason: StopReason::Stop,
+            error_message: None,
+            timestamp: now_ms(),
+        })];
+
+        let out = convert_input(&messages);
+        assert!(
+            out.is_empty(),
+            "a reasoning item with no follower must be dropped: {out:?}"
+        );
+    }
+
+    // The reasoning accumulator: summary deltas stream into a visible thinking
+    // block; done captures the verbatim item (minus transient status) and the
+    // signature encoder marks it for replay only when encrypted_content rode in.
+    #[test]
+    fn reasoning_summary_streams_and_done_captures_item_for_replay() {
+        let mut r = ReasoningItems::default();
+        let mut next: usize = 0;
+
+        let s1 = r.on_summary_delta("rs_1", "planning ", &mut next);
+        assert_eq!(s1.started_index, Some(0), "first delta opens the block");
+        let s2 = r.on_summary_delta("rs_1", "the edit", &mut next);
+        assert!(s2.started_index.is_none(), "no re-start on later deltas");
+
+        let done_item = json!({
+            "type": "reasoning",
+            "id": "rs_1",
+            "status": "completed",
+            "summary": [{"type": "summary_text", "text": "planning the edit"}],
+            "encrypted_content": "opaque-blob",
+        });
+        let s3 = r.on_done(&done_item, &mut next);
+        assert_eq!(
+            s3.ended,
+            Some((0, "planning the edit".to_string())),
+            "done closes the visible block with the assembled summary"
+        );
+
+        let finals = r.finalize();
+        assert_eq!(finals.len(), 1);
+        assert_eq!(finals[0].block_index, 0);
+        let sig =
+            reasoning_signature(&finals[0].raw_item).expect("encrypted item gets a signature");
+        assert!(sig.starts_with(REASONING_ITEM_MARKER));
+        let replayed: Value =
+            serde_json::from_str(&sig[REASONING_ITEM_MARKER.len()..]).expect("payload parses");
+        assert_eq!(replayed["id"], "rs_1");
+        assert_eq!(replayed["encrypted_content"], "opaque-blob");
+        assert!(
+            replayed.get("status").is_none(),
+            "transient status must not be replayed"
+        );
+        assert_eq!(next, 1, "one block index consumed");
+    }
+
+    // Without encrypted_content there is nothing the API will accept back under
+    // store:false — the item must NOT be marked for replay (signature None), and
+    // a summary-less item must stay invisible (no empty thinking card).
+    #[test]
+    fn reasoning_item_without_encrypted_content_gets_no_signature() {
+        let mut r = ReasoningItems::default();
+        let mut next: usize = 0;
+
+        let step = r.on_done(
+            &json!({"type": "reasoning", "id": "rs_2", "summary": []}),
+            &mut next,
+        );
+        assert!(
+            step.started_index.is_none(),
+            "no summary → no visible block"
+        );
+        assert!(step.ended.is_none());
+
+        let finals = r.finalize();
+        assert_eq!(finals.len(), 1, "still finalized for ordering");
+        assert!(
+            reasoning_signature(&finals[0].raw_item).is_none(),
+            "no encrypted_content → no replay signature"
+        );
+        // And an id-less item is unreplayable: nothing recorded at all.
+        let mut r2 = ReasoningItems::default();
+        r2.on_done(&json!({"type": "reasoning"}), &mut next);
+        assert!(r2.finalize().is_empty(), "id-less items can't be replayed");
     }
 }
