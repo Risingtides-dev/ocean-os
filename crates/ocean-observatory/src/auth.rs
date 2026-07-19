@@ -363,6 +363,17 @@ pub fn observer_token_for_child(ocean_dir: &Path) -> Result<Option<String>, Auth
         return Ok(Some(token));
     }
 
+    observer_token_from_file(ocean_dir)
+}
+
+/// Load only the rotating mode-0600 observer token file, deliberately ignoring
+/// `OCEAN_OBSERVER_TOKEN`. Long-lived trusted local clients use this after an
+/// environment-provided boot token receives 401 so a daemon restart can recover
+/// from the freshly rotated file without mutating process-global environment.
+///
+/// The same no-symlink, regular-file, mode, and nonempty checks as
+/// [`observer_token_for_child`] apply.
+pub fn observer_token_from_file(ocean_dir: &Path) -> Result<Option<String>, AuthError> {
     let path = ocean_dir.join(OBSERVER_TOKEN_FILE);
     let link_metadata = match fs::symlink_metadata(&path) {
         Ok(metadata) => metadata,
@@ -748,6 +759,11 @@ mod tests {
         assert_eq!(
             observer_token_for_child(directory.path()).expect("environment token"),
             Some("environment-token".to_owned())
+        );
+        assert_eq!(
+            observer_token_from_file(directory.path()).expect("rotating file token"),
+            Some("config-token".to_owned()),
+            "long-lived clients can recover from a stale boot-bound env token"
         );
 
         match prior {

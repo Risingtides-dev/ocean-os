@@ -49,6 +49,7 @@ use super::{
         pty_pane::PtyComponent,
         session_rail::SessionRailComponent,
         session_tray::SessionComponentTray,
+        workflow_graph::WorkflowGraphComponent,
     },
     daemon_boot, dictation, errfmt,
     event::{Event, EventHandler},
@@ -147,6 +148,13 @@ enum Center {
     Chat,
     Editor,
     Graph,
+    WorkflowGraph,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum RightRailMode {
+    Files,
+    Workflow,
 }
 
 /// Which visible pane has the keyboard.
@@ -379,6 +387,8 @@ pub struct App {
     pty: PtyComponent,
     editor: EditorComponent,
     graph: GraphComponent,
+    workflow_graph: WorkflowGraphComponent,
+    right_rail_mode: RightRailMode,
     center: Center,
     focus: Focus,
     session_id: Option<AgentSessionId>,
@@ -588,6 +598,8 @@ impl App {
             pty: PtyComponent::default(),
             editor: EditorComponent::new(root.clone()),
             graph: GraphComponent::new(root),
+            workflow_graph: WorkflowGraphComponent::default(),
+            right_rail_mode: RightRailMode::Files,
             // Land in the chat, typing-ready — the rail is one click away.
             center: Center::Chat,
             focus: Focus::Center,
@@ -832,6 +844,8 @@ impl App {
             // Global /v1/events: permission requests/decisions live here.
             self.client
                 .spawn_global_event_stream(self.actions_tx.clone());
+            self.client
+                .spawn_observatory_stream(self.actions_tx.clone());
         }
 
         // Render-on-demand: draw INSTANTLY in response to input (buttery scroll/
@@ -1303,12 +1317,16 @@ impl App {
                 }
                 let action = match t {
                     Focus::Sessions => self.rail.handle_mouse(m),
-                    Focus::Tree => self.tree.handle_mouse(m),
+                    Focus::Tree => match self.right_rail_mode {
+                        RightRailMode::Files => self.tree.handle_mouse(m),
+                        RightRailMode::Workflow => self.workflow_graph.handle_mouse(m),
+                    },
                     Focus::Term => self.pty.handle_mouse(m),
                     Focus::Center => match self.center {
                         Center::Chat => self.chat.handle_mouse(m),
                         Center::Editor => self.editor.handle_mouse(m),
                         Center::Graph => self.graph.handle_mouse(m),
+                        Center::WorkflowGraph => self.workflow_graph.handle_mouse(m),
                     },
                 };
                 if let Some(a) = action {
@@ -1447,12 +1465,16 @@ impl App {
         }
         let action = match self.focus {
             Focus::Sessions => self.rail.handle_event(&evt),
-            Focus::Tree => self.tree.handle_event(&evt),
+            Focus::Tree => match self.right_rail_mode {
+                RightRailMode::Files => self.tree.handle_event(&evt),
+                RightRailMode::Workflow => self.workflow_graph.handle_event(&evt),
+            },
             Focus::Term => self.pty.handle_event(&evt),
             Focus::Center => match self.center {
                 Center::Chat => self.chat.handle_event(&evt),
                 Center::Editor => self.editor.handle_event(&evt),
                 Center::Graph => self.graph.handle_event(&evt),
+                Center::WorkflowGraph => self.workflow_graph.handle_event(&evt),
             },
         };
         if let Some(a) = action {
@@ -1536,7 +1558,15 @@ impl App {
                     self.focus_to(Focus::Center);
                 }
             }
-            Btn::Tree => self.set_tree_visible_by_operator(!self.show_tree),
+            Btn::Tree => {
+                if self.show_tree && self.right_rail_mode == RightRailMode::Files {
+                    self.set_tree_visible_by_operator(false);
+                } else {
+                    self.right_rail_mode = RightRailMode::Files;
+                    self.set_tree_visible_by_operator(true);
+                    self.focus_to(Focus::Tree);
+                }
+            }
             Btn::Term => {
                 if !self.pty.is_active() {
                     self.pty.open(&PathBuf::from(&self.workspace_root), "");
@@ -1560,7 +1590,7 @@ impl App {
                 self.focus_to(Focus::Center);
             }
             Btn::Graph => {
-                self.center = if self.center == Center::Graph {
+                self.center = if matches!(self.center, Center::Graph | Center::WorkflowGraph) {
                     if self.editor.has_tabs() {
                         Center::Editor
                     } else {
@@ -1608,6 +1638,52 @@ impl App {
                 self.health.degrade(*source, condition.clone())
             }
             Action::HealthRecovered(source) => self.health.recover(*source),
+            Action::ObservatorySnapshot(snapshot) => {
+                let became_active = self
+                    .workflow_graph
+                    .graph
+                    .replace_snapshot((**snapshot).clone());
+                if became_active
+                    && self.center != Center::WorkflowGraph
+                    && !self.tree_auto_reveal_suppressed
+                {
+                    self.right_rail_mode = RightRailMode::Workflow;
+                    self.show_tree = true;
+                    self.apply_focus();
+                }
+            }
+            Action::ObservatoryEvent(event) => {
+                match self.workflow_graph.graph.apply_event((**event).clone()) {
+                    crate::shell::workflow_graph::ApplyEvent::Applied { became_active } => {
+                        if became_active
+                            && self.center != Center::WorkflowGraph
+                            && !self.tree_auto_reveal_suppressed
+                        {
+                            self.right_rail_mode = RightRailMode::Workflow;
+                            self.show_tree = true;
+                            self.apply_focus();
+                        }
+                    }
+                    crate::shell::workflow_graph::ApplyEvent::NeedsSnapshot => {
+                        self.workflow_graph.graph.mark_disconnected();
+                    }
+                    crate::shell::workflow_graph::ApplyEvent::Ignored => {}
+                }
+            }
+            Action::ObservatoryDisconnected => {
+                self.workflow_graph.graph.mark_disconnected();
+            }
+            Action::ExpandWorkflowGraph => {
+                // The expanded graph owns the center; restore Files in the
+                // right rail so the same component is never drawn twice with
+                // contradictory focus/affordance state.
+                self.right_rail_mode = RightRailMode::Files;
+                self.center = Center::WorkflowGraph;
+                self.focus_to(Focus::Center);
+            }
+            Action::WorkflowGraphCommand(command) => {
+                self.workflow_graph.graph.apply_command(*command);
+            }
             // Chat unwinds busy + restores the prompt (see its update arm);
             // the status line carries the humanized error.
             Action::TurnSendFailed { err, .. } => {
@@ -1881,6 +1957,7 @@ impl App {
                     self.focus_to(Focus::Sessions);
                 }
                 Nav::Files => {
+                    self.right_rail_mode = RightRailMode::Files;
                     self.set_tree_visible_by_operator(true);
                     self.focus_to(Focus::Tree);
                 }
@@ -4035,7 +4112,7 @@ impl App {
             match self.center {
                 Center::Chat => SelectionSpace::Chat,
                 Center::Editor if self.editor.has_tabs() => SelectionSpace::Editor,
-                Center::Editor | Center::Graph => SelectionSpace::Screen,
+                Center::Editor | Center::Graph | Center::WorkflowGraph => SelectionSpace::Screen,
             }
         }
     }
@@ -4072,12 +4149,17 @@ impl App {
 
     fn apply_focus(&mut self) {
         self.rail.focused = self.focus == Focus::Sessions;
-        self.tree.focused = self.focus == Focus::Tree;
+        self.tree.focused =
+            self.focus == Focus::Tree && self.right_rail_mode == RightRailMode::Files;
         self.pty.focused = self.focus == Focus::Term;
         let center = self.focus == Focus::Center;
         self.chat.focused = center && self.center == Center::Chat;
         self.editor.focused = center && self.center == Center::Editor;
         self.graph.focused = center && self.center == Center::Graph;
+        self.workflow_graph.focused = (self.focus == Focus::Tree
+            && self.right_rail_mode == RightRailMode::Workflow)
+            || (center && self.center == Center::WorkflowGraph);
+        self.workflow_graph.expanded = self.center == Center::WorkflowGraph;
     }
 
     fn submit_turn(&mut self, prompt: String) {
@@ -4290,6 +4372,7 @@ impl App {
                 .unwrap_or_default(),
             Center::Editor => format!(" {}", self.editor.crumb()),
             Center::Graph => String::new(),
+            Center::WorkflowGraph => " workflow execution graph".into(),
         };
         frame.render_widget(
             Paragraph::new(Span::styled(crumb, Style::default().fg(theme::COMMENT)))
@@ -4306,9 +4389,13 @@ impl App {
             Center::Chat => self.chat.draw(frame, r_center),
             Center::Editor => self.editor.draw(frame, r_center),
             Center::Graph => self.graph.draw(frame, r_center),
+            Center::WorkflowGraph => self.workflow_graph.draw(frame, r_center),
         }
         if tree_w > 0 {
-            self.tree.draw(frame, r_tree);
+            match self.right_rail_mode {
+                RightRailMode::Files => self.tree.draw(frame, r_tree),
+                RightRailMode::Workflow => self.workflow_graph.draw(frame, r_tree),
+            }
             if r_tray.height > 0 {
                 splitter(frame, r_split_tray, false);
                 self.tray.draw(frame, r_tray);
@@ -4448,6 +4535,7 @@ impl App {
             Center::Chat => "chat",
             Center::Editor => "editor",
             Center::Graph => "graph",
+            Center::WorkflowGraph => "workflow graph",
         };
         let line = Line::from(vec![
             Span::styled(
@@ -4504,7 +4592,7 @@ impl App {
             (
                 g("⟠", "[G]"),
                 Btn::Graph,
-                self.center == Center::Graph,
+                matches!(self.center, Center::Graph | Center::WorkflowGraph),
                 theme::MAGENTA,
             ),
             (
@@ -5375,6 +5463,105 @@ mod tests {
         assert!(
             app.sel_press.is_none() && app.sel_rect.is_none(),
             "splitter Down arms no selection"
+        );
+    }
+
+    fn observatory_snapshot(
+        phase: ocean_observatory::ExecutionPhase,
+    ) -> ocean_observatory::ObservatorySnapshot {
+        use ocean_observatory::{Cursor, Producer, ProducerKind, SnapshotNode, TruthProvenance};
+        ocean_observatory::ObservatorySnapshot {
+            watermark_cursor: Cursor::new(1),
+            earliest_available_cursor: Cursor::new(1),
+            observatory_id: "observatory".into(),
+            daemon_instance_id: "boot".into(),
+            nodes: vec![SnapshotNode {
+                execution_id: "execution-1".into(),
+                root_execution_id: "execution-1".into(),
+                parent_execution_id: None,
+                session_id: String::new(),
+                turn_id: String::new(),
+                request_id: String::new(),
+                phase,
+                producer: Producer {
+                    kind: ProducerKind::Extension,
+                    id: "crew".into(),
+                },
+                truth: TruthProvenance::ExtensionAttested,
+                started_at: "now".into(),
+                last_activity_at: "now".into(),
+                labels: vec!["implement workflow".into()],
+                duration_millis: None,
+            }],
+            edges: Vec::new(),
+            attention: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn active_observatory_execution_replaces_files_rail_and_completion_stays() {
+        let mut app = offline_app();
+        assert!(!app.show_tree);
+        app.dispatch(Action::ObservatorySnapshot(Box::new(observatory_snapshot(
+            ocean_observatory::ExecutionPhase::Running,
+        ))));
+        assert!(
+            app.show_tree,
+            "active execution auto-reveals the right rail"
+        );
+        assert!(app.right_rail_mode == RightRailMode::Workflow);
+        let screen = render_app_to_string(&mut app, 100, 28);
+        assert!(screen.contains("FLOW"));
+
+        app.dispatch(Action::ObservatorySnapshot(Box::new(observatory_snapshot(
+            ocean_observatory::ExecutionPhase::Finished,
+        ))));
+        assert!(app.show_tree, "completion must remain inspectable");
+        assert!(app.right_rail_mode == RightRailMode::Workflow);
+        assert_eq!(app.workflow_graph.graph.active_count(), 0);
+
+        app.dispatch(Action::Navigate(Nav::Files));
+        assert!(app.right_rail_mode == RightRailMode::Files);
+        assert!(app.show_tree);
+    }
+
+    #[test]
+    fn explicit_right_rail_close_suppresses_workflow_auto_reveal() {
+        let mut app = offline_app();
+        app.set_tree_visible_by_operator(false);
+        app.dispatch(Action::ObservatorySnapshot(Box::new(observatory_snapshot(
+            ocean_observatory::ExecutionPhase::Running,
+        ))));
+        assert!(!app.show_tree);
+        assert!(app.right_rail_mode == RightRailMode::Files);
+        assert_eq!(app.workflow_graph.graph.active_count(), 1);
+    }
+
+    #[test]
+    fn workflow_rail_expands_into_center_without_changing_authority() {
+        let mut app = offline_app();
+        app.dispatch(Action::ObservatorySnapshot(Box::new(observatory_snapshot(
+            ocean_observatory::ExecutionPhase::Running,
+        ))));
+        app.dispatch(Action::ExpandWorkflowGraph);
+        assert!(app.center == Center::WorkflowGraph);
+        assert!(app.focus == Focus::Center);
+        assert!(
+            app.right_rail_mode == RightRailMode::Files,
+            "expanded workflow graph restores Files instead of drawing one component twice"
+        );
+        assert_eq!(app.workflow_graph.graph.nodes.len(), 1);
+
+        app.dispatch(Action::ObservatorySnapshot(Box::new(observatory_snapshot(
+            ocean_observatory::ExecutionPhase::Finished,
+        ))));
+        app.dispatch(Action::ObservatorySnapshot(Box::new(observatory_snapshot(
+            ocean_observatory::ExecutionPhase::Running,
+        ))));
+        assert!(app.center == Center::WorkflowGraph);
+        assert!(
+            app.right_rail_mode == RightRailMode::Files,
+            "later activation cannot duplicate the center graph in the rail"
         );
     }
 

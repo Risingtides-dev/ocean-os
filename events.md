@@ -4452,3 +4452,14 @@ invite redemption, local-only transport, secret exclusions, preview, and an
 explicit human acknowledgement gate; the older public token/bootstrap procedure
 was not copied. Verified with `cargo xtask docs-check`, `git diff --check`,
 and a tracked-reference search.
+_________________________________________________________________________________
+time:      [14:37] [19-07-26]
+agent:     [pi] [gpt-5.6]
+worktree:  [feat/tui-workflow-graph-rail] /Users/risingtidesdev/.worktrees/ocean-os-tui-workflow-graph-rail
+type:      [feature-request]
+area:      [frontend]
+
+Implemented the first truthful workflow-graph rail slice by reusing Ocean TUI's existing 3D camera/projection renderer over authenticated Observatory topology. The TUI loads the boot-bound summary token, baselines from the durable snapshot cursor, resumes the typed SSE stream, and rebaselines on reset, malformed data, cursor gaps, daemon-instance changes, or stale environment-token 401 via the rotating secure file. An authoritative inactive-to-active execution transition replaces Files in the existing right rail unless the operator explicitly closed it; terminal graphs remain inspectable, explicit Files navigation restores the tree, and Enter expands the workflow graph into the center while Files returns beside it. All graph navigation mutates through typed Elm actions; authoritative state remains complete while paint work is bounded to 256 nodes and 1,024 edges with an honest hidden count. No orchestration, scheduling, or subagent authority entered core or the TUI.
+
+Verification: ocean-observatory 28 unit + 21 integration/redaction/store tests; ocean-tui 372 passed / 4 ignored; denied-warning Clippy for both crates; TUI release build; workspace check; formatting, docs-check, and diff-check. Live PTY smoke against the supervised daemon rendered the real Observatory snapshot (over 360 retained executions and 340 edges), auto-opened FLOW with current active nodes, expanded into center, and restored Files on the right. Three fresh review passes closed Elm-mutation, token-rotation, duplicate-view, render-bound, and malformed-SSE lifecycle findings; final review passed with no medium-or-higher issue.
+_________________________________________________________________________________

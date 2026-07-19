@@ -12,7 +12,7 @@
 //! re-subscribed fresh on the next turn. Add replay when mid-turn resilience
 //! matters (the blocking path's OCEAN-305 logic is the reference).
 
-use std::time::Duration;
+use std::{path::PathBuf, time::Duration};
 
 use futures::StreamExt;
 use ocean_agent_sdk::{
@@ -22,6 +22,10 @@ use ocean_agent_sdk::{
 use ocean_core::{
     EventEnvelope, HealthResponse, PermissionDecision, PermissionDecisionRequest, PermissionId,
     PermissionMode, PermissionSettingsRequest, PermissionSettingsResponse,
+};
+use ocean_observatory::{
+    observer_token_for_child, observer_token_from_file, EventEnvelope as ObservatoryEventEnvelope,
+    EventPayload, ObservatorySnapshot,
 };
 use tokio::sync::mpsc;
 
@@ -276,6 +280,167 @@ impl DaemonClient {
             }
         })
     }
+
+    /// Maintain a truthful daemon-wide Observatory projection: load the
+    /// boot-bound local summary token, fetch an authoritative snapshot, then
+    /// tail cursor-ordered lifecycle events. Any auth failure, daemon restart,
+    /// reset, gap, or cursor discontinuity retains the last UI graph as stale
+    /// and restarts from a fresh token + snapshot rather than guessing.
+    pub fn spawn_observatory_stream(
+        &self,
+        actions: mpsc::UnboundedSender<Action>,
+    ) -> tokio::task::JoinHandle<()> {
+        let http = self.http.clone();
+        let base = self.base.clone();
+        let config_dir = ocean_config_dir();
+        tokio::spawn(async move {
+            // An environment token is a boot-bound launch credential. If it
+            // receives 401 after daemon restart, permanently fall back to the
+            // rotating secure token file for this TUI process.
+            let mut allow_environment_token = true;
+            loop {
+                let token_dir = config_dir.clone();
+                let use_environment = allow_environment_token;
+                let token = match tokio::task::spawn_blocking(move || {
+                    if use_environment {
+                        observer_token_for_child(&token_dir)
+                    } else {
+                        observer_token_from_file(&token_dir)
+                    }
+                })
+                .await
+                {
+                    Ok(Ok(Some(token))) => token,
+                    _ => {
+                        let _ = actions.send(Action::ObservatoryDisconnected);
+                        tokio::time::sleep(Duration::from_secs(2)).await;
+                        continue;
+                    }
+                };
+
+                let snapshot_response = http
+                    .get(format!("{base}/v1/observatory/snapshot?detail=summary"))
+                    .bearer_auth(&token)
+                    .send()
+                    .await;
+                let snapshot = match snapshot_response {
+                    Ok(response) if response.status() == reqwest::StatusCode::UNAUTHORIZED => {
+                        allow_environment_token = false;
+                        let _ = actions.send(Action::ObservatoryDisconnected);
+                        tokio::time::sleep(Duration::from_secs(1)).await;
+                        continue;
+                    }
+                    Ok(response) => match response.error_for_status() {
+                        Ok(response) => match response.json::<ObservatorySnapshot>().await {
+                            Ok(snapshot) => snapshot,
+                            Err(_) => {
+                                let _ = actions.send(Action::ObservatoryDisconnected);
+                                tokio::time::sleep(Duration::from_secs(1)).await;
+                                continue;
+                            }
+                        },
+                        Err(_) => {
+                            let _ = actions.send(Action::ObservatoryDisconnected);
+                            tokio::time::sleep(Duration::from_secs(1)).await;
+                            continue;
+                        }
+                    },
+                    Err(_) => {
+                        let _ = actions.send(Action::ObservatoryDisconnected);
+                        tokio::time::sleep(Duration::from_secs(1)).await;
+                        continue;
+                    }
+                };
+                let mut cursor = snapshot.watermark_cursor;
+                let daemon_instance_id = snapshot.daemon_instance_id.clone();
+                let _ = actions.send(Action::ObservatorySnapshot(Box::new(snapshot)));
+
+                let response = http
+                    .get(format!(
+                        "{base}/v1/observatory/events?after={}&scope=summary",
+                        cursor.as_string()
+                    ))
+                    .bearer_auth(&token)
+                    .header("Last-Event-ID", cursor.as_string())
+                    .timeout(Duration::from_secs(60 * 60 * 24 * 365))
+                    .send()
+                    .await;
+                let response = match response {
+                    Ok(response) if response.status() == reqwest::StatusCode::UNAUTHORIZED => {
+                        allow_environment_token = false;
+                        let _ = actions.send(Action::ObservatoryDisconnected);
+                        tokio::time::sleep(Duration::from_secs(1)).await;
+                        continue;
+                    }
+                    Ok(response) => match response.error_for_status() {
+                        Ok(response) => response,
+                        Err(_) => {
+                            let _ = actions.send(Action::ObservatoryDisconnected);
+                            tokio::time::sleep(Duration::from_secs(1)).await;
+                            continue;
+                        }
+                    },
+                    Err(_) => {
+                        let _ = actions.send(Action::ObservatoryDisconnected);
+                        tokio::time::sleep(Duration::from_secs(1)).await;
+                        continue;
+                    }
+                };
+
+                let mut stream = response.bytes_stream();
+                let mut buffer = String::new();
+                let mut rebaseline = false;
+                while let Some(chunk) = stream.next().await {
+                    let Ok(bytes) = chunk else { break };
+                    buffer.push_str(&String::from_utf8_lossy(&bytes));
+                    while let Some(index) = buffer.find("\n\n") {
+                        let frame = buffer[..index].to_string();
+                        buffer.drain(..index + 2);
+                        let event = match parse_observatory_frame(&frame) {
+                            ObservatoryFrame::KeepAlive => continue,
+                            ObservatoryFrame::Rebaseline => {
+                                rebaseline = true;
+                                break;
+                            }
+                            ObservatoryFrame::Event(event) => event,
+                        };
+                        if event.daemon_instance_id != daemon_instance_id
+                            || !event.cursor.is_consecutive_after(cursor)
+                            || matches!(
+                                event.payload,
+                                EventPayload::StreamGap { .. } | EventPayload::StreamReset { .. }
+                            )
+                        {
+                            rebaseline = true;
+                            break;
+                        }
+                        cursor = event.cursor;
+                        let _ = actions.send(Action::ObservatoryEvent(event));
+                    }
+                    if rebaseline {
+                        break;
+                    }
+                }
+                let _ = actions.send(Action::ObservatoryDisconnected);
+                tokio::time::sleep(Duration::from_secs(1)).await;
+            }
+        })
+    }
+}
+
+/// Match daemon config resolution without depending on the session-owning
+/// `ocean-agent` crate: explicit override, XDG, HOME, then cwd fallback.
+fn ocean_config_dir() -> PathBuf {
+    if let Some(path) = std::env::var_os("OCEAN_CONFIG_DIR") {
+        return PathBuf::from(path);
+    }
+    if let Some(xdg) = std::env::var_os("XDG_CONFIG_HOME") {
+        return PathBuf::from(xdg).join("ocean-rs");
+    }
+    if let Some(home) = std::env::var_os("HOME") {
+        return PathBuf::from(home).join(".config").join("ocean-rs");
+    }
+    PathBuf::from(".ocean-rs")
 }
 
 impl DaemonClient {
@@ -555,6 +720,28 @@ fn parse_sse_event(frame: &str) -> Option<&str> {
     })
 }
 
+enum ObservatoryFrame {
+    KeepAlive,
+    Event(Box<ObservatoryEventEnvelope>),
+    Rebaseline,
+}
+
+fn parse_observatory_frame(frame: &str) -> ObservatoryFrame {
+    if matches!(parse_sse_event(frame), Some("reset" | "error")) {
+        return ObservatoryFrame::Rebaseline;
+    }
+    // Keepalive/comment frames carry no data. Any data frame on this typed
+    // stream that fails schema decoding is a continuity break: rebaseline now
+    // rather than waiting for a later cursor gap to expose it.
+    if !frame.lines().any(|line| line.starts_with("data:")) {
+        return ObservatoryFrame::KeepAlive;
+    }
+    parse_sse_data::<ObservatoryEventEnvelope>(frame)
+        .map(Box::new)
+        .map(ObservatoryFrame::Event)
+        .unwrap_or(ObservatoryFrame::Rebaseline)
+}
+
 /// Decode one SSE frame's `data:` payload as `T`.
 fn parse_sse_data<T: serde::de::DeserializeOwned>(frame: &str) -> Option<T> {
     let mut data = String::new();
@@ -628,6 +815,22 @@ mod tests {
         let frame = "event: error\ndata: {\"error\":\"subscriber lagged\"}";
         assert_eq!(parse_sse_event(frame), Some("error"));
         assert!(parse_sse_frame(frame).is_none());
+    }
+
+    #[test]
+    fn observatory_frames_rebaseline_on_reset_or_malformed_typed_data() {
+        assert!(matches!(
+            parse_observatory_frame(": keep-alive"),
+            ObservatoryFrame::KeepAlive
+        ));
+        assert!(matches!(
+            parse_observatory_frame("event: reset\ndata: {}"),
+            ObservatoryFrame::Rebaseline
+        ));
+        assert!(matches!(
+            parse_observatory_frame("event: message\ndata: {\"schema_version\":1}"),
+            ObservatoryFrame::Rebaseline
+        ));
     }
 
     /// Live end-to-end against the local daemon: mint a session, subscribe its
