@@ -1,10 +1,10 @@
 # Ocean Daemon Longhouse Governance-Control Extraction Manifest
 
 **Date:** 2026-07-19
-**Status:** Manifested; characterization not yet accepted; extraction not authorized
+**Status:** Characterization accepted; extraction authorized only for the exact 13-definition governance-control boundary
 **Owner:** Ocean OS
-**Source baseline:** fetched and rebased `origin/main` `afffd1d`
-**Rollback point:** pending accepted characterization commit
+**Source baseline:** fetched and rebased `origin/main` `729542b`
+**Rollback point:** characterization commit `f1971c0`
 
 ## Purpose
 
@@ -16,9 +16,9 @@ The result, if authorized, remains a private module of the `ocean-daemon` binary
 
 ## Current source and moving-baseline rule
 
-This manifest starts from fetched `origin/main` `afffd1d`. The published topic-projection implementation is PR #305 merge `9676b18`, with publication follow-up PR #306 merge `4ed957a`.
+This manifest started from fetched `origin/main` `afffd1d` and was reconciled before characterization through fetched `origin/main` `729542b`. The published topic-projection implementation is PR #305 merge `9676b18`, with publication follow-up PR #306 merge `4ed957a`.
 
-The candidate definitions are byte-identical from `4ed957a` through `afffd1d`. Intervening daemon changes add and harden the separate session-compaction route; later provider and documentation work does not change Longhouse control definitions, `AppState` Longhouse/title fields, startup authority assembly, route mounts, or `ocean-longhouse` algorithms. The compact route, banner, tests, and all other upstream behavior remain current and must not be restored from an older snapshot.
+The candidate definitions remain executable-token-identical from `4ed957a` through `729542b`; only the separately reviewed truth-in-comments checkpoints changed their attached comments. Intervening daemon changes add and harden the separate session-compaction and voice-planner seams; later provider, Crew, and documentation work does not change Longhouse control definitions, `AppState` Longhouse/title fields, startup authority assembly, route mounts, or `ocean-longhouse` algorithms. The compact route, banner, tests, and all other upstream behavior remain current and must not be restored from an older snapshot.
 
 Before manifest review, characterization, authorization, extraction, completion documentation, and publication:
 
@@ -172,6 +172,8 @@ Before characterization is accepted, make and independently review one behavior-
 
 The corrected comments become part of the accepted characterization rollback source and are then included in exact body/comment comparison. This separate checkpoint may clarify documentation only; it may not add authentication, alter a response, change mutation order, or fix poison behavior.
 
+Comment-only checkpoints `6d636c2` and `e0eccce` satisfy this requirement. Fresh correctness and security/trust-boundary reviews verified that every changed Rust line was a comment and that the final wording matches caller admission, daemon-held Revoker authority, threshold-one recall, three-report breach, post-close breach 200/zero-strike behavior, in-memory board projection, mutex blocking, and poison divergence.
+
 ## Characterization required before authorization
 
 Keep characterization inline in `main.rs` because it requires real router composition, `AppState`, SQLite fixtures, event buses, poison fixtures, and parent authority scans. Prefer a bounded set of table-driven extraction-aware tests.
@@ -182,7 +184,7 @@ Freeze malformed/missing/wrong-type bodies, UUID validation precedence, POST beh
 
 ### 2. Claim lifecycle and non-disclosure
 
-Freeze success; unknown/wrong-agent/blank-token/wrong-token/revoked/released indistinguishable 403; unbound/wrong-decision 409; identity-first decision disclosure; and one-shot ratification. The composition-owned successful convene response remains the sole permitted raw-token delivery. Prove token absence from every control response/error, event, SSE/replay/snapshot projection, captured tracing/log output, inspected `Debug` representation, and persisted plaintext/DB bytes after reopen. Add a whole-owner source assertion that the request token is never formatted or passed to logging, error, event, projection, or persistence sinks. Preserve the existing token-bearing request type's derived `Debug` only as an unused latent surface; assert it has no sink and defer any derive removal to a separate security-hardening change.
+Freeze success; unknown/wrong-agent/blank-token/wrong-token/revoked/released indistinguishable 403; unbound/wrong-decision 409; identity-first decision disclosure; and one-shot ratification. The composition-owned successful convene response remains the sole permitted raw-token delivery. Prove token absence from every control response/error, event, SSE/replay/snapshot projection, captured tracing/log output, and persisted plaintext/DB bytes after reopen. Add a whole-owner source assertion that the request token is never formatted or passed to logging, debug, error, event, projection, or persistence sinks. Preserve the existing token-bearing request type's derived `Debug` only as an unused latent surface; source-assert the derive and its lack of every sink, and defer any derive removal to a separate security-hardening change.
 
 ### 3. Revoke lifecycle and persistence
 
@@ -205,6 +207,24 @@ Freeze ID/summary/kind validation; only explicit evidence; unknown topic; exact 
 Freeze title and recall poison recovery where reachable; prove no guard crosses publication or await; require exactly the authorized 13 definitions in the selected owner; reject provider, token-mint, Revoker-key construction, startup, route, SSE, task, permission, room, call, and extra-registry authority; and prove startup still shares one Longhouse registry with runtime extensions and `AppState`.
 
 Owner-crate escrow/recall/breach tests remain authoritative for cryptographic constant-time verification, verifier-only persistence, DB reopen, key authorization, strike algorithms, and unreachable error branches. Daemon characterization must not duplicate algorithms or add executable seams only for testing.
+
+## Characterization result
+
+Commit `f1971c0` adds seven parent-owned, extraction-aware tests and their private test helpers without changing a production handler:
+
+- `longhouse_governance_control_http_methods_and_parse_precedence_are_exact` freezes all five route methods, `Allow`, empty/malformed/non-object/missing-body extractor responses, UUID/summary precedence, and complete error envelopes;
+- `longhouse_governance_control_claim_lifecycle_and_non_disclosure_are_exact` freezes identity-first claim behavior, uniform forged/unknown/revoked/released responses, unbound/wrong-decision disclosure, one-shot release, all-token response/event/projection/captured-log/reopened-DB-byte non-disclosure, and the unused latent `Debug` derive's no-sink source boundary;
+- `longhouse_governance_control_unauthenticated_mutation_lifecycle_is_exact` freezes no-credential manual revoke, omitted/blank reason, unknown/non-live/reopen behavior, omitted/zero/one threshold recall, successful cleanup plus retained non-live tally, three-report breach revocation, the exact post-close 200/zero-strike response, unknown/blank breach behavior, and later claim refusal;
+- `longhouse_governance_control_persistence_and_memory_reset_are_exact` freezes persisted breach strikes/revocation across reopen while recall tallies reset with reconstructed state;
+- `longhouse_governance_control_board_fold_publish_and_poison_are_exact` freezes validation, complete responses, exact mark/event fields, non-quorum kind mapping, healthy fold-before-publication, and poisoned publication/success without mutation;
+- `longhouse_governance_control_title_poison_recovery_is_exact` freezes parent title-lock poison recovery through the real claim route;
+- `longhouse_governance_control_source_authority_boundary_is_exact` freezes exact owner and import inventories, exact per-item visibility and private request fields, token-source sinks, lock-end-before-publication, five parent route mounts, one startup registry shared with runtime extensions and `AppState`, composition-owned title/Revoker/recall construction, and real-convene/title-path exclusions.
+
+Focused governance/control, recall, claim, revoke, board, convene, topic-projection, and router tests passed. All 500 daemon tests passed serialized. All 168 executed Longhouse tests plus one doc test passed with one host-dependent fixture ignored. Denied-warning daemon all-target Clippy, formatting, docs, and diff checks passed in dedicated target `/tmp/ocean-target-longhouse-governance-control`.
+
+Fresh correctness/test-adequacy and security/architecture/lifecycle review rounds found and drove closure of incomplete route matrices, token-log evidence, persistence, private-field compatibility, exact import/visibility inventory, and post-close breach truth. Final reviews reported PASS with no unresolved medium-or-higher issue.
+
+Extraction is authorized only from rollback point `f1971c0`, only for the exact 13 definitions/comments listed above, and only with the manifested imports and visibility. Real convene remains excluded.
 
 ## Validation matrix
 

@@ -5493,3 +5493,11 @@ type:      [docs]: correct post-close breach response contract
 area:      [security]: ocean-daemon governance control lifecycle
 
 Characterization exposed that `POST /v1/longhouse/breach` does not reach its mapped `NotLive` 409 branch after title closure: the owner strike adapter returns zero for a non-live title, so the existing route returns exact 200 `{ok:true,revoked:false,title_id,strikes:0,threshold:3}`. Preserved this observable behavior without fixing it and corrected the handler comment, extraction manifest, nearest daemon contract, mission, and code-health record. No executable Rust token, route, response, storage, credential, process, or deployment changed; characterization work remains uncommitted and extraction remains unauthorized.
+_________________________________________________________________________________
+time:      [03:35am] [19-07-26]
+agent:     [pi], [gpt-5.6-sol], [orchestrator], [subagents]
+worktree:  [pi/daemon-longhouse-control-governance-20260717]
+type:      [plan]: authorize Longhouse governance-control extraction
+area:      [testing]: ocean-daemon Phase 2C governance control
+
+Accepted characterization commit `f1971c0` as the rollback point and authorized only the exact 13-definition `longhouse_governance_control.rs` move. Seven extraction-aware parent tests freeze all five route methods/extractors/parse precedence and exact envelopes; claim identity-first secrecy, one-shot release, captured-log/event/projection/reopened-DB token non-disclosure, and latent `Debug` no-sink source constraints; unauthenticated manual revoke, omitted/zero/one threshold recall, retained non-live tally, three-report breach, and post-close exact 200/zero-strike response; persisted title/strike/revocation versus memory-only recall; board validation/kind/fold-before-publish/poison divergence; title poison; and exact item/import/visibility/startup/route/real-convene exclusions. All 500 daemon tests, 168 Longhouse tests plus one ignore and one doc test, denied-warning daemon Clippy, formatting/docs/diff, and final correctness plus security/lifecycle reviews passed with no unresolved medium-or-higher issue. Real convene remains excluded. No production handler, route, response, schema, credential, process, or deployment changed in characterization.
