@@ -353,7 +353,21 @@ impl AgentRuntime {
     /// preserves every existing caller and test; the daemon upgrades the
     /// registry with `.with_extensions().await` right after construction.
     pub fn from_env() -> anyhow::Result<Self> {
-        let config_dir = config_dir_from_env();
+        Self::with_config_dir(config_dir_from_env())
+    }
+
+    /// Build the runtime rooted at an explicit config dir instead of the
+    /// process-global `OCEAN_CONFIG_DIR`.
+    ///
+    /// The config dir owns the on-disk project/session store, so injecting it
+    /// lets embedders — and parallel tests — each own an isolated store without
+    /// racing on shared process env (two runtimes reading a clobbered
+    /// `OCEAN_CONFIG_DIR` otherwise collide on the same `projects.json`,
+    /// producing atomic-rename races and cross-test 404s). Model and credential
+    /// resolution still read the process env via `build_state_from_env`; only
+    /// the on-disk root is injected. `from_env` is the production default and
+    /// simply resolves the dir from the environment first.
+    pub fn with_config_dir(config_dir: PathBuf) -> anyhow::Result<Self> {
         let state = build_state_from_env(&config_dir)?;
         // Stop hooks are fail-open at load: a malformed ocean.toml already logs
         // loudly in `build_capability_registry`; the runtime must still start

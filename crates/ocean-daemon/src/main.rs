@@ -14482,12 +14482,24 @@ mod tests {
     /// tempdir guard (kept alive for the session config dir). Caller must hold
     /// `AUTO_CONVENE_ENV_LOCK` for the duration.
     pub(super) fn fake_convene_state(tmp: &tempfile::TempDir) -> AppState {
+        // OCEAN_MODEL / OCEAN_YOLO stay as process-env writes: they are the same
+        // constant for every caller (idempotent under parallel runs), and other
+        // daemon subsystems that read them at request time (yolo_settings) rely on
+        // the process env being set. OCEAN_CONFIG_DIR is also still exported for
+        // subsystems that resolve it live (rooms.db / titles.db / browser_stream),
+        // but the RUNTIME's config dir — which owns the on-disk project/session
+        // store — is injected directly below so parallel tests never build a
+        // runtime pointing at another test's (or a clobbered) config dir. That
+        // process-global read was the source of the github::tests rename races and
+        // cross-test 404s (TASK-58).
         std::env::set_var("OCEAN_CONFIG_DIR", tmp.path());
         std::env::set_var("OCEAN_MODEL", "fake-ok");
         // YOLO so the fake turn never blocks on a permission prompt (the fake
         // provider does no tool calls, but keep the gate out of the path).
         std::env::set_var("OCEAN_YOLO", "1");
-        let runtime = Arc::new(AgentRuntime::from_env().expect("fake runtime"));
+        let runtime = Arc::new(
+            AgentRuntime::with_config_dir(tmp.path().to_path_buf()).expect("fake runtime"),
+        );
         let store = ocean_store::SqliteRoomStore::open_in_memory().expect("in-mem store");
         let rooms = Arc::new(Mutex::new(store));
         let room_wakes = RoomWakeBus::default();
