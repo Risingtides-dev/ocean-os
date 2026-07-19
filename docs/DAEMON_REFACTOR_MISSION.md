@@ -1,9 +1,9 @@
 # Ocean Daemon Refactor: Mission, Progress, and Target
 
 **Status:** Active, green, and shipping in bounded checkpoints
-**Updated:** 2026-07-17
+**Updated:** 2026-07-19
 **Published Phase 2C implementation:** `9676b18`
-**Current manifest baseline:** `9177598`
+**Current manifest baseline:** `afffd1d`
 **Scope:** `crates/ocean-daemon`
 
 ## Mission
@@ -78,7 +78,8 @@ No extraction may introduce a public daemon library, service-trait architecture,
 | Longhouse preparation adapters | Published | Private `src/longhouse_preparation.rs` owns only state-free prepare/inspect/workflow HTTP shells; exact extractor/method/envelope/privacy, PR #292 evidence, cwd confinement, and blocking/read-only behavior were characterized; the 334-line move, dedicated-target gates, compatibility/MSRV/local CI, two fresh extraction reviews, hosted CI, and PR #296 merge `29d65f8` passed; librarian fetch/spec remain separate after a disclosed symlink-retarget security disposition |
 | Longhouse turn preparation/presentation | Published | Private `src/longhouse_turn_preparation.rs` owns only the fresh opt-out gate, cached read-only preparation under the existing blocking deadline, and deterministic advisory rendering/application; exact presentation/no-op, environment, cwd/cache/blocking/deadline/fail-open, helper-warning, module-authority, and all three call-site ordering contracts were characterized at `f6e8efe`; the exact 228-line move, dedicated-target gates, compatibility/MSRV/local CI, two fresh extraction reviews, hosted CI, and PR #299 merge `9095d5a` passed |
 | Longhouse topic projection/demo | Published | Private `src/longhouse_topics.rs` owns only the scripted demo plus topic list/detail adapters over the existing shared registry. Characterization `c443df9` freezes exact HTTP/event/projection/poison/shared-handle/task/authority contracts; commit `0199d57` moves the exact 252-line definition/comment boundary into the 273-line owner. All 491 daemon tests, 168 Longhouse tests plus one host-dependent ignore and one doc test, workspace/features, compatibility, MSRV, canonical local CI, mechanical comparison, two fresh extraction reviews, hosted macOS/Ubuntu/MSRV/cargo-deny CI, and PR #305 merge `9676b18` passed. Real convene remains composition-owned because it is directly coupled to ready-model filtering, asynchronous council orchestration, durable title grant/bind, and raw-token response delivery |
-| Longhouse convene and title/control governance | Next security wave | Re-manifest the coupled convene/title boundary separately; claim/revoke/recall/breach/board authority must not be hidden behind a new trait, substate, or public API |
+| Longhouse claim/revoke/recall/breach/board control | Manifested; characterization next | Fresh mapping selected the exact 13-definition private `longhouse_governance_control.rs` boundary over existing `AppState` handles and owner-crate algorithms. Characterization must freeze exact HTTP/lifecycle/persistence/poison/non-disclosure/source-authority behavior before extraction; current local-route trust, memory-only recall, blocking SQLite, and board poison behavior are preserved risks, not stronger module guarantees |
+| Real Longhouse convene/title grant-bind | Deferred separate security wave | Keep provider readiness, awaited council orchestration, projection-before-publication, durable title grant/bind, and raw-token response delivery together in `main.rs` until deterministic successful-path characterization is possible without a new trait, substate, test seam, or public API |
 | Calls and remaining registries | Later domain waves | One separately manifested domain at a time after both governance waves |
 | Agent-turn/SSE orchestration | Last | Highest-risk authority path; moves only after leaf and domain boundaries are proven |
 
@@ -86,7 +87,7 @@ At this checkpoint, `main.rs` is approximately 22.0k lines after persistent-room
 
 ## Course from here
 
-1. Publish the narrowed [Longhouse topic-projection checkpoint](specs/2026-07-16-ocean-daemon-longhouse-topic-projection-extraction-manifest.md), then separately manifest the coupled real-convene/title-control boundary before calls and turn/SSE orchestration.
+1. Characterize and publish the [Longhouse governance-control checkpoint](specs/2026-07-19-ocean-daemon-longhouse-governance-control-extraction-manifest.md), then separately manifest real convene/title grant-bind before calls and turn/SSE orchestration.
 2. Keep filesystem/project policy, permission authority, settings policy, host/extension ownership, and call-site orchestration fixed while domain boundaries move.
 3. Treat the deferred librarian security disposition and any remaining state-registry or control-plane boundary as their own checkpoints; do not bundle them with a domain move.
 4. Move turn/SSE orchestration last.

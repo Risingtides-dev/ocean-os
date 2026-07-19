@@ -5470,3 +5470,10 @@ area:  [backend]: Provider request encoding
 
 Recovered the focused replay repair from the divergent Mini main. Anthropic encoding drops empty history and tool-result text blocks, omits empty optional tool-result content, and keeps rolling cache breakpoints off thinking blocks. Focused protocol tests and workspace checks verify the current-main integration.
 _________________________________________________________________________________
+time:      [02:27am] [19-07-26]
+agent:     [pi], [gpt-5.6-sol], [orchestrator], [subagents]
+worktree:  [pi/daemon-longhouse-control-governance-20260717]
+type:      [plan]: manifest Longhouse governance-control extraction
+area:      [backend]: ocean-daemon Phase 2C governance control
+
+Fresh source, characterization, upstream, and oracle mapping at fetched `origin/main` `afffd1d` selected the smallest next behavior-neutral boundary: only `with_titles`, the five claim/revoke/recall/breach/board request/handler pairs, the breach threshold, and the board-kind parser may enter private `src/longhouse_governance_control.rs` after accepted characterization. Real convene remains in `main.rs` because it couples live provider readiness, awaited council execution, projection/event publication, durable title grant/bind, and raw-token delivery without a deterministic successful-path test seam. The manifest records complete HTTP/lifecycle/persistence/poison/non-disclosure/source-authority gates and preserves current local-route trust, caller-supplied recall voter IDs, blocking SQLite, memory-only/unbounded abandoned recalls, and board poison divergence as pre-existing risks requiring separate approval to change. No production code, route, runtime, schema, credential, daemon process, or deployment changed; extraction is not yet authorized.
