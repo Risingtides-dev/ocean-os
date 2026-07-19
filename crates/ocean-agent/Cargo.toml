@@ -6,6 +6,13 @@ license.workspace = true
 authors.workspace = true
 rust-version.workspace = true
 
+[features]
+default = []
+# Legacy chromiumoxide/CDP browser backend. Default-off: without it the 19
+# `browser_*` tools keep their schemas but return `browser_host_unavailable`,
+# and no chromiumoxide enters the build graph.
+legacy-chromium = ["ocean-runtime/legacy-chromium"]
+
 [dependencies]
 anyhow.workspace = true
 async-trait.workspace = true

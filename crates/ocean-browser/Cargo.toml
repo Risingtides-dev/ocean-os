@@ -5,10 +5,18 @@ edition = { workspace = true }
 license = { workspace = true }
 authors = { workspace = true }
 rust-version = { workspace = true }
-description = "Typed async handle to a Chrome instance driven over the DevTools Protocol."
+description = "Legacy Chrome DevTools Protocol backend (default-off); being replaced by the OceanWebKit browser host."
+
+[features]
+default = []
+# The entire crate is the legacy chromiumoxide/CDP backend. With this feature
+# off (the default) the crate compiles to an inert stub and no chromiumoxide
+# enters the build graph. Enable through a consumer
+# (`ocean-daemon --features legacy-chromium`), never directly in production.
+legacy-chromium = ["dep:chromiumoxide"]
 
 [dependencies]
-chromiumoxide = { workspace = true }
+chromiumoxide = { workspace = true, optional = true }
 tokio = { workspace = true }
 tokio-stream = { workspace = true }
 futures = "0.3"

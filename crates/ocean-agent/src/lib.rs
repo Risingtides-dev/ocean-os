@@ -2423,13 +2423,17 @@ async fn build_capability_registry(
 ) -> CapabilityRegistry {
     let mut providers: Vec<Arc<dyn CapabilityProvider>> = vec![Arc::new(BuiltinProvider::new())];
 
-    // Browser control. Chrome is launched lazily on the first turn that asks for
-    // tools (see BrowserProvider). We drive **Chrome for Testing** with its own
-    // dedicated profile (NOT the user's everyday Chrome): current stable Chrome
-    // (137+) removed `--load-extension`, so the Ocean cockpit extension only
-    // auto-loads in CfT — and a dedicated profile means we never conflict with
-    // (or require quitting) the user's running Chrome. The user logs into their
-    // accounts once inside Ocean's CfT; the profile persists them.
+    // Browser control. With the default-off `legacy-chromium` feature, Chrome
+    // is launched lazily on the first turn that asks for tools (see
+    // BrowserProvider); without it the provider registers the same 19 tool
+    // schemas but every execute returns `browser_host_unavailable` and no
+    // Chromium dependency exists in the build. In legacy mode we drive
+    // **Chrome for Testing** with its own dedicated profile (NOT the user's
+    // everyday Chrome): current stable Chrome (137+) removed `--load-extension`,
+    // so the Ocean cockpit extension only auto-loads in CfT — and a dedicated
+    // profile means we never conflict with (or require quitting) the user's
+    // running Chrome. The user logs into their accounts once inside Ocean's
+    // CfT; the profile persists them.
     let chrome_exe = resolve_chrome_for_testing(config_dir);
     let browser_profile = config_dir.join("chrome-profile");
     let browser_ext = {

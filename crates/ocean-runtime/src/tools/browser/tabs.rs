@@ -4,10 +4,13 @@
 //! `ocean_browser::BrowserHandle`'s shell methods.
 
 use async_trait::async_trait;
+#[cfg(feature = "legacy-chromium")]
 use ocean_browser::TabId;
 use serde_json::{json, Value};
 
-use super::{active_result, BrowserToolCtx};
+#[cfg(feature = "legacy-chromium")]
+use super::active_result;
+use super::BrowserToolCtx;
 use crate::types::{AgentTool, AgentToolResult};
 
 /// Read-only: list every open tab with its id/url/title/active flag. This is
@@ -38,19 +41,26 @@ impl AgentTool for BrowserListTabsTool {
         false
     }
     async fn execute(&self, _id: &str, _args: Value) -> Result<AgentToolResult, String> {
-        let ctx = self
-            .ctx
-            .lazy
-            .get()
-            .await?
-            .list_tabs()
-            .await
-            .map_err(|e| e.to_string())?;
-        let json = serde_json::to_string(&ctx).map_err(|e| e.to_string())?;
-        // Live browser action: enumerating tabs round-trips to CDP
-        // (snapshot_pages + per-page url/title), so it engages the live browser
-        // and must flag activity for the side-panel handoff.
-        Ok(active_result(json))
+        #[cfg(feature = "legacy-chromium")]
+        {
+            let ctx = self
+                .ctx
+                .lazy
+                .get()
+                .await?
+                .list_tabs()
+                .await
+                .map_err(|e| e.to_string())?;
+            let json = serde_json::to_string(&ctx).map_err(|e| e.to_string())?;
+            // Live browser action: enumerating tabs round-trips to CDP
+            // (snapshot_pages + per-page url/title), so it engages the live browser
+            // and must flag activity for the side-panel handoff.
+            Ok(active_result(json))
+        }
+        #[cfg(not(feature = "legacy-chromium"))]
+        {
+            Err(super::browser_host_unavailable())
+        }
     }
 }
 
@@ -80,19 +90,27 @@ impl AgentTool for BrowserOpenTabTool {
         true
     }
     async fn execute(&self, _id: &str, args: Value) -> Result<AgentToolResult, String> {
-        let url = args
-            .get("url")
-            .and_then(|v| v.as_str())
-            .ok_or("missing 'url'")?;
-        let id = self
-            .ctx
-            .lazy
-            .get()
-            .await?
-            .open_tab(url)
-            .await
-            .map_err(|e| e.to_string())?;
-        Ok(active_result(format!("opened tab {id} at {url}")))
+        #[cfg(feature = "legacy-chromium")]
+        {
+            let url = args
+                .get("url")
+                .and_then(|v| v.as_str())
+                .ok_or("missing 'url'")?;
+            let id = self
+                .ctx
+                .lazy
+                .get()
+                .await?
+                .open_tab(url)
+                .await
+                .map_err(|e| e.to_string())?;
+            Ok(active_result(format!("opened tab {id} at {url}")))
+        }
+        #[cfg(not(feature = "legacy-chromium"))]
+        {
+            let _ = args;
+            Err(super::browser_host_unavailable())
+        }
     }
 }
 
@@ -121,18 +139,26 @@ impl AgentTool for BrowserSwitchTabTool {
         true
     }
     async fn execute(&self, _id: &str, args: Value) -> Result<AgentToolResult, String> {
-        let tab_id = args
-            .get("tab_id")
-            .and_then(|v| v.as_str())
-            .ok_or("missing 'tab_id'")?;
-        self.ctx
-            .lazy
-            .get()
-            .await?
-            .switch_tab(&TabId(tab_id.to_string()))
-            .await
-            .map_err(|e| e.to_string())?;
-        Ok(active_result(format!("switched to tab {tab_id}")))
+        #[cfg(feature = "legacy-chromium")]
+        {
+            let tab_id = args
+                .get("tab_id")
+                .and_then(|v| v.as_str())
+                .ok_or("missing 'tab_id'")?;
+            self.ctx
+                .lazy
+                .get()
+                .await?
+                .switch_tab(&TabId(tab_id.to_string()))
+                .await
+                .map_err(|e| e.to_string())?;
+            Ok(active_result(format!("switched to tab {tab_id}")))
+        }
+        #[cfg(not(feature = "legacy-chromium"))]
+        {
+            let _ = args;
+            Err(super::browser_host_unavailable())
+        }
     }
 }
 
@@ -160,17 +186,25 @@ impl AgentTool for BrowserCloseTabTool {
         true
     }
     async fn execute(&self, _id: &str, args: Value) -> Result<AgentToolResult, String> {
-        let tab_id = args
-            .get("tab_id")
-            .and_then(|v| v.as_str())
-            .ok_or("missing 'tab_id'")?;
-        self.ctx
-            .lazy
-            .get()
-            .await?
-            .close_tab(&TabId(tab_id.to_string()))
-            .await
-            .map_err(|e| e.to_string())?;
-        Ok(active_result(format!("closed tab {tab_id}")))
+        #[cfg(feature = "legacy-chromium")]
+        {
+            let tab_id = args
+                .get("tab_id")
+                .and_then(|v| v.as_str())
+                .ok_or("missing 'tab_id'")?;
+            self.ctx
+                .lazy
+                .get()
+                .await?
+                .close_tab(&TabId(tab_id.to_string()))
+                .await
+                .map_err(|e| e.to_string())?;
+            Ok(active_result(format!("closed tab {tab_id}")))
+        }
+        #[cfg(not(feature = "legacy-chromium"))]
+        {
+            let _ = args;
+            Err(super::browser_host_unavailable())
+        }
     }
 }

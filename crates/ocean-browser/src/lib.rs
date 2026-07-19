@@ -1,30 +1,53 @@
-//! Typed async handle to a Chrome instance over the DevTools Protocol.
+//! Legacy typed async handle to a Chrome instance over the DevTools Protocol.
+//!
+//! **Quarantine:** this crate is the legacy Chromium backend and is scheduled
+//! for replacement by the OceanWebKit browser host. It compiles to an inert
+//! stub unless the default-off `legacy-chromium` feature is enabled (via
+//! `ocean-daemon --features legacy-chromium`); without it, no chromiumoxide
+//! enters the build graph.
 
+#[cfg(feature = "legacy-chromium")]
 pub mod downloads;
+#[cfg(feature = "legacy-chromium")]
 pub mod error;
+#[cfg(feature = "legacy-chromium")]
 pub mod launch;
+#[cfg(feature = "legacy-chromium")]
 pub mod netcap;
+#[cfg(feature = "legacy-chromium")]
 pub mod perception;
+#[cfg(feature = "legacy-chromium")]
 pub mod shell;
 
+#[cfg(feature = "legacy-chromium")]
 pub use downloads::{DownloadInfo, DownloadState};
+#[cfg(feature = "legacy-chromium")]
 pub use error::BrowserError;
+#[cfg(feature = "legacy-chromium")]
 pub use launch::{launch, LaunchConfig, LaunchedChrome};
+#[cfg(feature = "legacy-chromium")]
 pub use netcap::{CapturedResponse, NetCapture};
+#[cfg(feature = "legacy-chromium")]
 pub use perception::{ElementRef, PageRead};
+#[cfg(feature = "legacy-chromium")]
 pub use shell::{BrowserContext, TabId, TabInfo};
 
 /// Re-exported result alias used across the crate.
+#[cfg(feature = "legacy-chromium")]
 pub type Result<T> = std::result::Result<T, BrowserError>;
 
+#[cfg(feature = "legacy-chromium")]
 use std::sync::Arc;
 
+#[cfg(feature = "legacy-chromium")]
 use chromiumoxide::page::Page;
+#[cfg(feature = "legacy-chromium")]
 use tokio::sync::Mutex;
 
 /// Shared, cloneable handle to one Chrome + its active page. Cloning shares the
 /// same underlying browser (Arc). The active page is mutexed because tools may
 /// be called concurrently within a turn.
+#[cfg(feature = "legacy-chromium")]
 #[derive(Clone)]
 pub struct BrowserHandle {
     inner: Arc<Mutex<LaunchedChrome>>,
@@ -35,6 +58,7 @@ pub struct BrowserHandle {
     downloads: Arc<Mutex<Option<downloads::DownloadTracker>>>,
 }
 
+#[cfg(feature = "legacy-chromium")]
 impl BrowserHandle {
     pub async fn launch(cfg: LaunchConfig) -> Result<Self> {
         let chrome = launch(&cfg).await?;
@@ -314,6 +338,7 @@ impl BrowserHandle {
 /// chromiumoxide's internal `press_key` (which isn't exposed on the public
 /// `Page`). Looks up the US-layout key definition; for printable single chars
 /// the `text` field drives the inserted character.
+#[cfg(feature = "legacy-chromium")]
 async fn dispatch_key(page: &Page, key: &str) -> Result<()> {
     use chromiumoxide::cdp::browser_protocol::input::{
         DispatchKeyEventParams, DispatchKeyEventType,

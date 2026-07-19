@@ -29,20 +29,35 @@ livekit-tap = ["ocean-call/livekit-tap", "ocean-call/xai-stt", "ocean-call/xai-t
 # the websocket stack via ocean-call's `deepgram-stt`; OPT-IN so the default and
 # `livekit-tap`-only builds pull no websocket deps.
 deepgram-stt = ["livekit-tap", "ocean-call/deepgram-stt"]
+# Legacy chromiumoxide/CDP browser backend: the agent's 19 `browser_*` tools
+# drive a real Chrome for Testing and `/v1/browser/screencast` +
+# `/v1/browser/input` relay its live CDP session to Ocean Desktop. Default-off
+# while the backend is replaced by the OceanWebKit browser host; without it,
+# browser tools return `browser_host_unavailable` and the relay routes serve
+# the frozen `no-browser` status from `browser_stream_stub`.
+legacy-chromium = [
+    "dep:chromiumoxide",
+    "dep:ocean-browser",
+    "ocean-browser/legacy-chromium",
+    "ocean-agent/legacy-chromium",
+]
 
 [dependencies]
 anyhow.workspace = true
 async-trait.workspace = true
 axum.workspace = true
 chrono.workspace = true
-chromiumoxide.workspace = true
+# Legacy Chromium CDP relay (`browser_stream`): quarantined behind the
+# default-off `legacy-chromium` feature; replaced by a no-browser stub in
+# default builds.
+chromiumoxide = { workspace = true, optional = true }
 # P2-C: caller-owned idempotent redemption bearers and deterministic,
 # domain-separated agent registration keys. All are workspace-pinned.
 base64.workspace = true
 getrandom.workspace = true
 ocean-agent.workspace = true
 ocean-agent-sdk.workspace = true
-ocean-browser.workspace = true
+ocean-browser = { workspace = true, optional = true }
 ocean-call.workspace = true
 ocean-core.workspace = true
 ocean-longhouse.workspace = true

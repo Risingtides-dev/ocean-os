@@ -84,6 +84,21 @@ const COMPATIBILITY_GATES: &[Gate] = &[
         deny: false,
     },
     Gate {
+        label: "daemon legacy-chromium feature Clippy",
+        program: "cargo",
+        args: &[
+            "clippy",
+            "-p",
+            "ocean-daemon",
+            "--features",
+            "legacy-chromium",
+            "--",
+            "-D",
+            "warnings",
+        ],
+        deny: false,
+    },
+    Gate {
         label: "release-profile workspace all-target check",
         program: "cargo",
         args: &["check", "--workspace", "--all-targets", "--release"],
@@ -108,6 +123,18 @@ const MSRV_GATES: &[Gate] = &[
         label: "MSRV daemon deepgram-stt feature",
         program: "cargo",
         args: &["check", "-p", "ocean-daemon", "--features", "deepgram-stt"],
+        deny: false,
+    },
+    Gate {
+        label: "MSRV daemon legacy-chromium feature",
+        program: "cargo",
+        args: &[
+            "check",
+            "-p",
+            "ocean-daemon",
+            "--features",
+            "legacy-chromium",
+        ],
         deny: false,
     },
 ];
@@ -345,6 +372,7 @@ mod tests {
             [
                 "cargo clippy -p ocean-daemon --features livekit-tap -- -D warnings",
                 "cargo clippy -p ocean-daemon --features deepgram-stt -- -D warnings",
+                "cargo clippy -p ocean-daemon --features legacy-chromium -- -D warnings",
                 "cargo check --workspace --all-targets --release",
             ]
         );
@@ -358,6 +386,7 @@ mod tests {
                 "cargo check --workspace --all-targets",
                 "cargo check -p ocean-daemon --features livekit-tap",
                 "cargo check -p ocean-daemon --features deepgram-stt",
+                "cargo check -p ocean-daemon --features legacy-chromium",
             ]
         );
     }

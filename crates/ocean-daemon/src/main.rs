@@ -77,11 +77,17 @@ mod harness_profile;
 
 /// Bounded, fail-open post-turn advisor execution and attribution.
 mod advisor;
-/// Browser-screencast backend — streams the agent's live Chrome (JPEG frames
-/// + input forwarding) for Ocean Desktop's Browser tab over
-/// `/v1/browser/screencast` (SSE) and `/v1/browser/input`. Attaches as a SECOND
-/// CDP client to the same Chrome the agent already drives; see [`browser_stream`]
-/// for the frozen client contract.
+/// Browser-screencast backend — with the default-off `legacy-chromium` feature
+/// this streams the agent's live Chrome (JPEG frames + input forwarding) for
+/// Ocean Desktop's Browser tab over `/v1/browser/screencast` (SSE) and
+/// `/v1/browser/input`, attaching as a SECOND CDP client to the same Chrome the
+/// agent already drives. Without the feature a stub module serves the same
+/// frozen client contract (`no-browser` status / error) with no CDP and no
+/// chromiumoxide; routes stay registered in both modes.
+#[cfg(feature = "legacy-chromium")]
+mod browser_stream;
+#[cfg(not(feature = "legacy-chromium"))]
+#[path = "browser_stream_stub.rs"]
 mod browser_stream;
 /// Event buses — parallel broadcast/pub-sub for legacy `OceanEvent` and
 /// full-fidelity `AgentTurnEvent`.

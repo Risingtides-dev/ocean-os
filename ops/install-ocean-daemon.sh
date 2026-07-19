@@ -34,8 +34,14 @@ if [[ "$branch" != "main" ]]; then
   exit 64 # EX_USAGE
 fi
 
-echo "==> [1/3] building ocean-daemon (release) from '$branch'"
-( cd "$REPO" && cargo build -p ocean-daemon --release )
+echo "==> [1/3] building ocean-daemon (release, legacy-chromium) from '$branch'"
+# INTERIM: the supervised daemon keeps the legacy Chromium browser backend
+# (`legacy-chromium` feature) so agent browsing stays live while the
+# OceanWebKit engine program (docs/specs/2026-07-19-ocean-webkit-browser-program.md)
+# replaces it. Default builds compile no chromiumoxide; this flag is the
+# deliberate operator-visible exception for the production daemon. Drop it when
+# the OceanWebKit browser host ships.
+( cd "$REPO" && cargo build -p ocean-daemon --release --features legacy-chromium )
 
 BIN="$REPO/target/release/ocean-daemon"
 if [[ ! -x "$BIN" ]]; then

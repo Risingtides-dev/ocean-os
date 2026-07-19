@@ -1,7 +1,9 @@
 use async_trait::async_trait;
 use serde_json::{json, Value};
 
-use super::{active_result, BrowserToolCtx};
+#[cfg(feature = "legacy-chromium")]
+use super::active_result;
+use super::BrowserToolCtx;
 use crate::types::{AgentTool, AgentToolResult};
 
 pub struct BrowserNavigateTool {
@@ -27,20 +29,28 @@ impl AgentTool for BrowserNavigateTool {
         true
     }
     async fn execute(&self, _id: &str, args: Value) -> Result<AgentToolResult, String> {
-        let url = args
-            .get("url")
-            .and_then(|v| v.as_str())
-            .ok_or("missing 'url'")?;
-        let title = self
-            .ctx
-            .lazy
-            .get()
-            .await?
-            .navigate(url)
-            .await
-            .map_err(|e| e.to_string())?;
-        Ok(active_result(format!(
-            "navigated to {url} — title: {title}"
-        )))
+        #[cfg(feature = "legacy-chromium")]
+        {
+            let url = args
+                .get("url")
+                .and_then(|v| v.as_str())
+                .ok_or("missing 'url'")?;
+            let title = self
+                .ctx
+                .lazy
+                .get()
+                .await?
+                .navigate(url)
+                .await
+                .map_err(|e| e.to_string())?;
+            Ok(active_result(format!(
+                "navigated to {url} — title: {title}"
+            )))
+        }
+        #[cfg(not(feature = "legacy-chromium"))]
+        {
+            let _ = args;
+            Err(super::browser_host_unavailable())
+        }
     }
 }

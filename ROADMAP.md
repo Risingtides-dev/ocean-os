@@ -26,6 +26,26 @@ approved design or permission to alter public contracts.
 - [ ] Implement and independently review the daemon-owned metadata projection, durable ordered replay, authenticated snapshot/live API, and extension admission/binding contract before building the production animated Surface renderer.
 - [ ] Repair and contract-test end-to-end event resume through the Surface proxy (`Last-Event-ID` or an approved explicit cursor equivalent); do not use `/v1/agent/events?all=1` as the product feed.
 
+## Ocean Browser (OceanWebKit)
+
+Program direction ratified 2026-07-19 in
+[`docs/specs/2026-07-19-ocean-webkit-browser-program.md`](docs/specs/2026-07-19-ocean-webkit-browser-program.md):
+a custom WebKit engine with earned Chrome DevTools protocol parity, built
+outside the Cargo graph in a dedicated `ocean-webkit` repository.
+
+- [x] Quarantine the Chromium backend behind the default-off `legacy-chromium`
+      feature; default builds compile no chromiumoxide, the 19 `browser_*` tool
+      schemas stay pinned, and the daemon browser routes serve a frozen
+      `no-browser` contract without an engine.
+- [x] Keep interim browsing on the supervised daemon: `ops/install-ocean-daemon.sh`
+      builds with `--features legacy-chromium` until the OceanWebKit host ships.
+- [ ] Pass the first hard checkpoint (manifest §7): pinned-fork MiniBrowser, one
+      custom CDP command end-to-end, full-traffic capture with bodies, trusted
+      Automation input, unmodified Chrome DevTools frontend connection, minimal
+      Tauri embedding, signed helper packaging, and build/size/memory measurements.
+- [ ] Earn per-domain CDP parity with generated conformance tests; ship the
+      usable browser at the manifest's ship gate rather than protocol completeness.
+
 ## Harness evolution
 
 The source-researched mechanism inventory and dated implementation matrix live in

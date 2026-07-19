@@ -1,7 +1,9 @@
 use async_trait::async_trait;
 use serde_json::{json, Value};
 
-use super::{active_result, BrowserToolCtx};
+#[cfg(feature = "legacy-chromium")]
+use super::active_result;
+use super::BrowserToolCtx;
 use crate::types::{AgentTool, AgentToolResult};
 
 pub struct BrowserEvalJsTool {
@@ -23,19 +25,27 @@ impl AgentTool for BrowserEvalJsTool {
         true
     }
     async fn execute(&self, _id: &str, args: Value) -> Result<AgentToolResult, String> {
-        let src = args
-            .get("source")
-            .and_then(|v| v.as_str())
-            .ok_or("missing 'source'")?;
-        let out = self
-            .ctx
-            .lazy
-            .get()
-            .await?
-            .eval_js(src)
-            .await
-            .map_err(|e| e.to_string())?;
-        Ok(active_result(out))
+        #[cfg(feature = "legacy-chromium")]
+        {
+            let src = args
+                .get("source")
+                .and_then(|v| v.as_str())
+                .ok_or("missing 'source'")?;
+            let out = self
+                .ctx
+                .lazy
+                .get()
+                .await?
+                .eval_js(src)
+                .await
+                .map_err(|e| e.to_string())?;
+            Ok(active_result(out))
+        }
+        #[cfg(not(feature = "legacy-chromium"))]
+        {
+            let _ = args;
+            Err(super::browser_host_unavailable())
+        }
     }
 }
 
@@ -59,15 +69,22 @@ impl AgentTool for BrowserConsoleTool {
         false
     }
     async fn execute(&self, _id: &str, _args: Value) -> Result<AgentToolResult, String> {
-        let out = self
-            .ctx
-            .lazy
-            .get()
-            .await?
-            .read_console()
-            .await
-            .map_err(|e| e.to_string())?;
-        Ok(active_result(out))
+        #[cfg(feature = "legacy-chromium")]
+        {
+            let out = self
+                .ctx
+                .lazy
+                .get()
+                .await?
+                .read_console()
+                .await
+                .map_err(|e| e.to_string())?;
+            Ok(active_result(out))
+        }
+        #[cfg(not(feature = "legacy-chromium"))]
+        {
+            Err(super::browser_host_unavailable())
+        }
     }
 }
 
@@ -91,14 +108,21 @@ impl AgentTool for BrowserNetworkTool {
         false
     }
     async fn execute(&self, _id: &str, _args: Value) -> Result<AgentToolResult, String> {
-        let out = self
-            .ctx
-            .lazy
-            .get()
-            .await?
-            .read_network()
-            .await
-            .map_err(|e| e.to_string())?;
-        Ok(active_result(out))
+        #[cfg(feature = "legacy-chromium")]
+        {
+            let out = self
+                .ctx
+                .lazy
+                .get()
+                .await?
+                .read_network()
+                .await
+                .map_err(|e| e.to_string())?;
+            Ok(active_result(out))
+        }
+        #[cfg(not(feature = "legacy-chromium"))]
+        {
+            Err(super::browser_host_unavailable())
+        }
     }
 }

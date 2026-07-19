@@ -28,7 +28,7 @@ TUI / CLI / ACP / Ocean Surface
         +-- ocean-store -------------- durable local rooms
         +-- ocean-memory ------------- local typed memory
         +-- ocean-longhouse ---------- council/quorum/title coordination
-        `-- ocean-browser/ocean-call - browser and optional call capabilities
+        `-- ocean-browser/ocean-call - legacy browser (default-off feature) and optional call capabilities
 ```
 
 The daemon composes these packages in-process. It does not shell out to another

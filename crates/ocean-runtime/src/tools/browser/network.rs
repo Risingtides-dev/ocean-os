@@ -6,7 +6,9 @@
 use async_trait::async_trait;
 use serde_json::{json, Value};
 
-use super::{active_result, BrowserToolCtx};
+#[cfg(feature = "legacy-chromium")]
+use super::active_result;
+use super::BrowserToolCtx;
 use crate::types::{AgentTool, AgentToolResult};
 
 /// Start buffering network responses on the active page. Call this BEFORE the
@@ -39,17 +41,25 @@ impl AgentTool for BrowserCaptureNetworkTool {
         false
     }
     async fn execute(&self, _id: &str, args: Value) -> Result<AgentToolResult, String> {
-        let cap = args.get("limit").and_then(|v| v.as_u64()).unwrap_or(200) as usize;
-        self.ctx
-            .lazy
-            .get()
-            .await?
-            .start_netcap(cap)
-            .await
-            .map_err(|e| e.to_string())?;
-        Ok(active_result(format!(
-            "network capture started (buffering up to {cap} responses)"
-        )))
+        #[cfg(feature = "legacy-chromium")]
+        {
+            let cap = args.get("limit").and_then(|v| v.as_u64()).unwrap_or(200) as usize;
+            self.ctx
+                .lazy
+                .get()
+                .await?
+                .start_netcap(cap)
+                .await
+                .map_err(|e| e.to_string())?;
+            Ok(active_result(format!(
+                "network capture started (buffering up to {cap} responses)"
+            )))
+        }
+        #[cfg(not(feature = "legacy-chromium"))]
+        {
+            let _ = args;
+            Err(super::browser_host_unavailable())
+        }
     }
 }
 
@@ -76,12 +86,19 @@ impl AgentTool for BrowserCapturedRequestsTool {
         false
     }
     async fn execute(&self, _id: &str, _args: Value) -> Result<AgentToolResult, String> {
-        let reqs = self.ctx.lazy.get().await?.captured_requests().await;
-        let json = serde_json::to_string(&reqs).map_err(|e| e.to_string())?;
-        // Exempt from BrowserActivity: this reads the in-memory netcap buffer
-        // (no CDP round-trip). The capture that populated it already flagged
-        // activity, so listing the buffer is bookkeeping, not browser work.
-        Ok(AgentToolResult::text(json))
+        #[cfg(feature = "legacy-chromium")]
+        {
+            let reqs = self.ctx.lazy.get().await?.captured_requests().await;
+            let json = serde_json::to_string(&reqs).map_err(|e| e.to_string())?;
+            // Exempt from BrowserActivity: this reads the in-memory netcap buffer
+            // (no CDP round-trip). The capture that populated it already flagged
+            // activity, so listing the buffer is bookkeeping, not browser work.
+            Ok(AgentToolResult::text(json))
+        }
+        #[cfg(not(feature = "legacy-chromium"))]
+        {
+            Err(super::browser_host_unavailable())
+        }
     }
 }
 
@@ -113,21 +130,29 @@ impl AgentTool for BrowserResponseBodyTool {
         false
     }
     async fn execute(&self, _id: &str, args: Value) -> Result<AgentToolResult, String> {
-        let request_id = args
-            .get("request_id")
-            .and_then(|v| v.as_str())
-            .ok_or("missing 'request_id'")?;
-        let body = self
-            .ctx
-            .lazy
-            .get()
-            .await?
-            .response_body(request_id)
-            .await
-            .map_err(|e| e.to_string())?;
-        // Live browser action: fetching a body issues a CDP
-        // `Network.getResponseBody` against the active page, so it engages the
-        // live browser and must flag activity for the side-panel handoff.
-        Ok(active_result(body))
+        #[cfg(feature = "legacy-chromium")]
+        {
+            let request_id = args
+                .get("request_id")
+                .and_then(|v| v.as_str())
+                .ok_or("missing 'request_id'")?;
+            let body = self
+                .ctx
+                .lazy
+                .get()
+                .await?
+                .response_body(request_id)
+                .await
+                .map_err(|e| e.to_string())?;
+            // Live browser action: fetching a body issues a CDP
+            // `Network.getResponseBody` against the active page, so it engages the
+            // live browser and must flag activity for the side-panel handoff.
+            Ok(active_result(body))
+        }
+        #[cfg(not(feature = "legacy-chromium"))]
+        {
+            let _ = args;
+            Err(super::browser_host_unavailable())
+        }
     }
 }

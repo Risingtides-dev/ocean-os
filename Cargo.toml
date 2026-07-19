@@ -101,9 +101,13 @@ ocean-agent = { path = "crates/ocean-agent" }
 ocean-providers = { path = "crates/ocean-providers" }
 ocean-browser = { path = "crates/ocean-browser" }
 ocean-call = { path = "crates/ocean-call" }
-# Default features only ("bytes"). The `fetcher`/`rustls`/`native-tls` features
-# pull in chromiumoxide_fetcher (auto-downloads Chromium) which has a broken zip
-# gate in 0.9.1 — and we drive the system Chrome, so we never want the fetcher.
+# LEGACY: chromiumoxide is quarantined behind the default-off `legacy-chromium`
+# feature (ocean-browser → ocean-runtime → ocean-agent → ocean-daemon) while the
+# Chromium backend is being replaced by OceanWebKit. Default workspace builds
+# compile no chromiumoxide. Kept at default features only ("bytes"): the
+# `fetcher`/`rustls`/`native-tls` features pull in chromiumoxide_fetcher
+# (auto-downloads Chromium) which has a broken zip gate in 0.9.1 — and the
+# legacy backend drives the system Chrome, so we never want the fetcher.
 chromiumoxide = { version = "0.9" }
 base64 = "0.22"
 ocean-longhouse = { path = "crates/ocean-longhouse" }

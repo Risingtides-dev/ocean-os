@@ -24,6 +24,14 @@ This child doc governs `crates/` and is the canonical ownership, entry-point, an
 - Feature credentials remain isolated from agent routing: xAI speech uses `xai`,
   OpenAI Realtime voice uses `openai-realtime`, and future embedding providers
   require dedicated blocks plus a live typed consumer before picker exposure.
+- The Chromium browser backend is quarantined behind the default-off
+  `legacy-chromium` feature chain (`ocean-browser` → `ocean-runtime` →
+  `ocean-agent` → `ocean-daemon`) while it is replaced by the OceanWebKit
+  browser host. Default builds compile no chromiumoxide; the 19 `browser_*`
+  tools keep their exact schemas but return `browser_host_unavailable`, and
+  `/v1/browser/screencast` + `/v1/browser/input` serve the frozen `no-browser`
+  contract from `browser_stream_stub.rs`. Validate both modes:
+  `cargo check --workspace` and `cargo clippy -p ocean-daemon --features legacy-chromium -- -D warnings` (both are CI lanes).
 
 ## Workspace Package Index
 
@@ -35,7 +43,7 @@ The workspace currently contains 28 Rust packages.
 | `ocean-agent` | Sessions/history, prompt assembly, capability/runtime facade | Provider wire encoding; client UI | `ocean-agent/src/lib.rs`, `ocean-agent/src/session/mod.rs`, `ocean-agent/src/system_prompt.rs` | `ocean-agent/AGENTS.md` | `cargo test -p ocean-agent` |
 | `ocean-agent-sdk` | Product session/turn/event/surface vocabulary | Daemon execution and persistence | `ocean-agent-sdk/src/lib.rs` | — | `cargo test -p ocean-agent-sdk` |
 | `ocean-ast` | Standalone tree-sitter read-time structural summarization | Handoff extraction; hashline mutation; live runtime wiring | `ocean-ast/src/lib.rs::summarize_code` | — | `cargo test -p ocean-ast` |
-| `ocean-browser` | Typed Chrome DevTools handle, launch, tabs, perception, network/downloads | Runtime permission policy and tool registration | `ocean-browser/src/lib.rs` | — | `cargo test -p ocean-browser` |
+| `ocean-browser` | Legacy Chrome DevTools handle, launch, tabs, perception, network/downloads (feature-gated, default-off `legacy-chromium`; replaced by the OceanWebKit browser host) | Runtime permission policy and tool registration | `ocean-browser/src/lib.rs` | — | `cargo test -p ocean-browser --features legacy-chromium` |
 | `ocean-call` | PSTN/Twilio/LiveKit audio and call-intelligence pipeline | Daemon HTTP route ownership | `ocean-call/src/lib.rs`, `session_task.rs` | — | `cargo test -p ocean-call` |
 | `ocean-cli` | Thin daemon command/prompt/session client | Agent loop and session persistence | `ocean-cli/src/main.rs` | — | `cargo test -p ocean-cli` |
 | `ocean-context` | Evidence-bearing handoff claims, extraction, replay, reverification | Agent sessions; hashline edits; general AST summaries | `ocean-context/src/lib.rs`, `extract.rs` | — | `cargo test -p ocean-context` |

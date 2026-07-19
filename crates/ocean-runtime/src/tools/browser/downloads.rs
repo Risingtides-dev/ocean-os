@@ -6,7 +6,9 @@
 use async_trait::async_trait;
 use serde_json::{json, Value};
 
-use super::{active_result, BrowserToolCtx};
+#[cfg(feature = "legacy-chromium")]
+use super::active_result;
+use super::BrowserToolCtx;
 use crate::types::{AgentTool, AgentToolResult};
 
 /// Turn on downloading to a known directory and start tracking downloads.
@@ -36,22 +38,30 @@ impl AgentTool for BrowserEnableDownloadsTool {
         true
     }
     async fn execute(&self, _id: &str, args: Value) -> Result<AgentToolResult, String> {
-        let dir = args
-            .get("dir")
-            .and_then(|v| v.as_str())
-            .map(std::path::PathBuf::from);
-        let path = self
-            .ctx
-            .lazy
-            .get()
-            .await?
-            .enable_downloads(dir)
-            .await
-            .map_err(|e| e.to_string())?;
-        Ok(active_result(format!(
-            "downloads enabled → {}",
-            path.display()
-        )))
+        #[cfg(feature = "legacy-chromium")]
+        {
+            let dir = args
+                .get("dir")
+                .and_then(|v| v.as_str())
+                .map(std::path::PathBuf::from);
+            let path = self
+                .ctx
+                .lazy
+                .get()
+                .await?
+                .enable_downloads(dir)
+                .await
+                .map_err(|e| e.to_string())?;
+            Ok(active_result(format!(
+                "downloads enabled → {}",
+                path.display()
+            )))
+        }
+        #[cfg(not(feature = "legacy-chromium"))]
+        {
+            let _ = args;
+            Err(super::browser_host_unavailable())
+        }
     }
 }
 
@@ -80,11 +90,18 @@ impl AgentTool for BrowserDownloadsTool {
         false
     }
     async fn execute(&self, _id: &str, _args: Value) -> Result<AgentToolResult, String> {
-        let items = self.ctx.lazy.get().await?.download_list().await;
-        let json = serde_json::to_string(&items).map_err(|e| e.to_string())?;
-        // Exempt from BrowserActivity: this reads the in-memory download-tracking
-        // buffer (no CDP round-trip). The download was triggered by an earlier
-        // action that already flagged activity; polling the list is bookkeeping.
-        Ok(AgentToolResult::text(json))
+        #[cfg(feature = "legacy-chromium")]
+        {
+            let items = self.ctx.lazy.get().await?.download_list().await;
+            let json = serde_json::to_string(&items).map_err(|e| e.to_string())?;
+            // Exempt from BrowserActivity: this reads the in-memory download-tracking
+            // buffer (no CDP round-trip). The download was triggered by an earlier
+            // action that already flagged activity; polling the list is bookkeeping.
+            Ok(AgentToolResult::text(json))
+        }
+        #[cfg(not(feature = "legacy-chromium"))]
+        {
+            Err(super::browser_host_unavailable())
+        }
     }
 }

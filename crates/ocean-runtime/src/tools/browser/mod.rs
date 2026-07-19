@@ -1,4 +1,9 @@
-//! Agent-facing browser tools. Thin wrappers over `ocean_browser::BrowserHandle`.
+//! Agent-facing browser tools. With the default-off `legacy-chromium` feature
+//! they are thin wrappers over `ocean_browser::BrowserHandle`; without it the
+//! same 19 tool schemas stay registered but every execute returns the
+//! structured `browser_host_unavailable` error (see
+//! [`browser_host_unavailable`]). This keeps the agent tool contract stable
+//! while the Chromium backend is replaced by the OceanWebKit browser host.
 //!
 //! **Permission contract:** actuation tools (navigate, click, type, key, eval_js,
 //! tab open/switch/close, capture start, enable-downloads) are permission-gated.
@@ -24,22 +29,47 @@ pub mod network;
 pub mod perceive;
 pub mod tabs;
 
+#[cfg(feature = "legacy-chromium")]
 use std::future::Future;
 use std::path::PathBuf;
 use std::sync::Arc;
 
 use async_trait::async_trait;
+#[cfg(feature = "legacy-chromium")]
 use ocean_browser::{BrowserHandle, LaunchConfig};
+#[cfg(feature = "legacy-chromium")]
 use tokio::sync::Mutex;
+#[cfg(feature = "legacy-chromium")]
 use tokio::time::{timeout, Duration, Instant};
 
 use crate::capability::{CapabilityProvider, ProviderHealth, SessionContext, SharedTool};
-use crate::types::{AgentTool, AgentToolResult, ToolSideEffect};
+use crate::types::AgentTool;
+#[cfg(feature = "legacy-chromium")]
+use crate::types::{AgentToolResult, ToolSideEffect};
 
+/// Structured error every browser tool returns in a build with no browser
+/// engine: the legacy Chromium backend is compiled out (default-off
+/// `legacy-chromium` feature) and the OceanWebKit browser host is not
+/// connected yet. The stable `browser_host_unavailable` prefix lets agents
+/// and surfaces parse the condition instead of scraping prose.
+#[cfg(not(feature = "legacy-chromium"))]
+pub(crate) fn browser_host_unavailable() -> String {
+    "browser_host_unavailable: this Ocean build has no browser engine (the \
+     legacy Chromium backend is disabled behind the default-off \
+     `legacy-chromium` feature) and the OceanWebKit browser host is not \
+     connected yet. Report browsing as unavailable to the operator instead of \
+     retrying in a loop."
+        .to_string()
+}
+
+#[cfg(feature = "legacy-chromium")]
 const BROWSER_SINGLE_FLIGHT_TIMEOUT: Duration = Duration::from_secs(40);
+#[cfg(feature = "legacy-chromium")]
 const BROWSER_LIVENESS_TIMEOUT: Duration = Duration::from_secs(3);
+#[cfg(feature = "legacy-chromium")]
 const BROWSER_LAUNCH_TIMEOUT: Duration = Duration::from_secs(30);
 
+#[cfg(feature = "legacy-chromium")]
 #[derive(Clone, Copy)]
 struct BrowserDeadlines {
     single_flight: Duration,
@@ -47,12 +77,14 @@ struct BrowserDeadlines {
     launch: Duration,
 }
 
+#[cfg(feature = "legacy-chromium")]
 const BROWSER_DEADLINES: BrowserDeadlines = BrowserDeadlines {
     single_flight: BROWSER_SINGLE_FLIGHT_TIMEOUT,
     liveness: BROWSER_LIVENESS_TIMEOUT,
     launch: BROWSER_LAUNCH_TIMEOUT,
 };
 
+#[cfg(feature = "legacy-chromium")]
 struct BrowserSlot<H> {
     handle: Option<Arc<H>>,
     /// Completion time of the last successful liveness probe or launch. A
@@ -61,6 +93,7 @@ struct BrowserSlot<H> {
     validated_at: Option<Instant>,
 }
 
+#[cfg(feature = "legacy-chromium")]
 impl<H> Default for BrowserSlot<H> {
     fn default() -> Self {
         Self {
@@ -75,6 +108,7 @@ impl<H> Default for BrowserSlot<H> {
 /// concurrent callers cannot launch duplicate Chrome instances. Every awaited
 /// phase is bounded, and cancellation drops the guard/futures without caching a
 /// partial launch, leaving the slot retryable.
+#[cfg(feature = "legacy-chromium")]
 async fn get_or_launch_with<H, IsAlive, IsAliveFuture, Launch, LaunchFuture>(
     slot: &Mutex<BrowserSlot<H>>,
     deadlines: BrowserDeadlines,
@@ -139,12 +173,14 @@ where
 /// `.get().await` only when they actually run — so merely LISTING the browser
 /// tools (which happens on every turn) never launches Chrome. Chrome boots on
 /// the first real browser action, and is reused after.
+#[cfg(feature = "legacy-chromium")]
 #[derive(Clone)]
 pub struct LazyBrowser {
     cfg: Arc<LaunchConfig>,
     handle: Arc<Mutex<BrowserSlot<BrowserHandle>>>,
 }
 
+#[cfg(feature = "legacy-chromium")]
 impl LazyBrowser {
     pub fn new(cfg: LaunchConfig) -> Self {
         Self {
@@ -175,12 +211,21 @@ impl LazyBrowser {
 
 /// Shared dependency injected into every browser tool. Holds a LAZY browser —
 /// listing tools never launches Chrome; the first tool that runs does.
+#[cfg(feature = "legacy-chromium")]
 #[derive(Clone)]
 pub struct BrowserToolCtx {
     pub lazy: LazyBrowser,
 }
 
+/// Stub context for builds without a browser engine: the tools keep their
+/// schemas registered (stable prompt/tool contract) and return
+/// `browser_host_unavailable` on execute.
+#[cfg(not(feature = "legacy-chromium"))]
+#[derive(Clone)]
+pub struct BrowserToolCtx;
+
 /// Build a text result that also flags browser activity for the handoff.
+#[cfg(feature = "legacy-chromium")]
 fn active_result(text: impl Into<String>) -> AgentToolResult {
     let mut r = AgentToolResult::text(text);
     r.side_effects
@@ -221,10 +266,19 @@ pub fn browser_tools(ctx: BrowserToolCtx) -> Vec<Arc<dyn AgentTool>> {
 /// actual browser action and is reused afterward. Listing tools (which happens
 /// on every single turn) is therefore free — a "what's 2+2" turn never starts
 /// a browser.
+#[cfg(feature = "legacy-chromium")]
 pub struct BrowserProvider {
     lazy: LazyBrowser,
 }
 
+/// Stub provider for builds without a browser engine: advertises the SAME 19
+/// tool schemas so prompts and tool contracts stay stable across build modes,
+/// but never launches anything — each tool returns the structured
+/// `browser_host_unavailable` error on execute.
+#[cfg(not(feature = "legacy-chromium"))]
+pub struct BrowserProvider;
+
+#[cfg(feature = "legacy-chromium")]
 impl BrowserProvider {
     /// Build a provider. `profile_dir` is Chrome's user-data dir;
     /// `profile_directory` is the sub-profile (e.g. "Default"); `extension_dir`
@@ -249,6 +303,22 @@ impl BrowserProvider {
     }
 }
 
+#[cfg(not(feature = "legacy-chromium"))]
+impl BrowserProvider {
+    /// Same signature as the Chromium provider so capability assembly
+    /// (`ocean-agent`) is engine-agnostic and compiles unchanged in both
+    /// modes. Every argument is ignored in this build mode.
+    pub fn new(
+        _profile_dir: PathBuf,
+        _profile_directory: Option<String>,
+        _extension_dir: Option<PathBuf>,
+        _chrome_executable: Option<PathBuf>,
+    ) -> Self {
+        Self
+    }
+}
+
+#[cfg(feature = "legacy-chromium")]
 #[async_trait]
 impl CapabilityProvider for BrowserProvider {
     fn id(&self) -> &str {
@@ -267,7 +337,23 @@ impl CapabilityProvider for BrowserProvider {
     }
 }
 
-#[cfg(test)]
+#[cfg(not(feature = "legacy-chromium"))]
+#[async_trait]
+impl CapabilityProvider for BrowserProvider {
+    fn id(&self) -> &str {
+        "browser"
+    }
+
+    async fn tools(&self, _ctx: &SessionContext) -> Vec<SharedTool> {
+        browser_tools(BrowserToolCtx)
+    }
+
+    async fn health(&self) -> ProviderHealth {
+        ProviderHealth::Unavailable
+    }
+}
+
+#[cfg(all(test, feature = "legacy-chromium"))]
 mod tests {
     use super::*;
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -659,5 +745,85 @@ mod tests {
         .expect("mutex and cache remain retryable after cancellation");
         assert_eq!(retry.id, 9);
         assert_eq!(counters.attempts.load(Ordering::SeqCst), 2);
+    }
+}
+
+/// Stub-mode contract tests: with no browser engine compiled in, the 19 tool
+/// schemas stay registered byte-identical and every execute returns the
+/// structured `browser_host_unavailable` error instead of launching anything.
+#[cfg(all(test, not(feature = "legacy-chromium")))]
+mod stub_tests {
+    use super::*;
+    use serde_json::json;
+
+    const EXPECTED_TOOLS: &[&str] = &[
+        "browser_navigate",
+        "browser_read_page",
+        "browser_screenshot",
+        "browser_click",
+        "browser_type",
+        "browser_key",
+        "browser_scroll",
+        "browser_eval_js",
+        "browser_console",
+        "browser_network",
+        "browser_list_tabs",
+        "browser_open_tab",
+        "browser_switch_tab",
+        "browser_close_tab",
+        "browser_capture_network",
+        "browser_captured_requests",
+        "browser_response_body",
+        "browser_enable_downloads",
+        "browser_downloads",
+    ];
+
+    #[tokio::test]
+    async fn stub_registers_same_19_tool_schemas() {
+        let tools = browser_tools(BrowserToolCtx);
+        let mut names: Vec<&str> = tools.iter().map(|t| t.name()).collect();
+        names.sort_unstable();
+        let mut expected = EXPECTED_TOOLS.to_vec();
+        expected.sort_unstable();
+        assert_eq!(names, expected, "browser tool contract drifted");
+        for tool in &tools {
+            let schema = tool.parameters();
+            assert_eq!(
+                schema.get("type").and_then(|t| t.as_str()),
+                Some("object"),
+                "{} schema must stay an object",
+                tool.name()
+            );
+            assert!(
+                !tool.description().is_empty(),
+                "{} keeps a description",
+                tool.name()
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn stub_execute_returns_structured_unavailable_error() {
+        for tool in browser_tools(BrowserToolCtx) {
+            let err = tool
+                .execute("test-call", json!({}))
+                .await
+                .expect_err(&format!(
+                    "{} must not execute without an engine",
+                    tool.name()
+                ));
+            assert!(
+                err.starts_with("browser_host_unavailable"),
+                "{} returned an unstructured error: {err}",
+                tool.name()
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn stub_provider_reports_unavailable_health() {
+        let provider = BrowserProvider::new(PathBuf::from("/unused"), None, None, None);
+        assert_eq!(provider.health().await, ProviderHealth::Unavailable);
+        assert_eq!(provider.id(), "browser");
     }
 }

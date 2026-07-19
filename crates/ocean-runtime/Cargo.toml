@@ -22,7 +22,7 @@ ignore = "0.4"
 libc = "0.2"
 ocean-protocol = { path = "../ocean-protocol" }
 ocean-agent-sdk = { workspace = true }
-ocean-browser = { workspace = true }
+ocean-browser = { workspace = true, optional = true }
 ocean-hashline = { path = "../ocean-hashline" }
 regex.workspace = true
 reqwest.workspace = true
@@ -35,6 +35,14 @@ tokio-util.workspace = true
 tracing.workspace = true
 unicode-width = "0.2"
 uuid.workspace = true
+
+[features]
+default = []
+# Legacy chromiumoxide/CDP browser backend (being replaced by the OceanWebKit
+# browser host). Default-off: without it the 19 `browser_*` tools keep their
+# exact schemas registered but return a structured `browser_host_unavailable`
+# error instead of launching Chrome, and no chromiumoxide enters the graph.
+legacy-chromium = ["dep:ocean-browser", "ocean-browser/legacy-chromium"]
 
 [dev-dependencies]
 proptest = "1"

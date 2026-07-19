@@ -1,5 +1,7 @@
 //! Real-Chrome smoke test. Ignored by default (needs a Chrome binary + display
-//! or headless). Run with: `cargo test -p ocean-browser --test smoke -- --ignored`.
+//! or headless). Run with: `cargo test -p ocean-browser --features legacy-chromium --test smoke -- --ignored`.
+
+#![cfg(feature = "legacy-chromium")]
 
 use ocean_browser::{BrowserHandle, LaunchConfig};
 
