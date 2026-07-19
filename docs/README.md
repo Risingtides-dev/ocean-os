@@ -60,6 +60,10 @@ Active plans:
 - [`specs/2026-07-16-ocean-daemon-longhouse-topic-projection-extraction-manifest.md`](specs/2026-07-16-ocean-daemon-longhouse-topic-projection-extraction-manifest.md) — active first governance checkpoint, narrowed by fresh source mapping to the scripted demo and topic list/detail adapters; real convene/title authority remains a separate security wave.
 - [`specs/2026-07-18-ocean-crew-orchestration-and-durable-workflow-manifest.md`](specs/2026-07-18-ocean-crew-orchestration-and-durable-workflow-manifest.md) — proposed (not yet accepted) design ratification for extension-owned durable orchestration: the Ocean Crew task-graph extension, the six generic host seams it needs, the absorbed June 2026 R5 durable-workflow engine design, staging/grace safety, and the read-only Observatory relationship. This is the Phase 6 orchestration-transport ratification the extension manifest requires; no code is authorized until the operator accepts it.
 
+Proposals awaiting operator ruling:
+
+- [`specs/2026-07-19-cross-device-approval-and-attention.md`](specs/2026-07-19-cross-device-approval-and-attention.md) — phased design for permission-block notifications, a daemon-wide "Needs you" attention surface, and Web Push background reach, building on the 2026-07-19 `/web` `/desk` `/beam` session-handoff fabric. Proposed, not accepted.
+
 Active implementation reference:
 
 - [`specs/2026-07-03-omp-port-map.md`](specs/2026-07-03-omp-port-map.md) — source-researched OMP-to-Ocean mechanism map plus the dated current implementation audit. It is a prioritized reference, not current architecture; open checkpoints are routed through [`../ROADMAP.md`](../ROADMAP.md), and its original core-orchestration placement is superseded by the extension architecture.
