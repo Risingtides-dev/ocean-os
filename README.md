@@ -26,8 +26,9 @@ Bedrock data plane:
   Leptos UI and its browser, extension, and Tauri hosts.
 - [`ocean-agents`](https://github.com/Risingtides-dev/ocean-agents) owns editable
   assistant profiles, specialist packages, and couriers.
-- [`ocean-bedrock`](https://github.com/Risingtides-dev/ocean-bedrock) owns the
-  authenticated shared files, ledger, ingest, graph, and semantic-search plane.
+- `ocean-bedrock` (private) owns the authenticated shared files, ledger,
+  ingest, graph, and semantic-search plane. It is an optional team knowledge
+  service; Ocean OS runs fully without it.
 
 ## Quick start
 

@@ -4389,3 +4389,10 @@ Verification:
 - `cargo xtask docs-check` passed with 27 packages, 120 active Markdown files, and 129 local links
 - `git diff --check` passed
 - final independent review accepted the design with no medium-or-higher findings
+
+## 2026-07-18 — Bedrock privatized; public docs boundary cleanup (wave 2, ocean-os)
+- worktree: ocean-os main
+- `Risingtides-dev/ocean-bedrock` made private after preflight (no forks/stars/hooks/workflows; full-history secret scan clean over 436 blobs; npm audit clean; anonymous access now 404).
+- Removed the two public GitHub links to the now-private repo (`README.md`, `docs/OCEAN_PROJECT_MAP.md`), marked Bedrock as private/optional in `OCEAN.md`, and added a visibility statement to the project map: no public Ocean feature may hard-require Bedrock.
+- `skills/ocean-coworker-onboarding/` flagged for relocation to the private Bedrock repo in a later slice (no secrets present; it is internal onboarding for a private service).
+- Verified: `cargo xtask docs-check` PASS; no remaining `github.com/Risingtides-dev/ocean-bedrock` references in active docs.
