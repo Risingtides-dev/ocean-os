@@ -4489,3 +4489,11 @@ area:      [review]
 
 Closed every blocker from three adversarial review rounds. Session sync now projects directly from persisted messages with no SessionDetail/raw/tool/image copy, filters projectable rows before the 512-row cap, enforces the 1 MiB visible-text budget, and signals truncation. Every later session mutation publishes a scoped lifecycle/invalidation under the shared lease; legacy no-session requests pin ids before admission, and durable room triggers wait rather than drop. Replay gaps retain first-party event:error compatibility, reject empty/non-UTF8/foreign/unknown/evicted anchors, and expose only session-filtered diagnostic bounds. Compact acquires the busy lease before any existence read. Final independent release review approved with no blocker/high findings.
 _________________________________________________________________________________
+time:      [17:16] [19-07-26]
+agent:     [claude] [fable 5]
+worktree:  fix/task51-sol-dsml-salvage
+type:      [merge]
+area:      [backend]
+
+Landed TASK-51 (Sol DSML tool-call salvage) as 3b2c0499 on main — cut same-hour from smaths' screenshot of gpt-5.6-sol leaking raw DSML markup as transcript text with tools never executing. Fable builder sub, my review: the prior salvage (12cf4eb4/e3035161) was tail-only and Sol's leak is INTERLEAVED (prose, block, more prose), so it never matched. The shared helper now scans left-to-right lifting every well-formed block wherever it lands, stitching surviving prose; truncated final blocks still salvage; empty/broken blocks keep their markup visible; empty-name invokes rejected. The tail-only policy inversion is explicitly reasoned in the commit under the known-leaker + zero-structured-calls gate. Streaming reassembly preserved (buffer-then-salvage, split-across-deltas tested). 150 protocol + 518 daemon tests, fmt, clippy -D clean. I pushed; daemon bounce follows to serve the fix. Ledger note: this entry lands from the task worktree — canonical ocean-os carries other agents' uncommitted WIP (TUI files + in-progress ledger entries) left untouched.
+_________________________________________________________________________________
