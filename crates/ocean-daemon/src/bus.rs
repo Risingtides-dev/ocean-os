@@ -157,6 +157,12 @@ pub(crate) struct AgentEventBus {
     history_byte_limit: usize,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ReplayGapBounds {
+    pub(crate) oldest: Option<Uuid>,
+    pub(crate) newest: Option<Uuid>,
+}
+
 #[derive(Clone)]
 pub(crate) struct AgentEventEnvelope {
     pub(crate) id: Uuid,
@@ -228,7 +234,7 @@ impl AgentEventBus {
         }
     }
 
-    pub(crate) fn emit(&self, event: AgentTurnEvent) {
+    pub(crate) fn emit(&self, event: AgentTurnEvent) -> Uuid {
         // This is an estimate of retained replay bytes and the exact JSON body
         // shape SSE will later serialize (excluding the envelope UUID/SSE
         // framing). A serialization failure is conservatively treated as
@@ -264,9 +270,11 @@ impl AgentEventBus {
         // periods, so debug — not warn. Per-subscriber *lag* (a slow client that
         // overflows the ring buffer) surfaces on the RECEIVE side as
         // `Lagged(n)`, which the SSE handlers log at warn (OCEAN-87).
+        let id = envelope.id;
         if self.tx.send(envelope).is_err() {
             tracing::debug!("AgentEventBus: no active subscribers for event");
         }
+        id
     }
 
     /// Atomically subscribe to the live broadcast and snapshot the replay
@@ -301,6 +309,55 @@ impl AgentEventBus {
             None => Vec::new(),
         };
         (replay, rx)
+    }
+
+    /// Checked replay used by public SSE resumptions. A supplied but absent
+    /// anchor is never treated as live-only success: callers receive retained
+    /// diagnostics and must emit a typed reset-required gap.
+    pub(crate) fn subscribe_with_replay_checked(
+        &self,
+        last_event_id: Uuid,
+        expected_session: Option<ocean_agent_sdk::AgentSessionId>,
+    ) -> (
+        Result<Vec<AgentEventEnvelope>, ReplayGapBounds>,
+        broadcast::Receiver<AgentEventEnvelope>,
+    ) {
+        let history = self.lock_history();
+        let rx = self.tx.subscribe();
+        let in_scope = |env: &&AgentEventEnvelope| {
+            expected_session
+                .map(|session_id| env.event.session_id() == Some(session_id))
+                .unwrap_or(true)
+        };
+        let replay = match history
+            .iter()
+            .position(|env| env.id == last_event_id && in_scope(&env))
+        {
+            Some(pos) => Ok(history.iter().skip(pos + 1).cloned().collect()),
+            None => {
+                let mut scoped = history.iter().filter(in_scope);
+                let oldest = scoped.next().map(|env| env.id);
+                let newest = scoped.next_back().map(|env| env.id).or(oldest);
+                Err(ReplayGapBounds { oldest, newest })
+            }
+        };
+        (replay, rx)
+    }
+
+    /// Publish a session-scoped synchronization barrier and return its replay
+    /// id. Callers hold the session operation lease while emitting this fence
+    /// and reading/mutating the matching snapshot, so every later session event
+    /// is necessarily replayed after the returned id.
+    pub(crate) fn emit_session_fence(
+        &self,
+        session_id: ocean_agent_sdk::AgentSessionId,
+    ) -> ocean_core::SessionEventFence {
+        let id = self.emit(AgentTurnEvent::Extension {
+            extension: "ocean.session_sync_fence".into(),
+            payload: serde_json::json!({}),
+            scope: Some(session_id),
+        });
+        ocean_core::SessionEventFence { event_id: Some(id) }
     }
 
     /// OCEAN-305: atomically subscribe to the live broadcast and snapshot the
@@ -432,6 +489,39 @@ mod tests {
         let history = bus.lock_history();
         assert!(history.is_empty());
         assert_eq!(history.encoded_bytes, 0);
+    }
+
+    #[test]
+    fn checked_replay_distinguishes_unknown_anchor_from_empty_success() {
+        let bus = AgentEventBus::new_with_history_limits(4, 4, usize::MAX);
+        let session_id = AgentSessionId::new_v4();
+        let first = bus.emit(AgentTurnEvent::AssistantTextDelta {
+            session_id,
+            turn_id: AgentTurnId::new_v4(),
+            delta: "first".into(),
+        });
+        let fence = bus
+            .emit_session_fence(session_id)
+            .event_id
+            .expect("retained fence");
+        let (after_fence, _) = bus.subscribe_with_replay_checked(fence, Some(session_id));
+        assert!(after_fence.expect("known anchor").is_empty());
+
+        let foreign_session = AgentSessionId::new_v4();
+        let (foreign_gap, _) = bus.subscribe_with_replay_checked(fence, Some(foreign_session));
+        let Err(foreign_bounds) = foreign_gap else {
+            panic!("a globally valid anchor from another session must require reset");
+        };
+        assert_eq!(foreign_bounds.oldest, None);
+        assert_eq!(foreign_bounds.newest, None);
+
+        let missing = Uuid::new_v4();
+        let (gap, _) = bus.subscribe_with_replay_checked(missing, Some(session_id));
+        let Err(bounds) = gap else {
+            panic!("unknown anchor must be reset-required");
+        };
+        assert_eq!(bounds.oldest, Some(first));
+        assert_eq!(bounds.newest, Some(fence));
     }
 
     #[test]

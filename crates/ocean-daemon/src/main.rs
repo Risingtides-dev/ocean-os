@@ -585,6 +585,20 @@ fn parse_last_event_id(headers: &HeaderMap) -> Option<Uuid> {
         .and_then(|raw| Uuid::parse_str(raw.trim()).ok())
 }
 
+fn parse_agent_replay_anchor(headers: &HeaderMap) -> (Option<String>, Option<Result<Uuid, ()>>) {
+    let raw = headers
+        .get("last-event-id")
+        .map(|value| String::from_utf8_lossy(value.as_bytes()).into_owned());
+    let parsed = headers.get("last-event-id").map(|value| {
+        let text = value.to_str().map_err(|_| ())?.trim();
+        if text.is_empty() {
+            return Err(());
+        }
+        Uuid::parse_str(text).map_err(|_| ())
+    });
+    (raw, parsed)
+}
+
 /// Assemble the complete daemon router before binding [`AppState`].
 ///
 /// This is the behavior-neutral Phase 2C seam: route registration, grouped
@@ -651,6 +665,7 @@ fn app_router(cors: CorsLayer) -> Router<AppState> {
         .route("/v1/sessions", get(sessions))
         .route("/v1/sessions/{id}", get(session))
         .route("/v1/sessions/{id}/compact", post(compact_session))
+        .route("/v1/sessions/{id}/sync", get(session_sync))
         // Folder-as-agent classification (read-only): list + resolve agents from
         // the agents root. See docs/specs/folder-as-agent.md.
         .route("/v1/agents", get(agents_list))
@@ -1363,6 +1378,7 @@ fn banner_routes() -> &'static [&'static str] {
         "GET /v1/sessions",
         "GET /v1/sessions/{id}",
         "POST /v1/sessions/{id}/compact",
+        "GET /v1/sessions/{id}/sync",
         "GET /v1/agents",
         "GET /v1/agents/{name}",
         "GET /v1/projects",
@@ -1737,6 +1753,37 @@ async fn prompt(
         }
     };
 
+    if req.session_id.is_none() {
+        req.session_id = Some(SessionId::new_v4());
+        req.create_if_missing = true;
+    }
+    let session_lease = match req.session_id {
+        Some(session_id) => match state.runtime.try_session_operation(session_id) {
+            Ok(lease) => Some(lease),
+            Err(_) => {
+                return (
+                    StatusCode::CONFLICT,
+                    Json(ocean_core::PromptResponse {
+                        ok: false,
+                        request_id: req.request_id,
+                        session_id: req.session_id,
+                        code: None,
+                        wall_ms: 0,
+                        stdout: String::new(),
+                        stderr: "session has an active operation; try again shortly".into(),
+                        cwd: req.cwd.clone(),
+                        usage: ocean_core::TokenUsage::default(),
+                    }),
+                );
+            }
+        },
+        None => unreachable!("legacy prompt session id pinned above"),
+    };
+    emit_session_changed(
+        &state.agent_events,
+        AgentSessionId(req.session_id.expect("pinned session id")),
+    );
+
     let (request_id, cancel) = register_running_request(
         &state.requests,
         &mut req,
@@ -1772,8 +1819,14 @@ async fn prompt(
         req.decision_token.clone(),
     )
     .with_display_title(Some(display_title));
-    let res = state.runtime.prompt(req, control).await;
+    let res = match session_lease.as_ref() {
+        Some(lease) => state.runtime.prompt_with_lease(req, control, lease).await,
+        None => state.runtime.prompt(req, control).await,
+    };
     record_prompt_result(&state, request_id, &res, None).await;
+    if let Some(session_id) = res.session_id {
+        emit_session_changed(&state.agent_events, AgentSessionId(session_id));
+    }
 
     (StatusCode::OK, Json(res))
 }
@@ -1820,6 +1873,30 @@ async fn create_request(
         }
     };
 
+    if req.session_id.is_none() {
+        req.session_id = Some(SessionId::new_v4());
+        req.create_if_missing = true;
+    }
+    let session_lease = match req.session_id {
+        Some(session_id) => match state.runtime.try_session_operation(session_id) {
+            Ok(lease) => Some(lease),
+            Err(_) => {
+                return Json(RequestCreateResponse {
+                    ok: false,
+                    request_id: Uuid::new_v4(),
+                    session_id: req.session_id,
+                    state: RequestState::Errored,
+                    message: "session has an active operation; try again shortly".into(),
+                });
+            }
+        },
+        None => unreachable!("legacy request session id pinned above"),
+    };
+    emit_session_changed(
+        &state.agent_events,
+        AgentSessionId(req.session_id.expect("pinned session id")),
+    );
+
     let (request_id, cancel) = register_running_request(
         &state.requests,
         &mut req,
@@ -1855,8 +1932,19 @@ async fn create_request(
         // default-ON, fail-open behaviour as `prompt` and `agent_turn`.
         let consult = longhouse_prep_for_turn(req.prompt.clone(), req.cwd.clone()).await;
         req.prompt = apply_longhouse_prep(&req.prompt, consult.as_ref());
-        let res = task_state.runtime.prompt(req, control).await;
+        let res = match session_lease.as_ref() {
+            Some(lease) => {
+                task_state
+                    .runtime
+                    .prompt_with_lease(req, control, lease)
+                    .await
+            }
+            None => task_state.runtime.prompt(req, control).await,
+        };
         record_prompt_result(&task_state, request_id, &res, None).await;
+        if let Some(session_id) = res.session_id {
+            emit_session_changed(&task_state.agent_events, AgentSessionId(session_id));
+        }
     });
     attach_request_handle(&state.requests, request_id, handle).await;
 
@@ -3672,12 +3760,23 @@ impl ocean_call::TurnRunner for DaemonTurnRunner {
             decision_token: None,
         };
 
+        let session_lease = self
+            .state
+            .runtime
+            .try_session_operation(session_id)
+            .map_err(|_| anyhow::anyhow!("call session already has an active operation"))?;
+        emit_session_changed(&self.state.agent_events, AgentSessionId(session_id));
         tracing::info!(
             room = %self.room_label,
             %session_id,
             "call active lane: running agent turn for wake answer"
         );
-        let res = self.state.runtime.prompt(prompt_req, control).await;
+        let res = self
+            .state
+            .runtime
+            .prompt_with_lease(prompt_req, control, &session_lease)
+            .await;
+        emit_session_changed(&self.state.agent_events, AgentSessionId(session_id));
         if res.ok {
             Ok(res.stdout)
         } else {
@@ -5177,6 +5276,8 @@ async fn compact_session(
         wall_ms: 0,
         elided_messages: 0,
         stderr,
+        sync: None,
+        fence: None,
     };
 
     // Gate: same concurrency limiter as prompt/requests. Reject-at-capacity,
@@ -5197,28 +5298,52 @@ async fn compact_session(
         }
     };
 
-    // Pre-validate existence so a genuinely absent session maps to 404 (the
-    // AGENTS.md contract: only genuine absence is 404; unreadable is 500).
-    // The compaction itself re-validates under the session lock.
-    match state.runtime.session_detail_optional(session_id) {
-        Ok(Some(_)) => {}
-        Ok(None) => {
+    let lease = match state.runtime.try_session_operation(session_id) {
+        Ok(lease) => lease,
+        Err(_) => {
+            return (
+                StatusCode::CONFLICT,
+                Json(fail(
+                    "session has an active operation; try again shortly".into(),
+                )),
+            );
+        }
+    };
+    // Preserve 404-vs-corrupt mapping without constructing ordinary
+    // SessionDetail (which includes raw/tool/image projections). Busy sessions
+    // already returned 409 before this bounded admission read.
+    match state.runtime.session_exists_with_lease(&lease) {
+        Ok(true) => {}
+        Ok(false) => {
             return (
                 StatusCode::NOT_FOUND,
                 Json(fail("session not found".into())),
             );
         }
         Err(error) => {
-            tracing::warn!(%session_id, error = %error, "compact: failed to read session detail");
+            tracing::warn!(%session_id, error = %error, "compact: failed to read session");
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(fail("session could not be read".into())),
             );
         }
     }
+    // Capture after admission and before the lease-protected mutation/snapshot.
+    // Every later session event is ordered after this lease, so replay after the
+    // fence plus snapshot replacement cannot miss a mutation.
+    let fence = state
+        .agent_events
+        .emit_session_fence(AgentSessionId(session_id));
+    emit_session_changed(&state.agent_events, AgentSessionId(session_id));
 
-    match state.runtime.compact_session(session_id).await {
-        Ok(response) => (StatusCode::OK, Json(response)),
+    match state.runtime.compact_session_with_lease(&lease).await {
+        Ok(mut response) => {
+            if response.ok {
+                response.fence = Some(fence);
+                emit_session_changed(&state.agent_events, AgentSessionId(session_id));
+            }
+            (StatusCode::OK, Json(response))
+        }
         Err(error) => {
             // Sanitized 500 (the AGENTS.md contract): anyhow contexts from
             // storage failures carry filesystem paths — log the detail, return
@@ -5227,6 +5352,68 @@ async fn compact_session(
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(fail("internal server error".into())),
+            )
+        }
+    }
+}
+
+/// Refresh-only synchronized public transcript. Fence capture precedes the
+/// lease-protected read; clients replace from the snapshot and replay after the
+/// fence, with typed reset-required recovery if the global ring evicted it.
+async fn session_sync(
+    State(state): State<AppState>,
+    Path(session_id): Path<SessionId>,
+) -> (StatusCode, Json<ocean_core::SessionSyncResponse>) {
+    let lease = match state.runtime.try_session_operation(session_id) {
+        Ok(lease) => lease,
+        Err(_) => {
+            return (
+                StatusCode::CONFLICT,
+                Json(ocean_core::SessionSyncResponse {
+                    ok: false,
+                    session_id,
+                    snapshot: None,
+                    fence: None,
+                    error: Some("session has an active operation; try again shortly".into()),
+                }),
+            );
+        }
+    };
+    let fence = state
+        .agent_events
+        .emit_session_fence(AgentSessionId(session_id));
+    match state.runtime.sync_session_with_lease(&lease) {
+        Ok(Some(snapshot)) => (
+            StatusCode::OK,
+            Json(ocean_core::SessionSyncResponse {
+                ok: true,
+                session_id,
+                snapshot: Some(snapshot),
+                fence: Some(fence),
+                error: None,
+            }),
+        ),
+        Ok(None) => (
+            StatusCode::NOT_FOUND,
+            Json(ocean_core::SessionSyncResponse {
+                ok: false,
+                session_id,
+                snapshot: None,
+                fence: None,
+                error: Some("session not found".into()),
+            }),
+        ),
+        Err(error) => {
+            tracing::warn!(%session_id, error = %error, "session sync failed");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ocean_core::SessionSyncResponse {
+                    ok: false,
+                    session_id,
+                    snapshot: None,
+                    fence: None,
+                    error: Some("internal server error".into()),
+                }),
             )
         }
     }
@@ -5833,6 +6020,32 @@ async fn agent_turn(
     } else if let (None, Some(r)) = (&model_id, &role) {
         tracing::debug!(role = %r, "resolved model role → alias");
     }
+
+    // Admission owns the session mutation lane before any TurnStarted or
+    // request-registry claim. This makes lifecycle truth match execution and
+    // lets compact reject an already-admitted turn without a check/lock race.
+    let session_lease = match state.runtime.try_session_operation(core_sid(session_id)) {
+        Ok(lease) => lease,
+        Err(_) => {
+            return (
+                StatusCode::CONFLICT,
+                Json(AgentTurnResponse {
+                    ok: false,
+                    turn_id,
+                    session_id,
+                    status: AgentTurnStatus::Failed,
+                    event_id_prefix: event_prefix,
+                    error: Some("session has an active operation; try again shortly".into()),
+                    output_tokens: None,
+                    input_tokens: None,
+                    cache_read_tokens: None,
+                    tokens_per_second: None,
+                    context_usage: None,
+                    wall_ms: None,
+                }),
+            );
+        }
+    };
     emit_agent(
         &state.events,
         &state.agent_events,
@@ -6273,7 +6486,7 @@ async fn agent_turn(
         let in_flight = InFlightGuard::enter(bg_state.metrics.clone());
         let res = bg_state
             .runtime
-            .prompt(prompt_req, control)
+            .prompt_with_lease(prompt_req, control, &session_lease)
             .instrument(turn_span)
             .await;
         // Turn is done: drop the in-flight guard before the bridge drain and
@@ -6698,22 +6911,57 @@ async fn agent_events(
     // A `?replay=1` without `?session_id=` keeps the existing behavior: the
     // scope filter drops session-bearing events for unscoped subscribers, so
     // we never snapshot the firehose for them.
-    let last_event_id = parse_last_event_id(&headers);
+    let (raw_anchor, parsed_anchor) = parse_agent_replay_anchor(&headers);
+    let last_event_id = parsed_anchor
+        .as_ref()
+        .and_then(|result| result.as_ref().ok())
+        .copied();
     let full_replay = use_full_replay(replay_requested, last_event_id, want);
-    let (replay, live_rx) = if full_replay {
+    let mut replay_gap = None;
+    let (replay, live_rx) = if matches!(parsed_anchor, Some(Err(_))) {
+        let (replay, rx) = state.agent_events.subscribe_with_replay(None);
+        replay_gap = Some(ocean_core::AgentReplayGap {
+            code: ocean_core::AgentReplayGapCode::MalformedAnchor,
+            requested_event_id: raw_anchor,
+            oldest_available_event_id: None,
+            newest_available_event_id: None,
+            reset_required: true,
+        });
+        (replay, rx)
+    } else if full_replay {
         state.agent_events.subscribe_with_full_replay()
+    } else if let Some(anchor) = last_event_id {
+        let (checked, rx) = state
+            .agent_events
+            .subscribe_with_replay_checked(anchor, want);
+        match checked {
+            Ok(replay) => (replay, rx),
+            Err(bounds) => {
+                replay_gap = Some(ocean_core::AgentReplayGap {
+                    code: ocean_core::AgentReplayGapCode::AnchorUnavailable,
+                    requested_event_id: Some(anchor.to_string()),
+                    oldest_available_event_id: bounds.oldest,
+                    newest_available_event_id: bounds.newest,
+                    reset_required: true,
+                });
+                (Vec::new(), rx)
+            }
+        }
     } else {
-        state.agent_events.subscribe_with_replay(last_event_id)
+        state.agent_events.subscribe_with_replay(None)
     };
 
     // Scope-filter the snapshot into the replayed batch; `replayed_ids` lets
     // the live tail drop anything delivered twice across the replay/live seam
     // (there should be none, given the shared lock, but be defensive).
     let (frames, mut replayed_ids) = agent_replay_frames(replay, want, all);
-    let replay_events: Vec<Result<Event, Infallible>> = frames
-        .into_iter()
-        .map(|frame| Ok(frame.into_sse_event()))
-        .collect();
+    let mut replay_events: Vec<Result<Event, Infallible>> = Vec::new();
+    if let Some(gap) = replay_gap {
+        let data = serde_json::to_string(&gap)
+            .unwrap_or_else(|_| r#"{"code":"replay_gap","reset_required":true}"#.to_string());
+        replay_events.push(Ok(Event::default().event("error").data(data)));
+    }
+    replay_events.extend(frames.into_iter().map(|frame| Ok(frame.into_sse_event())));
 
     // OCEAN-372: clone the daemon-wide SSE-lag occurrence counter into the live
     // closure so every `Lagged` event bumps it. NOTE: this rail does NOT feed the
@@ -6758,8 +7006,14 @@ async fn agent_events(
                 skipped,
                 "agent_events SSE subscriber lagged; dropped events"
             );
-            let data = json!({ "type": "error", "message": format!("stream lagged by {skipped}") })
-                .to_string();
+            let data = serde_json::to_string(&ocean_core::AgentReplayGap {
+                code: ocean_core::AgentReplayGapCode::LiveLag,
+                requested_event_id: None,
+                oldest_available_event_id: None,
+                newest_available_event_id: None,
+                reset_required: true,
+            })
+            .unwrap_or_else(|_| r#"{"code":"live_lag","reset_required":true}"#.to_string());
             Some(Ok(Event::default().event("error").data(data)))
         }
     });
@@ -7210,15 +7464,24 @@ async fn agent_session_config_patch(
             })),
         );
     };
-    match state
-        .runtime
-        .set_session_model(
-            core_sid(session_id),
-            known.id.clone(),
-            known.provider.clone(),
-        )
-        .await
-    {
+    let session_lease = match state.runtime.try_session_operation(core_sid(session_id)) {
+        Ok(lease) => lease,
+        Err(_) => {
+            return (
+                StatusCode::CONFLICT,
+                Json(json!({
+                    "ok": false,
+                    "error": "session has an active operation; try again shortly"
+                })),
+            );
+        }
+    };
+    emit_session_changed(&state.agent_events, session_id);
+    match state.runtime.set_session_model_with_lease(
+        &session_lease,
+        known.id.clone(),
+        known.provider.clone(),
+    ) {
         Ok(Some(detail)) => {
             emit_agent(
                 &state.events,
@@ -7299,12 +7562,27 @@ async fn agent_session_message_append(
     // Handoff notes are tagged inline so the next turn (and a human reading
     // the transcript) can tell them from typed prompts.
     let text = format_session_append(req.kind.as_deref(), content);
+    let session_lease = match state.runtime.try_session_operation(core_sid(session_id)) {
+        Ok(lease) => lease,
+        Err(_) => {
+            return (
+                StatusCode::CONFLICT,
+                Json(json!({
+                    "ok": false,
+                    "error": "session has an active operation; try again shortly"
+                })),
+            );
+        }
+    };
+    emit_session_changed(&state.agent_events, session_id);
     match state
         .runtime
-        .append_session_message(core_sid(session_id), text)
-        .await
+        .append_session_message_with_lease(&session_lease, text)
     {
-        Ok(true) => (StatusCode::OK, Json(json!({ "ok": true }))),
+        Ok(true) => {
+            emit_session_changed(&state.agent_events, session_id);
+            (StatusCode::OK, Json(json!({ "ok": true })))
+        }
         Ok(false) => (
             StatusCode::NOT_FOUND,
             Json(json!({ "ok": false, "error": "session not found" })),
@@ -7673,6 +7951,17 @@ fn emit_agent(
         env.origin = Some(ocean_core::EVENT_ORIGIN_AGENT.to_string());
         events.emit(env);
     }
+}
+
+/// Notify synchronized session clients that a mutation committed without a
+/// richer agent-rail transcript event. The payload is deliberately empty; the
+/// event is only an invalidation signal that tells clients to call `/sync`.
+fn emit_session_changed(agent_events: &AgentEventBus, session_id: AgentSessionId) {
+    agent_events.emit(AgentTurnEvent::Extension {
+        extension: "ocean.session_changed".into(),
+        payload: json!({}),
+        scope: Some(session_id),
+    });
 }
 
 /// Map a runtime tool result's `details` (`serde_json::Value`) onto the SDK
@@ -8563,6 +8852,22 @@ mod tests {
             turn_id: AgentTurnId::new_v4(),
             delta: text.into(),
         }
+    }
+
+    #[test]
+    fn agent_replay_anchor_treats_empty_and_non_utf8_headers_as_malformed() {
+        let mut headers = HeaderMap::new();
+        headers.insert("last-event-id", HeaderValue::from_static(""));
+        let (raw, parsed) = parse_agent_replay_anchor(&headers);
+        assert_eq!(raw.as_deref(), Some(""));
+        assert!(matches!(parsed, Some(Err(()))));
+
+        headers.insert(
+            "last-event-id",
+            HeaderValue::from_bytes(&[0xff]).expect("opaque header bytes"),
+        );
+        let (_raw, parsed) = parse_agent_replay_anchor(&headers);
+        assert!(matches!(parsed, Some(Err(()))));
     }
 
     #[tokio::test]
@@ -12400,6 +12705,42 @@ mod tests {
         assert_eq!(state.turn_limiter.available_permits(), cap);
     }
 
+    #[tokio::test]
+    async fn agent_turn_busy_session_conflicts_before_turn_started_or_registration() {
+        let state = capped_turn_state(2);
+        let tmp = tempfile::tempdir().unwrap();
+        let (session_id, _, _) = state
+            .runtime
+            .create_session(tmp.path().to_str().unwrap(), None)
+            .unwrap();
+        let _lease = state
+            .runtime
+            .try_session_operation(session_id)
+            .expect("hold session operation lane");
+        let mut turn = sample_agent_turn();
+        turn.session_id = Some(AgentSessionId(session_id));
+        turn.cwd = tmp.path().to_string_lossy().into_owned();
+
+        let (status, body) = agent_turn(State(state.clone()), Json(turn)).await;
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert!(!body.ok);
+        assert!(body
+            .error
+            .as_deref()
+            .unwrap_or_default()
+            .contains("active operation"));
+        assert!(state.requests.read().await.is_empty());
+        let (events, _) = state.agent_events.subscribe_with_full_replay();
+        assert!(
+            events.iter().all(|envelope| !matches!(
+                envelope.event,
+                AgentTurnEvent::TurnStarted { session_id: seen, .. }
+                    if seen == AgentSessionId(session_id)
+            )),
+            "busy rejection must happen before TurnStarted"
+        );
+    }
+
     /// A finished turn releases its permit: after a turn runs to completion on the
     /// fake-ok runtime, the slot is back and a later turn is admitted (202).
     #[tokio::test]
@@ -12602,6 +12943,91 @@ mod tests {
         assert_eq!(body.session_id, ghost);
         assert_eq!(body.elided_messages, 0);
         assert!(body.stderr.contains("not found"), "stderr: {}", body.stderr);
+    }
+
+    #[tokio::test]
+    async fn compact_and_sync_return_authoritative_snapshot_and_replay_fence() {
+        let state = permission_test_state();
+        let tmp = tempfile::tempdir().unwrap();
+        let (session_id, _, _) = state
+            .runtime
+            .create_session(tmp.path().to_str().unwrap(), Some("test".into()))
+            .unwrap();
+        state.agent_events.emit(AgentTurnEvent::SessionCreated {
+            session_id: AgentSessionId(session_id),
+            title: String::new(),
+            cwd: tmp.path().to_string_lossy().into_owned(),
+        });
+
+        let (status, Json(compact)) = compact_session(State(state.clone()), Path(session_id)).await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(compact.ok);
+        assert_eq!(compact.sync.as_ref().unwrap().session_id, session_id);
+        assert!(compact.fence.unwrap().event_id.is_some());
+
+        let (status, Json(sync)) = session_sync(State(state), Path(session_id)).await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(sync.ok);
+        assert_eq!(sync.snapshot.unwrap().session_id, session_id);
+        assert!(sync.fence.unwrap().event_id.is_some());
+    }
+
+    #[tokio::test]
+    async fn out_of_turn_message_append_is_replay_visible_after_sync_fence() {
+        let state = permission_test_state();
+        let tmp = tempfile::tempdir().unwrap();
+        let (session_id, _, _) = state
+            .runtime
+            .create_session(tmp.path().to_str().unwrap(), None)
+            .unwrap();
+        let fence = state
+            .agent_events
+            .emit_session_fence(AgentSessionId(session_id))
+            .event_id
+            .unwrap();
+
+        let (status, Json(body)) = agent_session_message_append(
+            State(state.clone()),
+            Path(AgentSessionId(session_id)),
+            Json(SessionMessageAppendRequest {
+                role: "user".into(),
+                content: "handoff".into(),
+                kind: Some("handoff".into()),
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body, json!({"ok": true}));
+
+        let (replay, _) = state
+            .agent_events
+            .subscribe_with_replay_checked(fence, Some(AgentSessionId(session_id)));
+        let replay = replay.expect("sync fence remains replayable");
+        assert!(replay.iter().any(|envelope| matches!(
+            &envelope.event,
+            AgentTurnEvent::Extension { extension, scope, .. }
+                if extension == "ocean.session_changed"
+                    && *scope == Some(AgentSessionId(session_id))
+        )));
+    }
+
+    #[tokio::test]
+    async fn compact_busy_session_is_immediate_conflict() {
+        let state = permission_test_state();
+        let tmp = tempfile::tempdir().unwrap();
+        let (session_id, _, _) = state
+            .runtime
+            .create_session(tmp.path().to_str().unwrap(), None)
+            .unwrap();
+        let _lease = state
+            .runtime
+            .try_session_operation(session_id)
+            .expect("hold session lane");
+
+        let (status, Json(body)) = compact_session(State(state), Path(session_id)).await;
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert!(!body.ok);
+        assert!(body.stderr.contains("active operation"));
     }
 
     /// Compact is gated by the same concurrent-turn limiter as `prompt`:
@@ -19901,7 +20327,7 @@ mod tests {
         let prompt_apply = prompt.find(&apply_call).unwrap();
         let prompt_control = prompt.find("let control = build_prompt_control(").unwrap();
         let prompt_runtime = prompt
-            .find("state.runtime.prompt(req, control).await")
+            .find("state.runtime.prompt_with_lease(req, control, lease).await")
             .unwrap();
         assert!(
             prompt_cwd < prompt_registration
@@ -19930,7 +20356,7 @@ mod tests {
         let create_prep = create.find(&prep_call).unwrap();
         let create_apply = create.find(&apply_call).unwrap();
         let create_runtime = create
-            .find("task_state.runtime.prompt(req, control).await")
+            .find(".prompt_with_lease(req, control, lease)")
             .unwrap();
         let spawned_end = create.find("\n    });\n    attach_request_handle").unwrap();
         let response = create.rfind("Json(RequestCreateResponse {").unwrap();
@@ -21234,7 +21660,7 @@ mod tests {
         );
         assert_eq!(
             banner.len(),
-            91,
+            92,
             "route baseline changed; review the manifest"
         );
 
