@@ -126,7 +126,21 @@ This crate owns the full-screen terminal steering cockpit (`ocean` binary) for i
   remains permission-first, `Ctrl+L` clears only an idle transcript, and
   `Up`/`Down` remain history/picker navigation. Composer sizing, caret paint,
   and scroll use Unicode cell width and follow the cursor row, never the final
-  input row.
+  input row. `/compact` is an idle, bound-session action over the daemon-owned
+  atomic compaction route. Replace chat only from the response's bounded public
+  `SessionSyncSnapshot`, then restart the scoped SSE stream strictly after its
+  `SessionEventFence`; never bridge compact with an independent raw-session GET.
+  Binding, stream, and operation generations must reject A→B→A and queued stale
+  completions. A per-session unresolved-sync marker survives rebinding, blocks
+  prompts, and forces refresh when that session returns. Treat typed replay gaps
+  and scoped `ocean.session_changed` extensions as invalidations: clear derived
+  projections, abort/increment the old stream generation, and recover only via
+  `GET /v1/sessions/{id}/sync`. Compact's own lease-scoped invalidation may
+  arrive before its HTTP response: invalidate the old stream immediately but
+  defer `/sync` without replacing the compact operation generation, then run
+  refresh-only sync after the response. Reject the entire snapshot if its
+  identity, fence, visible-role/metadata shape, 512-row cap, or 1 MiB text cap
+  is invalid.
 - Composer dictation is local capture over daemon-owned STT. `Option+Space`
   (Crossterm `ALT+Space`, with macOS non-breaking-space fallback) toggles
   recording on and off while chat is focused; ordinary Space remains ordinary
