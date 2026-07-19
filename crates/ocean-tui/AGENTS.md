@@ -77,6 +77,19 @@ This crate owns the full-screen terminal steering cockpit (`ocean` binary) for i
   start). Context occupancy uses the provider-reported final request,
   never cumulative multi-round usage; unknown values remain absent. The model
   row falls back to the startup `/v1/models` fetch before the first turn.
+- The upper Files rail is a multi-purpose right-rail slot. An authoritative
+  Observatory inactive→active execution transition may auto-reveal it as the
+  read-only `FLOW` graph unless the operator explicitly closed the rail. The
+  graph consumes the boot-bound summary token, baselines from
+  `/v1/observatory/snapshot`, resumes `/v1/observatory/events` from that cursor,
+  and rebaselines on auth/reset/gap/instance or cursor discontinuity; it never
+  derives execution truth from chat cards or owns orchestration. Terminal nodes
+  remain inspectable until the operator deliberately returns to Files. Enter
+  expands the same workflow projection into the center graph surface; explicit
+  Files navigation restores `FileTreeComponent`. The renderer keeps all
+  authoritative nodes in state, uses immutable execution-id placement, bounds
+  only the painted subset with an honest hidden count, and preserves the lower
+  session-component tray and operator rail width.
 - The lower Files rail is a separate session-component tray, never part of
   `FileTreeComponent`. Its context meter uses a btop-inspired terminal grammar:
   a quiet empty bed, per-cell truecolor deep-aqua→cyan→amber→coral ramp, and a

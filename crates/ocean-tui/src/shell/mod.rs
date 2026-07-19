@@ -34,6 +34,7 @@ mod status;
 mod theme;
 mod tree;
 mod tui;
+mod workflow_graph;
 
 use app::App;
 use client::DaemonClient;

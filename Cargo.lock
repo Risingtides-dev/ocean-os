@@ -3694,6 +3694,7 @@ dependencies = [
  "ocean-agent-sdk",
  "ocean-core",
  "ocean-oauth",
+ "ocean-observatory",
  "ocean-providers",
  "open",
  "portable-pty",

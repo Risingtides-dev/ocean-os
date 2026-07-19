@@ -45,6 +45,18 @@ pub enum Action {
     /// A streamed agent event arrived from the daemon SSE. Boxed — it's much
     /// larger than the other variants and rides a hot channel.
     AgentEvent(Box<AgentTurnEvent>),
+    /// Authoritative daemon-wide Observatory baseline for the read-only
+    /// workflow graph. Boxed because snapshots may contain many nodes/edges.
+    ObservatorySnapshot(Box<ocean_observatory::ObservatorySnapshot>),
+    /// One cursor-ordered Observatory lifecycle event after the baseline.
+    ObservatoryEvent(Box<ocean_observatory::EventEnvelope>),
+    /// Observatory continuity was lost; retain the last graph but mark it stale
+    /// until the client obtains a fresh snapshot.
+    ObservatoryDisconnected,
+    /// Expand the compact workflow graph from the right rail into the center.
+    ExpandWorkflowGraph,
+    /// Reader-controlled workflow graph navigation reduced through the Elm loop.
+    WorkflowGraphCommand(crate::shell::workflow_graph::WorkflowGraphCommand),
     /// Session was minted/adopted; scope the stream to it.
     SessionBound(AgentSessionId),
     /// The scoped agent stream lost continuity (disconnect, replay lag/error,

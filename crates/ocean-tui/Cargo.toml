@@ -40,6 +40,7 @@ open = "5"
 # Kitty graphics protocol payload encoding (inline image display).
 base64.workspace = true
 ocean-oauth.workspace = true
+ocean-observatory.workspace = true
 ocean-providers.workspace = true
 
 # Native push-to-dictate capture is macOS-first. Target-gating avoids pulling
