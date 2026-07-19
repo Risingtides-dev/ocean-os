@@ -4412,3 +4412,13 @@ type:  [design]
 
 Amended the proposed (not accepted; authorizes no code) Ocean Crew Phase 6 manifest to define the extension-provided Longhouse delegation facade (longhouse__delegate_local/offshore), local/offshore target policy equivalence, real planner/implementer/reviewer/synthesizer Ocean capability profiles, host effective-capability intersection and audit records, Bedrock's bounded knowledge-only role, and explicit migration rejection of advisory /v1/subagents/spec tool strings as executable grants. Crew remains extension-owned; ocean-os and compiled ocean-longhouse gain no orchestration vocabulary or runtime. Verification: cargo xtask docs-check PASS (28 packages, 161 active Markdown files, 141 local links); diff-check clean.
 _________________________________________________________________________________
+_________________________________________________________________________________
+time:      [03:22am] [19-07-26]
+agent:     [pi], [gpt-5.6-sol], [orchestrator], [subagents]
+worktree:  [pi/ocean-walker-m1-20260719] /private/tmp/ocean-walker-m1-20260719
+type:      [feature-request]: port standalone Ocean filesystem walker
+area:      [backend]: unwired traversal and bounded scan cache
+
+Ported the pinned MIT `can1357/oh-my-pi` `crates/pi-walker` implementation at `03c48d073bd4849726cc14750b5aecfa310bdf26` into standalone `crates/ocean-walker`, then completed the bounded M1 corrective review pass. Preserved ordinary traversal behavior while adding exact native owned-path identity, clearly named lossy display projections, explicit fresh/cache provenance, post-scan cache age, one absolute lexical cache/invalidation namespace, generation-linearized invalidation/publication, a strict concurrent cache bound, pre-return heartbeat checks, and capped dedicated-pool construction with explicit serial fallback. Added deterministic barrier tests for cache races, failure/bound/provenance tests, pre-cancelled fresh/empty/cached coverage, a Linux/Unix invalid-byte path collision regression, direct Windows API features, and security/adoption docs. The crate is a workspace member outside `default-members` and has no typed-search, runtime grep/glob, daemon, agent, or capability wiring.
+
+Verification: 51 tests passed with three explicit performance ignores on current Rust and pinned Rust 1.88; denied-warning all-target Clippy, workspace test compilation, Windows GNU all-target cross-check, docs-check, formatting, and diff checks passed. Three fresh review lanes drove cache/path/Windows/security corrections; final acceptance found no medium-or-higher issues in the standalone unwired boundary.

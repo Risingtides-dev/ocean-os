@@ -27,7 +27,7 @@ This child doc governs `crates/` and is the canonical ownership, entry-point, an
 
 ## Workspace Package Index
 
-The workspace currently contains 28 Rust packages.
+The workspace currently contains 29 Rust packages.
 
 | Package | Owns | Does not own | Primary entry | Local contract | Narrow validation |
 |---|---|---|---|---|---|
@@ -58,12 +58,14 @@ The workspace currently contains 28 Rust packages.
 | `ocean-runtime` | Agent loop, permission gates, cancellation, capability/tool execution, runtime events | Session persistence; model credential routing | `ocean-runtime/src/lib.rs`, `agent_loop.rs` | `ocean-runtime/AGENTS.md` | `cargo test -p ocean-runtime` |
 | `ocean-store` | SQLite durable rooms, rosters, transcripts behind `RoomStore`; inherent access-projection and outbox APIs; restart-safe federation core (credentials, bindings, producer counters, confirmed ingest, trigger-claim journal) | Agent sessions, memory, Longhouse titles; federation network client | `ocean-store/src/lib.rs` | `ocean-store/AGENTS.md` | `cargo test -p ocean-store` |
 | `ocean-tui` | Ratatui steering cockpit and client interaction | Agent/session/runtime authority | `ocean-tui/src/main.rs`, `shell/` | `ocean-tui/AGENTS.md` | `cargo test -p ocean-tui && cargo build -p ocean-tui --release` |
+| `ocean-walker` | Standalone native filesystem traversal, filtering, parallel candidate delivery, and TTL scan caching | Typed content search; live runtime grep/glob or capability wiring | `ocean-walker/src/lib.rs::WalkRequest`, `walk_entries`, `collect_entries` | `ocean-walker/AGENTS.md` | `cargo test -p ocean-walker && cargo clippy -p ocean-walker --all-targets -- -D warnings` |
 | `xtask` | Repository docs/index checks, canonical repository/compatibility/MSRV gate manifests, WebRTC-cache recovery | Production runtime behavior | `../xtask/src/main.rs` | `../xtask/README.md` | `cargo test -p xtask && cargo xtask docs-check && cargo xtask ci --compatibility` |
 
 ## Non-default Members
 
 - `ocean-ast` is standalone and not yet wired into the live runtime. It stays outside `default-members` to avoid adding its multi-grammar compile cost to ordinary default builds; validate it explicitly or through `--workspace`.
 - `ocean-minimizer` is a standalone, dependency-free M1 library and is not yet wired into command capture or a harness profile. It stays outside `default-members` so ordinary builds do not imply live minimization; validate it explicitly or through `--workspace`.
+- `ocean-walker` is a standalone M1 traversal/cache library and is not yet wired into typed search or live runtime grep/glob. It stays outside `default-members` so ordinary builds do not imply production filesystem-tool adoption; validate it explicitly or through `--workspace`.
 - `xtask` is a developer task runner, not a product binary. Invoke it explicitly with `cargo xtask <command>`; `cargo xtask ci` owns the executable local/CI gate manifest while workspace commands still build/test xtask through `--workspace`.
 
 ## Cross-crate Change Impact
@@ -107,3 +109,4 @@ The workspace currently contains 28 Rust packages.
 - `ocean-runtime/` — agent loop and permission-gated tool execution → `ocean-runtime/AGENTS.md`
 - `ocean-store/` — SQLite durable rooms and federation store → `ocean-store/AGENTS.md`
 - `ocean-tui/` — terminal steering cockpit → `ocean-tui/AGENTS.md`
+- `ocean-walker/` — standalone native filesystem traversal and scan caching → `ocean-walker/AGENTS.md`
