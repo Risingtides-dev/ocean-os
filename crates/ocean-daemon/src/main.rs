@@ -17340,6 +17340,1576 @@ mod tests {
         (status, json)
     }
 
+    async fn governance_control_request(
+        app: Router,
+        method: Method,
+        path: &str,
+        body: &str,
+    ) -> (StatusCode, Option<String>, Option<String>, String) {
+        use http_body_util::BodyExt;
+        use tower::ServiceExt;
+        let req = axum::http::Request::builder()
+            .method(method)
+            .uri(path)
+            .header(axum::http::header::CONTENT_TYPE, "application/json")
+            .body(axum::body::Body::from(body.to_string()))
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        let status = resp.status();
+        let allow = resp
+            .headers()
+            .get(axum::http::header::ALLOW)
+            .and_then(|value| value.to_str().ok())
+            .map(str::to_string);
+        let content_type = resp
+            .headers()
+            .get(axum::http::header::CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok())
+            .map(str::to_string);
+        let body = String::from_utf8(
+            resp.into_body()
+                .collect()
+                .await
+                .unwrap()
+                .to_bytes()
+                .to_vec(),
+        )
+        .unwrap();
+        (status, allow, content_type, body)
+    }
+
+    fn grant_control_title(
+        state: &AppState,
+        topic_id: Uuid,
+        agent_id: Uuid,
+        decision: Option<Uuid>,
+    ) -> (Uuid, String) {
+        with_titles(state, |titles| {
+            let (title, secret) = titles
+                .grant(topic_id, agent_id, AgentRole::Firekeeper, 1)
+                .unwrap();
+            if let Some(decision) = decision {
+                titles.bind_decision(title.title_id, decision).unwrap();
+            }
+            (title.title_id, secret.token().to_string())
+        })
+    }
+
+    #[derive(Clone)]
+    struct GovernanceControlLogWriter(Arc<Mutex<Vec<u8>>>);
+
+    impl std::io::Write for GovernanceControlLogWriter {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn longhouse_governance_control_http_methods_and_parse_precedence_are_exact() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = escrow_state_with_titles_db(dir.path());
+        let app = longhouse_routes().with_state(state);
+
+        for (path, request_type, elements, first_field) in [
+            (
+                "/v1/longhouse/claim",
+                "LonghouseClaimRequest",
+                4,
+                "title_id",
+            ),
+            (
+                "/v1/longhouse/revoke",
+                "LonghouseRevokeRequest",
+                2,
+                "title_id",
+            ),
+            (
+                "/v1/longhouse/recall",
+                "LonghouseRecallRequest",
+                4,
+                "topic_id",
+            ),
+            (
+                "/v1/longhouse/breach",
+                "LonghouseBreachRequest",
+                2,
+                "title_id",
+            ),
+            (
+                "/v1/longhouse/board",
+                "LonghouseBoardPostRequest",
+                4,
+                "topic_id",
+            ),
+        ] {
+            for method in [
+                Method::GET,
+                Method::HEAD,
+                Method::PUT,
+                Method::PATCH,
+                Method::DELETE,
+                Method::OPTIONS,
+            ] {
+                let (status, allow, _, body) =
+                    governance_control_request(app.clone(), method.clone(), path, "").await;
+                assert_eq!(status, StatusCode::METHOD_NOT_ALLOWED, "{method} {path}");
+                assert_eq!(allow.as_deref(), Some("POST"), "{method} {path}");
+                assert!(body.is_empty(), "Axum 405 body drifted for {method} {path}");
+            }
+
+            for (input, expected_status, expected_body) in [
+                (
+                    "",
+                    StatusCode::BAD_REQUEST,
+                    "Failed to parse the request body as JSON: EOF while parsing a value at line 1 column 0".to_string(),
+                ),
+                (
+                    "{",
+                    StatusCode::BAD_REQUEST,
+                    "Failed to parse the request body as JSON: EOF while parsing an object at line 1 column 1".to_string(),
+                ),
+                (
+                    "[]",
+                    StatusCode::UNPROCESSABLE_ENTITY,
+                    format!(
+                        "Failed to deserialize the JSON body into the target type: invalid length 0, expected struct {request_type} with {elements} elements at line 1 column 2"
+                    ),
+                ),
+                (
+                    "{}",
+                    StatusCode::UNPROCESSABLE_ENTITY,
+                    format!(
+                        "Failed to deserialize the JSON body into the target type: missing field `{first_field}` at line 1 column 2"
+                    ),
+                ),
+            ] {
+                let (status, allow, content_type, body) =
+                    governance_control_request(app.clone(), Method::POST, path, input).await;
+                assert_eq!(status, expected_status, "POST {path} with {input:?}");
+                assert_eq!(allow, None);
+                assert_eq!(content_type.as_deref(), Some("text/plain; charset=utf-8"));
+                assert_eq!(body, expected_body, "POST {path} with {input:?}");
+            }
+        }
+
+        let (status, allow, _, body) = governance_control_request(
+            app.clone(),
+            Method::POST,
+            "/v1/longhouse/claim/extra",
+            "{}",
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert_eq!(allow, None);
+        assert!(body.is_empty());
+
+        let (claim_title_status, claim_title_error) = post_json(
+            app.clone(),
+            "/v1/longhouse/claim",
+            json!({
+                "title_id": "bad-title",
+                "agent_id": "bad-agent",
+                "token": "secret",
+                "decision": "bad-decision",
+            }),
+        )
+        .await;
+        assert_eq!(claim_title_status, StatusCode::BAD_REQUEST);
+        assert_eq!(
+            claim_title_error,
+            json!({
+                "ok": false,
+                "error": "`title_id` is not a valid UUID: \"bad-title\"",
+            })
+        );
+        let (claim_agent_status, claim_agent_error) = post_json(
+            app.clone(),
+            "/v1/longhouse/claim",
+            json!({
+                "title_id": esc_uid(110).to_string(),
+                "agent_id": "bad-agent",
+                "token": "secret",
+                "decision": "bad-decision",
+            }),
+        )
+        .await;
+        assert_eq!(claim_agent_status, StatusCode::BAD_REQUEST);
+        assert_eq!(
+            claim_agent_error,
+            json!({
+                "ok": false,
+                "error": "`agent_id` is not a valid UUID: \"bad-agent\"",
+            })
+        );
+        let (claim_decision_status, claim_decision_error) = post_json(
+            app.clone(),
+            "/v1/longhouse/claim",
+            json!({
+                "title_id": esc_uid(110).to_string(),
+                "agent_id": esc_uid(111).to_string(),
+                "token": "secret",
+                "decision": "bad-decision",
+            }),
+        )
+        .await;
+        assert_eq!(claim_decision_status, StatusCode::BAD_REQUEST);
+        assert_eq!(
+            claim_decision_error,
+            json!({
+                "ok": false,
+                "error": "`decision` is not a valid UUID: \"bad-decision\"",
+            })
+        );
+
+        for (path, body, expected_error) in [
+            (
+                "/v1/longhouse/revoke",
+                json!({ "title_id": "bad-title" }),
+                "`title_id` is not a valid UUID: \"bad-title\"",
+            ),
+            (
+                "/v1/longhouse/breach",
+                json!({ "title_id": "bad-title" }),
+                "`title_id` is not a valid UUID: \"bad-title\"",
+            ),
+            (
+                "/v1/longhouse/recall",
+                json!({
+                    "topic_id": "bad-topic",
+                    "firekeeper_id": "bad-firekeeper",
+                    "voter_id": "bad-voter",
+                }),
+                "`topic_id` is not a valid UUID: \"bad-topic\"",
+            ),
+            (
+                "/v1/longhouse/recall",
+                json!({
+                    "topic_id": esc_uid(112).to_string(),
+                    "firekeeper_id": "bad-firekeeper",
+                    "voter_id": "bad-voter",
+                }),
+                "`firekeeper_id` is not a valid UUID: \"bad-firekeeper\"",
+            ),
+            (
+                "/v1/longhouse/recall",
+                json!({
+                    "topic_id": esc_uid(112).to_string(),
+                    "firekeeper_id": esc_uid(113).to_string(),
+                    "voter_id": "bad-voter",
+                }),
+                "`voter_id` is not a valid UUID: \"bad-voter\"",
+            ),
+            (
+                "/v1/longhouse/board",
+                json!({
+                    "topic_id": "bad-topic",
+                    "author": "bad-author",
+                    "summary": "",
+                }),
+                "`topic_id` is not a valid UUID: \"bad-topic\"",
+            ),
+            (
+                "/v1/longhouse/board",
+                json!({
+                    "topic_id": esc_uid(112).to_string(),
+                    "author": "bad-author",
+                    "summary": "",
+                }),
+                "`author` is not a valid UUID: \"bad-author\"",
+            ),
+            (
+                "/v1/longhouse/board",
+                json!({
+                    "topic_id": esc_uid(112).to_string(),
+                    "author": esc_uid(113).to_string(),
+                    "summary": "   ",
+                }),
+                "`summary` must be a non-empty string",
+            ),
+        ] {
+            let (status, response) = post_json(app.clone(), path, body).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{path}");
+            assert_eq!(
+                response,
+                json!({ "ok": false, "error": expected_error }),
+                "{path}"
+            );
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn longhouse_governance_control_claim_lifecycle_and_non_disclosure_are_exact() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = escrow_state_with_titles_db(dir.path());
+        let captured_logs = Arc::new(Mutex::new(Vec::new()));
+        let log_writer = captured_logs.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .without_time()
+            .with_ansi(false)
+            .with_writer(move || GovernanceControlLogWriter(log_writer.clone()))
+            .finish();
+        let _subscriber_guard = tracing::subscriber::set_default(subscriber);
+        let agent = esc_uid(120);
+        let decision = esc_uid(121);
+        let other_decision = esc_uid(122);
+
+        let (success_title, success_token) =
+            grant_control_title(&state, esc_uid(123), agent, Some(decision));
+        with_titles(&state, |titles| {
+            titles.stake(esc_uid(123), esc_uid(124), 100, 2).unwrap();
+        });
+        let (forbidden_title, forbidden_token) =
+            grant_control_title(&state, esc_uid(125), agent, Some(decision));
+        let (revoked_title, revoked_token) =
+            grant_control_title(&state, esc_uid(126), agent, Some(decision));
+        let (released_title, released_token) =
+            grant_control_title(&state, esc_uid(127), agent, Some(decision));
+        let (unbound_title, unbound_token) = grant_control_title(&state, esc_uid(128), agent, None);
+        let (wrong_decision_title, wrong_decision_token) =
+            grant_control_title(&state, esc_uid(129), agent, Some(decision));
+
+        let revoker = state.revoker.clone();
+        let key = revoker.key();
+        with_titles(&state, |titles| {
+            revoker
+                .revoke(
+                    titles,
+                    Some(key.secret()),
+                    revoked_title,
+                    ocean_longhouse::RevokeAuthorization::PolicyBreach {
+                        detail: "pre-test revoke".into(),
+                    },
+                    3,
+                )
+                .unwrap();
+            ocean_longhouse::claim_bound_outcome(
+                titles,
+                released_title,
+                agent,
+                Some(&released_token),
+                decision,
+                4,
+            )
+            .unwrap();
+        });
+
+        let (initial_replay, mut token_event_rx) = state.agent_events.subscribe_with_replay(None);
+        assert!(initial_replay.is_empty());
+        let app = longhouse_routes().with_state(state.clone());
+        let forged_body = json!({
+            "ok": false,
+            "error": "claim refused: title not proven, or it has been revoked/released",
+        });
+        let all_generated_tokens = vec![
+            success_token.clone(),
+            forbidden_token.clone(),
+            revoked_token.clone(),
+            released_token.clone(),
+            unbound_token.clone(),
+            wrong_decision_token.clone(),
+        ];
+        let forbidden_cases = [
+            (
+                Uuid::from_u128(999_001),
+                agent,
+                "invented".to_string(),
+                other_decision,
+            ),
+            (
+                forbidden_title,
+                esc_uid(130),
+                forbidden_token.clone(),
+                other_decision,
+            ),
+            (
+                forbidden_title,
+                agent,
+                "wrong-token".to_string(),
+                other_decision,
+            ),
+            (forbidden_title, agent, "   ".to_string(), other_decision),
+            (revoked_title, agent, revoked_token, other_decision),
+            (released_title, agent, released_token, other_decision),
+        ];
+        let mut observed_control_wires = Vec::new();
+        for (title_id, presented_agent, token, presented_decision) in forbidden_cases {
+            let (status, body) = post_json(
+                app.clone(),
+                "/v1/longhouse/claim",
+                json!({
+                    "title_id": title_id.to_string(),
+                    "agent_id": presented_agent.to_string(),
+                    "token": token,
+                    "decision": presented_decision.to_string(),
+                }),
+            )
+            .await;
+            assert_eq!(status, StatusCode::FORBIDDEN);
+            assert_eq!(body, forged_body);
+            observed_control_wires.push(body.to_string());
+        }
+
+        let (unbound_status, unbound_body) = post_json(
+            app.clone(),
+            "/v1/longhouse/claim",
+            json!({
+                "title_id": unbound_title.to_string(),
+                "agent_id": agent.to_string(),
+                "token": unbound_token,
+                "decision": decision.to_string(),
+            }),
+        )
+        .await;
+        assert_eq!(unbound_status, StatusCode::CONFLICT);
+        assert_eq!(
+            unbound_body,
+            json!({
+                "ok": false,
+                "error": "claim refused: no converged decision is bound to this title yet",
+            })
+        );
+        observed_control_wires.push(unbound_body.to_string());
+
+        let (wrong_status, wrong_body) = post_json(
+            app.clone(),
+            "/v1/longhouse/claim",
+            json!({
+                "title_id": wrong_decision_title.to_string(),
+                "agent_id": agent.to_string(),
+                "token": wrong_decision_token,
+                "decision": other_decision.to_string(),
+            }),
+        )
+        .await;
+        assert_eq!(wrong_status, StatusCode::CONFLICT);
+        assert_eq!(
+            wrong_body,
+            json!({
+                "ok": false,
+                "error": format!(
+                    "claim refused: the bound decision is {decision}, not {other_decision}"
+                ),
+                "engine_decision": decision,
+                "claimed": other_decision,
+            })
+        );
+        observed_control_wires.push(wrong_body.to_string());
+
+        let (success_status, success_body) = post_json(
+            app.clone(),
+            "/v1/longhouse/claim",
+            json!({
+                "title_id": success_title.to_string(),
+                "agent_id": agent.to_string(),
+                "token": success_token.clone(),
+                "decision": decision.to_string(),
+            }),
+        )
+        .await;
+        assert_eq!(success_status, StatusCode::OK);
+        assert_eq!(
+            success_body,
+            json!({
+                "ok": true,
+                "title_id": success_title,
+                "decision": decision,
+                "escrow_released": 1,
+            })
+        );
+        observed_control_wires.push(success_body.to_string());
+
+        let (retry_status, retry_body) = post_json(
+            app.clone(),
+            "/v1/longhouse/claim",
+            json!({
+                "title_id": success_title.to_string(),
+                "agent_id": agent.to_string(),
+                "token": success_token.clone(),
+                "decision": decision.to_string(),
+            }),
+        )
+        .await;
+        assert_eq!(retry_status, StatusCode::FORBIDDEN);
+        assert_eq!(retry_body, forged_body);
+        observed_control_wires.push(retry_body.to_string());
+
+        let captured_logs = String::from_utf8(
+            captured_logs
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .clone(),
+        )
+        .unwrap();
+
+        let snapshot_wire = serde_json::to_string(
+            &state
+                .longhouse
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .topics(),
+        )
+        .unwrap();
+        assert!(matches!(
+            token_event_rx.try_recv(),
+            Err(tokio::sync::broadcast::error::TryRecvError::Empty)
+        ));
+        for token in &all_generated_tokens {
+            assert!(!snapshot_wire.contains(token));
+            assert!(!captured_logs.contains(token));
+            for wire in &observed_control_wires {
+                assert!(!wire.contains(token));
+            }
+        }
+        for presented in ["wrong-token", "invented"] {
+            assert!(!snapshot_wire.contains(presented));
+            assert!(!captured_logs.contains(presented));
+            for wire in &observed_control_wires {
+                assert!(!wire.contains(presented));
+            }
+        }
+
+        drop(app);
+        drop(state);
+        let reopened = ocean_longhouse::SqliteTitleRegistry::open(dir.path().join("titles.db"))
+            .expect("reopen characterized title DB");
+        assert_eq!(
+            reopened.verify_title(success_title, agent, Some(&success_token)),
+            Err(ocean_longhouse::ClaimError::ForgedFirekeeper),
+            "the successful title remains released after reopen"
+        );
+        drop(reopened);
+        let db_bytes = std::fs::read(dir.path().join("titles.db")).unwrap();
+        for token in &all_generated_tokens {
+            assert!(
+                !db_bytes
+                    .windows(token.len())
+                    .any(|window| window == token.as_bytes()),
+                "raw title token must not be persisted in SQLite bytes"
+            );
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn longhouse_governance_control_unauthenticated_mutation_lifecycle_is_exact() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = escrow_state_with_titles_db(dir.path());
+        let agent = esc_uid(140);
+        let decision = esc_uid(141);
+        let (revoke_title, revoke_token) =
+            grant_control_title(&state, esc_uid(142), agent, Some(decision));
+        let (recall_title, _) = grant_control_title(&state, esc_uid(143), agent, Some(decision));
+        let (breach_title, breach_token) =
+            grant_control_title(&state, esc_uid(144), agent, Some(decision));
+        let (blank_revoke_title, _) =
+            grant_control_title(&state, esc_uid(146), agent, Some(decision));
+        let (released_revoke_title, released_revoke_token) =
+            grant_control_title(&state, esc_uid(147), agent, Some(decision));
+        let (zero_recall_title, _) =
+            grant_control_title(&state, esc_uid(148), agent, Some(decision));
+        let (one_recall_title, _) =
+            grant_control_title(&state, esc_uid(149), agent, Some(decision));
+        let (retained_recall_title, _) =
+            grant_control_title(&state, esc_uid(150), agent, Some(decision));
+        let (blank_breach_title, _) =
+            grant_control_title(&state, esc_uid(151), agent, Some(decision));
+        with_titles(&state, |titles| {
+            ocean_longhouse::claim_bound_outcome(
+                titles,
+                released_revoke_title,
+                agent,
+                Some(&released_revoke_token),
+                decision,
+                5,
+            )
+            .unwrap();
+        });
+        let app = longhouse_routes().with_state(state.clone());
+
+        // No request in this test carries an auth, observer, principal, or
+        // permission-decision credential.
+        let (revoke_status, revoke_body) = post_json(
+            app.clone(),
+            "/v1/longhouse/revoke",
+            json!({ "title_id": revoke_title.to_string() }),
+        )
+        .await;
+        assert_eq!(revoke_status, StatusCode::OK);
+        assert_eq!(
+            revoke_body,
+            json!({
+                "ok": true,
+                "title_id": revoke_title,
+                "topic_id": esc_uid(142),
+                "agent_id": agent,
+                "reason": "hard recall: operator-initiated recall",
+            })
+        );
+        let (revoke_again_status, revoke_again_body) = post_json(
+            app.clone(),
+            "/v1/longhouse/revoke",
+            json!({ "title_id": revoke_title.to_string(), "reason": "again" }),
+        )
+        .await;
+        assert_eq!(revoke_again_status, StatusCode::CONFLICT);
+        assert_eq!(
+            revoke_again_body,
+            json!({
+                "ok": false,
+                "error": format!(
+                    "title '{revoke_title}' is not live (already revoked/released)"
+                ),
+            })
+        );
+        let (revoked_claim_status, revoked_claim_body) = post_json(
+            app.clone(),
+            "/v1/longhouse/claim",
+            json!({
+                "title_id": revoke_title.to_string(),
+                "agent_id": agent.to_string(),
+                "token": revoke_token,
+                "decision": decision.to_string(),
+            }),
+        )
+        .await;
+        assert_eq!(revoked_claim_status, StatusCode::FORBIDDEN);
+        assert_eq!(
+            revoked_claim_body,
+            json!({
+                "ok": false,
+                "error": "claim refused: title not proven, or it has been revoked/released",
+            })
+        );
+        let (blank_status, blank_body) = post_json(
+            app.clone(),
+            "/v1/longhouse/revoke",
+            json!({ "title_id": blank_revoke_title.to_string(), "reason": "   " }),
+        )
+        .await;
+        assert_eq!(blank_status, StatusCode::OK);
+        assert_eq!(
+            blank_body,
+            json!({
+                "ok": true,
+                "title_id": blank_revoke_title,
+                "topic_id": esc_uid(146),
+                "agent_id": agent,
+                "reason": "hard recall: operator-initiated recall",
+            })
+        );
+        let unknown_title = Uuid::from_u128(999_002);
+        let (unknown_status, unknown_body) = post_json(
+            app.clone(),
+            "/v1/longhouse/revoke",
+            json!({ "title_id": unknown_title.to_string() }),
+        )
+        .await;
+        assert_eq!(unknown_status, StatusCode::NOT_FOUND);
+        assert_eq!(
+            unknown_body,
+            json!({ "ok": false, "error": format!("no title with id '{unknown_title}'") })
+        );
+        let (released_status, released_body) = post_json(
+            app.clone(),
+            "/v1/longhouse/revoke",
+            json!({ "title_id": released_revoke_title.to_string() }),
+        )
+        .await;
+        assert_eq!(released_status, StatusCode::CONFLICT);
+        assert_eq!(
+            released_body,
+            json!({
+                "ok": false,
+                "error": format!(
+                    "title '{released_revoke_title}' is not live (already revoked/released)"
+                ),
+            })
+        );
+
+        let (recall_status, recall_body) = post_json(
+            app.clone(),
+            "/v1/longhouse/recall",
+            json!({
+                "topic_id": esc_uid(143).to_string(),
+                "firekeeper_id": agent.to_string(),
+                "voter_id": esc_uid(145).to_string(),
+            }),
+        )
+        .await;
+        assert_eq!(recall_status, StatusCode::OK);
+        assert_eq!(
+            recall_body,
+            json!({
+                "ok": true,
+                "carried": true,
+                "title_id": recall_title,
+                "topic_id": esc_uid(143),
+                "agent_id": agent,
+                "reason": "hard recall: quorum-of-recall: 1 no-confidence votes",
+            })
+        );
+        assert!(recall_tally_ids(&state.recalls).is_empty());
+
+        for (topic_id, title_id, voter_id, threshold) in [
+            (esc_uid(148), zero_recall_title, esc_uid(152), 0usize),
+            (esc_uid(149), one_recall_title, esc_uid(153), 1usize),
+        ] {
+            let (status, body) = post_json(
+                app.clone(),
+                "/v1/longhouse/recall",
+                json!({
+                    "topic_id": topic_id.to_string(),
+                    "firekeeper_id": agent.to_string(),
+                    "voter_id": voter_id.to_string(),
+                    "threshold": threshold,
+                }),
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK);
+            assert_eq!(
+                body,
+                json!({
+                    "ok": true,
+                    "carried": true,
+                    "title_id": title_id,
+                    "topic_id": topic_id,
+                    "agent_id": agent,
+                    "reason": "hard recall: quorum-of-recall: 1 no-confidence votes",
+                })
+            );
+        }
+
+        let retained_topic = esc_uid(150);
+        let retained_voter = esc_uid(154);
+        let (pending_status, pending_body) = post_json(
+            app.clone(),
+            "/v1/longhouse/recall",
+            json!({
+                "topic_id": retained_topic.to_string(),
+                "firekeeper_id": agent.to_string(),
+                "voter_id": retained_voter.to_string(),
+                "threshold": 2,
+            }),
+        )
+        .await;
+        assert_eq!(pending_status, StatusCode::OK);
+        assert_eq!(pending_body["carried"], json!(false));
+        assert_eq!(recall_tally_ids(&state.recalls), [retained_recall_title]);
+        let (retained_revoke_status, _) = post_json(
+            app.clone(),
+            "/v1/longhouse/revoke",
+            json!({ "title_id": retained_recall_title.to_string() }),
+        )
+        .await;
+        assert_eq!(retained_revoke_status, StatusCode::OK);
+        let (closed_recall_status, closed_recall_body) = post_json(
+            app.clone(),
+            "/v1/longhouse/recall",
+            json!({
+                "topic_id": retained_topic.to_string(),
+                "firekeeper_id": agent.to_string(),
+                "voter_id": esc_uid(155).to_string(),
+                "threshold": 2,
+            }),
+        )
+        .await;
+        assert_eq!(closed_recall_status, StatusCode::NOT_FOUND);
+        assert_eq!(
+            closed_recall_body,
+            json!({
+                "ok": false,
+                "error": format!(
+                    "no live firekeeper title for topic '{retained_topic}' held by '{agent}'"
+                ),
+            })
+        );
+        assert_eq!(
+            recall_tally_ids(&state.recalls),
+            [retained_recall_title],
+            "non-live lookup retains the existing memory-only tally"
+        );
+
+        for strikes in 1..=2 {
+            let (status, body) = post_json(
+                app.clone(),
+                "/v1/longhouse/breach",
+                json!({
+                    "title_id": breach_title.to_string(),
+                    "detail": if strikes == 1 { "  reported one  " } else { "reported two" },
+                }),
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK);
+            assert_eq!(
+                body,
+                json!({
+                    "ok": true,
+                    "revoked": false,
+                    "title_id": breach_title,
+                    "strikes": strikes,
+                    "threshold": 3,
+                })
+            );
+        }
+        let (third_status, third_body) = post_json(
+            app.clone(),
+            "/v1/longhouse/breach",
+            json!({ "title_id": breach_title.to_string() }),
+        )
+        .await;
+        assert_eq!(third_status, StatusCode::OK);
+        assert_eq!(
+            third_body,
+            json!({
+                "ok": true,
+                "revoked": true,
+                "title_id": breach_title,
+                "topic_id": esc_uid(144),
+                "agent_id": agent,
+                "reason": "graduated recall: 3 strikes",
+            })
+        );
+        assert!(!third_body.to_string().contains(&breach_token));
+        let (closed_breach_status, closed_breach_body) = post_json(
+            app.clone(),
+            "/v1/longhouse/breach",
+            json!({ "title_id": breach_title.to_string(), "detail": "after close" }),
+        )
+        .await;
+        assert_eq!(closed_breach_status, StatusCode::OK);
+        assert_eq!(
+            closed_breach_body,
+            json!({
+                "ok": true,
+                "revoked": false,
+                "title_id": breach_title,
+                "strikes": 0,
+                "threshold": 3,
+            })
+        );
+        let unknown_breach = Uuid::from_u128(999_003);
+        let (unknown_breach_status, unknown_breach_body) = post_json(
+            app.clone(),
+            "/v1/longhouse/breach",
+            json!({ "title_id": unknown_breach.to_string() }),
+        )
+        .await;
+        assert_eq!(unknown_breach_status, StatusCode::NOT_FOUND);
+        assert_eq!(
+            unknown_breach_body,
+            json!({ "ok": false, "error": format!("no title with id '{unknown_breach}'") })
+        );
+        let (blank_breach_status, blank_breach_body) = post_json(
+            app.clone(),
+            "/v1/longhouse/breach",
+            json!({ "title_id": blank_breach_title.to_string(), "detail": "   " }),
+        )
+        .await;
+        assert_eq!(blank_breach_status, StatusCode::OK);
+        assert_eq!(
+            blank_breach_body,
+            json!({
+                "ok": true,
+                "revoked": false,
+                "title_id": blank_breach_title,
+                "strikes": 1,
+                "threshold": 3,
+            })
+        );
+        assert_eq!(
+            with_titles(&state, |titles| titles
+                .lookup(blank_breach_title)
+                .unwrap()
+                .unwrap()
+                .strikes),
+            1
+        );
+        let (claim_status, claim_body) = post_json(
+            app,
+            "/v1/longhouse/claim",
+            json!({
+                "title_id": breach_title.to_string(),
+                "agent_id": agent.to_string(),
+                "token": breach_token,
+                "decision": decision.to_string(),
+            }),
+        )
+        .await;
+        assert_eq!(claim_status, StatusCode::FORBIDDEN);
+        assert_eq!(claim_body["ok"], json!(false));
+        drop(state);
+        let reopened = ocean_longhouse::SqliteTitleRegistry::open(dir.path().join("titles.db"))
+            .expect("reopen after manual revoke");
+        for title_id in [revoke_title, blank_revoke_title] {
+            let title = reopened.lookup(title_id).unwrap().unwrap();
+            assert_eq!(title.status, ocean_longhouse::TitleStatus::Revoked);
+            assert_eq!(
+                title.revoke_reason.as_deref(),
+                Some("hard recall: operator-initiated recall")
+            );
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn longhouse_governance_control_persistence_and_memory_reset_are_exact() {
+        let dir = tempfile::tempdir().unwrap();
+        let agent = esc_uid(150);
+        let decision = esc_uid(151);
+        let breach_topic = esc_uid(152);
+        let recall_topic = esc_uid(153);
+        let breach_title;
+        let recall_title;
+
+        {
+            let state = escrow_state_with_titles_db(dir.path());
+            (breach_title, _) = grant_control_title(&state, breach_topic, agent, Some(decision));
+            (recall_title, _) = grant_control_title(&state, recall_topic, agent, Some(decision));
+            let app = longhouse_routes().with_state(state.clone());
+            for expected in 1..=2 {
+                let (status, body) = post_json(
+                    app.clone(),
+                    "/v1/longhouse/breach",
+                    json!({ "title_id": breach_title.to_string(), "detail": "persist" }),
+                )
+                .await;
+                assert_eq!(status, StatusCode::OK);
+                assert_eq!(body["strikes"], json!(expected));
+            }
+            let (status, body) = post_json(
+                app,
+                "/v1/longhouse/recall",
+                json!({
+                    "topic_id": recall_topic.to_string(),
+                    "firekeeper_id": agent.to_string(),
+                    "voter_id": esc_uid(154).to_string(),
+                    "threshold": 2,
+                }),
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK);
+            assert_eq!(body["carried"], json!(false));
+            assert_eq!(body["votes"], json!(1));
+            assert_eq!(recall_tally_ids(&state.recalls), [recall_title]);
+        }
+
+        let state = escrow_state_with_titles_db(dir.path());
+        let app = longhouse_routes().with_state(state.clone());
+        let (breach_status, breach_body) = post_json(
+            app.clone(),
+            "/v1/longhouse/breach",
+            json!({ "title_id": breach_title.to_string(), "detail": "after reopen" }),
+        )
+        .await;
+        assert_eq!(breach_status, StatusCode::OK);
+        assert_eq!(breach_body["revoked"], json!(true));
+        assert_eq!(breach_body["reason"], json!("graduated recall: 3 strikes"));
+
+        assert!(recall_tally_ids(&state.recalls).is_empty());
+        let (recall_status, recall_body) = post_json(
+            app,
+            "/v1/longhouse/recall",
+            json!({
+                "topic_id": recall_topic.to_string(),
+                "firekeeper_id": agent.to_string(),
+                "voter_id": esc_uid(155).to_string(),
+                "threshold": 2,
+            }),
+        )
+        .await;
+        assert_eq!(recall_status, StatusCode::OK);
+        assert_eq!(
+            recall_body,
+            json!({
+                "ok": true,
+                "carried": false,
+                "title_id": recall_title,
+                "votes": 1,
+                "threshold": 2,
+            })
+        );
+        drop(state);
+        let reopened = ocean_longhouse::SqliteTitleRegistry::open(dir.path().join("titles.db"))
+            .expect("reopen after persisted breach revocation");
+        let breach = reopened.lookup(breach_title).unwrap().unwrap();
+        assert_eq!(breach.status, ocean_longhouse::TitleStatus::Revoked);
+        assert_eq!(breach.strikes, 3);
+        assert_eq!(
+            breach.revoke_reason.as_deref(),
+            Some("graduated recall: 3 strikes")
+        );
+        let recall = reopened.lookup(recall_title).unwrap().unwrap();
+        assert_eq!(recall.status, ocean_longhouse::TitleStatus::Live);
+        assert_eq!(recall.strikes, 0);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn longhouse_governance_control_board_fold_publish_and_poison_are_exact() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = escrow_state_with_titles_db(dir.path());
+        let topic_id = esc_uid(160);
+        let author = esc_uid(161);
+        state
+            .longhouse
+            .lock()
+            .unwrap()
+            .ingest(&LonghouseEvent::TopicConvened {
+                topic_id,
+                board_id: esc_uid(162),
+                federation: Federation::Commons,
+                trigger: ConveneTrigger::UserRequest,
+                title: "control board".into(),
+                deadline_ms: 99,
+            });
+        let (_replay, mut rx) = state.agent_events.subscribe_with_replay(None);
+        let app = longhouse_routes().with_state(state.clone());
+
+        for (request, expected) in [
+            (
+                json!({
+                    "topic_id": "bad-topic",
+                    "author": author.to_string(),
+                    "summary": "x",
+                }),
+                json!({
+                    "ok": false,
+                    "error": "`topic_id` is not a valid UUID: \"bad-topic\"",
+                }),
+            ),
+            (
+                json!({
+                    "topic_id": topic_id.to_string(),
+                    "author": "bad-author",
+                    "summary": "x",
+                }),
+                json!({
+                    "ok": false,
+                    "error": "`author` is not a valid UUID: \"bad-author\"",
+                }),
+            ),
+            (
+                json!({
+                    "topic_id": topic_id.to_string(),
+                    "author": author.to_string(),
+                    "summary": "   ",
+                }),
+                json!({
+                    "ok": false,
+                    "error": "`summary` must be a non-empty string",
+                }),
+            ),
+        ] {
+            let (status, body) = post_json(app.clone(), "/v1/longhouse/board", request).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST);
+            assert_eq!(body, expected);
+        }
+        let missing_topic = esc_uid(163);
+        let (missing_status, missing_body) = post_json(
+            app.clone(),
+            "/v1/longhouse/board",
+            json!({
+                "topic_id": missing_topic.to_string(),
+                "author": author.to_string(),
+                "summary": "missing",
+            }),
+        )
+        .await;
+        assert_eq!(missing_status, StatusCode::NOT_FOUND);
+        assert_eq!(
+            missing_body,
+            json!({
+                "ok": false,
+                "error": format!("no longhouse topic with id '{missing_topic}'"),
+            })
+        );
+
+        let (status, body) = post_json(
+            app.clone(),
+            "/v1/longhouse/board",
+            json!({
+                "topic_id": topic_id.to_string(),
+                "author": author.to_string(),
+                "kind": " EVIDENCE ",
+                "summary": "  already folded  ",
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let mark_id = Uuid::parse_str(body["mark_id"].as_str().unwrap()).unwrap();
+        assert_eq!(
+            body,
+            json!({ "ok": true, "topic_id": topic_id, "mark_id": mark_id })
+        );
+        let envelope = rx.recv().await.unwrap();
+        let event_wire = serde_json::to_string(&envelope.event).unwrap();
+        assert!(!event_wire.contains("token"));
+        assert!(!event_wire.contains("title_id"));
+        let event = LonghouseEvent::from_turn_event(&envelope.event).unwrap();
+        let LonghouseEvent::MarkPosted {
+            topic_id: event_topic,
+            mark,
+        } = event
+        else {
+            panic!("board route emitted a non-mark event")
+        };
+        assert_eq!(event_topic, topic_id);
+        assert_eq!(mark.mark_id, mark_id);
+        assert_eq!(mark.author, author);
+        assert_eq!(mark.kind, MarkKind::Evidence);
+        assert_eq!(mark.target, None);
+        assert_eq!(mark.summary, "already folded");
+        let snapshot = state.longhouse.lock().unwrap().topic(&topic_id).unwrap();
+        assert_eq!(snapshot.marks.last(), Some(&mark));
+        assert_eq!(snapshot.state, ocean_longhouse::TopicState::Convened);
+        assert_eq!(snapshot.firekeeper, None);
+        assert_eq!(snapshot.decision, None);
+
+        for supplied_kind in [
+            None,
+            Some("proposal"),
+            Some("endorse"),
+            Some("inhibit"),
+            Some("x"),
+        ] {
+            let body = json!({
+                "topic_id": topic_id.to_string(),
+                "author": author.to_string(),
+                "kind": supplied_kind,
+                "summary": "non quorum",
+            });
+            let (_, response) = post_json(app.clone(), "/v1/longhouse/board", body).await;
+            assert_eq!(response["ok"], json!(true));
+            let envelope = rx.recv().await.unwrap();
+            let event = LonghouseEvent::from_turn_event(&envelope.event).unwrap();
+            assert!(matches!(
+                event,
+                LonghouseEvent::MarkPosted {
+                    mark: Mark {
+                        kind: MarkKind::Note,
+                        ..
+                    },
+                    ..
+                }
+            ));
+        }
+
+        let before_poison = state.longhouse.lock().unwrap().topic(&topic_id).unwrap();
+        let poison_target = state.longhouse.clone();
+        assert!(std::thread::spawn(move || {
+            let _guard = poison_target.lock().unwrap();
+            panic!("poison board projection for characterization");
+        })
+        .join()
+        .is_err());
+        let (poison_status, poison_body) = post_json(
+            app,
+            "/v1/longhouse/board",
+            json!({
+                "topic_id": topic_id.to_string(),
+                "author": author.to_string(),
+                "kind": "evidence",
+                "summary": "published but not projected",
+            }),
+        )
+        .await;
+        assert_eq!(poison_status, StatusCode::OK);
+        let poison_mark_id = Uuid::parse_str(poison_body["mark_id"].as_str().unwrap()).unwrap();
+        assert_eq!(
+            poison_body,
+            json!({ "ok": true, "topic_id": topic_id, "mark_id": poison_mark_id })
+        );
+        let envelope = rx.recv().await.unwrap();
+        let poison_event = LonghouseEvent::from_turn_event(&envelope.event).unwrap();
+        assert!(matches!(
+            poison_event,
+            LonghouseEvent::MarkPosted { ref mark, .. }
+                if mark.summary == "published but not projected"
+        ));
+        let after_poison = state
+            .longhouse
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .topic(&topic_id)
+            .unwrap();
+        assert_eq!(after_poison, before_poison);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn longhouse_governance_control_title_poison_recovery_is_exact() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = escrow_state_with_titles_db(dir.path());
+        let agent = esc_uid(170);
+        let decision = esc_uid(171);
+        let (title_id, token) = grant_control_title(&state, esc_uid(172), agent, Some(decision));
+        let poison_target = state.titles.clone();
+        assert!(std::thread::spawn(move || {
+            let _guard = poison_target.lock().unwrap();
+            panic!("poison title registry for characterization");
+        })
+        .join()
+        .is_err());
+
+        let app = longhouse_routes().with_state(state);
+        let (status, body) = post_json(
+            app,
+            "/v1/longhouse/claim",
+            json!({
+                "title_id": title_id.to_string(),
+                "agent_id": agent.to_string(),
+                "token": token,
+                "decision": decision.to_string(),
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["title_id"], json!(title_id));
+    }
+
+    #[test]
+    fn longhouse_governance_control_source_authority_boundary_is_exact() {
+        fn function_source<'a>(source: &'a str, signature: &str) -> &'a str {
+            let start = source.find(signature).expect("function signature");
+            let body_start = start + source[start..].find('{').expect("function opening brace");
+            let mut depth = 0usize;
+            for (offset, byte) in source.as_bytes()[body_start..].iter().enumerate() {
+                match byte {
+                    b'{' => depth += 1,
+                    b'}' => {
+                        depth -= 1;
+                        if depth == 0 {
+                            return &source[start..body_start + offset + 1];
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            panic!("unterminated function {signature}");
+        }
+
+        fn block_end(source: &str, marker: &str) -> usize {
+            let start = source.find(marker).expect("block marker");
+            let body_start = start + source[start..].find('{').expect("block opening brace");
+            let mut depth = 0usize;
+            for (offset, byte) in source.as_bytes()[body_start..].iter().enumerate() {
+                match byte {
+                    b'{' => depth += 1,
+                    b'}' => {
+                        depth -= 1;
+                        if depth == 0 {
+                            return body_start + offset + 1;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            panic!("unterminated block {marker}");
+        }
+
+        let src_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let main_source = std::fs::read_to_string(src_dir.join("main.rs")).unwrap();
+        let production_end = main_source
+            .find("\n#[cfg(test)]\nmod tests {")
+            .expect("parent test module boundary");
+        let production_main = &main_source[..production_end];
+        let extracted = src_dir.join("longhouse_governance_control.rs");
+        let owner_source = if extracted.exists() {
+            assert!(production_main.contains("mod longhouse_governance_control;"));
+            for signature in [
+                "fn with_titles<T>(",
+                "async fn longhouse_claim(",
+                "async fn longhouse_revoke(",
+                "async fn longhouse_recall(",
+                "async fn longhouse_breach(",
+                "async fn longhouse_board_post(",
+                "fn parse_board_mark_kind(",
+            ] {
+                assert!(
+                    !production_main.contains(signature),
+                    "moved definition remained in main.rs: {signature}"
+                );
+            }
+            let parent_import_start = production_main
+                .find("use longhouse_governance_control::{")
+                .expect("parent governance-control imports");
+            let parent_import_end = parent_import_start
+                + production_main[parent_import_start..]
+                    .find("};")
+                    .expect("parent governance-control import end")
+                + 2;
+            assert_eq!(
+                &production_main[parent_import_start..parent_import_end],
+                "use longhouse_governance_control::{\n    longhouse_board_post, longhouse_breach, longhouse_claim, longhouse_recall, longhouse_revoke,\n    with_titles,\n};"
+            );
+            std::fs::read_to_string(&extracted).unwrap()
+        } else {
+            assert!(!production_main.contains("mod longhouse_governance_control;"));
+            source_section(
+                production_main,
+                "// ---- OCEAN-272: persisted-escrow ops",
+                "/// Where the persisted Longhouse **title registry** SQLite DB lives",
+            )
+            .to_string()
+        };
+
+        if extracted.exists() {
+            let imports = source_section(
+                &owner_source,
+                "use axum::{extract::State, http::StatusCode, Json};",
+                "// ---- OCEAN-272: persisted-escrow ops",
+            );
+            assert_eq!(
+                imports.trim(),
+                "use axum::{extract::State, http::StatusCode, Json};\nuse ocean_agent_sdk::{AgentRole, LonghouseEvent, Mark, MarkKind};\nuse serde_json::json;\nuse uuid::Uuid;\n\nuse super::{cast_recall_vote, remove_recall_tally, AppState};"
+            );
+        }
+
+        for signature in [
+            "fn with_titles<T>(",
+            "async fn longhouse_claim(",
+            "async fn longhouse_revoke(",
+            "async fn longhouse_recall(",
+            "async fn longhouse_breach(",
+            "async fn longhouse_board_post(",
+            "fn parse_board_mark_kind(",
+        ] {
+            assert!(owner_source.contains(signature), "missing {signature}");
+        }
+        for request in [
+            "struct LonghouseClaimRequest",
+            "struct LonghouseRevokeRequest",
+            "struct LonghouseRecallRequest",
+            "struct LonghouseBreachRequest",
+            "struct LonghouseBoardPostRequest",
+        ] {
+            assert!(owner_source.contains(request), "missing {request}");
+        }
+        assert!(owner_source.contains("const POLICY_BREACH_STRIKE_THRESHOLD: u8 = 3;"));
+        let items: Vec<String> = owner_source
+            .lines()
+            .map(str::trim)
+            .filter(|line| {
+                [
+                    "fn ",
+                    "async fn ",
+                    "struct ",
+                    "enum ",
+                    "trait ",
+                    "type ",
+                    "const ",
+                    "static ",
+                    "impl ",
+                    "pub(super) fn ",
+                    "pub(super) async fn ",
+                    "pub(super) struct ",
+                    "pub(super) enum ",
+                    "pub(super) trait ",
+                    "pub(super) type ",
+                    "pub(super) const ",
+                    "pub(super) static ",
+                    "pub(super) impl ",
+                    "pub(crate) ",
+                    "pub ",
+                ]
+                .iter()
+                .any(|prefix| line.starts_with(prefix))
+            })
+            .map(|line| line.strip_prefix("pub(super) ").unwrap_or(line).to_string())
+            .collect();
+        assert_eq!(
+            items,
+            [
+                "fn with_titles<T>(",
+                "struct LonghouseClaimRequest {",
+                "async fn longhouse_claim(",
+                "struct LonghouseRevokeRequest {",
+                "async fn longhouse_revoke(",
+                "const POLICY_BREACH_STRIKE_THRESHOLD: u8 = 3;",
+                "struct LonghouseRecallRequest {",
+                "async fn longhouse_recall(",
+                "struct LonghouseBreachRequest {",
+                "async fn longhouse_breach(",
+                "struct LonghouseBoardPostRequest {",
+                "fn parse_board_mark_kind(s: Option<&str>) -> MarkKind {",
+                "async fn longhouse_board_post(",
+            ],
+            "governance-control owner item inventory drifted"
+        );
+        assert!(!owner_source.contains(".await"));
+        assert!(
+            owner_source
+                .lines()
+                .map(str::trim)
+                .filter(|line| line.starts_with("pub"))
+                .all(|line| line.starts_with("pub(super) ")),
+            "governance-control owner gained broader visibility"
+        );
+        let parent_visible: Vec<&str> = owner_source
+            .lines()
+            .map(str::trim)
+            .filter(|line| line.starts_with("pub(super) "))
+            .collect();
+        if extracted.exists() {
+            assert_eq!(
+                parent_visible,
+                [
+                    "pub(super) fn with_titles<T>(",
+                    "pub(super) struct LonghouseClaimRequest {",
+                    "pub(super) async fn longhouse_claim(",
+                    "pub(super) struct LonghouseRevokeRequest {",
+                    "pub(super) async fn longhouse_revoke(",
+                    "pub(super) struct LonghouseRecallRequest {",
+                    "pub(super) async fn longhouse_recall(",
+                    "pub(super) struct LonghouseBreachRequest {",
+                    "pub(super) async fn longhouse_breach(",
+                    "pub(super) struct LonghouseBoardPostRequest {",
+                    "pub(super) async fn longhouse_board_post(",
+                ],
+                "governance-control parent visibility drifted"
+            );
+            assert!(owner_source.contains("\nconst POLICY_BREACH_STRIKE_THRESHOLD: u8 = 3;"));
+            assert!(
+                owner_source.contains("\nfn parse_board_mark_kind(s: Option<&str>) -> MarkKind {")
+            );
+        } else {
+            assert!(parent_visible.is_empty());
+        }
+
+        let claim_struct_start = owner_source
+            .find("struct LonghouseClaimRequest {")
+            .expect("claim request");
+        let claim_request_start = owner_source[..claim_struct_start]
+            .rfind("#[derive(Debug, serde::Deserialize)]")
+            .expect("claim request derive");
+        let claim_handler_start = owner_source
+            .find("async fn longhouse_claim(")
+            .expect("claim handler");
+        let claim_request = &owner_source[claim_request_start..claim_handler_start];
+        assert!(claim_request.contains("#[derive(Debug, serde::Deserialize)]"));
+        assert!(claim_request.contains("token: String,"));
+        assert!(!claim_request.contains("pub(super) token:"));
+
+        let claim = function_source(&owner_source, "async fn longhouse_claim(");
+        assert_eq!(claim.matches("req.token").count(), 1);
+        assert!(!claim.contains("tracing::"));
+        assert!(!claim.contains("\"token\""));
+        for sink in [
+            "format!(\"{req",
+            "format!(\"{:?}\", req",
+            "serde_json::to_value(&req)",
+            "serde_json::to_string(&req)",
+            "dbg!(",
+            "println!(",
+            "eprintln!(",
+            "log::",
+            "std::fs",
+            "File::",
+            "state.agent_events",
+            "state.events",
+        ] {
+            assert!(!claim.contains(sink), "claim token gained sink {sink}");
+        }
+
+        let board = function_source(&owner_source, "async fn longhouse_board_post(");
+        let second_lock = board
+            .find("if let Ok(mut reg) = state.longhouse.lock() {")
+            .unwrap();
+        let ingest = board.find("reg.ingest(&event);").unwrap();
+        let lock_end = block_end(board, "if let Ok(mut reg) = state.longhouse.lock() {");
+        let emit = board
+            .find("state.agent_events.emit(event.into_turn_event());")
+            .unwrap();
+        assert!(second_lock < ingest && ingest < lock_end && lock_end < emit);
+
+        for forbidden in [
+            "LonghouseConveneRequest",
+            "parse_federation",
+            "async fn longhouse_convene(",
+            "known_models_with_readiness",
+            "ProviderEnv",
+            "ocean_longhouse::convene(",
+            "secret.token",
+            "Revoker::new(",
+            "SqliteTitleRegistry::open(",
+            "LonghouseRegistry::new(",
+            "new_recall_registry(",
+            "fn longhouse_routes(",
+            ".route(",
+            "Sse<",
+            "subscribe_with_replay",
+            "tokio::spawn(",
+            "spawn_blocking",
+            "PermissionPolicy",
+            "run_turn",
+            "with_rooms",
+            "ocean_call",
+            "LiveKit",
+        ] {
+            assert!(
+                !owner_source.contains(forbidden),
+                "governance-control owner gained authority marker {forbidden:?}"
+            );
+        }
+        for false_contract in [
+            "distinct credentialed",
+            "recall is unforgeable",
+            "forged breach",
+            "durable board",
+            "durable mirror",
+            "detected policy breach",
+        ] {
+            assert!(
+                !owner_source.contains(false_contract),
+                "governance-control owner retained false contract {false_contract:?}"
+            );
+        }
+
+        let routes = source_section(
+            production_main,
+            "fn longhouse_routes()",
+            "/// Request body for `POST /v1/longhouse/convene`.",
+        );
+        for (path, handler) in [
+            ("/v1/longhouse/claim", "longhouse_claim"),
+            ("/v1/longhouse/revoke", "longhouse_revoke"),
+            ("/v1/longhouse/recall", "longhouse_recall"),
+            ("/v1/longhouse/breach", "longhouse_breach"),
+            ("/v1/longhouse/board", "longhouse_board_post"),
+        ] {
+            assert!(routes.contains(&format!(".route(\"{path}\", post({handler}))")));
+        }
+        assert!(!routes.contains("Authorization"));
+        assert!(!routes.contains("ObservatoryAuth"));
+        assert!(!routes.contains("PermissionDecision"));
+        assert!(production_main.contains("async fn longhouse_convene("));
+        assert!(production_main.contains("fn titles_db_path()"));
+        assert_eq!(
+            production_main
+                .matches("revoker: Arc::new(ocean_longhouse::Revoker::new()),")
+                .count(),
+            1
+        );
+        let startup = source_section(
+            production_main,
+            "// The Longhouse read-side topic registry.",
+            "// Persistent rooms (OCEAN-107):",
+        );
+        assert_eq!(startup.matches("LonghouseRegistry::new()").count(), 1);
+        assert!(startup.contains(".with_extensions(Some(longhouse.clone()))"));
+        let state_start = production_main.find("let state = AppState {").unwrap();
+        let state_assembly = &production_main[state_start..state_start + 2_000];
+        assert!(state_assembly.contains("\n        longhouse,"));
+        assert!(state_assembly.contains("\n        titles: Arc::new(Mutex::new(title_registry)),"));
+        assert!(state_assembly
+            .contains("\n        revoker: Arc::new(ocean_longhouse::Revoker::new()),"));
+        assert!(state_assembly.contains("\n        recalls: new_recall_registry(),"));
+    }
+
     #[test]
     fn recall_registry_preserves_first_threshold_distinct_voters_and_latching() {
         let recalls = new_recall_registry();
