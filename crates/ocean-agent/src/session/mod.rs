@@ -988,6 +988,56 @@ fn strip_longhouse_block(text: &str) -> &str {
     text
 }
 
+/// Strip a leading operator-guidance block. `apply_turn_guidance` in the daemon
+/// prepends the per-turn operator hints as `{block}\n\n{prompt}` with the header
+/// `Operator guidance for this turn:`; same marker-anchored, `\n\n`-terminated
+/// shape as [`strip_longhouse_block`] (the block's own lines use single `\n`, so
+/// the first blank line bounds it). Kept in sync with the daemon renderer by
+/// `render_turn_guidance_block_anchors_display_strip_marker` in ocean-daemon.
+fn strip_operator_guidance_block(text: &str) -> &str {
+    const MARKER: &str = "Operator guidance for this turn:";
+    if text.starts_with(MARKER) {
+        if let Some(idx) = text.find("\n\n") {
+            return text[idx + 2..].trim_start();
+        }
+    }
+    text
+}
+
+/// Peel the daemon-injected turn-prep layers off the front of a stored
+/// user-message body, for DISPLAY only (TASK-50). The runtime persists the fully
+/// composed prompt the model saw — the surface flag plus whatever steering blocks
+/// the daemon prepended plus the user's words — but a product transcript must
+/// render the user's own words, not the injected preamble. Reuses the same
+/// marker-anchored primitives the session-label derivation uses
+/// ([`strip_surface_flag`], [`strip_longhouse_block`],
+/// [`strip_operator_guidance_block`]) so each marker has a single source of
+/// truth. The daemon STACKS layers (`[FLAG] {longhouse}\n\n{guidance}\n\n
+/// {prompt}`), so this peels in a loop: each pass removes at most one leading
+/// layer and repeats until the front no longer matches a known marker. A body
+/// that never opened with a known marker is returned byte-for-byte (no false
+/// strips) — the anchoring is exact-prefix, so genuine user text that merely
+/// mentions a marker mid-line is untouched.
+///
+/// DEFERRED (documented, intentionally not stripped): the folder-as-agent
+/// instruction prefix has no marker to anchor on, and the `## Browser context`
+/// block carries an internal blank line so the shared `\n\n` terminator cannot
+/// bound it. Both are left intact rather than risk truncating genuine content;
+/// when either leads (folder-agent / surface-extension turns) it also shadows an
+/// inner Longhouse block from this peel. See the TASK-50 report.
+fn strip_injected_turn_prep(text: &str) -> &str {
+    let mut cur = text;
+    loop {
+        // Each sub-strip returns either `cur` unchanged or a strictly shorter
+        // suffix, so an unchanged length is a sound fixpoint signal.
+        let peeled = strip_operator_guidance_block(strip_longhouse_block(strip_surface_flag(cur)));
+        if peeled.len() == cur.len() {
+            return peeled;
+        }
+        cur = peeled;
+    }
+}
+
 /// The switcher/label title for a session: the explicit [`Session::title`]
 /// captured from the original prompt when present (new sessions), otherwise the
 /// first user message with the surface flag and any legacy Longhouse advisory
@@ -1096,6 +1146,14 @@ pub(crate) fn session_sync_snapshot(session: &Session) -> ocean_core::SessionSyn
             Message::ToolResult(_) => unreachable!("tool rows filtered above"),
         };
         let (mut text, omitted) = visible_text_tail(content, remaining);
+        // The compaction/refresh sync transcript is a visible transcript clients
+        // replace from, so it gets the same TASK-50 display strip as the detail
+        // projection. Only the leading (front) prefix carries the injected block;
+        // a row truncated from the front no longer opens with a marker, so the
+        // strip is a byte-for-byte no-op there.
+        if role == "user" {
+            text = strip_injected_turn_prep(&text).to_string();
+        }
         if text.is_empty()
             && content
                 .iter()
@@ -1169,15 +1227,22 @@ fn visible_text_tail(content: &[Content], max_bytes: usize) -> (String, usize) {
 
 pub(super) fn transcript_entry(message: &Message) -> SessionTranscriptEntry {
     match message {
-        Message::User { content, timestamp } => SessionTranscriptEntry {
-            role: "user".into(),
-            timestamp_ms: Some(*timestamp),
-            text: text_from_content(content),
-            images: images_from_content(content),
-            tool_call_id: None,
-            tool_name: None,
-            is_error: None,
-        },
+        Message::User { content, timestamp } => {
+            // Persisted user bodies carry the fully composed prompt (surface flag
+            // + injected steering blocks + the user's words); render only the
+            // user's words (TASK-50). Applied to every user turn, not just the
+            // first — the advisory is injected per turn.
+            let composed = text_from_content(content);
+            SessionTranscriptEntry {
+                role: "user".into(),
+                timestamp_ms: Some(*timestamp),
+                text: strip_injected_turn_prep(&composed).to_string(),
+                images: images_from_content(content),
+                tool_call_id: None,
+                tool_name: None,
+                is_error: None,
+            }
+        }
         Message::Assistant(assistant) => SessionTranscriptEntry {
             role: "assistant".into(),
             timestamp_ms: Some(assistant.timestamp),
@@ -1558,5 +1623,164 @@ mod title_tests {
         let expected = truncate_title(&long);
         assert_eq!(s.title.as_deref(), Some(expected.as_str()));
         assert!(expected.ends_with('…'));
+    }
+}
+
+/// TASK-50: the persisted user message body carries the fully composed prompt the
+/// model saw (surface flag + injected steering blocks + the user's words). The
+/// read-side transcript projections must render the user's words alone — the
+/// injected advisory/guidance preamble must not leak into product user bubbles.
+#[cfg(test)]
+mod body_strip_tests {
+    use super::*;
+
+    /// The real daemon Longhouse advisory header (see `render_longhouse_prep`);
+    /// the body strip anchors on its `Longhouse consult (advisory` prefix.
+    const LONGHOUSE_MARKER: &str =
+        "Longhouse consult (advisory — relevant skills/SOPs for this turn; \
+         recommendations only, not granted capabilities; you still route every \
+         action through the normal permission gates):";
+    /// The real daemon operator-guidance header (see `render_turn_guidance`).
+    const GUIDANCE_MARKER: &str = "Operator guidance for this turn:";
+
+    fn user_and_reply(bodies: &[&str]) -> Session {
+        let mut s = Session::new_with_id(
+            SessionId::new_v4(),
+            &ocean_protocol::Model::anthropic_claude_sonnet_4_6(),
+        );
+        let mut messages = Vec::new();
+        for body in bodies {
+            messages.push(Message::user_text(*body));
+            messages.push(Message::Assistant(AssistantMessage {
+                content: vec![Content::text("ok")],
+                api: "messages".into(),
+                provider: "fake".into(),
+                model: "fake".into(),
+                usage: Usage::default(),
+                stop_reason: StopReason::Stop,
+                error_message: None,
+                timestamp: 1,
+            }));
+        }
+        s.messages = messages;
+        s
+    }
+
+    fn user_texts(detail: &SessionDetail) -> Vec<String> {
+        detail
+            .transcript
+            .iter()
+            .filter(|e| e.role == "user")
+            .map(|e| e.text.clone())
+            .collect()
+    }
+
+    /// The reported bug: a real composed body (surface flag + Longhouse advisory
+    /// + the user's words) renders in the detail projection as the user's words
+    /// alone. Reaching the advisory requires the flag strip first (the advisory
+    /// is never leading), exactly as the session-label derivation does.
+    #[test]
+    fn detail_transcript_strips_flag_and_longhouse_from_user_body() {
+        let composed =
+            format!("[WEB] {LONGHOUSE_MARKER}\n- some-skill\n\nfix the flaky parser test");
+        let detail = session_detail(user_and_reply(&[&composed]));
+        assert_eq!(user_texts(&detail), vec!["fix the flaky parser test"]);
+    }
+
+    /// The advisory is injected on EVERY turn, so every user body is stripped,
+    /// not just the first.
+    #[test]
+    fn detail_transcript_strips_every_user_turn() {
+        let first = format!("[WEB] {LONGHOUSE_MARKER}\n- s\n\nfirst question");
+        let second = format!("[WEB] {LONGHOUSE_MARKER}\n- s\n\nsecond question");
+        let detail = session_detail(user_and_reply(&[&first, &second]));
+        assert_eq!(
+            user_texts(&detail),
+            vec!["first question", "second question"]
+        );
+    }
+
+    /// A body with no injected prefix at all is byte-identical (no false strips).
+    #[test]
+    fn detail_transcript_leaves_unadorned_body_byte_identical() {
+        let plain = "just fix the bug, there is no advisory or flag here";
+        let detail = session_detail(user_and_reply(&[plain]));
+        assert_eq!(user_texts(&detail), vec![plain]);
+    }
+
+    /// Exact-prefix anchoring: genuine user text that merely MENTIONS the
+    /// advisory marker mid-line (e.g. asking about a log line) is not mangled —
+    /// only a body that OPENS with the marker (after the flag) is stripped.
+    #[test]
+    fn detail_transcript_preserves_midline_marker_mention() {
+        let body = "[WEB] why does the log say \"Longhouse consult (advisory\" on cold start?";
+        let detail = session_detail(user_and_reply(&[body]));
+        // The flag is peeled (injected metadata), but the user's words — marker
+        // mention and all — survive intact.
+        assert_eq!(
+            user_texts(&detail),
+            vec!["why does the log say \"Longhouse consult (advisory\" on cold start?"]
+        );
+    }
+
+    /// A flag-only body (consult opted out / empty) still drops the flag to the
+    /// user's words.
+    #[test]
+    fn strip_peels_flag_only_body() {
+        assert_eq!(
+            strip_injected_turn_prep("[TUI] just a normal prompt"),
+            "just a normal prompt"
+        );
+    }
+
+    /// The operator-guidance block is marker-anchored and cleanly `\n\n`-bounded,
+    /// so a standalone guidance body strips to the user's words.
+    #[test]
+    fn strip_peels_operator_guidance_block() {
+        let body = format!("[TUI] {GUIDANCE_MARKER}\n- be terse\n\nship the release");
+        assert_eq!(strip_injected_turn_prep(&body), "ship the release");
+    }
+
+    /// Stacked layers peel in one call: flag, then the Longhouse advisory, then
+    /// the operator-guidance block (their real agent_turn stacking order), down
+    /// to the user's words.
+    #[test]
+    fn strip_peels_stacked_flag_longhouse_and_guidance() {
+        let body = format!(
+            "[WEB] {LONGHOUSE_MARKER}\n- skill-a\n\n{GUIDANCE_MARKER}\n- terse\n\nland the migration"
+        );
+        assert_eq!(strip_injected_turn_prep(&body), "land the migration");
+    }
+
+    /// A body with no known marker is returned byte-for-byte, including one that
+    /// opens with a NON-flag bracket token (`[TODO] …`).
+    #[test]
+    fn strip_leaves_non_marker_bodies_unchanged() {
+        assert_eq!(
+            strip_injected_turn_prep("[TODO] wire up the button"),
+            "[TODO] wire up the button"
+        );
+        assert_eq!(strip_injected_turn_prep("plain words"), "plain words");
+    }
+
+    /// DEFERRED layers stay intact (documented limitation): a folder-as-agent
+    /// instruction prefix (no marker) and a `## Browser context` block (internal
+    /// blank line) are not stripped, and when a browser block leads it shadows
+    /// the inner Longhouse block too. This pins the deferral so a future change
+    /// that starts stripping them is a conscious one.
+    #[test]
+    fn strip_defers_unmarked_and_multiparagraph_layers() {
+        let folder_agent = "[TUI] You are the deploy agent. Follow the runbook.\n\nship it";
+        assert_eq!(
+            strip_injected_turn_prep(folder_agent),
+            folder_agent.trim_start_matches("[TUI] ")
+        );
+        let browser = format!(
+            "[TAURI] ## Browser context\n\nThe operator's browser surface reported this live state:\n\
+             - Active tab: https://x (X)\n\n{LONGHOUSE_MARKER}\n- s\n\ndo the thing"
+        );
+        // Flag peeled; the browser block (and the Longhouse block it shadows)
+        // remain — the strip stops at the multi-paragraph browser block.
+        assert!(strip_injected_turn_prep(&browser).starts_with("## Browser context"));
     }
 }

@@ -10406,6 +10406,19 @@ mod tests {
         assert!(guided.ends_with("ship the feature"));
     }
 
+    /// TASK-50 cross-crate guard: ocean-agent's transcript display strip
+    /// (`strip_operator_guidance_block`) anchors on this exact header prefix to
+    /// peel the operator-guidance block out of persisted user bodies for display.
+    /// Keep the two literals in sync — if this header changes, the display strip
+    /// silently stops matching and the guidance block would leak into user
+    /// bubbles again. Mirrors TASK-40's Longhouse marker guard.
+    #[test]
+    fn render_turn_guidance_block_anchors_display_strip_marker() {
+        let block = render_turn_guidance(Some(&["be terse".to_string()]))
+            .expect("non-empty guidance renders a block");
+        assert!(block.starts_with("Operator guidance for this turn:"));
+    }
+
     #[test]
     fn turn_guidance_absent_or_blank_leaves_the_prompt_untouched() {
         // No guidance field at all → bare prompt (legacy turn shape).
