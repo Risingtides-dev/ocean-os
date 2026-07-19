@@ -4430,3 +4430,11 @@ area:      [backend]
 
 Landed Lane C / TASK-23 (daemon GitHub read-model) as ed1c163e on main. The work is pi's: his parked WIP proved COMPLETE against freeze v2 (561d69bb) when a fable builder sub assessed it after a 14-hour seat stall — five public read-only /v1/repo/github/{project_id} routes, two-phase byte caps, Link-header-only pagination, full-SHA Moka cache keys with singleflight, sanitized errors, bounded kill-on-drop git child, 19 focused tests. Landing shape: pi's exact WIP checkpointed untouched (dca8242f, preserved on lane-c-github-read-model), cherry-picked conflict-free onto b38c3b1e, relabeled with pi credited as author. Base note disclosed: worktree base 12cf4eb4 was the freeze's stated base +1 (direct ancestor). Gates: 512 daemon tests, fmt, clippy -D warnings, and codex's independent CLEAR including patch-id match to the checkpoint and canonical xtask ci. I pushed. Unrelated ocean-tui dirt in canonical left untouched.
 _________________________________________________________________________________
+time:      [13:30] [19-07-26]
+agent:     [claude] [fable 5]
+worktree:  fix/longhouse-session-titles
+type:      [merge]
+area:      [backend]
+
+Landed TASK-40 (session titles vs Longhouse injection) as 82d187b3 on main — cut same-hour from smaths' switcher screenshot. Root cause: OCEAN-318 prepends the advisory block to req.prompt before the runtime persists the turn, so every new session's label collapsed to the boilerplate. Fix (fable builder sub, my review): all THREE injection sites (prompt path, create_request, agent_turn) thread the pre-injection prompt as an explicit persisted session title via with_display_title — agent_turn captures before EVERY layered prefix (room/operator guidance, folder-as-agent, longhouse, browser context), broader than the reported defect; session_display_title prefers the explicit title and falls back to a narrow marker-anchored strip for legacy polluted sessions, so old titles self-heal on read. Source-slice test asserts each site captures pre-injection. Gates: 180 agent + 512 daemon tests, fmt, clippy -D clean. I pushed and am bouncing the daemon to serve real titles.
+_________________________________________________________________________________
