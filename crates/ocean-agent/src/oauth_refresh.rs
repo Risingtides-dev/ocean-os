@@ -179,13 +179,20 @@ fn block_needs_refresh(json: &Value, block: &str) -> Option<(String, bool)> {
 }
 
 /// Write `json` to `path` via a temp file + rename in the same directory, so a
-/// crash mid-write can never leave a truncated auth.json.
+/// crash mid-write can never leave a truncated auth.json. The temp file and the
+/// containing directory are fsynced so the replacement is durable across power
+/// loss (see `crate::durable`).
 fn write_atomically(path: &Path, json: &Value) -> std::io::Result<()> {
+    use std::io::Write as _;
     let dir = path.parent().unwrap_or_else(|| Path::new("."));
     let tmp = dir.join(format!(".auth.json.tmp-{}", std::process::id()));
     let pretty = serde_json::to_string_pretty(json).unwrap_or_else(|_| json.to_string());
-    std::fs::write(&tmp, pretty)?;
-    std::fs::rename(&tmp, path)
+    {
+        let mut file = std::fs::File::create(&tmp)?;
+        file.write_all(pretty.as_bytes())?;
+        file.sync_all()?;
+    }
+    crate::durable::durable_rename(&tmp, path)
 }
 
 fn unix_secs() -> i64 {

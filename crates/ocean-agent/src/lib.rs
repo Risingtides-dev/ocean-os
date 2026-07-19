@@ -40,6 +40,7 @@ pub use config::{DaemonConfig, McpSection, OffshoreSection};
 /// avoid colliding with `ocean_runtime::AgentConfig`; refer to the folder-agent
 /// config as `agentdir::AgentConfig`.
 pub mod agentdir;
+mod durable;
 mod memory_tools;
 pub use memory_tools::{list_memories, MemoryView};
 mod oauth_refresh;
@@ -3170,12 +3171,17 @@ fn load_last_model(config_dir: &std::path::Path) -> Option<String> {
 const YOLO_PREF_FILE: &str = "yolo_pref";
 
 fn write_pref_atomic(path: &std::path::Path, value: &str) -> std::io::Result<()> {
+    use std::io::Write as _;
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
     let tmp = path.with_extension(format!("tmp-{}", uuid::Uuid::new_v4().simple()));
-    std::fs::write(&tmp, value)?;
-    if let Err(error) = std::fs::rename(&tmp, path) {
+    {
+        let mut file = std::fs::File::create(&tmp)?;
+        file.write_all(value.as_bytes())?;
+        file.sync_all()?;
+    }
+    if let Err(error) = durable::durable_rename(&tmp, path) {
         let _ = std::fs::remove_file(&tmp);
         return Err(error);
     }

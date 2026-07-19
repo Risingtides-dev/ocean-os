@@ -404,7 +404,8 @@ pub fn save(config_dir: &Path, session: &Session) -> anyhow::Result<PathBuf> {
     let json = serde_json::to_string_pretty(session)?;
     // Atomic + durable write: a crash mid-write must never corrupt an
     // existing good transcript. Write to a temp sibling, fsync it, then
-    // rename over the target.
+    // rename over the target and fsync the directory so the rename itself
+    // survives power loss (see `crate::durable`).
     let tmp = dir.join(format!(".{}.json.tmp", session.id));
     {
         let mut file =
@@ -414,8 +415,8 @@ pub fn save(config_dir: &Path, session: &Session) -> anyhow::Result<PathBuf> {
         file.sync_all()
             .with_context(|| format!("fsync {}", tmp.display()))?;
     }
-    std::fs::rename(&tmp, &path)
-        .with_context(|| format!("rename {} -> {}", tmp.display(), path.display()))?;
+    crate::durable::durable_rename(&tmp, &path)
+        .with_context(|| format!("durable rename {} -> {}", tmp.display(), path.display()))?;
 
     // Split-brain invariant (one id == one file): a prior
     // `bind_workspace` rebind may have left this session's `<id>.json` in
@@ -1500,6 +1501,40 @@ mod history_search_tests {
         assert!(first[0].excerpt.starts_with('…'));
         assert!(first[0].excerpt.ends_with('…'));
     }
+
+    #[test]
+    fn save_roundtrips_durably_and_leaves_no_temp() {
+        let tmp = tempfile::tempdir().unwrap();
+        let session = stored_session(vec![
+            Message::user_text("durable transcript survives power loss"),
+            assistant_text("acknowledged", 200),
+        ]);
+
+        // Save exercises the durable temp+fsync+rename+dir-fsync path.
+        let path = save(tmp.path(), &session).unwrap();
+        assert!(path.exists(), "saved transcript file must exist");
+
+        // The temp sibling must have been renamed away, not left behind.
+        let dir = path.parent().unwrap();
+        let leftover_temp: Vec<_> = std::fs::read_dir(dir)
+            .unwrap()
+            .filter_map(Result::ok)
+            .filter(|e| {
+                e.file_name()
+                    .to_string_lossy()
+                    .starts_with(&format!(".{}", session.id))
+            })
+            .collect();
+        assert!(
+            leftover_temp.is_empty(),
+            "durable_rename must consume the temp file, found {leftover_temp:?}"
+        );
+
+        // Contents round-trip intact.
+        let loaded = load(tmp.path(), session.id).unwrap();
+        assert_eq!(loaded.id, session.id);
+        assert_eq!(loaded.messages.len(), session.messages.len());
+    }
 }
 
 #[cfg(test)]
@@ -1675,10 +1710,11 @@ mod body_strip_tests {
             .collect()
     }
 
-    /// The reported bug: a real composed body (surface flag + Longhouse advisory
-    /// + the user's words) renders in the detail projection as the user's words
-    /// alone. Reaching the advisory requires the flag strip first (the advisory
-    /// is never leading), exactly as the session-label derivation does.
+    /// The reported bug: a real composed body (surface flag, then Longhouse
+    /// advisory, then the user's words) renders in the detail projection as the
+    /// user's words alone. Reaching the advisory requires the flag strip first
+    /// (the advisory is never leading), exactly as the session-label derivation
+    /// does.
     #[test]
     fn detail_transcript_strips_flag_and_longhouse_from_user_body() {
         let composed =
