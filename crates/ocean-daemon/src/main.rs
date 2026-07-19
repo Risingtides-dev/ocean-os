@@ -94,6 +94,8 @@ mod cors;
 mod event_adapter;
 /// Home-sandboxed directory listing and capped file-read HTTP policy.
 mod filesystem;
+/// Public, read-only GitHub projection for registered project origins.
+mod github;
 /// Bounded fuzzy search over ocean-agent's persisted display transcripts.
 mod history_search;
 /// State-free Longhouse prepare, inspect, and workflow HTTP adapters.
@@ -658,6 +660,20 @@ fn app_router(cors: CorsLayer) -> Router<AppState> {
             "/v1/projects/{id}",
             get(project_get).patch(project_patch).delete(project_delete),
         )
+        .route("/v1/repo/github/{project_id}/pulls", get(github::pulls))
+        .route(
+            "/v1/repo/github/{project_id}/pulls/{number}",
+            get(github::pull),
+        )
+        .route(
+            "/v1/repo/github/{project_id}/head-sha/{sha}/checks",
+            get(github::checks),
+        )
+        .route(
+            "/v1/repo/github/{project_id}/pulls/{number}/reviews",
+            get(github::reviews),
+        )
+        .route("/v1/repo/github/{project_id}/commits", get(github::commits))
         .route("/v1/fs/dirs", get(fs_dirs))
         .route("/v1/fs/file", get(fs_file))
         .route("/v1/browser/screencast", get(browser_screencast))
@@ -1008,6 +1024,7 @@ async fn main() -> anyhow::Result<()> {
     if !extra_origins.is_empty() {
         tracing::info!(origins = ?extra_origins, "OCEAN_ALLOWED_ORIGINS: extra CORS origins");
     }
+    let github_service = github::GitHubService::new()?;
     let app = app_router(cors_layer(extra_origins));
 
     // Drain the registry of in-flight turn tasks AFTER axum finishes draining
@@ -1027,7 +1044,8 @@ async fn main() -> anyhow::Result<()> {
     let app = app
         .with_state(state)
         .layer(axum::Extension(observatory_auth))
-        .layer(axum::Extension(observatory_services));
+        .layer(axum::Extension(observatory_services))
+        .layer(axum::Extension(github_service));
 
     let addr: SocketAddr = bind.parse().context("invalid OCEAN_BIND")?;
     tracing::info!(%addr, "ocean-daemon listening");
@@ -1352,6 +1370,11 @@ fn banner_routes() -> &'static [&'static str] {
         "GET /v1/projects/{id}",
         "PATCH /v1/projects/{id}",
         "DELETE /v1/projects/{id}",
+        "GET /v1/repo/github/{project_id}/pulls",
+        "GET /v1/repo/github/{project_id}/pulls/{number}",
+        "GET /v1/repo/github/{project_id}/head-sha/{sha}/checks",
+        "GET /v1/repo/github/{project_id}/pulls/{number}/reviews",
+        "GET /v1/repo/github/{project_id}/commits",
         "GET /v1/fs/dirs",
         "GET /v1/fs/file",
         "GET /v1/browser/screencast",
@@ -21178,7 +21201,7 @@ mod tests {
         );
         assert_eq!(
             banner.len(),
-            86,
+            91,
             "route baseline changed; review the manifest"
         );
 

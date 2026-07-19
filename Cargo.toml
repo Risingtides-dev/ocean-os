@@ -98,6 +98,7 @@ ocean-runtime = { path = "crates/ocean-runtime" }
 ocean-mcp = { path = "crates/ocean-mcp" }
 toml = "0.8"
 semver = "1"
+moka = { version = "0.12", features = ["future"] }
 ocean-agent-sdk = { path = "crates/ocean-agent-sdk" }
 ocean-agent = { path = "crates/ocean-agent" }
 ocean-providers = { path = "crates/ocean-providers" }

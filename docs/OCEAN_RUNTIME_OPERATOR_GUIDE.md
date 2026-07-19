@@ -568,6 +568,17 @@ GET    /v1/projects/{id}                  project detail
 PATCH  /v1/projects/{id}                  update name and/or config (partial)
 DELETE /v1/projects/{id}                  delete a project (sessions become project-less)
 
+# GitHub repository projection (public repositories only; read-only, no PAT or Authorization header)
+GET    /v1/repo/github/{project_id}/pulls                         list pull requests (?state=open|closed|all&page=1&per_page=10; max 25)
+GET    /v1/repo/github/{project_id}/pulls/{number}                pull request detail
+GET    /v1/repo/github/{project_id}/head-sha/{sha}/checks         checks for one admitted full 40-hex head SHA
+GET    /v1/repo/github/{project_id}/pulls/{number}/reviews        list pull reviews (?page=1&per_page=10; max 25)
+GET    /v1/repo/github/{project_id}/commits                       list commits (?sha=main&page=1&per_page=10; max 25)
+
+These routes resolve only a registered project's workspace-root `origin` and
+accept only exact public GitHub remote forms. They never accept or forward a PAT,
+never send an `Authorization` header, and expose no aggregate or write route.
+
 # Filesystem and browser surface support
 GET    /v1/fs/dirs                        list home-sandboxed directories
 GET    /v1/fs/file                        read a home-sandboxed file

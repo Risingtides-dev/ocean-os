@@ -52,6 +52,7 @@ ocean-protocol.workspace = true
 ocean-providers.workspace = true
 ocean-runtime.workspace = true
 ocean-store.workspace = true
+moka.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true
