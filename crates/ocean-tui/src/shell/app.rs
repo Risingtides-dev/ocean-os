@@ -38,7 +38,7 @@ use tokio::sync::mpsc;
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use super::{
-    action::{Action, HealthSource, LoginTarget, Nav},
+    action::{Action, HealthSource, LoginTarget, Nav, SurfaceTarget},
     client::{DaemonClient, ModelEntry, TurnSubmitError},
     component::Component,
     components::{
@@ -361,6 +361,31 @@ fn unix_epoch_ms() -> i64 {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_millis() as i64)
         .unwrap_or(0)
+}
+
+/// The session-addressed URL a `/web` or `/desk` handoff opens. Both shapes
+/// resolve to the exact same chat on the sibling surface: the desktop app
+/// parses `ocean://session/<id>` (its Tauri shell registers the scheme and
+/// forwards it to the UI, which switches sessions); the web PWA reads
+/// `?session=<id>` at boot and binds it instead of the last persisted chat.
+fn surface_handoff_url(target: SurfaceTarget, id: AgentSessionId) -> String {
+    match target {
+        SurfaceTarget::Web => format!("{}/?session={id}", surface_web_base()),
+        SurfaceTarget::Desktop => format!("ocean://session/{id}"),
+    }
+}
+
+/// Base URL of the ocean-surface web proxy for `/web`. Defaults to the
+/// proxy's documented loopback port (`OCEAN_SURFACE_BIND` defaults to
+/// `0.0.0.0:8790`); set `OCEAN_SURFACE_URL` when it is served elsewhere
+/// (LAN/tailnet host, tunnel). Trailing slashes are trimmed so the query
+/// joins cleanly.
+fn surface_web_base() -> String {
+    std::env::var("OCEAN_SURFACE_URL")
+        .ok()
+        .map(|s| s.trim().trim_end_matches('/').to_string())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "http://127.0.0.1:8790".to_string())
 }
 
 struct SpaceHold {
@@ -1920,6 +1945,27 @@ impl App {
                 self.center = Center::Chat;
                 self.focus_to(Focus::Center);
             }
+            // `/web` / `/desk`: hand the bound session to a sibling surface —
+            // the exact same chat, addressed by session id. The desktop app
+            // registers the `ocean://` scheme with the OS (its window comes
+            // forward and switches sessions); the web PWA reads `?session=<id>`
+            // at boot. Nothing bound yet → an honest notice instead of
+            // opening a surface on an empty chat.
+            Action::OpenInSurface(target) => match self.session_id {
+                Some(id) => {
+                    let url = surface_handoff_url(*target, id);
+                    let label = match target {
+                        SurfaceTarget::Web => "web surface",
+                        SurfaceTarget::Desktop => "desktop app",
+                    };
+                    if open::that(&url).is_ok() {
+                        self.set_notice(format!("opened this chat in the {label}"));
+                    } else {
+                        self.set_notice(format!("could not open the {label} — visit {url}"));
+                    }
+                }
+                None => self.set_notice("no session yet — send a message first".into()),
+            },
             // `/model <id>`: remember the override for subsequent turns.
             Action::SetModel(id) => self.model_override = Some(id.clone()),
             // `/thinking <level>`: remember the override for subsequent turns.
@@ -6259,6 +6305,43 @@ mod tests {
             app.actions_rx.try_recv(),
             Err(TryRecvError::Empty)
         ));
+    }
+
+    #[test]
+    fn open_in_surface_without_a_session_sets_an_honest_notice() {
+        // `/web` or `/desk` before any turn is bound must not open a surface
+        // on an empty chat — it says why nothing opened.
+        let mut app = offline_app();
+        assert!(app.session_id.is_none());
+
+        app.dispatch(Action::OpenInSurface(SurfaceTarget::Web));
+        assert_eq!(app.status, "no session yet — send a message first");
+
+        app.dispatch(Action::OpenInSurface(SurfaceTarget::Desktop));
+        assert_eq!(app.status, "no session yet — send a message first");
+    }
+
+    #[test]
+    fn surface_handoff_url_shapes() {
+        let id =
+            AgentSessionId(uuid::Uuid::parse_str("11111111-2222-4333-8444-555555555555").unwrap());
+
+        // Desktop: the Tauri shell's registered `ocean://` deep link.
+        assert_eq!(
+            surface_handoff_url(SurfaceTarget::Desktop, id),
+            "ocean://session/11111111-2222-4333-8444-555555555555"
+        );
+        // Web: the proxy base (env-overridable) carrying `?session=<id>`.
+        let web = surface_handoff_url(SurfaceTarget::Web, id);
+        assert!(web.starts_with("http"), "got: {web}");
+        assert!(
+            web.ends_with("/?session=11111111-2222-4333-8444-555555555555"),
+            "got: {web}"
+        );
+        assert!(
+            !web.contains("//?session"),
+            "base join must be clean: {web}"
+        );
     }
 
     #[test]

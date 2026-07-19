@@ -52,6 +52,18 @@ pub const COMMANDS: &[SlashCommand] = &[
         soon: false,
     },
     SlashCommand {
+        name: "/web",
+        desc: "open this chat in the web surface (browser)",
+        group: "session",
+        soon: false,
+    },
+    SlashCommand {
+        name: "/desk",
+        desc: "open this chat in the desktop app",
+        group: "session",
+        soon: false,
+    },
+    SlashCommand {
         name: "/models",
         desc: "pick a model + thinking level (live registry)",
         group: "session",

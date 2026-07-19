@@ -26,7 +26,7 @@ use ratatui::{
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use crate::shell::{
-    action::{Action, LoginTarget, Nav},
+    action::{Action, LoginTarget, Nav, SurfaceTarget},
     component::Component,
     diff::{self, DiffKind, DiffRow},
     errfmt,
@@ -2315,6 +2315,10 @@ impl ChatComponent {
             // Pane/center navigation — the app owns Focus/Center, so emit a
             // targeted Navigate and let it move there.
             "/sessions" | "/resume" => Some(Action::Navigate(Nav::Sessions)),
+            // Surface handoff — the app owns the bound session id and the OS
+            // open; it answers with an honest notice when nothing is bound yet.
+            "/web" => Some(Action::OpenInSurface(SurfaceTarget::Web)),
+            "/desk" => Some(Action::OpenInSurface(SurfaceTarget::Desktop)),
             "/files" => Some(Action::Navigate(Nav::Files)),
             "/graph" => Some(Action::Navigate(Nav::Graph)),
             "/terminal" => Some(Action::Navigate(Nav::Terminal)),
@@ -4720,6 +4724,22 @@ mod tests {
         let act = chat.run_slash("/providers", "");
 
         assert!(matches!(act, Some(Action::OpenProviders)));
+    }
+
+    #[test]
+    fn slash_surface_handoffs_emit_intent() {
+        // `/web` and `/desk` route to the app, which owns the bound session
+        // id and the OS handoff.
+        let mut chat = ChatComponent::default();
+
+        assert!(matches!(
+            chat.run_slash("/web", ""),
+            Some(Action::OpenInSurface(SurfaceTarget::Web))
+        ));
+        assert!(matches!(
+            chat.run_slash("/desk", ""),
+            Some(Action::OpenInSurface(SurfaceTarget::Desktop))
+        ));
     }
 
     #[test]

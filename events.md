@@ -4389,3 +4389,11 @@ Verification:
 - `cargo xtask docs-check` passed with 27 packages, 120 active Markdown files, and 129 local links
 - `git diff --check` passed
 - final independent review accepted the design with no medium-or-higher findings
+_________________________________________________________________________________
+time:      [01:12am] [19-07-26]
+agent:     [pi], [unknown-model]
+worktree:  [main]
+type:      [feature-request]
+area:      [frontend]
+
+Added `/web` and `/desk` slash commands to ocean-tui: both hand the currently bound session — the exact same chat — to a sibling surface in the ocean-surface repo. `/web` opens `http://127.0.0.1:8790/?session=<id>` (proxy default; `OCEAN_SURFACE_URL` overrides) which the web PWA consumes at boot; `/desk` opens the `ocean://session/<id>` deep link the Tauri shell already registers. With no session bound, the status line says so instead of opening an empty chat. New `Action::OpenInSurface(SurfaceTarget)` rides the Elm loop (chat emits intent; the app owns the session id and the OS `open`); pure `surface_handoff_url` keeps both URL shapes testable. ocean-surface-ui learned the matching `?session=<id>` boot handoff (wins over the persisted localStorage session, then stripped via history.replaceState so reloads follow normal restore). ocean-tui: 366 tests pass, clippy clean, release build green; ocean-surface-ui: 419 tests pass, host + wasm32 checks clean. The ocean:// and ?session= URL shapes are now a documented cross-repo contract in crates/ocean-tui/AGENTS.md.

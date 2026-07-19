@@ -22,6 +22,11 @@ This crate owns the full-screen terminal steering cockpit (`ocean` binary) for i
   alive several seconds — `--help` exits before terminal setup and proves
   nothing.
 - Keep TUI behavior aligned with daemon API contracts; clients do not own sessions.
+- `/web` and `/desk` hand the bound session to sibling surfaces owned by the
+  `ocean-surface` repo: the web PWA consumes `?session=<id>` at boot (proxy
+  default `http://127.0.0.1:8790`, override via `OCEAN_SURFACE_URL`) and the
+  Tauri desktop app consumes the `ocean://session/<id>` deep link. Both URL
+  shapes are a cross-repo contract — change them only with ocean-surface.
 - The `shell/` workbench is the sole TUI. Do not reintroduce `--legacy`, nested TUI session resume, Track-0 room tabs, the mesh parity subcommand, or room-scoped `AgentTurnRequest` fields.
 - Do not introduce agent/session logic into the TUI; session state lives in the daemon via `ocean-agent`.
 

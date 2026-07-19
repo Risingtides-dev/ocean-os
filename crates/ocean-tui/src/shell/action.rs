@@ -25,6 +25,18 @@ pub enum LoginTarget {
     Codex,
 }
 
+/// Sibling surface targeted by `/web` or `/desk`. The handoff opens the
+/// currently bound session — the exact same chat — in that surface,
+/// addressed by session id (`?session=<id>` on the PWA; the
+/// `ocean://session/<id>` deep link on the Tauri desktop app).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SurfaceTarget {
+    /// Browser PWA served by `ocean-surface-proxy`.
+    Web,
+    /// Tauri desktop app (registers the `ocean://` scheme with the OS).
+    Desktop,
+}
+
 /// A typed health source — the daemon liveness probe and the SSE transport
 /// are tracked independently so a recovery clears only its own source
 /// (`status::Health`).
@@ -88,6 +100,9 @@ pub enum Action {
     /// `/new` — drop the bound session so the next turn mints a fresh one
     /// (stays in the current active project).
     NewSession,
+    /// `/web` / `/desk` — open the bound session's chat in a sibling surface.
+    /// The app owns the session id and the OS handoff; chat emits the intent.
+    OpenInSurface(SurfaceTarget),
     /// `+ new` on a project header in the rail: start a fresh session AND
     /// re-root the workbench (cwd for turns, file tree, graph) to `cwd`.
     NewSessionInProject {
