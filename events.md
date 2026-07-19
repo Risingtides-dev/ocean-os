@@ -5501,3 +5501,11 @@ type:      [plan]: authorize Longhouse governance-control extraction
 area:      [testing]: ocean-daemon Phase 2C governance control
 
 Accepted characterization commit `f1971c0` as the rollback point and authorized only the exact 13-definition `longhouse_governance_control.rs` move. Seven extraction-aware parent tests freeze all five route methods/extractors/parse precedence and exact envelopes; claim identity-first secrecy, one-shot release, captured-log/event/projection/reopened-DB token non-disclosure, and latent `Debug` no-sink source constraints; unauthenticated manual revoke, omitted/zero/one threshold recall, retained non-live tally, three-report breach, and post-close exact 200/zero-strike response; persisted title/strike/revocation versus memory-only recall; board validation/kind/fold-before-publish/poison divergence; title poison; and exact item/import/visibility/startup/route/real-convene exclusions. All 500 daemon tests, 168 Longhouse tests plus one ignore and one doc test, denied-warning daemon Clippy, formatting/docs/diff, and final correctness plus security/lifecycle reviews passed with no unresolved medium-or-higher issue. Real convene remains excluded. No production handler, route, response, schema, credential, process, or deployment changed in characterization.
+_________________________________________________________________________________
+time:      [03:39am] [19-07-26]
+agent:     [pi], [gpt-5.6-sol], [orchestrator]
+worktree:  [pi/daemon-longhouse-control-governance-20260717]
+type:      [testing]: correct governance-control parent import contract
+area:      [testing]: ocean-daemon Phase 2C governance control
+
+Corrected only the extraction-aware test's future parent import expectation: the five route handlers remain one production import block while parent-test-only `with_titles` uses a separate `#[cfg(test)]` import, avoiding a denied-warning release unused import without broadening request fields or production authority. Focused source-boundary characterization passed. Rollback and extraction authorization now bind to `0e7a4dc`, which contains the accepted seven-test characterization `f1971c0` plus this test-only correction. No production behavior, handler, route, response, schema, credential, process, or deployment changed.

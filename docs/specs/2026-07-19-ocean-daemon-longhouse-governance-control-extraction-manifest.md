@@ -4,7 +4,7 @@
 **Status:** Characterization accepted; extraction authorized only for the exact 13-definition governance-control boundary
 **Owner:** Ocean OS
 **Source baseline:** fetched and rebased `origin/main` `729542b`
-**Rollback point:** characterization commit `f1971c0`
+**Rollback point:** characterization import-contract commit `0e7a4dc` (seven-test characterization `f1971c0` plus test-only parent-import correction)
 
 ## Purpose
 
@@ -224,7 +224,9 @@ Focused governance/control, recall, claim, revoke, board, convene, topic-project
 
 Fresh correctness/test-adequacy and security/architecture/lifecycle review rounds found and drove closure of incomplete route matrices, token-log evidence, persistence, private-field compatibility, exact import/visibility inventory, and post-close breach truth. Final reviews reported PASS with no unresolved medium-or-higher issue.
 
-Extraction is authorized only from rollback point `f1971c0`, only for the exact 13 definitions/comments listed above, and only with the manifested imports and visibility. Real convene remains excluded.
+Test-only correction `0e7a4dc` updates the extraction-aware parent import expectation so `with_titles` remains a separate `#[cfg(test)]` import instead of creating a release-build unused import; production behavior and the seven tests are unchanged.
+
+Extraction is authorized only from rollback point `0e7a4dc`, only for the exact 13 definitions/comments listed above, and only with the manifested imports and visibility. Real convene remains excluded.
 
 ## Validation matrix
 
