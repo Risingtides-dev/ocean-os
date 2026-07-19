@@ -4404,3 +4404,11 @@ type:  [feature]
 
 Expanded the pre-session Voice Planner from proposal-only context blindness to bounded read-only project inspection. Realtime planner mint now advertises list_workspace and read_workspace_file alongside propose_handoff with closed schemas and explicit untrusted-data/non-execution instructions. Surface fulfillment normalizes relative paths, rejects absolute/~/'..', requires each daemon-canonicalized response target to remain under the frozen validated workspace (including symlink escape), caps listings and file payloads, rejects binary reads, and preserves Create draft/Create & start as the only session/turn mutation boundary. Verification: cargo fmt checks in ocean-os and ocean-surface; cargo test -p ocean-daemon voice_realtime (11 passed); cargo test -p ocean-surface-ui voice::realtime::tests (16 passed); cargo check -p ocean-surface-ui --target wasm32-unknown-unknown; LSP diagnostics clean.
 _________________________________________________________________________________
+
+time:  [03:01pm] [19-07-26]
+agent: ocean-tauri, codex
+worktree: [main]
+type:  [design]
+
+Amended the proposed (not accepted; authorizes no code) Ocean Crew Phase 6 manifest to define the extension-provided Longhouse delegation facade (longhouse__delegate_local/offshore), local/offshore target policy equivalence, real planner/implementer/reviewer/synthesizer Ocean capability profiles, host effective-capability intersection and audit records, Bedrock's bounded knowledge-only role, and explicit migration rejection of advisory /v1/subagents/spec tool strings as executable grants. Crew remains extension-owned; ocean-os and compiled ocean-longhouse gain no orchestration vocabulary or runtime. Verification: cargo xtask docs-check PASS (28 packages, 161 active Markdown files, 141 local links); diff-check clean.
+_________________________________________________________________________________
