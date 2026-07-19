@@ -4159,7 +4159,7 @@ impl App {
         self.workflow_graph.focused = (self.focus == Focus::Tree
             && self.right_rail_mode == RightRailMode::Workflow)
             || (center && self.center == Center::WorkflowGraph);
-        self.workflow_graph.expanded = center && self.center == Center::WorkflowGraph;
+        self.workflow_graph.expanded = self.center == Center::WorkflowGraph;
     }
 
     fn submit_turn(&mut self, prompt: String) {
