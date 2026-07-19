@@ -5161,8 +5161,10 @@ struct LonghouseBreachRequest {
 ///
 /// Status: 200 with `{ revoked: false, strikes, threshold }` while below
 /// threshold; 200 with `{ revoked: true, revocation }` when the breach tips the
-/// gradient and the title is pulled; 404 if the title is unknown; 409 if the
-/// title was already revoked/released; 400 on a malformed UUID.
+/// gradient and the title is pulled; 404 if the title is unknown. The current
+/// owner returns zero strikes for an already closed title, so a later report is
+/// also 200 with `revoked: false, strikes: 0`; the mapped `NotLive` 409 branch is
+/// not reached by that path. Malformed UUIDs return 400.
 async fn longhouse_breach(
     State(state): State<AppState>,
     Json(req): Json<LonghouseBreachRequest>,

@@ -5485,3 +5485,11 @@ type:      [docs]: correct Longhouse control authority comments
 area:      [security]: ocean-daemon governance control trust boundary
 
 Applied the manifest-required pre-characterization source-accuracy checkpoint without changing executable Rust tokens. Manual revoke now states that the daemon-held Revoker key authenticates daemon execution rather than the unauthenticated HTTP caller. Recall now states that voter identity is a caller-supplied UUID, distinctness is not caller authentication, and omitted/zero threshold clamps to one. Breach now states that each accepted report accrues a strike and the third can hard-revoke. Board now states that `LonghouseRegistry` is an in-memory projection and documents the existing poisoned-second-lock publication/success divergence. The nearest daemon contract and active progress records were updated; behavior, routes, responses, persistence, events, locks, credentials, and deployment remain unchanged. Characterization and extraction remain unauthorized.
+_________________________________________________________________________________
+time:      [03:13am] [19-07-26]
+agent:     [pi], [gpt-5.6-sol], [orchestrator], [subagents]
+worktree:  [pi/daemon-longhouse-control-governance-20260717]
+type:      [docs]: correct post-close breach response contract
+area:      [security]: ocean-daemon governance control lifecycle
+
+Characterization exposed that `POST /v1/longhouse/breach` does not reach its mapped `NotLive` 409 branch after title closure: the owner strike adapter returns zero for a non-live title, so the existing route returns exact 200 `{ok:true,revoked:false,title_id,strikes:0,threshold:3}`. Preserved this observable behavior without fixing it and corrected the handler comment, extraction manifest, nearest daemon contract, mission, and code-health record. No executable Rust token, route, response, storage, credential, process, or deployment changed; characterization work remains uncommitted and extraction remains unauthorized.

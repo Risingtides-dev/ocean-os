@@ -133,7 +133,7 @@ The module must not own permissions, turns, sessions, rooms, calls, librarian/sp
 
 - Parse the title UUID and retain the current default-detail behavior.
 - A fresh threshold-three ledger object per request delegates strike durability to SQLite.
-- Strikes one and two warn; strike three revokes; unknown, non-live, unauthorized, and storage errors retain exact mappings.
+- Strikes one and two warn; strike three revokes; an unknown title returns 404. After closure, the current owner reports zero strikes rather than `NotLive`, so the route returns 200 with `revoked: false, strikes: 0`; preserve that observable wire behavior. Unauthorized/storage mappings remain exact but are unreachable without a forbidden injection seam.
 - Existing persisted strike/revocation behavior remains restart-safe.
 
 ### Board
@@ -155,6 +155,7 @@ This extraction must describe current behavior honestly without broadening, hidi
 - SQLite operations synchronously block an async handler thread under the existing standard mutex;
 - authenticated wrong-decision claims disclose the bound decision while forged identities are collapsed;
 - board poison can produce live publication/success without projection mutation;
+- a breach report against an already closed title returns 200 with zero strikes rather than the handler's mapped `NotLive` 409 branch;
 - comments that imply a durable board or cryptographically credentialed/unforgeable HTTP caller overstate current behavior and are not promoted into the module contract;
 - composition-owned convene retains grant-success/bind-failure token delivery, grant-failure convergence mapping, ready-model ordering, and poison behavior.
 
@@ -166,7 +167,7 @@ Before characterization is accepted, make and independently review one behavior-
 
 - manual revoke must say the HTTP route relies on the current local-route trust posture and that the daemon, not the caller, owns the cryptographic Revoker key; merely naming a title through an authorized/trusted route is sufficient for the daemon to attempt revocation;
 - recall must say `voter_id` is caller-supplied, distinctness is UUID-based rather than credential authentication, omitted/zero threshold clamps to one, and a first distinct caller can carry a threshold-one tally;
-- breach must say each accepted request exercises daemon-held Revoker authority and three accepted reports can reach hard revocation; it must not call the report detected, authenticated, or unforgeable;
+- breach must say each accepted request exercises daemon-held Revoker authority, three accepted live-title reports can reach hard revocation, and a later report against the closed title currently returns 200 with zero strikes rather than 409; it must not call the report detected, authenticated, or unforgeable;
 - board must call `LonghouseRegistry` an in-memory read-side projection, not a durable board/record/mirror, and must describe current poison divergence honestly.
 
 The corrected comments become part of the accepted characterization rollback source and are then included in exact body/comment comparison. This separate checkpoint may clarify documentation only; it may not add authentication, alter a response, change mutation order, or fix poison behavior.
@@ -193,7 +194,7 @@ Freeze malformed/unknown/non-live no-tally behavior; first threshold; zero clamp
 
 ### 5. Breach lifecycle and persistence
 
-Add the missing daemon route matrix: malformed/default detail, unknown, non-live, strikes one/two, strike-three revocation, post-revoke rejection, exact envelopes, and persisted strike/revocation continuation after reopen.
+Add the missing daemon route matrix: malformed/default detail, unknown 404, strikes one/two, strike-three revocation, the exact post-revoke 200 `revoked:false,strikes:0` envelope, and persisted strike/revocation continuation after reopen.
 
 ### 6. Board fold/publication/poison behavior
 
