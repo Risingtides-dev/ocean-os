@@ -286,13 +286,13 @@ struct AppState {
     /// even with the correct token. Decide ≠ execute: this only *executes*. See
     /// [`RevokerHandle`].
     revoker: RevokerHandle,
-    /// Open quorum-of-recall tallies, keyed by the firekeeper `title_id` under
-    /// recall (OCEAN-302). Each [`ocean_longhouse::RecallVote`] counts *distinct*
-    /// credentialed no-confidence votes; when one carries, the daemon presents its
-    /// own [`AppState::revoker`] key and pulls the title. A single forged vote is
-    /// one credential and never carries — the recall is unforgeable. Held behind a
-    /// std `Mutex` like the other longhouse stores (the guard is always dropped
-    /// before any `await`). See [`RecallRegistryHandle`].
+    /// Open recall tallies keyed by the firekeeper `title_id` (OCEAN-302). Each
+    /// [`ocean_longhouse::RecallVote`] counts distinct caller-supplied voter UUIDs;
+    /// the handler does not authenticate those identities, and an omitted/zero
+    /// first threshold clamps to one. A carried tally asks the daemon-held
+    /// [`AppState::revoker`] to pull the title. Held behind a std `Mutex` like the
+    /// other longhouse stores (the guard is dropped before any `await`). See
+    /// [`RecallRegistryHandle`].
     recalls: RecallRegistryHandle,
     /// Daemon-wide count of call-transcript writes ultimately DROPPED after the
     /// bounded persistence retry (OCEAN-255). Shared (by clone of the `Arc`) into
@@ -391,17 +391,19 @@ type LonghouseRegistryHandle = Arc<Mutex<ocean_longhouse::LonghouseRegistry>>;
 /// Shared handle to the daemon's **persisted** Longhouse title registry
 /// (OCEAN-246/272): the durable, salt+hash-verifier store of firekeeper/validator
 /// titles. Held behind a std `Mutex` exactly like [`RoomStoreHandle`] — every
-/// method is synchronous and the guard is always dropped before any `await`, so a
-/// std `Mutex` is correct and never blocks the scheduler. This is what makes
+/// method is synchronous and the guard is dropped before any `await`. SQLite work
+/// still runs on the handler thread while the guard is held; moving it to a
+/// blocking pool is a separate behavior/concurrency change. This is what makes
 /// `claim_outcome` a daemon-held op: a title minted when a council converges
 /// survives the turn here, so a firekeeper can ratify in a *later* turn.
 type TitleRegistryHandle = Arc<Mutex<ocean_longhouse::SqliteTitleRegistry>>;
 /// Shared handle to the daemon's single [`ocean_longhouse::Revoker`] — the "War
-/// Chief" that *executes* (never decides) title revocation. It holds a
-/// server-minted capability key; only code holding this `Arc` can present that
-/// key, so a forged recall by an unprivileged caller is refused. Wrapped in an
-/// `Arc` (no `Mutex`: `Revoker` is immutable — it mutates the registry it is
-/// handed, under that registry's own lock).
+/// Chief" that executes title revocation. Its server-minted capability key
+/// restricts direct title-engine execution to daemon code holding this `Arc`.
+/// Control handlers present the key for requests admitted by the local router, so
+/// the key does not authenticate the HTTP caller. Wrapped in an `Arc` (no `Mutex`:
+/// `Revoker` is immutable — it mutates the registry it is handed, under that
+/// registry's own lock).
 type RevokerHandle = Arc<ocean_longhouse::Revoker>;
 // --- Turn-intake backpressure (OCEAN-304) -----------------------------------
 //
@@ -885,8 +887,9 @@ async fn main() -> anyhow::Result<()> {
     // `claim_outcome` can ratify across turns. It lives at `titles.db` alongside
     // `rooms.db` under the same config dir (`OCEAN_TITLES_DB_PATH` overrides the
     // whole path). `open` runs migrations idempotently — safe on a fresh or
-    // existing DB. The daemon also mints its single Revoker here; the capability
-    // key it holds is never emitted on the wire, so revocation is unforgeable.
+    // existing DB. The daemon also mints its single Revoker here. Its capability
+    // key never enters the wire and authenticates daemon execution to the title
+    // engine; caller admission to control routes is a separate trust boundary.
     let titles_db_path = titles_db_path();
     if let Some(parent) = titles_db_path.parent() {
         std::fs::create_dir_all(parent)
@@ -2624,18 +2627,16 @@ fn longhouse_routes() -> Router<AppState> {
         .route("/v1/longhouse/topics", get(longhouse_topics))
         .route("/v1/longhouse/topics/{topic_id}", get(longhouse_topic))
         // OCEAN-272: the persisted-escrow ops `longhouse_provider.rs` deferred.
-        // `claim` ratifies a converged outcome against the durable title registry
-        // (unforgeable, constant-time, revoked/released titles rejected — #229/#246);
-        // `board` posts a note/evidence mark to a tracked topic's durable board.
+        // `claim` constant-time verifies a title token and rejects revoked/released
+        // titles; `board` annotates the tracked topic's in-memory read projection.
         .route("/v1/longhouse/claim", post(longhouse_claim))
         .route("/v1/longhouse/board", post(longhouse_board_post))
-        // The Revoker's execute side: the daemon presents its own server-minted
-        // key to pull a title (decide≠execute, unforgeable — #246).
+        // Control routes have no caller-authentication extractor. The daemon-held
+        // Revoker key authenticates execution to the title engine, not the caller.
         .route("/v1/longhouse/revoke", post(longhouse_revoke))
-        // OCEAN-302: automated Revoker triggers. `recall` tallies distinct
-        // credentialed no-confidence votes and pulls the title on a carried quorum
-        // (unforgeable: a lone vote is one credential); `breach` accrues graduated
-        // strikes via `warn` and escalates to a hard `revoke` at the threshold.
+        // `recall` tallies distinct caller-supplied UUIDs; omitted/zero first
+        // threshold clamps to one. Each accepted `breach` request accrues a strike,
+        // and the third reaches the fixed hard-revocation threshold.
         .route("/v1/longhouse/recall", post(longhouse_recall))
         .route("/v1/longhouse/breach", post(longhouse_breach))
         // Workflow-brief endpoint (OCEAN-340): advisory + read-only + fail-open
@@ -2727,8 +2728,9 @@ async fn longhouse_convene(
     let clock = ocean_longhouse::SystemClock;
     // Emit each longhouse event onto the agent bus, exactly as the demo does
     // (`bus.emit(ev.into_turn_event())`), so existing SSE clients render it —
-    // AND tee it into the read-side registry so the topic survives a refresh
-    // (OCEAN-58). The registry is the durable mirror; the bus is the live feed.
+    // AND tee it into the in-memory read-side registry so the topic survives a
+    // client refresh during this process lifetime (OCEAN-58). The bus is the live
+    // feed; the registry is not restart durability.
     //
     // OCEAN-229/339: the bus closure carries only `LonghouseEvent` variants
     // (TopicConvened, RoleGranted, Converged, …) — none of which carry the
@@ -2736,8 +2738,9 @@ async fn longhouse_convene(
     // `grant()` below and is delivered solely in this HTTP response body.
     let outcome = ocean_longhouse::convene(convene_req, &clock, |ev| {
         // Fold into the observable topic store first, then publish to the bus.
-        // A std Mutex is fine: the guard is dropped before any await (the
-        // closure is fully synchronous), so it never blocks the scheduler.
+        // The closure is synchronous and drops the std Mutex guard before any
+        // await. Lock acquisition can still block this worker on contention; this
+        // checkpoint preserves that behavior rather than changing lock types.
         if let Ok(mut reg) = registry.lock() {
             reg.ingest(&ev);
         }
@@ -4877,14 +4880,14 @@ struct LonghouseRevokeRequest {
 /// the daemon's single [`ocean_longhouse::Revoker`] (OCEAN-246/272, the "War
 /// Chief").
 ///
-/// **Decide ≠ execute.** The *decision* to revoke is the operator's explicit
-/// request, arriving over the daemon's local trust boundary (loopback +
-/// CORS-restricted, OCEAN-53) like every other mutating route. The *execution* is
-/// the daemon presenting its own server-minted `RevokerKey` — which it alone holds
-/// (it is never emitted on the wire) — so the unforgeable-revocation property is
-/// preserved: a caller who merely names a `title_id` cannot deauthorize a
-/// firekeeper; only the daemon, holding the key, can. This is what makes the held
-/// Revoker a live executor rather than inert state.
+/// **Current trust boundary.** This handler has no caller-authentication extractor.
+/// Any request that reaches the local route with a valid live `title_id` asks the
+/// daemon to execute revocation. Loopback exposure and CORS restrictions are the
+/// current deployment posture; CORS is not authentication. The daemon presents
+/// its server-minted `RevokerKey`, which is never emitted on the wire. That key
+/// authenticates the daemon to the title engine; it does not authenticate the HTTP
+/// caller. The cryptographic execute capability remains daemon-held even though
+/// caller admission is outside this handler.
 ///
 /// 200 on a pulled title; 404 if unknown; 409 if the title was already
 /// revoked/released (`NotLive`); 400 on a malformed UUID. (`Unauthorized` is
@@ -4963,26 +4966,21 @@ async fn longhouse_revoke(
     }
 }
 
-// ---- OCEAN-302: automated Revoker triggers (quorum-of-recall + policy-breach) -
+// ---- OCEAN-302: Revoker triggers (recall tally + policy-breach report) -------
 //
-// The operator-initiated `POST /v1/longhouse/revoke` above is the *manual* path.
-// These two routes are the *automated decision-triggers* documented on
-// `escrow.rs`'s `RevokeAuthorization`, which were dead until now: nothing computed
-// the condition that drives the graduated `warn`/`revoke`. Both still go through
-// the daemon's single `Revoker` (which alone holds the server-minted `RevokerKey`,
-// held on `AppState` and never on the wire), so the unforgeable-revocation
-// property is preserved — a caller who merely names a title cannot depose a
-// firekeeper.
+// The direct `POST /v1/longhouse/revoke` path and these two trigger routes have no
+// caller-authentication extractor. Requests accepted by the local router can ask
+// the daemon to exercise its single `Revoker`, whose server-minted `RevokerKey` is
+// held on `AppState` and never sent on the wire. The key authenticates the daemon
+// to the title engine; it does not authenticate the HTTP caller.
 //
-//   * **recall**: a council member casts a no-confidence vote against a seated
-//     firekeeper. The daemon counts *distinct credentialed* votes in a pure
-//     `RecallVote`; only when the tally CARRIES (≥ threshold distinct voters) does
-//     it present its key and pull the title. A single forged vote is one
-//     credential and never carries — recall is unforgeable.
-//   * **breach**: a *detected* policy breach (a firekeeper acting outside its
-//     bound decision; a claim that fails verification) accrues a graduated strike
-//     via `warn`; the daemon escalates to a hard `revoke` once the strike count
-//     reaches the threshold — the existing graduated model, now actually driven.
+//   * **recall**: the daemon counts distinct caller-supplied `voter_id` UUIDs in a
+//     pure `RecallVote`. The first request fixes the threshold; omitted or zero is
+//     clamped to one, so one distinct caller can carry a threshold-one tally. A
+//     carried tally asks the daemon-held Revoker to pull the title.
+//   * **breach**: each accepted report accrues a graduated strike via `warn`; the
+//     third accepted report reaches the fixed threshold and asks the daemon-held
+//     Revoker to hard-pull the title.
 
 /// The strike count at which the daemon escalates a graduated policy-breach to a
 /// hard recall. Three strikes is the documented graduated default ("warn twice,
@@ -4997,30 +4995,26 @@ struct LonghouseRecallRequest {
     /// The firekeeper (public agent id) the council moves no confidence in. The
     /// daemon resolves this + `topic_id` to the live firekeeper title to pull.
     firekeeper_id: String,
-    /// The council member casting this no-confidence vote (public agent id). One
-    /// credential per voter, latest wins: the same voter casting twice counts
-    /// once, so a lone caller cannot manufacture a recall.
+    /// Caller-supplied public agent UUID used as the tally's distinct-voter key.
+    /// Repeating the same UUID counts once; this field is not authenticated by the
+    /// handler, so distinctness is not proof of distinct human or agent callers.
     voter_id: String,
-    /// Distinct credentialed votes required to carry the recall. Recorded when the
-    /// recall is FIRST opened for a title and immutable thereafter — a later voter
-    /// cannot lower the bar to force a premature carry. Absent/zero ⇒ clamped to a
-    /// safe minimum of 1 by the engine (an empty tally can never carry).
+    /// Distinct caller-supplied UUIDs required to carry the recall. Recorded when
+    /// the recall is FIRST opened for a title and immutable thereafter — a later
+    /// request cannot lower it. Absent/zero ⇒ clamped to 1 by the engine, so the
+    /// first distinct UUID carries a threshold-one tally.
     #[serde(default)]
     threshold: Option<usize>,
 }
 
-/// `POST /v1/longhouse/recall` — cast a no-confidence vote in a seated firekeeper
-/// (OCEAN-302, quorum-of-recall). The daemon tallies *distinct credentialed*
-/// votes per title in a pure `RecallVote`; when the tally carries (≥ threshold
-/// distinct voters) the daemon presents its own `RevokerKey` and hard-pulls the
-/// title via the same `Revoker` the manual route uses. A revoked title then fails
+/// `POST /v1/longhouse/recall` — submit a no-confidence vote UUID for a seated
+/// firekeeper (OCEAN-302, quorum-of-recall). The handler does not authenticate the
+/// caller-supplied `voter_id`; it only deduplicates equal UUIDs. The first request
+/// fixes the threshold, and absent/zero is clamped to one. When the tally carries,
+/// the daemon presents its own `RevokerKey` and hard-pulls the title via the same
+/// `Revoker` the manual route uses. The key gates execution inside the title
+/// engine but does not authenticate the route caller. A revoked title then fails
 /// `claim_outcome` even with the correct token (#246/#272).
-///
-/// Unforgeability: a single voter is one credential no matter how often it casts,
-/// so a lone forged vote never carries; the threshold is fixed when the recall is
-/// opened and cannot be lowered by a later voter; and the actual pull is still
-/// key-gated by the Revoker, so even a carried recall cannot deauthorize a
-/// firekeeper without the daemon's key.
 ///
 /// Status: 200 with `{ carried: false, votes, threshold }` while the recall is
 /// still pending; 200 with `{ carried: true, revocation }` when it carries and
@@ -5148,7 +5142,7 @@ async fn longhouse_recall(
 /// Request body for `POST /v1/longhouse/breach`.
 #[derive(Debug, serde::Deserialize)]
 struct LonghouseBreachRequest {
-    /// The seated title that breached policy (the firekeeper's persisted title id).
+    /// The seated title reported as having breached policy (persisted title id).
     title_id: String,
     /// Short human-facing description of the breach (recorded on the audit row,
     /// e.g. "acted outside bound decision", "claim failed verification N times").
@@ -5156,16 +5150,13 @@ struct LonghouseBreachRequest {
     detail: Option<String>,
 }
 
-/// `POST /v1/longhouse/breach` — report a detected policy breach against a seated
-/// title (OCEAN-302, policy-breach trigger). Each report accrues a graduated
-/// strike via the Revoker's `warn`; the daemon escalates to a hard `revoke` once
-/// the strike count reaches [`POLICY_BREACH_STRIKE_THRESHOLD`]. This is the
-/// existing graduated model — `warn` increments, `revoke` hard-pulls — now driven
-/// by a real trigger.
-///
-/// Unforgeability: the strike accrual and the pull both go through the daemon's
-/// `Revoker` (key held on `AppState`, never on the wire), so a forged breach
-/// report cannot grind a firekeeper toward recall. A revoked title then fails
+/// `POST /v1/longhouse/breach` — submit a policy-breach report against a seated
+/// title (OCEAN-302, policy-breach trigger). The handler does not authenticate or
+/// independently detect the report. Each accepted request asks the daemon-held
+/// Revoker to accrue a graduated strike via `warn`; the third accepted report
+/// reaches [`POLICY_BREACH_STRIKE_THRESHOLD`] and hard-revokes the title. The
+/// Revoker key is held on `AppState` and never sent on the wire, but it authenticates
+/// daemon execution rather than the HTTP caller. A revoked title then fails
 /// `claim_outcome` even with the correct token (#246/#272).
 ///
 /// Status: 200 with `{ revoked: false, strikes, threshold }` while below
@@ -5258,14 +5249,14 @@ async fn longhouse_breach(
 /// Request body for `POST /v1/longhouse/board`.
 #[derive(Debug, serde::Deserialize)]
 struct LonghouseBoardPostRequest {
-    /// The topic whose durable board receives the mark. Must be a tracked topic.
+    /// The topic whose in-memory read-side projection receives the mark.
     topic_id: String,
     /// The agent posting the mark.
     author: String,
     /// Mark kind: `note` (default) or `evidence`. Proposal/endorse/inhibit are
     /// quorum-affecting and are produced by the council's workers inside
-    /// `convene()`, never posted ad hoc here — the board post is an annotation on
-    /// the durable record, not a vote, so it never decides quorum.
+    /// `convene()`, never posted ad hoc here — this annotation is not a vote and
+    /// never decides quorum.
     #[serde(default)]
     kind: Option<String>,
     /// Short human-facing summary of the mark (shown on the deck's blackboard).
@@ -5284,11 +5275,10 @@ fn parse_board_mark_kind(s: Option<&str>) -> MarkKind {
 }
 
 /// `POST /v1/longhouse/board` — `board_post` (OCEAN-272): append a note/evidence
-/// mark to a tracked topic's **durable board** (the daemon-held
-/// `LonghouseRegistry`), and publish a `MarkPosted` onto the agent bus so live
-/// decks render it. Read-only with respect to convergence: the registry is the
-/// read-side projection, so this annotates the record — it never decides quorum
-/// (the engine does). 404 if the topic isn't tracked, 400 on a malformed UUID.
+/// mark to a tracked topic's daemon-held, in-memory `LonghouseRegistry` projection
+/// and publish `MarkPosted` onto the agent bus so live decks render it. The mark
+/// does not decide quorum; the council engine does. The projection is not restart
+/// durability. 404 if the topic isn't tracked, 400 on a malformed UUID.
 async fn longhouse_board_post(
     State(state): State<AppState>,
     Json(req): Json<LonghouseBoardPostRequest>,
@@ -5352,9 +5342,10 @@ async fn longhouse_board_post(
             summary: summary.to_string(),
         },
     };
-    // Fold into the durable board first, then publish to the live bus — identical
-    // ordering to `longhouse_convene` (registry is the durable mirror, bus is the
-    // live feed). The std Mutex guard is dropped before the bus emit.
+    // On a healthy lock, fold into the in-memory read projection first, then
+    // publish to the live bus; drop the std Mutex guard before emit. If the second
+    // lock attempt is poisoned, current behavior skips projection but still
+    // publishes and returns success.
     if let Ok(mut reg) = state.longhouse.lock() {
         reg.ingest(&event);
     }
@@ -17854,8 +17845,9 @@ mod tests {
         std::env::remove_var("OCEAN_YOLO");
     }
 
-    // `POST /v1/longhouse/board` posts a note mark onto a tracked topic's durable
-    // board (200), and 404s for an unknown topic. It never decides quorum.
+    // `POST /v1/longhouse/board` posts a note mark onto a tracked topic's
+    // in-memory read projection (200), and 404s for an unknown topic. It never
+    // decides quorum.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn board_post_route_appends_mark_to_tracked_topic() {
         let dir = tempfile::tempdir().unwrap();
@@ -17863,7 +17855,7 @@ mod tests {
         let topic = esc_uid(1);
         let author = esc_uid(10);
 
-        // Seed a tracked topic into the durable board (as a convened council would).
+        // Seed a tracked topic into the in-memory projection.
         {
             let mut reg = state.longhouse.lock().unwrap();
             reg.ingest(&LonghouseEvent::TopicConvened {
@@ -17895,7 +17887,7 @@ mod tests {
         );
         assert_eq!(body["ok"], json!(true));
 
-        // The mark landed on the durable board.
+        // The mark landed in the in-memory topic projection.
         let marks = state.longhouse.lock().unwrap().topic(&topic).unwrap().marks;
         assert!(
             marks.iter().any(|m| m.summary == "a board annotation"),
@@ -17947,10 +17939,9 @@ mod tests {
         );
     }
 
-    // The full decide≠execute + unforgeable-revocation loop through the REAL route
-    // table: the daemon's `POST /v1/longhouse/revoke` pulls a title (the daemon
-    // presents its own held key), and AFTER that a claim with the CORRECT token is
-    // refused 403. End to end, a revoked firekeeper cannot ratify.
+    // The real route exercises the daemon-held Revoker capability: an admitted
+    // `POST /v1/longhouse/revoke` request pulls the title using the daemon's key,
+    // and a later claim with the CORRECT token is refused 403.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn revoke_route_then_claim_is_rejected_end_to_end() {
         let dir = tempfile::tempdir().unwrap();
@@ -17964,7 +17955,7 @@ mod tests {
 
         let app = longhouse_routes().with_state(state);
 
-        // Operator revokes via the route — the daemon executes with its own key.
+        // The admitted route request makes the daemon execute with its own key.
         let (rev_status, rev_body) = post_json(
             app.clone(),
             "/v1/longhouse/revoke",

@@ -6,11 +6,11 @@ use std::{
 use ocean_longhouse::{RecallOutcome, RecallVote};
 use uuid::Uuid;
 
-/// Open quorum-of-recall tallies keyed by the firekeeper `title_id` under recall
-/// (OCEAN-302). Each value is the pure [`ocean_longhouse::RecallVote`] counting
-/// distinct credentialed no-confidence votes. Held behind a std `Mutex` like the
-/// other longhouse stores: every access is a quick synchronous read/insert and
-/// the guard is dropped before any `await`, so it never blocks the scheduler.
+/// Open recall tallies keyed by the firekeeper `title_id` (OCEAN-302). Each value
+/// is a pure [`ocean_longhouse::RecallVote`] counting distinct caller-supplied
+/// voter UUIDs; this registry does not authenticate those identities. Held behind
+/// a std `Mutex` like the other longhouse stores: every access is a quick
+/// synchronous read/insert and the guard is dropped before any `await`.
 pub(super) type RecallRegistryHandle = Arc<Mutex<HashMap<Uuid, RecallVote>>>;
 
 pub(super) fn new_recall_registry() -> RecallRegistryHandle {
