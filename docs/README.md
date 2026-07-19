@@ -63,7 +63,7 @@ Active plans:
 
 Proposals awaiting operator ruling:
 
-- [`specs/2026-07-19-cross-device-approval-and-attention.md`](specs/2026-07-19-cross-device-approval-and-attention.md) — phased design for permission-block notifications, a daemon-wide "Needs you" attention surface, and Web Push background reach, building on the 2026-07-19 `/web` `/desk` `/beam` session-handoff fabric. Proposed, not accepted.
+- [`specs/2026-07-19-cross-device-approval-and-attention.md`](specs/2026-07-19-cross-device-approval-and-attention.md) — phased design for permission-block notifications, a daemon-wide "Needs you" attention surface, and Web Push background reach, building on the 2026-07-19 `/web` `/desk` `/beam` session-handoff fabric. Phase 1 (notify on block) is accepted and implemented in `ocean-surface-ui`; Phases 2–3 remain proposed.
 
 Active implementation reference:
 

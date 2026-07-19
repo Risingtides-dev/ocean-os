@@ -1,7 +1,7 @@
 # Cross-Device Approval & Attention — Design Proposal
 
 **Date:** 2026-07-19
-**Status:** Proposed — not accepted. This is a design proposal awaiting operator ruling; it is not a work order.
+**Status:** Phase 1 accepted by operator (Smaths) on 2026-07-19 (recommendations on Q1–Q4 adopted as rulings) and implemented the same day in `ocean-surface-ui` — see the Revisions section. Phases 2–3 remain proposed, not accepted.
 **Type:** Design proposal with phased implementation plan
 **Scope:** Cross-repo — `ocean-os` (daemon, core; authority), `ocean-surface` (Leptos PWA, Tauri shell, proxy; presentation). No TUI changes required for Phases 1–2.
 
@@ -152,6 +152,24 @@ public attack surface.
    compact; AllowSession stays a desktop affordance.
 4. **TUI in Phase 2:** worth a status-line blocked count, or is the TUI
    always attended by definition? Recommendation: defer.
+
+## Revisions
+
+- **2026-07-19 — Phase 1 accepted + implemented.** Operator ruling: proceed
+  with the recommended answers to Q1–Q4 (notification body is tool name
+  only; Phase 3 push gated behind the posture floor; compact UI keeps
+  allow/deny only; TUI attention deferred). Implemented in `ocean-surface-ui`:
+  `permission_notify_decision` (pure, unit-tested) decides silence vs
+  content — silent when the operator watches the blocked session (focused
+  page + active session), notifying otherwise, including BACKGROUND
+  sessions; body redacted to the tool name; OS dedupe via the permission id
+  as the notification tag; click focuses the surface and opens the blocked
+  session through the existing `switch_session` path (`host::notify_with_click`,
+  best-effort click on the Tauri polyfill); per-device opt-out rides a
+  localStorage key toggled by the "Permission Notifications" palette command
+  (default on). Verified: 424 UI tests pass, clippy clean, wasm32 check
+  clean. Operator-run smoke (block a turn, watch the notification, click,
+  land in the session) remains pending.
 
 ## Non-goals
 
