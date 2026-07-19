@@ -1672,6 +1672,14 @@ impl AgentRuntime {
             error_message: None,
             timestamp: ocean_protocol::now_ms(),
         }));
+        // First user turn names the session (see `run_prompt`): adopt the
+        // daemon-supplied pre-composition prompt as the label so the fake path
+        // labels sessions identically to the real one.
+        if !reuse_accepted_user {
+            if let Some(title) = control.display_title.as_deref() {
+                session.ensure_title(title);
+            }
+        }
         session.replace_messages(messages);
         session::save(&self.config_dir, &session)?;
 
@@ -1695,6 +1703,11 @@ impl AgentRuntime {
         reuse_accepted_user: bool,
     ) -> anyhow::Result<(SessionId, String, String, TokenUsage)> {
         anyhow::ensure!(!req.prompt.trim().is_empty(), "prompt cannot be empty");
+
+        // Session label for a first-turn (the daemon-supplied pre-composition
+        // prompt). Read before `control` is destructured for the toolset below so
+        // the switcher label can be adopted at the first durable save.
+        let display_title = control.display_title.clone();
 
         // `snapshot` is already the EFFECTIVE turn state: `prompt()` resolved the
         // per-turn `model_id` override (OCEAN-36) before the readiness/dispatch
@@ -1806,6 +1819,19 @@ impl AgentRuntime {
             history.push(build_user_message(user_text, req.images.as_deref()));
         }
 
+        // First user turn of a fresh session names it: adopt the daemon-supplied
+        // display title (the pre-composition prompt) as the session label, before
+        // the first durable save so the switcher shows it immediately. Only on a
+        // genuine new user turn (`reuse_accepted_user` replays an already-accepted
+        // one) and only when unset, so resumes never relabel. `ensure_title` is a
+        // no-op when the daemon supplied no title (direct callers), leaving the
+        // read-side derivation in charge.
+        if !reuse_accepted_user {
+            if let Some(title) = display_title.as_deref() {
+                session.ensure_title(title);
+            }
+        }
+
         // Acceptance is itself a durable boundary. Save the user turn before
         // any provider call or side-effecting tool can run, so interruption in
         // the first long browser round cannot erase what was submitted.
@@ -1832,6 +1858,9 @@ impl AgentRuntime {
             tools_disabled,
             hashline_edits,
             artifact_spill,
+            // Already consumed above (session label at the first durable save);
+            // named here so the destructure stays exhaustive.
+            display_title: _,
         } = control;
         // Resolve the toolset for this turn through the capability registry —
         // built-ins plus any connected MCP/skill providers, deduped first-wins.
@@ -2269,6 +2298,16 @@ pub struct PromptControl {
     /// legacy caller, while TUI/ACP/CLI/web daemon turns enable it (defaults off
     /// in `PromptControl::new`).
     pub artifact_spill: bool,
+    /// Human-facing session label for the first-turn case: the ORIGINAL user
+    /// prompt, captured by the daemon BEFORE any prompt composition (room /
+    /// operator guidance, folder-as-agent instructions, the Longhouse advisory,
+    /// browser context, the surface flag). The runtime stores it as the session
+    /// `title` on the first user turn so the switcher label is the user's own
+    /// words, not the injected prefix — the persisted first message still carries
+    /// the fully-composed prompt the model saw. `None` for direct callers that
+    /// don't set it; the read side then derives and cleans the label from the
+    /// first user message. Set via [`PromptControl::with_display_title`].
+    pub display_title: Option<String>,
 }
 
 /// Narrow a turn's toolset to `allowlist` (folder-as-agent tool restriction).
@@ -2313,6 +2352,7 @@ impl PromptControl {
             tools_disabled: false,
             hashline_edits: false,
             artifact_spill: false,
+            display_title: None,
         }
     }
 
@@ -2388,6 +2428,15 @@ impl PromptControl {
     /// (OCEAN-36). `None` (or an empty string) leaves the global model in force.
     pub fn with_model_id(mut self, model_id: Option<String>) -> Self {
         self.model_id = model_id.filter(|m| !m.trim().is_empty());
+        self
+    }
+
+    /// Provide the human-facing session label (the pre-composition user prompt)
+    /// the runtime stores as the session `title` on its first turn. `None` or a
+    /// blank string leaves it unset, so the read side derives the label from the
+    /// first user message instead.
+    pub fn with_display_title(mut self, title: Option<String>) -> Self {
+        self.display_title = title.filter(|t| !t.trim().is_empty());
         self
     }
 }
@@ -5348,6 +5397,110 @@ done
         assert!(
             transcript.contains("hook continuation ping"),
             "hook reason must land on the transcript, got: {transcript}"
+        );
+        let _ = std::fs::remove_dir_all(config_dir);
+    }
+
+    /// TASK-40 (prompt path / `POST /v1/prompt` + `POST /v1/requests`): the daemon
+    /// prepends the Longhouse advisory to `req.prompt` before the runtime persists
+    /// the turn, but threads the ORIGINAL prompt through `PromptControl` as the
+    /// display title. The persisted session `title` must be the original — not the
+    /// injected boilerplate that made every session share one label — while the
+    /// stored first message still carries the composed prompt the model saw.
+    #[tokio::test]
+    async fn session_title_derives_from_display_title_not_composed_prompt() {
+        let config_dir = temp_config_dir("title-from-display-title");
+        let runtime = runtime(
+            config_dir.clone(),
+            provider_config(ProviderId::Fake, "fake-ok", false),
+        );
+        // Shape of the daemon-composed prompt: the Longhouse advisory block, a
+        // blank line, then the user's actual words.
+        let composed = "Longhouse consult (advisory — relevant skills/SOPs for this turn):\n\
+                        - some-skill\n\nfix the flaky parser test";
+        let res = runtime
+            .prompt(
+                PromptRequest {
+                    prompt: composed.into(),
+                    images: None,
+                    request_id: None,
+                    session_id: None,
+                    create_if_missing: true,
+                    max_turns: None,
+                    yolo: false,
+                    cwd: ".".into(),
+                    project_id: None,
+                    client_type: None,
+                    decision_token: None,
+                },
+                PromptControl::yolo(false)
+                    .with_display_title(Some("fix the flaky parser test".into())),
+            )
+            .await;
+        assert!(res.ok, "fake turn should succeed: {}", res.stderr);
+        let session_id = res.session_id.expect("session id");
+        let session = session::load_resumable(&config_dir, session_id)
+            .unwrap()
+            .expect("session persisted");
+        assert_eq!(
+            session.title.as_deref(),
+            Some("fix the flaky parser test"),
+            "title must derive from the display title, not the composed prompt"
+        );
+        // History is untouched: the model still saw the composed prompt.
+        let transcript = serde_json::to_string(&session.messages).unwrap();
+        assert!(
+            transcript.contains("Longhouse consult (advisory"),
+            "persisted first message must keep the composed prompt"
+        );
+        // The read-side label (what the switcher renders) matches the title.
+        let detail = runtime.session_detail(session_id).unwrap();
+        assert_eq!(detail.title, "fix the flaky parser test");
+        let _ = std::fs::remove_dir_all(config_dir);
+    }
+
+    /// TASK-40 (agent_turn path / `POST /v1/agent/turns`): the agent-turn handler
+    /// composes room/operator guidance AND the Longhouse advisory into the
+    /// persisted prompt, yet threads the ORIGINAL prompt as the display title
+    /// (`with_display_title(Some(prompt.clone()))`, captured before any layer).
+    /// Same runtime seam as the prompt path — this proves the title survives ANY
+    /// stacked prepend layer, so guidance layering can't pollute it either.
+    #[tokio::test]
+    async fn session_title_survives_guidance_and_longhouse_layers() {
+        let config_dir = temp_config_dir("title-survives-layers");
+        let runtime = runtime(
+            config_dir.clone(),
+            provider_config(ProviderId::Fake, "fake-ok", false),
+        );
+        let composed = "Room guidance: be terse.\n\n\
+                        Longhouse consult (advisory — skills):\n- some-skill\n\nland the migration";
+        let res = runtime
+            .prompt(
+                PromptRequest {
+                    prompt: composed.into(),
+                    images: None,
+                    request_id: None,
+                    session_id: None,
+                    create_if_missing: true,
+                    max_turns: None,
+                    yolo: false,
+                    cwd: ".".into(),
+                    project_id: None,
+                    client_type: Some("tui".into()),
+                    decision_token: None,
+                },
+                PromptControl::yolo(false).with_display_title(Some("land the migration".into())),
+            )
+            .await;
+        assert!(res.ok, "fake turn should succeed: {}", res.stderr);
+        let session_id = res.session_id.expect("session id");
+        let session = session::load_resumable(&config_dir, session_id)
+            .unwrap()
+            .expect("session persisted");
+        assert_eq!(
+            session.title.as_deref(),
+            Some("land the migration"),
+            "title must survive guidance + Longhouse layering"
         );
         let _ = std::fs::remove_dir_all(config_dir);
     }

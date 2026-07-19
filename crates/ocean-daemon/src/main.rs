@@ -1755,6 +1755,11 @@ async fn prompt(
     // `agent_turn`. Fail-open: a None/slow/error consult leaves the prompt
     // unchanged. PromptRequest carries no guidance/room fields, so we only
     // apply the skill brief, not the room/operator guidance layer.
+    // TASK-40: the session's switcher label must derive from the ORIGINAL user
+    // prompt, not the Longhouse-composed one. Capture it here, before the
+    // advisory is prepended, and thread it to the runtime as the display title so
+    // the first-turn label is the user's own words instead of the boilerplate.
+    let display_title = req.prompt.clone();
     let consult = longhouse_prep_for_turn(req.prompt.clone(), req.cwd.clone()).await;
     req.prompt = apply_longhouse_prep(&req.prompt, consult.as_ref());
 
@@ -1765,7 +1770,8 @@ async fn prompt(
         permission_mode,
         cancel,
         req.decision_token.clone(),
-    );
+    )
+    .with_display_title(Some(display_title));
     let res = state.runtime.prompt(req, control).await;
     record_prompt_result(&state, request_id, &res, None).await;
 
@@ -1827,6 +1833,9 @@ async fn create_request(
     req.yolo = permission_mode == PermissionMode::SkipAll;
     emit_user_message(&state.events, &req, request_id);
 
+    // TASK-40: capture the ORIGINAL prompt for the session label BEFORE the
+    // spawned task prepends the Longhouse advisory (below), so the switcher shows
+    // the user's own words rather than the injected boilerplate.
     let control = build_prompt_control(
         &state,
         request_id,
@@ -1834,7 +1843,8 @@ async fn create_request(
         permission_mode,
         cancel,
         req.decision_token.clone(),
-    );
+    )
+    .with_display_title(Some(req.prompt.clone()));
     let task_state = state.clone();
     let handle = tokio::spawn(async move {
         // `permit` is moved in and dropped when this future ends (or is aborted),
@@ -6195,6 +6205,11 @@ async fn agent_turn(
         cancel,
         decision_token,
     )
+    // TASK-40: label the session from the ORIGINAL `prompt` — captured before
+    // `guided_prompt` layered on the room/operator guidance, folder-as-agent
+    // instructions, the Longhouse advisory, and browser context — so the switcher
+    // never collapses to any injected prefix, whichever layer fired.
+    .with_display_title(Some(prompt.clone()))
     // W1 harness profile: only surfaces whose profile grants it (tui/acp/cli)
     // get hashline-tagged reads + the hashline_edit tool; web/voice stay plain.
     .with_hashline_edits(harness_caps.hashline_edits)
@@ -19954,6 +19969,24 @@ mod tests {
         );
         assert!(agent.contains("prompt.clone(), cwd.clone()"));
         assert!(agent.contains("apply_longhouse_prep(&guided_prompt, consult.as_ref())"));
+
+        // TASK-40: every injection site must thread the ORIGINAL prompt as the
+        // session display title so the switcher label is the user's words, not the
+        // injected advisory. The prompt path captures it BEFORE the apply call
+        // (proving the title source is pre-injection); create captures `req.prompt`
+        // at control-build time (before the spawned apply); agent_turn threads the
+        // pre-composition `prompt`. Asserted per-section so the literals in this
+        // test's own body (below the sliced handlers) never self-match.
+        let prompt_title_capture = prompt
+            .find("let display_title = req.prompt.clone();")
+            .expect("prompt path captures the original prompt for the title");
+        assert!(
+            prompt_title_capture < prompt_apply,
+            "the title source must be captured before the Longhouse injection"
+        );
+        assert!(prompt.contains(".with_display_title(Some(display_title))"));
+        assert!(create.contains(".with_display_title(Some(req.prompt.clone()))"));
+        assert!(agent.contains(".with_display_title(Some(prompt.clone()))"));
     }
 
     // ---- OCEAN-231: handler-level tests for the livekit-token + call_place ----

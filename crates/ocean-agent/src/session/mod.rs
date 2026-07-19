@@ -30,6 +30,17 @@ pub struct Session {
     /// field and deserialize as `None`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub client_type: Option<String>,
+    /// Human-facing session label, captured from the ORIGINAL user prompt of the
+    /// first turn — BEFORE any turn-prep composition (the surface flag, room /
+    /// operator guidance, folder-as-agent instructions, the Longhouse advisory
+    /// block, browser context). Set once on the first user turn and never
+    /// overwritten, so the switcher label stays the user's own words even though
+    /// the persisted first message carries the fully-composed prompt the model
+    /// saw. `None` on legacy files (predate this field) and on turns whose caller
+    /// supplied no display title; for those the read side derives and cleans the
+    /// label from the first user message. See [`session_display_title`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
 }
 
 impl Session {
@@ -55,6 +66,7 @@ impl Session {
             git_branch: None,
             git_commit: None,
             client_type: None,
+            title: None,
         }
     }
 
@@ -94,6 +106,23 @@ impl Session {
         self.model = model;
         self.provider = provider;
         self.updated_ms = ocean_protocol::now_ms();
+    }
+
+    /// Adopt `original` as the session's display [`Session::title`] if unset.
+    /// Called on the first user turn with the PRE-composition prompt (the user's
+    /// own words, before the surface flag / guidance / Longhouse advisory are
+    /// layered on), so the switcher label never collapses to an injected prefix.
+    /// First write wins — later turns and resumes never relabel — and blank input
+    /// is ignored so an empty turn can't erase the label. Stored already
+    /// truncated so the persisted label matches what the read side would render.
+    pub fn ensure_title(&mut self, original: &str) {
+        if self.title.is_some() {
+            return;
+        }
+        let trimmed = original.trim();
+        if !trimmed.is_empty() {
+            self.title = Some(truncate_title(trimmed));
+        }
     }
 }
 
@@ -627,7 +656,7 @@ pub fn search_history(
 
     let mut hits = Vec::new();
     for (_, session) in sessions.into_values() {
-        let title = first_user_text(&session.messages);
+        let title = session_display_title(&session);
         for (message_index, message) in session.messages.iter().enumerate() {
             let entry = transcript_entry(message);
             if !matches!(entry.role.as_str(), "user" | "assistant") || entry.text.trim().is_empty()
@@ -872,11 +901,12 @@ pub fn list(
                     continue;
                 }
             }
+            let title = session_display_title(&session);
             out.push(SessionSummary {
                 id: session.id,
                 model: session.model,
                 turns: session.messages.len() as u32,
-                title: first_user_text(&session.messages),
+                title,
                 workspace_root: session.workspace_root,
                 git_branch: session.git_branch,
                 updated_ms: Some(session.updated_ms),
@@ -903,20 +933,80 @@ pub fn list(
     Ok(out)
 }
 
-fn first_user_text(messages: &[Message]) -> String {
-    messages
-        .iter()
-        .find_map(|message| match message {
-            Message::User { content, .. } => content
-                .iter()
-                .find_map(|content| content.as_text().map(truncate_title)),
-            _ => None,
-        })
-        .unwrap_or_default()
+/// Untruncated text of the first user message, if any. The display-title
+/// derivation cleans and truncates this itself, so it needs the raw text — the
+/// legacy Longhouse-block strip keys off the `\n\n` separator that
+/// [`truncate_title`]'s whitespace-squash would otherwise erase.
+fn first_user_raw(messages: &[Message]) -> Option<String> {
+    messages.iter().find_map(|message| match message {
+        Message::User { content, .. } => content
+            .iter()
+            .find_map(|content| content.as_text().map(str::to_string)),
+        _ => None,
+    })
+}
+
+/// Strip a leading surface flag (`[WEB] `, `[TUI] `, …) if present. The runtime
+/// prefixes every persisted user message with the surface flag; it is not part
+/// of the user's words, so the label derivation drops it. Matched against the
+/// closed [`system_prompt::surface_flag`] taxonomy (kept honest by
+/// `surface_flag_taxonomy_is_canonical`) rather than a loose all-caps pattern,
+/// so a user prompt that opens with its OWN bracketed token (`[TODO] …`) is left
+/// intact — only a genuine surface flag is removed.
+fn strip_surface_flag(text: &str) -> &str {
+    // The full set of flags `surface_flag` can emit, including the `?` unknown.
+    const KNOWN_FLAGS: &[&str] = &[
+        "BRWSR", "TUI", "WEB", "TAURI", "GUI", "CLI", "VOX", "ACP", "SLACK", "CNVS", "MOBL", "?",
+    ];
+    let Some(rest) = text.strip_prefix('[') else {
+        return text;
+    };
+    let Some(close) = rest.find(']') else {
+        return text;
+    };
+    if !KNOWN_FLAGS.contains(&&rest[..close]) {
+        return text;
+    }
+    rest[close + 1..].trim_start()
+}
+
+/// Strip a leading Longhouse advisory block for LEGACY sessions whose stored
+/// first message was composed before the [`Session::title`] field existed. The
+/// daemon prepends the block as `{block}\n\n{prompt}`, so when the (flag-
+/// stripped) text opens with the advisory marker, drop through the first blank
+/// line to recover the user's prompt. New sessions carry an explicit `title`
+/// and never reach this path. Deliberately narrow — a marker-anchored fallback
+/// for the OCEAN-318 pollution this field was added to fix, not a general
+/// prompt un-composer.
+fn strip_longhouse_block(text: &str) -> &str {
+    const MARKER: &str = "Longhouse consult (advisory";
+    if text.starts_with(MARKER) {
+        if let Some(idx) = text.find("\n\n") {
+            return text[idx + 2..].trim_start();
+        }
+    }
+    text
+}
+
+/// The switcher/label title for a session: the explicit [`Session::title`]
+/// captured from the original prompt when present (new sessions), otherwise the
+/// first user message with the surface flag and any legacy Longhouse advisory
+/// prefix stripped, then truncated (legacy sessions predating the field).
+pub(crate) fn session_display_title(session: &Session) -> String {
+    if let Some(title) = session.title.as_deref() {
+        let trimmed = title.trim();
+        if !trimmed.is_empty() {
+            return trimmed.to_string();
+        }
+    }
+    match first_user_raw(&session.messages) {
+        Some(raw) => truncate_title(strip_longhouse_block(strip_surface_flag(&raw))),
+        None => String::new(),
+    }
 }
 
 pub(crate) fn session_detail(session: Session) -> SessionDetail {
-    let title = first_user_text(&session.messages);
+    let title = session_display_title(&session);
     let transcript = session
         .messages
         .iter()
@@ -1080,6 +1170,7 @@ mod history_search_tests {
             git_branch: None,
             git_commit: None,
             client_type: None,
+            title: None,
         }
     }
 
@@ -1211,5 +1302,129 @@ mod history_search_tests {
         assert!(first[0].excerpt.contains("blazing nightly cargo h"));
         assert!(first[0].excerpt.starts_with('…'));
         assert!(first[0].excerpt.ends_with('…'));
+    }
+}
+
+#[cfg(test)]
+mod title_tests {
+    use super::*;
+
+    /// The first byte-for-byte prefix of the daemon's real Longhouse advisory
+    /// block (see `render_longhouse_prep` in ocean-daemon). The strip fallback
+    /// anchors on this marker, so the test uses the real text.
+    const LONGHOUSE_MARKER: &str =
+        "Longhouse consult (advisory — relevant skills/SOPs for this turn; \
+         recommendations only, not granted capabilities; you still route every \
+         action through the normal permission gates):";
+
+    fn session_with(title: Option<&str>, first_user: &str) -> Session {
+        let mut s = Session::new_with_id(
+            SessionId::new_v4(),
+            &ocean_protocol::Model::anthropic_claude_sonnet_4_6(),
+        );
+        s.title = title.map(str::to_string);
+        s.messages = vec![
+            Message::user_text(first_user),
+            Message::Assistant(AssistantMessage {
+                content: vec![Content::text("ok")],
+                api: "messages".into(),
+                provider: "fake".into(),
+                model: "fake".into(),
+                usage: Usage::default(),
+                stop_reason: StopReason::Stop,
+                error_message: None,
+                timestamp: 1,
+            }),
+        ];
+        s
+    }
+
+    /// Prompt-path shape: the persisted first message is the composed prompt
+    /// (surface flag + Longhouse advisory + the user's words), but the explicit
+    /// `title` was captured from the ORIGINAL prompt, so the label is the user's
+    /// words — not the injected boilerplate every session would otherwise share.
+    #[test]
+    fn explicit_title_wins_over_longhouse_composed_first_message() {
+        let composed = format!("[WEB] {LONGHOUSE_MARKER}\n- skill\n\nfix the parser bug");
+        let s = session_with(Some("fix the parser bug"), &composed);
+        assert_eq!(session_display_title(&s), "fix the parser bug");
+    }
+
+    /// agent_turn-path shape: the composed prompt stacks room/operator guidance
+    /// AND the Longhouse advisory above the user's words. The explicit title
+    /// (original prompt) still wins, proving the fix is layer-agnostic — guidance
+    /// layering has the same prepend shape and would pollute the title too.
+    #[test]
+    fn explicit_title_wins_over_guidance_and_longhouse_layers() {
+        let composed = format!(
+            "[TUI] Room guidance: keep replies terse.\n\n{LONGHOUSE_MARKER}\n- skill\n\nship the release",
+        );
+        let s = session_with(Some("ship the release"), &composed);
+        assert_eq!(session_display_title(&s), "ship the release");
+    }
+
+    /// Legacy fallback (write-time case): sessions created before the `title`
+    /// field carry `None`, so the label derives from the composed first message.
+    /// The surface flag and the leading Longhouse advisory block are stripped to
+    /// recover the user's words, retroactively cleaning polluted legacy titles.
+    #[test]
+    fn legacy_session_strips_surface_flag_and_longhouse_block() {
+        let composed =
+            format!("[WEB] {LONGHOUSE_MARKER}\n- skill-a\n- skill-b\n\nfix the parser bug");
+        let s = session_with(None, &composed);
+        assert_eq!(session_display_title(&s), "fix the parser bug");
+    }
+
+    /// A legacy first message with only the surface flag (no Longhouse block —
+    /// consult opted out or empty) still drops the flag to the user's words.
+    #[test]
+    fn legacy_session_strips_surface_flag_without_longhouse() {
+        let s = session_with(None, "[TUI] just a normal prompt");
+        assert_eq!(session_display_title(&s), "just a normal prompt");
+    }
+
+    /// A user prompt that merely opens with a bracketed non-flag token (mixed
+    /// case, not a surface flag) is left intact — the strip only removes an
+    /// all-uppercase flag tag.
+    #[test]
+    fn non_flag_bracket_prefix_is_preserved() {
+        let s = session_with(None, "[TODO] wire up the button");
+        assert_eq!(session_display_title(&s), "[TODO] wire up the button");
+    }
+
+    /// `ensure_title` captures the first turn's prompt and never relabels on
+    /// later turns; blank input is ignored so an empty turn can't erase it.
+    #[test]
+    fn ensure_title_first_write_wins_and_ignores_blank() {
+        let mut s = Session::new_with_id(
+            SessionId::new_v4(),
+            &ocean_protocol::Model::anthropic_claude_sonnet_4_6(),
+        );
+        assert_eq!(s.title, None);
+        s.ensure_title("   ");
+        assert_eq!(s.title, None, "blank input must not set a title");
+        s.ensure_title("original prompt");
+        assert_eq!(s.title.as_deref(), Some("original prompt"));
+        s.ensure_title("a later turn's prompt");
+        assert_eq!(
+            s.title.as_deref(),
+            Some("original prompt"),
+            "first write wins; resumes never relabel"
+        );
+    }
+
+    /// `ensure_title` stores the truncated/whitespace-squashed form so the
+    /// persisted label matches what the read side renders.
+    #[test]
+    fn ensure_title_truncates_like_the_read_side() {
+        let long = "word ".repeat(40);
+        let mut s = Session::new_with_id(
+            SessionId::new_v4(),
+            &ocean_protocol::Model::anthropic_claude_sonnet_4_6(),
+        );
+        s.ensure_title(&long);
+        let expected = truncate_title(&long);
+        assert_eq!(s.title.as_deref(), Some(expected.as_str()));
+        assert!(expected.ends_with('…'));
     }
 }
