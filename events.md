@@ -4323,3 +4323,52 @@ type:      [feature-request]
 area:      [backend]
 
 Corrective pass over the initial compact commit (c144c344), left uncommitted for review. CompactResponse now reports elided_messages. compact_session gained the missing production wiring: provider readiness preflight (fail closed), full credential options (base_url, auth method, codex account header, stable session_id for prompt caching), thinking-strip history shaping via the shared route predicate, a trailing user instruction for providers requiring user-last requests, and a 300-second wall-clock bound matching the turn budget. The protected window is computed before any model call (a fully-protected transcript is an ok no-op with zero provider spend), is bounded by 20 messages and 20% of context with always-keep-last, and never begins on an orphan tool result. Daemon handler now returns 429 at capacity, 404 only for genuine absence, sanitized 500 for unreadable storage, and 200 otherwise; the route baseline is 86 and the operator guide quick reference documents the route. Added six ocean-agent tests (split bounds, orphan pairing, scripted-provider happy path with on-disk verification, unknown session, corrupt-never-wiped, short-session no-op without model call, provider-error leaves transcript untouched) and two daemon route tests (404 unknown, 429 at capacity).
+
+time:  [09:12] [18-07-26]
+agent: [codex] [gpt-5]
+worktree: [main]
+type:  [feature-request]
+area:  [design]
+
+Rendered two X-ready Ocean product comparison images from locally measured active harness install footprints. The comparison counts both Ocean runtime binaries, preserves editable SVG sources and measurement evidence, and keeps all exact text outside the generated product backplates.
+_________________________________________________________________________________
+
+time:  [08:45am] [18-07-26]
+agent: ocean-surface-tauri, claude, Ocean agent
+worktree: [main]
+type:  [workflow]
+
+Two-machine + GitHub alignment sweep. Pushed the Air's 5 stranded branches to origin via Mac SSH relay (voice-planner-control/surface pair, offshore, tui-compact-interrupt, integrate/dirty-main). Rescued both Air dirty mains to pushed rescue/* branches (os: kimi oauth + apply_patch WIP; surface: Dynamic Island WIP). Committed and pushed Mac's uncommitted halt2 cancel-race diff and the docs-reset overhaul. All four mains fast-forwarded to origin (os 428a9e21, surface 1ccd5ce). Pruned 10 dead worktrees across both machines; removed merged config-rpc/compact worktrees. Air gh token is expired — relay pushes went through the Mac.
+_________________________________________________________________________________
+
+time:  [05:05pm] [18-07-26]
+agent: ocean-tui, claude, ocean-prs
+worktree: [main]
+type:  [workflow]
+
+Landed the Air's Dynamic Island rescue into ocean-surface main (1ccd5ce → 4b7ad46). Merged rescue/air-surface-dirty-main-20260718, resolved 11 conflict hunks (daemon.rs planner/EventSource/Island unions; Island added to typed topmost_reveal Escape rail with tests; sessions.rs TUI-parity grouping + cwd helper retained; island.css wired in index.html/sidepanel/build-extension). Fixed island.rs test for active_turn/active_state. Gates: wasm, 417 tests, proxy, tauri, fmt, detached standalone verify. Scrubbed accidentally-staged .stitchpad/ from the commit pre-push and gitignored .stitchpad/ + .pi-subagents/. Air surface main synced to 4b7ad46. Joined stitchpad as @ocean-prs and posted lane status + app.rs rebase note.
+_________________________________________________________________________________
+
+time:  [05:25pm] [18-07-26]
+agent: ocean-tui, claude, ocean-prs
+worktree: [main]
+type:  [bug report]
+
+Operator observed raw DeepSeek DSML tool-call markup (<｜DSML｜tool_calls> invoke/parameter blocks) leaking as literal text from a gpt-5.6-sol codex turn — serving-side DSML parse failure. Ocean exposure: deepseek workers are the Longhouse default; a leaked call would render as garbage and silently drop the tool intent. Landed fix/deepseek-dsml-salvage on main: stream-end salvage in the OpenAI-compat collector (deepseek-only, zero-structured-calls gate, tail-block-only so quoted markup never fires, unicode+ASCII tokens, truncation-tolerant, ToolUse stop promotion). 5 unit tests; workspace check, 146 protocol tests, fmt, clippy all green. Daemon restart required to pick up: launchctl kickstart -k gui/$(id -u)/dev.risingtides.ocean-daemon after rebuild.
+_________________________________________________________________________________
+
+time:  [05:40pm] [18-07-26]
+agent: ocean-tui, claude, ocean-prs
+worktree: [main]
+type:  [bug report]
+
+Follow-up on the DSML leak: operator confirmed it is exclusive to gpt-5.6-sol; codex config verified clean (official endpoint, no base-url override) → model-side training contamination, Sol imitating DeepSeek DSML tool syntax. Ocean drives the gpt-5.6 family via the openai-codex provider whose collector had no salvage — the deepseek-only gate missed the actual leaker. Landed fix/dsml-salvage-codex-sol on main (12cf4eb4 → e3035161): codex.rs stream-end salvage gated on model_id gpt-5.6*, openai.rs gate widened to deepseek || gpt-5.6*, shared pub(crate) parser, stream-ordered salvage block indexes. Gates green incl. clippy -D warnings. Air synced. Daemon kickstart still pending operator go-ahead.
+_________________________________________________________________________________
+
+time:  [06:20pm] [18-07-26]
+agent: ocean-tui, claude
+worktree: [main]
+type:  [design]
+
+Drafted the Phase 6 orchestration-transport ratification: docs/specs/2026-07-18-ocean-crew-orchestration-and-durable-workflow-manifest.md (proposed, not accepted; authorizes no code). It relocates the June 2026 R5 durable-workflow design (typed async DAG, SQLite run-state, retries, closeouts — ocean-agents AGENT_FILESYSTEM_ARCHITECTURE.md 115dc4c) into an extension-owned Ocean Crew engine over ordinary Ocean turns, reconciling the three prior layers: Bedrock workflow specs (data), OCEAN-338/340 WorkflowBrief prep (discovery), R5 engine (execution, never built). Defines six generic host seams (execution request, cancellation, scoped lifecycle, interactive UI artifact lane incl. the TUI /v1/component/event gap, deduplicated continuation, confined state dir), a bounded v1 graph model, grace/auto-start safety, read-only Observatory attestation, stages A–E with gates, invariants, exclusions, stop conditions. Indexed in docs/README.md active plans, docs/AGENTS.md, root AGENTS.md work guidance. Verification: cargo xtask docs-check.
+_________________________________________________________________________________
