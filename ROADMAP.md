@@ -71,9 +71,14 @@ Ocean ports mechanisms into current owners rather than reproducing OMP package b
       active-run provider request clones, and pins exact recovery artifacts for that run; design
       acceptance did not enable a harness-profile capability.
 - [ ] Implement the reviewed minimizer M2 design as a characterization-first checkpoint.
-- [ ] Port the standalone shared walker mechanism as an independent, unwired checkpoint.
+- [x] Port the standalone shared walker mechanism as an independent M1 crate. It is
+      intentionally outside `default-members` and remains unwired from typed search and
+      production runtime capabilities.
 - [ ] Build a typed search engine over the accepted walker, then adopt it in live `grep`/`glob`
-      only after explicit parity review; do not bundle traversal, search, and runtime replacement.
+      only after explicit parity and security review; do not bundle traversal, search, and runtime
+      replacement. Runtime adoption must add point-of-use descriptor/handle-relative confinement
+      for adversarial roots, rename/symlink/reparse swaps, cached candidates, and every supported
+      OS; walker `FollowLinks`/`same_file_system` policies are not a sandbox.
 - [ ] Route isolation, task dispatch, typed yields, joins, budgets, and orchestration policy
       through the approved extension architecture; do not revive their superseded core placement.
 

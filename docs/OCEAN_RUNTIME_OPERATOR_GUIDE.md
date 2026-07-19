@@ -555,7 +555,8 @@ POST   /v1/rooms/{room_id}/livekit-token                  mint a LiveKit join to
 # Sessions (legacy view)
 GET    /v1/sessions                       list sessions
 GET    /v1/sessions/{id}                  session detail / transcript
-POST   /v1/sessions/{id}/compact          replace transcript with model summary + protected recent window (404 unknown, 429 at capacity)
+POST   /v1/sessions/{id}/compact          replace transcript and return visible snapshot + SSE fence (404 unknown, 409 busy, 429 capacity)
+GET    /v1/sessions/{id}/sync             refresh-only visible snapshot + SSE replay fence
 
 # Folder-as-agent definitions
 GET    /v1/agents                         list discoverable agent folders
@@ -567,6 +568,17 @@ POST   /v1/projects                       create a project bound to a directory
 GET    /v1/projects/{id}                  project detail
 PATCH  /v1/projects/{id}                  update name and/or config (partial)
 DELETE /v1/projects/{id}                  delete a project (sessions become project-less)
+
+# GitHub repository projection (public repositories only; read-only, no PAT or Authorization header)
+GET    /v1/repo/github/{project_id}/pulls                         list pull requests (?state=open|closed|all&page=1&per_page=10; max 25)
+GET    /v1/repo/github/{project_id}/pulls/{number}                pull request detail
+GET    /v1/repo/github/{project_id}/head-sha/{sha}/checks         checks for one admitted full 40-hex head SHA
+GET    /v1/repo/github/{project_id}/pulls/{number}/reviews        list pull reviews (?page=1&per_page=10; max 25)
+GET    /v1/repo/github/{project_id}/commits                       list commits (?sha=main&page=1&per_page=10; max 25)
+
+These routes resolve only a registered project's workspace-root `origin` and
+accept only exact public GitHub remote forms. They never accept or forward a PAT,
+never send an `Authorization` header, and expose no aggregate or write route.
 
 # Filesystem and browser surface support
 GET    /v1/fs/dirs                        list home-sandboxed directories

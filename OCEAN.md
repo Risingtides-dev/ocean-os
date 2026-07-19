@@ -13,7 +13,7 @@ Ocean is four connected repositories with separate authorities:
   Tauri shells;
 - `ocean-agents` — editable profiles, named specialist packages, and couriers;
 - `ocean-bedrock` — authenticated shared files, ledger, ingest, graph, and
-  semantic-search services.
+  semantic-search services (private repository; optional team service).
 
 Use [`docs/OCEAN_PROJECT_MAP.md`](docs/OCEAN_PROJECT_MAP.md) before making a
 cross-repository claim.

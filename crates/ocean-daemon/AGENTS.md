@@ -35,15 +35,27 @@ This crate owns the long-running Ocean HTTP service on `:4780`, including API ro
   a compatible per-request override.
 - Realtime `purpose: "planner"` is pre-session and propose-only: validate the
   registered project plus canonical live worktree before credential resolution,
-  advertise only `propose_handoff`, and mutate only through the existing
-  session/message/turn routes after an explicit Surface click.
+  advertise only bounded read-only workspace inspection tools plus
+  `propose_handoff`, and mutate only through the existing session/message/turn
+  routes after an explicit Surface click.
 - Session behavior lives in `ocean-agent`; route changes must not create a separate session model.
-- `POST /v1/sessions/{id}/compact` is a thin adapter over
-  `AgentRuntime::compact_session`: it takes a turn permit from the shared
-  concurrent-turn limiter (429 at capacity, permit held for the whole
-  handler), maps only genuine session absence to 404 and unreadable storage
-  or internal failure to sanitized 500s, and returns provider-level failures
-  as `200 ok:false` like the prompt path. No compaction logic in the daemon.
+- Product turns and legacy/call turns (legacy requests pin a session id before
+  admission) take the shared non-blocking session operation lease before
+  `TurnStarted`, invalidation, or request registration and retain it through
+  persistence plus terminal publication. Durable-room turns wait on the same
+  lane after their durable queued footprint and before request registration, so
+  a committed trigger is never dropped. Every mutation path emits a scoped
+  agent-rail lifecycle event or `ocean.session_changed` invalidation while
+  leased, making synchronized snapshots replay-safe even if execution aborts.
+- `POST /v1/sessions/{id}/compact` takes a turn permit from the shared limiter
+  (429 at capacity), rejects a busy session lease immediately with 409, emits a
+  session-scoped replay fence while holding the lease, and delegates model work
+  to `AgentRuntime::compact_session_with_lease`. Successful/no-op responses
+  include the lease-protected visible transcript snapshot plus that fence.
+  `GET /v1/sessions/{id}/sync` is refresh-only, returns the same bounded public
+  snapshot/fence, and rejects a busy lease with 409. Only genuine absence maps
+  to 404; unreadable/internal errors are sanitized 500s and provider failures
+  remain `200 ok:false`. No model compaction logic belongs in the daemon.
 - Session-config RPC v1 is `GET/PATCH /v1/agent/sessions/{id}/config`;
   PATCH accepts strict model-only JSON (malformed or extra-key bodies return
   exact `400 {"ok":false,"error":"invalid_request"}`), persists the catalog
@@ -71,11 +83,12 @@ This crate owns the long-running Ocean HTTP service on `:4780`, including API ro
 - `longhouse_preparation.rs` owns only the state-free prepare/inspect/workflow HTTP request/projection adapters. Preserve exact Axum extractor/method/default envelopes, PR #292 exact-token evidence and redaction, cwd roots/cache choice, and all three `spawn_blocking` fail-open lanes. Keep route composition, librarian query/fetch, compatibility subagent spec, and all governance/title/escrow/recall state in `main.rs`; ranking/cache algorithms remain in `ocean-longhouse`. The deferred cached skill-path symlink-retarget finding must be resolved separately before any librarian extraction.
 - `longhouse_turn_preparation.rs` owns only the fresh default-on opt-out gate, deterministic advisory rendering/application, fixed 250 ms deadline, and cached read-only `TurnPrep` selection inside one blocking closure. Keep all three call sites in `main.rs` with exact caller-cwd, request/permit/acknowledgement, event/runtime, raw-versus-guided prompt, and browser-layer order. Helper-owned warnings remain fixed-field, while delegated loader path logs, unsanitized advisory names/descriptions, and uncancelled timed-out work behind the process-wide cache lock remain documented separate risks rather than extraction scope.
 - `longhouse_topics.rs` owns only the detached scripted demo producer and read-only topic list/detail HTTP adapters over the existing `AppState::{agent_events,longhouse}` handles. Preserve the immediate acknowledgement, exact 17-event/delay/content/ID/tally sequence, projection-before-publication with no lock across publish/await, demo skip-on-poison/live-publication asymmetry, list/detail poison recovery, and exact UUID/error/envelope behavior. Keep `longhouse_routes()`, `AppState`, startup's one registry shared with runtime extensions, HTTP/SSE composition, real convene/model selection, and every title/escrow/revoker/recall/breach/board control path in `main.rs`; do not add a helper, registry, service seam, or broader governance authority here.
-- Agent SSE replay is globally bounded by both 2,048 events and 32 MiB of serialized event payload. Oldest envelopes evict until both limits hold; an individually oversized event remains live but is not replay-retained. Preserve full live delivery and the existing explicit subscriber-lag signal.
+- Agent SSE replay is globally bounded by both 2,048 events and 32 MiB of serialized event payload. Oldest envelopes evict until both limits hold; an individually oversized event remains live but is not replay-retained. Empty, non-UTF-8, malformed, foreign-session, unknown, or evicted `Last-Event-ID`, and live broadcast lag, emit the existing `event:error` frame with a typed `AgentReplayGap` body and `reset_required:true`; never silently attach live-only after an unavailable anchor. Gap bounds are filtered to the requested session and remain diagnostic opaque UUIDs. Preserve full live delivery and first-party error-frame compatibility.
 - Build provenance must follow normal branch commits and linked worktrees: `build.rs` watches Git `HEAD`, its resolved symbolic branch ref, and `packed-refs`; `/health` and `/ready` must report the exact main-built revision after deployment.
 - `AgentEvent::TurnCheckpoint` is an internal persistence signal consumed by `ocean-agent`; daemon bridges must filter it rather than exposing transcript deltas on SSE.
 - The Track-0 projection routes (`GET /v1/rooms`, detail, snapshot, events) are retired. Preserve `/v1/rooms/persistent/*` and `/v1/rooms/{room_id}/livekit-token`; these are separate durable-collaboration and media contracts.
 - The explicit method/path set in `app_router`, `banner_routes()`, and the operator-guide HTTP quick reference must remain identical. Preserve Axum's default 404/405 fallback and the global layer order: HTTP tracing outside CORS outside route dispatch.
+- `github.rs` owns exactly five public, read-only `GET /v1/repo/github/{project_id}/*` projections: pulls, one pull, full-head-SHA checks, reviews, and commits. Resolve only the registered workspace-root `origin`; accept only exact GitHub remote forms; never send credentials or `Authorization`; and add no aggregate or write route. Preserve route-owned sanitized extractor errors, two-phase byte/field/vector bounds, Link-only pagination, full-SHA Moka singleflight caches (256 entries/60s), pinned GitHub headers, and bounded kill-on-drop git stdout handling.
 - `POST /v1/longhouse/inspect` is a read-only projection of the exact ordinary preparation ranking: preserve the shared request/cwd roots/cache/cap/exact-token scorer/tie-break path, path-redacted compact response, raw-prompt/session/cwd/body non-echo (only contributing prompt terms and the additive `exact_name_phrase` flag are returned), and separation from turn execution, capabilities, models, and automatic prompt injection.
 - `harness_profile.rs` owns only the effective per-turn profile gates currently applied to `PromptControl`: hashline edits and artifact spill. LSP/memory remain globally registered, and stream rules, rich context, and minimization remain unavailable rather than logged-only profile claims. Preserve the unknown/missing → CLI fallback; `acp-zed` resolves explicitly with the same effective gates as its former fallback. New external surface classifications require a separate cross-repository policy decision.
 - `observatory_auth.rs` owns the typed Axum auth-state/extractor seam: accept `Authorization: Bearer` or the `Authorization-Observer` cookie, never query credentials, and map every credential failure to 401. Startup loads the secure secret, atomically mints the mode-0600 boot-bound `.ocean/observatory-token`, mounts typed extension state, and rotates the token file every ten minutes; no public token-creation route exists and the signing secret is never distributed.
@@ -120,6 +133,7 @@ This crate owns the long-running Ocean HTTP service on `:4780`, including API ro
 - `cargo test -p ocean-daemon longhouse_topic_projection_ -- --nocapture --test-threads=1`
 - `cargo test -p ocean-daemon harness_profile -- --nocapture`
 - `cargo test -p ocean-daemon router_contract -- --nocapture`
+- `cargo test -p ocean-daemon github::tests -- --test-threads=1`
 - `cargo test -p ocean-daemon observatory_auth -- --nocapture`
 - `cargo test -p ocean-daemon observatory:: -- --nocapture`
 - `cargo test -p ocean-daemon persistent_rooms -- --test-threads=1`

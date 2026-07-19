@@ -4437,3 +4437,127 @@ type:      [feature-request]
 area:      [frontend]
 
 Operator accepted Phase 1 of docs/specs/2026-07-19-cross-device-approval-and-attention.md (recommendations on Q1–Q4 adopted as rulings) and it shipped same-session in ocean-surface-ui: permission-block OS notifications. A pure permission_notify_decision gates silence vs content — silent while the operator watches the blocked session (focused page + active session), notifying otherwise including background sessions, since reaching the operator when they are not watching is the point. Bodies are redacted to the tool name (lock-screen privacy), the permission id rides as the OS notification tag (retry replaces, never stacks), and clicking focuses the surface and opens the blocked session via the existing switch_session path (host::notify_with_click; click is best-effort on the Tauri polyfill, badge still carries the count there). Per-device opt-out via localStorage key ocean.notify_permissions, toggled by the new "Permission Notifications" palette command (default on). host::notify refactored onto a shared ensure-notification-permission guard. Spec status and Revisions updated; docs/README reclassified Phase 1 accepted+implemented. Verified: 424 UI tests pass (5 new decision tests), clippy clean, wasm32 check clean, docs-check PASS. Operator-run browser smoke (block → notify → click → land) remains pending.
+
+## 2026-07-18 — Bedrock privatized; public docs boundary cleanup (wave 2, ocean-os)
+- worktree: ocean-os main
+- `Risingtides-dev/ocean-bedrock` made private after preflight (no forks/stars/hooks/workflows; full-history secret scan clean over 436 blobs; npm audit clean; anonymous access now 404).
+- Removed the two public GitHub links to the now-private repo (`README.md`, `docs/OCEAN_PROJECT_MAP.md`), marked Bedrock as private/optional in `OCEAN.md`, and added a visibility statement to the project map: no public Ocean feature may hard-require Bedrock.
+- `skills/ocean-coworker-onboarding/` flagged for relocation to the private Bedrock repo in a later slice (no secrets present; it is internal onboarding for a private service).
+- Verified: `cargo xtask docs-check` PASS; no remaining `github.com/Risingtides-dev/ocean-bedrock` references in active docs.
+
+time:  [03:01pm] [19-07-26]
+agent: ocean-tauri, codex
+worktree: [main]
+type:  [feature]
+
+Expanded the pre-session Voice Planner from proposal-only context blindness to bounded read-only project inspection. Realtime planner mint now advertises list_workspace and read_workspace_file alongside propose_handoff with closed schemas and explicit untrusted-data/non-execution instructions. Surface fulfillment normalizes relative paths, rejects absolute/~/'..', requires each daemon-canonicalized response target to remain under the frozen validated workspace (including symlink escape), caps listings and file payloads, rejects binary reads, and preserves Create draft/Create & start as the only session/turn mutation boundary. Verification: cargo fmt checks in ocean-os and ocean-surface; cargo test -p ocean-daemon voice_realtime (11 passed); cargo test -p ocean-surface-ui voice::realtime::tests (16 passed); cargo check -p ocean-surface-ui --target wasm32-unknown-unknown; LSP diagnostics clean.
+_________________________________________________________________________________
+
+time:  [03:01pm] [19-07-26]
+agent: ocean-tauri, codex
+worktree: [main]
+type:  [design]
+
+Amended the proposed (not accepted; authorizes no code) Ocean Crew Phase 6 manifest to define the extension-provided Longhouse delegation facade (longhouse__delegate_local/offshore), local/offshore target policy equivalence, real planner/implementer/reviewer/synthesizer Ocean capability profiles, host effective-capability intersection and audit records, Bedrock's bounded knowledge-only role, and explicit migration rejection of advisory /v1/subagents/spec tool strings as executable grants. Crew remains extension-owned; ocean-os and compiled ocean-longhouse gain no orchestration vocabulary or runtime. Verification: cargo xtask docs-check PASS (28 packages, 161 active Markdown files, 141 local links); diff-check clean.
+_________________________________________________________________________________
+_________________________________________________________________________________
+time:      [03:22am] [19-07-26]
+agent:     [pi], [gpt-5.6-sol], [orchestrator], [subagents]
+worktree:  [pi/ocean-walker-m1-20260719] /private/tmp/ocean-walker-m1-20260719
+type:      [feature-request]: port standalone Ocean filesystem walker
+area:      [backend]: unwired traversal and bounded scan cache
+
+Ported the pinned MIT `can1357/oh-my-pi` `crates/pi-walker` implementation at `03c48d073bd4849726cc14750b5aecfa310bdf26` into standalone `crates/ocean-walker`, then completed the bounded M1 corrective review pass. Preserved ordinary traversal behavior while adding exact native owned-path identity, clearly named lossy display projections, explicit fresh/cache provenance, post-scan cache age, one absolute lexical cache/invalidation namespace, generation-linearized invalidation/publication, a strict concurrent cache bound, pre-return heartbeat checks, and capped dedicated-pool construction with explicit serial fallback. Added deterministic barrier tests for cache races, failure/bound/provenance tests, pre-cancelled fresh/empty/cached coverage, a Linux/Unix invalid-byte path collision regression, direct Windows API features, and security/adoption docs. The crate is a workspace member outside `default-members` and has no typed-search, runtime grep/glob, daemon, agent, or capability wiring.
+
+Verification: 51 tests passed with three explicit performance ignores on current Rust and pinned Rust 1.88; denied-warning all-target Clippy, workspace test compilation, Windows GNU all-target cross-check, docs-check, formatting, and diff checks passed. Three fresh review lanes drove cache/path/Windows/security corrections; final acceptance found no medium-or-higher issues in the standalone unwired boundary.
+time:      [08:32] [19-07-26]
+agent:     [claude] [fable 5]
+worktree:  lane-c-landing
+type:      [merge]
+area:      [backend]
+
+Landed Lane C / TASK-23 (daemon GitHub read-model) as ed1c163e on main. The work is pi's: his parked WIP proved COMPLETE against freeze v2 (561d69bb) when a fable builder sub assessed it after a 14-hour seat stall — five public read-only /v1/repo/github/{project_id} routes, two-phase byte caps, Link-header-only pagination, full-SHA Moka cache keys with singleflight, sanitized errors, bounded kill-on-drop git child, 19 focused tests. Landing shape: pi's exact WIP checkpointed untouched (dca8242f, preserved on lane-c-github-read-model), cherry-picked conflict-free onto b38c3b1e, relabeled with pi credited as author. Base note disclosed: worktree base 12cf4eb4 was the freeze's stated base +1 (direct ancestor). Gates: 512 daemon tests, fmt, clippy -D warnings, and codex's independent CLEAR including patch-id match to the checkpoint and canonical xtask ci. I pushed. Unrelated ocean-tui dirt in canonical left untouched.
+_________________________________________________________________________________
+time:      [13:30] [19-07-26]
+agent:     [claude] [fable 5]
+worktree:  fix/longhouse-session-titles
+type:      [merge]
+area:      [backend]
+
+Landed TASK-40 (session titles vs Longhouse injection) as 82d187b3 on main — cut same-hour from smaths' switcher screenshot. Root cause: OCEAN-318 prepends the advisory block to req.prompt before the runtime persists the turn, so every new session's label collapsed to the boilerplate. Fix (fable builder sub, my review): all THREE injection sites (prompt path, create_request, agent_turn) thread the pre-injection prompt as an explicit persisted session title via with_display_title — agent_turn captures before EVERY layered prefix (room/operator guidance, folder-as-agent, longhouse, browser context), broader than the reported defect; session_display_title prefers the explicit title and falls back to a narrow marker-anchored strip for legacy polluted sessions, so old titles self-heal on read. Source-slice test asserts each site captures pre-injection. Gates: 180 agent + 512 daemon tests, fmt, clippy -D clean. I pushed and am bouncing the daemon to serve real titles.
+_________________________________________________________________________________
+
+time: [02:29pm] [07-19-26]
+agent: [ocean] [gpt-5]
+worktree: [public-onboarding-retirement-20260719]
+type: [security]: Private onboarding boundary
+area: [skills]: Bedrock coworker onboarding
+
+Retired the obsolete public `ocean-coworker-onboarding` skill after
+`ocean-bedrock` moved private. The private repository already owns the newer
+canonical `skills/ocean-bedrock-coworker-onboarding/SKILL.md` ceremony with
+invite redemption, local-only transport, secret exclusions, preview, and an
+explicit human acknowledgement gate; the older public token/bootstrap procedure
+was not copied. Verified with `cargo xtask docs-check`, `git diff --check`,
+and a tracked-reference search.
+_________________________________________________________________________________
+time:      [14:37] [19-07-26]
+agent:     [pi] [gpt-5.6]
+worktree:  [feat/tui-workflow-graph-rail] /Users/risingtidesdev/.worktrees/ocean-os-tui-workflow-graph-rail
+type:      [feature-request]
+area:      [frontend]
+
+Implemented the first truthful workflow-graph rail slice by reusing Ocean TUI's existing 3D camera/projection renderer over authenticated Observatory topology. The TUI loads the boot-bound summary token, baselines from the durable snapshot cursor, resumes the typed SSE stream, and rebaselines on reset, malformed data, cursor gaps, daemon-instance changes, or stale environment-token 401 via the rotating secure file. An authoritative inactive-to-active execution transition replaces Files in the existing right rail unless the operator explicitly closed it; terminal graphs remain inspectable, explicit Files navigation restores the tree, and Enter expands the workflow graph into the center while Files returns beside it. All graph navigation mutates through typed Elm actions; authoritative state remains complete while paint work is bounded to 256 nodes and 1,024 edges with an honest hidden count. No orchestration, scheduling, or subagent authority entered core or the TUI.
+
+Verification: ocean-observatory 28 unit + 21 integration/redaction/store tests; ocean-tui 372 passed / 4 ignored; denied-warning Clippy for both crates; TUI release build; workspace check; formatting, docs-check, and diff-check. Live PTY smoke against the supervised daemon rendered the real Observatory snapshot (over 360 retained executions and 340 edges), auto-opened FLOW with current active nodes, expanded into center, and restored Files on the right. Three fresh review passes closed Elm-mutation, token-rotation, duplicate-view, render-bound, and malformed-SSE lifecycle findings; final review passed with no medium-or-higher issue.
+_________________________________________________________________________________
+time:      [14:12] [19-07-26]
+agent:     [pi] [gpt-5.6]
+worktree:  [feat/compact-session-sync]
+type:      [feature-request]
+area:      [backend]
+
+Implemented the coherent backend compact-synchronization prerequisite: non-blocking per-session compact admission with 409 busy conflicts, lease-protected compact/no-op public transcript snapshots, refresh-only session sync, pre-snapshot opaque agent-SSE fences, typed reset-required replay gaps for malformed/unavailable anchors and live lag, and visible-Text-only transcript/history projection. Raw provider messages retain thinking for compatible replay. Full daemon-wide pre-TurnStarted lease admission remains a separately identified lifecycle-hardening follow-up; this checkpoint does not activate TUI `/compact`.
+_________________________________________________________________________________
+_________________________________________________________________________________
+time:      [14:28] [19-07-26]
+agent:     [pi] [gpt-5.6]
+worktree:  [feat/compact-session-sync]
+type:      [workflow]
+area:      [backend]
+
+Completed the session-admission portion that the preceding 14:12 checkpoint left open. Known-session product, legacy prompt/request, call, and durable-room turns now acquire the shared non-blocking operation lease before TurnStarted or request registration and retain it through persistence plus terminal publication; config/message mutations use the same leased lane. Compact and refresh sync acquire that lease before emitting a real session-scoped SSE fence and capturing the visible transcript snapshot. Busy agent turns and compact/sync fail before lifecycle claims, eliminating the check-to-lock race described in the earlier entry.
+_________________________________________________________________________________
+_________________________________________________________________________________
+time:      [15:23] [19-07-26]
+agent:     [pi] [gpt-5.6]
+worktree:  [feat/compact-session-sync]
+type:      [issues]
+area:      [review]
+
+Closed every blocker from three adversarial review rounds. Session sync now projects directly from persisted messages with no SessionDetail/raw/tool/image copy, filters projectable rows before the 512-row cap, enforces the 1 MiB visible-text budget, and signals truncation. Every later session mutation publishes a scoped lifecycle/invalidation under the shared lease; legacy no-session requests pin ids before admission, and durable room triggers wait rather than drop. Replay gaps retain first-party event:error compatibility, reject empty/non-UTF8/foreign/unknown/evicted anchors, and expose only session-filtered diagnostic bounds. Compact acquires the busy lease before any existence read. Final independent release review approved with no blocker/high findings.
+_________________________________________________________________________________
+time:      [17:16] [19-07-26]
+agent:     [claude] [fable 5]
+worktree:  fix/task51-sol-dsml-salvage
+type:      [merge]
+area:      [backend]
+
+Landed TASK-51 (Sol DSML tool-call salvage) as 3b2c0499 on main — cut same-hour from smaths' screenshot of gpt-5.6-sol leaking raw DSML markup as transcript text with tools never executing. Fable builder sub, my review: the prior salvage (12cf4eb4/e3035161) was tail-only and Sol's leak is INTERLEAVED (prose, block, more prose), so it never matched. The shared helper now scans left-to-right lifting every well-formed block wherever it lands, stitching surviving prose; truncated final blocks still salvage; empty/broken blocks keep their markup visible; empty-name invokes rejected. The tail-only policy inversion is explicitly reasoned in the commit under the known-leaker + zero-structured-calls gate. Streaming reassembly preserved (buffer-then-salvage, split-across-deltas tested). 150 protocol + 518 daemon tests, fmt, clippy -D clean. I pushed; daemon bounce follows to serve the fix. Ledger note: this entry lands from the task worktree — canonical ocean-os carries other agents' uncommitted WIP (TUI files + in-progress ledger entries) left untouched.
+_________________________________________________________________________________
+time:      [17:23] [19-07-26]
+agent:     [claude] [fable 5]
+worktree:  fix/task50-prompt-display
+type:      [merge]
+area:      [backend]
+
+Landed TASK-50 (transcript user bubbles vs injected advisory layers) as 7abd5982 on main — TASK-40's sibling, cut same-hour from smaths' screenshot of the Longhouse block rendering inside user messages. Fable builder sub, my review: strip_injected_turn_prep peels the stacked daemon layers (surface flag, Longhouse advisory, operator guidance) off stored user bodies at the DISPLAY projection boundary — transcript, hydration, sync snapshot, history excerpts — reusing TASK-40's marker primitives plus a new guidance strip whose daemon-renderer literal is pinned by a cross-crate guard test; raw messages stay provider-faithful; no store migration, history self-heals on read. Two deferrals documented honestly: folder-as-agent (no marker to anchor) and browser-context (internal blank line breaks the terminator) — FOLLOW-UP QUEUED: give every injected layer a marker at generation so display-stripping is total. 191 agent + 519 daemon tests, fmt, clippy clean. I pushed; daemon bounce follows.
+_________________________________________________________________________________
+time:      [18:05] [19-07-26]
+agent:     [claude] [fable 5]
+worktree:  task-53-mixed-turn-salvage (fable builder sub)
+type:      bug-report
+area:      backend
+
+TASK-53 landed 996c4b76: Sol (gpt-5.6 family) leaks DSML tool-call blocks as text even in MIXED turns with structured calls — smaths' live screenshot showed 7 structured calls then a trailing raw DSML block, which TASK-51's zero-structured-calls gate let through. Salvage now runs for known-leaker models whenever text exists, with a (name, parsed-args) dedupe against the turn's structured calls so a call emitted both ways never double-executes; ToolUse forced only when a salvaged call survives. Shared merge_dsml_salvage helper keeps codex.rs and openai.rs collectors identical; 3 new unit tests (mixed distinct, dedupe, non-leaker), 153 protocol tests green, fmt + clippy clean. Daemon rebuild + bounce follows this entry.
+_________________________________________________________________________________

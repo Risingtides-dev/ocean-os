@@ -121,46 +121,137 @@ fn is_blocking_empty_turn(stop: StopReason, has_usable_content: bool) -> bool {
 /// transcript and silently drop the model's intended tool call.
 ///
 /// Deliberately conservative to avoid firing on prose that merely *discusses*
-/// DSML (e.g. a transcript quoting leaked markup):
+/// DSML:
 /// - only called when ZERO structured tool calls arrived, and
-/// - only salvages a block at the TAIL of the text (nothing but whitespace
-///   after it) — a quoted example mid-document never matches, and
+/// - only lifts a WELL-FORMED block (a real invoke with a non-empty name),
+///   never an empty or structurally broken one, and
 /// - callers gate on the known leakers: the deepseek provider and the
 ///   gpt-5.6 family (Sol observed emitting DSML in the wild 2026-07-18 —
 ///   evidently trained on DeepSeek traces; official endpoint, no routing).
 ///
-/// Returns the text with the block removed plus `(name, arguments)` pairs.
+/// TASK-51: the leak is INTERLEAVED — Sol emits explanation prose, then a raw
+/// DSML `tool_calls` block, then more prose, as one text blob. The earlier
+/// tail-only rule (salvage only when nothing but whitespace follows the block)
+/// missed exactly this shape and let the call render as markup and drop. We now
+/// lift EVERY well-formed block out wherever it lands and stitch the surviving
+/// prose back together. Under the caller's gate (known-leaker model + zero
+/// structured calls) a well-formed block is a real failed call, not a quote;
+/// the residual false-positive risk (the model quoting a complete valid block
+/// while making no call) is far rarer than the live drop it fixes.
+///
+/// Returns the text with the block(s) removed plus `(name, arguments)` pairs.
 /// Both the true unicode token (`｜` U+FF5C) and the ASCII-pipe fallback some
 /// serving stacks detokenize to are recognized. A missing closing tag
-/// (truncated emission) still salvages: the block extends to end-of-text.
+/// (truncated emission) still salvages: the final block extends to end-of-text.
 pub(crate) fn salvage_dsml_tool_calls(text: &str) -> Option<(String, Vec<(String, Value)>)> {
     const MARKS: [(&str, &str); 2] = [("<｜DSML｜", "</｜DSML｜"), ("<|DSML|", "</|DSML|")];
     for (open, close) in MARKS {
         let start_tag = format!("{open}tool_calls>");
         let end_tag = format!("{close}tool_calls>");
-        let Some(start) = text.find(&start_tag) else {
+        if !text.contains(&start_tag) {
             continue;
-        };
-        let body_start = start + start_tag.len();
-        let (body, after) = match text[body_start..].find(&end_tag) {
-            Some(rel) => (
-                &text[body_start..body_start + rel],
-                &text[body_start + rel + end_tag.len()..],
-            ),
-            None => (&text[body_start..], ""),
-        };
-        // Refuse mid-document blocks: salvage only a trailing emission.
-        if !after.trim().is_empty() {
-            return None;
         }
-        let calls = parse_dsml_invokes(body, open, close)?;
+        let mut calls: Vec<(String, Value)> = Vec::new();
+        // Non-block prose segments, in order, stitched back together at the end.
+        let mut kept: Vec<&str> = Vec::new();
+        let mut cursor = 0usize;
+        while let Some(rel) = text[cursor..].find(&start_tag) {
+            let block_start = cursor + rel;
+            let body_start = block_start + start_tag.len();
+            // Locate the matching close tag; a missing one means a truncated
+            // emission whose block runs to end-of-text (only the final block).
+            let (body, block_end) = match text[body_start..].find(&end_tag) {
+                Some(erel) => (
+                    &text[body_start..body_start + erel],
+                    body_start + erel + end_tag.len(),
+                ),
+                None => (&text[body_start..], text.len()),
+            };
+            match parse_dsml_invokes(body, open, close) {
+                // A real block: keep the prose before it, lift the calls out.
+                Some(block_calls) if !block_calls.is_empty() => {
+                    kept.push(&text[cursor..block_start]);
+                    calls.extend(block_calls);
+                    cursor = block_end;
+                }
+                // Empty or structurally broken block: not a salvageable call.
+                // Leave its markup in the text (never silently drop visible
+                // content) and keep scanning past this start tag.
+                _ => {
+                    kept.push(&text[cursor..body_start]);
+                    cursor = body_start;
+                }
+            }
+        }
         if calls.is_empty() {
-            return None;
+            continue;
         }
-        let cleaned = text[..start].trim_end().to_string();
+        kept.push(&text[cursor..]);
+        let cleaned = kept
+            .iter()
+            .map(|s| s.trim())
+            .filter(|s| !s.is_empty())
+            .collect::<Vec<_>>()
+            .join("\n\n");
         return Some((cleaned, calls));
     }
     None
+}
+
+/// Outcome of merging DSML-salvaged tool calls into a turn that may ALSO
+/// carry structured function calls (TASK-53). Pure and shared by both stream
+/// collectors (Responses `codex.rs` and Chat-Completions here) so mixed-turn
+/// behavior is identical across providers and unit-testable without a live
+/// stream.
+pub(crate) struct DsmlSalvageMerge {
+    /// The transcript text with all matched DSML markup stripped. Applies even
+    /// when every salvaged call is a duplicate — visible markup is never left
+    /// behind once salvage matched.
+    pub cleaned_text: String,
+    /// Salvaged calls that survived dedupe against the turn's structured calls,
+    /// in emission order.
+    pub surviving: Vec<(String, Value)>,
+    /// True when at least one salvaged call survived: the caller must force
+    /// `StopReason::ToolUse`. When false the caller leaves `stop` untouched —
+    /// if structured calls exist it is already `ToolUse`, and if none exist
+    /// (everything a no-op) forcing it would be a lie.
+    pub forces_tool_use: bool,
+}
+
+/// Run DSML salvage for a known-leaker turn, then dedupe the recovered calls
+/// against the structured calls already parsed from the SAME turn.
+///
+/// `is_leaker` is the caller's model/provider gate (gpt-5.6 family for the
+/// Responses collector; that plus DeepSeek for the compat collector). Returns
+/// `None` — leaving the caller's text and calls untouched — for non-leaker
+/// turns, empty text, or text carrying no well-formed DSML block. `structured`
+/// is `(name, parsed-arguments)` for every structured call in the turn; a
+/// salvaged call is dropped when an identical pair exists there, because the
+/// model occasionally emits the same call both structurally and as text and
+/// executing both would double-run it.
+pub(crate) fn merge_dsml_salvage(
+    is_leaker: bool,
+    text: &str,
+    structured: &[(String, Value)],
+) -> Option<DsmlSalvageMerge> {
+    if !is_leaker || text.is_empty() {
+        return None;
+    }
+    let (cleaned_text, calls) = salvage_dsml_tool_calls(text)?;
+    let surviving: Vec<(String, Value)> = calls
+        .into_iter()
+        .filter(|(name, args)| {
+            !structured
+                .iter()
+                .any(|(sname, sargs)| sname == name && sargs == args)
+        })
+        .collect();
+    let forces_tool_use = !surviving.is_empty();
+    Some(DsmlSalvageMerge {
+        cleaned_text,
+        surviving,
+        forces_tool_use,
+    })
 }
 
 /// Parse the `invoke` elements inside a DSML `tool_calls` block body.
@@ -212,7 +303,11 @@ fn parse_dsml_invokes(body: &str, open: &str, close: &str) -> Option<Vec<(String
             args.insert(pname.to_string(), value);
             prest = nrest;
         }
-        calls.push((name.to_string(), Value::Object(args)));
+        // An empty invoke name (`invoke name="">`) is malformed markup, not a
+        // callable tool — skip it rather than emit a nameless call.
+        if !name.is_empty() {
+            calls.push((name.to_string(), Value::Object(args)));
+        }
         rest = next_rest;
     }
     Some(calls)
@@ -1077,27 +1172,37 @@ impl Provider for OpenAiProvider {
                 return;
             }
 
-            // DSML salvage (DeepSeek only): a serving stack that failed to
-            // parse the model's DSML markup hands us the tool call as literal
-            // text. Recover the intent instead of rendering markup and
-            // dropping the call. Gated on zero structured tool calls so a
-            // well-formed API response is never second-guessed.
+            // DSML salvage: a serving stack that failed to parse the model's
+            // DSML markup hands us the tool call as literal text. Recover the
+            // intent instead of rendering markup and dropping the call. Runs
+            // for known leakers (DeepSeek, gpt-5.6 family) whenever there is
+            // text — including MIXED turns that also produced structured calls
+            // (TASK-53) — and dedupes recovered calls against the structured
+            // ones so a call emitted both ways is not double-executed.
+            let structured_pairs: Vec<(String, Value)> = tool_calls
+                .values()
+                .map(|tc| {
+                    let args = if tc.args.is_empty() {
+                        Value::Object(Default::default())
+                    } else {
+                        serde_json::from_str(&tc.args).unwrap_or(Value::Object(Default::default()))
+                    };
+                    (tc.name.clone(), args)
+                })
+                .collect();
+            let is_leaker = provider == "deepseek" || model_id.starts_with("gpt-5.6");
             let mut salvaged_calls: Vec<(String, Value)> = Vec::new();
-            if !has_tool_calls && (provider == "deepseek" || model_id.starts_with("gpt-5.6")) {
-                if let Some((cleaned, calls)) = salvage_dsml_tool_calls(&text_buf) {
+            if let Some(merge) = merge_dsml_salvage(is_leaker, &text_buf, &structured_pairs) {
+                if merge.forces_tool_use {
                     tracing::warn!(
-                        count = calls.len(),
+                        count = merge.surviving.len(),
                         "salvaged DSML tool calls leaked as text content"
                     );
-                    text_buf = cleaned;
-                    salvaged_calls = calls;
+                    stop = StopReason::ToolUse;
                 }
+                text_buf = merge.cleaned_text;
+                salvaged_calls = merge.surviving;
             }
-            let stop = if salvaged_calls.is_empty() {
-                stop
-            } else {
-                StopReason::ToolUse
-            };
 
             let mut out_content: Vec<Content> = Vec::new();
             if !thinking_buf.is_empty() {
@@ -1208,12 +1313,29 @@ mod tests {
         assert_eq!(calls[0].1["command"], serde_json::json!("ls -la"));
     }
 
+    // TASK-51: the gpt-5.6-sol leak observed in the wild is INTERLEAVED — the
+    // model emits explanation prose, then a raw DSML tool_calls block, then
+    // more prose, all as one text blob. The tool call must be lifted out and
+    // the prose on BOTH sides preserved. This inverts the earlier tail-only
+    // policy: a well-formed block gated on a known-leaker model with zero
+    // structured calls is a real (failed) call wherever it lands, not a quote.
     #[test]
-    fn dsml_salvage_refuses_mid_document_blocks() {
-        // A transcript QUOTING leaked markup, followed by prose, must not be
-        // rewritten into a live tool call.
-        let text = format!("Look at this leak:\n{}\nWild, right?", dsml_block());
-        assert!(salvage_dsml_tool_calls(&text).is_none());
+    fn dsml_salvage_recovers_interleaved_tool_call() {
+        let text = format!(
+            "I'll open the file to check.\n{}\nThat should show the imports.",
+            dsml_block()
+        );
+        let (cleaned, calls) = salvage_dsml_tool_calls(&text).expect("salvage fires");
+        assert_eq!(
+            cleaned, "I'll open the file to check.\n\nThat should show the imports.",
+            "prose before AND after the lifted block is preserved"
+        );
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].0, "read");
+        assert_eq!(
+            calls[0].1["path"],
+            serde_json::json!("/tmp/x/src/components.rs")
+        );
     }
 
     #[test]
@@ -1225,6 +1347,94 @@ mod tests {
         );
     }
 
+    // TASK-51: the leak arrives on STREAMED deltas and the block can be split
+    // across chunk boundaries. The collector accumulates every content delta
+    // into one buffer (`text_buf.push_str`) and salvages once at stream end, so
+    // salvage must succeed regardless of where the chunk splits fall. Simulate
+    // that accumulation by reassembling the block from arbitrary fragments.
+    #[test]
+    fn dsml_salvage_handles_block_split_across_deltas() {
+        let full = format!("Reading it now.\n{}\nDone.", dsml_block());
+        // Split the accumulated text at many boundaries — mid-tag, mid-param —
+        // to mimic SSE chunking, then reassemble exactly as the collector does.
+        for chunk in [1usize, 3, 7, 13, 29, 64] {
+            let mut buf = String::new();
+            let bytes: Vec<char> = full.chars().collect();
+            for piece in bytes.chunks(chunk) {
+                buf.push_str(&piece.iter().collect::<String>());
+            }
+            assert_eq!(buf, full, "reassembly is lossless for chunk={chunk}");
+            let (cleaned, calls) = salvage_dsml_tool_calls(&buf)
+                .unwrap_or_else(|| panic!("salvage fires chunk={chunk}"));
+            assert_eq!(cleaned, "Reading it now.\n\nDone.");
+            assert_eq!(calls.len(), 1);
+            assert_eq!(calls[0].0, "read");
+        }
+    }
+
+    // Prose that carries no tool_calls block is returned untouched (None), so a
+    // normal streamed answer is never rewritten.
+    #[test]
+    fn dsml_salvage_leaves_prose_only_stream_untouched() {
+        let text = "Here is a plain answer with no markup and no tool call at all.";
+        assert!(salvage_dsml_tool_calls(text).is_none());
+    }
+
+    // Multiple DSML blocks interleaved with prose (Sol emits explanation, a
+    // block, explanation, another block): every call is lifted, all prose kept.
+    #[test]
+    fn dsml_salvage_recovers_multiple_interleaved_blocks() {
+        let text = format!(
+            "First I'll read it.\n{first}\nThen edit it.\n{second}\nAll set.",
+            first =
+                "<|DSML|tool_calls><|DSML|invoke name=\"read\"><|DSML|parameter name=\"path\" string=\"true\">a.rs</|DSML|parameter></|DSML|invoke></|DSML|tool_calls>",
+            second =
+                "<|DSML|tool_calls><|DSML|invoke name=\"edit\"><|DSML|parameter name=\"new_string\" string=\"true\">true</|DSML|parameter></|DSML|invoke></|DSML|tool_calls>",
+        );
+        let (cleaned, calls) = salvage_dsml_tool_calls(&text).expect("salvage fires");
+        assert_eq!(cleaned, "First I'll read it.\n\nThen edit it.\n\nAll set.");
+        assert_eq!(calls.len(), 2);
+        assert_eq!(calls[0].0, "read");
+        assert_eq!(calls[0].1["path"], serde_json::json!("a.rs"));
+        assert_eq!(calls[1].0, "edit");
+        // string="true" attribute form (the shape in the operator screenshot):
+        // kept as a literal string, NOT decoded to a JSON bool.
+        assert_eq!(calls[1].1["new_string"], serde_json::json!("true"));
+    }
+
+    // The operator screenshot showed `string="true"` attribute-style params.
+    // Confirm the string/JSON toggle: string="true" stays a string, and a
+    // malformed/undecodable string="false" value falls back to a raw string
+    // rather than dropping the call.
+    #[test]
+    fn dsml_salvage_handles_string_true_and_malformed_params() {
+        let text = concat!(
+            "<|DSML|tool_calls><|DSML|invoke name=\"edit\">",
+            "<|DSML|parameter name=\"new_string\" string=\"true\">true</|DSML|parameter>",
+            "<|DSML|parameter name=\"count\" string=\"false\">not-json</|DSML|parameter>",
+            "<|DSML|parameter name=\"obj\" string=\"false\">{\"k\": 1}</|DSML|parameter>",
+            "</|DSML|invoke></|DSML|tool_calls>",
+        );
+        let (_, calls) = salvage_dsml_tool_calls(text).expect("salvage fires");
+        assert_eq!(calls.len(), 1);
+        let args = &calls[0].1;
+        assert_eq!(
+            args["new_string"],
+            serde_json::json!("true"),
+            "string=\"true\" stays a string"
+        );
+        assert_eq!(
+            args["count"],
+            serde_json::json!("not-json"),
+            "undecodable JSON falls back to raw string"
+        );
+        assert_eq!(
+            args["obj"],
+            serde_json::json!({"k": 1}),
+            "string=\"false\" decodes JSON"
+        );
+    }
+
     #[test]
     fn dsml_salvage_parses_multiple_invokes() {
         let text = "<|DSML|tool_calls><|DSML|invoke name=\"a\"></|DSML|invoke><|DSML|invoke name=\"b\"><|DSML|parameter name=\"n\" string=\"false\">2</|DSML|parameter></|DSML|invoke></|DSML|tool_calls>";
@@ -1233,6 +1443,86 @@ mod tests {
         assert_eq!(calls[0].0, "a");
         assert_eq!(calls[1].0, "b");
         assert_eq!(calls[1].1["n"], serde_json::json!(2));
+    }
+
+    // ── TASK-53: mixed-turn DSML salvage (structured calls + leaked text) ──
+
+    // A leaker turn that made a structured call AND leaked a DIFFERENT call as
+    // a trailing DSML block: the salvaged call survives, the markup is stripped
+    // from the transcript, and ToolUse is forced.
+    #[test]
+    fn merge_salvages_mixed_turn_with_distinct_call() {
+        let structured = vec![("read".to_string(), serde_json::json!({"path": "a.rs"}))];
+        let text = concat!(
+            "let me also grep\n",
+            "<|DSML|tool_calls><|DSML|invoke name=\"grep\">",
+            "<|DSML|parameter name=\"q\">foo</|DSML|parameter>",
+            "</|DSML|invoke></|DSML|tool_calls>",
+        );
+        let merge = merge_dsml_salvage(true, text, &structured).expect("salvage fires");
+        assert!(
+            merge.forces_tool_use,
+            "a surviving salvaged call forces ToolUse"
+        );
+        assert_eq!(merge.surviving.len(), 1);
+        assert_eq!(merge.surviving[0].0, "grep");
+        assert_eq!(merge.surviving[0].1["q"], serde_json::json!("foo"));
+        assert!(
+            !merge.cleaned_text.contains("DSML"),
+            "markup stripped from transcript: {:?}",
+            merge.cleaned_text
+        );
+        assert!(
+            merge.cleaned_text.contains("grep"),
+            "surrounding prose preserved"
+        );
+    }
+
+    // The model emitted the SAME call both structurally and as text: the
+    // salvaged duplicate is dropped (no double-execution) but its markup is
+    // still stripped, and ToolUse is NOT forced by salvage (the structured
+    // path already owns the stop reason).
+    #[test]
+    fn merge_dedupes_call_emitted_both_ways() {
+        let structured = vec![(
+            "edit".to_string(),
+            serde_json::json!({"path": "x", "s": "y"}),
+        )];
+        let text = concat!(
+            "<|DSML|tool_calls><|DSML|invoke name=\"edit\">",
+            "<|DSML|parameter name=\"path\">x</|DSML|parameter>",
+            "<|DSML|parameter name=\"s\">y</|DSML|parameter>",
+            "</|DSML|invoke></|DSML|tool_calls>",
+        );
+        let merge = merge_dsml_salvage(true, text, &structured).expect("salvage fires");
+        assert!(
+            merge.surviving.is_empty(),
+            "identical structured call dedupes the salvage"
+        );
+        assert!(
+            !merge.forces_tool_use,
+            "no surviving call → salvage does not force ToolUse"
+        );
+        assert!(
+            !merge.cleaned_text.contains("DSML"),
+            "dropped duplicate still has its markup stripped: {:?}",
+            merge.cleaned_text
+        );
+    }
+
+    // Non-leaker model: DSML-looking text is left entirely untouched (no
+    // salvage, no dedupe) — merge returns None so the caller keeps text as-is.
+    #[test]
+    fn merge_skips_non_leaker_model() {
+        let text = concat!(
+            "<|DSML|tool_calls><|DSML|invoke name=\"grep\">",
+            "<|DSML|parameter name=\"q\">foo</|DSML|parameter>",
+            "</|DSML|invoke></|DSML|tool_calls>",
+        );
+        assert!(
+            merge_dsml_salvage(false, text, &[]).is_none(),
+            "non-leaker turn is never salvaged"
+        );
     }
 
     fn test_body(model: &Model, context: &Context, options: &StreamOptions) -> Value {

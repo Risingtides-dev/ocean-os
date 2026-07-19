@@ -13,10 +13,15 @@ Documentation policy: [`OCEAN_DOCUMENTATION_CONTRACT.md`](OCEAN_DOCUMENTATION_CO
 | daemon, agent loop, providers, models, tools, permissions, sessions, events, TUI, CLI, ACP, MCP client, local browser/call/room execution | [`ocean-os`](https://github.com/Risingtides-dev/ocean-os) | Rust runtime and local execution plane |
 | web/PWA UI, Chrome extension, Tauri shell, proxy, product interaction, visual design, responsive/mobile presentation | [`ocean-surface`](https://github.com/Risingtides-dev/ocean-surface) | Thin product surfaces over the daemon |
 | assistant profiles, surface prompts, named specialist packages, couriers, package SOPs and harness declarations | [`ocean-agents`](https://github.com/Risingtides-dev/ocean-agents) | Provider-agnostic behavior/package layer |
-| authenticated shared files, mounts, ledger, ingest, source registry, graph, semantic search, shared context, Bedrock API/MCP | [`ocean-bedrock`](https://github.com/Risingtides-dev/ocean-bedrock) | Shared knowledge and data plane |
+| authenticated shared files, mounts, ledger, ingest, source registry, graph, semantic search, shared context, Bedrock API/MCP | `ocean-bedrock` (private repository) | Shared knowledge and data plane |
 
 Read the target repository's `AGENTS.md` before editing. Do not infer ownership
 from a similarly named historical document in another repository.
+
+Visibility: `ocean-os`, `ocean-surface`, and `ocean-agents` are public.
+`ocean-bedrock` is a private repository; it is the optional authenticated
+knowledge/data plane for a team deployment, and no public Ocean feature may
+hard-require it.
 
 ## Implemented system shape
 

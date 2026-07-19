@@ -37,6 +37,22 @@ This crate owns Ocean's agent session/history layer and project prompt loading. 
   gpt-5.x into malformed tool calls across tool rounds). Kimi K2.x and other
   OpenAI-compatible routes retain the existing thinking-strip boundary;
   provider encoders still drop cross-provider thinking.
+- Public `SessionTranscriptEntry.text` and persisted history search project
+  visible `Content::Text` only. Provider `Thinking` remains in raw persisted
+  messages for compatible same-provider replay and never enters display/search
+  text.
+- The shared session mutation mutex exposes an opaque operation lease for
+  daemon admission. Interactive product/legacy/call turns and config/message/
+  compact/sync routes acquire it non-blockingly before lifecycle or mutation;
+  durable room turns wait on the same lane after their durable queued footprint
+  so an acknowledged trigger is never dropped. Every leased turn retains the
+  lane through persistence and terminal/invalidation publication. Plain runtime
+  wrappers remain compatibility callers that acquire the same lane.
+- `SessionSyncSnapshot` is projected directly from persisted messages without
+  constructing `SessionDetail`: user/assistant visible Text only, fixed image
+  placeholder with no metadata, at most 512 rows and 1 MiB text, with explicit
+  front-row/text truncation counts. Tool rows, raw messages, tool context,
+  provider thinking, image bytes, and MIME metadata never enter this response.
 - `compact_session` is owned here: one-shot no-tools model call, atomically
   replaces session transcript with summary + protected recent window. The
   session lock must be held for the entire load-call-save cycle. Only the

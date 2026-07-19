@@ -67,7 +67,7 @@ Proposals awaiting operator ruling:
 
 Active implementation reference:
 
-- [`specs/2026-07-03-omp-port-map.md`](specs/2026-07-03-omp-port-map.md) — source-researched OMP-to-Ocean mechanism map plus the dated current implementation audit. It is a prioritized reference, not current architecture; open checkpoints are routed through [`../ROADMAP.md`](../ROADMAP.md), and its original core-orchestration placement is superseded by the extension architecture.
+- [`specs/2026-07-03-omp-port-map.md`](specs/2026-07-03-omp-port-map.md) — source-researched OMP-to-Ocean mechanism map plus the dated implementation audit, including the implemented-but-unwired standalone walker M1. It is a prioritized reference, not current architecture; typed search and live runtime adoption remain open through [`../ROADMAP.md`](../ROADMAP.md), and its original core-orchestration placement is superseded by the extension architecture.
 
 Completed extraction manifests are retained evidence, not independent work orders. The broader behavior-neutral daemon refactor remains active under `DAEMON_REFACTOR_MISSION.md`; consult its progress section and the current code-health plan before selecting the next checkpoint.
 

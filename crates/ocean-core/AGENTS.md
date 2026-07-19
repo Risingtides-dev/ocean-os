@@ -15,6 +15,11 @@ This crate owns shared protocol types used across Ocean clients, daemon, runtime
 - Treat public type changes as cross-crate contract changes.
 - Preserve serde compatibility unless the breaking change is intentional and documented.
 - Keep protocol types free of daemon/runtime implementation details.
+- Session synchronization uses a bounded `SessionSyncSnapshot` plus opaque
+  boot-local `SessionEventFence`; it excludes raw messages, tool rows/payloads,
+  thinking, and image metadata, caps visible user/assistant text at 512 rows and
+  1 MiB, and reports truncation counts. `AgentReplayGap` is reset-required and
+  never claims ordering/range semantics for UUID event ids.
 - `PermissionMode` wire names are stable (`manual`, `automatic`, `skip_all`);
   clients display daemon-reported saved/effective settings rather than deriving
   policy locally.

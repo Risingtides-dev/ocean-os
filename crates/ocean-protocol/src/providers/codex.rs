@@ -1163,26 +1163,45 @@ impl Provider for CodexProvider {
                     thinking_signature,
                 }));
             }
-            // DSML salvage: gpt-5.6-family models (Sol observed live
-            // 2026-07-18) sometimes emit DeepSeek DSML tool-call markup as
-            // literal text instead of a structured function call. Same
-            // conservative rules as the OpenAI-compat collector: zero
-            // structured calls, well-formed tail block only.
+            // DSML salvage: gpt-5.6-family models (Sol) sometimes emit DeepSeek
+            // DSML tool-call markup as literal text instead of a structured
+            // function call — INTERLEAVED with prose, and even in MIXED turns
+            // that ALSO made structured calls (TASK-53 live proof 2026-07-19: a
+            // turn made 7 structured calls, then leaked one more as a trailing
+            // DSML block). So salvage runs for the known leaker model whenever
+            // there is text, regardless of structured-call count; the shared
+            // helper dedupes recovered calls against the structured ones (the
+            // model occasionally emits a call both ways) and forces ToolUse only
+            // when a salvaged call actually survives.
             let finalized_tool_calls: Vec<_> = tool_calls.finalize();
             let mut salvaged_calls: Vec<(String, Value)> = Vec::new();
-            if finalized_tool_calls.is_empty() && model_id.starts_with("gpt-5.6") {
-                if let Some((cleaned, calls)) =
-                    super::openai::salvage_dsml_tool_calls(&text_buf)
-                {
+            let structured_pairs: Vec<(String, Value)> = finalized_tool_calls
+                .iter()
+                .map(|tc| {
+                    let args = if tc.args.is_empty() {
+                        Value::Object(Default::default())
+                    } else {
+                        serde_json::from_str(&tc.args)
+                            .unwrap_or_else(|_| Value::Object(Default::default()))
+                    };
+                    (tc.name.clone(), args)
+                })
+                .collect();
+            if let Some(merge) = super::openai::merge_dsml_salvage(
+                model_id.starts_with("gpt-5.6"),
+                &text_buf,
+                &structured_pairs,
+            ) {
+                if merge.forces_tool_use {
                     tracing::warn!(
-                        count = calls.len(),
+                        count = merge.surviving.len(),
                         model = %model_id,
                         "salvaged DSML tool calls leaked as text content"
                     );
-                    text_buf = cleaned;
-                    salvaged_calls = calls;
                     stop = StopReason::ToolUse;
                 }
+                text_buf = merge.cleaned_text;
+                salvaged_calls = merge.surviving;
             }
 
             if let Some(i) = text_index {

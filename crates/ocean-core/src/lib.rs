@@ -233,6 +233,83 @@ pub struct CompactResponse {
     #[serde(default)]
     pub elided_messages: u64,
     pub stderr: String,
+    /// Authoritative visible transcript captured by the successful/no-op
+    /// compaction while the per-session operation lease was still held.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sync: Option<SessionSyncSnapshot>,
+    /// Replay anchor captured before the synchronized mutation/read. Clients
+    /// replace from `sync`, then replay strictly after this opaque boot-local id.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fence: Option<SessionEventFence>,
+}
+
+/// Opaque boot-local cursor into the daemon's agent-event replay ring.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionEventFence {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub event_id: Option<Uuid>,
+}
+
+pub const SESSION_SYNC_MAX_VISIBLE_MESSAGES: usize = 512;
+pub const SESSION_SYNC_MAX_VISIBLE_TEXT_BYTES: usize = 1024 * 1024;
+
+/// Bounded public session state used by compaction and refresh-only sync. Raw
+/// provider messages, tool arguments/results, image metadata, and thinking are
+/// deliberately absent; `transcript` contains visible `Content::Text` only.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SessionSyncSnapshot {
+    pub session_id: SessionId,
+    pub model: String,
+    pub provider: String,
+    #[serde(default)]
+    pub transcript: Vec<SessionTranscriptEntry>,
+    /// Visible user/assistant rows omitted from the front by response bounds.
+    #[serde(default, skip_serializing_if = "is_zero_u64")]
+    pub truncated_messages: u64,
+    /// UTF-8 bytes omitted from the oldest retained visible row when one row
+    /// alone exceeded the response text budget.
+    #[serde(default, skip_serializing_if = "is_zero_u64")]
+    pub truncated_text_bytes: u64,
+}
+
+fn is_zero_u64(value: &u64) -> bool {
+    *value == 0
+}
+
+/// Response for the refresh-only session synchronization route.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SessionSyncResponse {
+    pub ok: bool,
+    pub session_id: SessionId,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub snapshot: Option<SessionSyncSnapshot>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fence: Option<SessionEventFence>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
+/// Stable cause for an agent SSE reset-required signal.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AgentReplayGapCode {
+    MalformedAnchor,
+    AnchorUnavailable,
+    LiveLag,
+}
+
+/// Typed reset-required payload emitted when an agent SSE replay anchor is
+/// malformed, unknown/evicted, or a live receiver lags.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgentReplayGap {
+    pub code: AgentReplayGapCode,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub requested_event_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub oldest_available_event_id: Option<Uuid>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub newest_available_event_id: Option<Uuid>,
+    pub reset_required: bool,
 }
 
 /// Token usage for a turn, mirrored from `ocean_protocol::Usage` so `ocean-core`
@@ -312,7 +389,7 @@ pub struct SessionTranscriptEntry {
     pub text: String,
     /// Image blocks attached to this turn, by mime_type only (no base64). Empty
     /// for turns with no images. Lets a replaying client show that an image was
-    /// attached even though `text` only carries Text/Thinking content.
+    /// attached even though `text` carries visible Text content only.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub images: Vec<ImageMeta>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -2172,6 +2249,37 @@ mod tests {
             out.get("owner_principal_token_id").is_none(),
             "owner_principal_token_id MUST NOT survive serde roundtrip on FederatedMessageMeta"
         );
+    }
+
+    #[test]
+    fn compact_response_additive_sync_fields_default_for_older_payloads() {
+        let session_id = Uuid::new_v4();
+        let response: CompactResponse = serde_json::from_value(serde_json::json!({
+            "ok": true,
+            "session_id": session_id,
+            "wall_ms": 12,
+            "elided_messages": 3,
+            "stderr": ""
+        }))
+        .unwrap();
+        assert_eq!(response.session_id, session_id);
+        assert!(response.sync.is_none());
+        assert!(response.fence.is_none());
+    }
+
+    #[test]
+    fn agent_replay_gap_codes_have_stable_wire_names() {
+        let gap = AgentReplayGap {
+            code: AgentReplayGapCode::AnchorUnavailable,
+            requested_event_id: Some("missing".into()),
+            oldest_available_event_id: None,
+            newest_available_event_id: None,
+            reset_required: true,
+        };
+        let json = serde_json::to_value(&gap).unwrap();
+        assert_eq!(json["code"], "anchor_unavailable");
+        assert_eq!(json["reset_required"], true);
+        assert_eq!(serde_json::from_value::<AgentReplayGap>(json).unwrap(), gap);
     }
 
     #[test]
