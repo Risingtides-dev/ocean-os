@@ -4438,3 +4438,17 @@ area:      [backend]
 
 Landed TASK-40 (session titles vs Longhouse injection) as 82d187b3 on main — cut same-hour from smaths' switcher screenshot. Root cause: OCEAN-318 prepends the advisory block to req.prompt before the runtime persists the turn, so every new session's label collapsed to the boilerplate. Fix (fable builder sub, my review): all THREE injection sites (prompt path, create_request, agent_turn) thread the pre-injection prompt as an explicit persisted session title via with_display_title — agent_turn captures before EVERY layered prefix (room/operator guidance, folder-as-agent, longhouse, browser context), broader than the reported defect; session_display_title prefers the explicit title and falls back to a narrow marker-anchored strip for legacy polluted sessions, so old titles self-heal on read. Source-slice test asserts each site captures pre-injection. Gates: 180 agent + 512 daemon tests, fmt, clippy -D clean. I pushed and am bouncing the daemon to serve real titles.
 _________________________________________________________________________________
+
+time: [02:29pm] [07-19-26]
+agent: [ocean] [gpt-5]
+worktree: [public-onboarding-retirement-20260719]
+type: [security]: Private onboarding boundary
+area: [skills]: Bedrock coworker onboarding
+
+Retired the obsolete public `ocean-coworker-onboarding` skill after
+`ocean-bedrock` moved private. The private repository already owns the newer
+canonical `skills/ocean-bedrock-coworker-onboarding/SKILL.md` ceremony with
+invite redemption, local-only transport, secret exclusions, preview, and an
+explicit human acknowledgement gate; the older public token/bootstrap procedure
+was not copied. Verified with `cargo xtask docs-check`, `git diff --check`,
+and a tracked-reference search.

@@ -1,2 +1,0 @@
-name: Ocean Coworker Onboarding
-description: Use when a new coworker (or their agent) needs to connect to Ocean — get an ocean-bedrock API token, verify the connection, and wire their agent into the shared Ocean knowledge layer. Triggers on "onboard me to Ocean", "connect to ocean-bedrock", "get an Ocean token", "join the Ocean longhouse", or first-time Ocean setup on a new machine.
