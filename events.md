@@ -4513,3 +4513,11 @@ area:      backend
 
 TASK-53 landed 996c4b76: Sol (gpt-5.6 family) leaks DSML tool-call blocks as text even in MIXED turns with structured calls — smaths' live screenshot showed 7 structured calls then a trailing raw DSML block, which TASK-51's zero-structured-calls gate let through. Salvage now runs for known-leaker models whenever text exists, with a (name, parsed-args) dedupe against the turn's structured calls so a call emitted both ways never double-executes; ToolUse forced only when a salvaged call survives. Shared merge_dsml_salvage helper keeps codex.rs and openai.rs collectors identical; 3 new unit tests (mixed distinct, dedupe, non-leaker), 153 protocol tests green, fmt + clippy clean. Daemon rebuild + bounce follows this entry.
 _________________________________________________________________________________
+time:      [19:15] [19-07-26]
+agent:     [claude] [fable 5]
+worktree:  task-57-save-dir-fsync (fable builder sub, fable landed)
+type:      bug-report
+area:      backend
+
+TASK-57 landed 4d3e67c3 (daemon-core audit raw #2, cut ahead of codex verdict — spot-verified, disclosed): temp+rename saves fsynced the temp file but never the directory, so the rename was atomic but not durable. New crate::durable helper (durable_rename + unix-gated fsync_parent_dir) applied to all FOUR sites the sweep found — session save, oauth auth.json, projects list, yolo pref (which was also missing the temp fsync entirely). 194 agent tests + fmt + clippy green. Builder sub wedged twice mid-chain; fable took the lane over per announced protocol — also fixed a pre-existing doc_lazy_continuation clippy failure from TASK-50 that had made ocean-agent clippy-red on main. Gate lesson recorded: never pipe a gate command's output (a `| tail` swallowed clippy's failure and printed a false green this session — caught by reading the output, not the exit).
+_________________________________________________________________________________
