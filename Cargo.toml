@@ -10,6 +10,7 @@ members = [
   "crates/ocean-agent-sdk",
   "crates/ocean-ast",
   "crates/ocean-minimizer",
+  "crates/ocean-walker",
   "crates/ocean-providers",
   "crates/ocean-longhouse",
   "crates/ocean-heartbeat",
@@ -29,9 +30,10 @@ members = [
   "crates/ocean-observatory",
   "xtask",
 ]
-# ocean-ast and ocean-minimizer are standalone, unwired libraries; xtask is a
-# dev-only task runner (the cargo-xtask pattern). They compile under workspace
-# commands, but bare `cargo build` / `cargo test` skips them via default-members.
+# ocean-ast, ocean-minimizer, and ocean-walker are standalone, unwired libraries;
+# xtask is a dev-only task runner (the cargo-xtask pattern). They compile under
+# workspace commands, but bare `cargo build` / `cargo test` skips them via
+# default-members.
 # Invoke xtask explicitly:
 #   cargo xtask <cmd>        (alias in /.cargo/config.toml)
 #   cargo run -p xtask -- <cmd>
@@ -127,3 +129,8 @@ sha2 = "0.10"
 getrandom = "0.3"
 ocean-oauth = { path = "crates/ocean-oauth" }
 parking_lot = "0.12"
+globset = "0.4"
+ignore = "0.4"
+rayon = "1.12"
+libc = "0.2"
+windows-sys = "0.61"
