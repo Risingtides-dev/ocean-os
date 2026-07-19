@@ -103,6 +103,15 @@ pub enum Action {
     /// `/web` / `/desk` — open the bound session's chat in a sibling surface.
     /// The app owns the session id and the OS handoff; chat emits the intent.
     OpenInSurface(SurfaceTarget),
+    /// `/beam` — hand the bound session to ANOTHER device: the app resolves
+    /// the session-addressed URL and copies it, then follows up with
+    /// [`Action::BeamReady`] so chat renders the scannable QR + link.
+    BeamSession,
+    /// Follow-up to [`Action::BeamSession`] carrying the resolved URL. Chat
+    /// owns the QR rendering (pure half-block encoding) and transcript push.
+    BeamReady {
+        url: String,
+    },
     /// `+ new` on a project header in the rail: start a fresh session AND
     /// re-root the workbench (cwd for turns, file tree, graph) to `cwd`.
     NewSessionInProject {

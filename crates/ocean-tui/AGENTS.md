@@ -27,6 +27,11 @@ This crate owns the full-screen terminal steering cockpit (`ocean` binary) for i
   default `http://127.0.0.1:8790`, override via `OCEAN_SURFACE_URL`) and the
   Tauri desktop app consumes the `ocean://session/<id>` deep link. Both URL
   shapes are a cross-repo contract — change them only with ocean-surface.
+- `/beam` is the cross-device half of that contract: it copies the same
+  `?session=<id>` URL and renders it as an inverted Unicode half-block QR in
+  the transcript (dark modules on a light field for dark terminals). Point
+  `OCEAN_SURFACE_URL` at the public surface (e.g.
+  `https://ocean.agentsworld.org`) so beams land on reachable URLs.
 - The `shell/` workbench is the sole TUI. Do not reintroduce `--legacy`, nested TUI session resume, Track-0 room tabs, the mesh parity subcommand, or room-scoped `AgentTurnRequest` fields.
 - Do not introduce agent/session logic into the TUI; session state lives in the daemon via `ocean-agent`.
 

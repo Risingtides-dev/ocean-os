@@ -2319,6 +2319,9 @@ impl ChatComponent {
             // open; it answers with an honest notice when nothing is bound yet.
             "/web" => Some(Action::OpenInSurface(SurfaceTarget::Web)),
             "/desk" => Some(Action::OpenInSurface(SurfaceTarget::Desktop)),
+            // Cross-device handoff — the app resolves+copies the URL; the
+            // BeamReady follow-up comes back here for the QR render.
+            "/beam" => Some(Action::BeamSession),
             "/files" => Some(Action::Navigate(Nav::Files)),
             "/graph" => Some(Action::Navigate(Nav::Graph)),
             "/terminal" => Some(Action::Navigate(Nav::Terminal)),
@@ -2361,6 +2364,60 @@ impl ChatComponent {
             body.push_str(&format!("- `{}` — {}\n", c.name, c.desc));
         }
         self.turns.push(Turn::Assistant(body));
+    }
+
+    /// Push the `/beam` handoff into the transcript: a scannable QR (inside a
+    /// code fence so the markdown reflow can't mangle it) plus the URL in
+    /// line, which the app has already copied to the clipboard. The QR is
+    /// INVERTED for the dark chat bed — scanners want dark modules on a
+    /// light field, and here the filled half-blocks read as the light field.
+    /// A pane narrower than the code corrupts the scan, so the URL always
+    /// rides along as the copyable fallback.
+    fn push_beam(&mut self, url: &str) {
+        let mut body = String::from(
+            "# beam this chat\n\nScan to open it on your other device (first visit there asks for the surface login):\n\n```\n",
+        );
+        match Self::qr_lines(url) {
+            Some(rows) => {
+                for row in rows {
+                    body.push_str(&row);
+                    body.push('\n');
+                }
+            }
+            None => body.push_str("(link too long for a QR — use the URL below)\n"),
+        }
+        body.push_str("```\n\n`");
+        body.push_str(url);
+        body.push_str("` — copied to your clipboard\n");
+        self.turns.push(Turn::Assistant(body));
+        self.scroll_back = 0;
+    }
+
+    /// Render `content` as QR rows of Unicode half-blocks (two module rows
+    /// per terminal row, quiet zone on) with the module/field polarity
+    /// swapped for dark backgrounds. `None` when the content can't be encoded
+    /// (too long for a single code at EC level M).
+    fn qr_lines(content: &str) -> Option<Vec<String>> {
+        let code = qrcode::QrCode::with_error_correction_level(content, qrcode::EcLevel::M).ok()?;
+        let raw = code
+            .render::<qrcode::render::unicode::Dense1x2>()
+            .quiet_zone(true)
+            .build();
+        Some(
+            raw.lines()
+                .map(|line| {
+                    line.chars()
+                        .map(|c| match c {
+                            ' ' => '█',
+                            '█' => ' ',
+                            '▀' => '▄',
+                            '▄' => '▀',
+                            other => other,
+                        })
+                        .collect()
+                })
+                .collect(),
+        )
     }
 
     /// Render the floating command palette just above the composer. On the bare
@@ -3130,6 +3187,10 @@ impl Component for ChatComponent {
 
     fn update(&mut self, action: &Action) -> Option<Action> {
         match action {
+            Action::BeamReady { url } => {
+                self.push_beam(url);
+                return None;
+            }
             Action::ComposerInsert(text) => {
                 self.insert_at_cursor(text);
                 self.reset_history_nav();
@@ -4740,6 +4801,48 @@ mod tests {
             chat.run_slash("/desk", ""),
             Some(Action::OpenInSurface(SurfaceTarget::Desktop))
         ));
+        assert!(matches!(
+            chat.run_slash("/beam", ""),
+            Some(Action::BeamSession)
+        ));
+    }
+
+    #[test]
+    fn beam_ready_pushes_qr_and_url_into_the_transcript() {
+        let mut chat = ChatComponent::default();
+        let url = "https://ocean.agentsworld.org/?session=11111111-2222-4333-8444-555555555555";
+
+        chat.update(&Action::BeamReady {
+            url: url.to_string(),
+        });
+
+        let Some(Turn::Assistant(body)) = chat.turns.last() else {
+            panic!("beam should push an assistant turn");
+        };
+        // The fenced QR block (half-block glyphs) and the copyable URL both
+        // land in the transcript.
+        assert!(body.contains("```"), "QR must ride in a code fence: {body}");
+        assert!(body.contains('█'), "inverted QR rows expected: {body}");
+        assert!(body.contains(url), "the URL line is the fallback: {body}");
+    }
+
+    #[test]
+    fn qr_lines_are_rectangular_and_input_specific() {
+        let a = ChatComponent::qr_lines("https://example.com/?session=abc").unwrap();
+        let b = ChatComponent::qr_lines("https://example.com/?session=xyz").unwrap();
+
+        assert!(!a.is_empty());
+        let width = a[0].chars().count();
+        assert!(width >= 21, "a scannable code needs room: {width}");
+        assert!(
+            a.iter().all(|row| row.chars().count() == width),
+            "QR rows must stay rectangular or the scan corrupts"
+        );
+        assert!(a
+            .iter()
+            .flat_map(|row| row.chars())
+            .all(|c| matches!(c, ' ' | '█' | '▀' | '▄')));
+        assert_ne!(a, b, "different payloads must render different codes");
     }
 
     #[test]

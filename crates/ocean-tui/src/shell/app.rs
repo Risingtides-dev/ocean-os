@@ -1966,6 +1966,25 @@ impl App {
                 }
                 None => self.set_notice("no session yet — send a message first".into()),
             },
+            // `/beam`: hand the bound session to ANOTHER device. The app
+            // resolves the same session-addressed web URL `/web` opens
+            // (loopback by default; `OCEAN_SURFACE_URL` points it at the
+            // public surface), copies it for pasting anywhere, and chat
+            // renders the scannable QR on the BeamReady follow-up.
+            Action::BeamSession => match self.session_id {
+                Some(id) => {
+                    let url = surface_handoff_url(SurfaceTarget::Web, id);
+                    let text = url.clone();
+                    let tx = self.actions_tx.clone();
+                    tokio::spawn(async move {
+                        if let Err(e) = copy_to_clipboard(&text) {
+                            let _ = tx.send(Action::Status(format!("copy failed: {e}")));
+                        }
+                    });
+                    follow_up = Some(Action::BeamReady { url });
+                }
+                None => self.set_notice("no session yet — send a message first".into()),
+            },
             // `/model <id>`: remember the override for subsequent turns.
             Action::SetModel(id) => self.model_override = Some(id.clone()),
             // `/thinking <level>`: remember the override for subsequent turns.
@@ -6318,6 +6337,18 @@ mod tests {
         assert_eq!(app.status, "no session yet — send a message first");
 
         app.dispatch(Action::OpenInSurface(SurfaceTarget::Desktop));
+        assert_eq!(app.status, "no session yet — send a message first");
+    }
+
+    #[test]
+    fn beam_without_a_session_sets_an_honest_notice() {
+        // `/beam` with nothing bound must not copy, spawn, or render a QR —
+        // just say why.
+        let mut app = offline_app();
+        assert!(app.session_id.is_none());
+
+        app.dispatch(Action::BeamSession);
+
         assert_eq!(app.status, "no session yet — send a message first");
     }
 

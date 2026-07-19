@@ -64,6 +64,12 @@ pub const COMMANDS: &[SlashCommand] = &[
         soon: false,
     },
     SlashCommand {
+        name: "/beam",
+        desc: "beam this chat to another device (QR + copied link)",
+        group: "session",
+        soon: false,
+    },
+    SlashCommand {
         name: "/models",
         desc: "pick a model + thinking level (live registry)",
         group: "session",
@@ -362,6 +368,13 @@ mod tests {
             Some(false),
             "/login should be live, not a roadmap placeholder"
         );
+    }
+
+    #[test]
+    fn beam_is_registered_and_bea_ranks_it_first() {
+        assert!(is_command("/beam"), "/beam should be a live slash command");
+        let ranked = filter("bea");
+        assert_eq!(ranked[0].0.name, "/beam", "\"bea\" should rank /beam first");
     }
 
     #[test]
