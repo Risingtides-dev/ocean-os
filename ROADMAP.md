@@ -45,10 +45,15 @@ Ocean ports mechanisms into current owners rather than reproducing OMP package b
 - [x] Implement the standalone M1 command-output minimizer as a dependency-free,
       already-tokenized library with fixed conservative cargo/git/gh/npm/npx/pytest filters.
       It is intentionally outside `default-members` and has no live runtime wiring.
-- [ ] Design and review command-capture/runtime integration for `ocean-minimizer` over the
-      existing artifact and capability seams; adding the standalone crate did not enable a
-      harness-profile capability.
-- [ ] Implement a shared walker/search substrate as an independent reviewed checkpoint.
+- [x] Design the command-capture/runtime integration for `ocean-minimizer` over the existing
+      artifact and capability seams. The reviewed M2 design limits integration to explicitly
+      tokenized model-invoked Bash argv, keeps live/checkpoint/session history raw, minimizes only
+      active-run provider request clones, and pins exact recovery artifacts for that run; design
+      acceptance did not enable a harness-profile capability.
+- [ ] Implement the reviewed minimizer M2 design as a characterization-first checkpoint.
+- [ ] Port the standalone shared walker mechanism as an independent, unwired checkpoint.
+- [ ] Build a typed search engine over the accepted walker, then adopt it in live `grep`/`glob`
+      only after explicit parity review; do not bundle traversal, search, and runtime replacement.
 - [ ] Route isolation, task dispatch, typed yields, joins, budgets, and orchestration policy
       through the approved extension architecture; do not revive their superseded core placement.
 
