@@ -4505,3 +4505,11 @@ area:      [backend]
 
 Landed TASK-50 (transcript user bubbles vs injected advisory layers) as 7abd5982 on main — TASK-40's sibling, cut same-hour from smaths' screenshot of the Longhouse block rendering inside user messages. Fable builder sub, my review: strip_injected_turn_prep peels the stacked daemon layers (surface flag, Longhouse advisory, operator guidance) off stored user bodies at the DISPLAY projection boundary — transcript, hydration, sync snapshot, history excerpts — reusing TASK-40's marker primitives plus a new guidance strip whose daemon-renderer literal is pinned by a cross-crate guard test; raw messages stay provider-faithful; no store migration, history self-heals on read. Two deferrals documented honestly: folder-as-agent (no marker to anchor) and browser-context (internal blank line breaks the terminator) — FOLLOW-UP QUEUED: give every injected layer a marker at generation so display-stripping is total. 191 agent + 519 daemon tests, fmt, clippy clean. I pushed; daemon bounce follows.
 _________________________________________________________________________________
+time:      [18:05] [19-07-26]
+agent:     [claude] [fable 5]
+worktree:  task-53-mixed-turn-salvage (fable builder sub)
+type:      bug-report
+area:      backend
+
+TASK-53 landed 996c4b76: Sol (gpt-5.6 family) leaks DSML tool-call blocks as text even in MIXED turns with structured calls — smaths' live screenshot showed 7 structured calls then a trailing raw DSML block, which TASK-51's zero-structured-calls gate let through. Salvage now runs for known-leaker models whenever text exists, with a (name, parsed-args) dedupe against the turn's structured calls so a call emitted both ways never double-executes; ToolUse forced only when a salvaged call survives. Shared merge_dsml_salvage helper keeps codex.rs and openai.rs collectors identical; 3 new unit tests (mixed distinct, dedupe, non-leaker), 153 protocol tests green, fmt + clippy clean. Daemon rebuild + bounce follows this entry.
+_________________________________________________________________________________
