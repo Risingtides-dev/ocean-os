@@ -4463,3 +4463,29 @@ Implemented the first truthful workflow-graph rail slice by reusing Ocean TUI's 
 
 Verification: ocean-observatory 28 unit + 21 integration/redaction/store tests; ocean-tui 372 passed / 4 ignored; denied-warning Clippy for both crates; TUI release build; workspace check; formatting, docs-check, and diff-check. Live PTY smoke against the supervised daemon rendered the real Observatory snapshot (over 360 retained executions and 340 edges), auto-opened FLOW with current active nodes, expanded into center, and restored Files on the right. Three fresh review passes closed Elm-mutation, token-rotation, duplicate-view, render-bound, and malformed-SSE lifecycle findings; final review passed with no medium-or-higher issue.
 _________________________________________________________________________________
+time:      [14:12] [19-07-26]
+agent:     [pi] [gpt-5.6]
+worktree:  [feat/compact-session-sync]
+type:      [feature-request]
+area:      [backend]
+
+Implemented the coherent backend compact-synchronization prerequisite: non-blocking per-session compact admission with 409 busy conflicts, lease-protected compact/no-op public transcript snapshots, refresh-only session sync, pre-snapshot opaque agent-SSE fences, typed reset-required replay gaps for malformed/unavailable anchors and live lag, and visible-Text-only transcript/history projection. Raw provider messages retain thinking for compatible replay. Full daemon-wide pre-TurnStarted lease admission remains a separately identified lifecycle-hardening follow-up; this checkpoint does not activate TUI `/compact`.
+_________________________________________________________________________________
+_________________________________________________________________________________
+time:      [14:28] [19-07-26]
+agent:     [pi] [gpt-5.6]
+worktree:  [feat/compact-session-sync]
+type:      [workflow]
+area:      [backend]
+
+Completed the session-admission portion that the preceding 14:12 checkpoint left open. Known-session product, legacy prompt/request, call, and durable-room turns now acquire the shared non-blocking operation lease before TurnStarted or request registration and retain it through persistence plus terminal publication; config/message mutations use the same leased lane. Compact and refresh sync acquire that lease before emitting a real session-scoped SSE fence and capturing the visible transcript snapshot. Busy agent turns and compact/sync fail before lifecycle claims, eliminating the check-to-lock race described in the earlier entry.
+_________________________________________________________________________________
+_________________________________________________________________________________
+time:      [15:23] [19-07-26]
+agent:     [pi] [gpt-5.6]
+worktree:  [feat/compact-session-sync]
+type:      [issues]
+area:      [review]
+
+Closed every blocker from three adversarial review rounds. Session sync now projects directly from persisted messages with no SessionDetail/raw/tool/image copy, filters projectable rows before the 512-row cap, enforces the 1 MiB visible-text budget, and signals truncation. Every later session mutation publishes a scoped lifecycle/invalidation under the shared lease; legacy no-session requests pin ids before admission, and durable room triggers wait rather than drop. Replay gaps retain first-party event:error compatibility, reject empty/non-UTF8/foreign/unknown/evicted anchors, and expose only session-filtered diagnostic bounds. Compact acquires the busy lease before any existence read. Final independent release review approved with no blocker/high findings.
+_________________________________________________________________________________

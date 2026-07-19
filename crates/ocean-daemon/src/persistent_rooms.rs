@@ -29,8 +29,8 @@ use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 use super::{
-    build_prompt_control, core_sid, record_prompt_result, sdk_sid, sse_until_shutdown, AppState,
-    SSE_KEEPALIVE_INTERVAL,
+    build_prompt_control, core_sid, emit_session_changed, record_prompt_result, sdk_sid,
+    sse_until_shutdown, AppState, SSE_KEEPALIVE_INTERVAL,
 };
 use crate::request_control::register_running_request;
 use crate::room_federation::{AgentRegistrationInput, FederatedTriggerDispatch, IntentError};
@@ -1235,6 +1235,12 @@ fn spawn_room_agent_turn(
             decision_token: None,
         };
 
+        // The durable room trigger/audit footprint already committed before
+        // this spawned turn. Wait for the shared lane rather than dropping the
+        // acknowledged trigger; registration still happens only after admission.
+        let session_lease = state.runtime.session_operation(core_sid(session_id)).await;
+        emit_session_changed(&state.agent_events, session_id);
+
         let (_request_id, cancel) = register_running_request(
             &state.requests,
             &mut prompt_req,
@@ -1271,8 +1277,12 @@ fn spawn_room_agent_turn(
         #[cfg(test)]
         capture_room_turn(&agent.id, &prompt_req.prompt, &control);
 
-        let res = state.runtime.prompt(prompt_req, control).await;
+        let res = state
+            .runtime
+            .prompt_with_lease(prompt_req, control, &session_lease)
+            .await;
         record_prompt_result(&state, request_id, &res, None).await;
+        emit_session_changed(&state.agent_events, session_id);
 
         // Post the agent's reply back into the room as the agent participant.
         // The lock is taken synchronously here, after the await completed.

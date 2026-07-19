@@ -265,6 +265,30 @@ struct RuntimeState {
 ///
 /// Daemon-owned wrapper around `ocean-runtime` that adds Ocean's session,
 /// history, config, and permission layers on top of the underlying agent loop.
+/// Opaque ownership of one session's mutation lane. The guard is deliberately
+/// not exposed so callers cannot unlock early or operate on another id.
+pub struct SessionOperationLease {
+    id: SessionId,
+    _guard: tokio::sync::OwnedMutexGuard<()>,
+}
+
+impl SessionOperationLease {
+    pub fn session_id(&self) -> SessionId {
+        self.id
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SessionOperationBusy;
+
+impl std::fmt::Display for SessionOperationBusy {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("session has an active operation")
+    }
+}
+
+impl std::error::Error for SessionOperationBusy {}
+
 #[derive(Debug, Clone)]
 pub struct AgentRuntime {
     config_dir: PathBuf,
@@ -416,6 +440,27 @@ impl AgentRuntime {
         map.entry(id)
             .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
             .clone()
+    }
+
+    /// Acquire the shared mutation lane for a durable queued internal operation.
+    pub async fn session_operation(&self, id: SessionId) -> SessionOperationLease {
+        SessionOperationLease {
+            id,
+            _guard: self.session_lock(id).lock_owned().await,
+        }
+    }
+
+    /// Try to acquire the shared mutation lane without queueing. Interactive
+    /// admission and compaction use this so a busy session returns conflict
+    /// before any model call or lifecycle claim.
+    pub fn try_session_operation(
+        &self,
+        id: SessionId,
+    ) -> Result<SessionOperationLease, SessionOperationBusy> {
+        self.session_lock(id)
+            .try_lock_owned()
+            .map(|guard| SessionOperationLease { id, _guard: guard })
+            .map_err(|_| SessionOperationBusy)
     }
 
     /// Test-only view of the live per-session lock registry size, so prune
@@ -615,6 +660,27 @@ impl AgentRuntime {
     }
 
     pub async fn prompt(&self, req: PromptRequest, control: PromptControl) -> PromptResponse {
+        self.prompt_inner(req, control, None).await
+    }
+
+    /// Execute a turn under a daemon-admitted session operation lease. The
+    /// caller retains ownership so it can hold the same lease through terminal
+    /// lifecycle publication after this future returns.
+    pub async fn prompt_with_lease(
+        &self,
+        req: PromptRequest,
+        control: PromptControl,
+        lease: &SessionOperationLease,
+    ) -> PromptResponse {
+        self.prompt_inner(req, control, Some(lease)).await
+    }
+
+    async fn prompt_inner(
+        &self,
+        req: PromptRequest,
+        control: PromptControl,
+        lease: Option<&SessionOperationLease>,
+    ) -> PromptResponse {
         let request_id = req.request_id.unwrap_or_else(RequestId::new_v4);
         let mut req = req;
         req.request_id = Some(request_id);
@@ -735,7 +801,7 @@ impl AgentRuntime {
         // never fails over mid-stream: the moment any output streamed, the attempt
         // is final.
         let result = self
-            .run_turn_with_failover(req.clone(), control, effective, &env)
+            .run_turn_with_failover(req.clone(), control, effective, &env, lease)
             .await;
 
         match result {
@@ -863,6 +929,7 @@ impl AgentRuntime {
         control: PromptControl,
         state: RuntimeState,
         env: &ProviderEnv,
+        admitted_lease: Option<&SessionOperationLease>,
     ) -> anyhow::Result<(SessionId, String, String, TokenUsage)> {
         // Pin an implicit new session once for the whole primary+fallback
         // attempt. Otherwise each dispatch mints independently, orphaning the
@@ -879,8 +946,18 @@ impl AgentRuntime {
         // transaction. Releasing it between attempts would let another turn
         // append after the primary's accepted-user checkpoint, so the fallback
         // could reuse the wrong row or fail its invariant check.
-        let lock = self.session_lock(session_id);
-        let _turn_guard = lock.lock().await;
+        let owned_lease;
+        let _turn_lease = match admitted_lease {
+            Some(lease) if lease.session_id() == session_id => lease,
+            Some(_) => anyhow::bail!("session operation lease does not match prompt session"),
+            None => {
+                owned_lease = SessionOperationLease {
+                    id: session_id,
+                    _guard: self.session_lock(session_id).lock_owned().await,
+                };
+                &owned_lease
+            }
+        };
 
         let failed_provider = state.provider_config.selection.provider.clone();
         let (turn, effective_state) = match self
@@ -1313,8 +1390,19 @@ impl AgentRuntime {
         id: SessionId,
         text: String,
     ) -> anyhow::Result<bool> {
-        let lock = self.session_lock(id);
-        let _guard = lock.lock().await;
+        let lease = SessionOperationLease {
+            id,
+            _guard: self.session_lock(id).lock_owned().await,
+        };
+        self.append_session_message_with_lease(&lease, text)
+    }
+
+    pub fn append_session_message_with_lease(
+        &self,
+        lease: &SessionOperationLease,
+        text: String,
+    ) -> anyhow::Result<bool> {
+        let id = lease.id;
         let Some(mut session) = session::load_resumable(&self.config_dir, id)? else {
             return Ok(false);
         };
@@ -1337,14 +1425,57 @@ impl AgentRuntime {
         model: String,
         provider: String,
     ) -> anyhow::Result<Option<SessionDetail>> {
-        let lock = self.session_lock(id);
-        let _guard = lock.lock().await;
+        let lease = SessionOperationLease {
+            id,
+            _guard: self.session_lock(id).lock_owned().await,
+        };
+        self.set_session_model_with_lease(&lease, model, provider)
+    }
+
+    pub fn set_session_model_with_lease(
+        &self,
+        lease: &SessionOperationLease,
+        model: String,
+        provider: String,
+    ) -> anyhow::Result<Option<SessionDetail>> {
+        let id = lease.id;
         let Some(mut session) = session::load_resumable(&self.config_dir, id)? else {
             return Ok(None);
         };
         session.set_model(model, provider);
         session::save(&self.config_dir, &session)?;
         Ok(Some(session::session_detail(session)))
+    }
+
+    /// Read the authoritative public session projection under the same mutation
+    /// lane as turns/compact/config/message append. This is refresh-only: it
+    /// performs no provider call and never changes persistence.
+    pub async fn sync_session(
+        &self,
+        id: SessionId,
+    ) -> anyhow::Result<Option<ocean_core::SessionSyncSnapshot>> {
+        let lease = SessionOperationLease {
+            id,
+            _guard: self.session_lock(id).lock_owned().await,
+        };
+        self.sync_session_with_lease(&lease)
+    }
+
+    /// Check existence/readability without constructing the unbounded ordinary
+    /// `SessionDetail` projection. Callers already hold the matching lane.
+    pub fn session_exists_with_lease(&self, lease: &SessionOperationLease) -> anyhow::Result<bool> {
+        Ok(session::load_resumable(&self.config_dir, lease.id)?.is_some())
+    }
+
+    /// Read a synchronized public snapshot while the caller retains the
+    /// matching operation lease across daemon-side fence capture.
+    pub fn sync_session_with_lease(
+        &self,
+        lease: &SessionOperationLease,
+    ) -> anyhow::Result<Option<ocean_core::SessionSyncSnapshot>> {
+        Ok(session::load_resumable(&self.config_dir, lease.id)?
+            .as_ref()
+            .map(session::session_sync_snapshot))
     }
 
     /// Compact a session: replace the transcript with a model-generated summary
@@ -1361,7 +1492,27 @@ impl AgentRuntime {
         &self,
         id: SessionId,
     ) -> anyhow::Result<ocean_core::CompactResponse> {
+        let guard = self.session_lock(id).lock_owned().await;
+        let lease = SessionOperationLease { id, _guard: guard };
+        self.compact_session_with_lease(&lease).await
+    }
+
+    /// Non-blocking compact admission. `Err(SessionOperationBusy)` means some
+    /// turn/config/message/compact operation already owns this session lane.
+    pub async fn try_compact_session(
+        &self,
+        id: SessionId,
+    ) -> Result<anyhow::Result<ocean_core::CompactResponse>, SessionOperationBusy> {
+        let lease = self.try_session_operation(id)?;
+        Ok(self.compact_session_with_lease(&lease).await)
+    }
+
+    pub async fn compact_session_with_lease(
+        &self,
+        lease: &SessionOperationLease,
+    ) -> anyhow::Result<ocean_core::CompactResponse> {
         use futures::StreamExt as _;
+        let id = lease.id;
         use ocean_protocol::{stream_simple, AssistantMessageEvent, Context, StreamOptions};
         let start = std::time::Instant::now();
         let fail = |stderr: String, start: &std::time::Instant| ocean_core::CompactResponse {
@@ -1370,12 +1521,9 @@ impl AgentRuntime {
             wall_ms: start.elapsed().as_millis() as u64,
             elided_messages: 0,
             stderr,
+            sync: None,
+            fence: None,
         };
-
-        // Hold the per-session lock across the whole load → summarize → save
-        // cycle so a concurrent turn cannot interleave and lose its update.
-        let lock = self.session_lock(id);
-        let _guard = lock.lock().await;
 
         let Some(session) = session::load_resumable(&self.config_dir, id)? else {
             return Ok(fail("session not found".into(), &start));
@@ -1389,12 +1537,15 @@ impl AgentRuntime {
         // spending a model call.
         let split = compact_protected_split(&session.messages, model.context_window);
         if split == 0 {
+            let sync = session::session_sync_snapshot(&session);
             return Ok(ocean_core::CompactResponse {
                 ok: true,
                 session_id: id,
                 wall_ms: start.elapsed().as_millis() as u64,
                 elided_messages: 0,
                 stderr: "nothing to compact: the transcript fits in the protected window".into(),
+                sync: Some(sync),
+                fence: None,
             });
         }
 
@@ -1544,6 +1695,7 @@ impl AgentRuntime {
         updated.messages = new_messages;
         updated.updated_ms = ocean_protocol::now_ms();
         session::save(&self.config_dir, &updated)?;
+        let sync = session::session_sync_snapshot(&updated);
 
         Ok(ocean_core::CompactResponse {
             ok: true,
@@ -1551,6 +1703,8 @@ impl AgentRuntime {
             wall_ms: start.elapsed().as_millis() as u64,
             elided_messages,
             stderr: String::new(),
+            sync: Some(sync),
+            fence: None,
         })
     }
 
@@ -4065,6 +4219,33 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn try_compact_rejects_busy_session_but_not_a_different_session() {
+        let (rt, _calls) = compact_runtime("compact-busy", Vec::new());
+        let (busy_id, _) = seeded_session(&rt, vec![Message::user_text("busy")]);
+        let (other_id, _) = seeded_session(&rt, vec![Message::user_text("other")]);
+        let lease = rt.try_session_operation(busy_id).expect("first lease");
+
+        assert_eq!(
+            rt.try_compact_session(busy_id).await.unwrap_err(),
+            SessionOperationBusy
+        );
+        let other = rt
+            .try_compact_session(other_id)
+            .await
+            .expect("different session is independent")
+            .expect("other compact runs");
+        assert!(other.ok);
+        drop(lease);
+        let retry = rt
+            .try_compact_session(busy_id)
+            .await
+            .expect("released session admits")
+            .expect("retry runs");
+        assert!(retry.ok);
+        let _ = std::fs::remove_dir_all(&rt.config_dir);
+    }
+
+    #[tokio::test]
     async fn compact_session_provider_error_leaves_transcript_untouched() {
         let mut error = scripted_assistant("");
         error.stop_reason = ocean_protocol::StopReason::Error;
@@ -6256,11 +6437,18 @@ done
         session.replace_messages(vec![
             Message::user_text("inspect workspace"),
             Message::Assistant(AssistantMessage {
-                content: vec![Content::ToolCall {
-                    id: tool_call_id.clone(),
-                    name: "read".into(),
-                    arguments: serde_json::json!({"path": "README.md"}),
-                }],
+                content: vec![
+                    Content::text("visible answer"),
+                    Content::Thinking {
+                        thinking: "private reasoning sentinel".into(),
+                        thinking_signature: None,
+                    },
+                    Content::ToolCall {
+                        id: tool_call_id.clone(),
+                        name: "read".into(),
+                        arguments: serde_json::json!({"path": "README.md"}),
+                    },
+                ],
                 api: model.api.clone(),
                 provider: model.provider.clone(),
                 model: model.id.clone(),
@@ -6284,12 +6472,77 @@ done
             provider_config(ProviderId::Fake, "fake-ok", false),
         );
         let detail = runtime.session_detail(session.id).unwrap();
+        assert_eq!(detail.transcript[1].text, "visible answer");
+        assert!(!detail.transcript[1].text.contains("private reasoning"));
         assert_eq!(detail.tool_context.len(), 2);
         assert_eq!(detail.tool_context[0].kind, "call");
         assert_eq!(detail.tool_context[0].tool_name, "read");
         assert_eq!(detail.tool_context[1].kind, "result");
         assert_eq!(detail.tool_context[1].text, "contents");
+        let sync = session::session_sync_snapshot(&session);
+        assert_eq!(sync.transcript.len(), 2);
+        assert!(sync.transcript.iter().all(|entry| entry.role != "tool"));
+        assert!(sync.transcript.iter().all(|entry| entry.images.is_empty()));
+        assert!(sync
+            .transcript
+            .iter()
+            .all(|entry| !entry.text.contains("private reasoning") && entry.text != "contents"));
         let _ = std::fs::remove_dir_all(config_dir);
+    }
+
+    #[test]
+    fn session_sync_snapshot_bounds_rows_and_text_without_full_detail_projection() {
+        let model =
+            model_from_provider_config(&provider_config(ProviderId::Fake, "fake-ok", false))
+                .unwrap();
+        let mut session = session::Session::new(&model);
+        let mut messages = vec![Message::ToolResult(ocean_protocol::ToolResultMessage {
+            tool_call_id: "secret-call".into(),
+            tool_name: "read".into(),
+            content: vec![Content::text("secret tool output")],
+            is_error: false,
+            timestamp: ocean_protocol::now_ms(),
+        })];
+        messages.extend((0..514).map(|index| Message::user_text(format!("visible-{index}"))));
+        session.replace_messages(messages);
+        let sync = session::session_sync_snapshot(&session);
+        assert_eq!(
+            sync.transcript.len(),
+            ocean_core::SESSION_SYNC_MAX_VISIBLE_MESSAGES
+        );
+        assert_eq!(sync.truncated_messages, 2);
+        assert!(sync.transcript.iter().all(|entry| entry.role == "user"));
+
+        let mut tool_only = vec![Message::user_text("visible row survives")];
+        tool_only.extend((0..513).map(|index| {
+            Message::Assistant(AssistantMessage {
+                content: vec![Content::ToolCall {
+                    id: format!("call-{index}"),
+                    name: "read".into(),
+                    arguments: serde_json::json!({"path": "README.md"}),
+                }],
+                api: model.api.clone(),
+                provider: model.provider.clone(),
+                model: model.id.clone(),
+                usage: Usage::default(),
+                stop_reason: StopReason::ToolUse,
+                error_message: None,
+                timestamp: ocean_protocol::now_ms(),
+            })
+        }));
+        session.replace_messages(tool_only);
+        let sync = session::session_sync_snapshot(&session);
+        assert_eq!(sync.transcript.len(), 1);
+        assert_eq!(sync.transcript[0].text, "visible row survives");
+        assert_eq!(sync.truncated_messages, 0);
+
+        session.replace_messages(vec![Message::user_text(
+            "é".repeat((ocean_core::SESSION_SYNC_MAX_VISIBLE_TEXT_BYTES / 2) + 16),
+        )]);
+        let sync = session::session_sync_snapshot(&session);
+        assert_eq!(sync.transcript.len(), 1);
+        assert!(sync.transcript[0].text.len() <= ocean_core::SESSION_SYNC_MAX_VISIBLE_TEXT_BYTES);
+        assert!(sync.truncated_text_bytes > 0);
     }
 
     // ---- OCEAN-250: collection-list pagination -----------------------------

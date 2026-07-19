@@ -1050,6 +1050,123 @@ pub(crate) fn session_detail(session: Session) -> SessionDetail {
     }
 }
 
+fn sync_message_is_projectable(message: &Message) -> bool {
+    let content = match message {
+        Message::User { content, .. } => content,
+        Message::Assistant(assistant) => &assistant.content,
+        Message::ToolResult(_) => return false,
+    };
+    content.iter().any(|block| match block {
+        Content::Text { text } => !text.is_empty(),
+        Content::Image { .. } => true,
+        _ => false,
+    })
+}
+
+pub(crate) fn session_sync_snapshot(session: &Session) -> ocean_core::SessionSyncSnapshot {
+    let visible_count = session
+        .messages
+        .iter()
+        .filter(|message| sync_message_is_projectable(message))
+        .count();
+    let mut transcript = Vec::new();
+    let mut used_text_bytes = 0usize;
+    let mut truncated_text_bytes = 0u64;
+
+    for message in session
+        .messages
+        .iter()
+        .rev()
+        .filter(|message| sync_message_is_projectable(message))
+        .take(ocean_core::SESSION_SYNC_MAX_VISIBLE_MESSAGES)
+    {
+        let remaining =
+            ocean_core::SESSION_SYNC_MAX_VISIBLE_TEXT_BYTES.saturating_sub(used_text_bytes);
+        if remaining == 0 {
+            break;
+        }
+        let (role, content, timestamp_ms, is_error) = match message {
+            Message::User { content, timestamp } => ("user", content, Some(*timestamp), None),
+            Message::Assistant(assistant) => (
+                "assistant",
+                &assistant.content,
+                Some(assistant.timestamp),
+                assistant.error_message.as_ref().map(|_| true),
+            ),
+            Message::ToolResult(_) => unreachable!("tool rows filtered above"),
+        };
+        let (mut text, omitted) = visible_text_tail(content, remaining);
+        if text.is_empty()
+            && content
+                .iter()
+                .any(|block| matches!(block, Content::Image { .. }))
+        {
+            const IMAGE_MARKER: &str = "[image attachment]";
+            text.push_str(&IMAGE_MARKER[..IMAGE_MARKER.len().min(remaining)]);
+        }
+        if text.is_empty() {
+            continue;
+        }
+        used_text_bytes = used_text_bytes.saturating_add(text.len());
+        truncated_text_bytes = truncated_text_bytes.saturating_add(omitted as u64);
+        transcript.push(SessionTranscriptEntry {
+            role: role.into(),
+            timestamp_ms,
+            text,
+            images: Vec::new(),
+            tool_call_id: None,
+            tool_name: None,
+            is_error,
+        });
+        if omitted > 0 {
+            break;
+        }
+    }
+    transcript.reverse();
+
+    ocean_core::SessionSyncSnapshot {
+        session_id: session.id,
+        model: session.model.clone(),
+        provider: session.provider.clone(),
+        truncated_messages: visible_count.saturating_sub(transcript.len()) as u64,
+        truncated_text_bytes,
+        transcript,
+    }
+}
+
+fn visible_text_tail(content: &[Content], max_bytes: usize) -> (String, usize) {
+    let total = content.iter().fold(0usize, |total, block| match block {
+        Content::Text { text } => total.saturating_add(text.len()),
+        _ => total,
+    });
+    let mut skip = total.saturating_sub(max_bytes);
+    let mut output = String::with_capacity(total.min(max_bytes));
+    for block in content {
+        let Content::Text { text } = block else {
+            continue;
+        };
+        if skip >= text.len() {
+            skip -= text.len();
+            continue;
+        }
+        let mut start = skip;
+        while start < text.len() && !text.is_char_boundary(start) {
+            start += 1;
+        }
+        skip = 0;
+        output.push_str(&text[start..]);
+    }
+    if output.len() > max_bytes {
+        let mut start = output.len() - max_bytes;
+        while start < output.len() && !output.is_char_boundary(start) {
+            start += 1;
+        }
+        output = output[start..].to_string();
+    }
+    let omitted = total.saturating_sub(output.len());
+    (output, omitted)
+}
+
 pub(super) fn transcript_entry(message: &Message) -> SessionTranscriptEntry {
     match message {
         Message::User { content, timestamp } => SessionTranscriptEntry {
@@ -1115,12 +1232,14 @@ fn tool_context_entries(message: &Message) -> Vec<SessionToolContext> {
     }
 }
 
+/// Public/display transcript text. Provider reasoning remains in raw persisted
+/// messages for same-provider replay, but is never projected to clients or
+/// indexed by history search.
 fn text_from_content(content: &[Content]) -> String {
     content
         .iter()
         .filter_map(|content| match content {
             Content::Text { text } => Some(text.as_str()),
-            Content::Thinking { thinking, .. } => Some(thinking.as_str()),
             _ => None,
         })
         .collect::<Vec<_>>()
@@ -1235,9 +1354,16 @@ mod history_search_tests {
         if let Message::User { timestamp, .. } = &mut lexical {
             *timestamp = 150;
         }
+        let mut assistant = assistant_text("The blue ocean deployment is ready.", 200);
+        if let Message::Assistant(message) = &mut assistant {
+            message.content.push(Content::Thinking {
+                thinking: "private reasoning sentinel must never be searched".into(),
+                thinking_signature: None,
+            });
+        }
         let session = stored_session(vec![
             lexical,
-            assistant_text("The blue ocean deployment is ready.", 200),
+            assistant,
             Message::ToolResult(ocean_protocol::ToolResultMessage {
                 tool_call_id: "secret-call".into(),
                 tool_name: "provider_payload".into(),
@@ -1259,6 +1385,12 @@ mod history_search_tests {
         assert!(hits
             .iter()
             .all(|hit| hit.hit_id.starts_with(&session.id.to_string())));
+        assert!(
+            search_history(tmp.path(), "private reasoning sentinel", 20)
+                .unwrap()
+                .is_empty(),
+            "provider thinking must not enter history search"
+        );
     }
 
     #[test]
