@@ -1005,33 +1005,79 @@ fn strip_operator_guidance_block(text: &str) -> &str {
     text
 }
 
+/// Strip a leading folder-as-agent instruction block (TASK-54). Both daemon
+/// injection sites (`agent_turn` in `main.rs` and the persistent-room convene
+/// path) wrap the resolved `instructions.md` in an explicit
+/// `[folder-agent instructions]` … `[end folder-agent instructions]` frame via
+/// `compose_folder_agent_prompt`, so the layer is strippable even though the
+/// instructions body may itself contain blank lines (which would defeat the
+/// `\n\n`-terminated peel the other layers use). Anchored on the exact header
+/// line and bounded by the exact footer line, so genuine user text is untouched
+/// unless it reproduces BOTH sentinels. Kept in sync with the daemon renderer by
+/// `folder_agent_block_anchors_display_strip_marker` in ocean-daemon.
+fn strip_folder_agent_block(text: &str) -> &str {
+    const HEADER: &str = "[folder-agent instructions]\n";
+    const FOOTER: &str = "\n[end folder-agent instructions]\n\n";
+    if let Some(rest) = text.strip_prefix(HEADER) {
+        if let Some(idx) = rest.find(FOOTER) {
+            return rest[idx + FOOTER.len()..].trim_start();
+        }
+    }
+    text
+}
+
+/// Strip a leading `## Browser context` block (TASK-54). `apply_browser_context`
+/// in the daemon renders the surface-supplied tab state as a header line, a fixed
+/// description line, and one-line bullets, then `\n\n{prompt}` — with NO internal
+/// blank line, so the first `\n\n` cleanly bounds the block (the earlier layout
+/// carried a blank line after the header and could not be peeled). Anchored on the
+/// two-line header+description prefix rather than the bare `## Browser context`
+/// heading so a user message that merely opens with that heading is not stripped.
+/// Kept in sync with the daemon renderer by
+/// `browser_context_block_anchors_display_strip_marker` in ocean-daemon.
+fn strip_browser_context_block(text: &str) -> &str {
+    const MARKER: &str =
+        "## Browser context\nThe operator's browser surface reported this live state:\n";
+    if text.starts_with(MARKER) {
+        if let Some(idx) = text.find("\n\n") {
+            return text[idx + 2..].trim_start();
+        }
+    }
+    text
+}
+
 /// Peel the daemon-injected turn-prep layers off the front of a stored
 /// user-message body, for DISPLAY only (TASK-50). The runtime persists the fully
 /// composed prompt the model saw — the surface flag plus whatever steering blocks
 /// the daemon prepended plus the user's words — but a product transcript must
 /// render the user's own words, not the injected preamble. Reuses the same
 /// marker-anchored primitives the session-label derivation uses
-/// ([`strip_surface_flag`], [`strip_longhouse_block`],
+/// ([`strip_surface_flag`], [`strip_browser_context_block`],
+/// [`strip_longhouse_block`], [`strip_folder_agent_block`],
 /// [`strip_operator_guidance_block`]) so each marker has a single source of
-/// truth. The daemon STACKS layers (`[FLAG] {longhouse}\n\n{guidance}\n\n
-/// {prompt}`), so this peels in a loop: each pass removes at most one leading
-/// layer and repeats until the front no longer matches a known marker. A body
-/// that never opened with a known marker is returned byte-for-byte (no false
-/// strips) — the anchoring is exact-prefix, so genuine user text that merely
-/// mentions a marker mid-line is untouched.
+/// truth. The daemon STACKS layers (`[FLAG] {browser}\n\n{longhouse}\n\n
+/// {folder-agent}\n\n{guidance}\n\n{prompt}`), so this peels in a loop: each pass
+/// removes at most one leading layer and repeats until the front no longer
+/// matches a known marker. The loop is order-tolerant — every optional layer may
+/// be absent — because it re-tries all anchors each pass against whatever now
+/// leads. A body that never opened with a known marker is returned byte-for-byte
+/// (no false strips): the anchoring is exact-prefix, so genuine user text that
+/// merely mentions a marker mid-line is untouched.
 ///
-/// DEFERRED (documented, intentionally not stripped): the folder-as-agent
-/// instruction prefix has no marker to anchor on, and the `## Browser context`
-/// block carries an internal blank line so the shared `\n\n` terminator cannot
-/// bound it. Both are left intact rather than risk truncating genuine content;
-/// when either leads (folder-agent / surface-extension turns) it also shadows an
-/// inner Longhouse block from this peel. See the TASK-50 report.
+/// TASK-54 closed the two former deferrals: the folder-as-agent instruction layer
+/// is now framed with `[folder-agent instructions]` … `[end folder-agent
+/// instructions]` sentinels at generation, and the `## Browser context` block no
+/// longer carries an internal blank line, so both peel deterministically here.
 fn strip_injected_turn_prep(text: &str) -> &str {
     let mut cur = text;
     loop {
         // Each sub-strip returns either `cur` unchanged or a strictly shorter
-        // suffix, so an unchanged length is a sound fixpoint signal.
-        let peeled = strip_operator_guidance_block(strip_longhouse_block(strip_surface_flag(cur)));
+        // suffix, so an unchanged length is a sound fixpoint signal. Composed in
+        // the daemon's front-to-back stack order for a single-pass peel; the
+        // outer loop keeps it order-tolerant when layers are absent or reordered.
+        let peeled = strip_operator_guidance_block(strip_folder_agent_block(
+            strip_longhouse_block(strip_browser_context_block(strip_surface_flag(cur))),
+        ));
         if peeled.len() == cur.len() {
             return peeled;
         }
@@ -1677,6 +1723,13 @@ mod body_strip_tests {
          action through the normal permission gates):";
     /// The real daemon operator-guidance header (see `render_turn_guidance`).
     const GUIDANCE_MARKER: &str = "Operator guidance for this turn:";
+    /// The real daemon folder-as-agent sentinels (see `compose_folder_agent_prompt`).
+    const FOLDER_AGENT_HEADER: &str = "[folder-agent instructions]";
+    const FOLDER_AGENT_FOOTER: &str = "[end folder-agent instructions]";
+    /// The real daemon `## Browser context` header + fixed description line (see
+    /// `apply_browser_context`); the body strip anchors on this exact two-line prefix.
+    const BROWSER_MARKER: &str =
+        "## Browser context\nThe operator's browser surface reported this live state:";
 
     fn user_and_reply(bodies: &[&str]) -> Session {
         let mut s = Session::new_with_id(
@@ -1799,24 +1852,81 @@ mod body_strip_tests {
         assert_eq!(strip_injected_turn_prep("plain words"), "plain words");
     }
 
-    /// DEFERRED layers stay intact (documented limitation): a folder-as-agent
-    /// instruction prefix (no marker) and a `## Browser context` block (internal
-    /// blank line) are not stripped, and when a browser block leads it shadows
-    /// the inner Longhouse block too. This pins the deferral so a future change
-    /// that starts stripping them is a conscious one.
+    /// TASK-54: a standalone folder-as-agent block — whose instructions body has
+    /// its OWN internal blank line — strips to the user's words. The sentinel
+    /// frame (not a `\n\n` terminator) bounds it, so the blank line inside the
+    /// instructions does not truncate the peel early.
     #[test]
-    fn strip_defers_unmarked_and_multiparagraph_layers() {
-        let folder_agent = "[TUI] You are the deploy agent. Follow the runbook.\n\nship it";
-        assert_eq!(
-            strip_injected_turn_prep(folder_agent),
-            folder_agent.trim_start_matches("[TUI] ")
+    fn strip_peels_folder_agent_block() {
+        let body = format!(
+            "[TUI] {FOLDER_AGENT_HEADER}\nYou are the deploy agent.\n\nFollow the runbook.\n\
+             {FOLDER_AGENT_FOOTER}\n\nship it"
         );
+        assert_eq!(strip_injected_turn_prep(&body), "ship it");
+    }
+
+    /// TASK-54: a standalone `## Browser context` block strips to the user's
+    /// words now that the layer carries no internal blank line.
+    #[test]
+    fn strip_peels_browser_context_block() {
+        let body = format!(
+            "[TAURI] {BROWSER_MARKER}\n- Active tab: A Post (https://x)\n\nsummarize this page"
+        );
+        assert_eq!(strip_injected_turn_prep(&body), "summarize this page");
+    }
+
+    /// TASK-54: every optional layer stacked in the daemon's front-to-back order
+    /// (flag, browser, longhouse, folder-agent, guidance) peels in one call down
+    /// to the user's words.
+    #[test]
+    fn strip_peels_all_layers_stacked() {
+        let body = format!(
+            "[WEB] {BROWSER_MARKER}\n- Active tab: A (https://a)\n\n\
+             {LONGHOUSE_MARKER}\n- skill-a\n\n\
+             {FOLDER_AGENT_HEADER}\nBe the deploy agent.\n\nRun the runbook.\n{FOLDER_AGENT_FOOTER}\n\n\
+             {GUIDANCE_MARKER}\n- terse\n\nland the migration"
+        );
+        assert_eq!(strip_injected_turn_prep(&body), "land the migration");
+    }
+
+    /// TASK-54: order tolerance — the two new layers still strip when the layers
+    /// that would normally precede them (browser/longhouse) are absent.
+    #[test]
+    fn strip_peels_new_layers_when_optional_layers_absent() {
+        // Folder-agent directly under the flag (no browser/longhouse ahead of it).
+        let folder =
+            format!("[TUI] {FOLDER_AGENT_HEADER}\ndeploy agent\n{FOLDER_AGENT_FOOTER}\n\ndo it");
+        assert_eq!(strip_injected_turn_prep(&folder), "do it");
+        // Browser directly under the flag, followed straight by guidance.
         let browser = format!(
-            "[TAURI] ## Browser context\n\nThe operator's browser surface reported this live state:\n\
-             - Active tab: https://x (X)\n\n{LONGHOUSE_MARKER}\n- s\n\ndo the thing"
+            "[TAURI] {BROWSER_MARKER}\n- Active tab: A (https://a)\n\n{GUIDANCE_MARKER}\n- terse\n\ngo"
         );
-        // Flag peeled; the browser block (and the Longhouse block it shadows)
-        // remain — the strip stops at the multi-paragraph browser block.
-        assert!(strip_injected_turn_prep(&browser).starts_with("## Browser context"));
+        assert_eq!(strip_injected_turn_prep(&browser), "go");
+    }
+
+    /// TASK-54: user text that merely resembles the new markers is NOT stripped.
+    /// A bare `## Browser context` heading (without the fixed description line)
+    /// and an unclosed `[folder-agent instructions]` header are left byte-for-byte.
+    #[test]
+    fn strip_leaves_coincidental_new_marker_text_unchanged() {
+        // Bare heading, no description line -> not the browser anchor.
+        let heading = "## Browser context is a feature I want\n\nplease scope it";
+        assert_eq!(strip_injected_turn_prep(heading), heading);
+        // Header present but no matching footer sentinel -> not a folder block.
+        let no_footer = format!("{FOLDER_AGENT_HEADER}\nwhat does this marker mean?");
+        assert_eq!(strip_injected_turn_prep(&no_footer), no_footer);
+    }
+
+    /// TASK-54: stripping is idempotent — peeling an already-stripped body (or the
+    /// fully-stacked body twice) yields the same result as one pass.
+    #[test]
+    fn strip_is_idempotent_across_new_layers() {
+        let body = format!(
+            "[WEB] {BROWSER_MARKER}\n- Active tab: A (https://a)\n\n\
+             {FOLDER_AGENT_HEADER}\ndeploy\n{FOLDER_AGENT_FOOTER}\n\nship it"
+        );
+        let once = strip_injected_turn_prep(&body).to_string();
+        assert_eq!(once, "ship it");
+        assert_eq!(strip_injected_turn_prep(&once), once);
     }
 }

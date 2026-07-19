@@ -6152,7 +6152,7 @@ async fn agent_turn(
     ) = match resolve_named_agent(agent.as_deref().unwrap_or("")) {
         Ok(resolved) => {
             let prompt = match resolved.instructions_layer {
-                Some(instr) => format!("{instr}\n\n{guided_prompt}"),
+                Some(instr) => compose_folder_agent_prompt(&instr, &guided_prompt),
                 None => guided_prompt,
             };
             (
@@ -6892,6 +6892,28 @@ fn apply_turn_guidance(guidance: Option<&[String]>, prompt: &str) -> String {
     }
 }
 
+/// Sentinel lines that frame a folder-as-agent's `instructions.md` when it is
+/// prepended to a turn prompt (TASK-54). The model reads the bracketed
+/// instructions verbatim — the sentinels are part of the injected text — but
+/// anchoring the layer at generation lets `strip_injected_turn_prep` in
+/// ocean-agent peel the whole `[folder-agent instructions] … [end folder-agent
+/// instructions]` frame off DISPLAY projections. An explicit footer (rather than
+/// the `\n\n` terminator the other layers use) is required because an
+/// instructions body may itself contain blank lines. Kept in sync with the
+/// stripper's literals by `folder_agent_block_anchors_display_strip_marker`.
+const FOLDER_AGENT_HEADER: &str = "[folder-agent instructions]";
+const FOLDER_AGENT_FOOTER: &str = "[end folder-agent instructions]";
+
+/// Prepend a folder-as-agent's `instructions` above `prompt` as a marker-anchored
+/// steering layer (see [`FOLDER_AGENT_HEADER`]). `instructions` is the trimmed
+/// `instructions.md`; the header/footer lines bound it so a display projection can
+/// strip the layer deterministically even when the instructions body contains its
+/// own blank lines. The single source of truth for the folder-as-agent frame,
+/// shared by `agent_turn` and the persistent-room convene path.
+fn compose_folder_agent_prompt(instructions: &str, prompt: &str) -> String {
+    format!("{FOLDER_AGENT_HEADER}\n{instructions}\n{FOLDER_AGENT_FOOTER}\n\n{prompt}")
+}
+
 /// OCEAN-40 (Phase 2): fold the client-supplied browser context into the turn
 /// prompt as a compact, additive `## Browser context` block, the same purely
 /// prompt-layering seam room/operator/longhouse guidance uses — it touches no
@@ -6987,8 +7009,15 @@ fn apply_browser_context(
     // `lines` is non-empty here: a resolved active tab always pushes its line
     // above (the function returned early otherwise), so the block always has a
     // "this tab" anchor.
+    // TASK-54: header and description sit on consecutive lines (no blank line
+    // between them) so the block carries NO internal `\n\n` — the first blank
+    // line is the terminator before `{prompt}`. That lets the display stripper
+    // (`strip_browser_context_block` in ocean-agent, anchored on this exact
+    // two-line prefix) peel the layer deterministically. `lines` are all single
+    // inline bullets (newlines in tab fields are collapsed by
+    // `sanitize_browser_field`), so no bullet introduces a stray blank line.
     format!(
-        "## Browser context\n\nThe operator's browser surface reported this live state:\n{}\n\n{prompt}",
+        "## Browser context\nThe operator's browser surface reported this live state:\n{}\n\n{prompt}",
         lines.join("\n")
     )
 }
@@ -10813,6 +10842,49 @@ mod tests {
         let block = render_turn_guidance(Some(&["be terse".to_string()]))
             .expect("non-empty guidance renders a block");
         assert!(block.starts_with("Operator guidance for this turn:"));
+    }
+
+    /// TASK-54 cross-crate guard: ocean-agent's `strip_folder_agent_block` anchors
+    /// on the exact `[folder-agent instructions]` header and `[end folder-agent
+    /// instructions]` footer this composer emits. Keep the literals in sync — if
+    /// either sentinel changes, the display strip silently stops matching and the
+    /// folder-as-agent instructions would leak into user bubbles. The generated
+    /// text opens with the header line and encloses the instructions before the
+    /// footer line, and the `\n\n` terminator precedes the user's prompt.
+    #[test]
+    fn folder_agent_block_anchors_display_strip_marker() {
+        let composed = compose_folder_agent_prompt("be the deploy agent", "ship it");
+        assert!(composed.starts_with("[folder-agent instructions]\n"));
+        assert!(composed.contains("\n[end folder-agent instructions]\n\n"));
+        assert!(composed.ends_with("ship it"));
+        // The whole frame precedes the user's prompt.
+        assert!(
+            composed.find("[end folder-agent instructions]").unwrap()
+                < composed.find("ship it").unwrap()
+        );
+    }
+
+    /// TASK-54 cross-crate guard: ocean-agent's `strip_browser_context_block`
+    /// anchors on this exact `## Browser context` header + fixed description line,
+    /// and relies on the block carrying NO internal blank line (the first `\n\n`
+    /// must be the terminator before the prompt). Keep this in sync with that
+    /// stripper. Asserts the two-line anchor prefix and that the only `\n\n` in the
+    /// block is the one bounding the prompt.
+    #[test]
+    fn browser_context_block_anchors_display_strip_marker() {
+        let browser = ocean_agent_sdk::BrowserContext {
+            active_tab_url: Some("https://example.com".into()),
+            active_tab_title: Some("Example".into()),
+            tabs: Vec::new(),
+        };
+        let out = apply_browser_context("summarize", Some(&browser));
+        assert!(out.starts_with(
+            "## Browser context\nThe operator's browser surface reported this live state:\n"
+        ));
+        // Exactly one `\n\n` (the terminator before the prompt); no internal blank
+        // line that would defeat the display strip's `\n\n` bound.
+        assert_eq!(out.matches("\n\n").count(), 1);
+        assert!(out.ends_with("\n\nsummarize"));
     }
 
     #[test]

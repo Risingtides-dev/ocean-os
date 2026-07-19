@@ -1202,7 +1202,7 @@ fn spawn_room_agent_turn(
         // Prepend the resolved agent's instructions as a steering layer, exactly
         // as `agent_turn` does for a named folder-as-agent.
         let prompt = match resolved.instructions_layer {
-            Some(instr) => format!("{instr}\n\n{prompt}"),
+            Some(instr) => super::compose_folder_agent_prompt(&instr, &prompt),
             None => prompt,
         };
 
@@ -2626,9 +2626,11 @@ mod tests {
         let capture = wait_for_turn_capture("bound-agent")
             .await
             .expect("federated dispatch must run the bound local agent");
-        assert!(capture
-            .prompt
-            .starts_with("FEDERATED_AGENT_INSTRUCTIONS\n\n"));
+        // TASK-54: the instructions layer is framed with the folder-as-agent
+        // sentinels for display stripping.
+        assert!(capture.prompt.starts_with(
+            "[folder-agent instructions]\nFEDERATED_AGENT_INSTRUCTIONS\n[end folder-agent instructions]\n\n"
+        ));
         tokio::time::timeout(std::time::Duration::from_secs(2), async {
             loop {
                 let outbox = with_rooms(&state, |store| store.pending_outbox(&key)).unwrap();
@@ -3461,7 +3463,12 @@ env = { FIXTURE = "1" }
         let capture = wait_for_turn_capture("bound-agent")
             .await
             .expect("resolved room turn must reach runtime dispatch");
-        assert!(capture.prompt.starts_with("BOUND_AGENT_INSTRUCTIONS\n\n"));
+        // TASK-54: the instructions layer is framed with the folder-as-agent
+        // sentinels so display projections can strip it; the frame encloses the
+        // instructions and terminates before the user's prompt.
+        assert!(capture
+            .prompt
+            .starts_with("[folder-agent instructions]\nBOUND_AGENT_INSTRUCTIONS\n[end folder-agent instructions]\n\n"));
         assert_eq!(
             capture.tool_allowlist,
             Some(vec!["read".to_string(), "glob".to_string()])
