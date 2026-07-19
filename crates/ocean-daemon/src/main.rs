@@ -18644,8 +18644,10 @@ mod tests {
                 + 2;
             assert_eq!(
                 &production_main[parent_import_start..parent_import_end],
-                "use longhouse_governance_control::{\n    longhouse_board_post, longhouse_breach, longhouse_claim, longhouse_recall, longhouse_revoke,\n    with_titles,\n};"
+                "use longhouse_governance_control::{\n    longhouse_board_post, longhouse_breach, longhouse_claim, longhouse_recall, longhouse_revoke,\n};"
             );
+            assert!(production_main
+                .contains("#[cfg(test)]\nuse longhouse_governance_control::with_titles;"));
             std::fs::read_to_string(&extracted).unwrap()
         } else {
             assert!(!production_main.contains("mod longhouse_governance_control;"));
