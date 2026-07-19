@@ -1165,9 +1165,11 @@ impl Provider for CodexProvider {
             }
             // DSML salvage: gpt-5.6-family models (Sol observed live
             // 2026-07-18) sometimes emit DeepSeek DSML tool-call markup as
-            // literal text instead of a structured function call. Same
-            // conservative rules as the OpenAI-compat collector: zero
-            // structured calls, well-formed tail block only.
+            // literal text instead of a structured function call — often
+            // INTERLEAVED with explanation prose (TASK-51). Same conservative
+            // gate as the OpenAI-compat collector (zero structured calls, known
+            // leaker model); the shared helper lifts every well-formed block
+            // out wherever it lands and preserves the surrounding prose.
             let finalized_tool_calls: Vec<_> = tool_calls.finalize();
             let mut salvaged_calls: Vec<(String, Value)> = Vec::new();
             if finalized_tool_calls.is_empty() && model_id.starts_with("gpt-5.6") {
