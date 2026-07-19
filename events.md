@@ -4396,3 +4396,11 @@ Verification:
 - Removed the two public GitHub links to the now-private repo (`README.md`, `docs/OCEAN_PROJECT_MAP.md`), marked Bedrock as private/optional in `OCEAN.md`, and added a visibility statement to the project map: no public Ocean feature may hard-require Bedrock.
 - `skills/ocean-coworker-onboarding/` flagged for relocation to the private Bedrock repo in a later slice (no secrets present; it is internal onboarding for a private service).
 - Verified: `cargo xtask docs-check` PASS; no remaining `github.com/Risingtides-dev/ocean-bedrock` references in active docs.
+
+time:  [03:01pm] [19-07-26]
+agent: ocean-tauri, codex
+worktree: [main]
+type:  [feature]
+
+Expanded the pre-session Voice Planner from proposal-only context blindness to bounded read-only project inspection. Realtime planner mint now advertises list_workspace and read_workspace_file alongside propose_handoff with closed schemas and explicit untrusted-data/non-execution instructions. Surface fulfillment normalizes relative paths, rejects absolute/~/'..', requires each daemon-canonicalized response target to remain under the frozen validated workspace (including symlink escape), caps listings and file payloads, rejects binary reads, and preserves Create draft/Create & start as the only session/turn mutation boundary. Verification: cargo fmt checks in ocean-os and ocean-surface; cargo test -p ocean-daemon voice_realtime (11 passed); cargo test -p ocean-surface-ui voice::realtime::tests (16 passed); cargo check -p ocean-surface-ui --target wasm32-unknown-unknown; LSP diagnostics clean.
+_________________________________________________________________________________

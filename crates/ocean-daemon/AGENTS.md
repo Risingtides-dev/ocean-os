@@ -35,8 +35,9 @@ This crate owns the long-running Ocean HTTP service on `:4780`, including API ro
   a compatible per-request override.
 - Realtime `purpose: "planner"` is pre-session and propose-only: validate the
   registered project plus canonical live worktree before credential resolution,
-  advertise only `propose_handoff`, and mutate only through the existing
-  session/message/turn routes after an explicit Surface click.
+  advertise only bounded read-only workspace inspection tools plus
+  `propose_handoff`, and mutate only through the existing session/message/turn
+  routes after an explicit Surface click.
 - Session behavior lives in `ocean-agent`; route changes must not create a separate session model.
 - `POST /v1/sessions/{id}/compact` is a thin adapter over
   `AgentRuntime::compact_session`: it takes a turn permit from the shared
