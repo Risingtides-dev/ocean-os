@@ -26,7 +26,7 @@ This manifest is the separate design ratification that Phase 6 of the extension 
 - **Task graph** — the extension's control-flow graph: nodes, edges, joins, bounded cycles, ceilings. Extension vocabulary only.
 - **Member** — one graph node bound to a packaged folder-agent definition plus per-run overrides (task, model, budget).
 - **Execution graph** — the host/Observatory record of what actually ran: execution ids, parent/child edges, lifecycle facts. Host vocabulary only.
-- **Workflow spec** — portable declarative workflow data (Bedrock `workflows/*.workflow.json`, repo `docs/orchestrator/workflows/*.md`). Input to Crew, never authority.
+- **Workflow spec** — portable declarative workflow data (Bedrock `workflows/*.workflow.json`, private `ocean-agents` repo `internal/ocean-os/orchestrator/workflows/*.md`). Input to Crew, never authority.
 - **Staging artifact** — the single pinned, interactive UI component through which the operator inspects, edits, starts, or stops a proposed crew.
 - **Continuation** — an ordinary, package-attributed, deduplicated turn the extension requests in the root session to deliver aggregated results.
 - **Delegation facade** — the two extension-provided Longhouse tools, `longhouse__delegate_local` and `longhouse__delegate_offshore`, that accept one bounded task or graph proposal and route it to Crew. They are not core daemon APIs.
@@ -39,7 +39,7 @@ Three existing layers are reconciled by this design; none is deleted by it.
 
 | Layer | Artifact | Status | Role under this manifest |
 | --- | --- | --- | --- |
-| Spec (data) | `ocean-bedrock/workflows/*.workflow.json`, `docs/orchestrator/workflows/*.md` | shipped | Portable workflow definitions Crew may consume as proposals; never scheduler authority |
+| Spec (data) | `ocean-bedrock/workflows/*.workflow.json`, private `ocean-agents` `internal/ocean-os/orchestrator/workflows/*.md` | shipped | Portable workflow definitions Crew may consume as proposals; never scheduler authority |
 | Discovery (advisory) | `crates/ocean-longhouse/src/prepare.rs` `WorkflowIndex` (OCEAN-338), `POST /v1/workflows/prepare` (OCEAN-340) | shipped, read-only | Ranks candidate workflow specs for a turn; feeds the root agent's crew proposals; unchanged |
 | Execution (durable) | R5 `Workflow`/`Step`/`Contract` + SQLite run-state design | proposed, never built | Becomes Crew's extension-internal engine; does **not** become a core crate |
 | Delegation metadata (compatibility) | `POST /v1/subagents/spec`, `SubagentSpec.allowed_tools` | shipped, advisory only | Migration input only; current abstract tool-name strings do not spawn workers or grant executable tools and must not be treated as the Crew capability contract |
@@ -150,7 +150,7 @@ Strict order; each stage gates the next. Stages A–C live in `ocean-os` and fol
 - **Stage B — generic seams.** Execution request + cancellation + scoped delivery + continuation + state directory (§6.1–6.3, 6.5–6.6). *Gate:* host conformance tests prove grant non-widening, session isolation, idempotent replay, dedup, audit identity, and package-removal safety — with no orchestration vocabulary in core.
 - **Stage C — interactive workflow artifacts.** SDK types, daemon artifact registry/routing, TUI renderer + component-event transport, Surface renderer. *Gate:* revision/idempotency tests; a non-Crew demo extension drives the artifact end to end.
 - **Stage D — Crew v1.** Package registers the two Longhouse delegation facade tools; implements local and offshore adapters plus the four versioned capability profiles from §7.2; supports fixed fan-out ≤3, join, reduce, one continuation; SQLite durability with crash-recovery tests; staging→running hot-swap; Observatory attestation; Ocean Floor deep link. *Gate:* host conformance proves capability non-widening and requested/effective audit records; local/offshore policy-equivalence fixtures pass; kill-and-recover tests (daemon restart, service restart, child failure, budget exhaustion, cancellation) all reconcile against host truth.
-- **Stage E — bounded growth.** Conditional routing → one evaluator/revise cycle → bounded dynamic map fan-out → workflow-spec templates (consuming the Bedrock/`docs/orchestrator/workflows/` layer via the OCEAN-340 endpoint) → human checkpoints. Hierarchy and model-authored subgraphs remain out until separately ratified. Saved trigger-driven automation ("Ocean Flows") is a separate future product, not Crew scope creep.
+- **Stage E — bounded growth.** Conditional routing → one evaluator/revise cycle → bounded dynamic map fan-out → workflow-spec templates (consuming the Bedrock workflow layer and any repo-local `docs/orchestrator/workflows/` dir — now hosted by the private `ocean-agents` repo — via the OCEAN-340 endpoint) → human checkpoints. Hierarchy and model-authored subgraphs remain out until separately ratified. Saved trigger-driven automation ("Ocean Flows") is a separate future product, not Crew scope creep.
 
 ## 9. Critical invariants
 

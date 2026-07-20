@@ -43,8 +43,9 @@ Documentation policy: [`OCEAN_DOCUMENTATION_CONTRACT.md`](OCEAN_DOCUMENTATION_CO
   session/surface ecosystem invariants.
 - [`examples/agents/README.md`](examples/agents/README.md) — folder-as-agent
   examples.
-- [`orchestrator/`](orchestrator/) — current factory/orchestration references;
-  each workflow remains subordinate to runtime permissions and source truth.
+- Factory/orchestration operating references moved to the private
+  `ocean-agents` repository (`internal/ocean-os/orchestrator/`) on 2026-07-19;
+  workflow behavior remains subordinate to runtime permissions and source truth.
 
 ## Plans and retained evidence
 

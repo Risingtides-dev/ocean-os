@@ -4438,94 +4438,32 @@ area:      [backend]
 
 Landed TASK-40 (session titles vs Longhouse injection) as 82d187b3 on main — cut same-hour from smaths' switcher screenshot. Root cause: OCEAN-318 prepends the advisory block to req.prompt before the runtime persists the turn, so every new session's label collapsed to the boilerplate. Fix (fable builder sub, my review): all THREE injection sites (prompt path, create_request, agent_turn) thread the pre-injection prompt as an explicit persisted session title via with_display_title — agent_turn captures before EVERY layered prefix (room/operator guidance, folder-as-agent, longhouse, browser context), broader than the reported defect; session_display_title prefers the explicit title and falls back to a narrow marker-anchored strip for legacy polluted sessions, so old titles self-heal on read. Source-slice test asserts each site captures pre-injection. Gates: 180 agent + 512 daemon tests, fmt, clippy -D clean. I pushed and am bouncing the daemon to serve real titles.
 _________________________________________________________________________________
-
-time: [02:29pm] [07-19-26]
-agent: [ocean] [gpt-5]
-worktree: [public-onboarding-retirement-20260719]
-type: [security]: Private onboarding boundary
-area: [skills]: Bedrock coworker onboarding
-
-Retired the obsolete public `ocean-coworker-onboarding` skill after
-`ocean-bedrock` moved private. The private repository already owns the newer
-canonical `skills/ocean-bedrock-coworker-onboarding/SKILL.md` ceremony with
-invite redemption, local-only transport, secret exclusions, preview, and an
-explicit human acknowledgement gate; the older public token/bootstrap procedure
-was not copied. Verified with `cargo xtask docs-check`, `git diff --check`,
-and a tracked-reference search.
-_________________________________________________________________________________
-time:      [14:37] [19-07-26]
-agent:     [pi] [gpt-5.6]
-worktree:  [feat/tui-workflow-graph-rail] /Users/risingtidesdev/.worktrees/ocean-os-tui-workflow-graph-rail
-type:      [feature-request]
-area:      [frontend]
-
-Implemented the first truthful workflow-graph rail slice by reusing Ocean TUI's existing 3D camera/projection renderer over authenticated Observatory topology. The TUI loads the boot-bound summary token, baselines from the durable snapshot cursor, resumes the typed SSE stream, and rebaselines on reset, malformed data, cursor gaps, daemon-instance changes, or stale environment-token 401 via the rotating secure file. An authoritative inactive-to-active execution transition replaces Files in the existing right rail unless the operator explicitly closed it; terminal graphs remain inspectable, explicit Files navigation restores the tree, and Enter expands the workflow graph into the center while Files returns beside it. All graph navigation mutates through typed Elm actions; authoritative state remains complete while paint work is bounded to 256 nodes and 1,024 edges with an honest hidden count. No orchestration, scheduling, or subagent authority entered core or the TUI.
-
-Verification: ocean-observatory 28 unit + 21 integration/redaction/store tests; ocean-tui 372 passed / 4 ignored; denied-warning Clippy for both crates; TUI release build; workspace check; formatting, docs-check, and diff-check. Live PTY smoke against the supervised daemon rendered the real Observatory snapshot (over 360 retained executions and 340 edges), auto-opened FLOW with current active nodes, expanded into center, and restored Files on the right. Three fresh review passes closed Elm-mutation, token-rotation, duplicate-view, render-bound, and malformed-SSE lifecycle findings; final review passed with no medium-or-higher issue.
-_________________________________________________________________________________
-time:      [14:12] [19-07-26]
-agent:     [pi] [gpt-5.6]
-worktree:  [feat/compact-session-sync]
-type:      [feature-request]
-area:      [backend]
-
-Implemented the coherent backend compact-synchronization prerequisite: non-blocking per-session compact admission with 409 busy conflicts, lease-protected compact/no-op public transcript snapshots, refresh-only session sync, pre-snapshot opaque agent-SSE fences, typed reset-required replay gaps for malformed/unavailable anchors and live lag, and visible-Text-only transcript/history projection. Raw provider messages retain thinking for compatible replay. Full daemon-wide pre-TurnStarted lease admission remains a separately identified lifecycle-hardening follow-up; this checkpoint does not activate TUI `/compact`.
-_________________________________________________________________________________
-_________________________________________________________________________________
-time:      [14:28] [19-07-26]
-agent:     [pi] [gpt-5.6]
-worktree:  [feat/compact-session-sync]
-type:      [workflow]
-area:      [backend]
-
-Completed the session-admission portion that the preceding 14:12 checkpoint left open. Known-session product, legacy prompt/request, call, and durable-room turns now acquire the shared non-blocking operation lease before TurnStarted or request registration and retain it through persistence plus terminal publication; config/message mutations use the same leased lane. Compact and refresh sync acquire that lease before emitting a real session-scoped SSE fence and capturing the visible transcript snapshot. Busy agent turns and compact/sync fail before lifecycle claims, eliminating the check-to-lock race described in the earlier entry.
-_________________________________________________________________________________
-_________________________________________________________________________________
-time:      [15:23] [19-07-26]
-agent:     [pi] [gpt-5.6]
-worktree:  [feat/compact-session-sync]
-type:      [issues]
-area:      [review]
-
-Closed every blocker from three adversarial review rounds. Session sync now projects directly from persisted messages with no SessionDetail/raw/tool/image copy, filters projectable rows before the 512-row cap, enforces the 1 MiB visible-text budget, and signals truncation. Every later session mutation publishes a scoped lifecycle/invalidation under the shared lease; legacy no-session requests pin ids before admission, and durable room triggers wait rather than drop. Replay gaps retain first-party event:error compatibility, reject empty/non-UTF8/foreign/unknown/evicted anchors, and expose only session-filtered diagnostic bounds. Compact acquires the busy lease before any existence read. Final independent release review approved with no blocker/high findings.
-_________________________________________________________________________________
-time:      [17:16] [19-07-26]
+time:      [14:18] [19-07-26]
 agent:     [claude] [fable 5]
-worktree:  fix/task51-sol-dsml-salvage
-type:      [merge]
-area:      [backend]
+worktree:  [detached @ origin/main (4b756175)]
+type:      [release]
+area:      [infra]
 
-Landed TASK-51 (Sol DSML tool-call salvage) as 3b2c0499 on main — cut same-hour from smaths' screenshot of gpt-5.6-sol leaking raw DSML markup as transcript text with tools never executing. Fable builder sub, my review: the prior salvage (12cf4eb4/e3035161) was tail-only and Sol's leak is INTERLEAVED (prose, block, more prose), so it never matched. The shared helper now scans left-to-right lifting every well-formed block wherever it lands, stitching surviving prose; truncated final blocks still salvage; empty/broken blocks keep their markup visible; empty-name invokes rejected. The tail-only policy inversion is explicitly reasoned in the commit under the known-leaker + zero-structured-calls gate. Streaming reassembly preserved (buffer-then-salvage, split-across-deltas tested). 150 protocol + 518 daemon tests, fmt, clippy -D clean. I pushed; daemon bounce follows to serve the fix. Ledger note: this entry lands from the task worktree — canonical ocean-os carries other agents' uncommitted WIP (TUI files + in-progress ledger entries) left untouched.
+Post-merge reviewed PR #304 (Kimi K3 dynamic tools, merged 07-17 without its feature-review pass) and redeployed the daemon so K3 is actually servable. Review verdict sound: catalog maps kimi-k3 to Moonshot with 1M context/8K output cap and the bare kimi alias stays on K2.6; reasoning_content replay is gated to same-provider same-model K3 history; dynamic declarations bounded at 16 tools/512 KiB with explicit errors. Verified 344 protocol+runtime tests green at current main. Rebuilt clean in a detached worktree, swapped target/release/ocean-daemon, launchctl kickstart -k in a verified idle window (supervision is back on launchd — plist paths were fixed since the 16th). /health reports rev 4b7561757f9f and /v1/models now advertises kimi-k3; kimi auth present in auth.json.
 _________________________________________________________________________________
-time:      [17:23] [19-07-26]
+time:      [21:30] [19-07-26]
 agent:     [claude] [fable 5]
-worktree:  fix/task50-prompt-display
-type:      [merge]
-area:      [backend]
+worktree:  [main checkout ledger append only]
+type:      [release]
+area:      [infra]
 
-Landed TASK-50 (transcript user bubbles vs injected advisory layers) as 7abd5982 on main — TASK-40's sibling, cut same-hour from smaths' screenshot of the Longhouse block rendering inside user messages. Fable builder sub, my review: strip_injected_turn_prep peels the stacked daemon layers (surface flag, Longhouse advisory, operator guidance) off stored user bodies at the DISPLAY projection boundary — transcript, hydration, sync snapshot, history excerpts — reusing TASK-40's marker primitives plus a new guidance strip whose daemon-renderer literal is pinned by a cross-crate guard test; raw messages stay provider-faithful; no store migration, history self-heals on read. Two deferrals documented honestly: folder-as-agent (no marker to anchor) and browser-context (internal blank line breaks the terminator) — FOLLOW-UP QUEUED: give every injected layer a marker at generation so display-stripping is total. 191 agent + 519 daemon tests, fmt, clippy clean. I pushed; daemon bounce follows.
+TASK-7 merged as 824830c0 (#316) and the artifact path is seeded: ~/.local/libexec/ocean-daemon/ocean-daemon-824830c08e36 published from a clean detached-worktree build, `current` flipped atomically, ~/.local/bin/ocean-daemon now resolves through it. No daemon restart — running afedcd74 binary is functionally current (all later main commits are TUI-only, test-only, unwired search, or deploy scripts). Cutover remainder: launchd still execs the main checkout's launcher, which cannot advance past 4b756175 until the uncommitted crates/ocean-tui/AGENTS.md lane (transcript live-follow notes) lands; owner pinged on the pad. Old launcher remains functional meanwhile.
 _________________________________________________________________________________
-time:      [18:05] [19-07-26]
+time:      [22:05] [19-07-26]
 agent:     [claude] [fable 5]
-worktree:  task-53-mixed-turn-salvage (fable builder sub)
-type:      bug-report
-area:      backend
+worktree:  [detached @ origin/main (c60c3e14)]
+type:      [release]
+area:      [infra]
 
-TASK-53 landed 996c4b76: Sol (gpt-5.6 family) leaks DSML tool-call blocks as text even in MIXED turns with structured calls — smaths' live screenshot showed 7 structured calls then a trailing raw DSML block, which TASK-51's zero-structured-calls gate let through. Salvage now runs for known-leaker models whenever text exists, with a (name, parsed-args) dedupe against the turn's structured calls so a call emitted both ways never double-executes; ToolUse forced only when a salvaged call survives. Shared merge_dsml_salvage helper keeps codex.rs and openai.rs collectors identical; 3 new unit tests (mixed distinct, dedupe, non-leaker), 153 protocol tests green, fmt + clippy clean. Daemon rebuild + bounce follows this entry.
+Deployed the TASK-61 daemon (exact-once turn finalizer): clean detached-worktree build at c60c3e14, published as versioned artifact ocean-daemon-c60c3e148954 with atomic current flip, transitional copy for the pre-#316 launcher (main checkout is contested by a live TUI lane and still lags), idle-window kickstart at 0 turns in flight, /health confirms rev c60c3e148954. Daemon now carries the full daemon-core slate through TASK-61.
 _________________________________________________________________________________
-time:      [19:15] [19-07-26]
-agent:     [claude] [fable 5]
-worktree:  task-57-save-dir-fsync (fable builder sub, fable landed)
-type:      bug-report
-area:      backend
 
-TASK-57 landed 4d3e67c3 (daemon-core audit raw #2, cut ahead of codex verdict — spot-verified, disclosed): temp+rename saves fsynced the temp file but never the directory, so the rename was atomic but not durable. New crate::durable helper (durable_rename + unix-gated fsync_parent_dir) applied to all FOUR sites the sweep found — session save, oauth auth.json, projects list, yolo pref (which was also missing the temp fsync entirely). 194 agent tests + fmt + clippy green. Builder sub wedged twice mid-chain; fable took the lane over per announced protocol — also fixed a pre-existing doc_lazy_continuation clippy failure from TASK-50 that had made ocean-agent clippy-red on main. Gate lesson recorded: never pipe a gate command's output (a `| tail` swallowed clippy's failure and printed a false green this session — caught by reading the output, not the exit).
-_________________________________________________________________________________
-time:      [19:24] [19-07-26]
-agent:     [claude] [fable 5]
-worktree:  task-56-turn-terminal-guard + task-54-injection-markers (fable builder subs)
-type:      bug-report
-area:      backend
+## 2026-07-19 — knowledge-separation extraction (wave 1)
 
 Double landing. TASK-56 48bd92f9 (daemon-core raw #1): TurnTerminalGuard RAII mirrors InFlightGuard — a panic in the prompt await now drives the SAME update_request_finished terminal transition (no second state machine) and emits TurnFinished{Failed}; its return value gates emission so cancels keep their frame and normal turns emit exactly once; Drop hands async work to Handle::try_current detached spawn. 3 new tests through real registry+bus; 522 daemon tests green. TASK-54 9498905f: every injected prompt layer now anchored at generation — folder-agent gets [folder-agent instructions]…[end folder-agent instructions] sentinels via one shared compose helper (both daemon sites + rooms), browser context loses its internal blank line and strips on an exact two-line prefix; strip_injected_turn_prep peels all 5 layers order-tolerantly; 6 strip tests + 2 cross-crate anchor guards; agent 199 / daemon 524 green. Completes TASK-50's display-strip. KNOWN FLAKE (ticket-worthy): github::tests intermittently red under full-parallel cargo test (subprocess/tempdir races, different test each run, 19/19 in isolation on clean main) — bit one TASK-54 gate run, clean on rerun. Daemon rebuild + announced bounce for 54/56/57 follows.
 time:      [18:17] [19-07-26]
@@ -4630,3 +4568,4 @@ area:      [writing]
 
 Corrected the Observatory authentication contract after closing stale pad TASK-9: the read-only routes already consumed ObservatoryAuth in baf26468, so no route implementation was repeated. Gate 1 now states the implemented stateless-bearer truth — nonces make issuances unique but do not prevent replay within scope/lifetime — and assigns optional Authorization-Observer cookie issuance plus Secure/HttpOnly/SameSite/Path attributes to the authenticated Ocean Surface proxy. The daemon remains header/cookie input only, emits no Set-Cookie, exposes no issuance route, and never distributes its signing secret.
 _________________________________________________________________________________
+Moved internal operating material out of this public repo into the now-private `ocean-agents` repository: `docs/orchestrator/` (factory goal/loop/migration, team_takeover notes, workflows/) → `ocean-agents/docs/orchestrator/`; `skills/` (ocean-os-software-factory, ocean-coworker-onboarding) → `ocean-agents/internal/ocean-os/skills/` with live copies installed at `~/.config/ocean-rs/skills/` so Longhouse advisory discovery keeps working. Updated `docs/README.md` index and the two path references plus the Stage E prose in `docs/specs/2026-07-18-ocean-crew-orchestration-and-durable-workflow-manifest.md`. Workflow discovery (`{cwd}/docs/orchestrator/workflows/`) is fail-open, so ocean-os-cwd turns simply see no factory workflows now. `cargo xtask docs-check` PASS (155 active files, 141 links). Also generated `docs/phase0-inventory.json` (1,296-file classification manifest across the four repos). worktree: main
