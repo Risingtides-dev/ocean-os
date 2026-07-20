@@ -4593,3 +4593,11 @@ area:      [frontend]
 
 Fixed the TUI/launchd supervision race found while closing TASK-15 (pad TASK-20). Root cause: the TUI's autostart probes launchctl print; during an installer maintenance window (bootout->bootstrap) that probe fails, the TUI concludes "unsupervised" and direct-spawns — the orphan wins the port and the returning launchd job crashloops on EADDRINUSE (exactly the 02:35 incident). Fix: a failing launchctl probe with the LaunchAgent plist present on disk now resolves to a new SupervisionMaintenance outcome — no spawn, launchd RunAtLoad revives the daemon when bootstrap lands; app.rs surfaces it as a health condition. Regression test pins the window (plist installed + job unloaded -> never spawn, never kickstart); all 8 existing autostart tests extended with the install-state probe. 397 ocean-tui tests green, clippy zero, fmt clean.
 _________________________________________________________________________________
+time:      [06:20] [20-07-26]
+agent:     [claude] [fable 5]
+worktree:  fix/walker-cache-age-flake
+type:      [bug-report]
+area:      [testing]
+
+Fixed a real CI flake in ocean-walker that failed PR #324 on a crate that PR does not touch. wait_for_nonzero_cache_age busy-waited a flat 1ms and the test then asserted cache_age_ms > 0; because that field has millisecond resolution, on a loaded runner the cache write and the subsequent read can land in the same millisecond bucket and the age rounds to zero. The helper now sleeps past a full tick and confirms the OBSERVABLE SystemTime clock advanced at least 2ms rather than trusting a duration — the assertion and the wait now measure the same thing. Previously-failing test stress-run 8x locally, 51 walker tests green, clippy zero, fmt clean. Filed separately from TASK-21 rather than bundled, so the daemon fix and this test fix stay independently reviewable.
+_________________________________________________________________________________
