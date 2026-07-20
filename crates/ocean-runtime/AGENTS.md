@@ -41,7 +41,13 @@ This crate owns the Ocean agent loop and permission-gated tool execution runtime
   permission, cancellation, and execution handling may dispatch it; same-batch
   search results never grant execution authority. Final synthesis retains all
   historical declarations, sets `tool_choice` to `none`, and offers no executable
-  tool.
+  tool. Budget-rejected matches are never silently dropped from a `search_tools`
+  result: each carries `loaded:false` plus a machine-readable `excluded_reason`
+  (`tool_limit` at sixteen loaded tools, `schema_too_large` past the 128-KiB
+  per-schema cap, `byte_budget` past the 512-KiB declaration total), and the
+  result reports a top-level `excluded_count`. Durable `loaded:false` entries
+  are display truth only — reconstruction never loads them and they emit no
+  declaration on resume.
 - The reproducible history-cost kernel is `examples/history_cost_bench.rs`: run it in release mode from a clean revision with the fixed 10/100/1,000-message × 1/5/20-round matrix. Treat it as trim/serialization/clone scaling evidence, not end-to-end turn latency.
 - Hashline-enabled sessions expose both `edit` and `hashline_edit`; every profile retains `write`. Artifact spill is enabled by the daemon for TUI/ACP/CLI/web and disabled for voice; direct callers default off. These are the only effective profile gates currently copied into `SessionContext`. Controlled GPT-5.6 Terra benchmarks showed that hiding `edit` changed model exploration behavior and doubled wall time even when the model still selected `hashline_edit`.
 - `TodoTool` state is session-scoped in memory for bound sessions so the

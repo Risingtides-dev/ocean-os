@@ -339,22 +339,40 @@ fn search_dynamic_tools(
         .filter_map(|tool| serde_json::to_vec(tool).ok().map(|bytes| bytes.len()))
         .fold(0usize, usize::saturating_add);
     let mut matches = Vec::with_capacity(ranked.len());
+    let mut excluded_count = 0usize;
     for (_, tool) in ranked {
         let was_loaded = loaded.contains(&tool.name);
         if !was_loaded {
-            if loaded.len() >= MAX_DYNAMIC_TOOLS {
+            // A match the budget rejects is still reported — as loaded:false
+            // with a machine-readable reason — so callers can see exactly what
+            // the 16-tool / 512-KiB bounds excluded instead of a silent gap
+            // in the result list (pad TASK-17).
+            let excluded_reason = if loaded.len() >= MAX_DYNAMIC_TOOLS {
+                Some("tool_limit")
+            } else {
+                let schema_bytes = serde_json::to_vec(tool)
+                    .map_err(|error| format!("failed to size tool schema: {error}"))?
+                    .len();
+                if schema_bytes > MAX_DYNAMIC_TOOL_SCHEMA_BYTES {
+                    Some("schema_too_large")
+                } else if loaded_bytes.saturating_add(schema_bytes) > MAX_DYNAMIC_DECLARATION_BYTES
+                {
+                    Some("byte_budget")
+                } else {
+                    loaded_bytes = loaded_bytes.saturating_add(schema_bytes);
+                    loaded.insert(tool.name.clone());
+                    None
+                }
+            };
+            if let Some(reason) = excluded_reason {
+                excluded_count += 1;
+                matches.push(serde_json::json!({
+                    "name": tool.name,
+                    "loaded": false,
+                    "excluded_reason": reason
+                }));
                 continue;
             }
-            let schema_bytes = serde_json::to_vec(tool)
-                .map_err(|error| format!("failed to size tool schema: {error}"))?
-                .len();
-            if schema_bytes > MAX_DYNAMIC_TOOL_SCHEMA_BYTES
-                || loaded_bytes.saturating_add(schema_bytes) > MAX_DYNAMIC_DECLARATION_BYTES
-            {
-                continue;
-            }
-            loaded_bytes = loaded_bytes.saturating_add(schema_bytes);
-            loaded.insert(tool.name.clone());
         }
         // Do not persist descriptions in the synthetic ToolResult. The full
         // schema is supplied only in the request-scoped declaration on the next
@@ -369,7 +387,8 @@ fn search_dynamic_tools(
         "query": query,
         "matches": matches,
         "loaded_count": loaded.len(),
-        "loaded_limit": MAX_DYNAMIC_TOOLS
+        "loaded_limit": MAX_DYNAMIC_TOOLS,
+        "excluded_count": excluded_count
     }))
     .map_err(|error| format!("failed to encode search result: {error}"))
 }
@@ -1806,6 +1825,55 @@ mod tests {
             !loaded.contains("tool19"),
             "later matches cannot exceed the cap"
         );
+
+        // TASK-17: once the registry is full, a fresh match is reported as an
+        // explicit exclusion, never silently dropped from the result list.
+        let result =
+            search_dynamic_tools(&tools, &mut loaded, &serde_json::json!({"query": "tool19"}))
+                .expect("post-cap search succeeds");
+        let json: Value = serde_json::from_str(&result).expect("JSON result");
+        let entry = json["matches"]
+            .as_array()
+            .expect("matches")
+            .iter()
+            .find(|entry| entry["name"] == "tool19")
+            .expect("capped match is still listed")
+            .clone();
+        assert_eq!(entry["loaded"], false);
+        assert_eq!(entry["excluded_reason"], "tool_limit");
+        assert!(
+            json["excluded_count"].as_u64().expect("excluded_count") >= 1,
+            "top-level counter surfaces exclusions"
+        );
+    }
+
+    #[test]
+    fn oversized_single_schema_is_excluded_as_schema_too_large() {
+        // TASK-17 review follow-up: a schema past the 128-KiB per-tool cap is
+        // rejected with its own reason even when the registry and the 512-KiB
+        // declaration budget both have room.
+        let tools = vec![ocean_protocol::Tool {
+            name: "oversized".into(),
+            description: "x".repeat(MAX_DYNAMIC_TOOL_SCHEMA_BYTES + 1),
+            parameters: serde_json::json!({"type": "object"}),
+        }];
+        let mut loaded = HashSet::new();
+        let result = search_dynamic_tools(
+            &tools,
+            &mut loaded,
+            &serde_json::json!({"query": "oversized"}),
+        )
+        .expect("search succeeds");
+        let json: Value = serde_json::from_str(&result).expect("JSON result");
+        let entry = &json["matches"].as_array().expect("matches")[0];
+        assert_eq!(entry["name"], "oversized");
+        assert_eq!(entry["loaded"], false);
+        assert_eq!(entry["excluded_reason"], "schema_too_large");
+        assert_eq!(json["excluded_count"], 1);
+        assert!(
+            loaded.is_empty(),
+            "rejected schema must not enter the registry"
+        );
     }
 
     #[test]
@@ -1827,6 +1895,27 @@ mod tests {
             .sum::<usize>();
         assert!(bytes <= MAX_DYNAMIC_DECLARATION_BYTES);
         assert_eq!(loaded.len(), 4, "the fifth 120-KiB schema exceeds 512 KiB");
+
+        // TASK-17: byte-budget rejections are explicit in the same result.
+        let result =
+            search_dynamic_tools(&tools, &mut loaded, &serde_json::json!({"query": "large"}))
+                .expect("post-budget search succeeds");
+        let json: Value = serde_json::from_str(&result).expect("JSON result");
+        let excluded: Vec<&str> = json["matches"]
+            .as_array()
+            .expect("matches")
+            .iter()
+            .filter(|entry| entry["loaded"] == false)
+            .map(|entry| entry["excluded_reason"].as_str().expect("reason"))
+            .collect();
+        assert!(
+            excluded.iter().all(|reason| *reason == "byte_budget"),
+            "budget-rejected schemas carry the byte_budget reason, got {excluded:?}"
+        );
+        assert_eq!(
+            json["excluded_count"].as_u64().expect("excluded_count") as usize,
+            excluded.len()
+        );
     }
 
     #[test]
@@ -1867,6 +1956,72 @@ mod tests {
         assert_eq!(declarations.len(), 1);
         assert_eq!(declarations[0].before_message, 1);
         assert_eq!(declarations[0].tools[0].name, "echo");
+    }
+
+    #[test]
+    fn persisted_excluded_matches_never_reconstruct_as_loaded() {
+        // TASK-17 follow-up: the persisted result shape now carries
+        // loaded:false exclusion entries. Resume/reconstruction must treat
+        // them as *not loaded* — execution authority stays with the budget
+        // that excluded them, never with the durable transcript record.
+        let tool = |name: &str| ocean_protocol::Tool {
+            name: name.into(),
+            description: "cap".into(),
+            parameters: serde_json::json!({"type": "object"}),
+        };
+        let tools = vec![tool("kept"), tool("rejected")];
+        let search_result = serde_json::json!({
+            "query": "cap",
+            "matches": [
+                {"name": "kept", "loaded": true, "already_loaded": false},
+                {"name": "rejected", "loaded": false, "excluded_reason": "tool_limit"}
+            ],
+            "loaded_count": 1,
+            "loaded_limit": MAX_DYNAMIC_TOOLS,
+            "excluded_count": 1
+        });
+        let messages = vec![
+            Message::user_text("turn"),
+            Message::Assistant(AssistantMessage {
+                content: vec![Content::ToolCall {
+                    id: "search-1".into(),
+                    name: DYNAMIC_SEARCH_TOOL.into(),
+                    arguments: serde_json::json!({"query": "cap"}),
+                }],
+                api: "openai-completions".into(),
+                provider: "kimi".into(),
+                model: "kimi-k3".into(),
+                usage: Usage::default(),
+                stop_reason: StopReason::ToolUse,
+                error_message: None,
+                timestamp: 0,
+            }),
+            Message::ToolResult(ToolResultMessage {
+                tool_call_id: "search-1".into(),
+                tool_name: DYNAMIC_SEARCH_TOOL.into(),
+                content: vec![Content::text(search_result.to_string())],
+                is_error: false,
+                timestamp: 0,
+            }),
+            Message::user_text("resumed"),
+        ];
+        let loaded = reconstruct_loaded_dynamic_tools(&messages, &tools);
+        assert_eq!(
+            loaded.names,
+            vec!["kept"],
+            "excluded persisted matches must not reconstruct as loaded"
+        );
+        let declarations = dynamic_declarations_for_messages(&messages, &loaded, &tools);
+        assert_eq!(declarations.len(), 1);
+        assert_eq!(
+            declarations[0]
+                .tools
+                .iter()
+                .map(|tool| tool.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["kept"],
+            "no declaration may be emitted for an excluded match"
+        );
     }
 
     #[derive(Default)]

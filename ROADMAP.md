@@ -72,13 +72,16 @@ Ocean ports mechanisms into current owners rather than reproducing OMP package b
       acceptance did not enable a harness-profile capability.
 - [ ] Implement the reviewed minimizer M2 design as a characterization-first checkpoint.
 - [x] Port the standalone shared walker mechanism as an independent M1 crate. It is
-      intentionally outside `default-members` and remains unwired from typed search and
-      production runtime capabilities.
-- [ ] Build a typed search engine over the accepted walker, then adopt it in live `grep`/`glob`
-      only after explicit parity and security review; do not bundle traversal, search, and runtime
-      replacement. Runtime adoption must add point-of-use descriptor/handle-relative confinement
-      for adversarial roots, rename/symlink/reparse swaps, cached candidates, and every supported
-      OS; walker `FollowLinks`/`same_file_system` policies are not a sandbox.
+      intentionally outside `default-members`; only the standalone typed-search crate consumes it,
+      and neither crate is wired into production runtime capabilities.
+- [x] Build the standalone typed-search M1 over the accepted walker with bounded typed output,
+      exact native path identity, strict candidate policy, fresh opened-handle validation, and
+      deterministic ordered commit. It remains outside `default-members` and unwired.
+- [ ] Adopt standalone typed search in live `grep`/`glob` only after explicit parity and security
+      review; do not bundle the M1 engine with runtime replacement. Runtime adoption must add
+      point-of-use descriptor/handle-relative confinement for adversarial roots, intermediate
+      renames, symlink/reparse swaps, cached candidates, and every supported OS; walker
+      `FollowLinks`/`same_file_system` and search leaf-open controls are not a sandbox.
 - [ ] Route isolation, task dispatch, typed yields, joins, budgets, and orchestration policy
       through the approved extension architecture; do not revive their superseded core placement.
 

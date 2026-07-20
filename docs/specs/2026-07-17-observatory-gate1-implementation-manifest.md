@@ -522,7 +522,7 @@ HMAC(SHA256, daemon_secret, payload) + "." + payload_base64
 - HMAC-SHA256 provides cryptographic integrity without requiring asymmetric key infrastructure.
 - Daemon-local secret is stored in `.ocean/observatory-secret` (mode 0600, 32 bytes random).
 - Payload is self-contained and inspectable (no state lookup needed for validation).
-- Nonce prevents replay attacks.
+- The random nonce makes independently issued token payloads unique. V1 validation is stateless: it does not consume or remember nonces, so a captured token remains replayable within its scope until expiry or daemon restart.
 - Lifetime: 15-60 minutes. Default: 30 minutes. Configurable per environment.
 
 **Token Example (decoded):**
@@ -580,10 +580,15 @@ b3F0Yd3F8nQ2mT5rW9sP7kL1xJ4vM9nB2cD5eF8gH1jK4mL7oP0rS3tU6vW9xY2z . eyJwcmluY2lwY
 **No credential-issuance route:**
 - V1 exposes no `/v1/observatory/token/*` route. The mode-0600 local token file is the only automatic first-party distribution seam.
 
+**Compatibility cookie input:**
+- The daemon accepts `Authorization-Observer=<token>` from the HTTP `Cookie` header as a compatibility transport; it never emits `Set-Cookie` or mints a cookie credential.
+- Cookie issuance belongs to the authenticated Ocean Surface proxy. If that proxy uses the compatibility path, it must set `Secure`, `HttpOnly`, `SameSite=Strict`, and `Path=/v1/observatory`, with expiry no later than the embedded bearer expiry. Browser JavaScript must never receive the token.
+- The cookie value remains the same replayable bearer credential as the `Authorization` header. Cookie attributes reduce browser-side exposure and cross-site delivery; they do not add one-time-use semantics.
+
 **No Query-String Credentials:**
 - Tokens are never embedded in URLs or query parameters.
 - HTTP query strings can appear in logs, browser history, proxy logs, etc.
-- Always use HTTP headers or cookies.
+- Always use HTTP headers or the compatibility cookie.
 
 ### 3.5 Token Validation (Daemon Side)
 
@@ -624,6 +629,8 @@ pub fn validate_observer_token(token: &str, secret: &[u8; 32]) -> Result<TokenCl
     Ok(claims)
 }
 ```
+
+Validation checks signature, scope, expiry, and daemon boot binding. It does not maintain a nonce-consumption ledger: replay within the token lifetime is intended bearer behavior. Rotation limits the exposure window, while one-time semantics remain reserved for the separate in-memory Observatory binding-token contract.
 
 ---
 

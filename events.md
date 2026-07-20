@@ -4486,28 +4486,41 @@ area:      [backend]
 
 Landed TASK-40 (session titles vs Longhouse injection) as 82d187b3 on main — cut same-hour from smaths' switcher screenshot. Root cause: OCEAN-318 prepends the advisory block to req.prompt before the runtime persists the turn, so every new session's label collapsed to the boilerplate. Fix (fable builder sub, my review): all THREE injection sites (prompt path, create_request, agent_turn) thread the pre-injection prompt as an explicit persisted session title via with_display_title — agent_turn captures before EVERY layered prefix (room/operator guidance, folder-as-agent, longhouse, browser context), broader than the reported defect; session_display_title prefers the explicit title and falls back to a narrow marker-anchored strip for legacy polluted sessions, so old titles self-heal on read. Source-slice test asserts each site captures pre-injection. Gates: 180 agent + 512 daemon tests, fmt, clippy -D clean. I pushed and am bouncing the daemon to serve real titles.
 _________________________________________________________________________________
+time:      [14:18] [19-07-26]
+agent:     [claude] [fable 5]
+worktree:  [detached @ origin/main (4b756175)]
+type:      [release]
+area:      [infra]
 
-time: [02:29pm] [07-19-26]
-agent: [ocean] [gpt-5]
-worktree: [public-onboarding-retirement-20260719]
-type: [security]: Private onboarding boundary
-area: [skills]: Bedrock coworker onboarding
-
-Retired the obsolete public `ocean-coworker-onboarding` skill after
-`ocean-bedrock` moved private. The private repository already owns the newer
-canonical `skills/ocean-bedrock-coworker-onboarding/SKILL.md` ceremony with
-invite redemption, local-only transport, secret exclusions, preview, and an
-explicit human acknowledgement gate; the older public token/bootstrap procedure
-was not copied. Verified with `cargo xtask docs-check`, `git diff --check`,
-and a tracked-reference search.
+Post-merge reviewed PR #304 (Kimi K3 dynamic tools, merged 07-17 without its feature-review pass) and redeployed the daemon so K3 is actually servable. Review verdict sound: catalog maps kimi-k3 to Moonshot with 1M context/8K output cap and the bare kimi alias stays on K2.6; reasoning_content replay is gated to same-provider same-model K3 history; dynamic declarations bounded at 16 tools/512 KiB with explicit errors. Verified 344 protocol+runtime tests green at current main. Rebuilt clean in a detached worktree, swapped target/release/ocean-daemon, launchctl kickstart -k in a verified idle window (supervision is back on launchd — plist paths were fixed since the 16th). /health reports rev 4b7561757f9f and /v1/models now advertises kimi-k3; kimi auth present in auth.json.
 _________________________________________________________________________________
-time:      [14:37] [19-07-26]
-agent:     [pi] [gpt-5.6]
-worktree:  [feat/tui-workflow-graph-rail] /Users/risingtidesdev/.worktrees/ocean-os-tui-workflow-graph-rail
+time:      [21:30] [19-07-26]
+agent:     [claude] [fable 5]
+worktree:  [main checkout ledger append only]
+type:      [release]
+area:      [infra]
+
+TASK-7 merged as 824830c0 (#316) and the artifact path is seeded: ~/.local/libexec/ocean-daemon/ocean-daemon-824830c08e36 published from a clean detached-worktree build, `current` flipped atomically, ~/.local/bin/ocean-daemon now resolves through it. No daemon restart — running afedcd74 binary is functionally current (all later main commits are TUI-only, test-only, unwired search, or deploy scripts). Cutover remainder: launchd still execs the main checkout's launcher, which cannot advance past 4b756175 until the uncommitted crates/ocean-tui/AGENTS.md lane (transcript live-follow notes) lands; owner pinged on the pad. Old launcher remains functional meanwhile.
+_________________________________________________________________________________
+time:      [22:05] [19-07-26]
+agent:     [claude] [fable 5]
+worktree:  [detached @ origin/main (c60c3e14)]
+type:      [release]
+area:      [infra]
+
+Deployed the TASK-61 daemon (exact-once turn finalizer): clean detached-worktree build at c60c3e14, published as versioned artifact ocean-daemon-c60c3e148954 with atomic current flip, transitional copy for the pre-#316 launcher (main checkout is contested by a live TUI lane and still lags), idle-window kickstart at 0 turns in flight, /health confirms rev c60c3e148954. Daemon now carries the full daemon-core slate through TASK-61.
+_________________________________________________________________________________
+
+## 2026-07-19 — knowledge-separation extraction (wave 1)
+
+Double landing. TASK-56 48bd92f9 (daemon-core raw #1): TurnTerminalGuard RAII mirrors InFlightGuard — a panic in the prompt await now drives the SAME update_request_finished terminal transition (no second state machine) and emits TurnFinished{Failed}; its return value gates emission so cancels keep their frame and normal turns emit exactly once; Drop hands async work to Handle::try_current detached spawn. 3 new tests through real registry+bus; 522 daemon tests green. TASK-54 9498905f: every injected prompt layer now anchored at generation — folder-agent gets [folder-agent instructions]…[end folder-agent instructions] sentinels via one shared compose helper (both daemon sites + rooms), browser context loses its internal blank line and strips on an exact two-line prefix; strip_injected_turn_prep peels all 5 layers order-tolerantly; 6 strip tests + 2 cross-crate anchor guards; agent 199 / daemon 524 green. Completes TASK-50's display-strip. KNOWN FLAKE (ticket-worthy): github::tests intermittently red under full-parallel cargo test (subprocess/tempdir races, different test each run, 19/19 in isolation on clean main) — bit one TASK-54 gate run, clean on rerun. Daemon rebuild + announced bounce for 54/56/57 follows.
+time:      [18:17] [19-07-26]
+agent:     [pi] [gpt-5.6] [thoth]
+worktree:  [feat/tui-compact-activation]
 type:      [feature-request]
 area:      [frontend]
 
-Implemented the first truthful workflow-graph rail slice by reusing Ocean TUI's existing 3D camera/projection renderer over authenticated Observatory topology. The TUI loads the boot-bound summary token, baselines from the durable snapshot cursor, resumes the typed SSE stream, and rebaselines on reset, malformed data, cursor gaps, daemon-instance changes, or stale environment-token 401 via the rotating secure file. An authoritative inactive-to-active execution transition replaces Files in the existing right rail unless the operator explicitly closed it; terminal graphs remain inspectable, explicit Files navigation restores the tree, and Enter expands the workflow graph into the center while Files returns beside it. All graph navigation mutates through typed Elm actions; authoritative state remains complete while paint work is bounded to 256 nodes and 1,024 edges with an honest hidden count. No orchestration, scheduling, or subagent authority entered core or the TUI.
+Activated TUI `/compact` against the merged synchronized session contract. The TUI now installs only a bounded validated public `SessionSyncSnapshot`, restarts scoped SSE strictly after its opaque fence, rejects stale A→B→A and queued stream completions with binding/stream/operation generations, and preserves per-session unresolved markers across rebinding so prompts cannot outrun authority. Typed replay gaps and scoped `ocean.session_changed` invalidations clear derived projections and use refresh-only `/sync`; compact's own pre-response invalidation is deferred until its lease releases, then reconciled without racing or replacing the compact generation. Raw session messages, tools, thinking, image metadata, invalid roles, oversized snapshots, contradictory HTTP outcomes, and missing fences fail closed.
 
 Verification: ocean-observatory 28 unit + 21 integration/redaction/store tests; ocean-tui 372 passed / 4 ignored; denied-warning Clippy for both crates; TUI release build; workspace check; formatting, docs-check, and diff-check. Live PTY smoke against the supervised daemon rendered the real Observatory snapshot (over 360 retained executions and 340 edges), auto-opened FLOW with current active nodes, expanded into center, and restored Files on the right. Three fresh review passes closed Elm-mutation, token-rotation, duplicate-view, render-bound, and malformed-SSE lifecycle findings; final review passed with no medium-or-higher issue.
 _________________________________________________________________________________
@@ -4594,6 +4607,7 @@ type:      bug-report
 area:      backend
 
 Double landing. TASK-56 48bd92f9 (daemon-core raw #1): TurnTerminalGuard RAII mirrors InFlightGuard — a panic in the prompt await now drives the SAME update_request_finished terminal transition (no second state machine) and emits TurnFinished{Failed}; its return value gates emission so cancels keep their frame and normal turns emit exactly once; Drop hands async work to Handle::try_current detached spawn. 3 new tests through real registry+bus; 522 daemon tests green. TASK-54 9498905f: every injected prompt layer now anchored at generation — folder-agent gets [folder-agent instructions]…[end folder-agent instructions] sentinels via one shared compose helper (both daemon sites + rooms), browser context loses its internal blank line and strips on an exact two-line prefix; strip_injected_turn_prep peels all 5 layers order-tolerantly; 6 strip tests + 2 cross-crate anchor guards; agent 199 / daemon 524 green. Completes TASK-50's display-strip. KNOWN FLAKE (ticket-worthy): github::tests intermittently red under full-parallel cargo test (subprocess/tempdir races, different test each run, 19/19 in isolation on clean main) — bit one TASK-54 gate run, clean on rerun. Daemon rebuild + announced bounce for 54/56/57 follows.
+Verification: 384 TUI tests passed with 4 explicit ignores; denied-warning all-target TUI Clippy, release build, workspace test check, docs-check, formatting, and diff-check passed. A real mock SSE seam proves fence `Last-Event-ID` and reset routing. Three adversarial review rounds closed self-invalidation, cross-binding marker, snapshot validation, replay-reset, and stale-stream findings; final concurrency and security/API reviews approved with no blocker/high findings.
 _________________________________________________________________________________
 time:      [19:48] [19-07-26]
 agent:     [claude] [fable 5]
@@ -4602,4 +4616,105 @@ type:      refactor
 area:      testing
 
 TASK-58 landed 66e01c34: github::tests parallel flakiness root-caused to ONE shared-state source — fake_convene_state did set_var(OCEAN_CONFIG_DIR) then AgentRuntime::from_env(), and peer tests mutate that process-global env concurrently, so runtimes intermittently rooted in another test's (or a dropped) config dir. Explains all three observed symptoms: projects.json atomic-rename races, cross-test 404s, singleflight 404-vs-200 flips — and why isolation was always green. Fix: AgentRuntime::with_config_dir injection ctor (from_env delegates, prod path byte-identical); the helper injects its tempdir directly. No serialization attributes. Proof: sub ran 5x subset + 3x full green; fable reran full daemon suite twice + agent suite, all raw exits 0.
+_________________________________________________________________________________
+_________________________________________________________________________________
+time:      [08:21pm] [19-07-26]
+agent:     [pi], [gpt-5.6-sol], [orchestrator], [subagents]
+worktree:  [pi/ocean-typed-search-m1-20260719] /private/tmp/ocean-typed-search-m1-20260719
+type:      [feature-request]: standalone typed-search M1
+area:      [backend]: bounded trusted-root byte and filesystem search
+
+Implemented standalone `crates/ocean-search` over `ocean-walker` from pinned MIT Oh My Pi search mechanisms at `03c48d073bd4849726cc14750b5aecfa310bdf26`. The unwired Rust 2021/MSRV 1.88 library provides typed content/count/files output, Rust regex/literal/attributed fallback, explicit multiline, strict OR globs and native type filters, exact native path identity, opened-handle leaf validation, fixed cap-plus-one reads with oversized and binary skips, finite request/result ceilings, cooperative heartbeat, and deterministic path-window commit. Independent review drove pre-commit staging budgets, regex compiler bounds, truthful matching-record/per-file truncation, after-context preservation, later-window stop, consistent explicit-root policy, and read-error accounting. Added focused black-box/adapted donor coverage plus license, notice, README, local contract, canonical workspace/index/roadmap/project-map/OMP-map documentation. No runtime grep/glob, daemon, agent, TUI, capability/profile/tool schema, session, PCRE2, N-API/TypeScript, cache, prefix-search, or confinement wiring was added; runtime adoption remains a separate descriptor/handle-relative authorization checkpoint.
+
+Verification: 22 tests passed on current Rust and pinned Rust 1.88; denied-warning all-target Clippy, workspace test compilation, current-toolchain Windows GNU all-target cross-check, `cargo deny check`, docs-check, formatting, and diff checks passed. Three fresh final review lanes accepted the corrected standalone boundary with no medium-or-higher findings; Windows compiled but was not runtime-tested on this macOS host.
+time:      [04:38] [20-07-26]
+agent:     [claude] [fable 5]
+worktree:  fix/flaky-at-mention-trigger-test
+type:      [bug-report]
+area:      [testing]
+
+Fixed the flaky daemon test at_mention_queues_turn_and_posts_reply_back that failed PR #313's ubuntu gate (passes solo; 523-test parallel suite exposes it). Root cause: the test asserted raw broadcast-channel emptiness right after consuming the room_trigger event, but the spawned reply turn shares that channel and can emit lifecycle events before try_recv on a loaded runner. The duplicate-fire property it actually guards is synchronous (same handler, pre-return), so the assert now drains the channel and rejects only a second room_trigger Extension event, ignoring legitimate turn events. Test 5x stable, clippy zero, fmt clean. Pad ticket TASK-8.
+_________________________________________________________________________________
+time:      [21:16] [19-07-26]
+agent:     [claude] [fable 5]
+worktree:  task-60-tui-busy-submit (fable builder sub)
+type:      bug-report
+area:      frontend
+
+TASK-60 landed df939c39 (smaths screenshot: TUI stacking duplicate prompt rows + "turn could not start" per Enter press): Enter while busy now suppresses submit entirely (no optimistic row, no POST, one replace-not-append status notice); a raced 409-active-turn drops the optimistic row, keeps the prompt once in the composer, adds no error row. The 13de2a97 daemon-blip retry path is preserved and pinned by test (non-409 connect failures still restore the prompt). 390 TUI tests + fmt + clippy raw-exit 0; codex's trace was the spec. DISCLOSURE: my push sequencing slipped — df939c39 reached main minutes BEFORE my review completed (HEAD~1 confusion during a toolchain-pin cherry-pick); full review then passed post-hoc, gates green, no revert needed. Also landed c80cbb77: rust-toolchain 1.97.0 pin (rustfmt+clippy components) on BOTH repos (surface 94e42b8) — kills the cross-agent rustfmt drift that re-broke task-46 fmt twice; no rustfmt.toml on purpose (per-crate edition drives style, tree already formatted that way). Canonical ocean-os ref/tree mismatch from my update-ref repaired: non-WIP paths restored from HEAD, ocean-tui WIP + events.md preserved untouched, then ff to c80cbb77. @ocean-tui-agent: your canonical WIP now sits atop a main that already contains TASK-60 in the same files — rebase in a worktree before committing anything.
+_________________________________________________________________________________
+time:      [21:25] [19-07-26]
+agent:     [claude] [fable 5]
+worktree:  infra/task7-deploy-artifact-isolation
+type:      [refactor]
+area:      [infra]
+
+Killed the deploy-symlink footgun (pad TASK-7): the supervised daemon no longer execs the repo's mutable target/release output, so a cargo build in the checkout — any branch — can never silently become the running daemon at the next restart (the source of every -dirty health rev). ops/install-ocean-daemon.sh now publishes each main build to ~/.local/libexec/ocean-daemon/ocean-daemon-<rev> and flips a `current` symlink atomically (temp link + rename), repoints ~/.local/bin/ocean-daemon at `current`, and prunes to the three newest artifacts; deploy/ocean-daemon.sh execs `current` (OCEAN_DAEMON_BIN overrides) and fails closed with instructions when no artifact is installed. Publish/flip/prune logic sandbox-verified under a temp HOME; both scripts bash -n clean. NOTE for operators: next daemon deploy must run ops/install-ocean-daemon.sh once to seed the libexec path — a bare kickstart after only this merge will fail closed by design.
+_________________________________________________________________________________
+time:      [21:32] [19-07-26]
+agent:     [claude] [fable 5]
+worktree:  task-62-replay-floor (fable builder sub)
+type:      bug-report
+area:      backend
+
+TASK-62 landed 25af891e (daemon-core #3+#5, codex cut C): the global agent-event replay ring gains a per-session terminal floor — the latest TurnFinished per session survives eviction in a seq-ordered side map (new monotonic seq on AgentEventEnvelope; UUIDs carry no order), merged into all three replay producers under the SAME history-lock discipline the audit cleared (no new locks). Capped at 1024 sessions with oldest-seq eviction + warn. Lag recovery deliberately reuses the shipped LiveLag reset_required contract: the instructed reconnect now lands on a floor-backed ring that resurrects the lost terminal — no client contract change, no inline re-emission duplicates. Verified permissions ride the legacy rail, so TurnFinished is the sole reconnect-critical terminal. 529 daemon tests (5 new) + fmt + clippy raw-exit 0. Daemon bounce HELD to batch with TASK-61.
+_________________________________________________________________________________
+time:      [21:35] [19-07-26]
+agent:     [claude] [fable 5]
+worktree:  task-61-exact-once-finalizer (fable builder sub)
+type:      bug-report
+area:      backend
+
+TASK-61 landed a8c0e3d6 (daemon-core #4, codex cut A) — and the sub upgraded the spec: not emit-before but ATOMIC. update_request_finished now takes an on_finalize closure that runs UNDER the registry write guard, only when this call performs the terminal transition; the agent-bus TurnFinished emits inside that scope (both buses verified sync, no await, no re-entry — no lock hazard). A reader observing registry-terminal is thereby GUARANTEED the frame is already in the ring — the stale-projection window GET /v1/agent/sessions kept exposing is closed at the source, and the inverted window never opens. Normal completion and the TASK-56 orphan guard both funnel through the hook; a latent unconditional double-emit in the old normal path is now gated. 8-reader race test fails under the old order, passes now. Post-rebase over TASK-62: 532/0 + fmt + clippy raw-exit 0. Daemon-core audit slate now FULLY closed (#1 56, #2 57, #3+#5 62, #4 61, #6 hygiene-non-blocking via premise check). Batched daemon bounce (61+62) follows.
+
+_________________________________________________________________________________
+
+time:  [21:24] [07-19-26]
+agent: [pi] [gpt-5.4] [thoth]
+worktree: [fix/tui-resumed-turn-busy-409]
+type:  [bug report]: Resumed-turn duplicate 409 prompt slop
+area:  [frontend]: TUI session admission and optimistic transcript recovery
+
+Fixed resumed sessions that appeared submit-ready while an older turn still owned the daemon session lane. Resume now probes the bounded synchronized session surface, typed busy rejections roll back only the generation-tagged rejected user echo, preserve one composer prompt, latch Enter until authoritative completion, and avoid raw HTTP error output. Activity-probe, binding, stream, compact, submission, and turn identities reject stale/racing completions; outcome-unknown requests retain their no-rollback/no-restore safety contract.
+_________________________________________________________________________________
+time:      [22:20] [19-07-26]
+agent:     [claude] [fable 5]
+worktree:  infra/task13-msrv-pin-compat
+type:      [gh-actions]
+area:      [infra]
+
+Fixed the hosted MSRV lane broken by the 1.97 toolchain pin (pad TASK-13, blocking thoth's #317/TASK-12): rust-toolchain.toml outranks the job-installed 1.88, so the MSRV job ran 1.97 and xtask's version guard failed closed exactly as designed. RUSTUP_TOOLCHAIN=1.88.0 env on the MSRV step restores the intended toolchain (env override outranks the pin file and inherits to xtask's spawned cargo processes); the guard's failure message now prints the local-dev incantation. Verified by running the complete MSRV lane locally under the override: ci: MSRV lane passed.
+_________________________________________________________________________________
+time:      [22:58] [19-07-26]
+agent:     [claude] [fable 5]
+worktree:  task-65-surface-switch-strip (fable builder sub)
+type:      bug-report
+area:      backend
+
+TASK-65 landed 86ceab94 (smaths screenshot: "[surface switch: ...via [WEB] (was [TUI])..." rendering raw in a user bubble): the Fix-3 surface-switch notice LEADS the composed message ahead of the flag, so the TASK-50 strip loop (flag-anchored first peel) never fired and the whole stack leaked. strip_surface_switch_notice now peels FIRST; anchor = the full rigid lead-in through "via [" with the single-line ]\n terminator (works for all 12 surface tags; collision-negative cases tested). Generation extracted to compose_surface_switch_notice with a cross-crate anchor guard test so a reworded notice fails tests instead of leaking. Both display projections covered; title path naturally immune (notice can't appear on turn one). agent 205 / daemon 532 / fmt / clippy raw-exit 0 on the exact detached sha. Daemon bounced, health 200. That makes SIX anchored strippable layers; no unanchored injection sites remain known.
+_________________________________________________________________________________
+time:      [22:53] [19-07-26]
+agent:     [pi] [gpt-5.4] [thoth]
+worktree:  [pi/observatory-auth-docs-20260719]
+type:      [issues]
+area:      [writing]
+
+Corrected the Observatory authentication contract after closing stale pad TASK-9: the read-only routes already consumed ObservatoryAuth in baf26468, so no route implementation was repeated. Gate 1 now states the implemented stateless-bearer truth — nonces make issuances unique but do not prevent replay within scope/lifetime — and assigns optional Authorization-Observer cookie issuance plus Secure/HttpOnly/SameSite/Path attributes to the authenticated Ocean Surface proxy. The daemon remains header/cookie input only, emits no Set-Cookie, exposes no issuance route, and never distributes its signing secret.
+_________________________________________________________________________________
+Moved internal operating material out of this public repo into the now-private `ocean-agents` repository: `docs/orchestrator/` (factory goal/loop/migration, team_takeover notes, workflows/) → `ocean-agents/docs/orchestrator/`; `skills/` (ocean-os-software-factory, ocean-coworker-onboarding) → `ocean-agents/internal/ocean-os/skills/` with live copies installed at `~/.config/ocean-rs/skills/` so Longhouse advisory discovery keeps working. Updated `docs/README.md` index and the two path references plus the Stage E prose in `docs/specs/2026-07-18-ocean-crew-orchestration-and-durable-workflow-manifest.md`. Workflow discovery (`{cwd}/docs/orchestrator/workflows/`) is fail-open, so ocean-os-cwd turns simply see no factory workflows now. `cargo xtask docs-check` PASS (155 active files, 141 links). Also generated `docs/phase0-inventory.json` (1,296-file classification manifest across the four repos). worktree: main
+time:      [00:15] [20-07-26]
+agent:     [claude] [fable 5]
+worktree:  fix/task17-18-k3-bound-visibility
+type:      [bug-report]
+area:      [backend]
+
+Closed both K3 bound-enforcement gaps from pi's TASK-16 live-validation audit. TASK-17: runtime search_dynamic_tools no longer silently continues past budget-rejected matches — every ranked match the 16-tool/512-KiB budgets exclude is reported as loaded:false with a machine-readable excluded_reason (tool_limit / schema_too_large / byte_budget) plus a top-level excluded_count, so callers see exactly what was withheld. TASK-18: direct typed wire-bound regressions in the protocol layer — 16 dynamic tools pass and a 17th fails closed; a 512-KiB+1 schema fails closed; both assert the typed error names the limits. Existing cap tests extended to pin the new exclusion contract. All runtime+protocol tests green, clippy zero, fmt applied.
+_________________________________________________________________________________
+time:      [02:05] [20-07-26]
+agent:     [claude] [fable 5]
+worktree:  infra/task15-launcher-cutover
+type:      [refactor]
+area:      [infra]
+
+TASK-15: supervision fully decoupled from the dev checkout. The committed plist is now a machine-neutral template (killed three fossilized /Users/smathdaddy-macbook absolute paths that would have clobbered the hand-fixed installed plist on any reinstall); the installer renders the home placeholder at install time with an unexpanded-placeholder guard, publishes deploy/ocean-daemon.sh as ~/.local/libexec/ocean-daemon/launch.sh, and the rendered plist execs that copy — working-tree state can never again affect supervision, same isolation as the TASK-7 binary artifact. Launcher's dead REPO derivation removed. Installer's build-from-main guard now accepts detached worktrees whose HEAD is contained in origin/main and hard-fails any tracked modification, matching how deploys actually run. bash -n both scripts, sandbox plist render lint-clean.
 _________________________________________________________________________________

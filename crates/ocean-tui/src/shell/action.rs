@@ -48,6 +48,16 @@ pub enum HealthSource {
     Sse,
 }
 
+/// A compact request failure. `transcript_may_have_changed` is true when the
+/// daemon may have committed compaction but the TUI could not reload it; the
+/// app must then block new turns for that session rather than display stale
+/// history as if it were authoritative.
+#[derive(Debug, Clone)]
+pub struct CompactFailure {
+    pub message: String,
+    pub transcript_may_have_changed: bool,
+}
+
 #[derive(Debug, Clone)]
 pub enum Action {
     /// Redraw requested (coalesced with the render tick).
@@ -71,26 +81,99 @@ pub enum Action {
     WorkflowGraphCommand(crate::shell::workflow_graph::WorkflowGraphCommand),
     /// Session was minted/adopted; scope the stream to it.
     SessionBound(AgentSessionId),
-    /// The scoped agent stream lost continuity (disconnect, replay lag/error,
-    /// or daemon restart). Session projections must invalidate derived state
-    /// until a fresh authoritative turn boundary arrives.
+    /// An event from the currently bound scoped stream. Binding and stream
+    /// generations prevent A→B→A rebinding or a post-sync resubscribe from
+    /// accepting queued envelopes from a superseded task.
+    BoundAgentEvent {
+        session_id: AgentSessionId,
+        binding_generation: u64,
+        stream_generation: u64,
+        event: Box<AgentTurnEvent>,
+    },
+    /// The scoped stream transport lost continuity. The task reconnects from
+    /// its last event id; derived projections still invalidate immediately.
+    BoundAgentStreamGap {
+        session_id: AgentSessionId,
+        binding_generation: u64,
+        stream_generation: u64,
+    },
+    /// The daemon rejected a replay anchor or reported live lag. The client
+    /// must stop that stream and obtain a fresh synchronized snapshot/fence.
+    BoundAgentReplayResetRequired {
+        session_id: AgentSessionId,
+        binding_generation: u64,
+        stream_generation: u64,
+    },
+    /// Compatibility/internal action delivered to components only after the
+    /// app validates a bound stream generation.
     AgentStreamGap(AgentSessionId),
     /// Submit the composer's current text as a new turn.
-    SubmitPrompt(String),
+    SubmitPrompt {
+        submission_id: u64,
+        prompt: String,
+    },
+    /// `/compact` — ask the daemon to atomically compact the bound session.
+    CompactSession,
+    /// Async completion of compaction. Session id plus binding/operation
+    /// generations prevent stale A→B→A or earlier-operation completions from
+    /// replacing the current chat.
+    CompactFinished {
+        session_id: AgentSessionId,
+        binding_generation: u64,
+        operation_generation: u64,
+        result: Result<ocean_core::CompactResponse, CompactFailure>,
+    },
+    /// Refresh-only recovery after compaction may have committed without a
+    /// usable response, or after an SSE replay reset required a new baseline.
+    CompactReloadFinished {
+        session_id: AgentSessionId,
+        binding_generation: u64,
+        operation_generation: u64,
+        result: Result<ocean_core::SessionSyncResponse, CompactFailure>,
+    },
     /// A non-fatal error to surface in the status line.
     Error(String),
     /// A turn (or its session mint) could not be sent even after the daemon-blip
     /// retry window. The chat unwinds its busy state, surfaces the error in the
     /// transcript, and restores `prompt` to the composer so nothing typed is lost.
     TurnSendFailed {
+        submission_id: u64,
         prompt: String,
         err: String,
+    },
+    /// The daemon rejected a tagged optimistic submission because this session
+    /// already has an admitted operation. Roll back only that local echo,
+    /// preserve its prompt, and keep the composer latched until authoritative
+    /// stream/snapshot state proves the active turn finished.
+    TurnSessionBusy {
+        submission_id: u64,
+        session_id: AgentSessionId,
+        binding_generation: u64,
+        prompt: String,
+    },
+    /// The turn POST was accepted. Clears only the matching optimistic
+    /// submission tag; the stream remains authoritative for turn completion.
+    TurnAccepted {
+        submission_id: u64,
+        turn_id: ocean_agent_sdk::AgentTurnId,
     },
     /// The turn POST was connected but its final response was lost/invalid.
     /// The daemon may already be executing it, so do NOT restore the prompt or
     /// offer an automatic retry that could duplicate side effects.
     TurnOutcomeUnknown {
+        submission_id: u64,
         err: String,
+    },
+    /// Best-effort activity probe used on resume and after a busy rejection.
+    /// A synchronized snapshot proves the old turn is finished; an active-lane
+    /// conflict proves the composer must remain latched while SSE continues.
+    SessionActivityProbeFinished {
+        session_id: AgentSessionId,
+        binding_generation: u64,
+        probe_generation: u64,
+        after_busy_rejection: bool,
+        active_was_observed: bool,
+        result: Result<ocean_core::SessionSyncResponse, CompactFailure>,
     },
     /// Transient status message. COMPATIBILITY PATH for slash-command and
     /// notice producers — health transitions use the typed

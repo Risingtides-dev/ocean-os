@@ -217,6 +217,26 @@ fn paginate_by_id<T>(
 /// Each image's `data` accepts either a bare base64 string or a
 /// `data:<mime>;base64,<body>` URL; the prefix is stripped so `Content::Image`
 /// holds only the base64 body it expects.
+/// Compose the surface-switch notice (Fix 3, TASK-65) prepended to a user turn
+/// when the session's steering surface changed since the last turn. It is emitted
+/// AHEAD of the per-turn `[FLAG]` so the model leads with an explicit
+/// adjust-your-rendering cue. `flag`/`from` are canonical [`system_prompt::
+/// surface_flag`] labels (the new and previous surfaces).
+///
+/// Single source of truth for the notice text. The rigid lead-in
+/// `[surface switch: the user is now messaging you via [` is the exact anchor the
+/// DISPLAY strip (`strip_surface_switch_notice` in `session/mod.rs`) peels off
+/// transcript projections, and the trailing `]\n` is that strip's terminator —
+/// the notice is a single line, so its only `]\n` is the terminator. Kept in sync
+/// with the stripper's literals by `surface_switch_notice_anchors_display_strip_marker`;
+/// rewording the notice fails that guard rather than silently leaking the preamble.
+fn compose_surface_switch_notice(flag: &str, from: &str) -> String {
+    format!(
+        "[surface switch: the user is now messaging you via [{flag}] (was [{from}]). \
+         Adjust your rendering and tone to this surface.]\n"
+    )
+}
+
 fn build_user_message(text: String, images: Option<&[PromptImage]>) -> Message {
     let mut content = vec![Content::text(text)];
     if let Some(images) = images {
@@ -1967,10 +1987,7 @@ impl AgentRuntime {
             let mut out = String::new();
             if surface_switched {
                 let from = system_prompt::surface_flag(prev_surface.as_deref());
-                out.push_str(&format!(
-                    "[surface switch: the user is now messaging you via [{flag}] (was [{from}]). \
-                     Adjust your rendering and tone to this surface.]\n",
-                ));
+                out.push_str(&compose_surface_switch_notice(flag, from));
             }
             out.push_str(&format!("[{flag}] "));
             out.push_str(&req.prompt);
@@ -3556,6 +3573,26 @@ mod tests {
     }
     fn tool(name: &'static str) -> SharedTool {
         Arc::new(NamedTool(name))
+    }
+
+    /// TASK-65 cross-crate guard: ocean-agent's display strip
+    /// (`strip_surface_switch_notice` in `session/mod.rs`) anchors on this exact
+    /// lead-in and `]\n` terminator to peel the Fix-3 surface-switch notice out of
+    /// transcript projections. Keep the two literals in sync — if the notice text
+    /// changes, the display strip silently stops matching and the whole preamble
+    /// leaks into the user bubble again (the original operator-reported defect).
+    /// Mirrors `folder_agent_block_anchors_display_strip_marker` in ocean-daemon.
+    #[test]
+    fn surface_switch_notice_anchors_display_strip_marker() {
+        let notice = compose_surface_switch_notice("WEB", "TUI");
+        // The exact rigid lead-in the stripper anchors on, up to the variable flag.
+        assert!(notice.starts_with("[surface switch: the user is now messaging you via ["));
+        // Single-line notice bounded by the stripper's `]\n` terminator.
+        assert!(notice.ends_with("]\n"));
+        // The only `]\n` is the terminator, so the first one cleanly bounds the
+        // notice regardless of the {flag}/{from} pair — the internal `[WEB]`/`[TUI]`
+        // brackets are followed by a space or `(`, never a newline.
+        assert_eq!(notice.matches("]\n").count(), 1);
     }
 
     #[test]

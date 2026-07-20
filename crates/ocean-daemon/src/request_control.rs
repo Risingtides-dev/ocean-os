@@ -196,12 +196,37 @@ pub(super) async fn update_request_permission_result(
     control.status.updated_at = Some(Utc::now());
 }
 
+/// Drive a request to its terminal registry state, exactly once, and run
+/// `on_finalize` UNDER the registry write lock at the instant of the transition.
+///
+/// `on_finalize(final_state)` is the exact-once turn finalizer's atomic hook
+/// (TASK-61): it fires IFF *this* call performs the terminal transition — either
+/// the cancel-settle branch (`Cancelling`/`Cancelled` → `Cancelled`) or the
+/// normal desired-state branch (`Running` → `desired_state`). A call that finds
+/// the entry already terminal (a late twin — normal completion racing the orphan
+/// guard, or vice versa) returns the existing state and does NOT invoke the hook,
+/// so the terminal frame is emitted exactly once.
+///
+/// Because the hook runs while this function still holds the write guard — before
+/// the mutated `status.state` is visible to any `requests.read().await` reader —
+/// the registry transition and whatever the hook emits (the agent-bus
+/// `TurnFinished` frame) are atomic from a concurrent reader's perspective: a
+/// reader that observes the entry terminal is guaranteed the hook has already
+/// run. This closes the stale-projection window where `GET /v1/agent/sessions`
+/// (which derives `active_turn` from this registry) could report a turn cleared
+/// before the events stream delivered its `TurnFinished`. The hook MUST stay
+/// synchronous and non-blocking (no `.await`): it runs under the write lock, so
+/// blocking there would stall every registry reader. `emit_agent` / the event
+/// buses satisfy this (a `std::sync::Mutex` push + a non-blocking
+/// `broadcast::send`), and they never re-enter the registry, so there is no lock
+/// inversion.
 pub(super) async fn update_request_finished(
     requests: &RequestRegistry,
     request_id: RequestId,
     session_id: Option<SessionId>,
     desired_state: RequestState,
     message: String,
+    on_finalize: impl FnOnce(RequestState),
 ) -> Option<RequestState> {
     let mut requests = requests.write().await;
     let control = requests.get_mut(&request_id)?;
@@ -220,6 +245,7 @@ pub(super) async fn update_request_finished(
         status.updated_at = Some(Utc::now());
         status.finished_at = Some(Utc::now());
         let _ = control.handle.take();
+        on_finalize(RequestState::Cancelled);
         return Some(RequestState::Cancelled);
     }
 
@@ -234,5 +260,6 @@ pub(super) async fn update_request_finished(
     status.updated_at = Some(Utc::now());
     status.finished_at = Some(Utc::now());
     let _ = control.handle.take();
+    on_finalize(desired_state);
     Some(desired_state)
 }

@@ -36,13 +36,16 @@ Documentation policy: [`OCEAN_DOCUMENTATION_CONTRACT.md`](OCEAN_DOCUMENTATION_CO
 - [`LONGHOUSE.md`](LONGHOUSE.md) and [`LONGHOUSE_ORCHESTRATION.md`](LONGHOUSE_ORCHESTRATION.md) — current Longhouse subsystem overview, entry-path behavior, orchestration boundaries, and explicitly labeled target work.
 - [`OCEAN_NATIVE_INTERNALS_MAP.md`](OCEAN_NATIVE_INTERNALS_MAP.md) — focused
   `ocean-agent` internal seams; verify planned sections before acting.
+- [`../crates/ocean-search/README.md`](../crates/ocean-search/README.md) — standalone,
+  bounded typed-search M1 contract and its explicit trusted-root/non-confinement boundary.
 - [`PLUGINS.md`](PLUGINS.md) — subprocess plugin contract.
 - [`OCEAN_ECOSYSTEM_CONTRACT.md`](OCEAN_ECOSYSTEM_CONTRACT.md) — detailed
   session/surface ecosystem invariants.
 - [`examples/agents/README.md`](examples/agents/README.md) — folder-as-agent
   examples.
-- [`orchestrator/`](orchestrator/) — current factory/orchestration references;
-  each workflow remains subordinate to runtime permissions and source truth.
+- Factory/orchestration operating references moved to the private
+  `ocean-agents` repository (`internal/ocean-os/orchestrator/`) on 2026-07-19;
+  workflow behavior remains subordinate to runtime permissions and source truth.
 
 ## Plans and retained evidence
 
@@ -67,7 +70,7 @@ Proposals awaiting operator ruling:
 
 Active implementation reference:
 
-- [`specs/2026-07-03-omp-port-map.md`](specs/2026-07-03-omp-port-map.md) — source-researched OMP-to-Ocean mechanism map plus the dated implementation audit, including the implemented-but-unwired standalone walker M1. It is a prioritized reference, not current architecture; typed search and live runtime adoption remain open through [`../ROADMAP.md`](../ROADMAP.md), and its original core-orchestration placement is superseded by the extension architecture.
+- [`specs/2026-07-03-omp-port-map.md`](specs/2026-07-03-omp-port-map.md) — source-researched OMP-to-Ocean mechanism map plus the dated implementation audit, including the implemented-but-unwired standalone walker and typed-search M1 crates. It is a prioritized reference, not current architecture; live runtime search adoption remains open through [`../ROADMAP.md`](../ROADMAP.md), and its original core-orchestration placement is superseded by the extension architecture.
 
 Completed extraction manifests are retained evidence, not independent work orders. The broader behavior-neutral daemon refactor remains active under `DAEMON_REFACTOR_MISSION.md`; consult its progress section and the current code-health plan before selecting the next checkpoint.
 

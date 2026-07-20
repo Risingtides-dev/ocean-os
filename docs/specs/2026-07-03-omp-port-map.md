@@ -1,6 +1,6 @@
 # OMP → Ocean Port Map
 
-**Date:** 2026-07-03 · **Status:** Research complete; implementation audit refreshed 2026-07-16, walker M1 refreshed 2026-07-19 · **Owner:** Smaths / Ocean
+**Date:** 2026-07-03 · **Status:** Research complete; implementation audit refreshed 2026-07-16, walker/search M1 refreshed 2026-07-19 · **Owner:** Smaths / Ocean
 **Source:** deep source inspection of [oh-my-pi](https://github.com/can1357/oh-my-pi) (MIT, ~15.7k★) by 5 parallel research agents reading actual `.rs`/`.ts` files — not docs. This is the standing backlog: every feature worth reverse-engineering into Ocean, mapped to a destination crate, so features never need to be re-named one by one.
 
 > **Ownership update (2026-07-13):** backlog entries that place subagent definitions, `task`/spawn, lifecycle, or orchestration in core are superseded. Those capabilities must ship as extensions over generic permission-gated execution/capability seams; do not port their original core placement.
@@ -32,7 +32,7 @@ live. New features then attach to a profile in one line.
 | `ocean-hashline` (new) | file-hash anchors, patch dialects, snapshot store, recovery | `packages/hashline/` (TS→Rust reimplement) |
 | `ocean-ast` (new) | ast-grep-core wrapper, structural edits, `summarize_code` fold/unfold | `crates/pi-ast` (lift patterns) |
 | `ocean-walker` | implemented standalone/unwired parallel FS walker, bounded generation-safe TTL scan cache, exact native owned paths, and invalidation | `crates/pi-walker` |
-| `ocean-search` (new or in walker) | in-process grep (grep-regex/searcher), typed results | `crates/pi-natives/src/grep.rs` |
+| `ocean-search` | implemented standalone/unwired bounded typed in-memory and trusted-root path search over `ocean-walker`; no runtime authorization/adoption | `crates/pi-natives/src/grep.rs` |
 | `ocean-minimizer` | M1 standalone fixed filters over already-tokenized invocations; no TOML/config, artifact persistence/reference, footer, or runtime wiring | `crates/pi-shell/src/minimizer/` |
 | `ocean-iso` (new, later) | CoW worktree isolation (APFS clonefile) for subagents | `crates/pi-iso` |
 | `ocean-daemon` (extend) | harness profiles, tool harness (output-meta, artifacts, bm25 discovery, resolve protocol), TTSR, compaction, checkpoint/rewind | `packages/coding-agent/src/{tools,session}` |
@@ -253,8 +253,17 @@ propagate through git deps).
   (`MtimeDescPathAsc`), streaming visitors with pruning. Cache: process-global bounded state
   keyed by absolute lexical `(root, options)`, 1s TTL, explicit fresh/hit provenance, and
   generation-linearized invalidation/publication. Owned entries preserve exact native relative
-  paths alongside lossy display/filter projections. Typed search and production
-  glob/grep/context-ingest adoption remain separate pending security and parity checkpoints.
+  paths alongside lossy display/filter projections. Standalone `ocean-search` now consumes this
+  traversal contract; production glob/grep/context-ingest adoption remains separate pending
+  security and parity checkpoints.
+- **pi-natives grep mechanism — implemented as standalone `ocean-search` M1, unwired.**
+  Plain Rust typed content/count/files output over in-memory bytes or trusted file/directory roots,
+  Rust linear-time regex/literal/attributed fallback, explicit multiline, strict OR globs, native
+  type filters, exact native path identity, bounded open-once chunk reads, centralized NUL skips,
+  hard oversized-file skips, finite allocation ceilings, cooperative heartbeat, and deterministic
+  path-window commit. It deliberately excludes N-API/TypeScript, PCRE2, regex repair,
+  auto-multiline, donor oversized-prefix search, cache use, and runtime policy. Its no-follow leaf
+  open is race hardening, not root/intermediate confinement; live adoption remains separately gated.
 - **pi-iso** (~3,500 LOC) — **lift as-is.** One trait (`probe/start/stop/diff`), backends:
   APFS `clonefile(2)` (whole-tree reflink, one syscall — the Mac path), btrfs/ZFS snapshots,
   Linux FICLONE reflink, overlayfs (+fuse fallback), Windows ProjFS/ReFS, and `rcopy`
@@ -380,9 +389,9 @@ summary exists to keep the backlog honest.
 | W0 — profile seam | **Reconciled partial** | `ocean-daemon::harness_profile` resolves per turn and exposes only the two effective gates carried into `PromptControl`: hashline edits and artifact spill. `acp-zed` is attributed explicitly with behavior equal to its prior CLI fallback. LSP/memory are documented as global; unwired stream-rule/rich-context/minimizer flags are gone. | New external surface classifications remain policy decisions (`surface-tauri` still uses the compatibility fallback). Future mechanisms join the seam only when they are actually wired. |
 | W1 — edit reliability | **Built** | `ocean-hashline`, session snapshots, `HashlineEditTool`, `NoopLoopGuard`, `SpillingTool`, and `artifact://` retrieval are live. | Output metadata is thinner than OMP's complete directional/range protocol, and the broader hashline dialect remains out of scope. |
 | W2 — TUI streaming | **Strong partial** | `shell/markdown.rs` implements prefix-freeze; `shell/diff.rs` has word-level inverse diffs; the composer has persisted history, Ctrl-R, a kill ring, mentions, and a fuzzy slash palette; tool drawers and a basic Kitty image viewer are live. | No append-only native-scrollback architecture, OMP theme-token/80-theme compatibility, full image protocol ladder/ImageBudget, or complete composer integration set. |
-| W3 — context economy | **Partial** | Artifact spill is live. `ocean-agent::compact_history` deterministically elides older tool bodies and `ocean-runtime::trim_to_context_window` provides the hard suffix bound. `ocean-ast` implements structural summaries as a standalone crate. `ocean-minimizer` M1 implements fixed conservative filters as a standalone, dependency-free crate, and the reviewed M2 design freezes an explicit-Bash-argv, active-provider-only, turn-pinned-artifact boundary while raw events/checkpoints/session history remain authoritative. `ocean-walker` M1 now implements standalone traversal/filter/cache mechanics without production wiring. | Minimizer M2 is not implemented or profile-wired. Typed search and live walker adoption remain pending. There is also no BM25 tool discovery, promote/prune/shake/summarize pipeline, protection matchers, live general AST-read wiring, or conversational checkpoint/rewind. |
+| W3 — context economy | **Partial** | Artifact spill is live. `ocean-agent::compact_history` deterministically elides older tool bodies and `ocean-runtime::trim_to_context_window` provides the hard suffix bound. `ocean-ast` implements structural summaries as a standalone crate. `ocean-minimizer` M1 implements fixed conservative filters as a standalone, dependency-free crate, and the reviewed M2 design freezes an explicit-Bash-argv, active-provider-only, turn-pinned-artifact boundary while raw events/checkpoints/session history remain authoritative. `ocean-walker` and `ocean-search` M1 implement standalone traversal and bounded typed trusted-root search without production wiring. | Minimizer M2 is not implemented or profile-wired. Live walker/search adoption remains pending and requires a separate path-authorization boundary. There is also no BM25 tool discovery, promote/prune/shake/summarize pipeline, protection matchers, live general AST-read wiring, or conversational checkpoint/rewind. |
 | W4 — roles/catalog | **Partial** | Flat `[roles]`, per-turn model/advisor control, provider readiness, OAuth/API-key routing, retry, and cross-provider fallback are live. | No cycle-safe role aliases, thinking suffix grammar, per-role fallback, `tiny` role, path policy, configurable rich catalog, promotion target, or timed fallback cooldown/revert. |
-| W5 — code intelligence | **Substantial partial** | `ocean-lsp::LspProvider` is live with diagnostics, definition, references, hover, symbols, rename, and reload. Built-in grep supports Rust regex with literal fallback. The shared `ocean-walker` traversal/cache crate is implemented but unwired. | No typed search engine or live walker-backed grep/glob adoption, cross-line typed/mtime-ranked search, `ast_edit`, generic preview/resolve, rename-file/code-actions/raw request, or mutation-counter write-through diagnostics. |
+| W5 — code intelligence | **Substantial partial** | `ocean-lsp::LspProvider` is live with diagnostics, definition, references, hover, symbols, rename, and reload. Built-in grep supports Rust regex with literal fallback. The standalone `ocean-walker` traversal/cache and `ocean-search` bounded typed-search crates are implemented but unwired; search supports explicit cross-line mode. | No live walker-backed grep/glob adoption, mtime-ranked search, `ast_edit`, generic preview/resolve, rename-file/code-actions/raw request, or mutation-counter write-through diagnostics. |
 | W6 — rules/TTSR | **Absent** | The profile names `stream_rules`; no runtime engine is wired. | Typed rule capability taxonomy, `rule://`, three-tier delivery, abort/rewind/inject, and a builtin pack remain unimplemented. |
 | W7 — orchestration | **Superseded in core** | Session-scoped todo plus `retain`/`recall` are live Ocean-shaped mechanisms. | General task/spawn/IRC/typed-yield orchestration is extension-owned under the current architecture. CoW isolation, reflect/hindsight, and plan mode need separately approved extension-facing designs rather than the original core placement. |
 
@@ -392,7 +401,7 @@ summary exists to keep the backlog honest.
   remain globally registered, and stream rules, rich context, and minimization are not advertised
   until wired. The in-repo `acp-zed` emitter now resolves explicitly without changing its gates.
 - `NoopLoopGuard` is wired into `hashline_edit`; it is no longer dead code.
-- Grep is regex-first with explicit literal fallback; it is still not the planned typed search engine.
+- Live runtime grep remains regex-first with literal fallback and does not consume the now-implemented standalone typed-search engine.
 - `ocean-lsp` is a live capability provider rather than a dormant profile flag.
 - `retain` and `recall` are live over the typed SQLite memory store; BM25 and `reflect` remain open.
 - W2 advanced materially: prefix-freeze, inverse diff cards, composer history/search/kill ring,
@@ -418,18 +427,20 @@ summary exists to keep the backlog honest.
   strict cache capacity, pre-return heartbeat checks, and explicit serial fallback if its capped
   dedicated Rayon pool cannot be built. `FollowLinks` and `same_file_system` are snapshot
   traversal-selection policies, not sandbox/root-confinement controls. The crate is outside
-  `default-members`, does not authorize untrusted roots, and has no typed-search or production
-  capability wiring. Live adoption requires a separate point-of-use descriptor/handle-relative
+  `default-members`, does not authorize untrusted roots, and has no production capability wiring.
+  Standalone `ocean-search` consumes it with cache disabled. Live adoption requires a separate
+  point-of-use descriptor/handle-relative
   confinement gate for adversarial roots, rename/symlink/reparse swaps, cached candidates, and
   every supported OS.
 
 ### Next high-leverage sequence
 
 1. Implement the reviewed minimizer M2 design as a characterization-first checkpoint; do not imply that design acceptance enabled live minimization.
-2. Build typed search over the accepted standalone walker, then adopt it in live grep/glob only
-   after parity and security review. Runtime adoption must provide point-of-use descriptor/handle-
-   relative confinement for adversarial roots, rename/symlink/reparse swaps, cached candidates,
-   and every supported OS; do not mistake traversal selection for confinement.
+2. Review and adopt the completed standalone typed-search M1 in live grep/glob only after a
+   separate parity and security checkpoint. Runtime adoption must provide point-of-use
+   descriptor/handle-relative confinement for adversarial roots, intermediate renames,
+   symlink/reparse swaps, cached candidates, and every supported OS; do not mistake traversal or
+   leaf-open selection for confinement.
 3. Treat every W7 item as extension work; do not revive the superseded core task/spawn design.
 
 ## Scoping principle (John, 2026-07-03)
@@ -455,8 +466,9 @@ harness mechanisms rather than adding hidden commands.
    the current terminal workbench; do not replace it to imitate OMP.
 3. **W3 — context economy: partial.** The standalone minimizer M1 is built but unwired; M2 has
    a reviewed active-provider-only integration design but no implementation. The standalone walker
-   M1 is built but unwired; typed search and live grep/glob adoption remain separate checkpoints.
-   Richer compaction/checkpoint behavior needs explicit session and cache contracts.
+   and typed-search M1 crates are built but unwired; live grep/glob adoption remains a separate
+   authorization and parity checkpoint. Richer compaction/checkpoint behavior needs explicit
+   session and cache contracts.
 4. **W4 — roles v2 + models catalog: partial.** Current flat roles and provider catalog are stable
    compatibility surfaces; extend them additively rather than replacing them wholesale.
 5. **W5 — code intelligence: substantial partial.** Build on `ocean-lsp`; do not create a second

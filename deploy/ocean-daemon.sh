@@ -1,7 +1,10 @@
 #!/usr/bin/env bash
 # Supervised launcher for the Ocean daemon (OCEAN-253).
 #
-# This is the entrypoint launchd execs (via dev.risingtides.ocean-daemon.plist).
+# launchd execs the installed COPY of this script at
+# ~/.local/libexec/ocean-daemon/launch.sh (rendered plist points there), so a
+# dev checkout's working-tree state can never affect supervision (TASK-15).
+# The repo copy is the source of truth; the installer refreshes the copy.
 # It exec's the PREBUILT release binary with the production env. A supervised
 # service must respawn fast and deterministically, so this script does NOT run
 # `cargo build` — the binary is built once at install time (see
@@ -17,9 +20,6 @@
 # repo-cwd isn't needed to find the binary. Override via OCEAN_DAEMON_CWD.
 set -euo pipefail
 
-# Repo root = parent of this deploy/ dir, resolved absolutely (symlink-safe).
-REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-
 # Toolchain + common bins on PATH (launchd starts with a minimal PATH). The
 # daemon shells out to tools (git, ripgrep, etc.) for its own tool calls, so a
 # sane PATH matters even though this script doesn't compile anything.
@@ -27,11 +27,17 @@ REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 # `set -u` before the clearer NEUTRAL_CWD diagnostics below can run.
 export PATH="${HOME:-}/.rustup/toolchains/stable-aarch64-apple-darwin/bin:${HOME:-}/.cargo/bin:/usr/local/bin:/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin:$PATH"
 
-BIN="$REPO/target/release/ocean-daemon"
+# TASK-7: the supervised binary is an IMMUTABLE installed artifact, never the
+# repo's mutable target/release/ output. A cargo build in the checkout (any
+# branch) must not be able to silently become the running daemon at the next
+# restart — that is exactly how the -dirty health revs happened. The installer
+# copies each build to a versioned path and atomically flips `current`.
+BIN="${OCEAN_DAEMON_BIN:-${HOME:-}/.local/libexec/ocean-daemon/current}"
 if [[ ! -x "$BIN" ]]; then
-  echo "FATAL: $BIN not found or not executable." >&2
-  echo "       Build it first (from MAIN):  cargo build -p ocean-daemon --release" >&2
-  echo "       (ops/install-ocean-daemon.sh does this for you.)" >&2
+  echo "FATAL: no installed daemon at $BIN." >&2
+  echo "       Run ops/install-ocean-daemon.sh (from MAIN) to build, install a" >&2
+  echo "       versioned artifact, and flip the 'current' symlink atomically." >&2
+  echo "       The repo's target/release/ output is deliberately NOT launched." >&2
   exit 127
 fi
 

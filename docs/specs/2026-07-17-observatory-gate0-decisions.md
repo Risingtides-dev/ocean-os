@@ -59,6 +59,8 @@ Specifically:
 - **Token structure:** Tokens include: principal scope, daemon instance, expiry, and a cryptographic (HMAC) signature keyed by a daemon-local secret, or are opaque random tokens validated against daemon-held state. Tokens are never persisted to disk, logs, event streams, or URLs. Refresh requires re-authenticating with the daemon.
 - **No query-string credentials:** Tokens are never embedded in URLs or query parameters. They travel only via secure HTTP headers or environment variables.
 
+> **Gate 1 implementation refinement:** The accepted Gate 1 manifest supersedes these distribution details for V1. The daemon now publishes a rotating boot-bound summary bearer to the mode-0600 `.ocean/observatory-token` file; trusted native clients and the Ocean Surface proxy read it immediately before a request, and the proxy injects the `Authorization` header on the daemon-side hop. `OCEAN_OBSERVER_TOKEN` is an explicit isolated-process override only and is never injected globally. The daemon accepts `Authorization-Observer` only as compatibility cookie input and never issues it. See Gate 1 §3.4 for the current contract.
+
 ### Rationale
 
 - **Separation of concerns:** Tokens are scoped to observation, not control. They cannot approve permissions or cancel executions, addressing the "no implied control scope" requirement from section 9.

@@ -2093,6 +2093,82 @@ mod tests {
     }
 
     #[test]
+    fn seventeen_dynamic_tools_fail_the_wire_bound() {
+        // TASK-18: pin the 16-tool request bound with a direct 17-tool case —
+        // exactly 16 passes, the 17th trips the typed guard.
+        let model = kimi_model("kimi-k3");
+        let declaration = |count: usize| Context {
+            dynamic_tool_declarations: vec![crate::types::DynamicToolDeclaration {
+                tools: (0..count)
+                    .map(|index| dynamic_tool(&format!("tool{index:02}")))
+                    .collect(),
+                before_message: 0,
+            }],
+            ..Default::default()
+        };
+        super::build_body(&model, &declaration(16), &StreamOptions::default())
+            .expect("sixteen dynamic tools are within bounds");
+        let error = super::build_body(&model, &declaration(17), &StreamOptions::default())
+            .expect_err("seventeen dynamic tools must fail closed");
+        match error {
+            crate::Error::Other(message) => assert_eq!(
+                message,
+                "dynamic tool declarations exceed the 16-tool/512-KiB request bounds"
+            ),
+            other => panic!("expected Error::Other with the exact bound message, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn dynamic_schema_bytes_pass_at_exactly_512_kib_and_fail_one_byte_over() {
+        // TASK-18: calibrate the byte bound at its exact edge. The guard sums
+        // serialized tool bytes, so the fixture pads the description until the
+        // whole serialized declaration lands exactly on 512 KiB (pass), then
+        // adds one byte (fail) — proving the boundary, not just gross overflow.
+        let model = kimi_model("kimi-k3");
+        let sized_context = |description_len: usize| {
+            let mut tool = dynamic_tool("huge");
+            tool.description = "x".repeat(description_len);
+            Context {
+                dynamic_tool_declarations: vec![crate::types::DynamicToolDeclaration {
+                    tools: vec![tool],
+                    before_message: 0,
+                }],
+                ..Default::default()
+            }
+        };
+        let mut empty = dynamic_tool("huge");
+        empty.description = String::new();
+        let overhead = serde_json::to_vec(&empty)
+            .expect("fixture serializes")
+            .len();
+        let at_limit = 512 * 1024 - overhead;
+        assert_eq!(
+            serde_json::to_vec(&sized_context(at_limit).dynamic_tool_declarations[0].tools[0])
+                .expect("serializes")
+                .len(),
+            512 * 1024,
+            "fixture calibration: serialized tool is exactly 512 KiB"
+        );
+
+        super::build_body(&model, &sized_context(at_limit), &StreamOptions::default())
+            .expect("exactly 512 KiB of dynamic schema is within bounds");
+        let error = super::build_body(
+            &model,
+            &sized_context(at_limit + 1),
+            &StreamOptions::default(),
+        )
+        .expect_err("one byte past 512 KiB must fail closed");
+        match error {
+            crate::Error::Other(message) => assert_eq!(
+                message,
+                "dynamic tool declarations exceed the 16-tool/512-KiB request bounds"
+            ),
+            other => panic!("expected Error::Other with the exact bound message, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn dynamic_tools_fail_closed_for_kimi_k2_and_other_models() {
         let context = Context {
             dynamic_tool_declarations: vec![crate::types::DynamicToolDeclaration {

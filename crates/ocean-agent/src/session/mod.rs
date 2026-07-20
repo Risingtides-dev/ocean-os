@@ -1046,6 +1046,38 @@ fn strip_browser_context_block(text: &str) -> &str {
     text
 }
 
+/// Strip a leading surface-switch notice (Fix 3, TASK-65). On a DETECTED surface
+/// switch the runtime prepends a one-line notice AHEAD of the per-turn surface
+/// flag, so the composed body reads
+/// `[surface switch: the user is now messaging you via [{flag}] (was [{from}]).
+/// Adjust your rendering and tone to this surface.]\n[{flag}] {prompt}`. Because
+/// it now LEADS the body (ahead of the flag), the flag-anchored peel below would
+/// match nothing and the whole preamble rendered raw in the web transcript
+/// (operator-reported). Anchored on the rigid, invariant lead-in up to the
+/// variable `{flag}` — `[surface switch: the user is now messaging you via [` —
+/// then bounded by the notice's closing `]` + `\n` separator. The notice is a
+/// single line whose ONLY `]\n` is its terminator (its internal `[FLAG]`/`[FROM]`
+/// brackets are each followed by a space or `(`, never a newline), so the first
+/// `]\n` cleanly bounds it regardless of the `{flag}`/`{from}` pair. Kept in sync
+/// with the generator (`compose_surface_switch_notice` in ocean-agent's `lib.rs`)
+/// by `surface_switch_notice_anchors_display_strip_marker`.
+///
+/// False-positive tradeoff: a genuine user message is stripped only if it BOTH
+/// begins with that full ~50-character sentence AND contains a later `]\n`.
+/// Anchoring on the whole rigid clause (not a bare `[surface switch`) makes such
+/// a collision implausible for natural user text, while a reworded notice is
+/// caught by the cross-crate guard test rather than silently leaking again.
+fn strip_surface_switch_notice(text: &str) -> &str {
+    const ANCHOR: &str = "[surface switch: the user is now messaging you via [";
+    const TERMINATOR: &str = "]\n";
+    if text.starts_with(ANCHOR) {
+        if let Some(idx) = text.find(TERMINATOR) {
+            return text[idx + TERMINATOR.len()..].trim_start();
+        }
+    }
+    text
+}
+
 /// Peel the daemon-injected turn-prep layers off the front of a stored
 /// user-message body, for DISPLAY only (TASK-50). The runtime persists the fully
 /// composed prompt the model saw — the surface flag plus whatever steering blocks
@@ -1068,16 +1100,22 @@ fn strip_browser_context_block(text: &str) -> &str {
 /// is now framed with `[folder-agent instructions]` … `[end folder-agent
 /// instructions]` sentinels at generation, and the `## Browser context` block no
 /// longer carries an internal blank line, so both peel deterministically here.
+///
+/// TASK-65 added [`strip_surface_switch_notice`] as the FIRST peel: the Fix-3
+/// surface-switch notice is emitted AHEAD of the flag, so it must come off before
+/// the flag-anchored peel or the whole preamble leaks into the transcript.
 fn strip_injected_turn_prep(text: &str) -> &str {
     let mut cur = text;
     loop {
         // Each sub-strip returns either `cur` unchanged or a strictly shorter
         // suffix, so an unchanged length is a sound fixpoint signal. Composed in
-        // the daemon's front-to-back stack order for a single-pass peel; the
-        // outer loop keeps it order-tolerant when layers are absent or reordered.
-        let peeled = strip_operator_guidance_block(strip_folder_agent_block(
-            strip_longhouse_block(strip_browser_context_block(strip_surface_flag(cur))),
-        ));
+        // the daemon's front-to-back stack order for a single-pass peel (the
+        // surface-switch notice leads, ahead of the flag); the outer loop keeps it
+        // order-tolerant when layers are absent or reordered.
+        let peeled =
+            strip_operator_guidance_block(strip_folder_agent_block(strip_longhouse_block(
+                strip_browser_context_block(strip_surface_flag(strip_surface_switch_notice(cur))),
+            )));
         if peeled.len() == cur.len() {
             return peeled;
         }
@@ -1730,6 +1768,11 @@ mod body_strip_tests {
     /// `apply_browser_context`); the body strip anchors on this exact two-line prefix.
     const BROWSER_MARKER: &str =
         "## Browser context\nThe operator's browser surface reported this live state:";
+    /// The real Fix-3 surface-switch notice for a TUI→WEB switch (see
+    /// `compose_surface_switch_notice` in ocean-agent's `lib.rs`); emitted AHEAD of
+    /// the flag and terminated by `]\n`. The body strip anchors on its rigid lead-in.
+    const SURFACE_SWITCH_NOTICE: &str = "[surface switch: the user is now messaging you via \
+        [WEB] (was [TUI]). Adjust your rendering and tone to this surface.]\n";
 
     fn user_and_reply(bodies: &[&str]) -> Session {
         let mut s = Session::new_with_id(
@@ -1927,6 +1970,64 @@ mod body_strip_tests {
         );
         let once = strip_injected_turn_prep(&body).to_string();
         assert_eq!(once, "ship it");
+        assert_eq!(strip_injected_turn_prep(&once), once);
+    }
+
+    /// TASK-65: the original operator-reported defect — a surface-switch notice
+    /// LEADS the body ahead of the flag (`{notice}[WEB] {prompt}`) and must peel
+    /// down to the user's words, notice AND flag gone.
+    #[test]
+    fn strip_peels_leading_surface_switch_notice_and_flag() {
+        let body = format!("{SURFACE_SWITCH_NOTICE}[WEB] cwd?");
+        assert_eq!(strip_injected_turn_prep(&body), "cwd?");
+    }
+
+    /// TASK-65: the notice peels FIRST even when stacked ahead of every TASK-54
+    /// layer (notice, then flag, browser, longhouse, folder-agent, guidance) in
+    /// one call, down to the user's words.
+    #[test]
+    fn strip_peels_surface_switch_notice_above_full_stack() {
+        let body = format!(
+            "{SURFACE_SWITCH_NOTICE}[WEB] {BROWSER_MARKER}\n- Active tab: A (https://a)\n\n\
+             {LONGHOUSE_MARKER}\n- skill-a\n\n\
+             {FOLDER_AGENT_HEADER}\nBe the deploy agent.\n\nRun the runbook.\n{FOLDER_AGENT_FOOTER}\n\n\
+             {GUIDANCE_MARKER}\n- terse\n\nland the migration"
+        );
+        assert_eq!(strip_injected_turn_prep(&body), "land the migration");
+    }
+
+    /// TASK-65: a body with no notice (the common no-switch turn) is unaffected —
+    /// the flag-only peel still yields the user's words.
+    #[test]
+    fn strip_leaves_notice_absent_body_unchanged() {
+        assert_eq!(strip_injected_turn_prep("[WEB] cwd?"), "cwd?");
+    }
+
+    /// TASK-65 false-positive guard: user text that merely MENTIONS a surface
+    /// switch mid-message, or opens with a `[surface switch` token that is not the
+    /// full rigid clause, is left byte-for-byte (only the genuine flag is peeled).
+    #[test]
+    fn strip_leaves_coincidental_surface_switch_text_unchanged() {
+        // Mid-message mention: only the leading flag comes off; the words stay.
+        assert_eq!(
+            strip_injected_turn_prep("[TUI] here's a surface switch idea for the composer"),
+            "here's a surface switch idea for the composer"
+        );
+        // Opens with `[surface switch` but not the full anchor clause -> untouched.
+        let short = "[surface switch] what does that toggle do?";
+        assert_eq!(strip_injected_turn_prep(short), short);
+        // Full anchor clause but no `]\n` terminator (single-line user prose) ->
+        // untouched: the notice is always its own line, so a terminator is required.
+        let no_terminator = "[surface switch: the user is now messaging you via [the app]";
+        assert_eq!(strip_injected_turn_prep(no_terminator), no_terminator);
+    }
+
+    /// TASK-65: stripping the notice-led body is idempotent.
+    #[test]
+    fn strip_surface_switch_notice_is_idempotent() {
+        let body = format!("{SURFACE_SWITCH_NOTICE}[WEB] cwd?");
+        let once = strip_injected_turn_prep(&body).to_string();
+        assert_eq!(once, "cwd?");
         assert_eq!(strip_injected_turn_prep(&once), once);
     }
 }
