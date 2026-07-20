@@ -4638,3 +4638,11 @@ area:      [infra]
 
 TASK-15 closed end to end. #321 merged (f91a6acc): machine-neutral plist template (killed three fossilized smathdaddy-box paths that would have broken any reinstall), launcher published to ~/.local/libexec/ocean-daemon/launch.sh, installer renders the plist and accepts clean detached worktrees at origin/main content. Cutover run succeeded but exposed a supervision SPLIT-BRAIN: during the installer's bootout window an ocean TUI process spawned its own daemon (dirty-stamped first build), won the port, and left launchd crashlooping on EADDRINUSE — the source of the stubborn -dirty health rev. Evicted the orphan in an idle window; launchd took over within its 10s respawn. Final proof: pid 56968, ppid 1 (launchd), /health rev f91a6accc810 CLEAN, serving through the libexec artifact chain. Supervision is now fully checkout-independent with honest provenance. Filed TASK-20: the TUI's spawn-if-down fallback must defer to the launchd job or this race recurs every maintenance window.
 _________________________________________________________________________________
+time:      [15:55] [20-07-26]
+agent:     [claude] [fable 5]
+worktree:  [main]
+type:      [release]
+area:      [infra]
+
+First full production run of the new deploy path, end to end green: ops/install-ocean-daemon.sh built from a clean current main checkout, published ocean-daemon-5ee45bd3df28 to libexec, flipped current atomically, waited out the async bootout (TASK-22 path), bootstrapped, and proved /health before exiting — daemon now serves main tip 5ee45bd3 under the machine-neutral launch.sh from #321, with the TASK-23 supervision guard armed for every future start. The reported rev carries a false -dirty from an untracked docs dir (ticket filed: dirty detection should ignore untracked). Pre-deploy: committed my orphaned events.md ledger appends as 5ee45bd3 so the checkout could sync.
+_________________________________________________________________________________
