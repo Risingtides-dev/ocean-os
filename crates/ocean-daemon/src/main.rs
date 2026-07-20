@@ -15138,13 +15138,20 @@ mod tests {
             }
             other => panic!("expected room_trigger Extension event, got {other:?}"),
         }
-        assert!(
-            matches!(
-                trigger_rx.try_recv(),
-                Err(tokio::sync::broadcast::error::TryRecvError::Empty)
-            ),
-            "one resolved mention emits exactly one trigger event"
-        );
+        // A duplicate trigger would be emitted synchronously with the first
+        // (same handler, before room_post_message returns), so it is already
+        // in the channel here. The spawned reply turn races us with its own
+        // lifecycle events on this shared channel — drain whatever has
+        // arrived and assert no second room_trigger, instead of asserting
+        // raw emptiness (which flakes on loaded runners).
+        while let Ok(extra) = trigger_rx.try_recv() {
+            if let AgentTurnEvent::Extension { extension, .. } = &extra.event {
+                assert_ne!(
+                    extension, "room_trigger",
+                    "one resolved mention emits exactly one trigger event"
+                );
+            }
+        }
 
         // The event is followed synchronously by the audit append. The spawned
         // turn may already have replied, but these first three persisted rows
