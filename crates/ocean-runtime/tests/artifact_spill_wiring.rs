@@ -69,6 +69,7 @@ fn spill_ctx(session: &str) -> SessionContext {
         session_id: Some(session.into()),
         hashline: false,
         artifacts: true,
+        code_intelligence: true,
     }
 }
 
@@ -196,6 +197,7 @@ async fn profile_off_is_byte_identical_and_no_artifact_scheme() {
         session_id: Some("s-off".into()),
         hashline: false,
         artifacts: false,
+        code_intelligence: true,
     };
 
     let echo = tool_named(&registry, &ctx, "echo").await;

@@ -97,6 +97,11 @@ pub struct SessionContext {
     /// (web/voice) so their tool contract is unchanged. Resolved per-turn from
     /// the daemon's `HarnessProfile`.
     pub hashline: bool,
+    /// Whether the `lsp` code-intelligence tool may be offered this turn.
+    /// False for voice, whose spoken replies cannot carry definitions,
+    /// references, or diagnostics (TASK-26). Defaults true so every existing
+    /// construction keeps today's behavior.
+    pub code_intelligence: bool,
     /// Artifact-spill harness capability (W3 / harness profiles). When true,
     /// every tool's oversized text output is truncated for the model with an
     /// explicit notice and the full output is spilled to the session artifact
@@ -172,6 +177,7 @@ pub struct BuiltinProvider {
     /// `read artifact://` in a later turn share one store — same shape as
     /// `snapshots` above.
     artifacts: std::sync::Mutex<std::collections::HashMap<String, SharedArtifacts>>,
+    code_intelligence: true,
     /// Session-scoped no-op loop guards, keyed by session id. Same lifetime
     /// shape as `snapshots`: a `hashline_edit` that repeats the identical
     /// changeless patch across turns of one session accumulates against one
@@ -191,6 +197,7 @@ impl BuiltinProvider {
             tools: default_tools(),
             snapshots: std::sync::Mutex::new(std::collections::HashMap::new()),
             artifacts: std::sync::Mutex::new(std::collections::HashMap::new()),
+            code_intelligence: true,
             noop_guards: std::sync::Mutex::new(std::collections::HashMap::new()),
             todos: std::sync::Mutex::new(SessionTodos::default()),
         }
@@ -559,6 +566,7 @@ mod tests {
             session_id: Some("test-session".into()),
             hashline: false,
             artifacts: false,
+            code_intelligence: true,
         }
     }
 
@@ -940,6 +948,7 @@ mod tests {
             session_id: None,
             hashline: false,
             artifacts: false,
+            code_intelligence: true,
         };
         let got = provider.tools(&no_sess).await;
         let wait = got
@@ -999,6 +1008,7 @@ mod tests {
             session_id: None,
             hashline: false,
             artifacts: false,
+            code_intelligence: true,
         };
         let got = provider.tools(&no_sess).await;
         let tool = got

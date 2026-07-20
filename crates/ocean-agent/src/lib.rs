@@ -2044,6 +2044,7 @@ impl AgentRuntime {
             tools_disabled,
             hashline_edits,
             artifact_spill,
+            code_intelligence,
             // Already consumed above (session label at the first durable save);
             // named here so the destructure stays exhaustive.
             display_title: _,
@@ -2056,6 +2057,7 @@ impl AgentRuntime {
             session_id: Some(session_id.to_string()),
             hashline: hashline_edits,
             artifacts: artifact_spill,
+            code_intelligence,
         };
         let tools = self.capabilities.tools_for_session(&tool_ctx).await;
         // `tools_disabled` is a fail-closed authorization boundary. Unlike an
@@ -2484,6 +2486,13 @@ pub struct PromptControl {
     /// legacy caller, while TUI/ACP/CLI/web daemon turns enable it (defaults off
     /// in `PromptControl::new`).
     pub artifact_spill: bool,
+    /// When true, the `lsp` code-intelligence tool is offered for workspaces
+    /// with a ready language server. Set by the daemon from the surface's
+    /// effective `HarnessProfile`; `false` for voice, whose replies are spoken
+    /// and cannot carry definitions/references/diagnostics (TASK-26). Defaults
+    /// TRUE in `PromptControl::new` so direct/legacy callers keep today's
+    /// behavior unchanged.
+    pub code_intelligence: bool,
     /// Human-facing session label for the first-turn case: the ORIGINAL user
     /// prompt, captured by the daemon BEFORE any prompt composition (room /
     /// operator guidance, folder-as-agent instructions, the Longhouse advisory,
@@ -2538,6 +2547,9 @@ impl PromptControl {
             tools_disabled: false,
             hashline_edits: false,
             artifact_spill: false,
+            // TRUE by default: direct/legacy callers keep today's behavior; only
+            // the daemon's profile resolution turns it off (voice) — TASK-26.
+            code_intelligence: true,
             display_title: None,
         }
     }
@@ -2554,6 +2566,13 @@ impl PromptControl {
     /// surface's effective `HarnessProfile` capabilities on the daemon side.
     pub fn with_hashline_edits(mut self, on: bool) -> Self {
         self.hashline_edits = on;
+        self
+    }
+
+    /// Gate the `lsp` code-intelligence tool for this turn (TASK-26). Set from
+    /// the surface's effective `HarnessProfile` capabilities on the daemon side.
+    pub fn with_code_intelligence(mut self, on: bool) -> Self {
+        self.code_intelligence = on;
         self
     }
 
