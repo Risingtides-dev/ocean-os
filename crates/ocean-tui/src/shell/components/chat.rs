@@ -13,7 +13,7 @@ use std::{
 };
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
-use ocean_agent_sdk::{AgentTurnEvent, ThinkingLevel, ToolCallId};
+use ocean_agent_sdk::{AgentTurnEvent, AgentTurnId, ThinkingLevel, ToolCallId};
 use ocean_core::{OceanEvent, PermissionId};
 use ratatui::{
     buffer::Buffer,
@@ -368,6 +368,14 @@ pub struct ChatComponent {
     input: String,
     model: Option<String>,
     busy: bool,
+    /// Monotonic local identity for optimistic user echoes. Daemon admission
+    /// failures may arrive after unrelated stream events, so prompt text or a
+    /// tail index alone cannot safely identify the row to roll back.
+    next_submission_id: u64,
+    pending_submission_id: Option<u64>,
+    accepted_submission_id: Option<u64>,
+    accepted_turn_id: Option<AgentTurnId>,
+    finished_while_awaiting_ack: Vec<AgentTurnId>,
     /// Byte-index cursor position in the composer. `None` means trailing
     /// (at `input.len()`), which is also the Default so `chat_with` and
     /// direct `input = …` writes all self-seat at the end.
@@ -1773,7 +1781,29 @@ impl ChatComponent {
         self.clear_tool_ui_state();
         self.pinned = None;
         self.pinned_visible = true;
+        self.pending_submission_id = None;
+        self.accepted_submission_id = None;
+        self.accepted_turn_id = None;
+        self.finished_while_awaiting_ack.clear();
         self.busy = false;
+    }
+
+    fn rollback_optimistic_user(&mut self, submission_id: u64, prompt: &str) -> bool {
+        if self.pending_submission_id != Some(submission_id) {
+            return false;
+        }
+        self.pending_submission_id = None;
+        self.accepted_submission_id = None;
+        self.accepted_turn_id = None;
+        self.finished_while_awaiting_ack.clear();
+        if let Some(index) = self
+            .turns
+            .iter()
+            .rposition(|turn| matches!(turn, Turn::User(text) if text == prompt))
+        {
+            self.turns.remove(index);
+        }
+        true
     }
 
     pub fn transcript_row_for_screen(&self, screen_row: u16) -> Option<usize> {
@@ -2016,6 +2046,37 @@ impl ChatComponent {
     pub fn is_busy(&self) -> bool {
         self.busy
     }
+
+    pub fn has_pending_submission(&self, submission_id: u64) -> bool {
+        self.pending_submission_id == Some(submission_id)
+    }
+
+    pub fn has_pending_turn_submission(&self) -> bool {
+        self.pending_submission_id.is_some()
+    }
+
+    pub fn turn_finished_resolves_activity(&self, turn_id: AgentTurnId) -> bool {
+        self.pending_submission_id.is_none() || self.accepted_turn_id == Some(turn_id)
+    }
+
+    pub fn acceptance_already_finished(&self, submission_id: u64, turn_id: AgentTurnId) -> bool {
+        self.pending_submission_id == Some(submission_id)
+            && self.finished_while_awaiting_ack.contains(&turn_id)
+    }
+
+    #[cfg(test)]
+    pub fn seed_pending_submission_for_test(&mut self, submission_id: u64) {
+        self.pending_submission_id = Some(submission_id);
+        self.busy = true;
+    }
+
+    /// Adopt authoritative knowledge that the bound session already has an
+    /// active operation. Used by the resume probe before this TUI necessarily
+    /// observes that turn's historical `TurnStarted` event.
+    pub fn adopt_active_turn(&mut self) {
+        self.busy = true;
+    }
+
     /// Live activity for the bottom status row, derived from transcript state
     /// (never an action-driven copy, so it cannot go stale): the newest
     /// running tool's name while one runs, `working` for a busy turn between
@@ -3005,17 +3066,9 @@ impl Component for ChatComponent {
                         return Some(Action::Status(hint));
                     }
                 }
-                // A turn is already running: the daemon serializes turns per
-                // session and would reject a second POST with 409 (TASK-60).
-                // Suppress the submit entirely — no optimistic user row, no POST
-                // — and give one compact status-line notice instead of stacking
-                // duplicate rows. Re-pressing Enter just refreshes the same
-                // notice (set_notice replaces, never appends). Prompts restored
-                // to the composer after a daemon-blip TurnSendFailed are typed
-                // while idle (busy is cleared first), so this never blocks retry.
                 if self.busy {
                     return Some(Action::Status(
-                        "a turn is still running — wait for it to finish".into(),
+                        "session is still working — prompt kept in composer".into(),
                     ));
                 }
                 self.history.push(&text);
@@ -3025,7 +3078,13 @@ impl Component for ChatComponent {
                 self.scroll_back = 0;
                 self.turns.push(Turn::User(text.clone()));
                 self.busy = true;
-                Some(Action::SubmitPrompt(text))
+                self.next_submission_id = self.next_submission_id.wrapping_add(1);
+                let submission_id = self.next_submission_id;
+                self.pending_submission_id = Some(submission_id);
+                Some(Action::SubmitPrompt {
+                    submission_id,
+                    prompt: text,
+                })
             }
             (KeyCode::Backspace, _) => {
                 let c = self.cursor_byte();
@@ -3246,7 +3305,15 @@ impl Component for ChatComponent {
         // The turn (or its session mint) never reached the daemon, even after
         // the blip-retry window: unwind the spinner, say so in the transcript,
         // and put the prompt back in the composer so nothing typed is lost.
-        if let Action::TurnSendFailed { prompt, err } = action {
+        if let Action::TurnSendFailed {
+            submission_id,
+            prompt,
+            err,
+        } = action
+        {
+            if !self.rollback_optimistic_user(*submission_id, prompt) {
+                return None;
+            }
             self.busy = false;
             let msg = errfmt::humanize(err);
             let prefix = if errfmt::is_connect_shaped(err) {
@@ -3264,27 +3331,59 @@ impl Component for ChatComponent {
             self.scroll_back = 0;
             return None;
         }
-        // The daemon rejected this submission with 409 (session already has an
-        // active turn) — a race where local `busy` wasn't yet known. Nothing was
-        // persisted, so unwind THIS submission's optimistic effects only: drop
-        // the trailing user row we pushed for it, clear the busy flag it set,
-        // keep the prompt once in the composer, and add NO error transcript row.
-        // The concurrent turn's own stream events re-assert busy if it is ours.
-        if let Action::TurnBusyConflict { prompt } = action {
-            self.busy = false;
-            if matches!(self.turns.last(), Some(Turn::User(t)) if t == prompt) {
-                self.turns.pop();
+        if let Action::TurnSessionBusy {
+            submission_id,
+            prompt,
+            ..
+        } = action
+        {
+            if !self.rollback_optimistic_user(*submission_id, prompt) {
+                return None;
             }
+            // The prior operation still owns this session. Keep Enter blocked;
+            // TurnFinished or an authoritative synchronized snapshot clears it.
+            self.busy = true;
             if self.input.is_empty() {
                 self.input = prompt.clone();
             }
+            // App owns the single replace-in-place status notice. Do not add a
+            // transcript error/advisor row for this expected admission race.
             self.scroll_back = 0;
+            return None;
+        }
+        if let Action::TurnAccepted {
+            submission_id,
+            turn_id,
+        } = action
+        {
+            if self.pending_submission_id == Some(*submission_id) {
+                if self.finished_while_awaiting_ack.contains(turn_id) {
+                    self.pending_submission_id = None;
+                    self.accepted_submission_id = None;
+                    self.accepted_turn_id = None;
+                    self.busy = false;
+                } else {
+                    // Keep the tag through the matching TurnFinished so an
+                    // already-queued resume probe cannot replace this admitted
+                    // turn with a pre-turn snapshot after HTTP acknowledgement.
+                    self.accepted_submission_id = Some(*submission_id);
+                    self.accepted_turn_id = Some(*turn_id);
+                }
+                self.finished_while_awaiting_ack.clear();
+            }
             return None;
         }
         // The request connected, but the final HTTP outcome was lost. The
         // daemon may already have accepted/executed it, so restoring the prompt
         // would invite a duplicate browser action, write, or purchase.
-        if let Action::TurnOutcomeUnknown { err } = action {
+        if let Action::TurnOutcomeUnknown { submission_id, err } = action {
+            if self.pending_submission_id != Some(*submission_id) {
+                return None;
+            }
+            self.pending_submission_id = None;
+            self.accepted_submission_id = None;
+            self.accepted_turn_id = None;
+            self.finished_while_awaiting_ack.clear();
             self.busy = false;
             self.turns.push(Turn::Assistant(format!(
                 "{} turn connection ended before confirmation — {}\n\nThe prompt was not restored because the turn may already be running. Watch the session stream before resubmitting.",
@@ -3433,12 +3532,28 @@ impl Component for ChatComponent {
                     );
                 }
                 AgentTurnEvent::TurnFinished {
+                    turn_id,
                     status,
                     error,
                     tokens_per_second,
                     ..
                 } => {
-                    self.busy = false;
+                    let matches_accepted_submission = self.accepted_turn_id == Some(*turn_id);
+                    if matches_accepted_submission {
+                        self.pending_submission_id = None;
+                        self.accepted_submission_id = None;
+                        self.accepted_turn_id = None;
+                    } else if self.pending_submission_id.is_some()
+                        && self.accepted_submission_id.is_none()
+                    {
+                        self.finished_while_awaiting_ack.push(*turn_id);
+                        if self.finished_while_awaiting_ack.len() > 4 {
+                            self.finished_while_awaiting_ack.remove(0);
+                        }
+                    }
+                    if self.pending_submission_id.is_none() || matches_accepted_submission {
+                        self.busy = false;
+                    }
                     self.last_tok_per_s = *tokens_per_second;
                     let is_failure = matches!(
                         status,
@@ -4668,7 +4783,7 @@ mod tests {
         chat.turns.push(Turn::User("hello".into()));
         let act = chat.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
         // No SubmitPrompt — the menu intercepts Enter.
-        assert!(!matches!(act, Some(Action::SubmitPrompt(_))));
+        assert!(!matches!(act, Some(Action::SubmitPrompt { .. })));
         assert!(chat.turns.is_empty(), "/clear empties the transcript");
     }
 
@@ -4807,7 +4922,7 @@ mod tests {
         // A `/`-path that is NOT a command still sends as a normal message.
         let mut chat2 = chat_with("/etc/hosts is a file");
         let act2 = chat2.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
-        assert!(matches!(act2, Some(Action::SubmitPrompt(_))));
+        assert!(matches!(act2, Some(Action::SubmitPrompt { .. })));
     }
 
     #[test]
@@ -5333,7 +5448,7 @@ mod tests {
         let mut chat = chat_with("/etc/passwd hi");
         let act = chat.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
         assert!(
-            matches!(&act, Some(Action::SubmitPrompt(s)) if s == "/etc/passwd hi"),
+            matches!(&act, Some(Action::SubmitPrompt { prompt, .. }) if prompt == "/etc/passwd hi"),
             "path-like slash input must submit as prompt, got {act:?}"
         );
     }
@@ -5546,9 +5661,17 @@ mod tests {
     // ── turn-terminal paths ──────────────────────────────────────────────────
 
     fn turn_finished(status: AgentTurnStatus, error: Option<&str>) -> Action {
+        turn_finished_for(AgentTurnId(Uuid::nil()), status, error)
+    }
+
+    fn turn_finished_for(
+        turn_id: AgentTurnId,
+        status: AgentTurnStatus,
+        error: Option<&str>,
+    ) -> Action {
         Action::AgentEvent(Box::new(AgentTurnEvent::TurnFinished {
             session_id: AgentSessionId(Uuid::nil()),
-            turn_id: AgentTurnId(Uuid::nil()),
+            turn_id,
             status,
             error: error.map(|s| s.to_string()),
             wall_ms: None,
@@ -5558,6 +5681,66 @@ mod tests {
             tokens_per_second: None,
             context_usage: None,
         }))
+    }
+
+    #[test]
+    fn finish_before_ack_clears_only_the_matching_tagged_submission() {
+        let mut chat = ChatComponent {
+            input: "race".into(),
+            ..Default::default()
+        };
+        let Some(Action::SubmitPrompt { submission_id, .. }) =
+            chat.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+        else {
+            panic!("expected tagged submission");
+        };
+        let old_turn = AgentTurnId(Uuid::from_u128(801));
+        let accepted_turn = AgentTurnId(Uuid::from_u128(802));
+
+        chat.update(&turn_finished_for(
+            old_turn,
+            AgentTurnStatus::Completed,
+            None,
+        ));
+        chat.update(&Action::TurnAccepted {
+            submission_id,
+            turn_id: accepted_turn,
+        });
+        assert!(
+            chat.has_pending_submission(submission_id),
+            "an older turn finishing before ack must not clear the new submission"
+        );
+
+        chat.update(&turn_finished_for(
+            accepted_turn,
+            AgentTurnStatus::Completed,
+            None,
+        ));
+        assert!(!chat.has_pending_turn_submission());
+
+        let mut fast = ChatComponent {
+            input: "fast".into(),
+            ..Default::default()
+        };
+        let Some(Action::SubmitPrompt { submission_id, .. }) =
+            fast.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+        else {
+            panic!("expected fast submission");
+        };
+        let fast_turn = AgentTurnId(Uuid::from_u128(803));
+        fast.update(&turn_finished_for(
+            fast_turn,
+            AgentTurnStatus::Completed,
+            None,
+        ));
+        fast.update(&Action::TurnAccepted {
+            submission_id,
+            turn_id: fast_turn,
+        });
+        assert!(
+            !fast.has_pending_turn_submission(),
+            "the matching finish queued before ack must resolve the tag"
+        );
     }
 
     #[test]
@@ -6192,8 +6375,17 @@ mod tests {
 
     #[test]
     fn turn_send_failed_connect_uses_daemon_prefix() {
-        let mut chat = ChatComponent::default();
+        let mut chat = ChatComponent {
+            input: "hi".into(),
+            ..Default::default()
+        };
+        let Some(Action::SubmitPrompt { submission_id, .. }) =
+            chat.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+        else {
+            panic!("expected tagged submission");
+        };
         chat.update(&Action::TurnSendFailed {
+            submission_id,
             prompt: "hi".into(),
             err: "tcp connect error: Connection refused (os error 61)".into(),
         });
@@ -6209,8 +6401,17 @@ mod tests {
 
     #[test]
     fn turn_send_failed_non_connect_uses_neutral_prefix() {
-        let mut chat = ChatComponent::default();
+        let mut chat = ChatComponent {
+            input: "hi".into(),
+            ..Default::default()
+        };
+        let Some(Action::SubmitPrompt { submission_id, .. }) =
+            chat.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+        else {
+            panic!("expected tagged submission");
+        };
         chat.update(&Action::TurnSendFailed {
+            submission_id,
             prompt: "hi".into(),
             err: "turn: HTTP 401 Unauthorized".into(),
         });
@@ -6228,129 +6429,154 @@ mod tests {
         );
     }
 
-    // ── TASK-60: submit suppression while a turn is running ───────────────
-
-    /// (a) Enter while busy pushes no optimistic user row and emits no
-    /// SubmitPrompt (so no POST) — only a single compact status notice.
     #[test]
-    fn enter_while_busy_suppresses_submit_and_notifies() {
-        let mut chat = chat_with("another prompt");
-        chat.busy = true; // a turn is already streaming
-
-        let act = chat.handle_key(key(KeyCode::Enter));
-
+    fn busy_rejection_rolls_back_only_tagged_echo_and_latches_composer() {
+        let mut chat = ChatComponent {
+            input: "do not duplicate me".into(),
+            ..Default::default()
+        };
+        let Some(Action::SubmitPrompt { submission_id, .. }) =
+            chat.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+        else {
+            panic!("expected tagged submission");
+        };
+        chat.turns
+            .push(Turn::Assistant("older turn kept streaming".into()));
+        // The old turn may finish before its competing HTTP 409 reaches the
+        // UI. The later rejection must re-latch rather than getting stuck idle.
+        chat.update(&turn_finished(AgentTurnStatus::Completed, None));
         assert!(
-            !matches!(act, Some(Action::SubmitPrompt(_))),
-            "busy Enter must not POST a second turn"
+            chat.is_busy(),
+            "a nonmatching finish must not unlock a pending submission"
         );
-        assert!(
-            matches!(&act, Some(Action::Status(s)) if s.contains("still running")),
-            "busy Enter should surface a compact notice, got: {act:?}"
-        );
-        assert!(
-            chat.turns.is_empty(),
-            "busy Enter must not push an optimistic user row"
-        );
-        assert_eq!(
-            chat.input, "another prompt",
-            "the composer text is preserved for when the turn finishes"
-        );
-    }
 
-    /// (b) Repeated Enter while busy still yields exactly one notice per press
-    /// and zero rows — nothing stacks in the transcript.
-    #[test]
-    fn repeated_enter_while_busy_never_stacks_rows() {
-        let mut chat = chat_with("hammer");
-        chat.busy = true;
-
-        for _ in 0..5 {
-            let act = chat.handle_key(key(KeyCode::Enter));
-            assert!(
-                matches!(&act, Some(Action::Status(s)) if s.contains("still running")),
-                "each busy Enter is a single notice, got: {act:?}"
-            );
-        }
-
-        assert!(
-            chat.turns.is_empty(),
-            "repeated busy Enter must never accumulate transcript rows"
-        );
-    }
-
-    /// (c) A 409 active-turn rejection drops the optimistic row for that
-    /// submission, keeps the prompt once in the composer, and adds NO error row.
-    #[test]
-    fn active_turn_conflict_drops_optimistic_row_without_error() {
-        let mut chat = ChatComponent::default();
-        // Simulate the optimistic submit that raced ahead of a known-busy state.
-        chat.turns.push(Turn::User("raced prompt".into()));
-        chat.busy = true;
-
-        chat.update(&Action::TurnBusyConflict {
-            prompt: "raced prompt".into(),
+        chat.update(&Action::TurnSessionBusy {
+            submission_id,
+            session_id: AgentSessionId(uuid::Uuid::new_v4()),
+            binding_generation: 7,
+            prompt: "do not duplicate me".into(),
         });
 
-        assert!(
-            chat.turns.is_empty(),
-            "the optimistic user row must be removed"
-        );
-        assert!(!chat.busy, "a rejected submission unwinds its busy flag");
+        assert!(chat.is_busy(), "busy rejection must keep Enter latched");
+        assert_eq!(chat.input, "do not duplicate me");
         assert_eq!(
-            chat.input, "raced prompt",
-            "the prompt is kept exactly once in the composer"
+            chat.turns
+                .iter()
+                .filter(|turn| matches!(turn, Turn::User(text) if text == "do not duplicate me"))
+                .count(),
+            0,
+            "the rejected optimistic echo must be removed even after stream events"
+        );
+        let rendered = chat
+            .turns
+            .iter()
+            .filter_map(|turn| match turn {
+                Turn::Assistant(text) => Some(text.as_str()),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert_eq!(rendered, "older turn kept streaming");
+        assert!(!rendered.contains("409"));
+        assert!(!rendered.contains("http://"));
+        let retry = chat.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(
+            matches!(retry, Some(Action::Status(message)) if message.contains("still working"))
+        );
+        assert_eq!(
+            chat.turns
+                .iter()
+                .filter(|turn| matches!(turn, Turn::User(text) if text == "do not duplicate me"))
+                .count(),
+            0,
+            "Enter while latched must not create another optimistic echo"
         );
     }
 
-    /// (d) The 13de2a97 daemon-blip path is preserved: a non-409 send failure
-    /// still restores the prompt to the composer for retry.
     #[test]
-    fn daemon_blip_failure_still_restores_prompt_for_retry() {
+    fn repeated_enter_while_busy_never_posts_or_stacks_rows() {
         let mut chat = ChatComponent {
+            input: "hammer".into(),
             busy: true,
             ..Default::default()
         };
-
-        chat.update(&Action::TurnSendFailed {
-            prompt: "ride it out".into(),
-            err: "tcp connect error: Connection refused (os error 61)".into(),
-        });
-
-        assert!(!chat.busy, "the spinner unwinds on a send failure");
-        assert_eq!(
-            chat.input, "ride it out",
-            "a daemon-blip failure restores the prompt for retry"
-        );
-        assert_eq!(
-            chat.turns.len(),
-            1,
-            "the honest transcript note is still pushed"
-        );
-        let Turn::Assistant(msg) = &chat.turns[0] else {
-            panic!("expected Assistant note");
-        };
-        assert!(
-            msg.contains("back in the composer"),
-            "the retry hint stays, got: {msg}"
-        );
+        for _ in 0..5 {
+            let action = chat.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+            assert!(matches!(
+                action,
+                Some(Action::Status(message)) if message.contains("still working")
+            ));
+        }
+        assert!(chat.turns.is_empty());
+        assert_eq!(chat.input, "hammer");
+        assert!(!chat.has_pending_turn_submission());
     }
 
-    /// (e) A normal submit while idle is unchanged: it pushes the user row, sets
-    /// busy, and emits SubmitPrompt.
     #[test]
-    fn idle_enter_submits_normally() {
-        let mut chat = chat_with("hello there");
+    fn stale_submission_failure_cannot_rollback_same_prompt_after_rebind() {
+        let mut chat = ChatComponent {
+            input: "same prompt".into(),
+            ..Default::default()
+        };
+        let Some(Action::SubmitPrompt {
+            submission_id: stale_id,
+            ..
+        }) = chat.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+        else {
+            panic!("expected first submission");
+        };
+        chat.load_history(Vec::new());
+        chat.input = "same prompt".into();
+        let Some(Action::SubmitPrompt {
+            submission_id: current_id,
+            ..
+        }) = chat.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+        else {
+            panic!("expected rebound submission");
+        };
+        assert_ne!(stale_id, current_id);
 
-        let act = chat.handle_key(key(KeyCode::Enter));
+        chat.update(&Action::TurnSendFailed {
+            submission_id: stale_id,
+            prompt: "same prompt".into(),
+            err: "offline".into(),
+        });
 
-        assert!(
-            matches!(&act, Some(Action::SubmitPrompt(s)) if s == "hello there"),
-            "idle Enter still submits, got: {act:?}"
+        assert!(chat.has_pending_submission(current_id));
+        assert!(chat.is_busy());
+        assert_eq!(
+            chat.turns
+                .iter()
+                .filter(|turn| matches!(turn, Turn::User(text) if text == "same prompt"))
+                .count(),
+            1
         );
-        assert!(chat.busy, "idle Enter marks the turn busy");
-        assert_eq!(chat.turns.len(), 1, "idle Enter pushes the user row");
-        assert!(matches!(&chat.turns[0], Turn::User(s) if s == "hello there"));
-        assert!(chat.input.is_empty(), "the composer clears on submit");
+        assert!(chat.input.is_empty());
+    }
+
+    #[test]
+    fn outcome_unknown_keeps_optimistic_echo_and_does_not_restore_prompt() {
+        let mut chat = ChatComponent {
+            input: "side effecting prompt".into(),
+            ..Default::default()
+        };
+        let Some(Action::SubmitPrompt { submission_id, .. }) =
+            chat.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+        else {
+            panic!("expected tagged submission");
+        };
+
+        chat.update(&Action::TurnOutcomeUnknown {
+            submission_id,
+            err: "response body ended unexpectedly".into(),
+        });
+
+        assert!(chat.input.is_empty(), "unknown outcomes must not restore");
+        assert!(chat
+            .turns
+            .iter()
+            .any(|turn| matches!(turn, Turn::User(text) if text == "side effecting prompt")));
+        assert!(!chat.has_pending_turn_submission());
     }
 
     #[test]

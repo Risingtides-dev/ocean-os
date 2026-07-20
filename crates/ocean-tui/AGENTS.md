@@ -130,9 +130,18 @@ This crate owns the full-screen terminal steering cockpit (`ocean` binary) for i
   atomic compaction route. Replace chat only from the response's bounded public
   `SessionSyncSnapshot`, then restart the scoped SSE stream strictly after its
   `SessionEventFence`; never bridge compact with an independent raw-session GET.
-  Binding, stream, and operation generations must reject A→B→A and queued stale
-  completions. A per-session unresolved-sync marker survives rebinding, blocks
-  prompts, and forces refresh when that session returns. Treat typed replay gaps
+  Binding, stream, operation, activity-probe, and local submission generations
+  must reject A→B→A, finish-before-ack, and queued stale completions. Resuming a
+  session probes the same bounded `/sync` surface: an active-operation conflict
+  latches the composer until authoritative `TurnFinished` or a fenced snapshot;
+  an idle fenced snapshot replaces history. A busy turn-submit 409 is a typed UX
+  state, never raw HTTP: remove only the tagged rejected optimistic user row,
+  preserve its prompt once, and keep Enter latched. Generic pre-execution failures
+  also remove only their tagged optimistic row; 408/5xx/connected transport or
+  decode uncertainty never restores or rolls back the prompt. Activity probes
+  must not install across a newer submission or any compact-owned synchronization
+  marker. A per-session unresolved-sync marker survives rebinding, blocks prompts,
+  and forces refresh when that session returns. Treat typed replay gaps
   and scoped `ocean.session_changed` extensions as invalidations: clear derived
   projections, abort/increment the old stream generation, and recover only via
   `GET /v1/sessions/{id}/sync`. Compact's own lease-scoped invalidation may

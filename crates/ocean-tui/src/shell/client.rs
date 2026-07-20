@@ -34,14 +34,11 @@ use super::action::{Action, CompactFailure, HealthSource};
 /// Submission certainty matters because a turn may contain side-effecting
 /// tools. Only `DefinitelyUnsent` is safe to retry/restore automatically;
 /// `OutcomeUnknown` means the daemon may already be executing the prompt.
-/// `ActiveTurn` is the daemon's 409 — the session already has a turn running,
-/// so this submission was cleanly rejected and never persisted; the UI unwinds
-/// its optimistic row quietly rather than surfacing an error.
 #[derive(Debug)]
 pub enum TurnSubmitError {
     DefinitelyUnsent(String),
     Rejected(String),
-    ActiveTurn(String),
+    SessionBusy,
     OutcomeUnknown(String),
 }
 
@@ -50,8 +47,8 @@ impl std::fmt::Display for TurnSubmitError {
         match self {
             Self::DefinitelyUnsent(message)
             | Self::Rejected(message)
-            | Self::ActiveTurn(message)
             | Self::OutcomeUnknown(message) => f.write_str(message),
+            Self::SessionBusy => f.write_str("session is still working"),
         }
     }
 }
@@ -145,48 +142,52 @@ impl DaemonClient {
                         "daemon unreachable after {attempt} attempts: {error}"
                     )));
                 }
-                Err(error) => {
-                    return Err(TurnSubmitError::OutcomeUnknown(error.to_string()));
+                Err(_) => {
+                    return Err(TurnSubmitError::OutcomeUnknown(
+                        "turn response was interrupted after the request connected".into(),
+                    ));
                 }
             };
 
             let status = response.status();
-            // 409 is the daemon's admission verdict for "session has an active
-            // operation" — the turn was cleanly rejected before any execution or
-            // persistence. Surface it distinctly so the UI can drop the
-            // optimistic row without an error note (TASK-60), rather than lumping
-            // it in with genuine 4xx failures below.
-            if status == reqwest::StatusCode::CONFLICT {
-                return Err(TurnSubmitError::ActiveTurn(
-                    response
-                        .error_for_status()
-                        .expect_err("409 response must be an error")
-                        .to_string(),
-                ));
-            }
             // Ocean uses HTTP 408 only after the runtime has actually executed
             // and emitted a failed TurnFinished. Its JSON body is therefore a
             // normal known terminal response, not an admission rejection.
             if status_proves_turn_rejection(status) {
-                return Err(TurnSubmitError::Rejected(
-                    response
-                        .error_for_status()
-                        .expect_err("4xx response must be an error")
-                        .to_string(),
-                ));
+                let rejection = response.json::<AgentTurnResponse>().await.ok();
+                if status == reqwest::StatusCode::CONFLICT
+                    && rejection.as_ref().and_then(|body| body.error.as_deref())
+                        == Some("session has an active operation; try again shortly")
+                {
+                    return Err(TurnSubmitError::SessionBusy);
+                }
+                let message = match status {
+                    reqwest::StatusCode::UNAUTHORIZED | reqwest::StatusCode::FORBIDDEN => {
+                        "turn authorization was rejected".into()
+                    }
+                    reqwest::StatusCode::TOO_MANY_REQUESTS => {
+                        "too many concurrent turns; try again shortly".into()
+                    }
+                    reqwest::StatusCode::CONFLICT => {
+                        "turn conflicted with current session state".into()
+                    }
+                    reqwest::StatusCode::BAD_REQUEST
+                    | reqwest::StatusCode::UNPROCESSABLE_ENTITY => {
+                        "turn request was rejected".into()
+                    }
+                    _ => format!("turn rejected ({})", status.as_u16()),
+                };
+                return Err(TurnSubmitError::Rejected(message));
             }
             if status.is_server_error() {
-                return Err(TurnSubmitError::OutcomeUnknown(
-                    response
-                        .error_for_status()
-                        .expect_err("5xx response must be an error")
-                        .to_string(),
-                ));
+                return Err(TurnSubmitError::OutcomeUnknown(format!(
+                    "turn service returned {} after receiving the request",
+                    status.as_u16()
+                )));
             }
-            return response
-                .json::<AgentTurnResponse>()
-                .await
-                .map_err(|error| TurnSubmitError::OutcomeUnknown(error.to_string()));
+            return response.json::<AgentTurnResponse>().await.map_err(|_| {
+                TurnSubmitError::OutcomeUnknown("turn acknowledgement could not be decoded".into())
+            });
         }
     }
 
@@ -1032,6 +1033,67 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn busy_409_decodes_typed_body_without_exposing_raw_http_error() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind mock turn server");
+        let address = listener.local_addr().expect("mock address");
+        let session_id = AgentSessionId(uuid::Uuid::from_u128(41));
+        let turn_id = uuid::Uuid::from_u128(42);
+        let body = serde_json::json!({
+            "ok": false,
+            "turn_id": turn_id,
+            "session_id": session_id,
+            "status": "failed",
+            "event_id_prefix": turn_id,
+            "error": "session has an active operation; try again shortly"
+        })
+        .to_string();
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.expect("accept turn request");
+            let mut request = [0u8; 8192];
+            let _ = socket.read(&mut request).await.expect("read turn request");
+            let response = format!(
+                "HTTP/1.1 409 Conflict\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            socket
+                .write_all(response.as_bytes())
+                .await
+                .expect("write busy response");
+        });
+
+        let client = DaemonClient::new(&format!("http://{address}")).expect("client");
+        let request = AgentTurnRequest {
+            session_id: Some(session_id),
+            prompt: "second prompt".into(),
+            cwd: "/tmp".into(),
+            guidance: None,
+            project_id: None,
+            client_type: Some("tui".into()),
+            agent: None,
+            role: None,
+            thinking_level: None,
+            model_id: None,
+            images: None,
+            decision_token: None,
+            client_context: None,
+            advisor: None,
+        };
+        let error = client
+            .agent_turn_retrying(&request, |_, _| {})
+            .await
+            .expect_err("busy session must reject the second turn");
+
+        assert!(matches!(error, TurnSubmitError::SessionBusy));
+        assert_eq!(error.to_string(), "session is still working");
+        server.await.expect("mock server completed");
+    }
+
+    #[tokio::test]
     async fn fenced_stream_sends_last_event_id_and_routes_error_to_reset() {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
@@ -1161,75 +1223,5 @@ mod tests {
         println!("turn ok={} streamed text: {text:?}", resp.ok);
         assert!(got_started, "no TurnStarted arrived on the session stream");
         assert!(!text.is_empty(), "no assistant text streamed");
-    }
-
-    /// The daemon returns 409 with a JSON body when a session already has an
-    /// active turn. That must classify as `ActiveTurn`, distinct from the
-    /// generic `Rejected` bucket, so the UI can drop the optimistic row without
-    /// an error note (TASK-60).
-    #[tokio::test]
-    async fn active_turn_409_maps_to_active_turn_error() {
-        use tokio::io::{AsyncReadExt, AsyncWriteExt};
-
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
-            .await
-            .expect("bind mock turn server");
-        let address = listener.local_addr().expect("mock address");
-        let server = tokio::spawn(async move {
-            let (mut socket, _) = listener.accept().await.expect("accept turn POST");
-            let mut request = vec![0u8; 8192];
-            let mut used = 0usize;
-            loop {
-                let read = socket
-                    .read(&mut request[used..])
-                    .await
-                    .expect("read request");
-                if read == 0 {
-                    break;
-                }
-                used += read;
-                if request[..used]
-                    .windows(4)
-                    .any(|window| window == b"\r\n\r\n")
-                {
-                    break;
-                }
-            }
-            let body =
-                b"{\"ok\":false,\"error\":\"session has an active operation; try again shortly\"}";
-            let head = format!(
-                "HTTP/1.1 409 Conflict\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
-                body.len()
-            );
-            socket.write_all(head.as_bytes()).await.expect("write head");
-            socket.write_all(body).await.expect("write body");
-        });
-
-        let client = DaemonClient::new(&format!("http://{address}")).expect("client");
-        let req = AgentTurnRequest {
-            session_id: Some(AgentSessionId(uuid::Uuid::from_u128(9101))),
-            prompt: "second prompt while busy".into(),
-            cwd: "/tmp".into(),
-            guidance: None,
-            project_id: None,
-            client_type: Some("tui".into()),
-            agent: None,
-            role: None,
-            thinking_level: None,
-            model_id: None,
-            images: None,
-            decision_token: None,
-            client_context: None,
-            advisor: None,
-        };
-        let err = client
-            .agent_turn_retrying(&req, |_, _| {})
-            .await
-            .expect_err("409 must surface as an error");
-        assert!(
-            matches!(err, TurnSubmitError::ActiveTurn(_)),
-            "409 active-turn must map to ActiveTurn, got: {err:?}"
-        );
-        server.await.expect("mock server task");
     }
 }
