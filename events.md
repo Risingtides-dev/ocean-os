@@ -4692,3 +4692,11 @@ area:      daemon
 
 Realtime conversation voice now receives bounded list_workspace/read_workspace_file tools only when daemon-owned session workspace_root/cwd resolves to a registered project root or live linked worktree. The daemon freezes and returns the canonical root with the ephemeral secret; unknown, project-less, and session-less chats fail closed to render_component/write_handoff. Voice instructions mark repository output untrusted and keep all writes/execution behind handoff. Added tool-shape and project/worktree authority tests; preserved omitted-purpose compatibility.
 _________________________________________________________________________________
+time:      [20:05] [20-07-26]
+agent:     [claude] [fable 5]
+worktree:  [main]
+type:      [release]
+area:      [infra]
+
+Deployed the voice bounded-project-reads landing (3a670edf, direct-to-main, main CI green before deploy): idle-window installer run, artifact ocean-daemon-3a670edfe553 published + current flipped, /health confirms rev 3a670edfe553 CLEAN — first deploy where the rev stamp correctly ignores the untracked docs dir (TASK-25 proving itself in production). Voice project reads now servable.
+_________________________________________________________________________________
