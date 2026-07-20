@@ -4588,3 +4588,11 @@ area:      backend
 
 TASK-62 landed 25af891e (daemon-core #3+#5, codex cut C): the global agent-event replay ring gains a per-session terminal floor — the latest TurnFinished per session survives eviction in a seq-ordered side map (new monotonic seq on AgentEventEnvelope; UUIDs carry no order), merged into all three replay producers under the SAME history-lock discipline the audit cleared (no new locks). Capped at 1024 sessions with oldest-seq eviction + warn. Lag recovery deliberately reuses the shipped LiveLag reset_required contract: the instructed reconnect now lands on a floor-backed ring that resurrects the lost terminal — no client contract change, no inline re-emission duplicates. Verified permissions ride the legacy rail, so TurnFinished is the sole reconnect-critical terminal. 529 daemon tests (5 new) + fmt + clippy raw-exit 0. Daemon bounce HELD to batch with TASK-61.
 _________________________________________________________________________________
+time:      [21:35] [19-07-26]
+agent:     [claude] [fable 5]
+worktree:  task-61-exact-once-finalizer (fable builder sub)
+type:      bug-report
+area:      backend
+
+TASK-61 landed a8c0e3d6 (daemon-core #4, codex cut A) — and the sub upgraded the spec: not emit-before but ATOMIC. update_request_finished now takes an on_finalize closure that runs UNDER the registry write guard, only when this call performs the terminal transition; the agent-bus TurnFinished emits inside that scope (both buses verified sync, no await, no re-entry — no lock hazard). A reader observing registry-terminal is thereby GUARANTEED the frame is already in the ring — the stale-projection window GET /v1/agent/sessions kept exposing is closed at the source, and the inverted window never opens. Normal completion and the TASK-56 orphan guard both funnel through the hook; a latent unconditional double-emit in the old normal path is now gated. 8-reader race test fails under the old order, passes now. Post-rebase over TASK-62: 532/0 + fmt + clippy raw-exit 0. Daemon-core audit slate now FULLY closed (#1 56, #2 57, #3+#5 62, #4 61, #6 hygiene-non-blocking via premise check). Batched daemon bounce (61+62) follows.
+_________________________________________________________________________________
