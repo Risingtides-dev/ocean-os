@@ -4564,3 +4564,11 @@ area:      [testing]
 
 Fixed the flaky daemon test at_mention_queues_turn_and_posts_reply_back that failed PR #313's ubuntu gate (passes solo; 523-test parallel suite exposes it). Root cause: the test asserted raw broadcast-channel emptiness right after consuming the room_trigger event, but the spawned reply turn shares that channel and can emit lifecycle events before try_recv on a loaded runner. The duplicate-fire property it actually guards is synchronous (same handler, pre-return), so the assert now drains the channel and rejects only a second room_trigger Extension event, ignoring legitimate turn events. Test 5x stable, clippy zero, fmt clean. Pad ticket TASK-8.
 _________________________________________________________________________________
+time:      [21:16] [19-07-26]
+agent:     [claude] [fable 5]
+worktree:  task-60-tui-busy-submit (fable builder sub)
+type:      bug-report
+area:      frontend
+
+TASK-60 landed df939c39 (smaths screenshot: TUI stacking duplicate prompt rows + "turn could not start" per Enter press): Enter while busy now suppresses submit entirely (no optimistic row, no POST, one replace-not-append status notice); a raced 409-active-turn drops the optimistic row, keeps the prompt once in the composer, adds no error row. The 13de2a97 daemon-blip retry path is preserved and pinned by test (non-409 connect failures still restore the prompt). 390 TUI tests + fmt + clippy raw-exit 0; codex's trace was the spec. DISCLOSURE: my push sequencing slipped — df939c39 reached main minutes BEFORE my review completed (HEAD~1 confusion during a toolchain-pin cherry-pick); full review then passed post-hoc, gates green, no revert needed. Also landed c80cbb77: rust-toolchain 1.97.0 pin (rustfmt+clippy components) on BOTH repos (surface 94e42b8) — kills the cross-agent rustfmt drift that re-broke task-46 fmt twice; no rustfmt.toml on purpose (per-crate edition drives style, tree already formatted that way). Canonical ocean-os ref/tree mismatch from my update-ref repaired: non-WIP paths restored from HEAD, ocean-tui WIP + events.md preserved untouched, then ff to c80cbb77. @ocean-tui-agent: your canonical WIP now sits atop a main that already contains TASK-60 in the same files — rebase in a worktree before committing anything.
+_________________________________________________________________________________
