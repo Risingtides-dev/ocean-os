@@ -2,17 +2,18 @@
 //!
 //! ```text
 //! ┌ title row ──────────────────────────────────────────────┐
-//! │ sessions │▏│ breadcrumb                       │▏│ files │
-//! │ (left)   │ │ CENTER: chat / editor / graph    │ │(right)│
-//! │          │ │ ──────────────────────────────── │ │       │
-//! │          │ │ terminal (docked bottom, live)   │ │       │
+//! │ sessions │▏│ breadcrumb                 │▏│ work surface │
+//! │ (left)   │ │ CENTER: chat/editor/graph  │ │ files/flow/  │
+//! │          │ │ ────────────────────────── │ │ usage        │
+//! │          │ │ terminal (docked bottom)   │ │              │
 //! └ status row ──────────────────────────────────────────────┘
 //! ```
 //!
-//! No tabs: sessions, tree, and the terminal dock are collapsible around one
-//! center working surface. Normal startup presents a modal route chooser over a
-//! clean chat-only surface; explicit `--session` bypasses it. The center swaps
-//! between chat, editor, and graph without changing the launch workspace.
+//! No tabs: sessions, the mutable right rail, and the terminal dock are
+//! collapsible around one center working surface. Normal startup presents a
+//! modal route chooser over a clean chat-only surface; explicit `--session`
+//! bypasses it. The center swaps representations without changing the launch
+//! workspace.
 //!
 //! Keys: ⌃⌥1 sessions · ⌃⌥2 files · ⌃⌥3 chat · ⌃⌥4 editor · ⌃⌥5 graph toggle ·
 //! ⌃⌥6 terminal · Tab cycles focus · Esc → back to chat (double-Esc leaves the
@@ -49,6 +50,7 @@ use super::{
         pty_pane::PtyComponent,
         session_rail::SessionRailComponent,
         session_tray::SessionComponentTray,
+        session_usage::SessionUsageComponent,
         workflow_graph::WorkflowGraphComponent,
     },
     daemon_boot, dictation, errfmt,
@@ -151,9 +153,13 @@ enum Center {
     WorkflowGraph,
 }
 
+/// The right rail is a mutable work-surface slot. Files is an explicit operator
+/// destination; live projections may select Usage or Workflow only while the
+/// rail is hidden and auto-reveal remains permitted.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum RightRailMode {
     Files,
+    Usage,
     Workflow,
 }
 
@@ -408,6 +414,7 @@ pub struct App {
     rail: SessionRailComponent,
     tree: FileTreeComponent,
     tray: SessionComponentTray,
+    usage: SessionUsageComponent,
     chat: ChatComponent,
     pty: PtyComponent,
     editor: EditorComponent,
@@ -619,6 +626,7 @@ impl App {
             rail: SessionRailComponent::new(root.clone()),
             tree: FileTreeComponent::new(root.clone()),
             tray: SessionComponentTray::new(),
+            usage: SessionUsageComponent::default(),
             chat: ChatComponent::new(),
             pty: PtyComponent::default(),
             editor: EditorComponent::new(root.clone()),
@@ -1344,6 +1352,7 @@ impl App {
                     Focus::Sessions => self.rail.handle_mouse(m),
                     Focus::Tree => match self.right_rail_mode {
                         RightRailMode::Files => self.tree.handle_mouse(m),
+                        RightRailMode::Usage => self.usage.handle_mouse(m),
                         RightRailMode::Workflow => self.workflow_graph.handle_mouse(m),
                     },
                     Focus::Term => self.pty.handle_mouse(m),
@@ -1492,6 +1501,7 @@ impl App {
             Focus::Sessions => self.rail.handle_event(&evt),
             Focus::Tree => match self.right_rail_mode {
                 RightRailMode::Files => self.tree.handle_event(&evt),
+                RightRailMode::Usage => self.usage.handle_event(&evt),
                 RightRailMode::Workflow => self.workflow_graph.handle_event(&evt),
             },
             Focus::Term => self.pty.handle_event(&evt),
@@ -1669,6 +1679,7 @@ impl App {
                     .graph
                     .replace_snapshot((**snapshot).clone());
                 if became_active
+                    && !self.show_tree
                     && self.center != Center::WorkflowGraph
                     && !self.tree_auto_reveal_suppressed
                 {
@@ -1681,6 +1692,7 @@ impl App {
                 match self.workflow_graph.graph.apply_event((**event).clone()) {
                     crate::shell::workflow_graph::ApplyEvent::Applied { became_active } => {
                         if became_active
+                            && !self.show_tree
                             && self.center != Center::WorkflowGraph
                             && !self.tree_auto_reveal_suppressed
                         {
@@ -2448,11 +2460,20 @@ impl App {
         if let Some(next) = self.tray.update(&action) {
             self.dispatch(next);
         }
-        // Auto-reveal only on the hidden -> visible transition, and never after
-        // an explicit operator close. Graph/context/todo lifecycle updates can
-        // remount this tray but cannot override that dismissal latch.
-        if !self.tree_auto_reveal_suppressed && !tray_was_visible && self.tray.is_visible() {
+        if let Some(next) = self.usage.update(&action) {
+            self.dispatch(next);
+        }
+        // Session components reveal the mutable rail as Usage only when it was
+        // hidden. A visible Files/Workflow/Usage choice belongs to the operator
+        // and incoming lifecycle events must not replace it.
+        if !self.tree_auto_reveal_suppressed
+            && !tray_was_visible
+            && self.tray.is_visible()
+            && !self.show_tree
+        {
+            self.right_rail_mode = RightRailMode::Usage;
             self.show_tree = true;
+            self.apply_focus();
         }
         if let Some(next) = follow_up {
             self.dispatch(next);
@@ -4221,6 +4242,8 @@ impl App {
         self.chat.focused = center && self.center == Center::Chat;
         self.editor.focused = center && self.center == Center::Editor;
         self.graph.focused = center && self.center == Center::Graph;
+        self.usage.focused =
+            self.focus == Focus::Tree && self.right_rail_mode == RightRailMode::Usage;
         self.workflow_graph.focused = (self.focus == Focus::Tree
             && self.right_rail_mode == RightRailMode::Workflow)
             || (center && self.center == Center::WorkflowGraph);
@@ -4459,6 +4482,7 @@ impl App {
         if tree_w > 0 {
             match self.right_rail_mode {
                 RightRailMode::Files => self.tree.draw(frame, r_tree),
+                RightRailMode::Usage => self.usage.draw(frame, r_tree),
                 RightRailMode::Workflow => self.workflow_graph.draw(frame, r_tree),
             }
             if r_tray.height > 0 {
@@ -5564,7 +5588,7 @@ mod tests {
     }
 
     #[test]
-    fn active_observatory_execution_replaces_files_rail_and_completion_stays() {
+    fn active_observatory_execution_reveals_hidden_workflow_rail_and_completion_stays() {
         let mut app = offline_app();
         assert!(!app.show_tree);
         app.dispatch(Action::ObservatorySnapshot(Box::new(observatory_snapshot(
@@ -5588,6 +5612,19 @@ mod tests {
         app.dispatch(Action::Navigate(Nav::Files));
         assert!(app.right_rail_mode == RightRailMode::Files);
         assert!(app.show_tree);
+    }
+
+    #[test]
+    fn active_observatory_execution_preserves_visible_files_selection() {
+        let mut app = offline_app();
+        app.dispatch(Action::Navigate(Nav::Files));
+        app.dispatch(Action::ObservatorySnapshot(Box::new(observatory_snapshot(
+            ocean_observatory::ExecutionPhase::Running,
+        ))));
+
+        assert!(app.show_tree);
+        assert!(app.right_rail_mode == RightRailMode::Files);
+        assert_eq!(app.workflow_graph.graph.active_count(), 1);
     }
 
     #[test]
@@ -5736,6 +5773,11 @@ mod tests {
         let screen = render_app_to_string(&mut app, 100, 28);
         assert!(!screen.contains("SESSION COMPONENT"));
         assert!(screen.contains("tray task"));
+        assert!(app.right_rail_mode == RightRailMode::Files);
+        assert!(
+            !screen.contains("USAGE"),
+            "visible Files choice is preserved"
+        );
         assert!(app.r_tree.bottom() < app.r_tray.y);
 
         let anchor = (app.r_tray.x + 2, app.r_tray.y + 2);
@@ -5769,7 +5811,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn files_close_survives_terminal_and_graph_tray_updates() {
+    async fn usage_rail_close_survives_terminal_and_graph_tray_updates() {
         let mut app = offline_app();
         let sid = AgentSessionId(uuid::Uuid::from_u128(11));
         let tid = ocean_agent_sdk::AgentTurnId(uuid::Uuid::from_u128(12));
@@ -5803,15 +5845,19 @@ mod tests {
                 },
             },
         )));
-        assert!(app.show_tree, "new tray content initially reveals Files");
+        assert!(app.show_tree, "new tray content reveals the mutable rail");
+        assert!(app.right_rail_mode == RightRailMode::Usage);
 
         app.dispatch(Action::Navigate(Nav::Terminal));
         app.press(Btn::Tree);
-        assert!(!app.show_tree, "Files button closes the visible rail");
+        assert!(app.show_tree, "Files button first restores explicit Files");
+        assert!(app.right_rail_mode == RightRailMode::Files);
+        app.press(Btn::Tree);
+        assert!(!app.show_tree, "second Files press closes the visible rail");
         app.dispatch(Action::Render);
         assert!(
             !app.show_tree,
-            "terminal repaint must not reopen an explicitly hidden Files rail"
+            "terminal repaint must not reopen an explicitly hidden work rail"
         );
 
         app.dispatch(Action::Navigate(Nav::Graph));
@@ -5857,7 +5903,7 @@ mod tests {
         assert!(app.center == Center::Graph);
         assert!(
             !app.show_tree,
-            "Graph tray updates must respect the explicit Files dismissal"
+            "Graph tray updates must respect the explicit work-rail dismissal"
         );
 
         app.dispatch(Action::Navigate(Nav::Files));

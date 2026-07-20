@@ -4561,3 +4561,22 @@ area:      backend
 
 TASK-53 landed 996c4b76: Sol (gpt-5.6 family) leaks DSML tool-call blocks as text even in MIXED turns with structured calls — smaths' live screenshot showed 7 structured calls then a trailing raw DSML block, which TASK-51's zero-structured-calls gate let through. Salvage now runs for known-leaker models whenever text exists, with a (name, parsed-args) dedupe against the turn's structured calls so a call emitted both ways never double-executes; ToolUse forced only when a salvaged call survives. Shared merge_dsml_salvage helper keeps codex.rs and openai.rs collectors identical; 3 new unit tests (mixed distinct, dedupe, non-leaker), 153 protocol tests green, fmt + clippy clean. Daemon rebuild + bounce follows this entry.
 _________________________________________________________________________________
+_________________________________________________________________________________
+time:      [20:18] [19-07-26]
+agent:     [ocean] [gpt-5.4]
+worktree:  [main] /Users/smathdaddy-macbook/ocean-os
+type:      [feature-request]: establish event-driven TUI Work Surface usage slice
+area:      [frontend]: mutable right rail and truthful session usage
+
+Reconciled the local five-commit main lane with the nineteen upstream commits, including PR #311's Observatory workflow graph rail, then generalized that rail seam into a typed Work Surface with Files, Usage, and Workflow representations. Context/todo tray activation now reveals Usage rather than Files, while both session and Observatory lifecycle events leave any visible operator selection untouched and respect the explicit-close suppression latch. The new session-scoped Usage projection records at most 32 correlated daemon-reported final-request context measurements, follows model reroutes, rejects unknown capacity, handles duplicate terminal events idempotently, marks orphan/interrupted/gapped history partial, preserves known samples through gaps, clears on session switch, sanitizes labels, and renders a fixed 0–100 provider-measured sparkline. Domain state remains typed; no generic graph schema or execution authority entered the TUI.
+
+Self-review caught and restored the upstream workflow expanded-state focus invariant before commit. Focused tests cover usage correlation, duplicate replay, gaps, session switching, hidden auto-reveal, visible Files preservation, explicit dismissal, and workflow expansion. A fresh DeepSeek reviewer returned APPROVE with no medium-or-higher concern; the Longhouse topic itself aborted as insufficient alternatives because the other staffed reviewers produced no proposal.
+
+Verification:
+- `cargo test -p ocean-tui` (389 passed, 1 ignored)
+- `cargo clippy -p ocean-tui --all-targets -- -D warnings`
+- `cargo build -p ocean-tui --release`
+- `cargo xtask docs-check` (29 packages, 131 active Markdown files, 144 local links)
+- `cargo fmt --all -- --check`
+- `git diff --check`
+_________________________________________________________________________________

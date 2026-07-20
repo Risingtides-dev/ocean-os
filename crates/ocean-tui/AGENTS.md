@@ -87,37 +87,48 @@ This crate owns the full-screen terminal steering cockpit (`ocean` binary) for i
   start). Context occupancy uses the provider-reported final request,
   never cumulative multi-round usage; unknown values remain absent. The model
   row falls back to the startup `/v1/models` fetch before the first turn.
-- The upper Files rail is a multi-purpose right-rail slot. An authoritative
-  Observatory inactive→active execution transition may auto-reveal it as the
-  read-only `FLOW` graph unless the operator explicitly closed the rail. The
-  graph consumes the boot-bound summary token, baselines from
-  `/v1/observatory/snapshot`, resumes `/v1/observatory/events` from that cursor,
-  and rebaselines on auth/reset/gap/instance or cursor discontinuity; it never
-  derives execution truth from chat cards or owns orchestration. Terminal nodes
-  remain inspectable until the operator deliberately returns to Files. Enter
-  expands the same workflow projection into the center graph surface; explicit
-  Files navigation restores `FileTreeComponent`. The renderer keeps all
+- The upper right rail is a mutable Work Surface slot, not a Files-owned pane.
+  Its typed representations currently include explicit `Files`, session-scoped
+  `Usage`, and daemon-wide `Workflow`; domain projections keep their real schemas
+  rather than flattening into one generic graph model. Incoming events may select
+  a representation only while the rail is hidden and auto-reveal remains allowed;
+  they never replace a visible operator selection. Explicit Files navigation
+  restores `FileTreeComponent`.
+- The `USAGE` representation records a bounded history of only daemon-reported
+  final-request context measurements from correlated finished turns. It never
+  substitutes cumulative input tokens or local estimates, follows model reroutes,
+  clears on session switch, and labels retained history partial after an SSE gap.
+  A todo may reveal an honestly empty Usage surface while awaiting the first
+  measured turn; absence must not be backfilled with invented data.
+- An authoritative Observatory inactive→active execution transition may
+  auto-reveal the hidden Work Surface as the read-only `FLOW` graph unless the
+  operator explicitly closed the rail. The graph consumes the boot-bound summary
+  token, baselines from `/v1/observatory/snapshot`, resumes
+  `/v1/observatory/events` from that cursor, and rebaselines on
+  auth/reset/gap/instance or cursor discontinuity; it never derives execution
+  truth from chat cards or owns orchestration. Terminal nodes remain inspectable
+  until the operator deliberately changes representation. Enter expands the same
+  workflow projection into the center graph surface. The renderer keeps all
   authoritative nodes in state, uses immutable execution-id placement, bounds
   only the painted subset with an honest hidden count, and preserves the lower
   session-component tray and operator rail width.
-- The lower Files rail is a separate session-component tray, never part of
+- The lower right rail is a separate session-component tray, never part of
   `FileTreeComponent`. Its context meter uses a btop-inspired terminal grammar:
   a quiet empty bed, per-cell truecolor deep-aqua→cyan→amber→coral ramp, and a
   `░`/`▒`/`▓` frontier for sub-cell dithering (`.`/`:`/`=`/`#` fallback through
   `g()`); numeric warning thresholds remain truthful and separate from texture.
-  Its todo adapter applies only successful correlated tool
-  finishes and keeps confirmed items pinned while the same session remains
-  bound. The runtime's in-memory todo tool uses that same session scope, so the
-  display never outlives executable todo state. Explicit todo clear, session
-  switch/new session, daemon restart, or SSE-gap invalidation removes the pin.
-  Auto-reveal the Files rail only when this tray transitions hidden→visible;
-  once mounted, unrelated actions and Terminal render ticks must respect an
-  operator's explicit Files close.
-  It never parses human-formatted todo output into invented durable state. Todo
+  Its todo adapter applies only successful correlated tool finishes and keeps
+  confirmed items pinned while the same session remains bound. The runtime's
+  in-memory todo tool uses that same session scope, so the display never outlives
+  executable todo state. Explicit todo clear, session switch/new session, daemon
+  restart, or SSE-gap invalidation removes the pin. Auto-reveal the Work Surface
+  only when this tray transitions hidden→visible; once mounted, unrelated actions
+  and Terminal render ticks must respect an operator's explicit rail close. It
+  never parses human-formatted todo output into invented durable state. Todo
   `text` remains authoritative; an optional agent-supplied `title` (at most 36
-  terminal cells) is display-only and is preferred in the compact tray. Empty
-  or short layouts return the full rail to the file tree; tray selection and
-  mouse routing remain pane-bounded.
+  terminal cells) is display-only and is preferred in the compact tray. Empty or
+  short layouts return the full rail to its selected representation; tray
+  selection and mouse routing remain pane-bounded.
 - Consecutive tool bursts (`shell/components/chat.rs`) collapse under one
   non-wrapping parent summary with truthful running/done/failed counts. Hidden
   Thinking turns do not split a burst; visible prose/cards/errors do. Opening a
