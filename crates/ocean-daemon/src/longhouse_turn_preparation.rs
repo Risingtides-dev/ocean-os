@@ -6,6 +6,28 @@
 //! events, persistence, governance, calls, and librarian fetch remain outside.
 
 use std::env;
+use std::sync::Arc;
+
+/// Single-flight permit for the pre-turn consult (TASK-21).
+///
+/// The consult is time-bounded, but a timeout only abandons the *await* —
+/// dropping a `spawn_blocking` join handle does not cancel the task. Without
+/// this permit, a stalled cold/stale load under sustained turn volume strands
+/// one uncancelled blocking task per turn, all contending for the same
+/// process-wide cache lock, until the blocking pool saturates and unrelated
+/// disk work (session persistence, other I/O) queues behind it.
+///
+/// One permit, held by the blocking task itself and released only when that
+/// task truly finishes. A turn that finds it taken skips the consult and
+/// injects nothing — the same fail-open no-op as a timeout. So at most one
+/// consult is ever in flight, no matter how slow the disk or how fast the
+/// turns.
+static PREP_IN_FLIGHT: std::sync::OnceLock<Arc<tokio::sync::Semaphore>> =
+    std::sync::OnceLock::new();
+
+fn prep_permit() -> &'static Arc<tokio::sync::Semaphore> {
+    PREP_IN_FLIGHT.get_or_init(|| Arc::new(tokio::sync::Semaphore::new(1)))
+}
 
 /// Whether the **Longhouse pre-turn consult** is enabled. **Default ON**
 /// (OCEAN-283): now that the skill index is cached and the ranking is relevant,
@@ -198,7 +220,22 @@ pub(super) async fn longhouse_prep_for_turn(
         return None;
     }
 
+    // Single-flight (TASK-21): if a previous consult is still running — including
+    // one this turn's predecessor already abandoned at the deadline — skip rather
+    // than enqueue another uncancellable blocking task behind the same cache lock.
+    let permit = match Arc::clone(prep_permit()).try_acquire_owned() {
+        Ok(permit) => permit,
+        Err(_) => {
+            tracing::debug!("longhouse pre-turn consult already in flight; injecting no brief");
+            return None;
+        }
+    };
+
     let scan = tokio::task::spawn_blocking(move || {
+        // Held by the TASK, not the awaiter: a consult abandoned at the deadline
+        // keeps the permit until it actually finishes, so later turns skip
+        // instead of stacking behind it.
+        let _permit = permit;
         let roots = if cwd.is_empty() {
             ocean_longhouse::SkillRoots::default()
         } else {
@@ -223,11 +260,11 @@ pub(super) async fn longhouse_prep_for_turn(
                 deadline_ms = LONGHOUSE_PREP_DEADLINE.as_millis() as u64,
                 "longhouse pre-turn consult exceeded its deadline; injecting no brief"
             );
-            // Dropping the join handle does not cancel this read-only task. It
-            // cannot grant authority, but a stalled cold/stale load can retain
-            // the process-wide cache lock and make later blocking tasks queue
-            // behind it. The current turn still proceeds with no brief; bounding
-            // detached work is a separate availability hardening checkpoint.
+            // Dropping the join handle does not cancel this read-only task,
+            // but its permit is not released until it truly finishes, so at
+            // most ONE such task can ever be detached (TASK-21) — later turns
+            // skip the consult instead of queueing behind the process-wide cache lock.
+            // The current turn proceeds with no brief.
             return None;
         }
     };
@@ -242,5 +279,55 @@ pub(super) async fn longhouse_prep_for_turn(
             tracing::warn!(error = %err, "longhouse pre-turn consult task failed; injecting no brief");
             None
         }
+    }
+}
+
+#[cfg(test)]
+mod task21_tests {
+    use super::*;
+
+    /// TASK-21: the consult is single-flight. A stalled consult holds the
+    /// permit until it truly finishes, so N further turns during that stall
+    /// enqueue ZERO additional blocking tasks — the amplification that could
+    /// saturate the blocking pool is structurally impossible, not merely rare.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn stalled_consult_admits_no_second_blocking_task() {
+        let permit_source = Arc::clone(prep_permit());
+        // Stand in for a consult abandoned at the deadline: the task outlives
+        // the await and still holds the permit.
+        let held = permit_source
+            .try_acquire_owned()
+            .expect("permit is free at test start");
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel::<()>();
+        let stalled = tokio::task::spawn_blocking(move || {
+            let _permit = held;
+            let _ = release_rx.blocking_recv();
+        });
+
+        // Every turn arriving during the stall must skip immediately.
+        for turn in 0..8 {
+            assert!(
+                Arc::clone(prep_permit()).try_acquire_owned().is_err(),
+                "turn {turn} started a second consult while one was in flight"
+            );
+        }
+
+        // Once the stalled task truly finishes, consults resume.
+        let _ = release_tx.send(());
+        stalled.await.expect("stalled task joins");
+        assert!(
+            Arc::clone(prep_permit()).try_acquire_owned().is_ok(),
+            "permit must be reusable after the in-flight consult completes"
+        );
+    }
+
+    /// An empty prompt returns before the permit is ever consulted, so a turn
+    /// that cannot rank anything never contends for single-flight. (Asserted on
+    /// the empty-prompt guard rather than the env opt-out: env is process-wide
+    /// and would race the sibling test above under the parallel test harness.)
+    #[tokio::test]
+    async fn unrankable_turn_never_contends_for_the_permit() {
+        let prep = longhouse_prep_for_turn("   ".into(), String::new()).await;
+        assert!(prep.is_none(), "an empty prompt must inject nothing");
     }
 }

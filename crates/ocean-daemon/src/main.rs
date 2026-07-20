@@ -21054,8 +21054,14 @@ mod tests {
         assert!(outcomes.contains("Err(err) => {"));
         assert!(outcomes.contains("\n            None\n"));
         assert!(!prepare.contains("current_dir"));
-        assert!(prepare.contains("Dropping the join handle does not cancel this read-only task."));
+        assert!(prepare.contains("Dropping the join handle does not cancel this read-only task,"));
         assert!(prepare.contains("process-wide cache lock"));
+        // TASK-21: the boundary is now single-flight — an abandoned consult
+        // holds its permit until it truly finishes, so a stalled load can never
+        // be amplified into one detached blocking task per turn.
+        assert!(prepare.contains("try_acquire_owned()"));
+        assert!(prepare.contains("already in flight; injecting no brief"));
+        assert!(prepare.contains("let _permit = permit;"));
         assert_eq!(prepare.matches("tracing::warn!(").count(), 2);
         let timeout_warning_start = prepare.find("tracing::warn!(").unwrap();
         let timeout_warning_end = prepare[timeout_warning_start..]
@@ -21109,6 +21115,10 @@ mod tests {
             );
         }
         if is_extracted {
+            // The guard bounds PRODUCTION surface in this private leaf; the
+            // #[cfg(test)] module is excluded so regressions can be added
+            // without loosening the real constraint (TASK-21).
+            let source = source.split("#[cfg(test)]").next().unwrap_or(&source);
             let definitions = source
                 .lines()
                 .map(str::trim_start)
@@ -21119,7 +21129,9 @@ mod tests {
                         || line.starts_with("pub(super) async fn ")
                 })
                 .count();
-            assert_eq!(definitions, 4, "private owner gained an extra function");
+            // 5 = the original 4 + prep_permit(), the TASK-21 single-flight
+            // accessor that bounds detached blocking work.
+            assert_eq!(definitions, 5, "private owner gained an extra function");
             assert_eq!(source.matches(&deadline_prefix).count(), 1);
             assert!(!source.contains("\nstruct "));
             assert!(!source.contains("\nenum "));
