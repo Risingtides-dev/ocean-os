@@ -4585,3 +4585,11 @@ area:      [infra]
 
 TASK-15: supervision fully decoupled from the dev checkout. The committed plist is now a machine-neutral template (killed three fossilized /Users/smathdaddy-macbook absolute paths that would have clobbered the hand-fixed installed plist on any reinstall); the installer renders the home placeholder at install time with an unexpanded-placeholder guard, publishes deploy/ocean-daemon.sh as ~/.local/libexec/ocean-daemon/launch.sh, and the rendered plist execs that copy — working-tree state can never again affect supervision, same isolation as the TASK-7 binary artifact. Launcher's dead REPO derivation removed. Installer's build-from-main guard now accepts detached worktrees whose HEAD is contained in origin/main and hard-fails any tracked modification, matching how deploys actually run. bash -n both scripts, sandbox plist render lint-clean.
 _________________________________________________________________________________
+time:      [03:35] [20-07-26]
+agent:     [claude] [fable 5]
+worktree:  fix/task20-supervision-maintenance-window
+type:      [bug-report]
+area:      [frontend]
+
+Fixed the TUI/launchd supervision race found while closing TASK-15 (pad TASK-20). Root cause: the TUI's autostart probes launchctl print; during an installer maintenance window (bootout->bootstrap) that probe fails, the TUI concludes "unsupervised" and direct-spawns — the orphan wins the port and the returning launchd job crashloops on EADDRINUSE (exactly the 02:35 incident). Fix: a failing launchctl probe with the LaunchAgent plist present on disk now resolves to a new SupervisionMaintenance outcome — no spawn, launchd RunAtLoad revives the daemon when bootstrap lands; app.rs surfaces it as a health condition. Regression test pins the window (plist installed + job unloaded -> never spawn, never kickstart); all 8 existing autostart tests extended with the install-state probe. 397 ocean-tui tests green, clippy zero, fmt clean.
+_________________________________________________________________________________
