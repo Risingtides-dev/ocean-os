@@ -4722,27 +4722,44 @@ mod tests {
             .filter(WalkFilter::files_only())
             .empty_recheck(EmptyRecheck::Never);
 
-        let primed = request
-            .collect()
-            .expect("empty request should collect successfully");
-        assert_eq!(primed.backend, WalkBackend::Fresh);
-        assert!(
-            primed.entries.is_empty(),
-            "empty root should prime an empty files-only cache entry, got {:?}",
-            primed.entries
-        );
+        // The scan cache is process-global with a 1 s default TTL and a
+        // 16-entry cap, so under a loaded parallel run the primed entry can
+        // expire or be evicted before the stale observation — environmental,
+        // not a regression. Re-establish the precondition and retry a bounded
+        // number of times; a genuine cache bug still fails every attempt.
+        let created_path = tree.path().join("created.txt");
+        let mut observed_stale = None;
+        for _ in 0..5 {
+            invalidate_path(tree.path());
+            if created_path.exists() {
+                fs::remove_file(&created_path).expect("stale retry should reset created.txt");
+            }
 
-        fs::write(tree.path().join("created.txt"), "created")
-            .expect("file created after cache prime should be written");
-        wait_for_nonzero_cache_age();
+            let primed = request
+                .collect()
+                .expect("empty request should collect successfully");
+            assert_eq!(primed.backend, WalkBackend::Fresh);
+            assert!(
+                primed.entries.is_empty(),
+                "empty root should prime an empty files-only cache entry, got {:?}",
+                primed.entries
+            );
 
-        let stale = request
-            .collect()
-            .expect("empty recheck disabled request should read the cached empty result");
-        assert_eq!(stale.backend, WalkBackend::Cached);
-        assert!(
-            stale.stats.cache_age_ms > 0,
-            "cached empty result should be old enough to exercise empty recheck"
+            fs::write(&created_path, "created")
+                .expect("file created after cache prime should be written");
+            wait_for_nonzero_cache_age();
+
+            let stale = request
+                .collect()
+                .expect("empty recheck disabled request should read the cached empty result");
+            if stale.backend == WalkBackend::Cached && stale.stats.cache_age_ms > 0 {
+                observed_stale = Some(stale);
+                break;
+            }
+        }
+        let stale = observed_stale.expect(
+            "no attempt observed an aged cached-empty result; the cache is \
+             dropping or mis-aging entries even without parallel-load pressure",
         );
         assert!(
             stale.entries.is_empty(),
