@@ -1,0 +1,14 @@
+# Notices
+
+`ocean-search` adapts search mechanisms and black-box behavior tests from the
+MIT-licensed `can1357/oh-my-pi` repository, pinned at commit
+`03c48d073bd4849726cc14750b5aecfa310bdf26`, principally
+`crates/pi-natives/src/grep.rs`.
+
+Copyright (c) 2025 Mario Zechner
+Copyright (c) 2025-2026 Can Bölük
+
+The donor's N-API/TypeScript surface, PCRE2 fallback, regex brace/parenthesis
+repair, automatic multiline behavior, oversized-prefix search/reopen policy,
+and runtime policy were deliberately not ported. See `LICENSE` for the MIT
+terms.

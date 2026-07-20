@@ -63,7 +63,9 @@ Owns:
 - provider/model routing and wire protocols;
 - agent turns, tools, permissions, cancellation, cwd binding, and local sessions;
 - TUI, CLI, ACP bridge, MCP client, browser control, call pipeline;
-- durable local rooms and local coordination/memory primitives.
+- durable local rooms and local coordination/memory primitives;
+- standalone `ocean-walker` traversal and trusted-root `ocean-search` typed-search
+  libraries, neither of which is a live runtime capability or path-authorization boundary.
 
 Does not own product UI chrome, agent-package content, or Bedrock's shared cloud
 storage and ingest service.

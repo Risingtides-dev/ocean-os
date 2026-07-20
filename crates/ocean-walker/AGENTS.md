@@ -9,8 +9,9 @@ candidate delivery, and bounded TTL scan-cache library.
 
 - **Scope:** `crates/ocean-walker/`
 - **Parent contracts:** `../../AGENTS.md` and `../AGENTS.md`
-- **Does not own:** typed content search, runtime `grep`/`glob`, capability or
-  harness policy, N-API, shell execution, or production wiring
+- **Does not own:** typed content search (owned standalone by `ocean-search`),
+  runtime `grep`/`glob`, capability or harness policy, N-API, shell execution,
+  or production wiring
 
 ## Local Contracts
 
@@ -37,8 +38,9 @@ candidate delivery, and bounded TTL scan-cache library.
   Live adoption requires a separate point-of-use descriptor/handle-relative
   confinement gate covering swaps, cached candidates, and supported OSes.
 - Keep Rust 2021, Rust 1.88 compatibility, and warnings denied.
-- Keep the crate standalone and outside `default-members`; no live runtime,
-  grep, glob, agent, daemon, or TUI dependency/wiring belongs in M1.
+- Keep the crate standalone and outside `default-members`; `ocean-search` may
+  depend on this crate, but no live runtime, grep, glob, agent, daemon, or TUI
+  dependency/wiring belongs in M1.
 - Preserve pinned Oh My Pi attribution in `LICENSE` and `NOTICE`.
 
 ## Work Guidance
