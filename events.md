@@ -4708,3 +4708,11 @@ area:      [testing]
 
 Killed a flake in ocean-tui shell::herdr::tests::session_bind_reports_agent_session_id, found while running the full-workspace gate locally to verify the #333 security fix independent of stuck hosted CI. wait_for_marker polled a spawned subprocess's marker file for 50*20ms=1s then did a hard read_to_string().expect(); under full-suite parallel load the fake-herdr spawn can take longer than a second to land its write, so the final expect panicked. Passes 4/4 solo, fails only under parallelism — a load-dependent timing flake in a crate the security PR does not touch. Widened the budget to 5s and made it deadline-based (keep polling to the deadline, panic with a clear message only if the content never arrives) rather than asserting on one last read. Kept as its OWN PR, not bundled into #333, same discipline as the walker flake vs TASK-21. 397 ocean-tui tests green, clippy zero.
 _________________________________________________________________________________
+time:      [21:35] [20-07-26]
+agent:     [claude] [fable 5]
+worktree:  test/task28-federation-flake-pass
+type:      [refactor]
+area:      [testing]
+
+Flake-audit pass 1 (pad TASK-28): all 35 tight timeouts in room_federation's test module widened 1-2s -> 60s after programmatic classification proved every one is a POSITIVE wait (poll loop or must-arrive channel recv, sub-second solo); the five my scanner first flagged negative were artifacts of adjacent try_recv asserts — the real negative class, correctly deadline-free and untouched (their synchronicity audit is TASK-29 per-case work). Deadline policy documented once at the shared wait helper; TASK-27 already proved this file fails unrelated PRs under runner saturation. Federation suite 50/50, fmt clean. Note: first attempt's worktree was swept mid-flight by a parallel scratchpad cleanup — moved lane worktrees to ~/.worktrees, and the half-executed command chain pushed an empty branch that has been deleted.
+_________________________________________________________________________________
