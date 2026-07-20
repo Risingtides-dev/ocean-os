@@ -138,7 +138,10 @@ This crate owns the full-screen terminal steering cockpit (`ocean` binary) for i
   state, never raw HTTP: remove only the tagged rejected optimistic user row,
   preserve its prompt once, and keep Enter latched. Generic pre-execution failures
   also remove only their tagged optimistic row; 408/5xx/connected transport or
-  decode uncertainty never restores or rolls back the prompt. Activity probes
+  decode uncertainty never restores or rolls back the prompt. Submitted images
+  remain submission-scoped until admission is known: restore them only for a
+  definite pre-execution rejection, and never for accepted or unknown outcomes.
+  Activity probes
   must not install across a newer submission or any compact-owned synchronization
   marker. A per-session unresolved-sync marker survives rebinding, blocks prompts,
   and forces refresh when that session returns. Treat typed replay gaps
