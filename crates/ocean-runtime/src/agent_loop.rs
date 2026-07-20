@@ -1929,6 +1929,72 @@ mod tests {
         assert_eq!(declarations[0].tools[0].name, "echo");
     }
 
+    #[test]
+    fn persisted_excluded_matches_never_reconstruct_as_loaded() {
+        // TASK-17 follow-up: the persisted result shape now carries
+        // loaded:false exclusion entries. Resume/reconstruction must treat
+        // them as *not loaded* — execution authority stays with the budget
+        // that excluded them, never with the durable transcript record.
+        let tool = |name: &str| ocean_protocol::Tool {
+            name: name.into(),
+            description: "cap".into(),
+            parameters: serde_json::json!({"type": "object"}),
+        };
+        let tools = vec![tool("kept"), tool("rejected")];
+        let search_result = serde_json::json!({
+            "query": "cap",
+            "matches": [
+                {"name": "kept", "loaded": true, "already_loaded": false},
+                {"name": "rejected", "loaded": false, "excluded_reason": "tool_limit"}
+            ],
+            "loaded_count": 1,
+            "loaded_limit": MAX_DYNAMIC_TOOLS,
+            "excluded_count": 1
+        });
+        let messages = vec![
+            Message::user_text("turn"),
+            Message::Assistant(AssistantMessage {
+                content: vec![Content::ToolCall {
+                    id: "search-1".into(),
+                    name: DYNAMIC_SEARCH_TOOL.into(),
+                    arguments: serde_json::json!({"query": "cap"}),
+                }],
+                api: "openai-completions".into(),
+                provider: "kimi".into(),
+                model: "kimi-k3".into(),
+                usage: Usage::default(),
+                stop_reason: StopReason::ToolUse,
+                error_message: None,
+                timestamp: 0,
+            }),
+            Message::ToolResult(ToolResultMessage {
+                tool_call_id: "search-1".into(),
+                tool_name: DYNAMIC_SEARCH_TOOL.into(),
+                content: vec![Content::text(search_result.to_string())],
+                is_error: false,
+                timestamp: 0,
+            }),
+            Message::user_text("resumed"),
+        ];
+        let loaded = reconstruct_loaded_dynamic_tools(&messages, &tools);
+        assert_eq!(
+            loaded.names,
+            vec!["kept"],
+            "excluded persisted matches must not reconstruct as loaded"
+        );
+        let declarations = dynamic_declarations_for_messages(&messages, &loaded, &tools);
+        assert_eq!(declarations.len(), 1);
+        assert_eq!(
+            declarations[0]
+                .tools
+                .iter()
+                .map(|tool| tool.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["kept"],
+            "no declaration may be emitted for an excluded match"
+        );
+    }
+
     #[derive(Default)]
     struct TerminalDoneProvider {
         calls: AtomicUsize,

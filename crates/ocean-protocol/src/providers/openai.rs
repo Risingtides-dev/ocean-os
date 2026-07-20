@@ -2117,20 +2117,45 @@ mod tests {
     }
 
     #[test]
-    fn oversized_dynamic_schema_fails_the_wire_bound() {
-        // TASK-18: pin the 512-KiB request bound with a schema that crosses it.
+    fn dynamic_schema_bytes_pass_at_exactly_512_kib_and_fail_one_byte_over() {
+        // TASK-18: calibrate the byte bound at its exact edge. The guard sums
+        // serialized tool bytes, so the fixture pads the description until the
+        // whole serialized declaration lands exactly on 512 KiB (pass), then
+        // adds one byte (fail) — proving the boundary, not just gross overflow.
         let model = kimi_model("kimi-k3");
-        let mut huge = dynamic_tool("huge");
-        huge.description = "x".repeat(512 * 1024 + 1);
-        let context = Context {
-            dynamic_tool_declarations: vec![crate::types::DynamicToolDeclaration {
-                tools: vec![huge],
-                before_message: 0,
-            }],
-            ..Default::default()
+        let sized_context = |description_len: usize| {
+            let mut tool = dynamic_tool("huge");
+            tool.description = "x".repeat(description_len);
+            Context {
+                dynamic_tool_declarations: vec![crate::types::DynamicToolDeclaration {
+                    tools: vec![tool],
+                    before_message: 0,
+                }],
+                ..Default::default()
+            }
         };
-        let error = super::build_body(&model, &context, &StreamOptions::default())
-            .expect_err("oversized dynamic schema must fail closed");
+        let mut empty = dynamic_tool("huge");
+        empty.description = String::new();
+        let overhead = serde_json::to_vec(&empty)
+            .expect("fixture serializes")
+            .len();
+        let at_limit = 512 * 1024 - overhead;
+        assert_eq!(
+            serde_json::to_vec(&sized_context(at_limit).dynamic_tool_declarations[0].tools[0])
+                .expect("serializes")
+                .len(),
+            512 * 1024,
+            "fixture calibration: serialized tool is exactly 512 KiB"
+        );
+
+        super::build_body(&model, &sized_context(at_limit), &StreamOptions::default())
+            .expect("exactly 512 KiB of dynamic schema is within bounds");
+        let error = super::build_body(
+            &model,
+            &sized_context(at_limit + 1),
+            &StreamOptions::default(),
+        )
+        .expect_err("one byte past 512 KiB must fail closed");
         assert!(
             error.to_string().contains("16-tool/512-KiB"),
             "typed bound error names the limits, got: {error}"
