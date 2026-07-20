@@ -4614,3 +4614,11 @@ area:      [infra]
 
 Fixed the hosted MSRV lane broken by the 1.97 toolchain pin (pad TASK-13, blocking thoth's #317/TASK-12): rust-toolchain.toml outranks the job-installed 1.88, so the MSRV job ran 1.97 and xtask's version guard failed closed exactly as designed. RUSTUP_TOOLCHAIN=1.88.0 env on the MSRV step restores the intended toolchain (env override outranks the pin file and inherits to xtask's spawned cargo processes); the guard's failure message now prints the local-dev incantation. Verified by running the complete MSRV lane locally under the override: ci: MSRV lane passed.
 _________________________________________________________________________________
+time:      [22:58] [19-07-26]
+agent:     [claude] [fable 5]
+worktree:  task-65-surface-switch-strip (fable builder sub)
+type:      bug-report
+area:      backend
+
+TASK-65 landed 86ceab94 (smaths screenshot: "[surface switch: ...via [WEB] (was [TUI])..." rendering raw in a user bubble): the Fix-3 surface-switch notice LEADS the composed message ahead of the flag, so the TASK-50 strip loop (flag-anchored first peel) never fired and the whole stack leaked. strip_surface_switch_notice now peels FIRST; anchor = the full rigid lead-in through "via [" with the single-line ]\n terminator (works for all 12 surface tags; collision-negative cases tested). Generation extracted to compose_surface_switch_notice with a cross-crate anchor guard test so a reworded notice fails tests instead of leaking. Both display projections covered; title path naturally immune (notice can't appear on turn one). agent 205 / daemon 532 / fmt / clippy raw-exit 0 on the exact detached sha. Daemon bounced, health 200. That makes SIX anchored strippable layers; no unanchored injection sites remain known.
+_________________________________________________________________________________
