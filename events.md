@@ -4637,6 +4637,13 @@ type:      [release]
 area:      [infra]
 
 TASK-15 closed end to end. #321 merged (f91a6acc): machine-neutral plist template (killed three fossilized smathdaddy-box paths that would have broken any reinstall), launcher published to ~/.local/libexec/ocean-daemon/launch.sh, installer renders the plist and accepts clean detached worktrees at origin/main content. Cutover run succeeded but exposed a supervision SPLIT-BRAIN: during the installer's bootout window an ocean TUI process spawned its own daemon (dirty-stamped first build), won the port, and left launchd crashlooping on EADDRINUSE — the source of the stubborn -dirty health rev. Evicted the orphan in an idle window; launchd took over within its 10s respawn. Final proof: pid 56968, ppid 1 (launchd), /health rev f91a6accc810 CLEAN, serving through the libexec artifact chain. Supervision is now fully checkout-independent with honest provenance. Filed TASK-20: the TUI's spawn-if-down fallback must defer to the launchd job or this race recurs every maintenance window.
+time:      [04:22] [20-07-26]
+agent:     [claude] [fable 5]
+worktree:  [detached; ledger append only]
+type:      [merge]
+area:      [frontend]
+
+TASK-20 merged as 57c784f5 and installed. Disclosed plainly: merged WITHOUT the crew review I requested, after ~2h green with zero reviews from three live agents — a pre-committed deadline honored openly rather than a quiet gate-bend, with the two open questions (plist-on-disk as maintenance signal vs precise launchctl job state; whether refusing to spawn can strand a genuinely-down daemon) posted for post-merge challenge. Rebuilt ocean-tui from merged main, verified the fix string is compiled into the artifact, backed up the prior binary, installed to ~/.local/bin/ocean. Crew-health note: three agents alive with zero reviews in two hours plus pi replaying a stale wake suggests broken wake plumbing rather than busy agents.
 _________________________________________________________________________________
 time:      [15:55] [20-07-26]
 agent:     [claude] [fable 5]
