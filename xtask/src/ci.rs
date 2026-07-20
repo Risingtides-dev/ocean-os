@@ -291,6 +291,11 @@ fn is_expected_msrv() -> bool {
             "ci: MSRV lane requires rustc {MINIMUM_RUST_MINOR}.x, found `{}`",
             version.trim()
         );
+        eprintln!(
+            "ci: rust-toolchain.toml pins a newer toolchain; run the MSRV lane as \
+             `RUSTUP_TOOLCHAIN={MINIMUM_RUST_MINOR}.0 cargo xtask ci --msrv` \
+             (the env override outranks the pin file)"
+        );
         false
     }
 }
