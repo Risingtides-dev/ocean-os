@@ -1281,7 +1281,9 @@ fn spawn_room_agent_turn(
             .runtime
             .prompt_with_lease(prompt_req, control, &session_lease)
             .await;
-        record_prompt_result(&state, request_id, &res, None).await;
+        // Federated room turn: delivery is the legacy-bus record itself (origin
+        // None), with no separate agent-bus terminal frame, so pass `None`.
+        record_prompt_result(&state, request_id, &res, None, None).await;
         emit_session_changed(&state.agent_events, session_id);
 
         // Post the agent's reply back into the room as the agent participant.

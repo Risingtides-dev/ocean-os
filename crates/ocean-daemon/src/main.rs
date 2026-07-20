@@ -1823,7 +1823,8 @@ async fn prompt(
         Some(lease) => state.runtime.prompt_with_lease(req, control, lease).await,
         None => state.runtime.prompt(req, control).await,
     };
-    record_prompt_result(&state, request_id, &res, None).await;
+    // Legacy `/v1/prompt` turn: no agent-bus rail, so no agent-bus terminal frame.
+    record_prompt_result(&state, request_id, &res, None, None).await;
     if let Some(session_id) = res.session_id {
         emit_session_changed(&state.agent_events, AgentSessionId(session_id));
     }
@@ -1941,7 +1942,8 @@ async fn create_request(
             }
             None => task_state.runtime.prompt(req, control).await,
         };
-        record_prompt_result(&task_state, request_id, &res, None).await;
+        // Legacy `/v1/requests` turn: no agent-bus rail, so no agent-bus frame.
+        record_prompt_result(&task_state, request_id, &res, None, None).await;
         if let Some(session_id) = res.session_id {
             emit_session_changed(&task_state.agent_events, AgentSessionId(session_id));
         }
@@ -5502,6 +5504,7 @@ async fn record_prompt_result(
     request_id: RequestId,
     res: &ocean_core::PromptResponse,
     origin: Option<&'static str>,
+    agent_finished: Option<(AgentSessionId, AgentTurnEvent)>,
 ) {
     let desired_state = if res.ok {
         RequestState::Completed
@@ -5514,67 +5517,94 @@ async fn record_prompt_result(
         res.stderr.clone()
     };
 
+    // TASK-61: the terminal registry transition AND every terminal frame for this
+    // turn are emitted together, under the registry write lock, in this closure.
+    // `update_request_finished` runs it exactly once — only when this call is the
+    // one that transitions the entry terminal — and before the transition is
+    // visible to any registry reader, so `GET /v1/agent/sessions` can never report
+    // the turn cleared ahead of the `TurnFinished` the events stream will deliver.
+    //
+    // TOTAL ORDER inside the atomic window (preserved from pre-TASK-61): the
+    // legacy-bus mirrors (`AssistantDelta` before the legacy terminal frame) come
+    // first, then the agent-bus `TurnFinished`. Only the *relative* order of the
+    // registry transition and the agent-bus emit changed — they are now atomic
+    // rather than registry-first — so legacy clients see the same sequence.
     let final_state = update_request_finished(
         &state.requests,
         request_id,
         res.session_id,
         desired_state,
         message,
+        |final_state| {
+            match final_state {
+                RequestState::Completed => {
+                    if !res.stdout.trim().is_empty() {
+                        emit_with_origin(
+                            &state.events,
+                            res.session_id,
+                            Some(request_id),
+                            None,
+                            origin,
+                            OceanEvent::AssistantDelta {
+                                text: res.stdout.clone(),
+                            },
+                        );
+                    }
+                    emit_with_origin(
+                        &state.events,
+                        res.session_id,
+                        Some(request_id),
+                        None,
+                        origin,
+                        OceanEvent::TurnFinished {
+                            ok: true,
+                            wall_ms: res.wall_ms,
+                        },
+                    );
+                }
+                RequestState::Errored => {
+                    emit_with_origin(
+                        &state.events,
+                        res.session_id,
+                        Some(request_id),
+                        None,
+                        origin,
+                        OceanEvent::Error {
+                            message: res.stderr.clone(),
+                        },
+                    );
+                }
+                RequestState::Cancelled => {
+                    emit_with_origin(
+                        &state.events,
+                        res.session_id,
+                        Some(request_id),
+                        None,
+                        origin,
+                        OceanEvent::Cancelled {
+                            reason: Some("request marked cancelled after runtime returned".into()),
+                        },
+                    );
+                }
+                _ => {}
+            }
+
+            // Agent-bus terminal frame (agent-turn path only; legacy `/v1/prompt`
+            // and `/v1/requests` turns have no agent rail and pass `None`). The
+            // frame's status/telemetry are prebuilt by the caller from `res`, so a
+            // cancel-race still ships the res-derived frame exactly as before —
+            // what changed is that it now fires only on a fresh terminal
+            // transition, never a second time behind the orphan guard.
+            if let Some((session_id, frame)) = agent_finished {
+                emit_agent(&state.events, &state.agent_events, session_id, frame);
+            }
+        },
     )
     .await;
 
-    match final_state {
-        Some(RequestState::Completed) => {
-            if !res.stdout.trim().is_empty() {
-                emit_with_origin(
-                    &state.events,
-                    res.session_id,
-                    Some(request_id),
-                    None,
-                    origin,
-                    OceanEvent::AssistantDelta {
-                        text: res.stdout.clone(),
-                    },
-                );
-            }
-            emit_with_origin(
-                &state.events,
-                res.session_id,
-                Some(request_id),
-                None,
-                origin,
-                OceanEvent::TurnFinished {
-                    ok: true,
-                    wall_ms: res.wall_ms,
-                },
-            );
-        }
-        Some(RequestState::Errored) => {
-            emit_with_origin(
-                &state.events,
-                res.session_id,
-                Some(request_id),
-                None,
-                origin,
-                OceanEvent::Error {
-                    message: res.stderr.clone(),
-                },
-            );
-        }
-        Some(RequestState::Cancelled) => {
-            emit_with_origin(
-                &state.events,
-                res.session_id,
-                Some(request_id),
-                None,
-                origin,
-                OceanEvent::Cancelled {
-                    reason: Some("request marked cancelled after runtime returned".into()),
-                },
-            );
-        }
-        _ => {}
-    }
+    // `final_state` is retained for callers that branch on the outcome; the
+    // terminal frames were already emitted atomically inside the closure above.
+    let _ = final_state;
 }
 
 /// The clear, terminal error a turn carries when its task unwound (panicked) or
@@ -5609,49 +5639,59 @@ async fn terminate_orphaned_turn(
     session_id: AgentSessionId,
     turn_id: AgentTurnId,
 ) {
+    // TASK-61: share the ONE finalizer with the normal completion path. The
+    // terminal `TurnFinished(Failed)` is emitted INSIDE the registry write lock,
+    // atomically with the Running→Errored transition, so a reader that sees this
+    // orphan cleared is guaranteed the frame is already in the agent-bus ring —
+    // the same stale-projection guarantee the normal path now has.
+    //
     // `None` session_id preserves whatever `register_running_request` recorded.
-    let final_state = update_request_finished(
+    // The closure fires only when THIS call performs the transition (TASK-56's
+    // return-value gate). It then checks for the fresh `Errored` outcome: if a
+    // cancel already settled the entry (`Cancelled`), the cancel path owns the
+    // terminal frame and we emit nothing; a late-but-normal completion that won
+    // the race leaves the entry already terminal, so the closure never runs at
+    // all. Either way the turn gets exactly one terminal frame.
+    update_request_finished(
         requests,
         request_id,
         None,
         RequestState::Errored,
         ORPHANED_TURN_ERROR.to_string(),
+        |final_state| {
+            if !matches!(final_state, RequestState::Errored) {
+                return;
+            }
+
+            tracing::warn!(
+                %request_id,
+                %session_id,
+                %turn_id,
+                "turn task unwound before recording its result; forcing terminal TurnFinished(Failed)"
+            );
+
+            emit_agent(
+                events,
+                agent_events,
+                session_id,
+                AgentTurnEvent::TurnFinished {
+                    session_id,
+                    turn_id,
+                    status: AgentTurnStatus::Failed,
+                    error: Some(ORPHANED_TURN_ERROR.to_string()),
+                    // A panicked turn produced no trustworthy telemetry; omit it
+                    // rather than report zeros as if the turn measured them.
+                    wall_ms: None,
+                    output_tokens: None,
+                    input_tokens: None,
+                    cache_read_tokens: None,
+                    tokens_per_second: None,
+                    context_usage: None,
+                },
+            );
+        },
     )
     .await;
-
-    if !matches!(final_state, Some(RequestState::Errored)) {
-        // Either the entry was already terminal (a late-but-normal completion
-        // won the race) or it was cancelled — the owning path already delivered
-        // the terminal frame, so emitting here would double-report the turn.
-        return;
-    }
-
-    tracing::warn!(
-        %request_id,
-        %session_id,
-        %turn_id,
-        "turn task unwound before recording its result; forcing terminal TurnFinished(Failed)"
-    );
-
-    emit_agent(
-        events,
-        agent_events,
-        session_id,
-        AgentTurnEvent::TurnFinished {
-            session_id,
-            turn_id,
-            status: AgentTurnStatus::Failed,
-            error: Some(ORPHANED_TURN_ERROR.to_string()),
-            // A panicked turn produced no trustworthy telemetry; omit it rather
-            // than report zeros as if the turn measured them.
-            wall_ms: None,
-            output_tokens: None,
-            input_tokens: None,
-            cache_read_tokens: None,
-            tokens_per_second: None,
-            context_usage: None,
-        },
-    );
 }
 
 /// RAII guard that orphan-proofs a spawned turn task (TASK-56), mirroring the
@@ -6708,13 +6748,56 @@ async fn agent_turn(
                 source: "provider_reported_final_round".into(),
                 measured_at_ms: Utc::now().timestamp_millis(),
             });
-        // OCEAN-305: mark legacy completion announcements as agent mirrors — the
-        // same content already streamed delta-by-delta on /v1/agent/events.
+        // NOTE: assistant text already streamed delta-by-delta through the bridge,
+        // so this terminal TurnFinished carries no stdout. It IS how fire-and-ack
+        // clients learn the turn ended (the POST already ACKed): status + error +
+        // telemetry to every SSE subscriber. Status/error are derived from `res`
+        // exactly as before; on a cancel-race the res-derived frame still ships.
+        //
+        // TASK-61: this frame is handed to `record_prompt_result` and emitted
+        // INSIDE the registry write lock, atomically with the terminal transition,
+        // so `GET /v1/agent/sessions` can never observe the turn cleared before
+        // this frame is in the agent-bus ring. The prior code emitted it AFTER
+        // `record_prompt_result` had already flipped the registry terminal —
+        // exactly the stale-projection window this task closes.
+        let turn_finished = if res.ok {
+            AgentTurnEvent::TurnFinished {
+                session_id,
+                turn_id,
+                status: AgentTurnStatus::Completed,
+                error: None,
+                wall_ms: Some(res.wall_ms),
+                output_tokens: Some(output_tokens),
+                input_tokens,
+                cache_read_tokens,
+                tokens_per_second,
+                context_usage: context_usage.clone(),
+            }
+        } else {
+            AgentTurnEvent::TurnFinished {
+                session_id,
+                turn_id,
+                status: AgentTurnStatus::Failed,
+                error: Some(res.stderr.clone()),
+                wall_ms: Some(res.wall_ms),
+                output_tokens: Some(output_tokens),
+                input_tokens,
+                cache_read_tokens,
+                tokens_per_second,
+                context_usage: context_usage.clone(),
+            }
+        };
+
+        // OCEAN-305: legacy completion announcements are marked agent mirrors — the
+        // same content already streamed delta-by-delta on /v1/agent/events. TASK-61:
+        // the agent-bus `turn_finished` frame rides along and is emitted atomically
+        // with the terminal transition inside this call.
         record_prompt_result(
             &bg_state,
             request_id,
             &res,
             Some(ocean_core::EVENT_ORIGIN_AGENT),
+            Some((session_id, turn_finished)),
         )
         .await;
 
@@ -6732,50 +6815,10 @@ async fn agent_turn(
             "agent turn finished"
         );
 
-        // NOTE: assistant text already streamed delta-by-delta through the bridge,
-        // so we do NOT re-emit res.stdout here. This terminal TurnFinished is how
-        // fire-and-ack clients learn the turn ended (the POST already ACKed): it
-        // carries status + error + telemetry to every SSE subscriber.
-        if res.ok {
-            emit_agent(
-                &bg_state.events,
-                &bg_state.agent_events,
-                session_id,
-                AgentTurnEvent::TurnFinished {
-                    session_id,
-                    turn_id,
-                    status: AgentTurnStatus::Completed,
-                    error: None,
-                    wall_ms: Some(res.wall_ms),
-                    output_tokens: Some(output_tokens),
-                    input_tokens,
-                    cache_read_tokens,
-                    tokens_per_second,
-                    context_usage: context_usage.clone(),
-                },
-            );
-        } else {
-            emit_agent(
-                &bg_state.events,
-                &bg_state.agent_events,
-                session_id,
-                AgentTurnEvent::TurnFinished {
-                    session_id,
-                    turn_id,
-                    status: AgentTurnStatus::Failed,
-                    error: Some(res.stderr.clone()),
-                    wall_ms: Some(res.wall_ms),
-                    output_tokens: Some(output_tokens),
-                    input_tokens,
-                    cache_read_tokens,
-                    tokens_per_second,
-                    context_usage: context_usage.clone(),
-                },
-            );
-        }
-        // TASK-56: the registry is terminal (`record_prompt_result`) and the
-        // turn's own `TurnFinished` has shipped, so disarm — a later drop (e.g.
-        // the advisor path below panicking) must NOT re-terminate or double-emit.
+        // TASK-56: the registry is terminal and the turn's own `TurnFinished` has
+        // shipped (both, atomically, inside `record_prompt_result`), so disarm — a
+        // later drop (e.g. the advisor path below panicking) must NOT re-terminate
+        // or double-emit.
         turn_guard.disarm();
         // Post-turn advisor observer (fire-and-forget). Runs at most once per
         // operator prompt on a FRESH advisor-model context and, if it finds a real
@@ -10240,13 +10283,16 @@ mod tests {
                 turn_id,
             );
             // Mirror the real normal path: registry → terminal, one TurnFinished,
-            // then disarm.
+            // then disarm. This test exercises the guard, not the finalizer's
+            // atomic emit, so it transitions with a no-op hook and emits the frame
+            // separately below.
             update_request_finished(
                 &requests,
                 request_id,
                 None,
                 RequestState::Completed,
                 "prompt completed".to_string(),
+                |_| {},
             )
             .await;
             emit_agent(
@@ -10334,6 +10380,236 @@ mod tests {
             requests.read().await.get(&request_id).unwrap().status.state,
             RequestState::Cancelled,
             "the cancel branch of update_request_finished must own the transition"
+        );
+    }
+
+    /// A completed-turn agent-bus terminal frame, used by the TASK-61 finalizer
+    /// tests below.
+    fn completed_turn_finished(session_id: AgentSessionId, turn_id: AgentTurnId) -> AgentTurnEvent {
+        AgentTurnEvent::TurnFinished {
+            session_id,
+            turn_id,
+            status: AgentTurnStatus::Completed,
+            error: None,
+            wall_ms: Some(5),
+            output_tokens: Some(1),
+            input_tokens: None,
+            cache_read_tokens: None,
+            tokens_per_second: None,
+            context_usage: None,
+        }
+    }
+
+    /// Count the `TurnFinished` frames for `turn_id` currently in the agent-bus
+    /// replay ring.
+    fn turn_finished_count(agent_events: &AgentEventBus, turn_id: AgentTurnId) -> usize {
+        agent_events
+            .history
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|env| {
+                matches!(&env.event, AgentTurnEvent::TurnFinished { turn_id: t, .. } if *t == turn_id)
+            })
+            .count()
+    }
+
+    /// TASK-61 core property (the fix): the terminal transition and the agent-bus
+    /// `TurnFinished` are ATOMIC from any concurrent reader's view. The finalizer
+    /// emits the frame while still holding the registry write lock, before the
+    /// terminal state is visible, so a reader that acquires the read lock and sees
+    /// the entry terminal is GUARANTEED the frame is already in the agent-bus ring.
+    /// This closes the stale-projection window where `GET /v1/agent/sessions`
+    /// (deriving active_turn from this registry) could report a turn cleared
+    /// before the events stream delivered its `TurnFinished`.
+    ///
+    /// The pre-TASK-61 order — transition first, emit in a later lock scope —
+    /// would let a reader observe terminal with an empty ring, failing this test.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn finalizer_frame_is_atomic_with_registry_terminal_for_any_reader() {
+        let request_id = RequestId::new_v4();
+        let session_id = AgentSessionId::new_v4();
+        let turn_id = AgentTurnId::new_v4();
+        let requests: RequestRegistry = Arc::new(RwLock::new(HashMap::from([(
+            request_id,
+            status(request_id, RequestState::Running),
+        )])));
+        let events = EventBus::new(64);
+        let agent_events = AgentEventBus::new(64);
+
+        // Readers spin until they observe the entry terminal, then assert the ring
+        // already holds this turn's frame. None may ever see terminal-without-frame.
+        let readers: Vec<_> = (0..8)
+            .map(|_| {
+                let requests = requests.clone();
+                let agent_events = agent_events.clone();
+                tokio::spawn(async move {
+                    loop {
+                        let terminal = {
+                            let guard = requests.read().await;
+                            guard
+                                .get(&request_id)
+                                .is_some_and(|c| c.status.state.is_terminal())
+                        };
+                        if terminal {
+                            return turn_finished_count(&agent_events, turn_id) == 1;
+                        }
+                        tokio::task::yield_now().await;
+                    }
+                })
+            })
+            .collect();
+
+        // Let readers reach their spin loop while the entry is still Running.
+        for _ in 0..4 {
+            tokio::task::yield_now().await;
+        }
+
+        // Finalize exactly as the normal path does: emit the frame INSIDE the lock.
+        let final_state = update_request_finished(
+            &requests,
+            request_id,
+            None,
+            RequestState::Completed,
+            "prompt completed".to_string(),
+            |final_state| {
+                assert_eq!(final_state, RequestState::Completed);
+                emit_agent(
+                    &events,
+                    &agent_events,
+                    session_id,
+                    completed_turn_finished(session_id, turn_id),
+                );
+            },
+        )
+        .await;
+        assert_eq!(final_state, Some(RequestState::Completed));
+
+        for reader in readers {
+            assert!(
+                reader.await.unwrap(),
+                "a reader observed registry-terminal without the frame in the agent-bus ring"
+            );
+        }
+    }
+
+    /// TASK-61 exactly-once, normal-then-orphan: once the normal path finalizes a
+    /// turn, a late orphan-guard drop finds the entry already terminal and emits
+    /// NOTHING. Exactly one `TurnFinished` survives — the normal `Completed` one.
+    #[tokio::test]
+    async fn finalizer_normal_completion_then_late_orphan_guard_is_exactly_once() {
+        let request_id = RequestId::new_v4();
+        let session_id = AgentSessionId::new_v4();
+        let turn_id = AgentTurnId::new_v4();
+        let requests: RequestRegistry = Arc::new(RwLock::new(HashMap::from([(
+            request_id,
+            status(request_id, RequestState::Running),
+        )])));
+        let events = EventBus::new(64);
+        let agent_events = AgentEventBus::new(64);
+
+        // Normal completion finalizes + emits the Completed frame under the lock.
+        update_request_finished(
+            &requests,
+            request_id,
+            None,
+            RequestState::Completed,
+            "prompt completed".to_string(),
+            |_| {
+                emit_agent(
+                    &events,
+                    &agent_events,
+                    session_id,
+                    completed_turn_finished(session_id, turn_id),
+                );
+            },
+        )
+        .await;
+
+        // A late orphan-guard drop must be inert: the entry is already terminal.
+        terminate_orphaned_turn(
+            &requests,
+            &events,
+            &agent_events,
+            request_id,
+            session_id,
+            turn_id,
+        )
+        .await;
+
+        assert_eq!(
+            turn_finished_count(&agent_events, turn_id),
+            1,
+            "a late orphan guard must not add a second TurnFinished"
+        );
+        let registry = requests.read().await;
+        assert_eq!(
+            registry.get(&request_id).unwrap().status.state,
+            RequestState::Completed,
+            "the normal completion owns the terminal state"
+        );
+    }
+
+    /// TASK-61 exactly-once, orphan-then-normal: the orphan guard fires first
+    /// (Running→Errored + one Failed frame); a later normal completion finds the
+    /// entry already terminal and emits nothing. Exactly one `TurnFinished`.
+    #[tokio::test]
+    async fn finalizer_orphan_guard_then_late_normal_completion_is_exactly_once() {
+        let request_id = RequestId::new_v4();
+        let session_id = AgentSessionId::new_v4();
+        let turn_id = AgentTurnId::new_v4();
+        let requests: RequestRegistry = Arc::new(RwLock::new(HashMap::from([(
+            request_id,
+            status(request_id, RequestState::Running),
+        )])));
+        let events = EventBus::new(64);
+        let agent_events = AgentEventBus::new(64);
+
+        // Orphan guard wins: Running→Errored + exactly one Failed frame.
+        terminate_orphaned_turn(
+            &requests,
+            &events,
+            &agent_events,
+            request_id,
+            session_id,
+            turn_id,
+        )
+        .await;
+
+        // A late normal completion must be inert — entry already terminal.
+        let mut emitted_late = false;
+        update_request_finished(
+            &requests,
+            request_id,
+            None,
+            RequestState::Completed,
+            "prompt completed".to_string(),
+            |_| {
+                emitted_late = true;
+                emit_agent(
+                    &events,
+                    &agent_events,
+                    session_id,
+                    completed_turn_finished(session_id, turn_id),
+                );
+            },
+        )
+        .await;
+
+        assert!(
+            !emitted_late,
+            "a late normal completion must not re-fire the finalizer hook"
+        );
+        assert_eq!(
+            turn_finished_count(&agent_events, turn_id),
+            1,
+            "exactly one terminal frame — the orphan Failed one"
+        );
+        let registry = requests.read().await;
+        assert_eq!(
+            registry.get(&request_id).unwrap().status.state,
+            RequestState::Errored,
+            "the orphan guard owns the terminal state"
         );
     }
 
@@ -10482,16 +10758,25 @@ mod tests {
         control.handle = Some(tokio::spawn(async {}));
         let requests = Arc::new(RwLock::new(HashMap::from([(request_id, control)])));
 
+        // An already-terminal entry must NOT re-fire the finalizer hook — that is
+        // what keeps a late twin (normal completion racing the orphan guard) from
+        // emitting a second terminal frame (TASK-61 exactly-once).
+        let hook_fired = std::cell::Cell::new(false);
         let state = update_request_finished(
             &requests,
             request_id,
             Some(replacement_session),
             RequestState::Errored,
             "late error".into(),
+            |_| hook_fired.set(true),
         )
         .await;
 
         assert_eq!(state, Some(RequestState::Completed));
+        assert!(
+            !hook_fired.get(),
+            "the finalizer hook must not fire for an already-terminal entry"
+        );
         let requests = requests.read().await;
         let control = requests.get(&request_id).unwrap();
         assert_eq!(control.status.state, RequestState::Completed);
@@ -10518,16 +10803,26 @@ mod tests {
         control.handle = Some(tokio::spawn(async {}));
         let requests = Arc::new(RwLock::new(HashMap::from([(request_id, control)])));
 
+        // The cancel-settle branch IS a fresh terminal transition, so the hook
+        // fires — with `Cancelled`, so a caller (the normal path) can emit its
+        // cancel mirror while the orphan path emits nothing on that outcome.
+        let hook_state = std::cell::Cell::new(None);
         let state = update_request_finished(
             &requests,
             request_id,
             Some(replacement_session),
             RequestState::Completed,
             "late completion".into(),
+            |final_state| hook_state.set(Some(final_state)),
         )
         .await;
 
         assert_eq!(state, Some(RequestState::Cancelled));
+        assert_eq!(
+            hook_state.get(),
+            Some(RequestState::Cancelled),
+            "cancel-settle must fire the hook with Cancelled"
+        );
         let requests = requests.read().await;
         let control = requests.get(&request_id).unwrap();
         assert_eq!(control.status.state, RequestState::Cancelled);
@@ -10562,6 +10857,8 @@ mod tests {
             (errored_id, errored),
         ])));
 
+        // Missing entry: no transition, so the hook must never fire.
+        let missing_hook = std::cell::Cell::new(false);
         assert_eq!(
             update_request_finished(
                 &requests,
@@ -10569,10 +10866,17 @@ mod tests {
                 None,
                 RequestState::Errored,
                 "missing".into(),
+                |_| missing_hook.set(true),
             )
             .await,
             None
         );
+        assert!(
+            !missing_hook.get(),
+            "a missing entry must not fire the hook"
+        );
+        // Fresh Running→Completed: hook fires with the desired terminal state.
+        let completed_hook = std::cell::Cell::new(None);
         assert_eq!(
             update_request_finished(
                 &requests,
@@ -10580,10 +10884,14 @@ mod tests {
                 Some(completed_session),
                 RequestState::Completed,
                 "completed exactly".into(),
+                |final_state| completed_hook.set(Some(final_state)),
             )
             .await,
             Some(RequestState::Completed)
         );
+        assert_eq!(completed_hook.get(), Some(RequestState::Completed));
+        // Fresh WaitingForPermission→Errored: hook fires with Errored.
+        let errored_hook = std::cell::Cell::new(None);
         assert_eq!(
             update_request_finished(
                 &requests,
@@ -10591,10 +10899,12 @@ mod tests {
                 Some(replacement_error_session),
                 RequestState::Errored,
                 "errored exactly".into(),
+                |final_state| errored_hook.set(Some(final_state)),
             )
             .await,
             Some(RequestState::Errored)
         );
+        assert_eq!(errored_hook.get(), Some(RequestState::Errored));
 
         let registry = requests.read().await;
         let completed = &registry[&completed_id];
