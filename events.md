@@ -4528,6 +4528,15 @@ type:      bug-report
 area:      backend
 
 Double landing. TASK-56 48bd92f9 (daemon-core raw #1): TurnTerminalGuard RAII mirrors InFlightGuard — a panic in the prompt await now drives the SAME update_request_finished terminal transition (no second state machine) and emits TurnFinished{Failed}; its return value gates emission so cancels keep their frame and normal turns emit exactly once; Drop hands async work to Handle::try_current detached spawn. 3 new tests through real registry+bus; 522 daemon tests green. TASK-54 9498905f: every injected prompt layer now anchored at generation — folder-agent gets [folder-agent instructions]…[end folder-agent instructions] sentinels via one shared compose helper (both daemon sites + rooms), browser context loses its internal blank line and strips on an exact two-line prefix; strip_injected_turn_prep peels all 5 layers order-tolerantly; 6 strip tests + 2 cross-crate anchor guards; agent 199 / daemon 524 green. Completes TASK-50's display-strip. KNOWN FLAKE (ticket-worthy): github::tests intermittently red under full-parallel cargo test (subprocess/tempdir races, different test each run, 19/19 in isolation on clean main) — bit one TASK-54 gate run, clean on rerun. Daemon rebuild + announced bounce for 54/56/57 follows.
+time:      [18:17] [19-07-26]
+agent:     [pi] [gpt-5.6] [thoth]
+worktree:  [feat/tui-compact-activation]
+type:      [feature-request]
+area:      [frontend]
+
+Activated TUI `/compact` against the merged synchronized session contract. The TUI now installs only a bounded validated public `SessionSyncSnapshot`, restarts scoped SSE strictly after its opaque fence, rejects stale A→B→A and queued stream completions with binding/stream/operation generations, and preserves per-session unresolved markers across rebinding so prompts cannot outrun authority. Typed replay gaps and scoped `ocean.session_changed` invalidations clear derived projections and use refresh-only `/sync`; compact's own pre-response invalidation is deferred until its lease releases, then reconciled without racing or replacing the compact generation. Raw session messages, tools, thinking, image metadata, invalid roles, oversized snapshots, contradictory HTTP outcomes, and missing fences fail closed.
+
+Verification: 384 TUI tests passed with 4 explicit ignores; denied-warning all-target TUI Clippy, release build, workspace test check, docs-check, formatting, and diff-check passed. A real mock SSE seam proves fence `Last-Event-ID` and reset routing. Three adversarial review rounds closed self-invalidation, cross-binding marker, snapshot validation, replay-reset, and stale-stream findings; final concurrency and security/API reviews approved with no blocker/high findings.
 _________________________________________________________________________________
 time:      [19:48] [19-07-26]
 agent:     [claude] [fable 5]

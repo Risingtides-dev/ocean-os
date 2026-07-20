@@ -8,9 +8,8 @@
 //!   POST /v1/agent/turns               submit a turn (streams over SSE)
 //!   GET  /v1/agent/events?session_id=  SSE of AgentTurnEvent
 //!
-//! ponytail: no Last-Event-ID reconnect/replay yet — a dropped stream is
-//! re-subscribed fresh on the next turn. Add replay when mid-turn resilience
-//! matters (the blocking path's OCEAN-305 logic is the reference).
+//! Scoped event streams reconnect from Last-Event-ID. Synchronized session
+//! replacement restarts the stream strictly after the daemon-issued fence.
 
 use std::{path::PathBuf, time::Duration};
 
@@ -20,8 +19,9 @@ use ocean_agent_sdk::{
     AgentTurnRequest, AgentTurnResponse,
 };
 use ocean_core::{
-    EventEnvelope, HealthResponse, PermissionDecision, PermissionDecisionRequest, PermissionId,
-    PermissionMode, PermissionSettingsRequest, PermissionSettingsResponse,
+    CompactResponse, EventEnvelope, HealthResponse, PermissionDecision, PermissionDecisionRequest,
+    PermissionId, PermissionMode, PermissionSettingsRequest, PermissionSettingsResponse,
+    SessionSyncResponse,
 };
 use ocean_observatory::{
     observer_token_for_child, observer_token_from_file, EventEnvelope as ObservatoryEventEnvelope,
@@ -29,7 +29,7 @@ use ocean_observatory::{
 };
 use tokio::sync::mpsc;
 
-use super::action::{Action, HealthSource};
+use super::action::{Action, CompactFailure, HealthSource};
 
 /// Submission certainty matters because a turn may contain side-effecting
 /// tools. Only `DefinitelyUnsent` is safe to retry/restore automatically;
@@ -218,6 +218,9 @@ impl DaemonClient {
         session_id: AgentSessionId,
         actions: mpsc::UnboundedSender<Action>,
         replay_first: bool,
+        initial_last_event_id: Option<String>,
+        binding_generation: u64,
+        stream_generation: u64,
     ) -> tokio::task::JoinHandle<()> {
         let http = self.http.clone();
         // `replay=1` (OCEAN-305): a scoped subscriber with no Last-Event-ID gets
@@ -233,7 +236,7 @@ impl DaemonClient {
             if replay_first { "&replay=1" } else { "" }
         );
         tokio::spawn(async move {
-            let mut last_event_id: Option<String> = None;
+            let mut last_event_id = initial_last_event_id;
             loop {
                 // The client's default 120s TOTAL timeout would kill a live
                 // SSE body after 2 minutes (the original silent-stream-death
@@ -260,9 +263,19 @@ impl DaemonClient {
                                 last_event_id = Some(id);
                             }
                             if parse_sse_event(&frame) == Some("error") {
-                                let _ = actions.send(Action::AgentStreamGap(session_id));
+                                let _ = actions.send(Action::BoundAgentReplayResetRequired {
+                                    session_id,
+                                    binding_generation,
+                                    stream_generation,
+                                });
+                                return;
                             } else if let Some(evt) = parse_sse_frame(&frame) {
-                                let _ = actions.send(Action::AgentEvent(Box::new(evt)));
+                                let _ = actions.send(Action::BoundAgentEvent {
+                                    session_id,
+                                    binding_generation,
+                                    stream_generation,
+                                    event: Box::new(evt),
+                                });
                             }
                         }
                     }
@@ -271,7 +284,11 @@ impl DaemonClient {
                 // brief backoff, then resubscribe with the last seen id so the
                 // daemon replays what we missed. The typed transition persists
                 // until THIS source reconnects — unrelated notices can't clear it.
-                let _ = actions.send(Action::AgentStreamGap(session_id));
+                let _ = actions.send(Action::BoundAgentStreamGap {
+                    session_id,
+                    binding_generation,
+                    stream_generation,
+                });
                 let _ = actions.send(Action::HealthDegraded {
                     source: HealthSource::Sse,
                     condition: "stream reconnecting".into(),
@@ -479,6 +496,169 @@ impl DaemonClient {
                 tokio::time::sleep(std::time::Duration::from_secs(2)).await;
             }
         });
+    }
+
+    /// Reload a synchronized, identity-checked session baseline. This is the
+    /// only recovery path after a compact outcome or replay anchor is uncertain.
+    pub async fn refresh_compacted_session(
+        &self,
+        session_id: AgentSessionId,
+    ) -> Result<SessionSyncResponse, CompactFailure> {
+        let response = self
+            .http
+            .get(format!("{}/v1/sessions/{}/sync", self.base, session_id.0))
+            .timeout(Duration::from_secs(10))
+            .send()
+            .await
+            .map_err(|error| CompactFailure {
+                message: format!("session sync failed: {error}"),
+                transcript_may_have_changed: true,
+            })?;
+        let status = response.status();
+        let sync = response
+            .json::<SessionSyncResponse>()
+            .await
+            .map_err(|error| CompactFailure {
+                message: format!("session sync failed: {error}"),
+                transcript_may_have_changed: true,
+            })?;
+        if sync.session_id != session_id.0 {
+            return Err(CompactFailure {
+                message: "session sync response named a different session".into(),
+                transcript_may_have_changed: true,
+            });
+        }
+        if !status.is_success() || !sync.ok {
+            return Err(CompactFailure {
+                message: sync
+                    .error
+                    .clone()
+                    .unwrap_or_else(|| format!("session sync failed ({status})")),
+                transcript_may_have_changed: true,
+            });
+        }
+        let snapshot = sync.snapshot.as_ref().ok_or_else(|| CompactFailure {
+            message: "session sync response omitted its authoritative snapshot".into(),
+            transcript_may_have_changed: true,
+        })?;
+        if snapshot.session_id != session_id.0 {
+            return Err(CompactFailure {
+                message: "session sync snapshot named a different session".into(),
+                transcript_may_have_changed: true,
+            });
+        }
+        crate::shell::sessions::history_from_sync_snapshot(snapshot).map_err(|message| {
+            CompactFailure {
+                message,
+                transcript_may_have_changed: true,
+            }
+        })?;
+        if sync
+            .fence
+            .as_ref()
+            .and_then(|fence| fence.event_id)
+            .is_none()
+        {
+            return Err(CompactFailure {
+                message: "session sync response omitted its replay fence".into(),
+                transcript_may_have_changed: true,
+            });
+        }
+        Ok(sync)
+    }
+
+    /// Compact a bound session. The daemon returns the replacement transcript
+    /// and replay fence from inside the same per-session operation lease; no
+    /// independent GET is allowed across that synchronization seam.
+    pub async fn compact_session(
+        &self,
+        session_id: AgentSessionId,
+    ) -> Result<CompactResponse, CompactFailure> {
+        let response = self
+            .http
+            .post(format!(
+                "{}/v1/sessions/{}/compact",
+                self.base, session_id.0
+            ))
+            .send()
+            .await
+            .map_err(|error| CompactFailure {
+                message: error.to_string(),
+                // A pure connection failure proves the POST was not accepted;
+                // every later transport failure has an unknown commit outcome.
+                transcript_may_have_changed: !error.is_connect(),
+            })?;
+        let status = response.status();
+        let compact = response
+            .json::<CompactResponse>()
+            .await
+            .map_err(|error| CompactFailure {
+                message: error.to_string(),
+                // Without the typed body there is no proof the daemon rejected
+                // before commit, regardless of the proxy/status code observed.
+                transcript_may_have_changed: true,
+            })?;
+        if compact.session_id != session_id.0 {
+            return Err(CompactFailure {
+                message: "compact response named a different session".into(),
+                transcript_may_have_changed: true,
+            });
+        }
+        if !status.is_success() {
+            let documented_precommit_rejection = !compact.ok
+                && matches!(
+                    status,
+                    reqwest::StatusCode::NOT_FOUND
+                        | reqwest::StatusCode::CONFLICT
+                        | reqwest::StatusCode::TOO_MANY_REQUESTS
+                );
+            return Err(CompactFailure {
+                message: if compact.stderr.trim().is_empty() {
+                    format!("compact failed ({status})")
+                } else {
+                    compact.stderr.clone()
+                },
+                transcript_may_have_changed: !documented_precommit_rejection,
+            });
+        }
+        if !compact.ok {
+            return Err(CompactFailure {
+                message: if compact.stderr.trim().is_empty() {
+                    "compact failed".into()
+                } else {
+                    compact.stderr.clone()
+                },
+                transcript_may_have_changed: false,
+            });
+        }
+        let snapshot = compact.sync.as_ref().ok_or_else(|| CompactFailure {
+            message: "compact response omitted its authoritative snapshot".into(),
+            transcript_may_have_changed: true,
+        })?;
+        if snapshot.session_id != session_id.0 {
+            return Err(CompactFailure {
+                message: "compact snapshot named a different session".into(),
+                transcript_may_have_changed: true,
+            });
+        }
+        crate::shell::sessions::history_from_sync_snapshot(snapshot).map_err(|message| {
+            CompactFailure {
+                message,
+                transcript_may_have_changed: true,
+            }
+        })?;
+        if compact
+            .fence
+            .as_ref()
+            .and_then(|fence| fence.event_id)
+            .is_none()
+        {
+            return Err(CompactFailure {
+                message: "compact response omitted its replay fence".into(),
+                transcript_may_have_changed: true,
+            });
+        }
+        Ok(compact)
     }
 
     /// `POST /v1/permissions/{id}/decision`, replaying the turn's decision
@@ -833,6 +1013,72 @@ mod tests {
         ));
     }
 
+    #[tokio::test]
+    async fn fenced_stream_sends_last_event_id_and_routes_error_to_reset() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind mock SSE server");
+        let address = listener.local_addr().expect("mock address");
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.expect("accept SSE request");
+            let mut request = vec![0u8; 8192];
+            let mut used = 0usize;
+            loop {
+                let read = socket
+                    .read(&mut request[used..])
+                    .await
+                    .expect("read request");
+                if read == 0 {
+                    break;
+                }
+                used += read;
+                if request[..used]
+                    .windows(4)
+                    .any(|window| window == b"\r\n\r\n")
+                {
+                    break;
+                }
+            }
+            socket
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\nevent: error\ndata: {\"code\":\"anchor_unavailable\",\"reset_required\":true}\n\n",
+                )
+                .await
+                .expect("write SSE response");
+            String::from_utf8_lossy(&request[..used]).to_ascii_lowercase()
+        });
+
+        let client = DaemonClient::new(&format!("http://{address}")).expect("client");
+        let session_id = AgentSessionId(uuid::Uuid::from_u128(9001));
+        let fence = uuid::Uuid::from_u128(9002).to_string();
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let stream = client.spawn_event_stream(session_id, tx, false, Some(fence.clone()), 7, 11);
+
+        let reset = tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if let Some(Action::BoundAgentReplayResetRequired {
+                    session_id: got,
+                    binding_generation,
+                    stream_generation,
+                }) = rx.recv().await
+                {
+                    break (got, binding_generation, stream_generation);
+                }
+            }
+        })
+        .await
+        .expect("reset action arrived");
+        assert_eq!(reset, (session_id, 7, 11));
+        let request = server.await.expect("mock server completed");
+        assert!(
+            request.contains(&format!("last-event-id: {fence}")),
+            "request carried fence header: {request}"
+        );
+        stream.abort();
+    }
+
     /// Live end-to-end against the local daemon: mint a session, subscribe its
     /// stream, submit a tiny turn, and require streamed events to arrive and
     /// decode. Ignored by default (needs the daemon on :4780).
@@ -852,7 +1098,7 @@ mod tests {
         println!("session: {}", sess.session_id);
 
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
-        let _stream = client.spawn_event_stream(sess.session_id, tx, true);
+        let _stream = client.spawn_event_stream(sess.session_id, tx, true, None, 1, 1);
 
         let req = AgentTurnRequest {
             session_id: Some(sess.session_id),
@@ -880,7 +1126,7 @@ mod tests {
             let ev = tokio::time::timeout_at(deadline, rx.recv()).await;
             let Ok(Some(action)) = ev else { break };
             match action {
-                Action::AgentEvent(evt) => match *evt {
+                Action::BoundAgentEvent { event: evt, .. } => match *evt {
                     AgentTurnEvent::TurnStarted { .. } => got_started = true,
                     AgentTurnEvent::AssistantTextDelta { ref delta, .. } => {
                         text.push_str(delta);

@@ -158,9 +158,9 @@ pub const COMMANDS: &[SlashCommand] = &[
     // ── context (W3 roadmap) ───────────────────────────────────────────────
     SlashCommand {
         name: "/compact",
-        desc: "prune + shake the context (W3)",
+        desc: "summarize older context and keep the recent window",
         group: "context",
-        soon: true,
+        soon: false,
     },
     SlashCommand {
         name: "/context",
@@ -405,7 +405,7 @@ mod tests {
 
     #[test]
     fn ranked_results_rank_live_ahead_of_soon_on_ties() {
-        // "co" matches /copy (live) and /compact + /context (soon). The working
+        // "co" matches live /copy + /compact and soon /context. A working
         // command must lead the ranked list.
         let ranked = filter("co");
         let first_live = ranked.iter().position(|(c, _)| !c.soon);

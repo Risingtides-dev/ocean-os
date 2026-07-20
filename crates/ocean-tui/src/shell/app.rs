@@ -392,6 +392,12 @@ pub struct App {
     center: Center,
     focus: Focus,
     session_id: Option<AgentSessionId>,
+    /// Monotonic identity for the current session binding. A→B→A rebinding
+    /// cannot make an old completion current merely because the UUID matches.
+    session_binding_generation: u64,
+    /// Monotonic identity for the current scoped SSE task. Replacing history
+    /// from a sync fence invalidates envelopes already queued by the old task.
+    stream_generation: u64,
     /// Best-effort projection of the authoritative TUI lifecycle into a
     /// surrounding Herdr pane. Disabled automatically outside Herdr.
     herdr: HerdrReporter,
@@ -417,6 +423,26 @@ pub struct App {
     /// `/login` while set is rejected with a busy status instead of racing a
     /// second callback server / browser launch.
     login_in_flight: bool,
+    /// Session whose compact request is in flight, or whose committed outcome
+    /// could not be refreshed. New turns for this session are rejected so the
+    /// local transcript cannot race or lie about the daemon's replacement.
+    compacting_session: Option<AgentSessionId>,
+    /// The request is no longer in flight, but the matching authoritative
+    /// transcript still must be reloaded before that session may submit.
+    compact_refresh_required: bool,
+    /// True only while the POST compact future owns the current operation.
+    /// Its own lease-scoped invalidations defer until the response arrives.
+    compact_request_in_flight: bool,
+    /// A replay reset or session-changed event arrived while compact held the
+    /// daemon lease; follow the compact response with refresh-only sync.
+    compact_invalidation_pending: bool,
+    /// Binding generation captured by the active compact/sync operation.
+    compact_binding_generation: u64,
+    /// Monotonic identity for compact/sync completions within one binding.
+    compact_operation_generation: u64,
+    /// Sessions whose compact/sync outcome is not yet installed locally. This
+    /// survives A→B→A rebinding; returning to one forces refresh-only sync.
+    sessions_requiring_sync: HashSet<AgentSessionId>,
     should_quit: bool,
     actions_tx: mpsc::UnboundedSender<Action>,
     actions_rx: mpsc::UnboundedReceiver<Action>,
@@ -604,6 +630,8 @@ impl App {
             center: Center::Chat,
             focus: Focus::Center,
             session_id: None,
+            session_binding_generation: 0,
+            stream_generation: 0,
             herdr: HerdrReporter::from_env(),
             model_override: None,
             stream_task: None,
@@ -612,6 +640,13 @@ impl App {
             status_at: Instant::now(),
             health: status::Health::default(),
             login_in_flight: false,
+            compacting_session: None,
+            compact_refresh_required: false,
+            compact_request_in_flight: false,
+            compact_invalidation_pending: false,
+            compact_binding_generation: 0,
+            compact_operation_generation: 0,
+            sessions_requiring_sync: HashSet::new(),
             should_quit: false,
             actions_tx,
             actions_rx,
@@ -1696,6 +1731,255 @@ impl App {
                 self.in_flight_images.clear();
                 self.set_notice(errfmt::humanize(err));
             }
+            Action::BoundAgentEvent {
+                session_id,
+                binding_generation,
+                stream_generation,
+                event,
+            } => {
+                if self.session_id == Some(*session_id)
+                    && self.session_binding_generation == *binding_generation
+                    && self.stream_generation == *stream_generation
+                {
+                    let session_changed = matches!(
+                        &**event,
+                        AgentTurnEvent::Extension {
+                            extension,
+                            scope: Some(scope),
+                            ..
+                        } if extension == "ocean.session_changed" && scope == session_id
+                    );
+                    if session_changed {
+                        follow_up = Some(Action::AgentStreamGap(*session_id));
+                        self.handle_session_invalidation(
+                            *session_id,
+                            *binding_generation,
+                            "session changed on another surface · synchronizing context…",
+                        );
+                    } else {
+                        follow_up = Some(Action::AgentEvent(event.clone()));
+                    }
+                }
+            }
+            Action::BoundAgentStreamGap {
+                session_id,
+                binding_generation,
+                stream_generation,
+            } => {
+                if self.session_id == Some(*session_id)
+                    && self.session_binding_generation == *binding_generation
+                    && self.stream_generation == *stream_generation
+                {
+                    follow_up = Some(Action::AgentStreamGap(*session_id));
+                }
+            }
+            Action::BoundAgentReplayResetRequired {
+                session_id,
+                binding_generation,
+                stream_generation,
+            } => {
+                if self.session_id == Some(*session_id)
+                    && self.session_binding_generation == *binding_generation
+                    && self.stream_generation == *stream_generation
+                {
+                    follow_up = Some(Action::AgentStreamGap(*session_id));
+                    self.handle_session_invalidation(
+                        *session_id,
+                        *binding_generation,
+                        "session event history changed · synchronizing authoritative context…",
+                    );
+                }
+            }
+            Action::CompactSession => {
+                let recovery = self.compacting_session.filter(|session_id| {
+                    self.compact_refresh_required
+                        && self.session_id == Some(*session_id)
+                        && self.compact_binding_generation == self.session_binding_generation
+                });
+                if let Some(session_id) = recovery {
+                    // Local busy may itself be stale because the reset stream
+                    // lost TurnFinished. The daemon sync lease is authoritative.
+                    self.begin_compact_reload(
+                        session_id,
+                        self.session_binding_generation,
+                        "reloading synchronized session context…",
+                    );
+                } else if self.chat.is_busy() {
+                    self.set_notice("wait for the active turn to finish before compacting".into());
+                } else if self.compacting_session.is_some() {
+                    self.set_notice("session compaction already in progress".into());
+                } else if let Some(session_id) = self.session_id {
+                    self.sessions_requiring_sync.insert(session_id);
+                    self.compacting_session = Some(session_id);
+                    self.compact_refresh_required = false;
+                    self.compact_request_in_flight = true;
+                    self.compact_invalidation_pending = false;
+                    self.compact_binding_generation = self.session_binding_generation;
+                    self.compact_operation_generation =
+                        self.compact_operation_generation.wrapping_add(1);
+                    let binding_generation = self.compact_binding_generation;
+                    let operation_generation = self.compact_operation_generation;
+                    self.set_notice("compacting session context…".into());
+                    let client = self.client.clone();
+                    let tx = self.actions_tx.clone();
+                    tokio::spawn(async move {
+                        let _ = tx.send(Action::CompactFinished {
+                            session_id,
+                            binding_generation,
+                            operation_generation,
+                            result: client.compact_session(session_id).await,
+                        });
+                    });
+                } else {
+                    self.set_notice("nothing to compact — start or resume a session first".into());
+                }
+            }
+            Action::CompactFinished {
+                session_id,
+                binding_generation,
+                operation_generation,
+                result,
+            } => {
+                if !self.compact_completion_matches(
+                    *session_id,
+                    *binding_generation,
+                    *operation_generation,
+                ) {
+                    // A completion that no longer owns the active generation
+                    // cannot clear a newer invalidation marker, even if its own
+                    // precommit outcome was definitely unchanged.
+                    self.sessions_requiring_sync.insert(*session_id);
+                    return;
+                }
+                if self.session_id != Some(*session_id)
+                    || self.session_binding_generation != *binding_generation
+                {
+                    self.clear_compact_hold();
+                    return;
+                }
+                let follow_with_sync = self.compact_invalidation_pending;
+                self.compact_request_in_flight = false;
+                match result {
+                    Ok(response) => {
+                        let installed = response
+                            .sync
+                            .as_ref()
+                            .zip(response.fence.as_ref())
+                            .is_some_and(|(snapshot, fence)| {
+                                self.install_synchronized_session(
+                                    *session_id,
+                                    *binding_generation,
+                                    snapshot,
+                                    fence,
+                                )
+                            });
+                        if installed && follow_with_sync {
+                            self.begin_compact_reload(
+                                *session_id,
+                                *binding_generation,
+                                "compact committed · reconciling post-fence invalidation…",
+                            );
+                        } else if installed {
+                            self.clear_compact_hold();
+                            if response.elided_messages == 0 {
+                                self.set_notice(
+                                    "nothing to compact · recent context already protected".into(),
+                                );
+                            } else {
+                                self.set_notice(format!(
+                                    "context compacted · {} messages summarized · {} ms",
+                                    response.elided_messages, response.wall_ms
+                                ));
+                            }
+                        } else if follow_with_sync {
+                            self.begin_compact_reload(
+                                *session_id,
+                                *binding_generation,
+                                "compact response unusable · synchronizing authoritative context…",
+                            );
+                        } else {
+                            self.compact_refresh_required = true;
+                            self.set_notice(
+                                "compact response lacked a usable sync fence · run /compact to refresh"
+                                    .into(),
+                            );
+                        }
+                    }
+                    Err(error) => {
+                        let message = errfmt::humanize(&error.message);
+                        if follow_with_sync {
+                            self.begin_compact_reload(
+                                *session_id,
+                                *binding_generation,
+                                "compact invalidated · synchronizing authoritative context…",
+                            );
+                        } else if error.transcript_may_have_changed {
+                            self.sessions_requiring_sync.insert(*session_id);
+                            self.compact_refresh_required = true;
+                            self.set_notice(format!(
+                                "{message} · run /compact to retry the authoritative session sync"
+                            ));
+                        } else {
+                            self.sessions_requiring_sync.remove(session_id);
+                            self.clear_compact_hold();
+                            self.set_notice(message);
+                        }
+                    }
+                }
+            }
+            Action::CompactReloadFinished {
+                session_id,
+                binding_generation,
+                operation_generation,
+                result,
+            } => {
+                if !self.compact_completion_matches(
+                    *session_id,
+                    *binding_generation,
+                    *operation_generation,
+                ) {
+                    self.sessions_requiring_sync.insert(*session_id);
+                    return;
+                }
+                if self.session_id != Some(*session_id)
+                    || self.session_binding_generation != *binding_generation
+                {
+                    self.clear_compact_hold();
+                    return;
+                }
+                match result {
+                    Ok(sync) => {
+                        let installed =
+                            sync.snapshot.as_ref().zip(sync.fence.as_ref()).is_some_and(
+                                |(snapshot, fence)| {
+                                    self.install_synchronized_session(
+                                        *session_id,
+                                        *binding_generation,
+                                        snapshot,
+                                        fence,
+                                    )
+                                },
+                            );
+                        if installed {
+                            self.clear_compact_hold();
+                            self.set_notice("synchronized session context reloaded".into());
+                        } else {
+                            self.compact_refresh_required = true;
+                            self.set_notice(
+                                "session sync lacked a usable replay fence · run /compact to retry"
+                                    .into(),
+                            );
+                        }
+                    }
+                    Err(error) => {
+                        self.compact_refresh_required = true;
+                        let message = errfmt::humanize(&error.message);
+                        self.set_notice(format!(
+                            "{message} · run /compact to retry the authoritative session sync"
+                        ));
+                    }
+                }
+            }
             Action::SessionBound(id) => self.bind_session(*id),
             // Session hygiene: only fold in agent events for the BOUND session.
             // A superseded stream's last envelopes (or an unscoped daemon echo)
@@ -1905,7 +2189,20 @@ impl App {
                     self.active_dictation_id = None;
                 }
             }
-            Action::SubmitPrompt(text) => self.submit_turn(text.clone()),
+            Action::SubmitPrompt(text) => {
+                let synchronization_pending = self.session_id.is_some_and(|session_id| {
+                    self.compacting_session == Some(session_id)
+                        || self.sessions_requiring_sync.contains(&session_id)
+                });
+                if synchronization_pending {
+                    follow_up = Some(Action::TurnSendFailed {
+                        prompt: text.clone(),
+                        err: "session synchronization is still in progress".into(),
+                    });
+                } else {
+                    self.submit_turn(text.clone());
+                }
+            }
             Action::OpenFile(path) => {
                 self.editor.open(path.clone());
                 self.center = Center::Editor;
@@ -1944,7 +2241,10 @@ impl App {
                 // Intentional unbind: no stream will reconnect, so a stale
                 // degraded SSE reading must not persist forever.
                 self.health.recover(HealthSource::Sse);
+                self.session_binding_generation = self.session_binding_generation.wrapping_add(1);
+                self.stream_generation = self.stream_generation.wrapping_add(1);
                 self.session_id = None;
+                self.clear_compact_hold();
                 self.chat.load_history(Vec::new()); // clear the transcript
                 self.rail.live_id = None;
                 self.set_active_project(cwd.clone());
@@ -1993,7 +2293,10 @@ impl App {
                 // Intentional unbind: no stream will reconnect, so a stale
                 // degraded SSE reading must not persist forever.
                 self.health.recover(HealthSource::Sse);
+                self.session_binding_generation = self.session_binding_generation.wrapping_add(1);
+                self.stream_generation = self.stream_generation.wrapping_add(1);
                 self.session_id = None;
+                self.clear_compact_hold();
                 self.center = Center::Chat;
                 self.focus_to(Focus::Center);
             }
@@ -2407,7 +2710,16 @@ impl App {
     /// Bind the chat to `id`: abort any superseded stream and subscribe a fresh
     /// self-healing one. Idempotent for the already-bound session.
     fn bind_session_with(&mut self, id: AgentSessionId, replay_first: bool) {
+        let replaces_loaded_history = !replay_first;
+        if self.session_id != Some(id) || replaces_loaded_history {
+            // Switching/resuming replaces visible history. Increment even for
+            // A→B→A or an explicit A→A resume so queued old envelopes cannot
+            // become current merely because the UUID matches.
+            self.session_binding_generation = self.session_binding_generation.wrapping_add(1);
+            self.clear_compact_hold();
+        }
         if self.session_id == Some(id)
+            && !replaces_loaded_history
             && self.stream_task.as_ref().is_some_and(|t| !t.is_finished())
         {
             return;
@@ -2419,11 +2731,22 @@ impl App {
         // subscription below — start it from a neutral SSE source.
         self.health.recover(HealthSource::Sse);
         self.session_id = Some(id);
+        self.stream_generation = self.stream_generation.wrapping_add(1);
         self.stream_task = Some(self.client.spawn_event_stream(
             id,
             self.actions_tx.clone(),
             replay_first,
+            None,
+            self.session_binding_generation,
+            self.stream_generation,
         ));
+        if self.sessions_requiring_sync.contains(&id) {
+            self.begin_compact_reload(
+                id,
+                self.session_binding_generation,
+                "session compact outcome changed while unbound · synchronizing context…",
+            );
+        }
     }
 
     /// Mint-path bind: fresh chat, replay the session's buffered head.
@@ -4160,6 +4483,131 @@ impl App {
             && self.right_rail_mode == RightRailMode::Workflow)
             || (center && self.center == Center::WorkflowGraph);
         self.workflow_graph.expanded = self.center == Center::WorkflowGraph;
+    }
+
+    fn clear_compact_hold(&mut self) {
+        self.compacting_session = None;
+        self.compact_refresh_required = false;
+        self.compact_request_in_flight = false;
+        self.compact_invalidation_pending = false;
+    }
+
+    fn compact_completion_matches(
+        &self,
+        session_id: AgentSessionId,
+        binding_generation: u64,
+        operation_generation: u64,
+    ) -> bool {
+        self.compacting_session == Some(session_id)
+            && self.compact_binding_generation == binding_generation
+            && self.compact_operation_generation == operation_generation
+    }
+
+    fn handle_session_invalidation(
+        &mut self,
+        session_id: AgentSessionId,
+        binding_generation: u64,
+        notice: &str,
+    ) {
+        if self.session_id != Some(session_id)
+            || self.session_binding_generation != binding_generation
+        {
+            return;
+        }
+        if self.compact_request_in_flight
+            && self.compacting_session == Some(session_id)
+            && self.compact_binding_generation == binding_generation
+        {
+            // The daemon deliberately emits compact's invalidation while its
+            // lease is still held. Do not race that lease with /sync or replace
+            // the compact operation generation; defer a follow-up sync instead.
+            self.stream_generation = self.stream_generation.wrapping_add(1);
+            if let Some(task) = self.stream_task.take() {
+                task.abort();
+            }
+            self.sessions_requiring_sync.insert(session_id);
+            self.compact_invalidation_pending = true;
+            self.set_notice("session changed during compaction · waiting to synchronize…".into());
+        } else {
+            self.begin_compact_reload(session_id, binding_generation, notice);
+        }
+    }
+
+    fn begin_compact_reload(
+        &mut self,
+        session_id: AgentSessionId,
+        binding_generation: u64,
+        notice: &str,
+    ) {
+        if self.session_id != Some(session_id)
+            || self.session_binding_generation != binding_generation
+        {
+            return;
+        }
+        self.stream_generation = self.stream_generation.wrapping_add(1);
+        if let Some(task) = self.stream_task.take() {
+            task.abort();
+        }
+        self.sessions_requiring_sync.insert(session_id);
+        self.compacting_session = Some(session_id);
+        self.compact_refresh_required = false;
+        self.compact_request_in_flight = false;
+        self.compact_invalidation_pending = false;
+        self.compact_binding_generation = binding_generation;
+        self.compact_operation_generation = self.compact_operation_generation.wrapping_add(1);
+        let operation_generation = self.compact_operation_generation;
+        self.set_notice(notice.into());
+        let client = self.client.clone();
+        let tx = self.actions_tx.clone();
+        tokio::spawn(async move {
+            let _ = tx.send(Action::CompactReloadFinished {
+                session_id,
+                binding_generation,
+                operation_generation,
+                result: client.refresh_compacted_session(session_id).await,
+            });
+        });
+    }
+
+    /// Atomically replace visible history from a synchronized snapshot and
+    /// restart the scoped stream strictly after its fence. Incrementing the
+    /// stream generation before aborting rejects already-queued old envelopes.
+    fn install_synchronized_session(
+        &mut self,
+        session_id: AgentSessionId,
+        binding_generation: u64,
+        snapshot: &ocean_core::SessionSyncSnapshot,
+        fence: &ocean_core::SessionEventFence,
+    ) -> bool {
+        if self.session_id != Some(session_id)
+            || self.session_binding_generation != binding_generation
+            || snapshot.session_id != session_id.0
+        {
+            return false;
+        }
+        let Some(event_id) = fence.event_id else {
+            return false;
+        };
+        self.stream_generation = self.stream_generation.wrapping_add(1);
+        let stream_generation = self.stream_generation;
+        if let Some(task) = self.stream_task.take() {
+            task.abort();
+        }
+        self.health.recover(HealthSource::Sse);
+        let Ok(history) = crate::shell::sessions::history_from_sync_snapshot(snapshot) else {
+            return false;
+        };
+        self.chat.load_history(history);
+        self.stream_task = Some(self.client.spawn_event_stream(
+            session_id,
+            self.actions_tx.clone(),
+            false,
+            Some(event_id.to_string()),
+            binding_generation,
+            stream_generation,
+        ));
+        self.sessions_requiring_sync.remove(&session_id);
+        true
     }
 
     fn submit_turn(&mut self, prompt: String) {
@@ -6624,6 +7072,487 @@ mod tests {
         app.models_sel = 0;
         app.models_apply();
         assert_eq!(app.status_data().model, Some("deepseek-v4-pro"));
+    }
+
+    #[test]
+    fn compact_rejects_unbound_and_active_sessions_without_spawning() {
+        let mut app = offline_app();
+        while app.actions_rx.try_recv().is_ok() {}
+
+        app.dispatch(Action::CompactSession);
+        assert!(app.status.contains("start or resume"));
+        assert_eq!(app.compacting_session, None);
+        assert!(matches!(
+            app.actions_rx.try_recv(),
+            Err(TryRecvError::Empty)
+        ));
+
+        app.session_id = Some(AgentSessionId(uuid::Uuid::from_u128(41)));
+        app.dispatch(Action::AgentEvent(Box::new(AgentTurnEvent::TurnStarted {
+            turn_id: ocean_agent_sdk::AgentTurnId(uuid::Uuid::from_u128(42)),
+            session_id: app.session_id.unwrap(),
+            model: Some("test-model".into()),
+        })));
+        app.dispatch(Action::CompactSession);
+        assert!(app.status.contains("active turn"));
+        assert_eq!(app.compacting_session, None);
+        assert!(matches!(
+            app.actions_rx.try_recv(),
+            Err(TryRecvError::Empty)
+        ));
+    }
+
+    fn synchronized_snapshot(
+        session_id: AgentSessionId,
+        text: &str,
+    ) -> ocean_core::SessionSyncSnapshot {
+        ocean_core::SessionSyncSnapshot {
+            session_id: session_id.0,
+            model: "test-model".into(),
+            provider: "fake".into(),
+            transcript: vec![ocean_core::SessionTranscriptEntry {
+                role: "assistant".into(),
+                timestamp_ms: None,
+                text: text.into(),
+                images: Vec::new(),
+                tool_call_id: None,
+                tool_name: None,
+                is_error: None,
+            }],
+            truncated_messages: 0,
+            truncated_text_bytes: 0,
+        }
+    }
+
+    fn synchronized_fence(index: u128) -> ocean_core::SessionEventFence {
+        ocean_core::SessionEventFence {
+            event_id: Some(uuid::Uuid::from_u128(index)),
+        }
+    }
+
+    fn compact_success(
+        session_id: AgentSessionId,
+        text: &str,
+        elided_messages: u64,
+        fence_index: u128,
+    ) -> ocean_core::CompactResponse {
+        ocean_core::CompactResponse {
+            ok: true,
+            session_id: session_id.0,
+            elided_messages,
+            wall_ms: 87,
+            stderr: String::new(),
+            sync: Some(synchronized_snapshot(session_id, text)),
+            fence: Some(synchronized_fence(fence_index)),
+        }
+    }
+
+    fn sync_success(
+        session_id: AgentSessionId,
+        text: &str,
+        fence_index: u128,
+    ) -> ocean_core::SessionSyncResponse {
+        ocean_core::SessionSyncResponse {
+            ok: true,
+            session_id: session_id.0,
+            snapshot: Some(synchronized_snapshot(session_id, text)),
+            fence: Some(synchronized_fence(fence_index)),
+            error: None,
+        }
+    }
+
+    fn arm_compact(app: &mut App, session_id: AgentSessionId) -> (u64, u64) {
+        app.session_id = Some(session_id);
+        app.session_binding_generation = app.session_binding_generation.wrapping_add(1);
+        app.sessions_requiring_sync.insert(session_id);
+        app.compacting_session = Some(session_id);
+        app.compact_request_in_flight = true;
+        app.compact_invalidation_pending = false;
+        app.compact_binding_generation = app.session_binding_generation;
+        app.compact_operation_generation = app.compact_operation_generation.wrapping_add(1);
+        (
+            app.compact_binding_generation,
+            app.compact_operation_generation,
+        )
+    }
+
+    #[tokio::test]
+    async fn compact_completion_installs_snapshot_fence_and_reports_success_or_noop() {
+        let mut app = offline_app();
+        let session_id = AgentSessionId(uuid::Uuid::from_u128(51));
+        let (binding_generation, operation_generation) = arm_compact(&mut app, session_id);
+        let original_stream_generation = app.stream_generation;
+
+        app.dispatch(Action::CompactFinished {
+            session_id,
+            binding_generation,
+            operation_generation,
+            result: Ok(compact_success(
+                session_id,
+                "authoritative compacted summary",
+                12,
+                5001,
+            )),
+        });
+        assert_eq!(app.compacting_session, None);
+        assert!(app.stream_generation > original_stream_generation);
+        assert!(app.stream_task.is_some());
+        assert_eq!(
+            app.chat.last_reply_for_test().as_deref(),
+            Some("authoritative compacted summary")
+        );
+        assert!(app.status.contains("12 messages summarized"));
+
+        let (binding_generation, operation_generation) = arm_compact(&mut app, session_id);
+        app.dispatch(Action::CompactFinished {
+            session_id,
+            binding_generation,
+            operation_generation,
+            result: Ok(compact_success(
+                session_id,
+                "unchanged recent context",
+                0,
+                5002,
+            )),
+        });
+        assert_eq!(app.compacting_session, None);
+        assert_eq!(
+            app.chat.last_reply_for_test().as_deref(),
+            Some("unchanged recent context")
+        );
+        assert!(app.status.contains("nothing to compact"));
+
+        let (binding_generation, operation_generation) = arm_compact(&mut app, session_id);
+        app.dispatch(Action::CompactFinished {
+            session_id,
+            binding_generation,
+            operation_generation,
+            result: Err(crate::shell::action::CompactFailure {
+                message: "provider deadline elapsed".into(),
+                transcript_may_have_changed: false,
+            }),
+        });
+        assert_eq!(app.compacting_session, None);
+        assert!(
+            app.status.contains("timed out") || app.status.contains("deadline"),
+            "provider/timeout errors stay visible: {}",
+            app.status
+        );
+
+        let (binding_generation, operation_generation) = arm_compact(&mut app, session_id);
+        app.dispatch(Action::CompactFinished {
+            session_id,
+            binding_generation,
+            operation_generation,
+            result: Err(crate::shell::action::CompactFailure {
+                message: "compacted, but response was lost".into(),
+                transcript_may_have_changed: true,
+            }),
+        });
+        assert_eq!(app.compacting_session, Some(session_id));
+        assert!(app.compact_refresh_required);
+        assert!(app.status.contains("run /compact"));
+
+        app.compact_refresh_required = false;
+        app.dispatch(Action::CompactReloadFinished {
+            session_id,
+            binding_generation,
+            operation_generation,
+            result: Ok(sync_success(
+                session_id,
+                "recovered authoritative context",
+                5003,
+            )),
+        });
+        assert_eq!(app.compacting_session, None);
+        assert!(!app.compact_refresh_required);
+        assert_eq!(
+            app.chat.last_reply_for_test().as_deref(),
+            Some("recovered authoritative context")
+        );
+    }
+
+    #[tokio::test]
+    async fn compact_self_invalidation_defers_sync_until_post_response() {
+        let mut app = offline_app();
+        let session_id = AgentSessionId(uuid::Uuid::from_u128(53));
+        let (binding_generation, operation_generation) = arm_compact(&mut app, session_id);
+        let stream_generation = app.stream_generation;
+
+        app.dispatch(Action::BoundAgentEvent {
+            session_id,
+            binding_generation,
+            stream_generation,
+            event: Box::new(AgentTurnEvent::Extension {
+                extension: "ocean.session_changed".into(),
+                payload: serde_json::json!({}),
+                scope: Some(session_id),
+            }),
+        });
+        assert!(app.compact_request_in_flight);
+        assert!(app.compact_invalidation_pending);
+        assert_eq!(app.compact_operation_generation, operation_generation);
+
+        app.dispatch(Action::CompactFinished {
+            session_id,
+            binding_generation,
+            operation_generation,
+            result: Ok(compact_success(
+                session_id,
+                "compacted before follow-up sync",
+                4,
+                5007,
+            )),
+        });
+
+        assert_eq!(
+            app.chat.last_reply_for_test().as_deref(),
+            Some("compacted before follow-up sync")
+        );
+        assert_eq!(app.compacting_session, Some(session_id));
+        assert!(!app.compact_request_in_flight);
+        assert!(app.sessions_requiring_sync.contains(&session_id));
+        assert!(app.compact_operation_generation > operation_generation);
+
+        let sync_operation = app.compact_operation_generation;
+        app.dispatch(Action::CompactReloadFinished {
+            session_id,
+            binding_generation,
+            operation_generation: sync_operation,
+            result: Ok(sync_success(session_id, "post-compact authority", 5008)),
+        });
+        assert_eq!(app.compacting_session, None);
+        assert!(!app.sessions_requiring_sync.contains(&session_id));
+        assert_eq!(
+            app.chat.last_reply_for_test().as_deref(),
+            Some("post-compact authority")
+        );
+    }
+
+    #[tokio::test]
+    async fn compact_completion_clears_pre_fence_busy_and_restarts_after_fence() {
+        let mut app = offline_app();
+        let session_id = AgentSessionId(uuid::Uuid::from_u128(56));
+        let (binding_generation, operation_generation) = arm_compact(&mut app, session_id);
+        let old_stream_generation = app.stream_generation;
+        app.dispatch(Action::AgentEvent(Box::new(AgentTurnEvent::TurnStarted {
+            turn_id: ocean_agent_sdk::AgentTurnId(uuid::Uuid::from_u128(57)),
+            session_id,
+            model: Some("test-model".into()),
+        })));
+
+        app.dispatch(Action::CompactFinished {
+            session_id,
+            binding_generation,
+            operation_generation,
+            result: Ok(compact_success(
+                session_id,
+                "snapshot before active turn",
+                8,
+                5004,
+            )),
+        });
+
+        assert!(!app.chat.is_busy());
+        assert_eq!(app.compacting_session, None);
+        assert!(!app.compact_refresh_required);
+        assert!(app.stream_generation > old_stream_generation);
+        assert_eq!(
+            app.chat.last_reply_for_test().as_deref(),
+            Some("snapshot before active turn")
+        );
+        app.dispatch(Action::BoundAgentEvent {
+            session_id,
+            binding_generation,
+            stream_generation: app.stream_generation,
+            event: Box::new(AgentTurnEvent::TurnStarted {
+                turn_id: ocean_agent_sdk::AgentTurnId(uuid::Uuid::from_u128(58)),
+                session_id,
+                model: Some("post-fence-model".into()),
+            }),
+        });
+        assert!(app.chat.is_busy(), "post-fence replay re-establishes busy");
+    }
+
+    #[tokio::test]
+    async fn compact_completion_rejects_a_to_b_to_a_generation_alias() {
+        let mut app = offline_app();
+        let session_id = AgentSessionId(uuid::Uuid::from_u128(61));
+        let (old_binding, old_operation) = arm_compact(&mut app, session_id);
+        app.chat
+            .load_history(vec![crate::shell::sessions::HistoryMsg {
+                role: "assistant".into(),
+                text: "current session".into(),
+            }]);
+
+        // Exercise the real A→B→A bind path while A's daemon operation can
+        // still commit. Rebinding A must enter refresh-only hold automatically.
+        let other = AgentSessionId(uuid::Uuid::from_u128(62));
+        app.bind_session_with(other, true);
+        app.bind_session_with(session_id, true);
+        assert_eq!(app.compacting_session, Some(session_id));
+        assert!(app.sessions_requiring_sync.contains(&session_id));
+        assert_ne!(app.compact_binding_generation, old_binding);
+
+        app.dispatch(Action::CompactFinished {
+            session_id,
+            binding_generation: old_binding,
+            operation_generation: old_operation,
+            result: Ok(compact_success(session_id, "stale session", 9, 5005)),
+        });
+
+        assert_eq!(app.compacting_session, Some(session_id));
+        assert!(app.sessions_requiring_sync.contains(&session_id));
+        app.dispatch(Action::CompactFinished {
+            session_id,
+            binding_generation: old_binding,
+            operation_generation: old_operation,
+            result: Err(crate::shell::action::CompactFailure {
+                message: "old precommit rejection".into(),
+                transcript_may_have_changed: false,
+            }),
+        });
+        assert!(app.sessions_requiring_sync.contains(&session_id));
+        assert_eq!(
+            app.chat.last_reply_for_test().as_deref(),
+            Some("current session")
+        );
+        app.dispatch(Action::SubmitPrompt("must stay local".into()));
+        assert!(app.status.contains("synchronization"));
+    }
+
+    #[tokio::test]
+    async fn superseded_stream_generation_cannot_apply_queued_same_session_event() {
+        let mut app = offline_app();
+        let session_id = AgentSessionId(uuid::Uuid::from_u128(71));
+        app.session_id = Some(session_id);
+        app.session_binding_generation = 4;
+        app.stream_generation = 8;
+
+        app.dispatch(Action::BoundAgentEvent {
+            session_id,
+            binding_generation: 4,
+            stream_generation: 7,
+            event: Box::new(AgentTurnEvent::TurnStarted {
+                turn_id: ocean_agent_sdk::AgentTurnId(uuid::Uuid::from_u128(72)),
+                session_id,
+                model: Some("stale-model".into()),
+            }),
+        });
+
+        assert!(!app.chat.is_busy());
+    }
+
+    #[tokio::test]
+    async fn session_changed_invalidates_derived_tray_and_enters_sync_hold() {
+        let mut app = offline_app();
+        app.show_tree = true;
+        let session_id = AgentSessionId(uuid::Uuid::from_u128(75));
+        let turn_id = ocean_agent_sdk::AgentTurnId(uuid::Uuid::from_u128(76));
+        let call_id = ocean_agent_sdk::ToolCallId(uuid::Uuid::from_u128(77));
+        app.dispatch(Action::SessionBound(session_id));
+        let binding_generation = app.session_binding_generation;
+        let stream_generation = app.stream_generation;
+        app.dispatch(Action::AgentEvent(Box::new(AgentTurnEvent::TurnStarted {
+            session_id,
+            turn_id,
+            model: None,
+        })));
+        app.dispatch(Action::AgentEvent(Box::new(
+            AgentTurnEvent::ToolCallStarted {
+                session_id,
+                turn_id,
+                call: ocean_agent_sdk::ToolCall {
+                    id: call_id.clone(),
+                    name: "todo".into(),
+                    args_json: serde_json::json!({"action":"add","text":"stale todo"}),
+                },
+            },
+        )));
+        app.dispatch(Action::AgentEvent(Box::new(
+            AgentTurnEvent::ToolCallFinished {
+                session_id,
+                turn_id,
+                call_id,
+                result: ocean_agent_sdk::ToolResult {
+                    ok: true,
+                    output: "1 [ ] stale todo\n".into(),
+                    metadata_json: None,
+                },
+            },
+        )));
+        assert!(app.tray.is_visible());
+        assert!(app.tray.has_todo_text_for_test("stale todo"));
+
+        app.dispatch(Action::BoundAgentEvent {
+            session_id,
+            binding_generation,
+            stream_generation,
+            event: Box::new(AgentTurnEvent::Extension {
+                extension: "ocean.session_changed".into(),
+                payload: serde_json::json!({}),
+                scope: Some(session_id),
+            }),
+        });
+
+        assert!(!app.tray.has_todo_text_for_test("stale todo"));
+        assert_eq!(app.compacting_session, Some(session_id));
+        assert!(app.sessions_requiring_sync.contains(&session_id));
+        assert!(app.stream_generation > stream_generation);
+    }
+
+    #[tokio::test]
+    async fn replay_reset_enters_refresh_only_hold_and_sync_clears_stale_busy() {
+        let mut app = offline_app();
+        let session_id = AgentSessionId(uuid::Uuid::from_u128(81));
+        app.session_id = Some(session_id);
+        app.session_binding_generation = 5;
+        app.stream_generation = 9;
+        app.dispatch(Action::AgentEvent(Box::new(AgentTurnEvent::TurnStarted {
+            turn_id: ocean_agent_sdk::AgentTurnId(uuid::Uuid::from_u128(82)),
+            session_id,
+            model: Some("test-model".into()),
+        })));
+        assert!(app.chat.is_busy());
+
+        app.dispatch(Action::BoundAgentReplayResetRequired {
+            session_id,
+            binding_generation: 5,
+            stream_generation: 9,
+        });
+        assert_eq!(app.compacting_session, Some(session_id));
+        assert!(!app.compact_refresh_required);
+        assert!(app.status.contains("synchronizing"));
+        assert!(app.stream_generation > 9);
+
+        // An envelope already queued by the aborted stream is rejected now,
+        // not only after the replacement sync finishes.
+        app.dispatch(Action::BoundAgentEvent {
+            session_id,
+            binding_generation: 5,
+            stream_generation: 9,
+            event: Box::new(AgentTurnEvent::AssistantTextDelta {
+                session_id,
+                turn_id: ocean_agent_sdk::AgentTurnId(uuid::Uuid::from_u128(82)),
+                delta: "stale".into(),
+            }),
+        });
+        assert_ne!(app.chat.last_reply_for_test().as_deref(), Some("stale"));
+
+        let operation_generation = app.compact_operation_generation;
+        app.dispatch(Action::CompactReloadFinished {
+            session_id,
+            binding_generation: 5,
+            operation_generation,
+            result: Ok(sync_success(session_id, "authoritative idle history", 5006)),
+        });
+
+        assert!(!app.chat.is_busy());
+        assert_eq!(app.compacting_session, None);
+        assert_eq!(
+            app.chat.last_reply_for_test().as_deref(),
+            Some("authoritative idle history")
+        );
     }
 
     #[test]

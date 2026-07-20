@@ -152,6 +152,11 @@ impl SessionComponentTray {
         self.todo.is_visible() || self.context_usage.is_some()
     }
 
+    #[cfg(test)]
+    pub(crate) fn has_todo_text_for_test(&self, text: &str) -> bool {
+        self.todo.items.iter().any(|item| item.text == text)
+    }
+
     pub fn desired_height(&self) -> u16 {
         let status_rows = u16::from(!self.todo.pending.is_empty() || self.todo.uncertain);
         let todo_rows = if self.todo.is_visible() {

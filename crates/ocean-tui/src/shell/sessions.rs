@@ -271,10 +271,70 @@ pub fn sort_sessions(v: &mut [Session]) {
     v.sort_by_key(|session| std::cmp::Reverse(session.mtime));
 }
 
-/// A single transcript message loaded from a session's on-disk record.
+/// A single display-ready user/assistant transcript message.
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct HistoryMsg {
     pub role: String,
     pub text: String,
+}
+
+/// Project raw persisted daemon messages through the same visible-text path as
+/// native disk resume. Only `{type:"text", text:…}` blocks are shown, so
+/// provider thinking blocks never become visible prose after a refresh.
+pub fn history_from_messages(messages: &[serde_json::Value]) -> Vec<HistoryMsg> {
+    messages
+        .iter()
+        .filter_map(|message| {
+            let role = json_str(message, "role").unwrap_or("");
+            if role != "user" && role != "assistant" {
+                return None;
+            }
+            let text = message_text(message);
+            (!text.trim().is_empty()).then(|| HistoryMsg {
+                role: role.to_string(),
+                text,
+            })
+        })
+        .collect()
+}
+
+/// Validate and project the daemon's bounded public synchronization snapshot
+/// into native chat history. Any private-shaped row or response-bound violation
+/// rejects the entire snapshot; silently filtering it would not be fail closed.
+pub fn history_from_sync_snapshot(
+    snapshot: &ocean_core::SessionSyncSnapshot,
+) -> Result<Vec<HistoryMsg>, String> {
+    if snapshot.transcript.len() > ocean_core::SESSION_SYNC_MAX_VISIBLE_MESSAGES {
+        return Err("session sync snapshot exceeded the visible-message bound".into());
+    }
+    let mut visible_bytes = 0usize;
+    let mut history = Vec::with_capacity(snapshot.transcript.len());
+    for message in &snapshot.transcript {
+        if message.role != "user" && message.role != "assistant" {
+            return Err("session sync snapshot contained a non-visible role".into());
+        }
+        if !message.images.is_empty()
+            || message.tool_call_id.is_some()
+            || message.tool_name.is_some()
+            || message.is_error.is_some()
+        {
+            return Err("session sync snapshot contained private-shaped metadata".into());
+        }
+        visible_bytes = visible_bytes
+            .checked_add(message.text.len())
+            .ok_or_else(|| "session sync snapshot text bound overflowed".to_string())?;
+        if visible_bytes > ocean_core::SESSION_SYNC_MAX_VISIBLE_TEXT_BYTES {
+            return Err("session sync snapshot exceeded the visible-text bound".into());
+        }
+        let text = clean_history_text(&message.text);
+        if !text.trim().is_empty() {
+            history.push(HistoryMsg {
+                role: message.role.clone(),
+                text,
+            });
+        }
+    }
+    Ok(history)
 }
 
 /// Load a session's transcript from its JSON record. Concatenates the text of
@@ -290,22 +350,7 @@ pub fn load_transcript(path: &Path) -> Vec<HistoryMsg> {
     let Some(messages) = v.get("messages").and_then(|m| m.as_array()) else {
         return Vec::new();
     };
-    let mut out = Vec::new();
-    for m in messages {
-        let role = json_str(m, "role").unwrap_or("");
-        if role != "user" && role != "assistant" {
-            continue;
-        }
-        let text = message_text(m);
-        if text.trim().is_empty() {
-            continue;
-        }
-        out.push(HistoryMsg {
-            role: role.to_string(),
-            text,
-        });
-    }
-    out
+    history_from_messages(messages)
 }
 
 /// Extract the plain text of a message whose `content` is either a string or an
@@ -320,6 +365,9 @@ fn message_text(m: &serde_json::Value) -> String {
     if let Some(arr) = c.as_array() {
         let mut buf = String::new();
         for b in arr {
+            if matches!(json_str(b, "type"), Some(kind) if kind != "text") {
+                continue;
+            }
             if let Some(t) = json_str(b, "text") {
                 if !buf.is_empty() {
                     buf.push('\n');
@@ -546,6 +594,94 @@ mod tests {
         );
         // Untagged text is left untouched.
         assert_eq!(clean_history_text("no tag here"), "no tag here");
+    }
+
+    #[test]
+    fn daemon_transcript_refresh_matches_native_history_projection() {
+        let messages = vec![
+            json!({"role":"user","content":"[TUI] hello again"}),
+            json!({"role":"tool","content":[{"type":"text","text":"private tool output"}]}),
+            json!({
+                "role":"assistant",
+                "content":[
+                    {"type":"thinking","thinking":"hidden chain of thought"},
+                    {"type":"thinking","text":"also hidden even with a text-shaped field"},
+                    {"type":"text","text":"compacted summary"}
+                ]
+            }),
+        ];
+
+        assert_eq!(
+            history_from_messages(&messages),
+            vec![
+                HistoryMsg {
+                    role: "user".into(),
+                    text: "hello again".into(),
+                },
+                HistoryMsg {
+                    role: "assistant".into(),
+                    text: "compacted summary".into(),
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn synchronized_snapshot_projection_is_visible_text_only_and_strips_client_tag() {
+        let entry = |role: &str, text: &str| ocean_core::SessionTranscriptEntry {
+            role: role.into(),
+            timestamp_ms: None,
+            text: text.into(),
+            images: Vec::new(),
+            tool_call_id: None,
+            tool_name: None,
+            is_error: None,
+        };
+        let mut snapshot = ocean_core::SessionSyncSnapshot {
+            session_id: uuid::Uuid::nil(),
+            model: "test".into(),
+            provider: "fake".into(),
+            transcript: vec![
+                entry("user", "[TUI] hello"),
+                entry("assistant", "visible answer"),
+            ],
+            truncated_messages: 2,
+            truncated_text_bytes: 0,
+        };
+
+        assert_eq!(
+            history_from_sync_snapshot(&snapshot).expect("valid public snapshot"),
+            vec![
+                HistoryMsg {
+                    role: "user".into(),
+                    text: "hello".into(),
+                },
+                HistoryMsg {
+                    role: "assistant".into(),
+                    text: "visible answer".into(),
+                },
+            ]
+        );
+
+        snapshot
+            .transcript
+            .push(entry("tool", "private tool output"));
+        assert!(history_from_sync_snapshot(&snapshot).is_err());
+        snapshot.transcript.pop();
+        snapshot.transcript[0].images.push(ocean_core::ImageMeta {
+            mime_type: "image/png".into(),
+        });
+        assert!(history_from_sync_snapshot(&snapshot).is_err());
+
+        snapshot.transcript = (0..=ocean_core::SESSION_SYNC_MAX_VISIBLE_MESSAGES)
+            .map(|_| entry("user", "x"))
+            .collect();
+        assert!(history_from_sync_snapshot(&snapshot).is_err());
+        snapshot.transcript = vec![entry(
+            "assistant",
+            &"x".repeat(ocean_core::SESSION_SYNC_MAX_VISIBLE_TEXT_BYTES + 1),
+        )];
+        assert!(history_from_sync_snapshot(&snapshot).is_err());
     }
 
     #[test]

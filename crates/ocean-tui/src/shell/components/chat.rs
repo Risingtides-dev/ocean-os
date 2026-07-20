@@ -1755,7 +1755,9 @@ impl ChatComponent {
         None
     }
 
-    /// Replace the transcript with a resumed session's history (from disk).
+    /// Replace the transcript with a resumed or synchronized session history.
+    /// A synchronized fence is authoritative for everything before it; replay
+    /// strictly after the fence re-establishes any newer active turn.
     pub fn load_history(&mut self, msgs: Vec<crate::shell::sessions::HistoryMsg>) {
         self.turns = msgs
             .into_iter()
@@ -2308,6 +2310,7 @@ impl ChatComponent {
                 }
             }
             "/providers" => Some(Action::OpenProviders),
+            "/compact" => Some(Action::CompactSession),
             "/copy" => match self.last_reply() {
                 Some(text) => Some(Action::CopyToClipboard(text)),
                 None => Some(Action::Status("nothing to copy yet".into())),
@@ -2335,6 +2338,11 @@ impl ChatComponent {
     }
 
     /// The text of the newest assistant reply, for `/copy`.
+    #[cfg(test)]
+    pub(crate) fn last_reply_for_test(&self) -> Option<String> {
+        self.last_reply()
+    }
+
     fn last_reply(&self) -> Option<String> {
         self.turns.iter().rev().find_map(|t| match t {
             Turn::Assistant(s) if !s.trim().is_empty() => Some(s.clone()),
@@ -4748,12 +4756,12 @@ mod tests {
     }
 
     #[test]
-    fn soon_command_surfaces_honest_hint() {
+    fn compact_command_routes_to_daemon_action() {
         let mut chat = ChatComponent::default();
-        match chat.run_slash("/compact", "") {
-            Some(Action::Status(s)) => assert!(s.contains("not wired"), "got: {s}"),
-            other => panic!("expected a Status hint, got {other:?}"),
-        }
+        assert!(matches!(
+            chat.run_slash("/compact", ""),
+            Some(Action::CompactSession)
+        ));
     }
 
     #[test]
