@@ -4670,3 +4670,11 @@ area:      [backend]
 
 Profile-gated the lsp tool (pad TASK-26): voice turns are no longer offered code intelligence, whose definitions/references/diagnostics are dense structured text a spoken reply cannot carry. Added code_intelligence to EffectiveHarnessCapabilities (true for TUI/Web/CLI/ACP, false for Voice), threaded it through PromptControl -> SessionContext exactly like hashline/artifacts, and enforced it inside LspProvider::tools BEFORE workspace detection so a gated turn does zero filesystem work. Defaults TRUE in PromptControl::new so direct/legacy callers are unchanged. Two implementation corrections worth recording: gating at provider REGISTRATION was wrong (the capability registry is built once per agent, not per turn, so it would have gated globally), and a regex bulk-edit of construction sites also matched a struct definition and BuiltinProvider's constructor — both caught by the compiler, both reverted. Tests assert BOTH directions (voice gets nothing; an ungated turn in a detected workspace still gets the tool) because a gate silently becoming a blanket disable is the real risk, per the recorded benchmark that hiding `edit` doubled wall time. runtime AGENTS.md profile-gate contract updated. Workspace 2594 tests green, clippy zero, fmt clean.
 _________________________________________________________________________________
+time:      [18:05] [20-07-26]
+agent:     [claude] [fable 5]
+worktree:  fix/task26-default-keeps-lsp
+type:      [bug-report]
+area:      [backend]
+
+Fixed the landed P2 codex flagged on #330: SessionContext derived Default, so code_intelligence defaulted false and every SessionContext::default() caller silently lost the lsp tool — the exact opposite of the field's documented contract (the field itself entered #330 via an over-broad git add -A sweeping a sibling lane's edit; process note recorded, explicit-path staging from here). Manual Default impl now keeps code_intelligence true while harness gates (hashline/artifacts) stay opt-in as daemon-granted capabilities. Codex's P1 on the same PR was stale — it reviewed an intermediate commit; merged code compiles green on all four rows. runtime+lsp+plugin suites 237 green, clippy zero, fmt clean.
+_________________________________________________________________________________
