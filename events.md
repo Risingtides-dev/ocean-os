@@ -4716,3 +4716,15 @@ area:      [testing]
 
 Flake-audit pass 1 (pad TASK-28): all 35 tight timeouts in room_federation's test module widened 1-2s -> 60s after programmatic classification proved every one is a POSITIVE wait (poll loop or must-arrive channel recv, sub-second solo); the five my scanner first flagged negative were artifacts of adjacent try_recv asserts — the real negative class, correctly deadline-free and untouched (their synchronicity audit is TASK-29 per-case work). Deadline policy documented once at the shared wait helper; TASK-27 already proved this file fails unrelated PRs under runner saturation. Federation suite 50/50, fmt clean. Note: first attempt's worktree was swept mid-flight by a parallel scratchpad cleanup — moved lane worktrees to ~/.worktrees, and the half-executed command chain pushed an empty branch that has been deleted.
 _________________________________________________________________________________
+
+time:      [06:10pm] [07-20-26]
+agent:     [ocean] [gpt-5]
+worktree:  [agents-split-closeout-20260720]
+type:      docs/security boundary
+area:      cross-repo ownership
+
+Recorded the clean Ocean agent-package split: public ocean-agents now owns only
+organization-neutral profiles, conventions, generic transport, and references;
+private risingtides-agents owns Rising Tides production assistants, couriers,
+Slack intake, internal skills, and factory workflows. Updated the canonical
+project map and active extension/Crew path references. No runtime behavior changed.

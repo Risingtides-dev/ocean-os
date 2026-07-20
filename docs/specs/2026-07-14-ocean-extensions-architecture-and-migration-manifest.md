@@ -35,7 +35,7 @@ The current system already contains several extension-like mechanisms, but they 
 - `crates/ocean-agent/src/lib.rs` discovers global plugin providers from the Ocean config directory and binds per-agent subprocess capabilities.
 - `crates/ocean-daemon` owns session-scoped SSE events and process/runtime state.
 - `crates/ocean-agent-sdk` contains typed external daemon vocabulary, including the current Slack Canvas contract.
-- `ocean-agents` contains package data plus transitional executable bridges, including the live Slack Socket Mode and delivery path.
+- Public `ocean-agents` contains reusable package/profile data; private `risingtides-agents` contains production package data plus transitional executable bridges, including the live Slack Socket Mode and delivery path.
 - `ocean-bedrock` contains source-runner adapters for knowledge ingestion, which are related to but distinct from live surface/service adapters.
 
 No files move until the host contract, trust boundary, package schema, and parity gates below are implemented or explicitly resolved. Behavior-neutral extraction and architectural redesign must remain separate changes.
@@ -104,7 +104,7 @@ Does not own:
 
 Third-party packages, including orchestration extensions, may live in any Git repository or local directory. `ocean-extensions` is a distribution catalog and reference owner, not a global runtime authority; inclusion there is not required for installation.
 
-### 4.3 `ocean-agents` — Rising Tides deployments
+### 4.3 `risingtides-agents` — Rising Tides deployments
 
 Owns:
 
@@ -409,11 +409,11 @@ Purpose: move the generic live Slack transport/bridge out of deployment-specific
 
 Candidate source inventory:
 
-- `ocean-agents/assistants/bridge/`;
-- `ocean-agents/couriers/transport/slack.py`;
+- `risingtides-agents/assistants/bridge/`;
+- `risingtides-agents/couriers/transport/slack.py`;
 - generic Slack base profiles and bridge fixtures where ownership review confirms they are not content-agent-specific.
 
-Retained in `ocean-agents`:
+Retained in `risingtides-agents`:
 
 - `assistants/content-agent/` identity, instructions, company SOPs, tool grants, and knowledge declarations;
 - agent-specific Slack overrides;
@@ -540,9 +540,9 @@ Evidence recorded on 2026-07-14:
 
 ### Phase 5 — `ocean-slack` parity extraction
 
-1. Write a separate exact-file extraction manifest against then-current `ocean-agents` main.
+1. Write a separate exact-file extraction manifest against then-current `risingtides-agents` main.
 2. Port generic bridge/transport behavior without agent redesign.
-3. Keep content-agent behavior and identity in `ocean-agents`.
+3. Keep content-agent behavior and identity in `risingtides-agents`.
 4. Run old and new parity fixtures and a live Slack smoke.
 5. Retire transitional Python only after replacement acceptance.
 
@@ -575,8 +575,8 @@ Candidate source boundaries that require fresh manifests at extraction time:
 | Candidate | Current owner | Future owner | Required separate manifest |
 | --- | --- | --- | --- |
 | Herdr adapter | New work | `ocean-extensions/extensions/ocean-herdr` | Creation manifest and host-contract version |
-| Slack Socket Mode bridge | `ocean-agents/assistants/bridge/` | `ocean-extensions/extensions/ocean-slack` | Exact-file parity extraction manifest |
-| Slack outbound transport | `ocean-agents/couriers/transport/slack.py` | `ocean-slack` | Exact-file parity extraction manifest |
+| Slack Socket Mode bridge | `risingtides-agents/assistants/bridge/` | `ocean-extensions/extensions/ocean-slack` | Exact-file parity extraction manifest |
+| Slack outbound transport | `risingtides-agents/couriers/transport/slack.py` | `ocean-slack` | Exact-file parity extraction manifest |
 | Slack base profile | `ocean-agents/assistants/_base/SLACK/` | To be decided by generic-vs-agent-specific audit | Profile ownership manifest |
 | Slack Canvas protocol | `ocean-os/crates/ocean-agent-sdk` plus runtime events | Retain initially | Separate protocol-generalization proposal only |
 | Plugin manifest/transport | `ocean-os/crates/ocean-plugin` | Retain | Harden in place; no cross-repo move |
