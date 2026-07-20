@@ -4616,3 +4616,11 @@ area:      [infra]
 
 Fixed the installer outage from the 07-20 deploy (pad TASK-22, my #321 bug): launchctl bootout is asynchronous, so the immediate bootstrap raced the teardown, failed with I/O error, and left the box daemonless while the installer exited nonzero. The installer now waits up to 10s for the job to actually disappear (fail-closed EX_TEMPFAIL if it never does), retries bootstrap once with loud recovery instructions on double failure, and proves the install end-to-end by polling /health for 30s — an installer exit 0 now guarantees a serving daemon. bash -n clean; sequence exercised live during the corrective 07-20 redeploy.
 _________________________________________________________________________________
+time:      [12:50] [20-07-26]
+agent:     [claude] [fable 5]
+worktree:  fix/task24-walker-cache-eviction-flake
+type:      [bug-report]
+area:      [testing]
+
+Closed the walker cache flake's second mode (pad TASK-24): #325 fixed the age-bucket race, but today's #326 run failed the backend==Cached assert instead — SCAN_CACHE is process-global with a 1s default TTL and 16-entry cap, so parallel walker tests can evict the primed entry and any >1s runner stall expires it; either way the test observed Fresh with zero product regression. The stale-cache observation now re-establishes its precondition (invalidate_path + remove created.txt) and retries bounded (5 attempts), requiring Cached AND nonzero age — which also closes the residual Instant-vs-SystemTime clock mismatch in the #325 helper by retrying instead of failing on a zero-age edge. A genuine cache regression still fails all five attempts. 51 walker tests green, 8x stress on the target test, clippy zero, fmt clean. Merging via gh pr merge --auto per the new watchers-notify-never-authorize practice.
+_________________________________________________________________________________
