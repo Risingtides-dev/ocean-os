@@ -38,6 +38,13 @@ This crate owns the long-running Ocean HTTP service on `:4780`, including API ro
   advertise only bounded read-only workspace inspection tools plus
   `propose_handoff`, and mutate only through the existing session/message/turn
   routes after an explicit Surface click.
+- Realtime `purpose: "conversation"` may advertise bounded read-only
+  `list_workspace` / `read_workspace_file` tools only when the daemon resolves
+  the supplied session's persisted `workspace_root`/`cwd` back to a registered project
+  or live linked worktree. Return that canonical root with the secret for frozen
+  Surface fulfillment; never accept a browser/model-nominated conversation root,
+  and keep project-less/session-less conversations on render + handoff only.
+
 - Session behavior lives in `ocean-agent`; route changes must not create a separate session model.
 - Product turns and legacy/call turns (legacy requests pin a session id before
   admission) take the shared non-blocking session operation lease before

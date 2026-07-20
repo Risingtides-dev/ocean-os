@@ -1279,12 +1279,24 @@ impl AgentRuntime {
     }
 
     /// Resolve the project that owns a session's workspace, following git
-    /// worktrees back to their main checkout. First tries an exact match on the
-    /// given root; if that misses, resolves the git common-dir's main worktree
-    /// (`git -C <root> rev-parse --path-format=absolute --git-common-dir` → the
-    /// enclosing repo root) and matches THAT. None on any git/lookup failure.
+    /// worktrees back to their main checkout. First tries an exact stored-root
+    /// match, then compares canonical roots (so macOS `/var` ↔ `/private/var`
+    /// aliases do not lose ownership), and finally resolves the git common-dir's
+    /// main worktree and canonically matches THAT. None on any git/lookup failure.
     pub fn owning_project_for_root(&self, workspace_root: &str) -> Option<Project> {
         if let Ok(Some(project)) = self.project_for_workspace(workspace_root) {
+            return Some(project);
+        }
+
+        let projects = self.list_projects().ok()?;
+        let workspace_canonical = std::fs::canonicalize(workspace_root).ok()?;
+        let canonical_owner = |candidate: &Path| {
+            projects.iter().find_map(|project| {
+                let project_root = std::fs::canonicalize(&project.workspace_root).ok()?;
+                (project_root == candidate).then(|| project.clone())
+            })
+        };
+        if let Some(project) = canonical_owner(&workspace_canonical) {
             return Some(project);
         }
 
@@ -1313,13 +1325,16 @@ impl AgentRuntime {
         };
         let common_dir = common_dir.canonicalize().ok()?;
         let main_root = common_dir.parent()?.canonicalize().ok()?;
-        let main_root = main_root.to_string_lossy();
-        let main_root = main_root.trim_end_matches(std::path::MAIN_SEPARATOR);
-        if main_root.is_empty() {
+        let main_root_str = main_root.to_string_lossy();
+        let main_root_str = main_root_str.trim_end_matches(std::path::MAIN_SEPARATOR);
+        if main_root_str.is_empty() {
             return None;
         }
 
-        self.project_for_workspace(main_root).ok().flatten()
+        self.project_for_workspace(main_root_str)
+            .ok()
+            .flatten()
+            .or_else(|| canonical_owner(&main_root))
     }
 
     /// A cheap owning-project index: each project's `workspace_root` → the

@@ -4684,4 +4684,11 @@ type:      [bug-report]
 area:      [testing]
 
 Third shared-CI-tax flake closed (pad TASK-27, failed #331's ubuntu row from a diff touching only ocean-runtime): p2c_startup_attempts_every_pending_row_beyond_128 gave 5s for 129 sequential redeem round-trips — sub-second solo, starved on a saturated runner. Deadline raised to 60s with rationale pinned in-comment; the poll loop is progress-guaranteed so the generous budget costs nothing when healthy. Test green, fmt clean.
+time:      [01:21] [20-07-26]
+agent:     [ocean] [gpt-5.6]
+worktree:  feat/voice-conversation-project-tools
+type:      feature
+area:      daemon
+
+Realtime conversation voice now receives bounded list_workspace/read_workspace_file tools only when daemon-owned session workspace_root/cwd resolves to a registered project root or live linked worktree. The daemon freezes and returns the canonical root with the ephemeral secret; unknown, project-less, and session-less chats fail closed to render_component/write_handoff. Voice instructions mark repository output untrusted and keep all writes/execution behind handoff. Added tool-shape and project/worktree authority tests; preserved omitted-purpose compatibility.
 _________________________________________________________________________________

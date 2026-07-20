@@ -7986,14 +7986,51 @@ async fn validate_voice_planner_context(
     })
 }
 
+/// Resolve a normal realtime conversation's workspace from daemon-owned
+/// session state. Project-less, missing, or inaccessible sessions fail closed
+/// to the original conversation tool set; the browser cannot nominate a root.
+async fn validated_conversation_workspace(
+    runtime: &AgentRuntime,
+    detail: &SessionDetail,
+) -> Option<ValidatedPlannerContext> {
+    let root = detail
+        .workspace_root
+        .as_deref()
+        .filter(|root| !root.trim().is_empty())
+        .or_else(|| detail.cwd.as_deref().filter(|cwd| !cwd.trim().is_empty()))?
+        .trim();
+    if root.chars().count() > voice_realtime::PLANNER_WORKSPACE_ROOT_MAX_CHARS {
+        return None;
+    }
+    let project = runtime.owning_project_for_root(root)?;
+    validate_voice_planner_context(
+        runtime,
+        &voice_realtime::VoicePlannerContext {
+            project_id: project.id,
+            workspace_root: root.to_string(),
+        },
+    )
+    .await
+    .ok()
+}
+
 /// Mint an ephemeral OpenAI Realtime client secret. Conversation mode preserves
 /// the original session briefing; planner mode is pre-session and propose-only.
 async fn voice_realtime_client_secret(
     State(state): State<AppState>,
     Json(req): Json<voice_realtime::RealtimeSecretRequest>,
 ) -> (StatusCode, Json<Value>) {
-    // Validate mode/context before credential resolution so malformed or
-    // unauthorized planner requests return 400 rather than a credential error.
+    // Resolve one daemon-owned session snapshot up front. Conversation workspace
+    // authority and transcript briefing must come from the same session identity.
+    let session_detail = req
+        .session_id
+        .as_deref()
+        .and_then(|raw| raw.parse::<SessionId>().ok())
+        .and_then(|id| state.runtime.session_detail(id).ok());
+
+    // Validate planner mode/context before credential resolution. Conversation
+    // mode never accepts a browser-supplied workspace; it derives a registered
+    // project root/live worktree from the daemon-owned session snapshot above.
     let planner = match req.purpose {
         voice_realtime::RealtimePurpose::Conversation => {
             if req.planner_context.is_some() {
@@ -8023,6 +8060,14 @@ async fn voice_realtime_client_secret(
             }
         }
     };
+    let conversation_workspace = if req.purpose == voice_realtime::RealtimePurpose::Conversation {
+        match session_detail.as_ref() {
+            Some(detail) => validated_conversation_workspace(&state.runtime, detail).await,
+            None => None,
+        }
+    } else {
+        None
+    };
 
     let Some(credential) = ocean_providers::resolve_openai_realtime_api_key() else {
         return (
@@ -8033,13 +8078,10 @@ async fn voice_realtime_client_secret(
         );
     };
 
-    // Briefing: best-effort. A bad/unknown session id degrades to the
-    // header-only instructions rather than blocking the voice session.
-    let transcript: Vec<(String, String)> = req
-        .session_id
-        .as_deref()
-        .and_then(|raw| raw.parse::<SessionId>().ok())
-        .and_then(|id| state.runtime.session_detail(id).ok())
+    // Briefing is best-effort. A bad/unknown session id degrades to the
+    // header-only, no-workspace-tools conversation rather than blocking voice.
+    let transcript: Vec<(String, String)> = session_detail
+        .as_ref()
         .map(|detail| {
             detail
                 .transcript
@@ -8063,13 +8105,19 @@ async fn voice_realtime_client_secret(
         let body = voice_realtime::planner_upstream_body(&model, &instructions);
         (instructions, body)
     } else {
-        let instructions = voice_realtime::build_instructions(&transcript);
-        let body = voice_realtime::upstream_body(&model, &instructions);
+        let workspace_tools = conversation_workspace.is_some();
+        let instructions = voice_realtime::build_instructions(&transcript, workspace_tools);
+        let body = voice_realtime::upstream_body(&model, &instructions, workspace_tools);
         (instructions, body)
     };
     let _ = instructions;
     match voice_realtime::mint_client_secret(&credential, &model, &body).await {
-        Ok(normalized) => (StatusCode::OK, Json(normalized)),
+        Ok(mut normalized) => {
+            if let Some(context) = conversation_workspace {
+                normalized["workspace_root"] = json!(context.workspace_root);
+            }
+            (StatusCode::OK, Json(normalized))
+        }
         Err(err) => {
             tracing::warn!(error = %err, "realtime client-secret mint failed");
             (StatusCode::BAD_GATEWAY, Json(json!({ "error": err })))
@@ -23843,6 +23891,32 @@ prunable gitdir file points to non-existent location
         validate_voice_planner_context(&state.runtime, &context(&live))
             .await
             .expect("live linked worktree is valid");
+
+        let (conversation_id, _, _) = state
+            .runtime
+            .create_session(&live.to_string_lossy(), Some("surface-web".into()))
+            .expect("conversation session");
+        let conversation = state.runtime.session_detail(conversation_id).unwrap();
+        let scoped = validated_conversation_workspace(&state.runtime, &conversation)
+            .await
+            .expect("registered live-worktree session receives project reads");
+        assert_eq!(
+            scoped.workspace_root,
+            std::fs::canonicalize(&live).unwrap().to_string_lossy()
+        );
+
+        let projectless = tmp.path().join("projectless");
+        std::fs::create_dir(&projectless).unwrap();
+        let (projectless_id, _, _) = state
+            .runtime
+            .create_session(&projectless.to_string_lossy(), None)
+            .expect("project-less session");
+        let projectless_detail = state.runtime.session_detail(projectless_id).unwrap();
+        assert!(
+            validated_conversation_workspace(&state.runtime, &projectless_detail)
+                .await
+                .is_none()
+        );
 
         let unrelated = tmp.path().join("unrelated");
         std::fs::create_dir(&unrelated).unwrap();
