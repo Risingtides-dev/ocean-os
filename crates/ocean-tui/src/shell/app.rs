@@ -870,6 +870,12 @@ impl App {
                                 daemon_boot::AutostartOutcome::SupervisionUnknown => {
                                     Some("daemon autostart blocked".to_string())
                                 }
+                                // Installer maintenance window: launchd's
+                                // RunAtLoad brings the daemon back on its own;
+                                // spawning here would orphan-race the port.
+                                daemon_boot::AutostartOutcome::SupervisionMaintenance => {
+                                    Some("daemon restarting under launchd maintenance".to_string())
+                                }
                             };
                             if let Some(condition) = condition {
                                 let _ = tx.send(Action::HealthDegraded {
