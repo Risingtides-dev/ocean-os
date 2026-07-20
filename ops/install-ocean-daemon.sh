@@ -43,6 +43,28 @@ if [[ ! -x "$BIN" ]]; then
   exit 1
 fi
 
+# --- TASK-7: publish an immutable versioned artifact -------------------------
+# The launcher (deploy/ocean-daemon.sh) execs ~/.local/libexec/ocean-daemon/current,
+# never the repo's target/release output, so checkout builds can't silently
+# become the running daemon. Copy this build to a rev-named path and flip the
+# `current` symlink atomically (symlink-at-temp-path + rename).
+LIBEXEC="$HOME/.local/libexec/ocean-daemon"
+rev="$(git -C "$REPO" describe --always --dirty --abbrev=12 2>/dev/null || echo unknown)"
+DEST_BIN="$LIBEXEC/ocean-daemon-$rev"
+mkdir -p "$LIBEXEC"
+install -m 0755 "$BIN" "$DEST_BIN"
+TMP_LINK="$LIBEXEC/.current.$$"
+ln -s "$DEST_BIN" "$TMP_LINK"
+mv -f "$TMP_LINK" "$LIBEXEC/current"
+# Convenience path used by hand-launches and the ocean TUI.
+mkdir -p "$HOME/.local/bin"
+ln -sfn "$LIBEXEC/current" "$HOME/.local/bin/ocean-daemon"
+# Keep the three newest artifacts; `current` always survives via its target.
+ls -t "$LIBEXEC"/ocean-daemon-* 2>/dev/null | tail -n +4 | while read -r old; do
+  [[ "$(readlink "$LIBEXEC/current")" == "$old" ]] || rm -f "$old"
+done
+echo "==> published $DEST_BIN (current -> $(readlink "$LIBEXEC/current"))"
+
 echo "==> [2/3] installing plist -> $PLIST_DST"
 mkdir -p "$HOME/Library/LaunchAgents"
 cp "$PLIST_SRC" "$PLIST_DST"

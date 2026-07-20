@@ -27,11 +27,17 @@ REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 # `set -u` before the clearer NEUTRAL_CWD diagnostics below can run.
 export PATH="${HOME:-}/.rustup/toolchains/stable-aarch64-apple-darwin/bin:${HOME:-}/.cargo/bin:/usr/local/bin:/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin:$PATH"
 
-BIN="$REPO/target/release/ocean-daemon"
+# TASK-7: the supervised binary is an IMMUTABLE installed artifact, never the
+# repo's mutable target/release/ output. A cargo build in the checkout (any
+# branch) must not be able to silently become the running daemon at the next
+# restart — that is exactly how the -dirty health revs happened. The installer
+# copies each build to a versioned path and atomically flips `current`.
+BIN="${OCEAN_DAEMON_BIN:-${HOME:-}/.local/libexec/ocean-daemon/current}"
 if [[ ! -x "$BIN" ]]; then
-  echo "FATAL: $BIN not found or not executable." >&2
-  echo "       Build it first (from MAIN):  cargo build -p ocean-daemon --release" >&2
-  echo "       (ops/install-ocean-daemon.sh does this for you.)" >&2
+  echo "FATAL: no installed daemon at $BIN." >&2
+  echo "       Run ops/install-ocean-daemon.sh (from MAIN) to build, install a" >&2
+  echo "       versioned artifact, and flip the 'current' symlink atomically." >&2
+  echo "       The repo's target/release/ output is deliberately NOT launched." >&2
   exit 127
 fi
 
