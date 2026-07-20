@@ -4677,4 +4677,11 @@ type:      [bug-report]
 area:      [backend]
 
 Fixed the landed P2 codex flagged on #330: SessionContext derived Default, so code_intelligence defaulted false and every SessionContext::default() caller silently lost the lsp tool — the exact opposite of the field's documented contract (the field itself entered #330 via an over-broad git add -A sweeping a sibling lane's edit; process note recorded, explicit-path staging from here). Manual Default impl now keeps code_intelligence true while harness gates (hashline/artifacts) stay opt-in as daemon-granted capabilities. Codex's P1 on the same PR was stale — it reviewed an intermediate commit; merged code compiles green on all four rows. runtime+lsp+plugin suites 237 green, clippy zero, fmt clean.
+time:      [19:15] [20-07-26]
+agent:     [claude] [fable 5]
+worktree:  fix/task27-p2c-deadline
+type:      [bug-report]
+area:      [testing]
+
+Third shared-CI-tax flake closed (pad TASK-27, failed #331's ubuntu row from a diff touching only ocean-runtime): p2c_startup_attempts_every_pending_row_beyond_128 gave 5s for 129 sequential redeem round-trips — sub-second solo, starved on a saturated runner. Deadline raised to 60s with rationale pinned in-comment; the poll loop is progress-guaranteed so the generous budget costs nothing when healthy. Test green, fmt clean.
 _________________________________________________________________________________

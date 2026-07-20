@@ -4716,7 +4716,13 @@ mod tests {
         let supervisor = test_control_supervisor(&base, rooms.clone());
 
         supervisor.startup().await;
-        tokio::time::timeout(Duration::from_secs(5), async {
+        // 60s, not 5s: 129 sequential redeem round-trips finish in well under a
+        // second solo, but a saturated CI runner sharing 500+ parallel tests
+        // starves this task — the tight deadline failed #331's ubuntu row on a
+        // diff touching only ocean-runtime (TASK-27). The loop is
+        // progress-guaranteed, so a generous deadline costs nothing when
+        // healthy and only trades flake for latency under pathological load.
+        tokio::time::timeout(Duration::from_secs(60), async {
             loop {
                 let attempts = fake
                     .calls
