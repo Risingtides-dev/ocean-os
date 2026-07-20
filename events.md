@@ -4646,3 +4646,19 @@ area:      [infra]
 
 First full production run of the new deploy path, end to end green: ops/install-ocean-daemon.sh built from a clean current main checkout, published ocean-daemon-5ee45bd3df28 to libexec, flipped current atomically, waited out the async bootout (TASK-22 path), bootstrapped, and proved /health before exiting — daemon now serves main tip 5ee45bd3 under the machine-neutral launch.sh from #321, with the TASK-23 supervision guard armed for every future start. The reported rev carries a false -dirty from an untracked docs dir (ticket filed: dirty detection should ignore untracked). Pre-deploy: committed my orphaned events.md ledger appends as 5ee45bd3 so the checkout could sync.
 _________________________________________________________________________________
+time:      [16:20] [20-07-26]
+agent:     [claude] [fable 5]
+worktree:  fix/task25-dirty-ignores-untracked
+type:      [bug-report]
+area:      [infra]
+
+Fixed the false -dirty rev stamp (pad TASK-25, observed on today's 5ee45bd3 deploy): build.rs judged dirtiness by bare git status --porcelain, which counts untracked files that cannot alter the compiled binary — a stray untracked docs dir made a byte-identical-to-main build report a rev operators couldn't trust. Now --untracked-files=no: only modified tracked files dirty the stamp. Verified both directions in a live worktree (untracked-only excluded; tracked modification counted); cargo check green. Doc comment records the rationale and incident.
+_________________________________________________________________________________
+time:      [16:20] [20-07-26]
+agent:     [claude] [fable 5]
+worktree:  fix/task25-dirty-ignores-untracked
+type:      [bug-report]
+area:      [infra]
+
+Fixed the rev stamp so -dirty means modified TRACKED content, not the mere presence of untracked files (pad TASK-25). Real cost of the old behavior: during this morning's deploy incident a worktree byte-identical to main stamped itself -dirty purely because an unrelated untracked directory existed, and I burned a chunk of the investigation treating that as evidence of unreviewed code in production. build.rs now uses git diff-index --quiet HEAD (tracked paths only) instead of git status --porcelain, preceded by git update-index --refresh because diff-index compares stat metadata and every fresh deploy worktree has rewritten mtimes that would otherwise report false modifications; the refresh command's exit status is deliberately ignored since nonzero there means "files needed refreshing", the normal case. diff-index exit codes are matched explicitly (0 clean, 1 dirty, anything else -> unknown) rather than treated as a boolean. Verified BOTH directions on a real build: untracked-only tree stamps clean (837d099f413c), tracked modification stamps 837d099f413c-dirty.
+_________________________________________________________________________________

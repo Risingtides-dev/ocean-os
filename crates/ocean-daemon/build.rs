@@ -5,7 +5,8 @@
 //! and provenance the daemon's launchd supervisor can't otherwise prove.
 //!
 //! - `git rev-parse --short=12 HEAD` -> the short sha.
-//! - `git status --porcelain` non-empty -> append `-dirty`.
+//! - `git diff-index HEAD` reports modified TRACKED files -> append `-dirty`.
+//!   Untracked files are deliberately NOT dirt (TASK-25).
 //! - Any git failure (no git on PATH, nonzero status, empty sha) -> `unknown`,
 //!   so a deployed binary can never claim a precise commit it cannot prove.
 
@@ -74,16 +75,35 @@ fn try_build_rev() -> Option<String> {
     if sha.is_empty() {
         return None;
     }
-    // A failed `status` (spawn error or nonzero) means dirtiness is unverifiable:
-    // fall back to `unknown` for the whole rev rather than risk stamping a
-    // clean-looking sha for a worktree we couldn't actually inspect.
+    // Dirtiness means MODIFIED TRACKED CONTENT — not the presence of untracked
+    // files (TASK-25). `git status --porcelain` reports untracked paths too, so
+    // a stray build artifact or an unrelated scratch directory made a build
+    // whose tracked tree is byte-identical to main stamp itself `-dirty`,
+    // which then reads as "someone deployed unreviewed code" during an
+    // incident. `diff-index` compares the working tree against HEAD over
+    // tracked paths only.
+    //
+    // `update-index --refresh` first: diff-index compares stat metadata, so a
+    // fresh checkout with rewritten mtimes (every deploy worktree) reports
+    // false modifications until the index is refreshed. Its exit status is
+    // deliberately ignored — it is nonzero exactly when it finds files needing
+    // refresh, which is the normal case here, not an error.
+    let _ = std::process::Command::new("git")
+        .args(["update-index", "--refresh"])
+        .output();
+    // A failed `diff-index` (spawn error or an unexpected exit) means dirtiness
+    // is unverifiable: fall back to `unknown` for the whole rev rather than
+    // risk stamping a clean-looking sha for a worktree we couldn't inspect.
     let status = std::process::Command::new("git")
-        .args(["status", "--porcelain"])
-        .output()
+        .args(["diff-index", "--quiet", "HEAD", "--"])
+        .status()
         .ok()?;
-    if !status.status.success() {
-        return None;
-    }
-    let dirty = !String::from_utf8_lossy(&status.stdout).trim().is_empty();
+    // diff-index --quiet: 0 = clean, 1 = tracked modifications, anything else
+    // is a real failure.
+    let dirty = match status.code() {
+        Some(0) => false,
+        Some(1) => true,
+        _ => return None,
+    };
     Some(if dirty { format!("{sha}-dirty") } else { sha })
 }
