@@ -4700,3 +4700,11 @@ area:      [infra]
 
 Deployed the voice bounded-project-reads landing (3a670edf, direct-to-main, main CI green before deploy): idle-window installer run, artifact ocean-daemon-3a670edfe553 published + current flipped, /health confirms rev 3a670edfe553 CLEAN — first deploy where the rev stamp correctly ignores the untracked docs dir (TASK-25 proving itself in production). Voice project reads now servable.
 _________________________________________________________________________________
+time:      [20:40] [20-07-26]
+agent:     [claude] [fable 5]
+worktree:  fix/herdr-marker-wait-flake
+type:      [bug-report]
+area:      [testing]
+
+Killed a flake in ocean-tui shell::herdr::tests::session_bind_reports_agent_session_id, found while running the full-workspace gate locally to verify the #333 security fix independent of stuck hosted CI. wait_for_marker polled a spawned subprocess's marker file for 50*20ms=1s then did a hard read_to_string().expect(); under full-suite parallel load the fake-herdr spawn can take longer than a second to land its write, so the final expect panicked. Passes 4/4 solo, fails only under parallelism — a load-dependent timing flake in a crate the security PR does not touch. Widened the budget to 5s and made it deadline-based (keep polling to the deadline, panic with a clear message only if the content never arrives) rather than asserting on one last read. Kept as its OWN PR, not bundled into #333, same discipline as the walker flake vs TASK-21. 397 ocean-tui tests green, clippy zero.
+_________________________________________________________________________________

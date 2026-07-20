@@ -699,7 +699,13 @@ mod tests {
 
     #[cfg(unix)]
     fn wait_for_marker(path: &std::path::Path) -> String {
-        for _ in 0..50 {
+        // Waits for a spawned subprocess to write its marker file. The old
+        // 1s budget (50 * 20ms) plus a hard `.expect()` on the final read
+        // flaked under full-suite parallel load, where the fake-herdr spawn
+        // can take longer than a second to land its write. Widen the budget
+        // to 5s and keep polling to the deadline instead of asserting on one
+        // last read — the content check, not the clock, decides success.
+        for _ in 0..250 {
             if let Ok(contents) = std::fs::read_to_string(path) {
                 if !contents.trim().is_empty() {
                     return contents;
@@ -707,6 +713,6 @@ mod tests {
             }
             std::thread::sleep(Duration::from_millis(20));
         }
-        std::fs::read_to_string(path).expect("marker written")
+        panic!("marker at {} was not written within 5s", path.display())
     }
 }
