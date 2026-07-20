@@ -1848,6 +1848,35 @@ mod tests {
     }
 
     #[test]
+    fn oversized_single_schema_is_excluded_as_schema_too_large() {
+        // TASK-17 review follow-up: a schema past the 128-KiB per-tool cap is
+        // rejected with its own reason even when the registry and the 512-KiB
+        // declaration budget both have room.
+        let tools = vec![ocean_protocol::Tool {
+            name: "oversized".into(),
+            description: "x".repeat(MAX_DYNAMIC_TOOL_SCHEMA_BYTES + 1),
+            parameters: serde_json::json!({"type": "object"}),
+        }];
+        let mut loaded = HashSet::new();
+        let result = search_dynamic_tools(
+            &tools,
+            &mut loaded,
+            &serde_json::json!({"query": "oversized"}),
+        )
+        .expect("search succeeds");
+        let json: Value = serde_json::from_str(&result).expect("JSON result");
+        let entry = &json["matches"].as_array().expect("matches")[0];
+        assert_eq!(entry["name"], "oversized");
+        assert_eq!(entry["loaded"], false);
+        assert_eq!(entry["excluded_reason"], "schema_too_large");
+        assert_eq!(json["excluded_count"], 1);
+        assert!(
+            loaded.is_empty(),
+            "rejected schema must not enter the registry"
+        );
+    }
+
+    #[test]
     fn dynamic_tool_search_enforces_the_512_kib_schema_budget() {
         let tools: Vec<ocean_protocol::Tool> = (0..8)
             .map(|index| ocean_protocol::Tool {

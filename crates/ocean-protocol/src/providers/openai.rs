@@ -2110,10 +2110,13 @@ mod tests {
             .expect("sixteen dynamic tools are within bounds");
         let error = super::build_body(&model, &declaration(17), &StreamOptions::default())
             .expect_err("seventeen dynamic tools must fail closed");
-        assert!(
-            error.to_string().contains("16-tool/512-KiB"),
-            "typed bound error names the limits, got: {error}"
-        );
+        match error {
+            crate::Error::Other(message) => assert_eq!(
+                message,
+                "dynamic tool declarations exceed the 16-tool/512-KiB request bounds"
+            ),
+            other => panic!("expected Error::Other with the exact bound message, got {other:?}"),
+        }
     }
 
     #[test]
@@ -2156,10 +2159,13 @@ mod tests {
             &StreamOptions::default(),
         )
         .expect_err("one byte past 512 KiB must fail closed");
-        assert!(
-            error.to_string().contains("16-tool/512-KiB"),
-            "typed bound error names the limits, got: {error}"
-        );
+        match error {
+            crate::Error::Other(message) => assert_eq!(
+                message,
+                "dynamic tool declarations exceed the 16-tool/512-KiB request bounds"
+            ),
+            other => panic!("expected Error::Other with the exact bound message, got {other:?}"),
+        }
     }
 
     #[test]
