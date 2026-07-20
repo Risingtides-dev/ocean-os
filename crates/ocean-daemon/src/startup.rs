@@ -410,15 +410,18 @@ fn configured_providers() -> Vec<&'static str> {
 // escape hatch for deliberately supervisor-free runs (dev boxes, tests).
 
 /// The launchd job label whose ownership of the port this guard enforces.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 pub const LAUNCHD_LABEL: &str = "dev.risingtides.ocean-daemon";
 
 /// Probe result for the launchd job: `None` = no job registered;
 /// `Some(None)` = job registered but not currently running;
 /// `Some(Some(pid))` = job running as `pid`.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 pub type LaunchdJob = Option<Option<u32>>;
 
 /// What the supervision guard decided at boot.
 #[derive(Debug, PartialEq, Eq)]
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 pub enum SupervisionVerdict {
     /// Bind normally.
     Proceed,
@@ -432,6 +435,7 @@ pub enum SupervisionVerdict {
 /// Pure decision: refuse whenever the launchd job exists and this process is
 /// not the one it launched — including a registered-but-idle job, which
 /// launchd may kickstart onto the port at any moment.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 pub fn supervision_verdict(
     job: LaunchdJob,
     self_pid: u32,
@@ -448,6 +452,7 @@ pub fn supervision_verdict(
 }
 
 /// Extract `pid = N` from `launchctl print` output. Absent for idle jobs.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 pub fn parse_launchd_pid(output: &str) -> Option<u32> {
     output.lines().find_map(|line| {
         let trimmed = line.trim();
