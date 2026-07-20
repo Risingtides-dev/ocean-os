@@ -6675,6 +6675,9 @@ async fn agent_turn(
     // W3 harness profile: surfaces whose effective profile grants it spill
     // oversized output to session artifacts; voice stays plain.
     .with_artifact_spill(harness_caps.artifact_spill)
+    // TASK-26: voice turns don't get the `lsp` tool — spoken replies can't
+    // carry definitions/references/diagnostics.
+    .with_code_intelligence(harness_caps.code_intelligence)
     .with_event_sink(event_tx)
     // Per-turn reasoning override (OCEAN-28/41): threads the optional
     // request `thinking_level` into this turn's config only, leaving the

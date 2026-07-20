@@ -43,6 +43,7 @@ async fn hashline_read_then_edit_roundtrip() {
         session_id: Some("s-hl".into()),
         hashline: true,
         artifacts: false,
+        code_intelligence: true,
     };
 
     // 1. read emits a [path#HASH] tag.
@@ -113,6 +114,7 @@ async fn repeated_noop_hashline_edit_trips_the_loop_guard() {
         session_id: Some("s-noop".into()),
         hashline: true,
         artifacts: false,
+        code_intelligence: true,
     };
 
     // Read to record a snapshot + get the live tag.
@@ -188,6 +190,7 @@ async fn non_hashline_profile_is_untagged_and_has_no_edit_tool() {
         session_id: Some("s-plain".into()),
         hashline: false,
         artifacts: false,
+        code_intelligence: true,
     };
 
     let read = tool_named(&provider, &ctx, "read")

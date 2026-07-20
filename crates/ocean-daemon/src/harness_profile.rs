@@ -38,6 +38,11 @@ pub struct EffectiveHarnessCapabilities {
     pub hashline_edits: bool,
     /// Spill oversized tool results and expose their `artifact://` recovery URI.
     pub artifact_spill: bool,
+    /// Offer the `lsp` code-intelligence tool (TASK-26). Voice turns cannot use
+    /// it: definitions, references, and diagnostics are dense structured text
+    /// that is unusable when spoken, and the tool's own registration cost is
+    /// pointless on a surface that will never render it.
+    pub code_intelligence: bool,
 }
 
 impl HarnessProfile {
@@ -64,7 +69,7 @@ impl HarnessProfile {
         }
     }
 
-    /// Return the two effective gates applied to `PromptControl` for this turn.
+    /// Return the effective gates applied to `PromptControl` for this turn.
     ///
     /// This matrix is behavior-compatible with the pre-reconciliation code:
     /// ACP previously fell through to CLI, and both profiles had these two gates
@@ -75,14 +80,17 @@ impl HarnessProfile {
             Self::Tui | Self::Cli | Self::Acp => EffectiveHarnessCapabilities {
                 hashline_edits: true,
                 artifact_spill: true,
+                code_intelligence: true,
             },
             Self::Web => EffectiveHarnessCapabilities {
                 hashline_edits: false,
                 artifact_spill: true,
+                code_intelligence: true,
             },
             Self::Voice => EffectiveHarnessCapabilities {
                 hashline_edits: false,
                 artifact_spill: false,
+                code_intelligence: false,
             },
         }
     }
@@ -117,15 +125,15 @@ mod tests {
         // Source anchors: ocean-tui/shell, ocean-cli, ocean-acp/daemon,
         // daemon voice adapters + persistent_rooms, and ocean-heartbeat.
         let cases = [
-            ("tui", HarnessProfile::Tui, true, true),
-            ("cli", HarnessProfile::Cli, true, true),
-            ("acp-zed", HarnessProfile::Acp, true, true),
-            ("leo-voice", HarnessProfile::Voice, false, false),
-            ("call-voice", HarnessProfile::Voice, false, false),
-            ("room", HarnessProfile::Cli, true, true),
-            ("heartbeat", HarnessProfile::Cli, true, true),
+            ("tui", HarnessProfile::Tui, true, true, true),
+            ("cli", HarnessProfile::Cli, true, true, true),
+            ("acp-zed", HarnessProfile::Acp, true, true, true),
+            ("leo-voice", HarnessProfile::Voice, false, false, false),
+            ("call-voice", HarnessProfile::Voice, false, false, false),
+            ("room", HarnessProfile::Cli, true, true, true),
+            ("heartbeat", HarnessProfile::Cli, true, true, true),
         ];
-        for (client_type, profile, hashline_edits, artifact_spill) in cases {
+        for (client_type, profile, hashline_edits, artifact_spill, code_intelligence) in cases {
             let resolved = HarnessProfile::from_client_type(Some(client_type));
             assert_eq!(resolved, profile, "client_type={client_type}");
             assert_eq!(
@@ -133,6 +141,7 @@ mod tests {
                 EffectiveHarnessCapabilities {
                     hashline_edits,
                     artifact_spill,
+                    code_intelligence,
                 },
                 "client_type={client_type}"
             );
@@ -169,6 +178,7 @@ mod tests {
         let full = EffectiveHarnessCapabilities {
             hashline_edits: true,
             artifact_spill: true,
+            code_intelligence: true,
         };
         assert_eq!(HarnessProfile::Tui.effective_capabilities(), full);
         assert_eq!(HarnessProfile::Acp.effective_capabilities(), full);
@@ -178,6 +188,7 @@ mod tests {
             EffectiveHarnessCapabilities {
                 hashline_edits: false,
                 artifact_spill: true,
+                code_intelligence: true,
             }
         );
         assert_eq!(
@@ -185,6 +196,7 @@ mod tests {
             EffectiveHarnessCapabilities {
                 hashline_edits: false,
                 artifact_spill: false,
+                code_intelligence: false,
             }
         );
     }

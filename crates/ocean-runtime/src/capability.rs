@@ -97,6 +97,11 @@ pub struct SessionContext {
     /// (web/voice) so their tool contract is unchanged. Resolved per-turn from
     /// the daemon's `HarnessProfile`.
     pub hashline: bool,
+    /// Whether the `lsp` code-intelligence tool may be offered this turn.
+    /// False for voice, whose spoken replies cannot carry definitions,
+    /// references, or diagnostics (TASK-26). Defaults true so every existing
+    /// construction keeps today's behavior.
+    pub code_intelligence: bool,
     /// Artifact-spill harness capability (W3 / harness profiles). When true,
     /// every tool's oversized text output is truncated for the model with an
     /// explicit notice and the full output is spilled to the session artifact
@@ -559,6 +564,7 @@ mod tests {
             session_id: Some("test-session".into()),
             hashline: false,
             artifacts: false,
+            code_intelligence: true,
         }
     }
 
@@ -940,6 +946,7 @@ mod tests {
             session_id: None,
             hashline: false,
             artifacts: false,
+            code_intelligence: true,
         };
         let got = provider.tools(&no_sess).await;
         let wait = got
@@ -999,6 +1006,7 @@ mod tests {
             session_id: None,
             hashline: false,
             artifacts: false,
+            code_intelligence: true,
         };
         let got = provider.tools(&no_sess).await;
         let tool = got
