@@ -2093,6 +2093,51 @@ mod tests {
     }
 
     #[test]
+    fn seventeen_dynamic_tools_fail_the_wire_bound() {
+        // TASK-18: pin the 16-tool request bound with a direct 17-tool case —
+        // exactly 16 passes, the 17th trips the typed guard.
+        let model = kimi_model("kimi-k3");
+        let declaration = |count: usize| Context {
+            dynamic_tool_declarations: vec![crate::types::DynamicToolDeclaration {
+                tools: (0..count)
+                    .map(|index| dynamic_tool(&format!("tool{index:02}")))
+                    .collect(),
+                before_message: 0,
+            }],
+            ..Default::default()
+        };
+        super::build_body(&model, &declaration(16), &StreamOptions::default())
+            .expect("sixteen dynamic tools are within bounds");
+        let error = super::build_body(&model, &declaration(17), &StreamOptions::default())
+            .expect_err("seventeen dynamic tools must fail closed");
+        assert!(
+            error.to_string().contains("16-tool/512-KiB"),
+            "typed bound error names the limits, got: {error}"
+        );
+    }
+
+    #[test]
+    fn oversized_dynamic_schema_fails_the_wire_bound() {
+        // TASK-18: pin the 512-KiB request bound with a schema that crosses it.
+        let model = kimi_model("kimi-k3");
+        let mut huge = dynamic_tool("huge");
+        huge.description = "x".repeat(512 * 1024 + 1);
+        let context = Context {
+            dynamic_tool_declarations: vec![crate::types::DynamicToolDeclaration {
+                tools: vec![huge],
+                before_message: 0,
+            }],
+            ..Default::default()
+        };
+        let error = super::build_body(&model, &context, &StreamOptions::default())
+            .expect_err("oversized dynamic schema must fail closed");
+        assert!(
+            error.to_string().contains("16-tool/512-KiB"),
+            "typed bound error names the limits, got: {error}"
+        );
+    }
+
+    #[test]
     fn dynamic_tools_fail_closed_for_kimi_k2_and_other_models() {
         let context = Context {
             dynamic_tool_declarations: vec![crate::types::DynamicToolDeclaration {
