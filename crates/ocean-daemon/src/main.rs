@@ -3012,29 +3012,59 @@ async fn skills_fetch(Json(req): Json<SkillFetchRequest>) -> (StatusCode, Json<s
             // symlinks during the walk; this closes the same hole on the
             // cached-then-retargeted path.
             Some(brief) => {
-                match std::fs::symlink_metadata(&brief.source_path) {
-                    // A symlink where the index recorded a real skill file is
-                    // never legitimate — fail closed and say why.
-                    Ok(meta) if meta.file_type().is_symlink() => {
-                        tracing::warn!(
-                            path = %brief.source_path.display(),
-                            "refusing skill fetch: indexed path is now a symlink"
-                        );
-                        SkillFetchOutcome::Unreadable {
-                            error: "indexed skill path is no longer a regular file".to_string(),
+                // Re-validate at READ time, not just index time.
+                //
+                // The index is cached per TTL window, so an entry can name a
+                // path that was a regular file during the walk and has since
+                // been retargeted. `read_to_string` follows symlinks — in the
+                // FINAL component and in every ANCESTOR directory — so the only
+                // sound check is to fully resolve the path and require that it
+                // still lands inside a configured skill root. `symlink_metadata`
+                // alone is NOT sufficient: it leaves the final component
+                // unfollowed but happily resolves a parent directory that was
+                // swapped for a symlink.
+                //
+                // This matters beyond an operator footgun because
+                // `SkillRoots::for_cwd` adds the REPO-LOCAL `<cwd>/skills` root:
+                // an untrusted repository can ship the link, so the writer need
+                // not be the operator.
+                let allowed: Vec<std::path::PathBuf> = [
+                    roots.ocean.as_ref(),
+                    roots.spawner.as_ref(),
+                    roots.codex.as_ref(),
+                    roots.repo.as_ref(),
+                ]
+                .into_iter()
+                .flatten()
+                // Roots themselves may legitimately BE symlinks (a symlinked
+                // ~/.codex/skills is normal), so compare resolved-to-resolved.
+                .filter_map(|root| std::fs::canonicalize(root).ok())
+                .collect();
+                match std::fs::canonicalize(&brief.source_path) {
+                    Ok(resolved)
+                        if allowed.iter().any(|root| resolved.starts_with(root)) =>
+                    {
+                        // Resolved and still inside a skill root: a symlink
+                        // anywhere in the path led somewhere legitimate.
+                        match std::fs::read_to_string(&resolved) {
+                            Ok(body) => SkillFetchOutcome::Found { brief, body },
+                            // Genuine TOCTOU race: vanished/perms changed after
+                            // the index walk.
+                            Err(err) => SkillFetchOutcome::Unreadable {
+                                error: err.to_string(),
+                            },
                         }
                     }
-                    Ok(meta) if !meta.is_file() => SkillFetchOutcome::Unreadable {
-                        error: "indexed skill path is no longer a regular file".to_string(),
-                    },
-                    Ok(_) => match std::fs::read_to_string(&brief.source_path) {
-                        Ok(body) => SkillFetchOutcome::Found { brief, body },
-                        // A read failure here is a TOCTOU race (file
-                        // vanished/changed perms after the index walk).
-                        Err(err) => SkillFetchOutcome::Unreadable {
-                            error: err.to_string(),
-                        },
-                    },
+                    Ok(resolved) => {
+                        tracing::warn!(
+                            indexed = %brief.source_path.display(),
+                            resolved = %resolved.display(),
+                            "refusing skill fetch: indexed path now resolves outside every skill root"
+                        );
+                        SkillFetchOutcome::Unreadable {
+                            error: "indexed skill path resolves outside the skill roots".to_string(),
+                        }
+                    }
                     Err(err) => SkillFetchOutcome::Unreadable {
                         error: err.to_string(),
                     },
@@ -8485,6 +8515,42 @@ mod tests {
         assert!(
             refused,
             "a retargeted skill path must never be read through"
+        );
+    }
+
+    /// Codex P1 on #333: the FIRST version of this guard used
+    /// `symlink_metadata`, which leaves only the FINAL component unfollowed —
+    /// swapping an ANCESTOR directory for a symlink walked straight past it.
+    /// Only full resolution plus root containment closes that.
+    #[test]
+    fn skill_fetch_refuses_a_symlinked_ancestor_directory() {
+        let root = tempfile::tempdir().expect("root");
+        let outside = tempfile::tempdir().expect("outside");
+        let skills = root.path().join("skills");
+        std::fs::create_dir_all(skills.join("a")).expect("mkdir");
+        std::fs::write(skills.join("a/SKILL.md"), "real").expect("write real");
+        std::fs::write(outside.path().join("SKILL.md"), "CANARY-SECRET").expect("write secret");
+
+        // Retarget the ANCESTOR: skills/a becomes a symlink elsewhere.
+        std::fs::remove_dir_all(skills.join("a")).expect("rm dir");
+        std::os::unix::fs::symlink(outside.path(), skills.join("a")).expect("symlink dir");
+        let indexed = skills.join("a/SKILL.md");
+
+        // The naive check PASSES here — which is precisely why it was unsound.
+        let naive_ok = std::fs::symlink_metadata(&indexed)
+            .map(|m| !m.file_type().is_symlink() && m.is_file())
+            .unwrap_or(false);
+        assert!(
+            naive_ok,
+            "fixture must defeat the symlink_metadata-only check to be meaningful"
+        );
+
+        // The shipped check refuses: resolution escapes the skill root.
+        let canonical_root = std::fs::canonicalize(&skills).expect("canonical skills root");
+        let resolved = std::fs::canonicalize(&indexed).expect("resolve");
+        assert!(
+            !resolved.starts_with(&canonical_root),
+            "a symlinked ancestor must be caught by root containment"
         );
     }
 
