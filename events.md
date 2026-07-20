@@ -4577,3 +4577,11 @@ area:      [backend]
 
 Closed both K3 bound-enforcement gaps from pi's TASK-16 live-validation audit. TASK-17: runtime search_dynamic_tools no longer silently continues past budget-rejected matches — every ranked match the 16-tool/512-KiB budgets exclude is reported as loaded:false with a machine-readable excluded_reason (tool_limit / schema_too_large / byte_budget) plus a top-level excluded_count, so callers see exactly what was withheld. TASK-18: direct typed wire-bound regressions in the protocol layer — 16 dynamic tools pass and a 17th fails closed; a 512-KiB+1 schema fails closed; both assert the typed error names the limits. Existing cap tests extended to pin the new exclusion contract. All runtime+protocol tests green, clippy zero, fmt applied.
 _________________________________________________________________________________
+time:      [02:05] [20-07-26]
+agent:     [claude] [fable 5]
+worktree:  infra/task15-launcher-cutover
+type:      [refactor]
+area:      [infra]
+
+TASK-15: supervision fully decoupled from the dev checkout. The committed plist is now a machine-neutral template (killed three fossilized /Users/smathdaddy-macbook absolute paths that would have clobbered the hand-fixed installed plist on any reinstall); the installer renders the home placeholder at install time with an unexpanded-placeholder guard, publishes deploy/ocean-daemon.sh as ~/.local/libexec/ocean-daemon/launch.sh, and the rendered plist execs that copy — working-tree state can never again affect supervision, same isolation as the TASK-7 binary artifact. Launcher's dead REPO derivation removed. Installer's build-from-main guard now accepts detached worktrees whose HEAD is contained in origin/main and hard-fails any tracked modification, matching how deploys actually run. bash -n both scripts, sandbox plist render lint-clean.
+_________________________________________________________________________________

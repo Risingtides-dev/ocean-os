@@ -1,7 +1,10 @@
 #!/usr/bin/env bash
 # Supervised launcher for the Ocean daemon (OCEAN-253).
 #
-# This is the entrypoint launchd execs (via dev.risingtides.ocean-daemon.plist).
+# launchd execs the installed COPY of this script at
+# ~/.local/libexec/ocean-daemon/launch.sh (rendered plist points there), so a
+# dev checkout's working-tree state can never affect supervision (TASK-15).
+# The repo copy is the source of truth; the installer refreshes the copy.
 # It exec's the PREBUILT release binary with the production env. A supervised
 # service must respawn fast and deterministically, so this script does NOT run
 # `cargo build` — the binary is built once at install time (see
@@ -16,9 +19,6 @@
 # cwd invalid, so we run from $HOME instead. BIN is resolved absolutely, so
 # repo-cwd isn't needed to find the binary. Override via OCEAN_DAEMON_CWD.
 set -euo pipefail
-
-# Repo root = parent of this deploy/ dir, resolved absolutely (symlink-safe).
-REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
 # Toolchain + common bins on PATH (launchd starts with a minimal PATH). The
 # daemon shells out to tools (git, ripgrep, etc.) for its own tool calls, so a
