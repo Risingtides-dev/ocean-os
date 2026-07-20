@@ -795,6 +795,39 @@ async fn main() -> anyhow::Result<()> {
         }
     }
 
+    // TASK-23: when launchd owns the dev.risingtides.ocean-daemon job, only the
+    // process launchd launched may bind. Long-lived TUIs carry old autostart
+    // code in memory, so this invariant cannot be enforced client-side —
+    // installing a fixed binary never upgrades running processes. Exit 0: for a
+    // supervised box a second daemon is an intentional no-op, not an error.
+    // `OCEAN_UNSUPERVISED=1` is the explicit dev/test escape hatch.
+    #[cfg(target_os = "macos")]
+    {
+        let unsupervised = matches!(
+            env::var("OCEAN_UNSUPERVISED").as_deref(),
+            Ok("1") | Ok("true") | Ok("yes") | Ok("on")
+        );
+        match startup::supervision_verdict(
+            startup::probe_launchd_job(startup::LAUNCHD_LABEL),
+            std::process::id(),
+            unsupervised,
+        ) {
+            startup::SupervisionVerdict::Proceed => {}
+            startup::SupervisionVerdict::RefuseForeignSupervisor { job_pid } => {
+                eprintln!(
+                    "ocean-daemon: launchd owns the {} job{} — refusing to bind; the \
+                     supervised instance serves this box. Set OCEAN_UNSUPERVISED=1 for a \
+                     deliberate supervisor-free run.",
+                    startup::LAUNCHD_LABEL,
+                    job_pid
+                        .map(|pid| format!(" (running as pid {pid})"))
+                        .unwrap_or_else(|| " (registered, not running)".to_string()),
+                );
+                return Ok(());
+            }
+        }
+    }
+
     let bind = env::var("OCEAN_BIND").unwrap_or_else(|_| "127.0.0.1:4780".to_string());
 
     // The Longhouse read-side topic registry. Built BEFORE the runtime so the
