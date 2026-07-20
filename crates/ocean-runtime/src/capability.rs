@@ -85,7 +85,7 @@ impl SessionTodos {
 /// *only* a selection hint: a provider can vary its toolset by workspace or
 /// session. Built-ins ignore it. Kept deliberately small; grow it (room id,
 /// selected skills) rather than inventing a parallel context type.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct SessionContext {
     /// Working directory for this turn.
     pub cwd: PathBuf,
@@ -110,6 +110,24 @@ pub struct SessionContext {
     /// off for voice; direct legacy callers default off. Resolved per-turn from
     /// the daemon's effective `HarnessProfile`.
     pub artifacts: bool,
+}
+
+/// Manual impl because `code_intelligence` must default TRUE: the derived
+/// `Default` would hand every `SessionContext::default()` caller `false` and
+/// silently strip the `lsp` tool from direct/legacy paths — the exact
+/// contract violation codex flagged on #330. Harness gates (`hashline`,
+/// `artifacts`) stay default-off: they are daemon-granted capabilities, not
+/// baseline behavior.
+impl Default for SessionContext {
+    fn default() -> Self {
+        Self {
+            cwd: PathBuf::new(),
+            session_id: None,
+            hashline: false,
+            code_intelligence: true,
+            artifacts: false,
+        }
+    }
 }
 
 /// Coarse health of a capability provider, surfaced for diagnostics.
