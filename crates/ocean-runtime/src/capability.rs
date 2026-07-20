@@ -177,7 +177,6 @@ pub struct BuiltinProvider {
     /// `read artifact://` in a later turn share one store — same shape as
     /// `snapshots` above.
     artifacts: std::sync::Mutex<std::collections::HashMap<String, SharedArtifacts>>,
-    code_intelligence: true,
     /// Session-scoped no-op loop guards, keyed by session id. Same lifetime
     /// shape as `snapshots`: a `hashline_edit` that repeats the identical
     /// changeless patch across turns of one session accumulates against one
@@ -197,7 +196,6 @@ impl BuiltinProvider {
             tools: default_tools(),
             snapshots: std::sync::Mutex::new(std::collections::HashMap::new()),
             artifacts: std::sync::Mutex::new(std::collections::HashMap::new()),
-            code_intelligence: true,
             noop_guards: std::sync::Mutex::new(std::collections::HashMap::new()),
             todos: std::sync::Mutex::new(SessionTodos::default()),
         }
