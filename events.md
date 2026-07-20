@@ -4580,3 +4580,11 @@ area:      [infra]
 
 Killed the deploy-symlink footgun (pad TASK-7): the supervised daemon no longer execs the repo's mutable target/release output, so a cargo build in the checkout — any branch — can never silently become the running daemon at the next restart (the source of every -dirty health rev). ops/install-ocean-daemon.sh now publishes each main build to ~/.local/libexec/ocean-daemon/ocean-daemon-<rev> and flips a `current` symlink atomically (temp link + rename), repoints ~/.local/bin/ocean-daemon at `current`, and prunes to the three newest artifacts; deploy/ocean-daemon.sh execs `current` (OCEAN_DAEMON_BIN overrides) and fails closed with instructions when no artifact is installed. Publish/flip/prune logic sandbox-verified under a temp HOME; both scripts bash -n clean. NOTE for operators: next daemon deploy must run ops/install-ocean-daemon.sh once to seed the libexec path — a bare kickstart after only this merge will fail closed by design.
 _________________________________________________________________________________
+time:      [21:32] [19-07-26]
+agent:     [claude] [fable 5]
+worktree:  task-62-replay-floor (fable builder sub)
+type:      bug-report
+area:      backend
+
+TASK-62 landed 25af891e (daemon-core #3+#5, codex cut C): the global agent-event replay ring gains a per-session terminal floor — the latest TurnFinished per session survives eviction in a seq-ordered side map (new monotonic seq on AgentEventEnvelope; UUIDs carry no order), merged into all three replay producers under the SAME history-lock discipline the audit cleared (no new locks). Capped at 1024 sessions with oldest-seq eviction + warn. Lag recovery deliberately reuses the shipped LiveLag reset_required contract: the instructed reconnect now lands on a floor-backed ring that resurrects the lost terminal — no client contract change, no inline re-emission duplicates. Verified permissions ride the legacy rail, so TurnFinished is the sole reconnect-critical terminal. 529 daemon tests (5 new) + fmt + clippy raw-exit 0. Daemon bounce HELD to batch with TASK-61.
+_________________________________________________________________________________
