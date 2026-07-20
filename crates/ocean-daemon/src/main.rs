@@ -2999,14 +2999,47 @@ async fn skills_fetch(Json(req): Json<SkillFetchRequest>) -> (StatusCode, Json<s
             .cloned();
 
         match matched {
-            // Known skill: read its full body. A read failure here is a TOCTOU
-            // race (file vanished/changed perms after the index walk).
-            Some(brief) => match std::fs::read_to_string(&brief.source_path) {
-                Ok(body) => SkillFetchOutcome::Found { brief, body },
-                Err(err) => SkillFetchOutcome::Unreadable {
-                    error: err.to_string(),
-                },
-            },
+            // Known skill: read its full body — but re-validate the path at
+            // READ time, not just at index time.
+            //
+            // The index is cached per TTL window, so an entry can name a path
+            // that was a regular file during the walk and is a SYMLINK now.
+            // `read_to_string` follows symlinks, so without this check a
+            // retargeted entry turns an indexed skill path into an arbitrary
+            // file read — and skill roots include the REPO-LOCAL `<cwd>/skills`
+            // (`SkillRoots::for_cwd`), so the writer need not be the operator:
+            // an untrusted repo could ship one. The loader already skips
+            // symlinks during the walk; this closes the same hole on the
+            // cached-then-retargeted path.
+            Some(brief) => {
+                match std::fs::symlink_metadata(&brief.source_path) {
+                    // A symlink where the index recorded a real skill file is
+                    // never legitimate — fail closed and say why.
+                    Ok(meta) if meta.file_type().is_symlink() => {
+                        tracing::warn!(
+                            path = %brief.source_path.display(),
+                            "refusing skill fetch: indexed path is now a symlink"
+                        );
+                        SkillFetchOutcome::Unreadable {
+                            error: "indexed skill path is no longer a regular file".to_string(),
+                        }
+                    }
+                    Ok(meta) if !meta.is_file() => SkillFetchOutcome::Unreadable {
+                        error: "indexed skill path is no longer a regular file".to_string(),
+                    },
+                    Ok(_) => match std::fs::read_to_string(&brief.source_path) {
+                        Ok(body) => SkillFetchOutcome::Found { brief, body },
+                        // A read failure here is a TOCTOU race (file
+                        // vanished/changed perms after the index walk).
+                        Err(err) => SkillFetchOutcome::Unreadable {
+                            error: err.to_string(),
+                        },
+                    },
+                    Err(err) => SkillFetchOutcome::Unreadable {
+                        error: err.to_string(),
+                    },
+                }
+            }
             // Not in the index → unknown id. Never read the raw `id` path.
             None => SkillFetchOutcome::Unknown,
         }
@@ -8421,6 +8454,39 @@ fn event_type_name(event: &OceanEvent) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Security: a cached index entry whose path has since been replaced by a
+    /// symlink must NOT be read through. Skill roots include the repo-local
+    /// `<cwd>/skills`, so the writer of that symlink need not be the operator —
+    /// an untrusted repo could ship one, turning an indexed skill path into an
+    /// arbitrary read of whatever the link targets.
+    #[test]
+    fn skill_fetch_refuses_a_path_retargeted_to_a_symlink() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let secret = dir.path().join("secret.txt");
+        std::fs::write(&secret, "CANARY-SECRET").expect("write secret");
+        let skill = dir.path().join("SKILL.md");
+        std::fs::write(&skill, "---\nname: x\ndescription: y\n---\nbody\n").expect("write skill");
+        assert!(std::fs::symlink_metadata(&skill).expect("stat").is_file());
+
+        // Retarget: the indexed path is now a symlink at the secret.
+        std::fs::remove_file(&skill).expect("remove");
+        std::os::unix::fs::symlink(&secret, &skill).expect("symlink");
+
+        // Prove the link really would leak the secret if followed.
+        assert_eq!(
+            std::fs::read_to_string(&skill).expect("follows link"),
+            "CANARY-SECRET"
+        );
+
+        // The guard applied before reading in `skills_fetch`.
+        let meta = std::fs::symlink_metadata(&skill).expect("stat link");
+        let refused = meta.file_type().is_symlink() || !meta.is_file();
+        assert!(
+            refused,
+            "a retargeted skill path must never be read through"
+        );
+    }
 
     #[test]
     fn planner_handoff_uses_exact_truthful_marker() {
