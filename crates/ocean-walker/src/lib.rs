@@ -4453,10 +4453,25 @@ mod tests {
         }
     }
 
+    /// Block until a cache entry written *now* would report a nonzero
+    /// `cache_age_ms`.
+    ///
+    /// A flat 1 ms spin was not enough: `cache_age_ms` has millisecond
+    /// resolution, so on a loaded runner the write and the read can still land
+    /// in the same millisecond bucket and the age rounds to 0 (this failed CI
+    /// on an unrelated PR). Sleep past a full tick, then confirm the observable
+    /// clock actually advanced instead of trusting the duration.
     fn wait_for_nonzero_cache_age() {
-        let started = std::time::Instant::now();
-        while started.elapsed() < Duration::from_millis(1) {
-            std::thread::yield_now();
+        let started = std::time::SystemTime::now();
+        loop {
+            std::thread::sleep(Duration::from_millis(5));
+            let advanced = std::time::SystemTime::now()
+                .duration_since(started)
+                .map(|elapsed| elapsed.as_millis() >= 2)
+                .unwrap_or(false);
+            if advanced {
+                return;
+            }
         }
     }
 
