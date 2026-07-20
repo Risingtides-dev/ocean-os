@@ -37,16 +37,25 @@ pub fn load_all(config_dir: &Path) -> anyhow::Result<Vec<Project>> {
     serde_json::from_str(&raw).with_context(|| format!("parse {}", path.display()))
 }
 
-/// Write the full project list, atomically (temp sibling + rename).
+/// Write the full project list, atomically and durably (temp sibling +
+/// fsync + rename + directory fsync; see `crate::durable`).
 pub fn save_all(config_dir: &Path, projects: &[Project]) -> anyhow::Result<()> {
+    use std::io::Write as _;
     std::fs::create_dir_all(config_dir)
         .with_context(|| format!("mkdir {}", config_dir.display()))?;
     let path = projects_path(config_dir);
     let json = serde_json::to_string_pretty(projects)?;
     let tmp = config_dir.join(".projects.json.tmp");
-    std::fs::write(&tmp, json).with_context(|| format!("write {}", tmp.display()))?;
-    std::fs::rename(&tmp, &path)
-        .with_context(|| format!("rename {} -> {}", tmp.display(), path.display()))?;
+    {
+        let mut file =
+            std::fs::File::create(&tmp).with_context(|| format!("create {}", tmp.display()))?;
+        file.write_all(json.as_bytes())
+            .with_context(|| format!("write {}", tmp.display()))?;
+        file.sync_all()
+            .with_context(|| format!("fsync {}", tmp.display()))?;
+    }
+    crate::durable::durable_rename(&tmp, &path)
+        .with_context(|| format!("durable rename {} -> {}", tmp.display(), path.display()))?;
     Ok(())
 }
 

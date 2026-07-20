@@ -40,6 +40,7 @@ pub use config::{DaemonConfig, McpSection, OffshoreSection};
 /// avoid colliding with `ocean_runtime::AgentConfig`; refer to the folder-agent
 /// config as `agentdir::AgentConfig`.
 pub mod agentdir;
+mod durable;
 mod memory_tools;
 pub use memory_tools::{list_memories, MemoryView};
 mod oauth_refresh;
@@ -352,7 +353,21 @@ impl AgentRuntime {
     /// preserves every existing caller and test; the daemon upgrades the
     /// registry with `.with_extensions().await` right after construction.
     pub fn from_env() -> anyhow::Result<Self> {
-        let config_dir = config_dir_from_env();
+        Self::with_config_dir(config_dir_from_env())
+    }
+
+    /// Build the runtime rooted at an explicit config dir instead of the
+    /// process-global `OCEAN_CONFIG_DIR`.
+    ///
+    /// The config dir owns the on-disk project/session store, so injecting it
+    /// lets embedders — and parallel tests — each own an isolated store without
+    /// racing on shared process env (two runtimes reading a clobbered
+    /// `OCEAN_CONFIG_DIR` otherwise collide on the same `projects.json`,
+    /// producing atomic-rename races and cross-test 404s). Model and credential
+    /// resolution still read the process env via `build_state_from_env`; only
+    /// the on-disk root is injected. `from_env` is the production default and
+    /// simply resolves the dir from the environment first.
+    pub fn with_config_dir(config_dir: PathBuf) -> anyhow::Result<Self> {
         let state = build_state_from_env(&config_dir)?;
         // Stop hooks are fail-open at load: a malformed ocean.toml already logs
         // loudly in `build_capability_registry`; the runtime must still start
@@ -3174,12 +3189,17 @@ fn load_last_model(config_dir: &std::path::Path) -> Option<String> {
 const YOLO_PREF_FILE: &str = "yolo_pref";
 
 fn write_pref_atomic(path: &std::path::Path, value: &str) -> std::io::Result<()> {
+    use std::io::Write as _;
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
     let tmp = path.with_extension(format!("tmp-{}", uuid::Uuid::new_v4().simple()));
-    std::fs::write(&tmp, value)?;
-    if let Err(error) = std::fs::rename(&tmp, path) {
+    {
+        let mut file = std::fs::File::create(&tmp)?;
+        file.write_all(value.as_bytes())?;
+        file.sync_all()?;
+    }
+    if let Err(error) = durable::durable_rename(&tmp, path) {
         let _ = std::fs::remove_file(&tmp);
         return Err(error);
     }

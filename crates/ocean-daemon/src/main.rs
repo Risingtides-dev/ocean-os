@@ -5583,6 +5583,179 @@ async fn record_prompt_result(
     }
 }
 
+/// The clear, terminal error a turn carries when its task unwound (panicked) or
+/// was dropped before it could record its own result (TASK-56). Surfaced both as
+/// the registry request's terminal message and as the `error` on the emitted
+/// `TurnFinished{Failed}`, so an operator sees *why* the turn died instead of a
+/// spinner that never resolves.
+const ORPHANED_TURN_ERROR: &str = "turn task panicked before completing";
+
+/// Drive an orphaned turn — one whose spawned task unwound (panic) or was dropped
+/// before `record_prompt_result` ran — to the SAME terminal state a normally
+/// errored turn reaches, and deliver the terminal frame its clients are still
+/// waiting on (TASK-56).
+///
+/// The registry transition reuses [`update_request_finished`] — the single
+/// terminal-transition primitive (see `request_control.rs`) — so there is exactly
+/// one request state machine, never a second invented here. Its return value is
+/// also the double-emit / cancellation guard: on a real orphaned turn the request
+/// is still `Running` (the task died before `record_prompt_result`), so the call
+/// performs the Running→Errored transition and returns `Some(Errored)`, and only
+/// then do we emit `AgentTurnEvent::TurnFinished{Failed}`. If a cancel already
+/// moved the request to `Cancelling`/`Cancelled`, the primitive returns
+/// `Some(Cancelled)` and we emit nothing — the cancel path owns that terminal
+/// frame. This restores all three correctness points: `GET /v1/agent/sessions`
+/// stops reporting the turn active, an events subscriber receives the terminal
+/// `TurnFinished{Failed}`, and the registry entry becomes GC-eligible.
+async fn terminate_orphaned_turn(
+    requests: &RequestRegistry,
+    events: &EventBus,
+    agent_events: &AgentEventBus,
+    request_id: RequestId,
+    session_id: AgentSessionId,
+    turn_id: AgentTurnId,
+) {
+    // `None` session_id preserves whatever `register_running_request` recorded.
+    let final_state = update_request_finished(
+        requests,
+        request_id,
+        None,
+        RequestState::Errored,
+        ORPHANED_TURN_ERROR.to_string(),
+    )
+    .await;
+
+    if !matches!(final_state, Some(RequestState::Errored)) {
+        // Either the entry was already terminal (a late-but-normal completion
+        // won the race) or it was cancelled — the owning path already delivered
+        // the terminal frame, so emitting here would double-report the turn.
+        return;
+    }
+
+    tracing::warn!(
+        %request_id,
+        %session_id,
+        %turn_id,
+        "turn task unwound before recording its result; forcing terminal TurnFinished(Failed)"
+    );
+
+    emit_agent(
+        events,
+        agent_events,
+        session_id,
+        AgentTurnEvent::TurnFinished {
+            session_id,
+            turn_id,
+            status: AgentTurnStatus::Failed,
+            error: Some(ORPHANED_TURN_ERROR.to_string()),
+            // A panicked turn produced no trustworthy telemetry; omit it rather
+            // than report zeros as if the turn measured them.
+            wall_ms: None,
+            output_tokens: None,
+            input_tokens: None,
+            cache_read_tokens: None,
+            tokens_per_second: None,
+            context_usage: None,
+        },
+    );
+}
+
+/// RAII guard that orphan-proofs a spawned turn task (TASK-56), mirroring the
+/// [`InFlightGuard`] idiom. Armed just before `runtime.prompt(...).await` and
+/// [`disarm`](Self::disarm)ed on the normal path once `record_prompt_result` has
+/// driven the registry terminal and the turn's own `TurnFinished` has been
+/// emitted.
+///
+/// If it drops while still armed — a panic inside the prompt await unwinds the
+/// task, or the task is dropped mid-turn — [`Drop`] drives the same terminal
+/// transition and terminal frame via [`terminate_orphaned_turn`]. Without this,
+/// a panicked turn leaves its registry entry `Running` FOREVER (the GC reaps only
+/// terminal entries), every events client's spinner hangs, and no terminal frame
+/// is ever delivered. The turn permit and [`InFlightGuard`] already release
+/// correctly on unwind; this closes the orphaned registry / terminal-event side.
+///
+/// [`Drop`] is synchronous but the registry transition is async
+/// (`requests.write().await`), so it hands the work to a detached task on the
+/// ambient runtime — the same detach-and-emit shape the turn's background work
+/// already uses. `Handle::try_current` is defensive: inside the turn task the
+/// runtime is always present, and only a full runtime teardown (the daemon
+/// process itself exiting) would find none, in which case the lingering entry
+/// dies with the process anyway.
+struct TurnTerminalGuard {
+    armed: bool,
+    requests: RequestRegistry,
+    events: EventBus,
+    agent_events: AgentEventBus,
+    request_id: RequestId,
+    session_id: AgentSessionId,
+    turn_id: AgentTurnId,
+}
+
+impl TurnTerminalGuard {
+    fn arm(
+        requests: RequestRegistry,
+        events: EventBus,
+        agent_events: AgentEventBus,
+        request_id: RequestId,
+        session_id: AgentSessionId,
+        turn_id: AgentTurnId,
+    ) -> Self {
+        Self {
+            armed: true,
+            requests,
+            events,
+            agent_events,
+            request_id,
+            session_id,
+            turn_id,
+        }
+    }
+
+    /// The turn recorded its own result and emitted its own terminal frame, so a
+    /// subsequent drop must be a no-op — this is what keeps the normal path to
+    /// exactly one `TurnFinished`.
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for TurnTerminalGuard {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        let requests = self.requests.clone();
+        let events = self.events.clone();
+        let agent_events = self.agent_events.clone();
+        let request_id = self.request_id;
+        let session_id = self.session_id;
+        let turn_id = self.turn_id;
+        match tokio::runtime::Handle::try_current() {
+            Ok(handle) => {
+                handle.spawn(async move {
+                    terminate_orphaned_turn(
+                        &requests,
+                        &events,
+                        &agent_events,
+                        request_id,
+                        session_id,
+                        turn_id,
+                    )
+                    .await;
+                });
+            }
+            Err(_) => {
+                tracing::error!(
+                    %request_id,
+                    %turn_id,
+                    "turn task unwound with no tokio runtime to emit its terminal frame; \
+                     registry entry lingers until process exit"
+                );
+            }
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // /v1/agent/* handlers — product-shaped agent-turn API
 // ---------------------------------------------------------------------------
@@ -5985,7 +6158,7 @@ async fn agent_turn(
     ) = match resolve_named_agent(agent.as_deref().unwrap_or("")) {
         Ok(resolved) => {
             let prompt = match resolved.instructions_layer {
-                Some(instr) => format!("{instr}\n\n{guided_prompt}"),
+                Some(instr) => compose_folder_agent_prompt(&instr, &guided_prompt),
                 None => guided_prompt,
             };
             (
@@ -6490,6 +6663,21 @@ async fn agent_turn(
         // The RAII guard decrements metrics.in_flight on drop — including on a
         // cancelled/panicked turn — so /metrics stays honest.
         let in_flight = InFlightGuard::enter(bg_state.metrics.clone());
+        // TASK-56: armed for the whole prompt await. If that await PANICS and
+        // unwinds this task, `record_prompt_result` + the terminal `TurnFinished`
+        // below are skipped, orphaning the registry entry as `Running` forever and
+        // hanging every client spinner. This guard's Drop forces the same terminal
+        // transition + `TurnFinished(Failed)` on unwind; it is disarmed on the
+        // normal path once both have run, so a completed turn keeps exactly one
+        // terminal frame.
+        let mut turn_guard = TurnTerminalGuard::arm(
+            bg_state.requests.clone(),
+            bg_state.events.clone(),
+            bg_state.agent_events.clone(),
+            request_id,
+            session_id,
+            turn_id,
+        );
         let res = bg_state
             .runtime
             .prompt_with_lease(prompt_req, control, &session_lease)
@@ -6591,6 +6779,10 @@ async fn agent_turn(
                 },
             );
         }
+        // TASK-56: the registry is terminal (`record_prompt_result`) and the
+        // turn's own `TurnFinished` has shipped, so disarm — a later drop (e.g.
+        // the advisor path below panicking) must NOT re-terminate or double-emit.
+        turn_guard.disarm();
         // Post-turn advisor observer (fire-and-forget). Runs at most once per
         // operator prompt on a FRESH advisor-model context and, if it finds a real
         // concern, emits it as an AgentTurnEvent::Extension scoped to this
@@ -6706,6 +6898,28 @@ fn apply_turn_guidance(guidance: Option<&[String]>, prompt: &str) -> String {
     }
 }
 
+/// Sentinel lines that frame a folder-as-agent's `instructions.md` when it is
+/// prepended to a turn prompt (TASK-54). The model reads the bracketed
+/// instructions verbatim — the sentinels are part of the injected text — but
+/// anchoring the layer at generation lets `strip_injected_turn_prep` in
+/// ocean-agent peel the whole `[folder-agent instructions] … [end folder-agent
+/// instructions]` frame off DISPLAY projections. An explicit footer (rather than
+/// the `\n\n` terminator the other layers use) is required because an
+/// instructions body may itself contain blank lines. Kept in sync with the
+/// stripper's literals by `folder_agent_block_anchors_display_strip_marker`.
+const FOLDER_AGENT_HEADER: &str = "[folder-agent instructions]";
+const FOLDER_AGENT_FOOTER: &str = "[end folder-agent instructions]";
+
+/// Prepend a folder-as-agent's `instructions` above `prompt` as a marker-anchored
+/// steering layer (see [`FOLDER_AGENT_HEADER`]). `instructions` is the trimmed
+/// `instructions.md`; the header/footer lines bound it so a display projection can
+/// strip the layer deterministically even when the instructions body contains its
+/// own blank lines. The single source of truth for the folder-as-agent frame,
+/// shared by `agent_turn` and the persistent-room convene path.
+fn compose_folder_agent_prompt(instructions: &str, prompt: &str) -> String {
+    format!("{FOLDER_AGENT_HEADER}\n{instructions}\n{FOLDER_AGENT_FOOTER}\n\n{prompt}")
+}
+
 /// OCEAN-40 (Phase 2): fold the client-supplied browser context into the turn
 /// prompt as a compact, additive `## Browser context` block, the same purely
 /// prompt-layering seam room/operator/longhouse guidance uses — it touches no
@@ -6801,8 +7015,15 @@ fn apply_browser_context(
     // `lines` is non-empty here: a resolved active tab always pushes its line
     // above (the function returned early otherwise), so the block always has a
     // "this tab" anchor.
+    // TASK-54: header and description sit on consecutive lines (no blank line
+    // between them) so the block carries NO internal `\n\n` — the first blank
+    // line is the terminator before `{prompt}`. That lets the display stripper
+    // (`strip_browser_context_block` in ocean-agent, anchored on this exact
+    // two-line prefix) peel the layer deterministically. `lines` are all single
+    // inline bullets (newlines in tab fields are collapsed by
+    // `sanitize_browser_field`), so no bullet introduces a stray blank line.
     format!(
-        "## Browser context\n\nThe operator's browser surface reported this live state:\n{}\n\n{prompt}",
+        "## Browser context\nThe operator's browser surface reported this live state:\n{}\n\n{prompt}",
         lines.join("\n")
     )
 }
@@ -9907,6 +10128,210 @@ mod tests {
         assert!(requests.read().await.is_empty());
     }
 
+    /// Await the next `TurnFinished` off a live agent-bus receiver, returning its
+    /// status + error. Panics if the bus closes first. (TASK-56 test helper.)
+    async fn next_turn_finished(
+        rx: &mut broadcast::Receiver<AgentEventEnvelope>,
+    ) -> (AgentTurnStatus, Option<String>) {
+        loop {
+            match rx.recv().await {
+                Ok(env) => {
+                    if let AgentTurnEvent::TurnFinished { status, error, .. } = env.event {
+                        return (status, error);
+                    }
+                }
+                Err(err) => panic!("agent bus closed before a TurnFinished arrived: {err:?}"),
+            }
+        }
+    }
+
+    /// TASK-56 core property: a turn task that PANICS inside its prompt await —
+    /// skipping `record_prompt_result` and the terminal emit — is still driven to
+    /// a terminal registry state and still delivers a terminal `TurnFinished` to
+    /// events subscribers, via the drop-guard. Asserts all three correctness
+    /// points: (a) the registry entry is no longer active (so
+    /// `GET /v1/agent/sessions` stops reporting it), (b) a subscriber receives
+    /// `TurnFinished{Failed}` with the error, and (c) the entry is now terminal
+    /// (hence GC-eligible). Drives the guard through the REAL registry + bus.
+    #[tokio::test]
+    async fn turn_terminal_guard_orphan_proofs_a_panicked_turn() {
+        let request_id = RequestId::new_v4();
+        let session_id = AgentSessionId::new_v4();
+        let turn_id = AgentTurnId::new_v4();
+        let requests: RequestRegistry = Arc::new(RwLock::new(HashMap::from([(
+            request_id,
+            status(request_id, RequestState::Running),
+        )])));
+        let events = EventBus::new(16);
+        let agent_events = AgentEventBus::new(64);
+        let mut rx = agent_events.subscribe_with_replay(None).1;
+
+        // Arm the guard, then panic inside the "prompt await" — the exact orphan
+        // shape where the task unwinds before it can record its own result.
+        let handle = tokio::spawn({
+            let requests = requests.clone();
+            let events = events.clone();
+            let agent_events = agent_events.clone();
+            async move {
+                let _guard = TurnTerminalGuard::arm(
+                    requests,
+                    events,
+                    agent_events,
+                    request_id,
+                    session_id,
+                    turn_id,
+                );
+                panic!("simulated prompt panic before completion");
+            }
+        });
+        assert!(handle.await.is_err(), "the turn task must have panicked");
+
+        // (b) subscriber receives the terminal TurnFinished{Failed} + error.
+        let (finished_status, error) = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            next_turn_finished(&mut rx),
+        )
+        .await
+        .expect("the drop-guard must emit a terminal TurnFinished after the panic");
+        assert_eq!(finished_status, AgentTurnStatus::Failed);
+        assert_eq!(error.as_deref(), Some(ORPHANED_TURN_ERROR));
+
+        // Ordering: `terminate_orphaned_turn` writes the registry BEFORE it emits,
+        // so once the TurnFinished is observed the transition has already landed.
+        let registry = requests.read().await;
+        let control = registry
+            .get(&request_id)
+            .expect("entry is still present until the GC sweep reaps it");
+        // (a) no longer active + (c) terminal ⇒ GC-eligible.
+        assert_eq!(control.status.state, RequestState::Errored);
+        assert!(control.is_terminal(), "orphaned entry must be GC-eligible");
+        assert_eq!(control.status.message.as_deref(), Some(ORPHANED_TURN_ERROR));
+    }
+
+    /// The disarmed guard is inert: on the normal path the turn records its own
+    /// result and emits its own single `TurnFinished`, then disarms — so dropping
+    /// the guard must NOT transition the registry again or emit a second terminal
+    /// frame. Guards against a double-report regression (TASK-56).
+    #[tokio::test]
+    async fn turn_terminal_guard_disarmed_does_not_double_emit() {
+        let request_id = RequestId::new_v4();
+        let session_id = AgentSessionId::new_v4();
+        let turn_id = AgentTurnId::new_v4();
+        let requests: RequestRegistry = Arc::new(RwLock::new(HashMap::from([(
+            request_id,
+            status(request_id, RequestState::Running),
+        )])));
+        let events = EventBus::new(16);
+        let agent_events = AgentEventBus::new(64);
+        let mut rx = agent_events.subscribe_with_replay(None).1;
+
+        {
+            let mut guard = TurnTerminalGuard::arm(
+                requests.clone(),
+                events.clone(),
+                agent_events.clone(),
+                request_id,
+                session_id,
+                turn_id,
+            );
+            // Mirror the real normal path: registry → terminal, one TurnFinished,
+            // then disarm.
+            update_request_finished(
+                &requests,
+                request_id,
+                None,
+                RequestState::Completed,
+                "prompt completed".to_string(),
+            )
+            .await;
+            emit_agent(
+                &events,
+                &agent_events,
+                session_id,
+                AgentTurnEvent::TurnFinished {
+                    session_id,
+                    turn_id,
+                    status: AgentTurnStatus::Completed,
+                    error: None,
+                    wall_ms: Some(5),
+                    output_tokens: Some(1),
+                    input_tokens: None,
+                    cache_read_tokens: None,
+                    tokens_per_second: None,
+                    context_usage: None,
+                },
+            );
+            guard.disarm();
+        } // guard dropped here — disarmed, so Drop is a no-op.
+
+        // Give any (erroneously) spawned detached terminate task a chance to run.
+        for _ in 0..8 {
+            tokio::task::yield_now().await;
+        }
+
+        let mut finishes = Vec::new();
+        loop {
+            match rx.try_recv() {
+                Ok(env) => {
+                    if let AgentTurnEvent::TurnFinished { status, .. } = env.event {
+                        finishes.push(status);
+                    }
+                }
+                Err(broadcast::error::TryRecvError::Empty)
+                | Err(broadcast::error::TryRecvError::Closed) => break,
+                Err(broadcast::error::TryRecvError::Lagged(_)) => continue,
+            }
+        }
+        assert_eq!(
+            finishes,
+            vec![AgentTurnStatus::Completed],
+            "a disarmed guard must not add a second TurnFinished"
+        );
+        assert_eq!(
+            requests.read().await.get(&request_id).unwrap().status.state,
+            RequestState::Completed,
+            "the disarmed guard must not overwrite the terminal state"
+        );
+    }
+
+    /// The terminal transition reuses `update_request_finished`, so it inherits
+    /// the cancel branch: if a cancel already moved the request to `Cancelling`,
+    /// the orphan terminator settles it as `Cancelled` and emits NOTHING — the
+    /// cancel path owns that turn's terminal frame, never a spurious `Failed`.
+    #[tokio::test]
+    async fn terminate_orphaned_turn_yields_to_the_cancel_path() {
+        let request_id = RequestId::new_v4();
+        let session_id = AgentSessionId::new_v4();
+        let turn_id = AgentTurnId::new_v4();
+        let requests: RequestRegistry = Arc::new(RwLock::new(HashMap::from([(
+            request_id,
+            status(request_id, RequestState::Cancelling),
+        )])));
+        let events = EventBus::new(16);
+        let agent_events = AgentEventBus::new(64);
+        let mut rx = agent_events.subscribe_with_replay(None).1;
+
+        terminate_orphaned_turn(
+            &requests,
+            &events,
+            &agent_events,
+            request_id,
+            session_id,
+            turn_id,
+        )
+        .await;
+
+        assert!(
+            matches!(rx.try_recv(), Err(broadcast::error::TryRecvError::Empty)),
+            "a cancelled turn must not get a spurious Failed TurnFinished"
+        );
+        assert_eq!(
+            requests.read().await.get(&request_id).unwrap().status.state,
+            RequestState::Cancelled,
+            "the cancel branch of update_request_finished must own the transition"
+        );
+    }
+
     #[tokio::test]
     async fn cancel_permission_waiter_mismatch_consumes_without_signalling() {
         let owner_request = RequestId::new_v4();
@@ -10423,6 +10848,49 @@ mod tests {
         let block = render_turn_guidance(Some(&["be terse".to_string()]))
             .expect("non-empty guidance renders a block");
         assert!(block.starts_with("Operator guidance for this turn:"));
+    }
+
+    /// TASK-54 cross-crate guard: ocean-agent's `strip_folder_agent_block` anchors
+    /// on the exact `[folder-agent instructions]` header and `[end folder-agent
+    /// instructions]` footer this composer emits. Keep the literals in sync — if
+    /// either sentinel changes, the display strip silently stops matching and the
+    /// folder-as-agent instructions would leak into user bubbles. The generated
+    /// text opens with the header line and encloses the instructions before the
+    /// footer line, and the `\n\n` terminator precedes the user's prompt.
+    #[test]
+    fn folder_agent_block_anchors_display_strip_marker() {
+        let composed = compose_folder_agent_prompt("be the deploy agent", "ship it");
+        assert!(composed.starts_with("[folder-agent instructions]\n"));
+        assert!(composed.contains("\n[end folder-agent instructions]\n\n"));
+        assert!(composed.ends_with("ship it"));
+        // The whole frame precedes the user's prompt.
+        assert!(
+            composed.find("[end folder-agent instructions]").unwrap()
+                < composed.find("ship it").unwrap()
+        );
+    }
+
+    /// TASK-54 cross-crate guard: ocean-agent's `strip_browser_context_block`
+    /// anchors on this exact `## Browser context` header + fixed description line,
+    /// and relies on the block carrying NO internal blank line (the first `\n\n`
+    /// must be the terminator before the prompt). Keep this in sync with that
+    /// stripper. Asserts the two-line anchor prefix and that the only `\n\n` in the
+    /// block is the one bounding the prompt.
+    #[test]
+    fn browser_context_block_anchors_display_strip_marker() {
+        let browser = ocean_agent_sdk::BrowserContext {
+            active_tab_url: Some("https://example.com".into()),
+            active_tab_title: Some("Example".into()),
+            tabs: Vec::new(),
+        };
+        let out = apply_browser_context("summarize", Some(&browser));
+        assert!(out.starts_with(
+            "## Browser context\nThe operator's browser surface reported this live state:\n"
+        ));
+        // Exactly one `\n\n` (the terminator before the prompt); no internal blank
+        // line that would defeat the display strip's `\n\n` bound.
+        assert_eq!(out.matches("\n\n").count(), 1);
+        assert!(out.ends_with("\n\nsummarize"));
     }
 
     #[test]
@@ -14020,12 +14488,24 @@ mod tests {
     /// tempdir guard (kept alive for the session config dir). Caller must hold
     /// `AUTO_CONVENE_ENV_LOCK` for the duration.
     pub(super) fn fake_convene_state(tmp: &tempfile::TempDir) -> AppState {
+        // OCEAN_MODEL / OCEAN_YOLO stay as process-env writes: they are the same
+        // constant for every caller (idempotent under parallel runs), and other
+        // daemon subsystems that read them at request time (yolo_settings) rely on
+        // the process env being set. OCEAN_CONFIG_DIR is also still exported for
+        // subsystems that resolve it live (rooms.db / titles.db / browser_stream),
+        // but the RUNTIME's config dir — which owns the on-disk project/session
+        // store — is injected directly below so parallel tests never build a
+        // runtime pointing at another test's (or a clobbered) config dir. That
+        // process-global read was the source of the github::tests rename races and
+        // cross-test 404s (TASK-58).
         std::env::set_var("OCEAN_CONFIG_DIR", tmp.path());
         std::env::set_var("OCEAN_MODEL", "fake-ok");
         // YOLO so the fake turn never blocks on a permission prompt (the fake
         // provider does no tool calls, but keep the gate out of the path).
         std::env::set_var("OCEAN_YOLO", "1");
-        let runtime = Arc::new(AgentRuntime::from_env().expect("fake runtime"));
+        let runtime = Arc::new(
+            AgentRuntime::with_config_dir(tmp.path().to_path_buf()).expect("fake runtime"),
+        );
         let store = ocean_store::SqliteRoomStore::open_in_memory().expect("in-mem store");
         let rooms = Arc::new(Mutex::new(store));
         let room_wakes = RoomWakeBus::default();

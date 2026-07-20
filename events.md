@@ -4579,4 +4579,27 @@ Verification:
 - `cargo xtask docs-check` (29 packages, 131 active Markdown files, 144 local links)
 - `cargo fmt --all -- --check`
 - `git diff --check`
+time:      [19:15] [19-07-26]
+agent:     [claude] [fable 5]
+worktree:  task-57-save-dir-fsync (fable builder sub, fable landed)
+type:      bug-report
+area:      backend
+
+TASK-57 landed 4d3e67c3 (daemon-core audit raw #2, cut ahead of codex verdict — spot-verified, disclosed): temp+rename saves fsynced the temp file but never the directory, so the rename was atomic but not durable. New crate::durable helper (durable_rename + unix-gated fsync_parent_dir) applied to all FOUR sites the sweep found — session save, oauth auth.json, projects list, yolo pref (which was also missing the temp fsync entirely). 194 agent tests + fmt + clippy green. Builder sub wedged twice mid-chain; fable took the lane over per announced protocol — also fixed a pre-existing doc_lazy_continuation clippy failure from TASK-50 that had made ocean-agent clippy-red on main. Gate lesson recorded: never pipe a gate command's output (a `| tail` swallowed clippy's failure and printed a false green this session — caught by reading the output, not the exit).
+_________________________________________________________________________________
+time:      [19:24] [19-07-26]
+agent:     [claude] [fable 5]
+worktree:  task-56-turn-terminal-guard + task-54-injection-markers (fable builder subs)
+type:      bug-report
+area:      backend
+
+Double landing. TASK-56 48bd92f9 (daemon-core raw #1): TurnTerminalGuard RAII mirrors InFlightGuard — a panic in the prompt await now drives the SAME update_request_finished terminal transition (no second state machine) and emits TurnFinished{Failed}; its return value gates emission so cancels keep their frame and normal turns emit exactly once; Drop hands async work to Handle::try_current detached spawn. 3 new tests through real registry+bus; 522 daemon tests green. TASK-54 9498905f: every injected prompt layer now anchored at generation — folder-agent gets [folder-agent instructions]…[end folder-agent instructions] sentinels via one shared compose helper (both daemon sites + rooms), browser context loses its internal blank line and strips on an exact two-line prefix; strip_injected_turn_prep peels all 5 layers order-tolerantly; 6 strip tests + 2 cross-crate anchor guards; agent 199 / daemon 524 green. Completes TASK-50's display-strip. KNOWN FLAKE (ticket-worthy): github::tests intermittently red under full-parallel cargo test (subprocess/tempdir races, different test each run, 19/19 in isolation on clean main) — bit one TASK-54 gate run, clean on rerun. Daemon rebuild + announced bounce for 54/56/57 follows.
+_________________________________________________________________________________
+time:      [19:48] [19-07-26]
+agent:     [claude] [fable 5]
+worktree:  task-58-github-test-hermetic (fable builder sub)
+type:      refactor
+area:      testing
+
+TASK-58 landed 66e01c34: github::tests parallel flakiness root-caused to ONE shared-state source — fake_convene_state did set_var(OCEAN_CONFIG_DIR) then AgentRuntime::from_env(), and peer tests mutate that process-global env concurrently, so runtimes intermittently rooted in another test's (or a dropped) config dir. Explains all three observed symptoms: projects.json atomic-rename races, cross-test 404s, singleflight 404-vs-200 flips — and why isolation was always green. Fix: AgentRuntime::with_config_dir injection ctor (from_env delegates, prod path byte-identical); the helper injects its tempdir directly. No serialization attributes. Proof: sub ran 5x subset + 3x full green; fable reran full daemon suite twice + agent suite, all raw exits 0.
 _________________________________________________________________________________
