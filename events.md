@@ -4608,3 +4608,11 @@ area:      [backend]
 
 Bounded the detached Longhouse prep work the code itself flagged as deferred (pad TASK-21). The per-turn consult is deadline-bounded, but a timeout only abandons the await — dropping a spawn_blocking handle does not cancel the task, so under sustained turns against a slow disk each turn stranded another uncancelled task contending for the process-wide cache lock until the blocking pool saturated and unrelated disk work queued behind it. Fix is single-flight: one process-wide permit acquired with try_acquire_owned and moved INTO the blocking closure, so an abandoned consult keeps its permit until it truly finishes and later turns skip (same fail-open no-op as a timeout) instead of stacking. Regression proves the property directly: with one consult stalled, eight subsequent turns admit zero additional blocking tasks, and the permit is reusable once the stalled task completes. Two source-characterization guards updated rather than loosened — the boundary guard now pins the single-flight invariant (try_acquire_owned, the skip log, the permit move), and the function-count cap now measures production surface only (excludes #[cfg(test)]) at 5, so regressions can be added without weakening the real constraint. Fail-open behavior and the byte-for-byte opt-out path unchanged. 534 daemon tests green, clippy zero, fmt clean.
 _________________________________________________________________________________
+time:      [12:15] [20-07-26]
+agent:     [claude] [fable 5]
+worktree:  infra/task22-bootout-wait
+type:      [bug-report]
+area:      [infra]
+
+Fixed the installer outage from the 07-20 deploy (pad TASK-22, my #321 bug): launchctl bootout is asynchronous, so the immediate bootstrap raced the teardown, failed with I/O error, and left the box daemonless while the installer exited nonzero. The installer now waits up to 10s for the job to actually disappear (fail-closed EX_TEMPFAIL if it never does), retries bootstrap once with loud recovery instructions on double failure, and proves the install end-to-end by polling /health for 30s — an installer exit 0 now guarantees a serving daemon. bash -n clean; sequence exercised live during the corrective 07-20 redeploy.
+_________________________________________________________________________________
