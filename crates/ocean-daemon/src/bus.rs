@@ -9,12 +9,12 @@
 //! event slips between joining the live broadcast and catching up.
 
 use std::{
-    collections::VecDeque,
+    collections::{HashMap, HashSet, VecDeque},
     ops::Deref,
     sync::{Arc, Mutex, MutexGuard},
 };
 
-use ocean_agent_sdk::AgentTurnEvent;
+use ocean_agent_sdk::{AgentSessionId, AgentTurnEvent};
 use ocean_core::EventEnvelope;
 use tokio::sync::broadcast;
 use uuid::Uuid;
@@ -31,6 +31,16 @@ pub(crate) const AGENT_EVENT_REPLAY_BUFFER: usize = 2048;
 /// exceeded, oldest envelopes are evicted until both hold. An individual event
 /// larger than this ceiling is delivered live but is not replay-retained.
 pub(crate) const AGENT_EVENT_REPLAY_MAX_BYTES: usize = 32 * 1024 * 1024;
+
+/// Maximum number of per-session terminal-event floor entries retained by the
+/// agent-event replay ring (TASK-62). The floor keeps the LATEST terminal event
+/// (`TurnFinished`) for a session even after the global ring evicts it under
+/// load from other sessions, so a reconnecting scoped client always recovers
+/// its turn-end. One entry per session bounds the map by active session count;
+/// this ceiling is a hard backstop against an unbounded churn of distinct
+/// session ids — when exceeded, the oldest terminal (smallest sequence) is
+/// dropped and the eviction is logged at warn.
+pub(crate) const AGENT_EVENT_REPLAY_FLOOR_MAX_SESSIONS: usize = 1024;
 
 /// Shared SSE keep-alive interval for both the legacy `/v1/events` rail and the
 /// `/v1/agent/events` rail. Set to 3s (down from axum's 15s default) per
@@ -168,18 +178,46 @@ pub(crate) struct AgentEventEnvelope {
     pub(crate) id: Uuid,
     pub(crate) event: AgentTurnEvent,
     pub(crate) encoded_bytes: usize,
+    /// Monotonic emission sequence, assigned under the history lock. Ids are
+    /// random UUIDs and carry no ordering, so replay ordering — and merging a
+    /// resurrected terminal-floor entry back into the ring snapshot in true
+    /// emission order — keys off this instead (TASK-62).
+    pub(crate) seq: u64,
 }
 
 pub(crate) struct AgentReplayHistory {
     envelopes: VecDeque<AgentEventEnvelope>,
     encoded_bytes: usize,
+    /// Per-session latest terminal event (`TurnFinished`), retained even after
+    /// the ring evicts it, so a reconnecting scoped client always recovers its
+    /// turn-end (TASK-62). Not counted against `encoded_bytes`: it is bounded by
+    /// session count (`floor_limit`), not payload bytes.
+    floor: HashMap<AgentSessionId, AgentEventEnvelope>,
+    floor_limit: usize,
+    /// Next monotonic emission sequence. Assigned under the same lock that
+    /// guards `envelopes`, so ordering is total and consistent with push order.
+    next_seq: u64,
+}
+
+/// The only reconnect-critical terminal event on the agent bus. Permission
+/// prompts/decisions ride the legacy `OceanEvent` / `/v1/events` rail (which
+/// keeps its own history), not this bus, so `TurnFinished` is the sole terminal
+/// the floor must protect for `/v1/agent/events` reconnect correctness (TASK-62).
+fn terminal_floor_session(event: &AgentTurnEvent) -> Option<AgentSessionId> {
+    match event {
+        AgentTurnEvent::TurnFinished { session_id, .. } => Some(*session_id),
+        _ => None,
+    }
 }
 
 impl AgentReplayHistory {
-    fn with_capacity(capacity: usize) -> Self {
+    fn with_capacity(capacity: usize, floor_limit: usize) -> Self {
         Self {
             envelopes: VecDeque::with_capacity(capacity),
             encoded_bytes: 0,
+            floor: HashMap::new(),
+            floor_limit,
+            next_seq: 0,
         }
     }
 
@@ -187,6 +225,40 @@ impl AgentReplayHistory {
         self.encoded_bytes = self.envelopes.iter().fold(0usize, |total, envelope| {
             total.saturating_add(envelope.encoded_bytes)
         });
+    }
+
+    /// Record `envelope` as the latest terminal for `session`, replacing any
+    /// older terminal for it. Enforces the session-count ceiling by evicting the
+    /// oldest (smallest-sequence) terminal when a NEW session pushes past it.
+    fn record_floor(&mut self, session: AgentSessionId, envelope: AgentEventEnvelope) {
+        let is_new_session = self.floor.insert(session, envelope).is_none();
+        if is_new_session && self.floor.len() > self.floor_limit {
+            if let Some((&oldest_session, _)) = self.floor.iter().min_by_key(|(_, env)| env.seq) {
+                self.floor.remove(&oldest_session);
+                tracing::warn!(
+                    floor_limit = self.floor_limit,
+                    "AgentReplayHistory: terminal floor exceeded session cap; \
+                     evicted oldest session's terminal"
+                );
+            }
+        }
+    }
+
+    /// Snapshot the ring merged with any floor terminals no longer present in
+    /// the ring, returned in true emission (sequence) order. Floor entries that
+    /// survive eviction are always older than every ring entry (eviction is
+    /// strictly oldest-first), so they sort ahead; sorting by `seq` keeps the
+    /// batch identical to plain ring order whenever the floor adds nothing.
+    fn merged_ordered(&self) -> Vec<AgentEventEnvelope> {
+        let ring_ids: HashSet<Uuid> = self.envelopes.iter().map(|env| env.id).collect();
+        let mut merged: Vec<AgentEventEnvelope> = self.envelopes.iter().cloned().collect();
+        for env in self.floor.values() {
+            if !ring_ids.contains(&env.id) {
+                merged.push(env.clone());
+            }
+        }
+        merged.sort_by_key(|env| env.seq);
+        merged
     }
 }
 
@@ -217,10 +289,19 @@ impl AgentEventBus {
             tx,
             history: Arc::new(Mutex::new(AgentReplayHistory::with_capacity(
                 history_limit.min(256),
+                AGENT_EVENT_REPLAY_FLOOR_MAX_SESSIONS,
             ))),
             history_limit,
             history_byte_limit,
         }
+    }
+
+    /// Test-only: shrink the per-session terminal-floor cap so the bound is
+    /// exercisable without emitting thousands of distinct sessions.
+    #[cfg(test)]
+    fn with_floor_limit(self, floor_limit: usize) -> Self {
+        self.lock_history().floor_limit = floor_limit;
+        self
     }
 
     fn lock_history(&self) -> MutexGuard<'_, AgentReplayHistory> {
@@ -239,20 +320,38 @@ impl AgentEventBus {
         // shape SSE will later serialize (excluding the envelope UUID/SSE
         // framing). A serialization failure is conservatively treated as
         // oversized: the event stays live but is not retained for replay.
+        // Serialize outside the history lock to keep the critical section short.
         let encoded_bytes = serialized_event_bytes(&event);
-        let envelope = AgentEventEnvelope {
-            id: Uuid::new_v4(),
-            event,
-            encoded_bytes,
-        };
+        let id = Uuid::new_v4();
 
         // Record into the bounded replay ring BEFORE broadcasting so that a
         // client which subscribes (and snapshots the buffer) concurrently with
         // this emit can never observe the live event without also finding it in
         // the replay buffer — closing the gap/dupe seam (OCEAN-129). Count and
         // serialized-byte limits are enforced together under the history lock.
-        {
+        // The monotonic sequence and per-session terminal floor are assigned and
+        // updated under this same lock so ordering and floor state stay
+        // consistent with the ring (TASK-62).
+        let envelope = {
             let mut history = self.lock_history();
+            let seq = history.next_seq;
+            history.next_seq = history.next_seq.wrapping_add(1);
+            let envelope = AgentEventEnvelope {
+                id,
+                event,
+                encoded_bytes,
+                seq,
+            };
+
+            // Resurrection floor: keep the LATEST terminal per session so ring
+            // eviction under multi-session load can never lose a reconnecting
+            // client's turn-end. Updated before eviction runs — even if this very
+            // envelope is immediately evicted by the byte cap, its floor copy
+            // survives for replay.
+            if let Some(session) = terminal_floor_session(&envelope.event) {
+                history.record_floor(session, envelope.clone());
+            }
+
             history.encoded_bytes = history.encoded_bytes.saturating_add(envelope.encoded_bytes);
             history.envelopes.push_back(envelope.clone());
             while history.envelopes.len() > self.history_limit
@@ -263,7 +362,8 @@ impl AgentEventBus {
                 };
                 history.encoded_bytes = history.encoded_bytes.saturating_sub(evicted.encoded_bytes);
             }
-        }
+            envelope
+        };
 
         // `broadcast::send` errors only when there are no live receivers (no SSE
         // client subscribed to `/v1/agent/events`). That's expected during idle
@@ -299,10 +399,14 @@ impl AgentEventBus {
     ) {
         let history = self.lock_history();
         let rx = self.tx.subscribe();
+        // Merge the resurrection floor into the ring snapshot in emission order
+        // so a still-buffered anchor replays past it, and a floor-only terminal
+        // (evicted from the ring) is still delivered after the anchor (TASK-62).
+        let merged = history.merged_ordered();
         let replay = match last_event_id {
-            Some(want) => match history.iter().position(|env| env.id == want) {
+            Some(want) => match merged.iter().position(|env| env.id == want) {
                 // Found: replay everything strictly after it.
-                Some(pos) => history.iter().skip(pos + 1).cloned().collect(),
+                Some(pos) => merged[pos + 1..].to_vec(),
                 // Not found (aged out / unknown id): no replay.
                 None => Vec::new(),
             },
@@ -324,18 +428,23 @@ impl AgentEventBus {
     ) {
         let history = self.lock_history();
         let rx = self.tx.subscribe();
+        // Snapshot ring + resurrection floor in emission order, then anchor/scope
+        // over the merged batch. A session's floored `TurnFinished` that the ring
+        // has since evicted is now a valid, in-scope replay target and widens the
+        // reset-required gap bounds instead of vanishing (TASK-62).
+        let merged = history.merged_ordered();
         let in_scope = |env: &&AgentEventEnvelope| {
             expected_session
                 .map(|session_id| env.event.session_id() == Some(session_id))
                 .unwrap_or(true)
         };
-        let replay = match history
+        let replay = match merged
             .iter()
             .position(|env| env.id == last_event_id && in_scope(&env))
         {
-            Some(pos) => Ok(history.iter().skip(pos + 1).cloned().collect()),
+            Some(pos) => Ok(merged[pos + 1..].to_vec()),
             None => {
-                let mut scoped = history.iter().filter(in_scope);
+                let mut scoped = merged.iter().filter(in_scope);
                 let oldest = scoped.next().map(|env| env.id);
                 let newest = scoped.next_back().map(|env| env.id).or(oldest);
                 Err(ReplayGapBounds { oldest, newest })
@@ -380,7 +489,11 @@ impl AgentEventBus {
     ) {
         let history = self.lock_history();
         let rx = self.tx.subscribe();
-        let replay = history.iter().cloned().collect();
+        // Merge the resurrection floor so a full-replay recovery (the OCEAN-305
+        // first-turn path) also surfaces a session's floored `TurnFinished` that
+        // the ring already evicted (TASK-62). The caller's per-event session
+        // scope filters this to the reconnecting session, exactly as for live.
+        let replay = history.merged_ordered();
         (replay, rx)
     }
 }
@@ -388,8 +501,31 @@ impl AgentEventBus {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ocean_agent_sdk::{AgentSessionId, AgentTurnId, ToolCallId, ToolResult};
+    use ocean_agent_sdk::{AgentTurnId, AgentTurnStatus, ToolCallId, ToolResult};
     use tokio::sync::broadcast::error::TryRecvError;
+
+    fn turn_finished(session_id: AgentSessionId) -> AgentTurnEvent {
+        AgentTurnEvent::TurnFinished {
+            session_id,
+            turn_id: AgentTurnId::new_v4(),
+            status: AgentTurnStatus::Completed,
+            error: None,
+            wall_ms: None,
+            output_tokens: None,
+            input_tokens: None,
+            cache_read_tokens: None,
+            tokens_per_second: None,
+            context_usage: None,
+        }
+    }
+
+    fn delta(session_id: AgentSessionId, text: &str) -> AgentTurnEvent {
+        AgentTurnEvent::AssistantTextDelta {
+            session_id,
+            turn_id: AgentTurnId::new_v4(),
+            delta: text.into(),
+        }
+    }
 
     /// Characterize finite byte pressure at the bounded downstream bus. The
     /// producer never blocks: a slow capacity-2 subscriber lags while the replay
@@ -524,6 +660,197 @@ mod tests {
         assert_eq!(bounds.newest, Some(fence));
     }
 
+    // TASK-62 (a): a quiet session's terminal survives ring eviction driven by a
+    // chatty neighbor, and the `?replay` full-history path still recovers it.
+    #[test]
+    fn terminal_floor_survives_ring_eviction_for_quiet_session() {
+        let bus = AgentEventBus::new_with_history_limits(64, 4, usize::MAX);
+        let quiet = AgentSessionId::new_v4();
+        let chatty = AgentSessionId::new_v4();
+
+        let quiet_terminal = bus.emit(turn_finished(quiet));
+        // Overrun the 4-slot ring with the chatty session's deltas.
+        for i in 0..8 {
+            bus.emit(delta(chatty, &format!("chatty-{i}")));
+        }
+
+        // The terminal is gone from the ring itself...
+        assert!(
+            bus.lock_history()
+                .iter()
+                .all(|env| env.id != quiet_terminal),
+            "chatty burst should have evicted the quiet terminal from the ring"
+        );
+
+        // ...but the floor-backed full replay still surfaces exactly one copy.
+        let (replay, _rx) = bus.subscribe_with_full_replay();
+        let recovered: Vec<_> = replay
+            .iter()
+            .filter(|env| env.event.session_id() == Some(quiet))
+            .collect();
+        assert_eq!(
+            recovered.len(),
+            1,
+            "quiet session's terminal must be recovered"
+        );
+        assert_eq!(recovered[0].id, quiet_terminal);
+        assert!(matches!(
+            recovered[0].event,
+            AgentTurnEvent::TurnFinished { .. }
+        ));
+    }
+
+    // TASK-62 (b): a newer terminal for the same session replaces the older floor
+    // entry; only the latest is retained and replayed.
+    #[test]
+    fn terminal_floor_keeps_only_latest_terminal_per_session() {
+        let bus = AgentEventBus::new_with_history_limits(64, 4, usize::MAX);
+        let session = AgentSessionId::new_v4();
+        let noise = AgentSessionId::new_v4();
+
+        let first_terminal = bus.emit(turn_finished(session));
+        for i in 0..8 {
+            bus.emit(delta(noise, &format!("n1-{i}")));
+        }
+        let second_terminal = bus.emit(turn_finished(session));
+        for i in 0..8 {
+            bus.emit(delta(noise, &format!("n2-{i}")));
+        }
+        assert_ne!(first_terminal, second_terminal);
+
+        let (replay, _rx) = bus.subscribe_with_full_replay();
+        let terminals: Vec<_> = replay
+            .iter()
+            .filter(|env| {
+                env.event.session_id() == Some(session)
+                    && matches!(env.event, AgentTurnEvent::TurnFinished { .. })
+            })
+            .map(|env| env.id)
+            .collect();
+        assert_eq!(
+            terminals,
+            vec![second_terminal],
+            "only the newest terminal should survive"
+        );
+
+        let history = bus.lock_history();
+        assert_eq!(history.floor.len(), 1);
+        assert_eq!(
+            history.floor.get(&session).map(|env| env.id),
+            Some(second_terminal)
+        );
+    }
+
+    // TASK-62 (c): a deliberately-lagged subscriber loses the terminal live, but
+    // the floor-backed reconnect (the recovery the `LiveLag` reset frame
+    // instructs) re-delivers it.
+    #[test]
+    fn lagged_subscriber_recovers_terminal_via_floor_backed_reconnect() {
+        // capacity-2 broadcast ring so a stalled subscriber overflows quickly;
+        // 4-slot replay ring so the chatty burst also evicts the terminal.
+        let bus = AgentEventBus::new_with_history_limits(2, 4, usize::MAX);
+        let quiet = AgentSessionId::new_v4();
+        let chatty = AgentSessionId::new_v4();
+
+        let (_replay, mut rx) = bus.subscribe_with_replay(None);
+        let quiet_terminal = bus.emit(turn_finished(quiet));
+        for i in 0..8 {
+            bus.emit(delta(chatty, &format!("chatty-{i}")));
+        }
+
+        // The stalled live subscriber lags; the skipped frames included the
+        // quiet session's terminal.
+        match rx.try_recv() {
+            Err(TryRecvError::Lagged(_)) => {}
+            Ok(_) => panic!("stalled subscriber unexpectedly received an event without lag"),
+            Err(error) => panic!("expected the stalled subscriber to lag, got {error:?}"),
+        }
+
+        // Recovery reconnect (full replay) re-delivers the terminal from the floor.
+        let (recovered, _rx) = bus.subscribe_with_full_replay();
+        assert!(
+            recovered.iter().any(|env| env.id == quiet_terminal
+                && matches!(env.event, AgentTurnEvent::TurnFinished { .. })),
+            "floor-backed reconnect must recover the lagged terminal"
+        );
+    }
+
+    // TASK-62 (d): merged replay is ordered by emission sequence and never
+    // duplicates a terminal held in both the ring and the floor.
+    #[test]
+    fn merged_replay_is_ordered_and_dedup_free() {
+        // Evicted-terminal case: floored entry sorts to the front, appears once.
+        let bus = AgentEventBus::new_with_history_limits(64, 4, usize::MAX);
+        let quiet = AgentSessionId::new_v4();
+        let chatty = AgentSessionId::new_v4();
+        let quiet_terminal = bus.emit(turn_finished(quiet));
+        for i in 0..8 {
+            bus.emit(delta(chatty, &format!("chatty-{i}")));
+        }
+        let (replay, _rx) = bus.subscribe_with_full_replay();
+        let seqs: Vec<_> = replay.iter().map(|env| env.seq).collect();
+        let mut sorted = seqs.clone();
+        sorted.sort_unstable();
+        assert_eq!(seqs, sorted, "merged replay must be in emission order");
+        assert_eq!(
+            replay.first().map(|env| env.id),
+            Some(quiet_terminal),
+            "the resurrected terminal is oldest and sorts to the front"
+        );
+        let unique: HashSet<_> = replay.iter().map(|env| env.id).collect();
+        assert_eq!(
+            unique.len(),
+            replay.len(),
+            "no duplicate ids in merged replay"
+        );
+
+        // In-ring case: a terminal still in the ring must not be doubled by its
+        // floor copy.
+        let live = AgentEventBus::new_with_history_limits(64, 16, usize::MAX);
+        let session = AgentSessionId::new_v4();
+        let terminal = live.emit(turn_finished(session));
+        live.emit(delta(session, "after"));
+        let (replay, _rx) = live.subscribe_with_full_replay();
+        assert_eq!(
+            replay.iter().filter(|env| env.id == terminal).count(),
+            1,
+            "a terminal in both ring and floor must appear exactly once"
+        );
+    }
+
+    // TASK-62 (e): the floor is bounded by its session cap; the oldest session's
+    // terminal is evicted, newest retained.
+    #[test]
+    fn terminal_floor_respects_session_cap() {
+        let bus = AgentEventBus::new_with_history_limits(256, 4, usize::MAX).with_floor_limit(2);
+        let mut sessions = Vec::new();
+        for _ in 0..5 {
+            let session = AgentSessionId::new_v4();
+            sessions.push(session);
+            bus.emit(turn_finished(session));
+            // Evict this terminal from the ring so it lives only in the floor.
+            let noise = AgentSessionId::new_v4();
+            for i in 0..8 {
+                bus.emit(delta(noise, &format!("n-{i}")));
+            }
+        }
+
+        let history = bus.lock_history();
+        assert!(
+            history.floor.len() <= 2,
+            "floor must stay within its session cap, got {}",
+            history.floor.len()
+        );
+        assert!(
+            history.floor.contains_key(sessions.last().unwrap()),
+            "the newest session's terminal must be retained"
+        );
+        assert!(
+            !history.floor.contains_key(&sessions[0]),
+            "the oldest session's terminal must be evicted past the cap"
+        );
+    }
+
     #[test]
     fn agent_bus_poison_recovery_recomputes_bytes_before_eviction() {
         let event = AgentTurnEvent::AssistantTextDelta {
@@ -540,6 +867,7 @@ mod tests {
                 id: Uuid::new_v4(),
                 event: event.clone(),
                 encoded_bytes,
+                seq: 0,
             });
             // Simulate a panic after the deque mutation but before aggregate
             // accounting. Recovery must rebuild the total from the deque.

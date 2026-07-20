@@ -7222,6 +7222,17 @@ async fn agent_events(
             // OCCURRENCE counter (OCEAN-372). We do NOT add `skipped` to
             // `sse_events_dropped` here — see the clone-site note above: on this
             // scope-filtered rail `skipped` over-counts deliverable loss.
+            //
+            // TASK-62: the recovery contract is unchanged — we emit the existing
+            // `LiveLag` reset-required frame and leave the stream open. What the
+            // per-session terminal floor adds is that the reconnect this frame
+            // already instructs (via `Last-Event-ID`, else `?replay=1`) now lands
+            // on a ring that has RESURRECTED this session's latest `TurnFinished`
+            // even if a chatty neighbor evicted it, so a lagged quiet-session
+            // client reliably relearns its turn ended. Re-emitting terminals
+            // inline here was rejected: it would duplicate into a stream the
+            // client abandons on reset and add no correctness the floor-backed
+            // reconnect doesn't already give (client dedupes by event id).
             sse_lag_events.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             tracing::warn!(
                 skipped,
@@ -21679,6 +21690,7 @@ mod tests {
                 id: Uuid::new_v4(),
                 event: delta_event(other, &format!("other-{i}")),
                 encoded_bytes: 0,
+                seq: i as u64,
             });
         }
 
