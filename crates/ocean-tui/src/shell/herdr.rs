@@ -104,7 +104,7 @@ impl Reporter {
         self.sync_session(bound_session, session_start_source);
 
         match action {
-            Action::SubmitPrompt(_) => {
+            Action::SubmitPrompt { .. } => {
                 self.turn_active = true;
                 self.pending_permissions = 0;
                 self.set_state(State::Working);
@@ -141,14 +141,30 @@ impl Reporter {
                     _ => {}
                 }
             }
-            Action::TurnSendFailed { .. }
-            | Action::TurnOutcomeUnknown { .. }
-            | Action::TurnBusyConflict { .. } => self.finish_turn(),
+            Action::TurnSendFailed { .. } | Action::TurnOutcomeUnknown { .. } => self.finish_turn(),
+            Action::TurnSessionBusy { .. } => {
+                self.turn_active = true;
+                self.set_state(State::Working);
+            }
             Action::NewSession
             | Action::NewSessionInProject { .. }
             | Action::ResumeSession { .. } => self.finish_turn(),
             _ => {}
         }
+    }
+
+    /// A resume probe proved that the bound daemon session already owns an
+    /// active operation even if this TUI missed its historical TurnStarted.
+    pub fn adopt_activity(&mut self) {
+        self.turn_active = true;
+        self.pending_permissions = 0;
+        self.set_state(State::Working);
+    }
+
+    /// An authoritative synchronized snapshot proved that a previously adopted
+    /// active operation is no longer running.
+    pub fn resolve_activity(&mut self) {
+        self.finish_turn();
     }
 
     pub fn release(&mut self) {
@@ -480,16 +496,50 @@ mod tests {
     #[test]
     fn send_failures_return_to_idle() {
         let mut reporter = Reporter::default();
-        reporter.observe(&Action::SubmitPrompt("hello".into()), None);
+        reporter.observe(
+            &Action::SubmitPrompt {
+                submission_id: 1,
+                prompt: "hello".into(),
+            },
+            None,
+        );
         assert_eq!(reporter.state, Some(State::Working));
 
         reporter.observe(
             &Action::TurnSendFailed {
+                submission_id: 1,
                 prompt: "hello".into(),
                 err: "offline".into(),
             },
             None,
         );
+        assert_eq!(reporter.state, Some(State::Idle));
+        assert!(!reporter.turn_active);
+    }
+
+    #[test]
+    fn synchronized_activity_resolution_returns_busy_adoption_to_idle() {
+        let mut reporter = Reporter::default();
+        let sid = session(81);
+        reporter.observe(
+            &Action::SubmitPrompt {
+                submission_id: 1,
+                prompt: "duplicate".into(),
+            },
+            Some(sid),
+        );
+        reporter.observe(
+            &Action::TurnSessionBusy {
+                submission_id: 1,
+                session_id: sid,
+                binding_generation: 3,
+                prompt: "duplicate".into(),
+            },
+            Some(sid),
+        );
+        assert_eq!(reporter.state, Some(State::Working));
+
+        reporter.resolve_activity();
         assert_eq!(reporter.state, Some(State::Idle));
         assert!(!reporter.turn_active);
     }

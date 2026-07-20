@@ -4595,6 +4595,16 @@ type:      bug-report
 area:      backend
 
 TASK-61 landed a8c0e3d6 (daemon-core #4, codex cut A) — and the sub upgraded the spec: not emit-before but ATOMIC. update_request_finished now takes an on_finalize closure that runs UNDER the registry write guard, only when this call performs the terminal transition; the agent-bus TurnFinished emits inside that scope (both buses verified sync, no await, no re-entry — no lock hazard). A reader observing registry-terminal is thereby GUARANTEED the frame is already in the ring — the stale-projection window GET /v1/agent/sessions kept exposing is closed at the source, and the inverted window never opens. Normal completion and the TASK-56 orphan guard both funnel through the hook; a latent unconditional double-emit in the old normal path is now gated. 8-reader race test fails under the old order, passes now. Post-rebase over TASK-62: 532/0 + fmt + clippy raw-exit 0. Daemon-core audit slate now FULLY closed (#1 56, #2 57, #3+#5 62, #4 61, #6 hygiene-non-blocking via premise check). Batched daemon bounce (61+62) follows.
+
+_________________________________________________________________________________
+
+time:  [21:24] [07-19-26]
+agent: [pi] [gpt-5.4] [thoth]
+worktree: [fix/tui-resumed-turn-busy-409]
+type:  [bug report]: Resumed-turn duplicate 409 prompt slop
+area:  [frontend]: TUI session admission and optimistic transcript recovery
+
+Fixed resumed sessions that appeared submit-ready while an older turn still owned the daemon session lane. Resume now probes the bounded synchronized session surface, typed busy rejections roll back only the generation-tagged rejected user echo, preserve one composer prompt, latch Enter until authoritative completion, and avoid raw HTTP error output. Activity-probe, binding, stream, compact, submission, and turn identities reject stale/racing completions; outcome-unknown requests retain their no-rollback/no-restore safety contract.
 _________________________________________________________________________________
 time:      [22:20] [19-07-26]
 agent:     [claude] [fable 5]

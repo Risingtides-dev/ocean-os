@@ -398,6 +398,9 @@ pub struct App {
     /// Monotonic identity for the current scoped SSE task. Replacing history
     /// from a sync fence invalidates envelopes already queued by the old task.
     stream_generation: u64,
+    /// Monotonic identity for best-effort resume/busy activity probes. New
+    /// submissions and compact operations invalidate older probe completions.
+    session_activity_probe_generation: u64,
     /// Best-effort projection of the authoritative TUI lifecycle into a
     /// surrounding Herdr pane. Disabled automatically outside Herdr.
     herdr: HerdrReporter,
@@ -632,6 +635,7 @@ impl App {
             session_id: None,
             session_binding_generation: 0,
             stream_generation: 0,
+            session_activity_probe_generation: 0,
             herdr: HerdrReporter::from_env(),
             model_override: None,
             stream_task: None,
@@ -769,6 +773,9 @@ impl App {
         self.chat
             .load_history(crate::shell::sessions::load_transcript(&session.path));
         self.bind_session_with(id, false);
+        if self.compacting_session != Some(id) && !self.sessions_requiring_sync.contains(&id) {
+            self.spawn_session_activity_probe(id, self.session_binding_generation, 0, false, false);
+        }
         // This initialization path intentionally skips dispatch (replay_first
         // differs from a fresh mint), so explicitly deliver the same bind
         // action to session-scoped components. Use ResumeSession so the
@@ -1656,6 +1663,19 @@ impl App {
     }
 
     fn dispatch(&mut self, action: Action) {
+        let completed_submission_id = match &action {
+            Action::TurnSendFailed { submission_id, .. }
+            | Action::TurnSessionBusy { submission_id, .. }
+            | Action::TurnAccepted { submission_id, .. }
+            | Action::TurnOutcomeUnknown { submission_id, .. } => Some(*submission_id),
+            _ => None,
+        };
+        if completed_submission_id.is_some_and(|id| !self.chat.has_pending_submission(id)) {
+            // A prior binding/history replacement cleared this optimistic tag,
+            // or a newer submission superseded it. It must not touch transcript,
+            // images, Herdr lifecycle, or the current session's busy state.
+            return;
+        }
         let tray_was_visible = self.tray.is_visible();
         let mut follow_up = None;
         match &action {
@@ -1721,22 +1741,120 @@ impl App {
             }
             // Chat unwinds busy + restores the prompt (see its update arm);
             // the status line carries the humanized error.
-            Action::TurnSendFailed { err, .. } => {
+            Action::TurnSendFailed {
+                submission_id, err, ..
+            } if self.chat.has_pending_submission(*submission_id) => {
                 self.pending_images.append(&mut self.in_flight_images);
                 self.set_notice(errfmt::humanize(err));
             }
-            Action::TurnOutcomeUnknown { err } => {
+            Action::TurnSessionBusy {
+                submission_id,
+                session_id,
+                binding_generation,
+                ..
+            } if self.chat.has_pending_submission(*submission_id) => {
+                self.pending_images.append(&mut self.in_flight_images);
+                self.set_notice("session is still working — prompt preserved".into());
+                if self.session_id == Some(*session_id)
+                    && self.session_binding_generation == *binding_generation
+                {
+                    self.spawn_session_activity_probe(
+                        *session_id,
+                        *binding_generation,
+                        100,
+                        true,
+                        true,
+                    );
+                }
+            }
+            Action::TurnAccepted {
+                submission_id,
+                turn_id,
+            } if self.chat.has_pending_submission(*submission_id) => {
+                self.in_flight_images.clear();
+                if self
+                    .chat
+                    .acceptance_already_finished(*submission_id, *turn_id)
+                {
+                    self.herdr.resolve_activity();
+                }
+            }
+            Action::TurnOutcomeUnknown { submission_id, err }
+                if self.chat.has_pending_submission(*submission_id) =>
+            {
                 // The daemon may have accepted the image turn; never replay an
                 // attachment when the outcome is unknown.
                 self.in_flight_images.clear();
                 self.set_notice(errfmt::humanize(err));
             }
-            // 409 active-turn rejection: the chat arm (above) drops the optimistic
-            // row and keeps the prompt; here we recover any in-flight images and
-            // surface the single "still running" notice. Nothing was persisted.
-            Action::TurnBusyConflict { .. } => {
-                self.pending_images.append(&mut self.in_flight_images);
-                self.set_notice("a turn is still running — wait for it to finish".into());
+            Action::SessionActivityProbeFinished {
+                session_id,
+                binding_generation,
+                probe_generation,
+                after_busy_rejection,
+                active_was_observed,
+                result,
+            } => {
+                if self.session_id == Some(*session_id)
+                    && self.session_binding_generation == *binding_generation
+                    && self.session_activity_probe_generation == *probe_generation
+                    && !self.chat.has_pending_turn_submission()
+                    && self.compacting_session != Some(*session_id)
+                    && !self.sessions_requiring_sync.contains(session_id)
+                {
+                    match result {
+                        Ok(sync) => {
+                            let installed =
+                                sync.snapshot.as_ref().zip(sync.fence.as_ref()).is_some_and(
+                                    |(snapshot, fence)| {
+                                        self.install_synchronized_session(
+                                            *session_id,
+                                            *binding_generation,
+                                            snapshot,
+                                            fence,
+                                        )
+                                    },
+                                );
+                            if installed {
+                                self.herdr.resolve_activity();
+                            }
+                            if installed && *after_busy_rejection {
+                                self.set_notice(
+                                    "session ready — preserved prompt can be sent".into(),
+                                );
+                            }
+                        }
+                        Err(error) if error.message.contains("session has an active operation") => {
+                            self.chat.adopt_active_turn();
+                            self.herdr.adopt_activity();
+                            self.set_notice("session is still working — input locked".into());
+                            self.spawn_session_activity_probe(
+                                *session_id,
+                                *binding_generation,
+                                1_000,
+                                *after_busy_rejection,
+                                true,
+                            );
+                        }
+                        Err(_) if *active_was_observed => {
+                            // Once activity was authoritatively observed, keep
+                            // probing until a fenced snapshot succeeds even if
+                            // the live stream already cleared its busy flag.
+                            self.spawn_session_activity_probe(
+                                *session_id,
+                                *binding_generation,
+                                1_000,
+                                *after_busy_rejection,
+                                true,
+                            );
+                        }
+                        Err(_) => {
+                            // Before activity is proven, the existing bound
+                            // stream remains authoritative; probe transport
+                            // noise must not invent a busy state.
+                        }
+                    }
+                }
             }
             Action::BoundAgentEvent {
                 session_id,
@@ -1816,6 +1934,8 @@ impl App {
                 } else if self.compacting_session.is_some() {
                     self.set_notice("session compaction already in progress".into());
                 } else if let Some(session_id) = self.session_id {
+                    self.session_activity_probe_generation =
+                        self.session_activity_probe_generation.wrapping_add(1);
                     self.sessions_requiring_sync.insert(session_id);
                     self.compacting_session = Some(session_id);
                     self.compact_refresh_required = false;
@@ -2196,18 +2316,23 @@ impl App {
                     self.active_dictation_id = None;
                 }
             }
-            Action::SubmitPrompt(text) => {
+            Action::SubmitPrompt {
+                submission_id,
+                prompt,
+            } => {
                 let synchronization_pending = self.session_id.is_some_and(|session_id| {
                     self.compacting_session == Some(session_id)
                         || self.sessions_requiring_sync.contains(&session_id)
                 });
                 if synchronization_pending {
+                    self.set_notice("session synchronization is still in progress".into());
                     follow_up = Some(Action::TurnSendFailed {
-                        prompt: text.clone(),
+                        submission_id: *submission_id,
+                        prompt: prompt.clone(),
                         err: "session synchronization is still in progress".into(),
                     });
                 } else {
-                    self.submit_turn(text.clone());
+                    self.submit_turn(*submission_id, prompt.clone());
                 }
             }
             Action::OpenFile(path) => {
@@ -2234,6 +2359,17 @@ impl App {
                     .load_history(crate::shell::sessions::load_transcript(path));
                 self.bind_session_with(*id, false); // transcript came from disk
                 self.rail.live_id = Some(id.0.to_string());
+                if self.compacting_session != Some(*id)
+                    && !self.sessions_requiring_sync.contains(id)
+                {
+                    self.spawn_session_activity_probe(
+                        *id,
+                        self.session_binding_generation,
+                        0,
+                        false,
+                        false,
+                    );
+                }
                 // Re-root the workbench to the dir this session ran in, so the
                 // file tree, graph, and future turns follow the session.
                 self.set_active_project(cwd.clone());
@@ -2686,7 +2822,20 @@ impl App {
         }
         // Project lifecycle only after the app has filtered stale session
         // events and applied the same authoritative transition the UI uses.
-        self.herdr.observe(&action, self.session_id);
+        // A finish from the previously resumed turn cannot idle Herdr while a
+        // different tagged submission is still awaiting/holding admission.
+        let herdr_event_is_current = match &action {
+            Action::AgentEvent(event) => match event.as_ref() {
+                AgentTurnEvent::TurnFinished { turn_id, .. } => {
+                    self.chat.turn_finished_resolves_activity(*turn_id)
+                }
+                _ => true,
+            },
+            _ => true,
+        };
+        if herdr_event_is_current {
+            self.herdr.observe(&action, self.session_id);
+        }
         if let Some(next) = self.chat.update(&action) {
             self.dispatch(next);
         }
@@ -4555,6 +4704,8 @@ impl App {
         if let Some(task) = self.stream_task.take() {
             task.abort();
         }
+        self.session_activity_probe_generation =
+            self.session_activity_probe_generation.wrapping_add(1);
         self.sessions_requiring_sync.insert(session_id);
         self.compacting_session = Some(session_id);
         self.compact_refresh_required = false;
@@ -4617,13 +4768,56 @@ impl App {
         true
     }
 
-    fn submit_turn(&mut self, prompt: String) {
+    fn spawn_session_activity_probe(
+        &mut self,
+        session_id: AgentSessionId,
+        binding_generation: u64,
+        delay_ms: u64,
+        after_busy_rejection: bool,
+        active_was_observed: bool,
+    ) {
+        self.session_activity_probe_generation =
+            self.session_activity_probe_generation.wrapping_add(1);
+        let probe_generation = self.session_activity_probe_generation;
+        let client = self.client.clone();
+        let tx = self.actions_tx.clone();
+        tokio::spawn(async move {
+            if delay_ms > 0 {
+                // Let a concurrently queued TurnFinished win before asking for
+                // an authoritative post-turn snapshot.
+                tokio::time::sleep(Duration::from_millis(delay_ms)).await;
+            }
+            let result = client.refresh_compacted_session(session_id).await;
+            let _ = tx.send(Action::SessionActivityProbeFinished {
+                session_id,
+                binding_generation,
+                probe_generation,
+                after_busy_rejection,
+                active_was_observed,
+                result,
+            });
+        });
+    }
+
+    fn stage_pending_images_for_submit(&mut self) -> Option<Vec<ocean_agent_sdk::TurnImage>> {
+        self.in_flight_images = std::mem::take(&mut self.pending_images);
+        (!self.in_flight_images.is_empty()).then(|| self.in_flight_images.clone())
+    }
+
+    fn submit_turn(&mut self, submission_id: u64, prompt: String) {
+        // A pre-submit resume probe may have captured a fence before this turn.
+        // Its later completion must never replace the optimistic/user-visible
+        // row or the newly admitted stream.
+        self.session_activity_probe_generation =
+            self.session_activity_probe_generation.wrapping_add(1);
         let client = self.client.clone();
         let tx = self.actions_tx.clone();
         let workspace = self.workspace_root.clone();
-        let images = (!self.pending_images.is_empty()).then(|| self.pending_images.clone());
-        self.pending_images.clear();
+        // Hold the exact submitted attachments until admission certainty is
+        // known: restore on definite rejection, discard on accept/unknown.
+        let images = self.stage_pending_images_for_submit();
         let existing = self.session_id;
+        let binding_generation = self.session_binding_generation;
         let model_id = self.model_override.clone();
         let thinking = self.thinking_override;
         let advisor = self.advisor_ctl.clone();
@@ -4664,6 +4858,7 @@ impl App {
                         }
                         Err(e) => {
                             let _ = tx.send(Action::TurnSendFailed {
+                                submission_id,
                                 prompt,
                                 err: format!("session: {e}"),
                             });
@@ -4689,18 +4884,34 @@ impl App {
                 advisor,
             };
             let on_retry = retry_status("turn", tx.clone());
-            if let Err(error) = client.agent_turn_retrying(&req, on_retry).await {
-                let err = format!("turn: {error}");
-                let action = match error {
-                    // 409: the session already had an active turn. Quietly drop
-                    // the optimistic row and keep the prompt — no error note.
-                    TurnSubmitError::ActiveTurn(_) => Action::TurnBusyConflict { prompt },
-                    TurnSubmitError::DefinitelyUnsent(_) | TurnSubmitError::Rejected(_) => {
-                        Action::TurnSendFailed { prompt, err }
-                    }
-                    TurnSubmitError::OutcomeUnknown(_) => Action::TurnOutcomeUnknown { err },
-                };
-                let _ = tx.send(action);
+            match client.agent_turn_retrying(&req, on_retry).await {
+                Ok(response) => {
+                    let _ = tx.send(Action::TurnAccepted {
+                        submission_id,
+                        turn_id: response.turn_id,
+                    });
+                }
+                Err(error) => {
+                    let action = match error {
+                        TurnSubmitError::DefinitelyUnsent(message)
+                        | TurnSubmitError::Rejected(message) => Action::TurnSendFailed {
+                            submission_id,
+                            prompt,
+                            err: format!("turn: {message}"),
+                        },
+                        TurnSubmitError::SessionBusy => Action::TurnSessionBusy {
+                            submission_id,
+                            session_id,
+                            binding_generation,
+                            prompt,
+                        },
+                        TurnSubmitError::OutcomeUnknown(message) => Action::TurnOutcomeUnknown {
+                            submission_id,
+                            err: format!("turn: {message}"),
+                        },
+                    };
+                    let _ = tx.send(action);
+                }
             }
         });
     }
@@ -6459,6 +6670,10 @@ mod tests {
         assert!(!app.launch_open);
         assert_eq!(app.workspace_root, launch_root);
         assert_eq!(app.session_id, Some(want));
+        assert_eq!(
+            app.session_activity_probe_generation, 1,
+            "explicit --session resume must probe daemon-owned activity"
+        );
 
         let turn_id = ocean_agent_sdk::AgentTurnId(uuid::Uuid::from_u128(77));
         let call_id = ocean_agent_sdk::ToolCallId(uuid::Uuid::from_u128(78));
@@ -7171,6 +7386,220 @@ mod tests {
         }
     }
 
+    fn test_image(label: &str) -> ocean_agent_sdk::TurnImage {
+        ocean_agent_sdk::TurnImage {
+            mime_type: "image/png".into(),
+            data: label.into(),
+        }
+    }
+
+    #[tokio::test]
+    async fn submitted_images_restore_only_for_definite_rejections() {
+        let mut app = offline_app();
+        let session_id = AgentSessionId(uuid::Uuid::from_u128(590));
+        app.session_id = Some(session_id);
+        app.session_binding_generation = 4;
+
+        app.pending_images.push(test_image("busy"));
+        let staged = app
+            .stage_pending_images_for_submit()
+            .expect("staged busy image");
+        assert_eq!(staged[0].data, "busy");
+        assert!(app.pending_images.is_empty());
+        assert_eq!(app.in_flight_images.len(), 1);
+        app.chat.seed_pending_submission_for_test(1);
+        app.dispatch(Action::TurnSessionBusy {
+            submission_id: 1,
+            session_id,
+            binding_generation: 4,
+            prompt: "with image".into(),
+        });
+        assert_eq!(app.pending_images.len(), 1, "busy rejection restores image");
+        assert!(app.in_flight_images.is_empty());
+
+        let _ = app.stage_pending_images_for_submit();
+        app.chat.seed_pending_submission_for_test(2);
+        app.dispatch(Action::TurnSendFailed {
+            submission_id: 2,
+            prompt: "retry image".into(),
+            err: "daemon unavailable".into(),
+        });
+        assert_eq!(
+            app.pending_images.len(),
+            1,
+            "definitely-unsent rejection restores image"
+        );
+
+        let _ = app.stage_pending_images_for_submit();
+        app.chat.seed_pending_submission_for_test(3);
+        app.dispatch(Action::TurnAccepted {
+            submission_id: 3,
+            turn_id: ocean_agent_sdk::AgentTurnId(uuid::Uuid::from_u128(591)),
+        });
+        assert!(app.pending_images.is_empty());
+        assert!(
+            app.in_flight_images.is_empty(),
+            "accepted image is consumed"
+        );
+
+        app.chat.load_history(Vec::new());
+        app.pending_images.push(test_image("unknown"));
+        let _ = app.stage_pending_images_for_submit();
+        app.chat.seed_pending_submission_for_test(4);
+        app.dispatch(Action::TurnOutcomeUnknown {
+            submission_id: 4,
+            err: "acknowledgement lost".into(),
+        });
+        assert!(app.pending_images.is_empty());
+        assert!(
+            app.in_flight_images.is_empty(),
+            "unknown outcome must not offer an unsafe image replay"
+        );
+    }
+
+    #[tokio::test]
+    async fn resume_activity_probe_latches_busy_and_snapshot_clears_it() {
+        let mut app = offline_app();
+        let session_id = AgentSessionId(uuid::Uuid::from_u128(600));
+        app.session_id = Some(session_id);
+        app.session_binding_generation = 9;
+        app.session_activity_probe_generation = 3;
+
+        app.dispatch(Action::SessionActivityProbeFinished {
+            session_id,
+            binding_generation: 9,
+            probe_generation: 3,
+            after_busy_rejection: false,
+            active_was_observed: false,
+            result: Err(crate::shell::action::CompactFailure {
+                message: "session has an active operation; try again shortly".into(),
+                transcript_may_have_changed: true,
+            }),
+        });
+        assert!(app.chat.is_busy(), "active resume must lock the composer");
+        assert!(app.status.contains("still working"));
+
+        assert_eq!(app.session_activity_probe_generation, 4);
+        app.dispatch(Action::SessionActivityProbeFinished {
+            session_id,
+            binding_generation: 9,
+            probe_generation: 4,
+            after_busy_rejection: true,
+            active_was_observed: true,
+            result: Ok(sync_success(session_id, "finished while resuming", 601)),
+        });
+        assert!(
+            !app.chat.is_busy(),
+            "authoritative post-turn snapshot must unlock the composer"
+        );
+        assert!(app.status.contains("session ready"));
+    }
+
+    #[tokio::test]
+    async fn observed_activity_keeps_polling_after_stream_finish_and_probe_blip() {
+        let mut app = offline_app();
+        let session_id = AgentSessionId(uuid::Uuid::from_u128(602));
+        app.session_id = Some(session_id);
+        app.session_binding_generation = 10;
+        app.session_activity_probe_generation = 5;
+        app.chat.adopt_active_turn();
+        app.dispatch(Action::AgentEvent(Box::new(AgentTurnEvent::TurnFinished {
+            session_id,
+            turn_id: ocean_agent_sdk::AgentTurnId(uuid::Uuid::from_u128(603)),
+            status: ocean_agent_sdk::AgentTurnStatus::Completed,
+            error: None,
+            wall_ms: None,
+            output_tokens: None,
+            input_tokens: None,
+            cache_read_tokens: None,
+            tokens_per_second: None,
+            context_usage: None,
+        })));
+        assert!(!app.chat.is_busy());
+
+        app.dispatch(Action::SessionActivityProbeFinished {
+            session_id,
+            binding_generation: 10,
+            probe_generation: 5,
+            after_busy_rejection: false,
+            active_was_observed: true,
+            result: Err(crate::shell::action::CompactFailure {
+                message: "temporary sync transport failure".into(),
+                transcript_may_have_changed: true,
+            }),
+        });
+
+        assert_eq!(
+            app.session_activity_probe_generation, 6,
+            "authoritatively observed activity must keep polling to a fence"
+        );
+    }
+
+    #[test]
+    fn stale_or_compaction_racing_activity_probe_cannot_replace_history() {
+        let mut app = offline_app();
+        let session_id = AgentSessionId(uuid::Uuid::from_u128(605));
+        app.session_id = Some(session_id);
+        app.session_binding_generation = 12;
+        app.session_activity_probe_generation = 8;
+        app.chat
+            .load_history(vec![crate::shell::sessions::HistoryMsg {
+                role: "assistant".into(),
+                text: "current history".into(),
+            }]);
+
+        app.dispatch(Action::SessionActivityProbeFinished {
+            session_id,
+            binding_generation: 12,
+            probe_generation: 7,
+            after_busy_rejection: false,
+            active_was_observed: false,
+            result: Ok(sync_success(session_id, "stale probe", 606)),
+        });
+        assert_eq!(
+            app.chat.last_reply_for_test().as_deref(),
+            Some("current history")
+        );
+
+        app.sessions_requiring_sync.insert(session_id);
+        app.dispatch(Action::SessionActivityProbeFinished {
+            session_id,
+            binding_generation: 12,
+            probe_generation: 8,
+            after_busy_rejection: false,
+            active_was_observed: false,
+            result: Ok(sync_success(session_id, "raced compact", 607)),
+        });
+        assert_eq!(
+            app.chat.last_reply_for_test().as_deref(),
+            Some("current history")
+        );
+        assert!(app.sessions_requiring_sync.contains(&session_id));
+    }
+
+    #[test]
+    fn stale_resume_activity_probe_cannot_latch_a_rebound_session() {
+        let mut app = offline_app();
+        let session_id = AgentSessionId(uuid::Uuid::from_u128(610));
+        app.session_id = Some(session_id);
+        app.session_binding_generation = 12;
+        app.session_activity_probe_generation = 6;
+
+        app.dispatch(Action::SessionActivityProbeFinished {
+            session_id,
+            binding_generation: 11,
+            probe_generation: 6,
+            after_busy_rejection: false,
+            active_was_observed: false,
+            result: Err(crate::shell::action::CompactFailure {
+                message: "session has an active operation; try again shortly".into(),
+                transcript_may_have_changed: true,
+            }),
+        });
+
+        assert!(!app.chat.is_busy());
+    }
+
     fn arm_compact(app: &mut App, session_id: AgentSessionId) -> (u64, u64) {
         app.session_id = Some(session_id);
         app.session_binding_generation = app.session_binding_generation.wrapping_add(1);
@@ -7427,7 +7856,10 @@ mod tests {
             app.chat.last_reply_for_test().as_deref(),
             Some("current session")
         );
-        app.dispatch(Action::SubmitPrompt("must stay local".into()));
+        app.dispatch(Action::SubmitPrompt {
+            submission_id: 1,
+            prompt: "must stay local".into(),
+        });
         assert!(app.status.contains("synchronization"));
     }
 

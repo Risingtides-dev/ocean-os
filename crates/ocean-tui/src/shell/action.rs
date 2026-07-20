@@ -96,7 +96,10 @@ pub enum Action {
     /// app validates a bound stream generation.
     AgentStreamGap(AgentSessionId),
     /// Submit the composer's current text as a new turn.
-    SubmitPrompt(String),
+    SubmitPrompt {
+        submission_id: u64,
+        prompt: String,
+    },
     /// `/compact` — ask the daemon to atomically compact the bound session.
     CompactSession,
     /// Async completion of compaction. Session id plus binding/operation
@@ -122,22 +125,43 @@ pub enum Action {
     /// retry window. The chat unwinds its busy state, surfaces the error in the
     /// transcript, and restores `prompt` to the composer so nothing typed is lost.
     TurnSendFailed {
+        submission_id: u64,
         prompt: String,
         err: String,
+    },
+    /// The daemon rejected a tagged optimistic submission because this session
+    /// already has an admitted operation. Roll back only that local echo,
+    /// preserve its prompt, and keep the composer latched until authoritative
+    /// stream/snapshot state proves the active turn finished.
+    TurnSessionBusy {
+        submission_id: u64,
+        session_id: AgentSessionId,
+        binding_generation: u64,
+        prompt: String,
+    },
+    /// The turn POST was accepted. Clears only the matching optimistic
+    /// submission tag; the stream remains authoritative for turn completion.
+    TurnAccepted {
+        submission_id: u64,
+        turn_id: ocean_agent_sdk::AgentTurnId,
     },
     /// The turn POST was connected but its final response was lost/invalid.
     /// The daemon may already be executing it, so do NOT restore the prompt or
     /// offer an automatic retry that could duplicate side effects.
     TurnOutcomeUnknown {
+        submission_id: u64,
         err: String,
     },
-    /// The daemon rejected the submission with 409 because the session already
-    /// has an active turn (TASK-60). Nothing was persisted, so the chat quietly
-    /// drops the optimistic user row it pushed for this submission, keeps the
-    /// prompt once in the composer, and adds NO error transcript row; the status
-    /// line carries a single "turn still running" notice.
-    TurnBusyConflict {
-        prompt: String,
+    /// Best-effort activity probe used on resume and after a busy rejection.
+    /// A synchronized snapshot proves the old turn is finished; an active-lane
+    /// conflict proves the composer must remain latched while SSE continues.
+    SessionActivityProbeFinished {
+        session_id: AgentSessionId,
+        binding_generation: u64,
+        probe_generation: u64,
+        after_busy_rejection: bool,
+        active_was_observed: bool,
+        result: Result<ocean_core::SessionSyncResponse, CompactFailure>,
     },
     /// Transient status message. COMPATIBILITY PATH for slash-command and
     /// notice producers — health transitions use the typed
