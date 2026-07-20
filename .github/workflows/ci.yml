@@ -85,7 +85,14 @@ jobs:
         uses: Swatinem/rust-cache@v2
 
       - name: Default + supported-feature checks
+        # rust-toolchain.toml pins the workspace to 1.97, and rustup resolves
+        # that pin ahead of the job-installed 1.88 — so every cargo invocation
+        # (including the ones xtask spawns) must be forced back onto the MSRV
+        # toolchain explicitly. RUSTUP_TOOLCHAIN outranks the pin file and is
+        # inherited by xtask's child processes.
         run: cargo xtask ci --msrv
+        env:
+          RUSTUP_TOOLCHAIN: "1.88.0"
 
   # ── supply-chain audit ───────────────────────────────────────────────────
   deny:

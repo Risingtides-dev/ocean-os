@@ -4596,3 +4596,11 @@ area:      backend
 
 TASK-61 landed a8c0e3d6 (daemon-core #4, codex cut A) — and the sub upgraded the spec: not emit-before but ATOMIC. update_request_finished now takes an on_finalize closure that runs UNDER the registry write guard, only when this call performs the terminal transition; the agent-bus TurnFinished emits inside that scope (both buses verified sync, no await, no re-entry — no lock hazard). A reader observing registry-terminal is thereby GUARANTEED the frame is already in the ring — the stale-projection window GET /v1/agent/sessions kept exposing is closed at the source, and the inverted window never opens. Normal completion and the TASK-56 orphan guard both funnel through the hook; a latent unconditional double-emit in the old normal path is now gated. 8-reader race test fails under the old order, passes now. Post-rebase over TASK-62: 532/0 + fmt + clippy raw-exit 0. Daemon-core audit slate now FULLY closed (#1 56, #2 57, #3+#5 62, #4 61, #6 hygiene-non-blocking via premise check). Batched daemon bounce (61+62) follows.
 _________________________________________________________________________________
+time:      [22:20] [19-07-26]
+agent:     [claude] [fable 5]
+worktree:  infra/task13-msrv-pin-compat
+type:      [gh-actions]
+area:      [infra]
+
+Fixed the hosted MSRV lane broken by the 1.97 toolchain pin (pad TASK-13, blocking thoth's #317/TASK-12): rust-toolchain.toml outranks the job-installed 1.88, so the MSRV job ran 1.97 and xtask's version guard failed closed exactly as designed. RUSTUP_TOOLCHAIN=1.88.0 env on the MSRV step restores the intended toolchain (env override outranks the pin file and inherits to xtask's spawned cargo processes); the guard's failure message now prints the local-dev incantation. Verified by running the complete MSRV lane locally under the override: ci: MSRV lane passed.
+_________________________________________________________________________________
