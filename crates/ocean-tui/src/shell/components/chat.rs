@@ -3005,6 +3005,19 @@ impl Component for ChatComponent {
                         return Some(Action::Status(hint));
                     }
                 }
+                // A turn is already running: the daemon serializes turns per
+                // session and would reject a second POST with 409 (TASK-60).
+                // Suppress the submit entirely — no optimistic user row, no POST
+                // — and give one compact status-line notice instead of stacking
+                // duplicate rows. Re-pressing Enter just refreshes the same
+                // notice (set_notice replaces, never appends). Prompts restored
+                // to the composer after a daemon-blip TurnSendFailed are typed
+                // while idle (busy is cleared first), so this never blocks retry.
+                if self.busy {
+                    return Some(Action::Status(
+                        "a turn is still running — wait for it to finish".into(),
+                    ));
+                }
                 self.history.push(&text);
                 self.reset_history_nav();
                 self.input.clear();
@@ -3245,6 +3258,23 @@ impl Component for ChatComponent {
                 "{} {prefix} — {msg}\n\nYour prompt is back in the composer.",
                 g("⚠", "!")
             )));
+            if self.input.is_empty() {
+                self.input = prompt.clone();
+            }
+            self.scroll_back = 0;
+            return None;
+        }
+        // The daemon rejected this submission with 409 (session already has an
+        // active turn) — a race where local `busy` wasn't yet known. Nothing was
+        // persisted, so unwind THIS submission's optimistic effects only: drop
+        // the trailing user row we pushed for it, clear the busy flag it set,
+        // keep the prompt once in the composer, and add NO error transcript row.
+        // The concurrent turn's own stream events re-assert busy if it is ours.
+        if let Action::TurnBusyConflict { prompt } = action {
+            self.busy = false;
+            if matches!(self.turns.last(), Some(Turn::User(t)) if t == prompt) {
+                self.turns.pop();
+            }
             if self.input.is_empty() {
                 self.input = prompt.clone();
             }
@@ -6196,6 +6226,131 @@ mod tests {
             !msg.contains("couldn't reach the daemon"),
             "non-connect error must not use daemon prefix, got: {msg}"
         );
+    }
+
+    // ── TASK-60: submit suppression while a turn is running ───────────────
+
+    /// (a) Enter while busy pushes no optimistic user row and emits no
+    /// SubmitPrompt (so no POST) — only a single compact status notice.
+    #[test]
+    fn enter_while_busy_suppresses_submit_and_notifies() {
+        let mut chat = chat_with("another prompt");
+        chat.busy = true; // a turn is already streaming
+
+        let act = chat.handle_key(key(KeyCode::Enter));
+
+        assert!(
+            !matches!(act, Some(Action::SubmitPrompt(_))),
+            "busy Enter must not POST a second turn"
+        );
+        assert!(
+            matches!(&act, Some(Action::Status(s)) if s.contains("still running")),
+            "busy Enter should surface a compact notice, got: {act:?}"
+        );
+        assert!(
+            chat.turns.is_empty(),
+            "busy Enter must not push an optimistic user row"
+        );
+        assert_eq!(
+            chat.input, "another prompt",
+            "the composer text is preserved for when the turn finishes"
+        );
+    }
+
+    /// (b) Repeated Enter while busy still yields exactly one notice per press
+    /// and zero rows — nothing stacks in the transcript.
+    #[test]
+    fn repeated_enter_while_busy_never_stacks_rows() {
+        let mut chat = chat_with("hammer");
+        chat.busy = true;
+
+        for _ in 0..5 {
+            let act = chat.handle_key(key(KeyCode::Enter));
+            assert!(
+                matches!(&act, Some(Action::Status(s)) if s.contains("still running")),
+                "each busy Enter is a single notice, got: {act:?}"
+            );
+        }
+
+        assert!(
+            chat.turns.is_empty(),
+            "repeated busy Enter must never accumulate transcript rows"
+        );
+    }
+
+    /// (c) A 409 active-turn rejection drops the optimistic row for that
+    /// submission, keeps the prompt once in the composer, and adds NO error row.
+    #[test]
+    fn active_turn_conflict_drops_optimistic_row_without_error() {
+        let mut chat = ChatComponent::default();
+        // Simulate the optimistic submit that raced ahead of a known-busy state.
+        chat.turns.push(Turn::User("raced prompt".into()));
+        chat.busy = true;
+
+        chat.update(&Action::TurnBusyConflict {
+            prompt: "raced prompt".into(),
+        });
+
+        assert!(
+            chat.turns.is_empty(),
+            "the optimistic user row must be removed"
+        );
+        assert!(!chat.busy, "a rejected submission unwinds its busy flag");
+        assert_eq!(
+            chat.input, "raced prompt",
+            "the prompt is kept exactly once in the composer"
+        );
+    }
+
+    /// (d) The 13de2a97 daemon-blip path is preserved: a non-409 send failure
+    /// still restores the prompt to the composer for retry.
+    #[test]
+    fn daemon_blip_failure_still_restores_prompt_for_retry() {
+        let mut chat = ChatComponent {
+            busy: true,
+            ..Default::default()
+        };
+
+        chat.update(&Action::TurnSendFailed {
+            prompt: "ride it out".into(),
+            err: "tcp connect error: Connection refused (os error 61)".into(),
+        });
+
+        assert!(!chat.busy, "the spinner unwinds on a send failure");
+        assert_eq!(
+            chat.input, "ride it out",
+            "a daemon-blip failure restores the prompt for retry"
+        );
+        assert_eq!(
+            chat.turns.len(),
+            1,
+            "the honest transcript note is still pushed"
+        );
+        let Turn::Assistant(msg) = &chat.turns[0] else {
+            panic!("expected Assistant note");
+        };
+        assert!(
+            msg.contains("back in the composer"),
+            "the retry hint stays, got: {msg}"
+        );
+    }
+
+    /// (e) A normal submit while idle is unchanged: it pushes the user row, sets
+    /// busy, and emits SubmitPrompt.
+    #[test]
+    fn idle_enter_submits_normally() {
+        let mut chat = chat_with("hello there");
+
+        let act = chat.handle_key(key(KeyCode::Enter));
+
+        assert!(
+            matches!(&act, Some(Action::SubmitPrompt(s)) if s == "hello there"),
+            "idle Enter still submits, got: {act:?}"
+        );
+        assert!(chat.busy, "idle Enter marks the turn busy");
+        assert_eq!(chat.turns.len(), 1, "idle Enter pushes the user row");
+        assert!(matches!(&chat.turns[0], Turn::User(s) if s == "hello there"));
+        assert!(chat.input.is_empty(), "the composer clears on submit");
     }
 
     #[test]

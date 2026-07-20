@@ -131,6 +131,14 @@ pub enum Action {
     TurnOutcomeUnknown {
         err: String,
     },
+    /// The daemon rejected the submission with 409 because the session already
+    /// has an active turn (TASK-60). Nothing was persisted, so the chat quietly
+    /// drops the optimistic user row it pushed for this submission, keeps the
+    /// prompt once in the composer, and adds NO error transcript row; the status
+    /// line carries a single "turn still running" notice.
+    TurnBusyConflict {
+        prompt: String,
+    },
     /// Transient status message. COMPATIBILITY PATH for slash-command and
     /// notice producers — health transitions use the typed
     /// [`Action::HealthDegraded`]/[`Action::HealthRecovered`] variants instead

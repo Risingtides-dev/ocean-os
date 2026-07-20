@@ -141,7 +141,9 @@ impl Reporter {
                     _ => {}
                 }
             }
-            Action::TurnSendFailed { .. } | Action::TurnOutcomeUnknown { .. } => self.finish_turn(),
+            Action::TurnSendFailed { .. }
+            | Action::TurnOutcomeUnknown { .. }
+            | Action::TurnBusyConflict { .. } => self.finish_turn(),
             Action::NewSession
             | Action::NewSessionInProject { .. }
             | Action::ResumeSession { .. } => self.finish_turn(),

@@ -1731,6 +1731,13 @@ impl App {
                 self.in_flight_images.clear();
                 self.set_notice(errfmt::humanize(err));
             }
+            // 409 active-turn rejection: the chat arm (above) drops the optimistic
+            // row and keeps the prompt; here we recover any in-flight images and
+            // surface the single "still running" notice. Nothing was persisted.
+            Action::TurnBusyConflict { .. } => {
+                self.pending_images.append(&mut self.in_flight_images);
+                self.set_notice("a turn is still running — wait for it to finish".into());
+            }
             Action::BoundAgentEvent {
                 session_id,
                 binding_generation,
@@ -4685,6 +4692,9 @@ impl App {
             if let Err(error) = client.agent_turn_retrying(&req, on_retry).await {
                 let err = format!("turn: {error}");
                 let action = match error {
+                    // 409: the session already had an active turn. Quietly drop
+                    // the optimistic row and keep the prompt — no error note.
+                    TurnSubmitError::ActiveTurn(_) => Action::TurnBusyConflict { prompt },
                     TurnSubmitError::DefinitelyUnsent(_) | TurnSubmitError::Rejected(_) => {
                         Action::TurnSendFailed { prompt, err }
                     }
