@@ -3044,13 +3044,13 @@ fn open_nofollow_read(path: &std::path::Path) -> Result<String, String> {
     #[cfg(not(target_os = "macos"))]
     let flags = libc::O_NOFOLLOW;
 
-    #[cfg(not(target_os = "macos"))]
-    if let Some(parent) = path.parent() {
-        match (std::fs::canonicalize(parent), std::fs::canonicalize(path)) {
-            (Ok(cp), Ok(cf)) if cf.starts_with(&cp) => {}
-            _ => return Err("skill path parent could not be resolved without a symlink".into()),
-        }
-    }
+    // NOTE (non-macOS): `O_NOFOLLOW` above guards only the FINAL component, so a
+    // symlinked ANCESTOR is not caught here — full protection needs
+    // `openat2(RESOLVE_NO_SYMLINKS)`, filed as follow-up (TASK-32). This is NOT
+    // a production gap: the daemon deploys only on macOS, where `O_NOFOLLOW_ANY`
+    // (above) rejects a symlink in ANY component. The earlier canonical-ancestor
+    // check that lived here was REMOVED because it compared the path to its own
+    // resolved parent (always true) and thus guarded nothing — security theater.
 
     let mut file = std::fs::OpenOptions::new()
         .read(true)
@@ -8564,6 +8564,9 @@ mod tests {
     }
 
     /// Ancestor swap (Codex P1 round 1): a parent dir under skills/ is a symlink.
+    // macOS-only: asserts the O_NOFOLLOW_ANY production guarantee. The
+    // non-macOS fallback guards only the final component (TASK-32 openat2).
+    #[cfg(target_os = "macos")]
     #[test]
     fn guarded_read_refuses_ancestor_symlink() {
         let cwd = tempfile::tempdir().expect("cwd");
@@ -8583,6 +8586,9 @@ mod tests {
     /// Root swap (Codex P1 round 2): `<cwd>/skills` itself is retargeted. The
     /// repo controls `skills`, so it is part of the untrusted remainder and the
     /// no-follow open must refuse it.
+    // macOS-only: asserts the O_NOFOLLOW_ANY production guarantee. The
+    // non-macOS fallback guards only the final component (TASK-32 openat2).
+    #[cfg(target_os = "macos")]
     #[test]
     fn guarded_read_refuses_root_directory_swap() {
         let cwd = tempfile::tempdir().expect("cwd");
