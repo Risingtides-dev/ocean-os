@@ -4752,9 +4752,24 @@ mod tests {
         })
         .await
         .expect("all pending rows attempted once");
-        assert!(with_rooms_handle(&rooms, |s| s.list_pending_redemptions())
-            .unwrap()
-            .is_empty());
+        // The attempt counter increments when the fake RECEIVES a call, but a
+        // row leaves the pending store only after its 403 response is
+        // processed — an instantaneous emptiness assert races that final
+        // write under load (this fired on #339's ubuntu row). Poll the
+        // observable end state under the same generous deadline.
+        tokio::time::timeout(Duration::from_secs(60), async {
+            loop {
+                let pending = with_rooms_handle(&rooms, |s| s.list_pending_redemptions())
+                    .unwrap()
+                    .len();
+                if pending == 0 {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("every attempted row must drain from the pending store");
         supervisor.shutdown().await;
         server.abort();
     }
