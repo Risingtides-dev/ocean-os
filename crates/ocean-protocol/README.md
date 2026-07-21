@@ -50,4 +50,4 @@ Set `OPENAI_API_KEY` to the provider's key, or pass `api_key` directly.
 
 ## License
 
-MIT. See [`/NOTICE.md`](../../NOTICE.md) for third-party attributions.
+MIT OR Apache-2.0. See [`/NOTICE.md`](../../NOTICE.md) for third-party attributions.

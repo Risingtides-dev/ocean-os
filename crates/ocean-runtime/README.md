@@ -32,4 +32,4 @@ println!("{} messages", run.messages.len());
 
 ## License
 
-MIT. See [`/NOTICE.md`](../../NOTICE.md) for third-party attributions.
+MIT OR Apache-2.0. See [`/NOTICE.md`](../../NOTICE.md) for third-party attributions.

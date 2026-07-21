@@ -3493,8 +3493,8 @@ cargo, default human git status/log, default gh PR checks, npm install/ci, npx
 first-run preambles, and attributed pytest summaries/failure blocks. Machine,
 custom, NUL, oversized, unknown, and ambiguous shapes remain byte-identical.
 Preserved selected pinned OMP fixtures, added exact gh/npx/pytest goldens and
-OMP/RTK MIT attribution, and documented that M1 has no shell parser, TOML/user
-configuration, artifacts/footer, or daemon/runtime/agent/TUI/profile wiring.
+OMP MIT attribution and RTK provenance (the pinned RTK revision's Apache-2.0
+license was corrected in the 2026-07-20 launch-license pass), and documented that M1 has no shell parser, TOML/user configuration, artifacts/footer, or daemon/runtime/agent/TUI/profile wiring.
 
 Provenance:
 - Oh My Pi `03c48d073bd4849726cc14750b5aecfa310bdf26`
@@ -4743,3 +4743,11 @@ area:      [backend]
 
 Completed Observatory Gate 1 Task 9, the independent security + protocol + architecture review and the program's sole remaining task. Six independent fresh-context category passes (auth, redaction, persistence, protocol, admission/binding, extension-invariant/Gate-0) ran read-only against main 6ba2cef per the task-8 independence norm, with every gating claim re-verified by direct source read before consolidation. Verdicts: auth PASS (HMAC sign-before-parse, constant-time compare, fail-closed 0600/O_NOFOLLOW secret, boot-bound rotation, no Set-Cookie/issuance-route/query-string, stateless-bearer corrections hold); redaction PASS under D1 (closed payload types, exhaustive no-wildcard adapter over all 16 AgentTurnEvent variants, planted-secret sentinel sweeps green); admission/binding library PASS (transitive cycle detection, depth 32, fresh-token idempotency, 256-bit single-use 30s bindings); extension invariant + Gate 0 PASS (GET-only routes, record-only, whole-daemon scope, no orchestration in core). Five GATING findings block the production renderer gate: G1 snapshot_at is not point-in-time (reads unfiltered current nodes/edges, labels with requested watermark — breaks snapshot+tail equivalence, §7.1/§4.2); G2 ReplayEvent omits §7.3 fields (recorded_at/truth/producer/topology/correlation/visibility) — §10.7 wire deviation needing code or manifest reconciliation; G3 retention never scheduled + all-or-nothing gate permits unbounded growth; G4 startup cursor seed ignores durable watermarks → cursor reuse after full-prune+restart (§2.3), activated exactly by fixing G3, so G3+G4 land together; G5 401 rejections lack §7.4 headers and §7.1 JSON body. Twelve non-gating findings F1–F12 recorded (spawn_blocking for store calls, §4.1 schema migration, Summary-scope assertion, complete-flag semantics, plus the admission-wiring gate conditions for the future turn path: strip_binding + validate_topology_edge currently have zero production call sites — explicit V1 record-only scope, must wire with the attestation seam). Review retained at docs/specs/2026-07-20-observatory-gate1-task9-independent-review.md; ROADMAP renderer gate stays closed with the G1–G5 precondition recorded; root/docs AGENTS + README index updated. Verification: ocean-observatory 49/49, daemon observatory 27/27 + observatory_auth 5/5, docs-check, diff-check.
 _________________________________________________________________________________
+_________________________________________________________________________________
+time:      [license-credits] [20-07-26]
+agent:     [ocean] [gpt-5.6]
+worktree:  [license-credits-20260720]
+type:      legal/docs
+area:      public launch licensing and attribution
+
+Applied the operator-approved public launch posture: Ocean OS code and project-authored non-brand documentation/assets are MIT OR Apache-2.0, copyright © 2026 Rising Tides, while Ocean names and logos remain outside the open-source grants under a nominative-use trademark policy. Added root license texts, scope, contribution terms, human credits, and expanded donor notices for Pi, Oh My Pi, inertia-tui's 3D terminal graph mathematics, and RTK. Corrected the pinned RTK minimizer provenance from MIT to Apache-2.0 and bundled that license with the standalone minimizer crate. Updated Cargo package metadata and README discoverability; no runtime behavior changed.

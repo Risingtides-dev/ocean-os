@@ -30,6 +30,17 @@ See the cross-crate change-impact matrix in `crates/AGENTS.md` before changing e
 - Keep public errors and operator-visible fallback behavior honest.
 - Update owning docs and append `events.md` after meaningful work.
 
+## Contribution licensing
+
+Unless you explicitly state otherwise, a contribution intentionally submitted
+to Ocean OS is provided under the repository's `MIT OR Apache-2.0` licensing
+posture. By contributing, you confirm that you have the right to submit the
+work. Preserve upstream notices and identify copied or adapted third-party
+material; do not submit third-party names or logos as Ocean brand assets.
+
+See [`LICENSE`](../LICENSE), [`NOTICE.md`](../NOTICE.md), and
+[`TRADEMARKS.md`](../TRADEMARKS.md).
+
 ## Validation
 
 ### Fast loop

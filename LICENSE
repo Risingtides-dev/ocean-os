@@ -1,0 +1,32 @@
+# Licensing Ocean OS
+
+Except for the exclusions and third-party materials described below, Ocean OS
+source code is available under either of these licenses, at your option:
+
+- the Apache License, Version 2.0 ([`LICENSE-APACHE`](LICENSE-APACHE)); or
+- the MIT License ([`LICENSE-MIT`](LICENSE-MIT)).
+
+Copyright © 2026 Rising Tides.
+
+## Documentation and project-authored assets
+
+Project-authored documentation and non-brand assets in this repository are
+available under the same `MIT OR Apache-2.0` choice unless a file or directory
+states different terms.
+
+## Brand exclusion
+
+The licenses above do not grant rights to Ocean names, logos, wordmarks, or
+other distinctive brand assets except for reasonable nominative use when
+accurately referring to this project. See [`TRADEMARKS.md`](TRADEMARKS.md).
+
+## Third-party material
+
+Third-party code and assets remain under their respective licenses. See
+[`NOTICE.md`](NOTICE.md), local `NOTICE`/`LICENSE` files, source headers, and the
+dependency manifests. Those terms continue to apply regardless of which Ocean
+license you select.
+
+Unless required by an upstream license or agreed in writing, contributions
+submitted to this repository are licensed under this same project licensing
+posture.

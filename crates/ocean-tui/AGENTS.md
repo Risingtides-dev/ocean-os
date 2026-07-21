@@ -24,6 +24,7 @@ This crate owns the full-screen terminal steering cockpit (`ocean` binary) for i
 - Keep TUI behavior aligned with daemon API contracts; clients do not own sessions.
 - The `shell/` workbench is the sole TUI. Do not reintroduce `--legacy`, nested TUI session resume, Track-0 room tabs, the mesh parity subcommand, or room-scoped `AgentTurnRequest` fields.
 - Do not introduce agent/session logic into the TUI; session state lives in the daemon via `ocean-agent`.
+- Preserve the Kairav Mittal / `aclfe/inertia` attribution and audited donor revision in `src/shell/spatial.rs`; the project-graph implementation reuses its 3D camera/projection mathematics under the elected MIT terms.
 
 ## Hard Rules (violations have broken the build before — 2026-07-08)
 
