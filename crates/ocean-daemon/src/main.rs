@@ -3052,10 +3052,11 @@ fn open_nofollow_read(path: &std::path::Path) -> Result<String, String> {
         // macOS: O_NOFOLLOW_ANY rejects a symlink in ANY component. Other Unix
         // (not a supported target) falls back to O_NOFOLLOW, which guards only
         // the final component — no such platform is a deploy or CI target.
+        // O_CLOEXEC for the same fd-isolation reason as the Linux path.
         #[cfg(target_os = "macos")]
-        let flags = libc::O_NOFOLLOW_ANY;
+        let flags = libc::O_NOFOLLOW_ANY | libc::O_CLOEXEC;
         #[cfg(not(target_os = "macos"))]
-        let flags = libc::O_NOFOLLOW;
+        let flags = libc::O_NOFOLLOW | libc::O_CLOEXEC;
         std::fs::OpenOptions::new()
             .read(true)
             .custom_flags(flags)
@@ -3092,7 +3093,10 @@ fn open_nofollow_linux(path: &std::path::Path) -> Result<std::fs::File, String> 
     let c_path = std::ffi::CString::new(path.as_os_str().as_bytes())
         .map_err(|_| "skill path contains an interior NUL".to_string())?;
     let how = OpenHow {
-        flags: libc::O_RDONLY as u64,
+        // O_CLOEXEC so a concurrent exec in the multithreaded daemon cannot
+        // leak the readable skill fd to a child (Rust's std open sets this by
+        // default; openat2 does not — Codex P2 on #336).
+        flags: (libc::O_RDONLY | libc::O_CLOEXEC) as u64,
         mode: 0,
         resolve: RESOLVE_NO_SYMLINKS,
     };
