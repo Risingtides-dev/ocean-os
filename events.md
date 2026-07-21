@@ -4751,3 +4751,19 @@ type:      legal/docs
 area:      public launch licensing and attribution
 
 Applied the operator-approved public launch posture: Ocean OS code and project-authored non-brand documentation/assets are MIT OR Apache-2.0, copyright © 2026 Rising Tides, while Ocean names and logos remain outside the open-source grants under a nominative-use trademark policy. Added root license texts, scope, contribution terms, human credits, and expanded donor notices for Pi, Oh My Pi, inertia-tui's 3D terminal graph mathematics, and RTK. Corrected the pinned RTK minimizer provenance from MIT to Apache-2.0 and bundled that license with the standalone minimizer crate. Updated Cargo package metadata and README discoverability; no runtime behavior changed.
+time:      [23:55] [20-07-26]
+agent:     [claude] [fable 5]
+worktree:  feat/task30-nofollow-relative-root
+type:      [bug-report]
+area:      [backend]
+
+Correct fix for the librarian symlink-retarget vulnerability (TASK-30; supersedes the unsound path-check attempts in draft #333 that Codex correctly P1'd twice). Root cause of the earlier failures: check-then-read on a pathname cannot be made TOCTOU-safe, and plain O_NOFOLLOW_ANY on the absolute path over-rejects legitimate system symlinks (macOS /var->/private/var) and legit symlinked home roots, blanket-breaking real fetches. Design: split the indexed path into a TRUSTED PREFIX and an UNTRUSTED REMAINDER — home roots (~/.config/ocean-rs, ~/.spawner, ~/.codex) trust the whole root (a symlinked ~/.codex is the user's own config); the repo root trusts only the operator cwd, since an untrusted repo controls skills/ and below. Canonicalize the trusted prefix (clears legit symlinks so real files are not false-rejected), then no-follow-open the full path: macOS O_NOFOLLOW_ANY refuses a symlink in ANY component, checked atomically at open, body read from that handle — no reopen, no check-then-read TOCTOU, and a swapped root/ancestor/final component all rejected. Off-macOS (CI only) uses O_NOFOLLOW plus a canonical ancestor check. Threat-model assumption documented for reviewer confirmation: home roots trusted, repo root not (an attacker who owns your home already owns you). Attack matrix all green: legit-file-under-system-symlink (the happy path that broke attempt 3), final-swap, ancestor-swap (Codex P1 rd1), root-swap (Codex P1 rd2). 541 daemon tests green, clippy zero, fmt clean. HOLDS FOR review — not self-merged.
+_________________________________________________________________________________
+time:      [02:10] [21-07-26]
+agent:     [claude] [fable 5]
+worktree:  feat/task30-nofollow-relative-root
+type:      [bug-report]
+area:      [backend]
+
+Closed Codex's Linux P1 on #336 by making the fix sound on BOTH platforms instead of deferring. Codex correctly held that leaving the non-macOS path on O_NOFOLLOW (final component only) and cfg-hiding the attack tests was a real hole, not a follow-up. Corrected my own reasoning: I claimed I could not verify a Linux syscall from macOS, but CI IS the Linux verifier — so I implemented openat2(RESOLVE_NO_SYMLINKS) via libc::syscall (SYS 437, open_how{O_RDONLY,0,RESOLVE_NO_SYMLINKS}, AT_FDCWD), reading from the returned fd, and UNGATED the ancestor/root-swap attack tests so ubuntu CI proves them. macOS keeps O_NOFOLLOW_ANY. Both reject a symlink in ANY component atomically at open. TASK-32 is thereby folded into #336 rather than left dangling. macOS: 541 daemon tests green, clippy zero, fmt clean. Linux openat2 path verified by ubuntu CI (the ancestor/root tests fail there if the syscall wiring is wrong, exactly as they did before this change). Still draft, not self-merged.
+_________________________________________________________________________________
