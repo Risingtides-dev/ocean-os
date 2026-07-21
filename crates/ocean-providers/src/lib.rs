@@ -39,6 +39,12 @@ const ANTHROPIC_BASE_URL: &str = "https://api.anthropic.com";
 // (see `minimax_base_url`) to point back at the mainland platform.
 const MINIMAX_BASE_URL: &str = "https://api.minimax.io/v1";
 const MOONSHOT_BASE_URL: &str = "https://api.moonshot.ai/v1";
+// Kimi CODING SUBSCRIPTION endpoint (the "kimi code" plan). Unlike the raw
+// metered Moonshot API above, this speaks the Anthropic Messages wire protocol
+// (verified live: POST {base}/v1/messages, x-api-key auth, returns signed
+// thinking) and bills against the subscription, not per-token balance. This is
+// what fixes the "insufficient balance" 429 for plan users (TASK-19).
+const KIMI_CODING_BASE_URL: &str = "https://api.kimi.com/coding";
 // Kimi K3's published context window is 1M tokens. Moonshot permits up to 1M
 // completion tokens, but Ocean intentionally keeps its conservative 8K output
 // reservation so one turn cannot consume the entire shared context by default.
@@ -70,6 +76,9 @@ pub enum ProviderId {
     MiniMax,
     /// Moonshot AI / Kimi (OpenAI-compatible chat-completions; K2/K3 family).
     Kimi,
+    /// Kimi CODING SUBSCRIPTION ("kimi code" plan): Anthropic-messages wire at
+    /// api.kimi.com/coding, billed against the plan, not metered balance.
+    KimiCoding,
     /// Z.AI / Zhipu GLM (OpenAI-compatible chat-completions; GLM-4/5 family).
     Glm,
     /// Google Generative AI (Gemini family; v1beta generativelanguage API).
@@ -88,6 +97,7 @@ impl ProviderId {
             Self::ClaudeCode => "claude-code",
             Self::MiniMax => "minimax",
             Self::Kimi => "kimi",
+            Self::KimiCoding => "kimi-coding",
             Self::Glm => "glm",
             Self::Google => "google",
             Self::OpenAiCompatible => "openai-compatible",
@@ -107,6 +117,7 @@ impl ProviderId {
             Self::Anthropic => &["OCEAN_ANTHROPIC_API_KEY", "ANTHROPIC_API_KEY"],
             Self::MiniMax => &["OCEAN_MINIMAX_API_KEY", "MINIMAX_API_KEY"],
             Self::Kimi => &["OCEAN_MOONSHOT_API_KEY", "MOONSHOT_API_KEY", "KIMI_API_KEY"],
+            Self::KimiCoding => &["OCEAN_KIMI_CODING_KEY", "KIMI_CODING_API_KEY"],
             Self::Glm => &[
                 "OCEAN_GLM_API_KEY",
                 "GLM_API_KEY",
@@ -706,6 +717,7 @@ pub fn known_models() -> Vec<KnownModel> {
         // resolver lowercases the lookup key, so these still route correctly.
         m("MiniMax-M2.7", "minimax", "MiniMax M2.7"),
         m("MiniMax-M2", "minimax", "MiniMax M2"),
+        m("k3", "kimi-coding", "Kimi K3 (coding plan)"),
         m("kimi-k3", "kimi", "Kimi K3"),
         m("kimi-k2.6", "kimi", "Kimi K2.6"),
         m("kimi-k2", "kimi", "Kimi K2"),
@@ -994,6 +1006,16 @@ pub fn resolve_model_selection(env: &ProviderEnv) -> Result<ModelSelection, Prov
         // Moonshot AI / Kimi family. Official OpenAI-compatible base; model ids
         // are lowercase so casing survives normalization as-is. Keep the bare
         // `kimi` alias on K2.6 for backward compatibility; K3 is opt-in.
+        // Kimi coding SUBSCRIPTION (TASK-19): the "kimi code" plan endpoint,
+        // Anthropic-messages, billed against the subscription. Distinct from the
+        // raw metered `kimi-k3` below. `k3` is the plan's own model id.
+        "kimi-coding" | "kimi-code" | "k3" | "kimi-for-coding" => Ok(model_selection(
+            ProviderId::KimiCoding,
+            "k3",
+            KIMI_CODING_BASE_URL,
+            KIMI_K3_CONTEXT_WINDOW,
+            131_072,
+        )),
         "kimi-k3" => Ok(model_selection(
             ProviderId::Kimi,
             "kimi-k3",
@@ -1842,6 +1864,24 @@ mod tests {
     }
 
     #[test]
+    fn kimi_coding_routes_to_the_subscription_endpoint() {
+        // TASK-19: the coding-plan aliases must route to the api.kimi.com/coding
+        // Anthropic endpoint, NOT the raw metered Moonshot API (that mis-route is
+        // what returns "insufficient balance" for subscription users).
+        for alias in ["kimi-coding", "kimi-code", "k3", "kimi-for-coding"] {
+            let sel = resolve_model_selection(&env(&[("OCEAN_MODEL", alias)]))
+                .unwrap_or_else(|e| panic!("{alias} not routable: {e}"));
+            assert_eq!(sel.provider, ProviderId::KimiCoding, "alias {alias}");
+            assert_eq!(sel.model, "k3", "alias {alias}");
+            assert_eq!(sel.base_url, "https://api.kimi.com/coding", "alias {alias}");
+        }
+        // The raw metered path stays on Moonshot, unchanged.
+        let raw = resolve_model_selection(&env(&[("OCEAN_MODEL", "kimi-k3")])).unwrap();
+        assert_eq!(raw.provider, ProviderId::Kimi);
+        assert_eq!(raw.base_url, "https://api.moonshot.ai/v1");
+    }
+
+    #[test]
     fn known_models_are_all_routable() {
         // Every model the public picker advertises must actually route through
         // resolve_model_selection (passed as OCEAN_MODEL, the way a client
@@ -1919,6 +1959,7 @@ mod tests {
             // current.model, and known_models() advertises the same string.
             "MiniMax-M2",
             "MiniMax-M2.7",
+            "k3",
             "kimi-k3",
             "kimi-k2.6",
             "kimi-k2",

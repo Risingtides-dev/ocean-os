@@ -3150,6 +3150,11 @@ fn model_from_provider_config(config: &ProviderConfig) -> anyhow::Result<Model> 
             selection.context_window,
             selection.max_output_tokens,
         )),
+        ProviderId::KimiCoding => Ok(Model::kimi_coding_k3(
+            selection.base_url.clone(),
+            selection.context_window,
+            selection.max_output_tokens,
+        )),
         ProviderId::Anthropic => Ok(match selection.model.as_str() {
             "claude-sonnet-5" => Model::anthropic_claude_sonnet_5(),
             "claude-opus-4-8" => Model::anthropic_claude_opus_4_8(),
