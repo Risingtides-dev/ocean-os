@@ -2,7 +2,7 @@
 name = "ocean-hashline"
 version = "0.1.0"
 edition = "2021"
-license = "MIT"
+license.workspace = true
 authors = ["Ocean OS"]
 rust-version.workspace = true
 description = "Pure-Rust reimplementation of oh-my-pi's hashline edit algorithm: file-hash anchored line-precise patches with stale detection and snapshot-based recovery."

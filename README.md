@@ -97,6 +97,18 @@ Compatibility lanes also run supported daemon features and release builds on
 stable Rust and the default/supported feature paths on pinned Rust 1.88. See
 [`AGENTS.md`](AGENTS.md) and [`xtask/README.md`](xtask/README.md).
 
+## License, trademarks, and credits
+
+Ocean OS code is available under **MIT OR Apache-2.0**, at your option.
+Project-authored documentation and non-brand assets use the same posture unless
+marked otherwise. Ocean names and logos are excluded from the open-source
+grants; reasonable nominative use is described in the trademark policy.
+
+- [`LICENSE`](LICENSE) — scope and license choice
+- [`TRADEMARKS.md`](TRADEMARKS.md) — names, logos, and nominative use
+- [`CREDITS.md`](CREDITS.md) — human acknowledgements
+- [`NOTICE.md`](NOTICE.md) — legal third-party notices and donor provenance
+
 ## Contributing
 
 Read [`AGENTS.md`](AGENTS.md) before editing and then follow every nearer

@@ -727,6 +727,11 @@ pub(crate) fn npx(invocation: &Invocation, input: &str) -> FilterResult {
     FilterResult::Text(out)
 }
 
+// Modified Ocean reimplementation of pytest-summary state-machine concepts from
+// RTK `src/cmds/python/pytest_cmd.rs` at 878af7de99e0ba71da2e8fd996f6b52a1836e06c,
+// inherited through the pinned Oh My Pi donor. See ../NOTICE and
+// ../LICENSE-APACHE; Ocean changes consume already-tokenized input and retain
+// bounded failure evidence rather than reproducing RTK's command surface.
 pub(crate) fn pytest(invocation: &Invocation, input: &str, exit_code: i32) -> FilterResult {
     if has_any_flag(
         &invocation.args,
