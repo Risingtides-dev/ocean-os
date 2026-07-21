@@ -23,7 +23,7 @@ approved design or permission to alter public contracts.
 
 - [x] Gate 0 decisions accepted — see [`docs/specs/2026-07-17-observatory-gate0-decisions.md`](docs/specs/2026-07-17-observatory-gate0-decisions.md), including the operator's 90s-game visual-parity ruling on truthful events with a durable event store.
 - [x] Gate 1 implementation manifest accepted on 2026-07-17 — schema, auth token format, persistence contract, admission/binding contract, strict task dependencies, and test requirements are fixed in [`docs/specs/2026-07-17-observatory-gate1-implementation-manifest.md`](docs/specs/2026-07-17-observatory-gate1-implementation-manifest.md).
-- [ ] Implement and independently review the daemon-owned metadata projection, durable ordered replay, authenticated snapshot/live API, and extension admission/binding contract before building the production animated Surface renderer.
+- [ ] Implement and independently review the daemon-owned metadata projection, durable ordered replay, authenticated snapshot/live API, and extension admission/binding contract before building the production animated Surface renderer. Implementation (tasks 2–8) is landed and the Task 9 independent review is retained at [`docs/specs/2026-07-20-observatory-gate1-task9-independent-review.md`](docs/specs/2026-07-20-observatory-gate1-task9-independent-review.md); its gating repairs G1–G5 must land and pass delta review before this gate opens.
 - [ ] Repair and contract-test end-to-end event resume through the Surface proxy (`Last-Event-ID` or an approved explicit cursor equivalent); do not use `/v1/agent/events?all=1` as the product feed.
 
 ## Ocean Browser (OceanWebKit)
