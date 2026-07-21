@@ -3031,39 +3031,89 @@ fn read_skill_body_guarded(
     open_nofollow_read(&full)
 }
 
-/// No-follow open + read. macOS: `O_NOFOLLOW_ANY` (rejects a symlink in ANY
-/// component, atomically at open). Other Unix is CI-only (the daemon deploys on
-/// macOS): `O_NOFOLLOW` guards the final component, plus a canonical ancestor
-/// check.
+/// No-follow open + read: refuse a symlink in ANY component of `path` and read
+/// from the resulting handle (no reopen). Sound on both deploy and CI targets:
+/// * macOS (deploy): `O_NOFOLLOW_ANY`.
+/// * Linux (CI): `openat2` with `RESOLVE_NO_SYMLINKS`.
+///
+/// Both fail the open if any component is a symlink, checked atomically, so a
+/// swapped final component, ancestor directory, or root is rejected rather than
+/// followed. `path` is `canonical_prefix.join(remainder)` — the prefix is
+/// already symlink-free, so only a symlink in the untrusted remainder trips it.
 fn open_nofollow_read(path: &std::path::Path) -> Result<String, String> {
     use std::io::Read;
-    use std::os::unix::fs::OpenOptionsExt;
 
-    #[cfg(target_os = "macos")]
-    let flags = libc::O_NOFOLLOW_ANY;
-    #[cfg(not(target_os = "macos"))]
-    let flags = libc::O_NOFOLLOW;
+    #[cfg(target_os = "linux")]
+    let mut file = open_nofollow_linux(path)?;
 
-    // NOTE (non-macOS): `O_NOFOLLOW` above guards only the FINAL component, so a
-    // symlinked ANCESTOR is not caught here — full protection needs
-    // `openat2(RESOLVE_NO_SYMLINKS)`, filed as follow-up (TASK-32). This is NOT
-    // a production gap: the daemon deploys only on macOS, where `O_NOFOLLOW_ANY`
-    // (above) rejects a symlink in ANY component. The earlier canonical-ancestor
-    // check that lived here was REMOVED because it compared the path to its own
-    // resolved parent (always true) and thus guarded nothing — security theater.
+    #[cfg(not(target_os = "linux"))]
+    let mut file = {
+        use std::os::unix::fs::OpenOptionsExt;
+        // macOS: O_NOFOLLOW_ANY rejects a symlink in ANY component. Other Unix
+        // (not a supported target) falls back to O_NOFOLLOW, which guards only
+        // the final component — no such platform is a deploy or CI target.
+        #[cfg(target_os = "macos")]
+        let flags = libc::O_NOFOLLOW_ANY;
+        #[cfg(not(target_os = "macos"))]
+        let flags = libc::O_NOFOLLOW;
+        std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(flags)
+            .open(path)
+            .map_err(|err| {
+                tracing::warn!(path = %path.display(), %err, "refusing skill fetch: no-follow open failed");
+                "skill path could not be opened without following a symlink".to_string()
+            })?
+    };
 
-    let mut file = std::fs::OpenOptions::new()
-        .read(true)
-        .custom_flags(flags)
-        .open(path)
-        .map_err(|err| {
-            tracing::warn!(path = %path.display(), %err, "refusing skill fetch: no-follow open failed");
-            "skill path could not be opened without following a symlink".to_string()
-        })?;
     let mut body = String::new();
     file.read_to_string(&mut body)
         .map_err(|err| err.to_string())?;
     Ok(body)
+}
+
+/// Linux no-follow open via `openat2(RESOLVE_NO_SYMLINKS)` — rejects a symlink
+/// in any path component, unlike `O_NOFOLLOW` which only guards the final one.
+#[cfg(target_os = "linux")]
+fn open_nofollow_linux(path: &std::path::Path) -> Result<std::fs::File, String> {
+    use std::os::fd::FromRawFd;
+    use std::os::unix::ffi::OsStrExt;
+
+    // struct open_how { u64 flags; u64 mode; u64 resolve; }
+    #[repr(C)]
+    struct OpenHow {
+        flags: u64,
+        mode: u64,
+        resolve: u64,
+    }
+    const RESOLVE_NO_SYMLINKS: u64 = 0x04;
+    const SYS_OPENAT2: libc::c_long = 437;
+
+    let c_path = std::ffi::CString::new(path.as_os_str().as_bytes())
+        .map_err(|_| "skill path contains an interior NUL".to_string())?;
+    let how = OpenHow {
+        flags: libc::O_RDONLY as u64,
+        mode: 0,
+        resolve: RESOLVE_NO_SYMLINKS,
+    };
+    // SAFETY: openat2 with a valid CString path, a correctly-sized open_how, and
+    // AT_FDCWD. The returned fd (>= 0) is owned by the File below.
+    let fd = unsafe {
+        libc::syscall(
+            SYS_OPENAT2,
+            libc::AT_FDCWD,
+            c_path.as_ptr(),
+            &how as *const OpenHow,
+            std::mem::size_of::<OpenHow>(),
+        )
+    };
+    if fd < 0 {
+        let err = std::io::Error::last_os_error();
+        tracing::warn!(path = %path.display(), %err, "refusing skill fetch: openat2 no-follow open failed");
+        return Err("skill path could not be opened without following a symlink".to_string());
+    }
+    // SAFETY: fd is a fresh, owned, valid file descriptor from openat2.
+    Ok(unsafe { std::fs::File::from_raw_fd(fd as i32) })
 }
 
 async fn skills_fetch(Json(req): Json<SkillFetchRequest>) -> (StatusCode, Json<serde_json::Value>) {
@@ -8564,9 +8614,7 @@ mod tests {
     }
 
     /// Ancestor swap (Codex P1 round 1): a parent dir under skills/ is a symlink.
-    // macOS-only: asserts the O_NOFOLLOW_ANY production guarantee. The
-    // non-macOS fallback guards only the final component (TASK-32 openat2).
-    #[cfg(target_os = "macos")]
+    // Sound on macOS (O_NOFOLLOW_ANY) and Linux (openat2 RESOLVE_NO_SYMLINKS).
     #[test]
     fn guarded_read_refuses_ancestor_symlink() {
         let cwd = tempfile::tempdir().expect("cwd");
@@ -8586,9 +8634,7 @@ mod tests {
     /// Root swap (Codex P1 round 2): `<cwd>/skills` itself is retargeted. The
     /// repo controls `skills`, so it is part of the untrusted remainder and the
     /// no-follow open must refuse it.
-    // macOS-only: asserts the O_NOFOLLOW_ANY production guarantee. The
-    // non-macOS fallback guards only the final component (TASK-32 openat2).
-    #[cfg(target_os = "macos")]
+    // Sound on macOS (O_NOFOLLOW_ANY) and Linux (openat2 RESOLVE_NO_SYMLINKS).
     #[test]
     fn guarded_read_refuses_root_directory_swap() {
         let cwd = tempfile::tempdir().expect("cwd");
