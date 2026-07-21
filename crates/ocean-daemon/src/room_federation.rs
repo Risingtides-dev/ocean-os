@@ -4737,7 +4737,14 @@ mod tests {
                     .iter()
                     .filter(|call| call.path == "redeem")
                     .count();
-                if attempts == 129 {
+                // `>= 129`, not `== 129` (TASK-33): a 403-failed redeem can be
+                // re-attempted, so the count can climb past 129 — and even
+                // absent retries, the exact-129 moment is a transient the 10ms
+                // poll can skip under load, hanging until the 60s deadline. The
+                // completeness invariant is "every one of the 129 rows was
+                // attempted"; the pending-list-empty assertion AFTER this loop
+                // is the real correctness check (it catches any row skipped).
+                if attempts >= 129 {
                     break;
                 }
                 tokio::time::sleep(Duration::from_millis(10)).await;
