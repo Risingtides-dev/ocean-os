@@ -2969,6 +2969,103 @@ struct SkillFetchRequest {
 /// `spawn_blocking`. Errors map to typed `{ ok: false, error }` bodies:
 /// `404` for an unknown id, `500` only if the matched file became unreadable
 /// between index + read (a TOCTOU race) — mirrors the topic-fetch error shape.
+/// Read a skill body such that a symlink planted in the UNTRUSTED portion of
+/// the path is refused rather than followed (TASK-30, #333 done right).
+///
+/// The cached index can name a path that was a regular file at walk time and a
+/// symlink now, and `SkillRoots::for_cwd` adds the repo-local `<cwd>/skills`
+/// root — so the retarget can be shipped by an untrusted repository, not just
+/// the operator. Two earlier path-check attempts were unsound (Codex P1/P2 on
+/// #333): canonicalizing the roots at fetch time moves the allowed boundary if
+/// a root is swapped, and any resolve-then-reopen follows whatever the pathname
+/// points to at read time.
+///
+/// Design: split the path into a TRUSTED PREFIX and an UNTRUSTED REMAINDER.
+/// * Home roots (`~/.config/ocean-rs`, `~/.spawner`, `~/.codex`) are the user's
+///   own config; the whole root is trusted (a symlinked `~/.codex` is legit).
+/// * The repo root trusts only the operator-supplied cwd — the repo controls
+///   `skills/` and everything under it, so `skills` is part of the remainder.
+///
+/// The trusted prefix is canonicalized (resolving LEGITIMATE symlinks such as
+/// macOS `/var -> /private/var` so we do not false-reject real skills), then the
+/// full path is opened with a no-follow open. On the macOS deploy target that is
+/// `O_NOFOLLOW_ANY`, which fails if ANY component is a symlink — checked
+/// atomically at open, and the body is read from THAT handle, so there is no
+/// check-then-read TOCTOU. Because the canonical prefix is already symlink-free,
+/// only a symlink in the untrusted remainder can trip it.
+fn read_skill_body_guarded(
+    source_path: &std::path::Path,
+    roots: &ocean_longhouse::SkillRoots,
+) -> Result<String, String> {
+    use std::path::{Path, PathBuf};
+    // (trusted_prefix, full_root). Home roots trust the whole root; the repo
+    // root trusts only its parent (the operator cwd).
+    let mut candidates: Vec<(PathBuf, &Path)> = Vec::new();
+    for home in [
+        roots.ocean.as_deref(),
+        roots.spawner.as_deref(),
+        roots.codex.as_deref(),
+    ]
+    .into_iter()
+    .flatten()
+    {
+        candidates.push((home.to_path_buf(), home));
+    }
+    if let Some(repo) = roots.repo.as_deref() {
+        let trusted = repo.parent().unwrap_or(repo).to_path_buf();
+        candidates.push((trusted, repo));
+    }
+
+    let (trusted_prefix, _root) = candidates
+        .iter()
+        .find(|(_, root)| source_path.starts_with(root))
+        .ok_or_else(|| "skill path is not under any configured root".to_string())?;
+
+    let remainder = source_path
+        .strip_prefix(trusted_prefix)
+        .map_err(|_| "skill path escapes its trusted prefix".to_string())?;
+
+    // Resolve legitimate symlinks in the TRUSTED prefix only.
+    let canonical_prefix = std::fs::canonicalize(trusted_prefix).map_err(|err| err.to_string())?;
+    let full = canonical_prefix.join(remainder);
+    open_nofollow_read(&full)
+}
+
+/// No-follow open + read. macOS: `O_NOFOLLOW_ANY` (rejects a symlink in ANY
+/// component, atomically at open). Other Unix is CI-only (the daemon deploys on
+/// macOS): `O_NOFOLLOW` guards the final component, plus a canonical ancestor
+/// check.
+fn open_nofollow_read(path: &std::path::Path) -> Result<String, String> {
+    use std::io::Read;
+    use std::os::unix::fs::OpenOptionsExt;
+
+    #[cfg(target_os = "macos")]
+    let flags = libc::O_NOFOLLOW_ANY;
+    #[cfg(not(target_os = "macos"))]
+    let flags = libc::O_NOFOLLOW;
+
+    #[cfg(not(target_os = "macos"))]
+    if let Some(parent) = path.parent() {
+        match (std::fs::canonicalize(parent), std::fs::canonicalize(path)) {
+            (Ok(cp), Ok(cf)) if cf.starts_with(&cp) => {}
+            _ => return Err("skill path parent could not be resolved without a symlink".into()),
+        }
+    }
+
+    let mut file = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(flags)
+        .open(path)
+        .map_err(|err| {
+            tracing::warn!(path = %path.display(), %err, "refusing skill fetch: no-follow open failed");
+            "skill path could not be opened without following a symlink".to_string()
+        })?;
+    let mut body = String::new();
+    file.read_to_string(&mut body)
+        .map_err(|err| err.to_string())?;
+    Ok(body)
+}
+
 async fn skills_fetch(Json(req): Json<SkillFetchRequest>) -> (StatusCode, Json<serde_json::Value>) {
     let SkillFetchRequest { id, cwd } = req;
 
@@ -2999,13 +3096,15 @@ async fn skills_fetch(Json(req): Json<SkillFetchRequest>) -> (StatusCode, Json<s
             .cloned();
 
         match matched {
-            // Known skill: read its full body. A read failure here is a TOCTOU
-            // race (file vanished/changed perms after the index walk).
-            Some(brief) => match std::fs::read_to_string(&brief.source_path) {
+            // Known skill: read its full body through the symlink-safe guard
+            // (TASK-30). The cached index can name a path that has since been
+            // retargeted, and the repo-local `<cwd>/skills` root means the
+            // retarget can be shipped by an UNTRUSTED repository, so a plain
+            // `read_to_string` (which follows symlinks in the final component
+            // AND every ancestor) would be an arbitrary file read.
+            Some(brief) => match read_skill_body_guarded(&brief.source_path, &roots) {
                 Ok(body) => SkillFetchOutcome::Found { brief, body },
-                Err(err) => SkillFetchOutcome::Unreadable {
-                    error: err.to_string(),
-                },
+                Err(error) => SkillFetchOutcome::Unreadable { error },
             },
             // Not in the index → unknown id. Never read the raw `id` path.
             None => SkillFetchOutcome::Unknown,
@@ -8421,6 +8520,85 @@ fn event_type_name(event: &OceanEvent) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ---- TASK-30: symlink-safe skill read (#333 done right) --------------
+    #[cfg(test)]
+    fn roots_with_repo(cwd: &std::path::Path) -> ocean_longhouse::SkillRoots {
+        ocean_longhouse::SkillRoots {
+            ocean: None,
+            spawner: None,
+            codex: None,
+            repo: Some(cwd.join("skills")),
+        }
+    }
+
+    /// Happy path: a real skill file under a repo whose cwd sits below a
+    /// LEGITIMATE system symlink (macOS tempdirs live under /var -> /private/var).
+    /// The earlier absolute-path O_NOFOLLOW_ANY attempt WRONGLY rejected this.
+    #[test]
+    fn guarded_read_allows_a_real_file_under_a_legit_system_symlink() {
+        let cwd = tempfile::tempdir().expect("cwd");
+        std::fs::create_dir_all(cwd.path().join("skills/a")).expect("mkdir");
+        std::fs::write(cwd.path().join("skills/a/SKILL.md"), "real body").expect("write");
+        let roots = roots_with_repo(cwd.path());
+        let got = read_skill_body_guarded(&cwd.path().join("skills/a/SKILL.md"), &roots);
+        assert_eq!(got.as_deref(), Ok("real body"), "legit file must read");
+    }
+
+    /// Final-component swap: the skill file itself becomes a symlink.
+    #[test]
+    fn guarded_read_refuses_final_component_symlink() {
+        let cwd = tempfile::tempdir().expect("cwd");
+        let secret = cwd.path().join("secret.txt");
+        std::fs::write(&secret, "CANARY").expect("secret");
+        std::fs::create_dir_all(cwd.path().join("skills")).expect("mkdir");
+        let skill = cwd.path().join("skills/SKILL.md");
+        std::fs::write(&skill, "real").expect("write");
+        std::fs::remove_file(&skill).expect("rm");
+        std::os::unix::fs::symlink(&secret, &skill).expect("symlink");
+        let roots = roots_with_repo(cwd.path());
+        assert!(
+            read_skill_body_guarded(&skill, &roots).is_err(),
+            "final symlink refused"
+        );
+    }
+
+    /// Ancestor swap (Codex P1 round 1): a parent dir under skills/ is a symlink.
+    #[test]
+    fn guarded_read_refuses_ancestor_symlink() {
+        let cwd = tempfile::tempdir().expect("cwd");
+        let outside = tempfile::tempdir().expect("outside");
+        std::fs::write(outside.path().join("SKILL.md"), "CANARY").expect("secret");
+        std::fs::create_dir_all(cwd.path().join("skills/a")).expect("mkdir");
+        std::fs::remove_dir_all(cwd.path().join("skills/a")).expect("rm");
+        std::os::unix::fs::symlink(outside.path(), cwd.path().join("skills/a")).expect("symlink");
+        let roots = roots_with_repo(cwd.path());
+        let indexed = cwd.path().join("skills/a/SKILL.md");
+        assert!(
+            read_skill_body_guarded(&indexed, &roots).is_err(),
+            "ancestor symlink refused"
+        );
+    }
+
+    /// Root swap (Codex P1 round 2): `<cwd>/skills` itself is retargeted. The
+    /// repo controls `skills`, so it is part of the untrusted remainder and the
+    /// no-follow open must refuse it.
+    #[test]
+    fn guarded_read_refuses_root_directory_swap() {
+        let cwd = tempfile::tempdir().expect("cwd");
+        let outside = tempfile::tempdir().expect("outside");
+        std::fs::create_dir_all(outside.path().join("a")).expect("mkdir out");
+        std::fs::write(outside.path().join("a/SKILL.md"), "CANARY").expect("secret");
+        // `<cwd>/skills` is a symlink to the attacker dir.
+        std::os::unix::fs::symlink(outside.path(), cwd.path().join("skills"))
+            .expect("symlink root");
+        let roots = roots_with_repo(cwd.path());
+        let indexed = cwd.path().join("skills/a/SKILL.md");
+        assert!(
+            read_skill_body_guarded(&indexed, &roots).is_err(),
+            "a swapped repo skills root must be refused"
+        );
+    }
 
     #[test]
     fn planner_handoff_uses_exact_truthful_marker() {
