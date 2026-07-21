@@ -5,6 +5,7 @@ edition = "2021"
 license.workspace = true
 authors = ["Ocean OS"]
 rust-version.workspace = true
+publish.workspace = true
 description = "Pure-Rust reimplementation of oh-my-pi's hashline edit algorithm: file-hash anchored line-precise patches with stale detection and snapshot-based recovery."
 
 [dependencies]
