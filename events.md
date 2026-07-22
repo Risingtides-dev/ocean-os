@@ -4775,3 +4775,58 @@ area:      [backend]
 
 Added the Kimi CODING SUBSCRIPTION provider (TASK-16/19) — the real fix for smaths' 'insufficient balance' 429. Root cause (correcting my earlier wrong 'account suspended' call): Ocean routed Kimi to api.moonshot.ai/v1 (raw metered OpenAI API) but smaths is on the kimi-code PLAN, which lives at api.kimi.com/coding speaking Anthropic-messages. Built to a LIVE-VERIFIED contract: probed the endpoint with the key first (HTTP 200, x-api-key, no KimiCLI UA needed, returns signed thinking), so no guessing. Implementation reuses Ocean's existing Claude/anthropic-messages path — ProviderId::KimiCoding → base api.kimi.com/coding, model 'k3', aliases kimi-coding/kimi-code/k3/kimi-for-coding; Model::kimi_coding_k3; auth resolves the 'kimi-coding' auth.json block (subscription key wired in, old auth.json backed up). Raw metered kimi-k3 path untouched — both coexist. VERIFIED END TO END: ephemeral daemon (port 4788) drove a real kimi-coding turn — status completed, 60 output tokens, 4.2s, response 'KIMI-CODING-LIVE-OK', k3 shows ready=True resolving from auth.json. Prod daemon untouched during test. Provider+protocol+agent tests green, clippy zero, routing unit-tested (kimi-coding→subscription, kimi-k3→moonshot).
 _________________________________________________________________________________
+_________________________________________________________________________________
+
+time:      [00:20] [21-07-26]
+agent:     [pi] [claude-opus-4.5] [thoth]
+worktree:  [main]
+type:      [plan]
+area:      [agent-building]
+
+Revised the proposed Phase 6 design ratification (docs/specs/2026-07-18-ocean-crew-
+orchestration-and-durable-workflow-manifest.md) at operator request. Lane names
+ratified: Undertow (local) / Offshore (remote); facade tools renamed to
+longhouse__delegate_undertow / longhouse__delegate_offshore. Added normative member
+completion envelope + acceptance ledger (7.7: attested/checked/verified/reviewed,
+verification as parent-grant host executions, joins gate on ledger status) and
+budget ladder / derived attention states / boundary-only member control (7.8).
+workflow_control artifact gains a bounded topology snapshot; Surface gets a
+read-only flow-graph sidebar projection merging extension-attested topology with
+host-observed lifecycle (6.4, 7.6). Durability rows extended (model attempts,
+capability ids, budget outcomes, grant rows); continuation batching; invariants
+11-12; exclusions extended (mid-turn injection, transcript-fork context); Stage C/D
+scopes and acceptance criteria updated. Appended informative annex 13: pi-subagents
+v0.35.1 concept study (~49k lines TS) mapping 20 concepts to Ocean dispositions --
+explicitly non-parity per the docs contract. Updated docs/AGENTS.md pointer line.
+Status remains proposed; operator acceptance still required before Stage A.
+_________________________________________________________________________________
+time:      [03:29am] [21-07-26]
+agent:     [ocean] [gpt-5.4]
+worktree:  [main]
+type:      [docs]
+area:      [docs]
+
+Refreshed the Ocean Surface architecture page as one bounded honesty/freshness slice. Corrected the canonical Leptos/Tauri/legacy-GPUI boundary, documented proxy-forwarded daemon-owned STT/TTS, and made the transcript-only POST /v1/agent/voice contract explicit without implying microphone capture, daemon STT, wake word, TTS, or a completed voice UX. Verified the live proxy health response, local file page, HTML parse, diff hygiene, and docs-check; no media assets were fabricated.
+time:      [04:28] [21-07-26]
+agent:     [claude] [fable 5]
+worktree:  [detached @ origin/main (ca29a36a); ledger append only]
+type:      [release]
+area:      [backend]
+
+Deployed the merged skills-fetch symlink fix (#336, smaths-merged as ca29a36a) so it actually runs. Full verification, all clean: hardened installer exit 0, /health rev ca29a36ac4e3, single daemon pid 58780 ppid 1 (launchd-supervised), ZERO orphans (TASK-20/23 held through the deploy), and the supervision guard proved live by hand-run — the binary printed "launchd owns the job — refusing to bind" and exited. The symlink vulnerability is now closed on the running daemon, not just on main: an untrusted repo can no longer exfiltrate an out-of-root file through a retargeted <cwd>/skills path (macOS O_NOFOLLOW_ANY, both-platform-verified). Closes the arc: 6 review rounds, 4 genuine bugs caught before merge (2 Codex P1s, a Linux security-theater gap, a CLOEXEC fd-leak regression), every one caught by a test or reviewer.
+_________________________________________________________________________________
+_________________________________________________________________________________
+
+time:      [00:35] [21-07-26]
+agent:     [pi] [claude-opus-4.5] [thoth]
+worktree:  [main]
+type:      [goal]
+area:      [agent-building]
+
+Operator accepted the Crew Phase 6 design ratification (2026-07-21). Status flipped
+to accepted in the manifest and docs/AGENTS.md. Ratified: extension-owned Ocean Crew
+orchestration, Undertow/Offshore lanes, six generic host seams, capability-profile
+intersection, acceptance ledger, budget ladder, staging artifact + flow-graph
+sidebar, all 12 acceptance items (a)-(i). Stage A (extension host readiness:
+Phase 1 acceptance gate, Phases 2-3 implementation) is now authorized. Stages B-E
+require their own implementation manifests before code.
