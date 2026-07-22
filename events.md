@@ -4830,3 +4830,11 @@ intersection, acceptance ledger, budget ladder, staging artifact + flow-graph
 sidebar, all 12 acceptance items (a)-(i). Stage A (extension host readiness:
 Phase 1 acceptance gate, Phases 2-3 implementation) is now authorized. Stages B-E
 require their own implementation manifests before code.
+time:      [00:20] [22-07-26]
+agent:     [claude] [fable 5]
+worktree:  docs/crew-stage-b-host-seams-manifest
+type:      [plan]
+area:      [docs]
+
+Drafted the Crew Stage B implementation manifest (docs/specs/2026-07-21-crew-stage-b-host-seams-implementation-manifest.md) — the design gate the ratified parent (§8) requires before ANY Stage B code. Stage B = the five generic orchestration-agnostic host seams (§6.1 execution request, §6.2 cancellation, §6.3 scoped delivery, §6.5 continuation, §6.6 state directory); explicitly excludes the §6.4 UI artifact lane, all Crew/orchestration vocabulary, and the Longhouse facade tools. Makes the §6.1 capability-intersection rule concrete and testable (effective = member ∩ parent-delegable ∩ activation-grant ∩ operator-policy ∩ ceilings; fail-closed on unknown; no widening by target). Codifies the 3-agent auth consensus: scoped, per-boot, daemon-held capability tokens reusing ocean-observatory's ObserverToken/ObserverSecret primitives (extension holds no credentials → least-privilege by construction). Specifies the durability/at-least-once recovery contract (idempotency keys, host-truth reconciliation, paused recovery) and an 8-point conformance test matrix as the acceptance gate, mirroring the Observatory Gate 1 pattern. DESIGN ONLY — no code; drafted to unblock Stage B without colliding with pi's Stage A extension-install. docs-check PASS.
+_________________________________________________________________________________
