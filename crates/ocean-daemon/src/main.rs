@@ -98,6 +98,8 @@ mod component_interaction;
 mod cors;
 /// Pure adapters between full-fidelity SDK agent events and the legacy core rail.
 mod event_adapter;
+/// Read-only installed/trusted/enabled extension state inspection and diagnostics.
+mod extension_state;
 /// Home-sandboxed directory listing and capped file-read HTTP policy.
 mod filesystem;
 /// Public, read-only GitHub projection for registered project origins.
@@ -624,6 +626,8 @@ fn app_router(cors: CorsLayer) -> Router<AppState> {
         .route("/v1/observatory/snapshot", get(observatory::snapshot))
         .route("/v1/observatory/events", get(observatory::events))
         .route("/v1/observatory/replay", get(observatory::replay))
+        .route("/v1/extensions/{id}/inspect", get(extension_state::inspect))
+        .route("/v1/extensions/{id}/doctor", get(extension_state::doctor))
         // OCEAN-262: the Slack canvas bridge (`ocean-agents`) POSTs a fulfilled
         // awareness result here after round-tripping a `read`/`list`/`create` to
         // the live Slack Canvas API; a `GET` queries the stored fulfillment per
@@ -1381,6 +1385,8 @@ fn banner_routes() -> &'static [&'static str] {
         "GET /v1/observatory/snapshot",
         "GET /v1/observatory/events",
         "GET /v1/observatory/replay",
+        "GET /v1/extensions/{id}/inspect",
+        "GET /v1/extensions/{id}/doctor",
         "POST /v1/agent/canvas/fulfill",
         "GET /v1/agent/canvas/fulfill",
         "POST /v1/agent/sessions",
@@ -22818,7 +22824,7 @@ mod tests {
         );
         assert_eq!(
             banner.len(),
-            92,
+            94,
             "route baseline changed; review the manifest"
         );
 

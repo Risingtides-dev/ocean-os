@@ -5169,6 +5169,64 @@ exit 0 on the shared checkout that carries three unpushed commits, while the new
 logic exits 64 with "on 'main' and HEAD is not contained in origin/main". A clean
 worktree sitting exactly at origin/main still passes. The dirty-tree check is
 unchanged and still fires independently.
+Added the daemon transport seam (crates/ocean-daemon/src/transport.rs):
+ServeListener (Tcp | Virtual) implementing axum::serve::Listener, with
+VirtualConnector dialing in-process tokio duplex streams. Both axum::serve
+sites in main.rs now route through ServeListener::tcp — TCP accept semantics
+delegate to axum's own impl, behavior-neutral. Motivated by the Ocean-under-
+Wanix experiment: a /tmp spike proved hyper serves HTTP over duplex streams
+on wasm32-wasip1 (no sockets, no socket2), so the daemon's browser story
+needs only this seam plus (later) a Wanix namespace bridge and dependency
+gating. 4 new tests (virtual+tcp HTTP round trips, refused connect, accept
+ordering) pass; clippy all-targets clean; full ocean-daemon suite: 566 pass,
+1 pre-existing failure in uncommitted extension_state WIP (untracked file,
+not part of this change). Staged surgically around that WIP. Reviewer
+acknowledgement pending per merge gate. ocean-daemon/AGENTS.md updated.
+_________________________________________________________________________________
+time:      [01:12] [22-07-26]
+agent:     [pi] [thoth]
+worktree:  [main]
+type:      [feature-request]
+area:      [backend]
+
+Accepted Extension Phase 1, the package-schema and hardened read-only tool-lane
+checkpoint within Crew Stage A. Added strict revision-matched installed/trusted/
+enabled state under daemon authority; descriptor-relative no-follow state/store
+inspection; bounded, frozen sha256-tree-v1 verification; exact-digest capability
+grant intersection; registered-project enablement projection; static no-execution
+inspect/doctor HTTP routes; and thin ocean-rs extension inspect/doctor clients.
+Manifest validation now separates structural metadata from host compatibility and
+owns canonical resources/services/capability references. Local provenance is
+lexically canonical and credential-bearing or floating Git sources fail closed.
+AgentRuntime captures the config root so request authority never races the process
+environment. Legacy unmanaged plugins remain compatibility-only; no mutation,
+activation, lifecycle observer, service supervision, or Crew Stage B-E code was
+added.
+
+Verification passed: focused extension/plugin/agent/CLI/daemon suites (23 daemon
+extension-state tests), workspace check/tests, strict touched-package Clippy,
+formatting, docs-check, compatibility and Rust 1.88 MSRV manifests, and canonical
+cargo xtask ci. One known ocean-browser cancellation test flaked once, then passed
+three isolated retries and the clean full workspace rerun. Final security and
+correctness delta reviewers approved after source canonicalization and a
+directory-containing, umask-independent digest KAT were added. Phase 1 is
+accepted; Crew Stage A remains open for separately gated extension Phases 2-3.
+_________________________________________________________________________________
+_________________________________________________________________________________
+time:      [01:33] [22-07-26]
+agent:     [pi] [thoth]
+worktree:  [main]
+type:      [workflow]
+area:      [testing]
+
+Final integration verification on current main (including the independently landed
+daemon transport seam) is green. The first canonical rerun exposed a separate
+nondeterministic ocean-tui Herdr reporting test; it passed three isolated retries
+and the next full workspace run. That next run exhausted the build volume during
+Clippy after all workspace tests passed. Removed only obsolete verification and
+incremental build caches, recovered 25 GiB, disabled incremental compilation for
+the retry, and cargo xtask ci then passed end to end, including cargo-deny. No
+source change was made for either transient failure.
 _________________________________________________________________________________
 time:      [16:52] [24-07-26]
 agent:     [claude] [opus 5]
@@ -5192,4 +5250,27 @@ grandfathered the existing entries explicitly: this is an append-only ledger and
 rewriting 251 historical entries to satisfy a format change would be worse than
 the inconsistency, besides conflicting with every in-flight branch. Only the
 header changed; no historical entry was touched.
+_________________________________________________________________________________
+_________________________________________________________________________________
+time:      [18:18] [27-07-26]
+agent:     [pi] [gpt-5.4] [worker]
+worktree:  [feat/extensions-phase1-current]
+type:      [workflow]
+area:      [backend]
+
+Reconciled the operator-accepted Extension Phase 1 state-inspection checkpoint
+from 069d6af9 onto origin/main 571c331d in the isolated worktree. The replay
+applied without content conflicts, preserving current-main deck and Claude Opus 5
+changes while retaining strict installed/trusted/enabled state, immutable
+artifact validation, static inspect/doctor daemon reads, thin CLI commands, and
+all accepted security coverage. Corrected only the extension manifest's stale
+claims that Stop hooks were still unreachable; current main has invoked bounded,
+fail-open Stop continuations since 2026-07-16. No Phase 2, package mutation,
+supervision, Crew, Telegram, deployment, push, or PR work was added.
+
+Verification passed: ocean-extension (13), ocean-cli (14), focused daemon
+extension-state (23), and full ocean-daemon (558) tests; workspace test-target
+check; strict all-target Clippy for ocean-extension/ocean-agent/ocean-cli/
+ocean-daemon; formatting; docs-check (30 packages, 127 active Markdown files,
+155 local links); and diff whitespace checks.
 _________________________________________________________________________________

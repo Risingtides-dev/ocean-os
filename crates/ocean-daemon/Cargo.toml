@@ -61,6 +61,7 @@ ocean-agent-sdk.workspace = true
 ocean-browser = { workspace = true, optional = true }
 ocean-call.workspace = true
 ocean-core.workspace = true
+ocean-extension.workspace = true
 ocean-longhouse.workspace = true
 ocean-observatory.workspace = true
 ocean-protocol.workspace = true
@@ -71,7 +72,9 @@ ocean-store.workspace = true
 moka.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+semver.workspace = true
 sha2.workspace = true
+fs2.workspace = true
 # Voice phases 2-4: the Realtime client-secret mint POSTs to api.openai.com,
 # and the STT endpoint uses multipart for xAI speech-to-text. Workspace-pinned;
 # already a transitive dep via ocean-protocol.

@@ -101,6 +101,23 @@ enum AgentsCmd {
     },
 }
 
+/// Read-only extension state commands. Package mutation remains a later phase.
+#[derive(Debug, Subcommand)]
+enum ExtensionCmd {
+    /// Inspect installed/trusted/enabled state without executing package code.
+    Inspect {
+        id: String,
+        #[arg(long)]
+        project_id: Option<uuid::Uuid>,
+    },
+    /// Run static state, digest, manifest, trust, and enablement diagnostics.
+    Doctor {
+        id: String,
+        #[arg(long)]
+        project_id: Option<uuid::Uuid>,
+    },
+}
+
 #[derive(Debug, Parser)]
 #[command(name = "ocean-rs", about = "Ocean OS agent runtime client")]
 struct Cli {
@@ -142,6 +159,11 @@ enum Cmd {
     Sessions,
     Session {
         id: SessionId,
+    },
+    /// Inspect daemon-owned extension state without mutating it.
+    Extension {
+        #[command(subcommand)]
+        subcmd: ExtensionCmd,
     },
     /// Onboard onto Ocean: verify a bedrock API token and print what to set.
     /// The interactive initiation surface — run it with no flags and it walks
@@ -288,6 +310,31 @@ fn usage_footer(res: &PromptResponse) -> String {
 fn check_response(res: &PromptResponse) -> anyhow::Result<()> {
     anyhow::ensure!(res.ok, "daemon reported error: {}", res.stderr.trim());
     Ok(())
+}
+
+fn check_extension_response(
+    status: reqwest::StatusCode,
+    body: &serde_json::Value,
+) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        status.is_success(),
+        "extension request failed with {status}"
+    );
+    anyhow::ensure!(
+        body.get("ok").and_then(serde_json::Value::as_bool) == Some(true),
+        "extension diagnostics reported a failure"
+    );
+    Ok(())
+}
+
+async fn print_extension_response(client: &reqwest::Client, url: String) -> anyhow::Result<()> {
+    let response = client.get(url).send().await?;
+    let status = response.status();
+    let text = response.text().await.context("read extension response")?;
+    let body: serde_json::Value =
+        serde_json::from_str(&text).context("decode extension response")?;
+    println!("{}", serde_json::to_string_pretty(&body)?);
+    check_extension_response(status, &body)
 }
 
 fn urlencoding(s: &str) -> String {
@@ -614,6 +661,23 @@ async fn main() -> anyhow::Result<()> {
             );
             println!("{}", serde_json::to_string_pretty(&body)?);
         }
+        Cmd::Extension { subcmd } => {
+            let (id, project_id, action) = match subcmd {
+                ExtensionCmd::Inspect { id, project_id } => (id, project_id, "inspect"),
+                ExtensionCmd::Doctor { id, project_id } => (id, project_id, "doctor"),
+            };
+            let mut url = format!(
+                "{}/v1/extensions/{}/{}",
+                cli.url.trim_end_matches('/'),
+                urlencoding(&id),
+                action
+            );
+            if let Some(project_id) = project_id {
+                url.push_str("?project_id=");
+                url.push_str(&project_id.to_string());
+            }
+            print_extension_response(&client, url).await?;
+        }
         Cmd::Onboard { bedrock_url, token } => {
             let bedrock_url = resolve_or_prompt(
                 bedrock_url,
@@ -880,6 +944,54 @@ mod tests {
         assert_eq!(permission_mode_from_env(), None);
         std::env::remove_var("OCEAN_CLI_PERMISSION");
         assert_eq!(permission_mode_from_env(), None);
+    }
+
+    #[test]
+    fn extension_read_commands_parse_without_local_state_access() {
+        let project_id = uuid::Uuid::new_v4();
+        let inspect = Cli::try_parse_from([
+            "ocean-rs",
+            "extension",
+            "inspect",
+            "example.phase-one",
+            "--project-id",
+            &project_id.to_string(),
+        ])
+        .expect("inspect command parses");
+        assert!(matches!(
+            inspect.cmd,
+            Cmd::Extension {
+                subcmd: ExtensionCmd::Inspect { id, project_id: Some(parsed) }
+            } if id == "example.phase-one" && parsed == project_id
+        ));
+
+        let doctor = Cli::try_parse_from(["ocean-rs", "extension", "doctor", "example.phase-one"])
+            .expect("doctor command parses");
+        assert!(matches!(
+            doctor.cmd,
+            Cmd::Extension {
+                subcmd: ExtensionCmd::Doctor { id, project_id: None }
+            } if id == "example.phase-one"
+        ));
+    }
+
+    #[test]
+    fn extension_response_exit_semantics_fail_on_http_or_doctor_error() {
+        assert!(check_extension_response(
+            reqwest::StatusCode::OK,
+            &serde_json::json!({"ok": true})
+        )
+        .is_ok());
+        assert!(check_extension_response(
+            reqwest::StatusCode::NOT_FOUND,
+            &serde_json::json!({"ok": false, "error": "extension_not_found"})
+        )
+        .is_err());
+        assert!(check_extension_response(
+            reqwest::StatusCode::OK,
+            &serde_json::json!({"ok": false, "diagnostics": []})
+        )
+        .is_err());
     }
 
     #[test]

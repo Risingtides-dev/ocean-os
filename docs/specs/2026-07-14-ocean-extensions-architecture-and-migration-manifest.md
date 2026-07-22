@@ -2,7 +2,7 @@
 
 **Date:** 2026-07-14
 **Type:** cross-repo architecture and staged extraction manifest
-**Status:** Approved direction; Phase 0 accepted, Phase 1 schema/tool-lane checkpoint implemented but not accepted
+**Status:** Approved direction; Phases 0–1 accepted, Phase 2 next
 **Owner:** Smaths / Ocean
 **Authoring baseline:** `ocean-os` `3fe699924811`
 **Current ratification:** `ocean-os` `529e0ed1de2fb9b3b04b8c44979db8e8406f1ca1`; subagent ownership decision `c5740fd428d3d23f8aea57881c8f6b0c40f4a9ee`
@@ -30,7 +30,7 @@ This direction deliberately copies Pi's strongest idea—one installable package
 The current system already contains several extension-like mechanisms, but they are not one contract:
 
 - `crates/ocean-plugin` loads model-callable subprocess tools from `plugin.toml`.
-- `crates/ocean-hooks` defines a subprocess hook runner, but only the `Stop` event exists and live turn execution does not currently call it.
+- `crates/ocean-hooks` defines the subprocess runner for the live `Stop` continuation hook; it is not the public extension lifecycle-observer API.
 - `crates/ocean-agent/src/agentdir.rs` discovers folder agents, skills, tool grants, subprocess capabilities, and nested `subagents/`.
 - `crates/ocean-agent/src/lib.rs` discovers global plugin providers from the Ocean config directory and binds per-agent subprocess capabilities.
 - `crates/ocean-daemon` owns session-scoped SSE events and process/runtime state.
@@ -174,7 +174,7 @@ The outer manifest indexes package resources. Existing specialized inner contrac
 
 ## 6. Draft `ocean-extension.toml` contract
 
-Schema v1 parsing and non-executing validation now live in `ocean-extension`. The contract remains a pre-acceptance API until the full Phase 1 gate passes.
+Accepted schema-v1 parsing plus filesystem-independent metadata validation and non-executing canonical package validation live in `ocean-extension`. Install automation remains deferred to Phase 3.
 
 ```toml
 schema_version = 1
@@ -265,7 +265,7 @@ path = "profiles/TUI"
 
 ## 7. Trust and security contract
 
-The existing plugin lane is not a sandbox merely because each advertised model tool requires permission. Phase 0 evidence showed that legacy plugin subprocesses launched as the local user, inherited the daemon environment, and could act before a tool call was approved. The implemented-but-not-accepted Phase 1 schema/tool-lane checkpoint now supplies an explicit minimal child environment and canonical real cwd/PWD; process isolation and the remaining Phase 1 protections are still pending.
+The existing plugin lane is not a sandbox merely because each advertised model tool requires permission. Phase 0 evidence showed that legacy plugin subprocesses launched as the local user, inherited the daemon environment, and could act before a tool call was approved. Accepted Phase 1 supplies an explicit minimal child environment and canonical real cwd/PWD, separates installed/trusted/enabled state, and exposes static no-execution inspect/doctor reads. Process isolation, lifecycle supervision, and package-management mutations remain later-phase work.
 
 Broad third-party installation is blocked until the following host protections exist:
 
@@ -473,8 +473,13 @@ Phase 0 fixes the local state layout under the exact `ocean_agent::config_dir_fr
 - `enabled.json` records a global activation default and optional overrides keyed only by a registered Ocean `ProjectId`. Project-specific enablement lives in daemon-owned user config, never repository-local files or session state. An unregistered workspace receives only global policy; no path-derived authorization identity is minted.
 - Effective activation requires installed, trusted, and enabled state. A project override cannot supply or widen trust.
 - `store/` contains immutable, verified payloads published atomically; `.state.lock` serializes daemon-owned mutations and coherent reads. The CLI/TUI remain daemon clients rather than independent registry writers.
-- Existing `<config_dir>/plugins` and `OCEAN_PLUGINS_DIR` sources remain `legacy-unmanaged` compatibility sources. Phase 0 does not auto-adopt, copy, trust, or enable them; adoption and eventual cutoff require explicit operator action and a separate migration.
-- This state is not stored under `<config_dir>/sessions`, repository `.ocean/`, or `projects.json`, and it does not change session authority or promise hot loading.
+- Existing `<config_dir>/plugins` and `OCEAN_PLUGINS_DIR` sources remain `legacy-unmanaged` compatibility sources. Phase 1 does not auto-adopt, copy, trust, or enable them; adoption and eventual cutoff require explicit operator action and a separate migration.
+- The three JSON documents use strict schema v1 arrays and the same nonzero `state_revision`; partial, malformed, oversized, duplicate, unknown-field/version, or revision-mismatched state fails closed. A wholly absent `extensions/` directory is the only empty-state case and read paths never create it.
+- Installed artifacts use `sha256:<64 lowercase hex>` identities. `sha256-tree-v1` hashes a sorted descriptor-anchored inventory: UTF-8 relative entry paths, executable bits, byte lengths, domain-separated file-content hashes, and explicit trailing-slash directory records, including empty directories. Symlinks, hardlinks, special files, path replacement, non-UTF-8 entries, in-read mutations, more than 10,000 entries, depth over 64, or payloads over 256 MiB fail closed. The frozen known-answer test owns exact encoding.
+- Every untrusted state/store component is opened descriptor-relatively with no-follow semantics; `.state.lock` is held across the three-file snapshot, package digest, and manifest inventory validation. Lock wait is bounded to 250 ms and static artifact inspection to four concurrent blocking tasks.
+- Provenance is either a lexically canonical absolute local path (no `.`/`..`, repeated separators, or trailing-separator aliases) or a credential-free HTTPS/SSH Git locator pinned to a 40- or 64-character lowercase hexadecimal revision. Trust grants bind the exact artifact digest and cannot exceed the package's requested capabilities.
+- `GET /v1/extensions/{id}/inspect` and `GET /v1/extensions/{id}/doctor` (plus `ocean-rs extension inspect|doctor`) are daemon-owned reads. Optional project selection accepts only a registered `ProjectId`. Responses expose resources, requested/effective grants, compatibility, source/digest, global/project enablement, and static health; doctor never launches a plugin/service/hook, runs Git/shell/provider calls, or performs a health probe.
+- This state is not stored under `<config_dir>/sessions`, repository `.ocean/`, or `projects.json`, and it does not change session authority, activate packages, or promise hot loading.
 
 ## 13. Staged implementation plan
 
@@ -482,7 +487,7 @@ Phase 0 fixes the local state layout under the exact `ocean_agent::config_dir_fr
 
 1. Ratify this manifest and mirror only a pointer into sibling-repo planning docs as needed.
 2. Characterize current plugin launch environment, startup timing, shutdown, cwd, and failure behavior.
-3. Characterize `ocean-hooks` reachability and confirm no live turn path currently invokes it.
+3. Characterize the Phase 0 `ocean-hooks` reachability baseline, which then had no live turn invocation.
 4. Snapshot global and per-agent plugin discovery behavior and namespacing.
 5. Snapshot Slack bridge parity fixtures and live operational requirements.
 6. Decide the local install-state path without changing session-storage authority.
@@ -491,7 +496,7 @@ Evidence recorded on 2026-07-14:
 
 - At the Phase 0 baseline, global plugin discovery scanned immediate directories under `OCEAN_PLUGINS_DIR` or `<config_dir>/plugins` in unsorted filesystem order, launched sequentially during capability-registry assembly, and treated a live `list_tools` call as readiness. Folder-agent subprocess capabilities launched sequentially per applicable turn. Both legacy launch paths executed before model-tool permission and inherited the daemon environment and real cwd; a declared folder-agent `cwd` changed only `PWD`. The implemented Phase 1 schema/tool-lane checkpoint supersedes the environment/cwd behavior as described below, while shutdown remains implicit reference-counted stdin closure/direct-child kill without a protocol shutdown, graceful wait, or proven descendant cleanup.
 - Current plugin names are flattened as `plugin__<plugin>__<tool>` without component grammar or delimiter escaping; ordered registry composition is first-wins. Built-ins remain unshadowable, but duplicate plugin identities, separator ambiguity, manifest/live-tool mismatch, and filesystem-dependent global collision winners remain characterized migration debt.
-- `ocean-hooks` is loaded and validated only as daemon configuration. No live turn path calls `run_hooks`; the current Stop subprocess primitive is therefore unreachable from production turns. When called directly it is sequential and fail-open, inherits daemon environment, and lacks explicit timeout/cancellation process-tree cleanup.
+- At the Phase 0 baseline, `ocean-hooks` was loaded and validated only as daemon configuration and no live turn path called `run_hooks`. Since 2026-07-16, completed production turns invoke the configured `Stop` hook chain and a block decision can run a bounded continuation turn. The hook runner remains sequential and fail-open, inherits the daemon environment, and lacks cancellation process-tree cleanup; this live interceptor is not the deferred extension lifecycle-observer API.
 - Slack parity remains a cross-repository snapshot, not a completed extraction: preserve Socket Mode acknowledgement/reconnect/dedupe, stable thread-to-session identity, scoped daemon turns, threaded replies, uploads, Canvas operations/fulfillment, slash intake, token/rate-limit behavior, and content-agent-specific overrides. Direct transport/reply tests and a live Slack smoke remain missing; the live chat path currently reduces daemon output to text, so documented structured Canvas/file output parity is not yet proven.
 - The daemon-owned local install-state decision is fixed in Section 12.1.
 - The three-file characterization slice adds behavior-neutral coverage for plugin environment overlay, inherited real cwd, first-wire `list_tools`, folder-agent `PWD` versus real cwd, and direct hook-chain context/control flow. It deliberately records current insecure ambient behavior without treating it as a permanent contract.
@@ -507,9 +512,9 @@ Evidence recorded on 2026-07-14:
 5. Add extension inspect/doctor read paths before install automation.
 6. Preserve existing `plugin.toml` loading compatibility during migration.
 
-**Checkpoint status (2026-07-14):** implemented but not accepted. `ocean-extension` provides fail-closed schema-v1 parsing, SemVer compatibility, canonical confined resource validation, and no-execution tests. The plugin and folder-agent subprocess lane now uses explicit minimal environment and canonical real cwd/PWD while preserving existing `plugin.toml` loading and permission/namespacing behavior. Installed/trusted/enabled state separation and extension inspect/doctor read paths remain pending; no state persistence or routes were added.
+**Acceptance status (2026-07-22): accepted.** `ocean-extension` provides fail-closed schema-v1 parsing, filesystem-independent metadata validation, SemVer compatibility, canonical confined resource validation, versioned observer-event validation, and no-execution tests. The plugin and folder-agent subprocess lane uses explicit minimal environment and canonical real cwd/PWD while preserving existing `plugin.toml` loading and permission/namespacing behavior. The daemon now reads strict installed/trusted/enabled state coherently under `.state.lock`, verifies immutable artifacts through the frozen descriptor-anchored tree digest, intersects exact-digest grants, honors only registered-project overrides, and exposes static inspect/doctor routes through a thin daemon-client CLI. No install/enable mutation, lifecycle observer, service supervision, hot loading, or Crew Stage B–E code was added.
 
-**Gate:** malformed/path-escape/duplicate/compatibility/security tests; plugin E2E; workspace tests; fresh security review.
+**Gate result:** malformed/path-escape/duplicate/compatibility/state/security tests, plugin E2E, touched-package suites and strict Clippy, workspace build/tests, compatibility/MSRV manifests, full `cargo xtask ci`, formatting, docs/index integrity, and fresh independent security/correctness review passed. Reviewer-found TOCTOU, FIFO blocking, unbounded enumeration, source-reflection, in-read mutation, and directory-digest gaps were repaired and delta-reviewed before acceptance.
 
 ### Phase 2 — lifecycle observers and supervised services
 
@@ -522,7 +527,7 @@ Evidence recorded on 2026-07-14:
 
 ### Phase 3 — local/Git package management
 
-1. Implement install/remove/list/inspect/enable/disable/doctor.
+1. Implement install/remove/list/enable/disable, retaining and extending the accepted inspect/doctor read paths without making clients state writers.
 2. Support local path and pinned Git source.
 3. Record digest, source, version, scope, grants, and enablement locally.
 4. Add update grant-diff confirmation.
@@ -639,7 +644,9 @@ Pause the active wave if any of the following appears:
 - manual heading, source-path, and current-behavior review
 - `git diff --check`
 
-**Phase 0 result (2026-07-14):** `cargo xtask docs-check` passed with 25 indexed packages, 103 active Markdown files, and 109 checked local links; `git diff --check` passed. The full `ocean-plugin`, `ocean-hooks`, and `ocean-agent` suites, workspace check/test compilation, strict touched-crate Clippy, and formatting passed. Fresh code/security/architecture review confirmed the ratified ownership split, source-backed evidence, process-test cleanup, and four-repo activation boundary after the normal-binary test probe was removed and the evidence count was corrected. Phase 0 is accepted; Phase 1 is next.
+**Phase 0 result (2026-07-14):** `cargo xtask docs-check` passed with 25 indexed packages, 103 active Markdown files, and 109 checked local links; `git diff --check` passed. The full `ocean-plugin`, `ocean-hooks`, and `ocean-agent` suites, workspace check/test compilation, strict touched-crate Clippy, and formatting passed. Fresh code/security/architecture review confirmed the ratified ownership split, source-backed evidence, process-test cleanup, and four-repo activation boundary after the normal-binary test probe was removed and the evidence count was corrected. Phase 0 is accepted.
+
+**Phase 1 result (2026-07-22):** `cargo test -p ocean-extension`, `cargo test -p ocean-plugin`, `cargo test -p ocean-agent`, `cargo test -p ocean-cli`, and `cargo test -p ocean-daemon` passed, including descriptor-replacement, symlink, FIFO, digest known-answer, mutation-revalidation, resource-inventory, trust/enablement, registered-project, HTTP-envelope, and no-execution coverage. `cargo check --workspace --tests`, strict touched-package Clippy, `cargo fmt --all -- --check`, `cargo xtask docs-check`, compatibility/MSRV manifests, and the canonical `cargo xtask ci` gate passed. Fresh independent security and correctness delta reviews approved the repaired implementation. Phase 1 is accepted; Phase 2 is next. Crew Stage A remains open for extension-manifest Phases 2–3 (lifecycle observers, supervised services, and local/Git package management); Crew Stages B–E retain their own manifest-first gates.
 
 ### Minimum source gates for later waves
 

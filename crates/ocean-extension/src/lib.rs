@@ -64,12 +64,17 @@ impl RawOceanExtensionManifest {
         Self::parse(&input)
     }
 
-    /// Validate identity, compatibility, capabilities, and every declared path.
-    pub fn validate(
+    /// Validate schema, identity, compatibility, capability references, and
+    /// lexical resource paths without touching the filesystem.
+    ///
+    /// Descriptor-anchored inspectors use this after reading the manifest from
+    /// the exact artifact handle they hashed, then prove each relative path
+    /// against that same artifact inventory. Ordinary package validation uses
+    /// the same metadata pass before canonical filesystem resolution.
+    pub fn validate_metadata(
         self,
-        package_root: impl AsRef<Path>,
         host_version: &Version,
-    ) -> Result<OceanExtensionManifest, ExtensionManifestError> {
+    ) -> Result<OceanExtensionMetadata, ExtensionManifestError> {
         if self.schema_version != SCHEMA_VERSION {
             return Err(ExtensionManifestError::UnsupportedSchemaVersion {
                 found: self.schema_version,
@@ -85,16 +90,72 @@ impl RawOceanExtensionManifest {
             });
         }
 
-        let package_root = canonical_directory(package_root.as_ref(), "package root")?;
         let mut ids = HashSet::new();
-        let plugins = validate_path_resources(&package_root, "plugin", self.plugins, &mut ids)?;
-        let agents = validate_path_resources(&package_root, "agent", self.agents, &mut ids)?;
-        let skills = validate_path_resources(&package_root, "skill", self.skills, &mut ids)?;
+        validate_metadata_path_resources("plugin", &self.plugins, &mut ids)?;
+        validate_metadata_path_resources("agent", &self.agents, &mut ids)?;
+        validate_metadata_path_resources("skill", &self.skills, &mut ids)?;
 
         let mut services = Vec::with_capacity(self.services.len());
         for service in self.services {
             claim_id("service", &service.id, &mut ids)?;
+            validate_resource_path_syntax("service entry", Some(&service.id), &service.entry)?;
+            validate_service_events(&service.id, &service.events)?;
             let capabilities = validate_capabilities(&service.id, service.capabilities)?;
+            services.push(MetadataServiceResource {
+                id: service.id,
+                entry: service.entry,
+                args: service.args,
+                events: service.events,
+                restart: service.restart,
+                health: service.health,
+                capabilities,
+            });
+        }
+
+        for profile in &self.profiles {
+            validate_resource_path_syntax("profile path", Some(&profile.surface), &profile.path)?;
+        }
+        for resource in &self.external {
+            validate_resource_path_syntax(
+                "external manifest",
+                Some(resource.kind.as_str()),
+                &resource.manifest,
+            )?;
+        }
+
+        Ok(OceanExtensionMetadata {
+            schema_version: self.schema_version,
+            id: self.id,
+            name: self.name,
+            version,
+            min_ocean_version,
+            description: self.description,
+            license: self.license,
+            package: self.package,
+            trust: self.trust,
+            plugins: self.plugins,
+            services,
+            agents: self.agents,
+            skills: self.skills,
+            profiles: self.profiles,
+            external: self.external,
+        })
+    }
+
+    /// Validate identity, compatibility, capabilities, and every declared path.
+    pub fn validate(
+        self,
+        package_root: impl AsRef<Path>,
+        host_version: &Version,
+    ) -> Result<OceanExtensionManifest, ExtensionManifestError> {
+        let metadata = self.validate_metadata(host_version)?;
+        let package_root = canonical_directory(package_root.as_ref(), "package root")?;
+        let plugins = resolve_path_resources(&package_root, "plugin", metadata.plugins)?;
+        let agents = resolve_path_resources(&package_root, "agent", metadata.agents)?;
+        let skills = resolve_path_resources(&package_root, "skill", metadata.skills)?;
+
+        let mut services = Vec::with_capacity(metadata.services.len());
+        for service in metadata.services {
             let entry = canonical_resource_path(
                 &package_root,
                 "service entry",
@@ -108,12 +169,12 @@ impl RawOceanExtensionManifest {
                 events: service.events,
                 restart: service.restart,
                 health: service.health,
-                capabilities,
+                capabilities: service.capabilities,
             });
         }
 
-        let mut profiles = Vec::with_capacity(self.profiles.len());
-        for profile in self.profiles {
+        let mut profiles = Vec::with_capacity(metadata.profiles.len());
+        for profile in metadata.profiles {
             let path = canonical_resource_path(
                 &package_root,
                 "profile path",
@@ -126,8 +187,8 @@ impl RawOceanExtensionManifest {
             });
         }
 
-        let mut external = Vec::with_capacity(self.external.len());
-        for resource in self.external {
+        let mut external = Vec::with_capacity(metadata.external.len());
+        for resource in metadata.external {
             let manifest = canonical_resource_path(
                 &package_root,
                 "external manifest",
@@ -141,15 +202,15 @@ impl RawOceanExtensionManifest {
         }
 
         Ok(OceanExtensionManifest {
-            schema_version: self.schema_version,
-            id: self.id,
-            name: self.name,
-            version,
-            min_ocean_version,
-            description: self.description,
-            license: self.license,
-            package: self.package,
-            trust: self.trust,
+            schema_version: metadata.schema_version,
+            id: metadata.id,
+            name: metadata.name,
+            version: metadata.version,
+            min_ocean_version: metadata.min_ocean_version,
+            description: metadata.description,
+            license: metadata.license,
+            package: metadata.package,
+            trust: metadata.trust,
             package_root,
             plugins,
             services,
@@ -373,6 +434,43 @@ impl fmt::Display for ExternalKind {
     }
 }
 
+/// Filesystem-independent validated package metadata.
+///
+/// Resource paths remain package-relative. A caller that already owns an
+/// immutable descriptor-anchored artifact inventory can compare these paths to
+/// that inventory without reopening attacker-controlled pathnames.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OceanExtensionMetadata {
+    pub schema_version: u32,
+    pub id: String,
+    pub name: String,
+    pub version: Version,
+    pub min_ocean_version: Version,
+    pub description: Option<String>,
+    pub license: Option<String>,
+    pub package: Option<PackageMetadata>,
+    pub trust: Option<TrustMetadata>,
+    pub plugins: Vec<RawPathResource>,
+    pub services: Vec<MetadataServiceResource>,
+    pub agents: Vec<RawPathResource>,
+    pub skills: Vec<RawPathResource>,
+    pub profiles: Vec<RawProfileResource>,
+    pub external: Vec<RawExternalResource>,
+}
+
+/// A lexically validated service declaration whose entry remains relative to
+/// its package inventory.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MetadataServiceResource {
+    pub id: String,
+    pub entry: String,
+    pub args: Vec<String>,
+    pub events: Vec<String>,
+    pub restart: Option<RestartPolicy>,
+    pub health: Option<ServiceHealth>,
+    pub capabilities: RequestedCapabilities,
+}
+
 /// A validated package whose filesystem resources are canonical and confined.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OceanExtensionManifest {
@@ -470,6 +568,10 @@ pub enum ExtensionManifestError {
         capability: &'static str,
         value: String,
     },
+    InvalidServiceEvent {
+        service_id: String,
+        value: String,
+    },
 }
 
 impl fmt::Display for ExtensionManifestError {
@@ -517,6 +619,10 @@ impl fmt::Display for ExtensionManifestError {
                 f,
                 "invalid {capability} capability reference `{value}` for service `{service_id}`"
             ),
+            Self::InvalidServiceEvent { service_id, value } => write!(
+                f,
+                "invalid lifecycle event `{value}` for service `{service_id}`"
+            ),
         }
     }
 }
@@ -541,7 +647,11 @@ fn valid_label(value: &str) -> bool {
             .all(|byte| byte.is_ascii_alphanumeric() || *byte == b'-')
 }
 
-fn validate_extension_id(id: &str) -> Result<(), ExtensionManifestError> {
+/// Validate the stable reverse-domain extension identity grammar.
+///
+/// State/inspection readers use the same grammar as package manifests so a
+/// separately persisted install record cannot acquire a second identity shape.
+pub fn validate_extension_id(id: &str) -> Result<(), ExtensionManifestError> {
     let labels: Vec<_> = id.split('.').collect();
     if id.bytes().any(|byte| byte.is_ascii_uppercase())
         || labels.len() < 2
@@ -571,16 +681,26 @@ fn claim_id(
     Ok(())
 }
 
-fn validate_path_resources(
+fn validate_metadata_path_resources(
+    kind: &'static str,
+    resources: &[RawPathResource],
+    ids: &mut HashSet<String>,
+) -> Result<(), ExtensionManifestError> {
+    for resource in resources {
+        claim_id(kind, &resource.id, ids)?;
+        validate_resource_path_syntax(kind, Some(&resource.id), &resource.path)?;
+    }
+    Ok(())
+}
+
+fn resolve_path_resources(
     root: &Path,
     kind: &'static str,
     resources: Vec<RawPathResource>,
-    ids: &mut HashSet<String>,
 ) -> Result<Vec<PathResource>, ExtensionManifestError> {
     resources
         .into_iter()
         .map(|resource| {
-            claim_id(kind, &resource.id, ids)?;
             let path = canonical_resource_path(root, kind, Some(&resource.id), &resource.path)?;
             Ok(PathResource {
                 id: resource.id,
@@ -609,8 +729,7 @@ fn canonical_directory(path: &Path, kind: &'static str) -> Result<PathBuf, Exten
     Ok(canonical)
 }
 
-fn canonical_resource_path(
-    root: &Path,
+fn validate_resource_path_syntax(
     kind: &'static str,
     id: Option<&str>,
     raw: &str,
@@ -631,7 +750,17 @@ fn canonical_resource_path(
             reason: "path must be nonempty, relative, and contain no parent components".to_string(),
         });
     }
-    let joined = root.join(path);
+    Ok(path.to_path_buf())
+}
+
+fn canonical_resource_path(
+    root: &Path,
+    kind: &'static str,
+    id: Option<&str>,
+    raw: &str,
+) -> Result<PathBuf, ExtensionManifestError> {
+    let path = validate_resource_path_syntax(kind, id, raw)?;
+    let joined = root.join(&path);
     let canonical =
         fs::canonicalize(&joined).map_err(|error| ExtensionManifestError::InvalidResourcePath {
             kind,
@@ -648,6 +777,34 @@ fn canonical_resource_path(
         });
     }
     Ok(canonical)
+}
+
+fn validate_service_events(
+    service_id: &str,
+    events: &[String],
+) -> Result<(), ExtensionManifestError> {
+    const EVENTS: &[&str] = &[
+        "daemon_started",
+        "session_started",
+        "turn_started",
+        "permission_requested",
+        "permission_resolved",
+        "tool_started",
+        "tool_finished",
+        "turn_finished",
+        "session_stopped",
+        "daemon_stopping",
+    ];
+    let mut seen = HashSet::new();
+    for event in events {
+        if !EVENTS.contains(&event.as_str()) || !seen.insert(event) {
+            return Err(ExtensionManifestError::InvalidServiceEvent {
+                service_id: service_id.to_string(),
+                value: event.clone(),
+            });
+        }
+    }
+    Ok(())
 }
 
 fn validate_capabilities(
