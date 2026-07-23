@@ -5093,3 +5093,27 @@ One more stale copy of the same claim survives at
 docs/specs/2026-07-14-ocean-extensions-architecture-and-migration-manifest.md:33;
 that is a ratified manifest in pi's lane, so I flagged it rather than editing it.
 _________________________________________________________________________________
+_________________________________________________________________________________
+time:      [17:06] [23-07-26]
+agent:     [ocean] [coding]
+worktree:  [feat/tui-markdown-preview]
+type:      [feature-request]
+area:      [frontend]
+
+Added an mdfried-inspired, terminal-native Markdown file experience to Ocean TUI
+without importing or depending on GPL-licensed mdfried code. Markdown files now
+open as styled, read-only previews rendered from the current unsaved source buffer;
+Ctrl-P flips each tab between preview and raw editing without changing its source,
+cursor, dirty bit, or source viewport. Preview owns independent keyboard/mouse
+scrolling, applies a document margin, sanitizes terminal controls before spans, and
+keeps paste/edit disabled. The existing Ocean Markdown renderer supplies headings,
+lists, code, tables, links, and terminal-safe image cards; oversized text and
+terminal graphics overlays remain deliberately outside Ratatui's cell renderer.
+Focused render/input/sanitization tests and crate quality gates cover the behavior.
+Verification: `cargo fmt --all -- --check`, `cargo check -p ocean-tui`, strict
+all-target/all-feature Clippy, `cargo xtask docs-check`, and all 405 ocean-tui tests
+passed (1 ignored) with the full suite serialized. The known nondeterministic
+`resume_discovery_returns_through_action_channel` test timed out in parallel runs,
+then passed three isolated retries and the complete serial suite. Longhouse external
+review `24ac553a-a5b4-48b0-9450-93f470a53f62` approved with no blocking defect.
+_________________________________________________________________________________

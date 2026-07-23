@@ -1,6 +1,6 @@
-//! EditorComponent — syntax-highlighted text editor. Wraps `shell::editor::EditorTab`
-//! (harvested from CTRL) plus a shared syntect `Highlighter`. Opens files from
-//! the tree/graph, edits in place, Ctrl-S saves.
+//! EditorComponent — syntax-highlighted source editor plus a read-only, styled
+//! Markdown preview. Opens files from the tree/graph, edits source in place,
+//! Ctrl-S saves, and Ctrl-P flips Markdown tabs between source and preview.
 
 use std::path::PathBuf;
 
@@ -9,7 +9,7 @@ use ratatui::{
     layout::Rect,
     style::{Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Paragraph},
+    widgets::{block::Padding, Block, Paragraph, Wrap},
     Frame,
 };
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
@@ -21,17 +21,20 @@ use crate::shell::{
     editor::EditorTab,
     git::Mark,
     highlight::Highlighter,
+    markdown::Markdown,
     panel,
     theme::{self, g},
 };
 
 const GUTTER_W: u16 = 6; // 1 git mark + "{:>4} " line number
 const WHEEL_ROWS: isize = 3;
+const PREVIEW_PAD_X: u16 = 2;
 
 pub struct EditorComponent {
     hl: Highlighter,
     root: PathBuf,
     tabs: Vec<EditorTab>,
+    markdown: Markdown,
     active: usize,
     pub focused: bool,
     last_body_h: usize,
@@ -47,6 +50,7 @@ impl EditorComponent {
             hl: Highlighter::new(),
             root,
             tabs: Vec::new(),
+            markdown: Markdown::default(),
             active: 0,
             focused: false,
             last_body_h: 20,
@@ -78,9 +82,16 @@ impl EditorComponent {
     pub fn open(&mut self, path: PathBuf) {
         if let Some(i) = self.tabs.iter().position(|t| t.path == path) {
             self.active = i;
+            if self.tabs[i].markdown_preview {
+                self.markdown.clear();
+            }
             return;
         }
         if let Ok(mut tab) = EditorTab::open(path, &self.hl) {
+            tab.markdown_preview = is_markdown(&tab.ext());
+            if tab.markdown_preview {
+                self.markdown.clear();
+            }
             tab.load_git(&self.root);
             self.tabs.push(tab);
             self.active = self.tabs.len() - 1;
@@ -101,9 +112,14 @@ impl EditorComponent {
     }
 
     pub fn selection_columns(&self) -> Option<(u16, u16)> {
-        (self.has_tabs() && self.selection_body.width > GUTTER_W).then(|| {
+        let gutter = self
+            .tabs
+            .get(self.active)
+            .filter(|t| t.markdown_preview && is_markdown(&t.ext()))
+            .map_or(GUTTER_W, |_| 0);
+        (self.has_tabs() && self.selection_body.width > gutter).then(|| {
             (
-                self.selection_body.x + GUTTER_W,
+                self.selection_body.x + gutter,
                 self.selection_body.right().saturating_sub(1),
             )
         })
@@ -132,6 +148,9 @@ impl Component for EditorComponent {
         }
         let hl = &self.hl;
         let t = self.tabs.get_mut(self.active)?;
+        if t.markdown_preview && is_markdown(&t.ext()) {
+            return None;
+        }
         for c in text.chars() {
             match c {
                 '\n' => t.insert_newline(hl),
@@ -148,13 +167,40 @@ impl Component for EditorComponent {
         if !self.focused {
             return None;
         }
-        let vp = self.last_body_h;
+        let vp = self.last_body_h.max(1);
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+        if ctrl && key.code == KeyCode::Char('p') {
+            let t = self.tabs.get_mut(self.active)?;
+            if is_markdown(&t.ext()) {
+                t.markdown_preview = !t.markdown_preview;
+                self.markdown.clear();
+                self.follow_cursor = !t.markdown_preview;
+                return Some(Action::Render);
+            }
+            return None;
+        }
         if ctrl && key.code == KeyCode::Char('s') {
             if let Some(t) = self.tab() {
                 let _ = t.save();
             }
             return None;
+        }
+        let preview = self
+            .tabs
+            .get(self.active)
+            .is_some_and(|t| t.markdown_preview && is_markdown(&t.ext()));
+        if preview {
+            let t = self.tabs.get_mut(self.active)?;
+            match key.code {
+                KeyCode::Up => t.preview_scroll = t.preview_scroll.saturating_sub(1),
+                KeyCode::Down => t.preview_scroll = t.preview_scroll.saturating_add(1),
+                KeyCode::PageUp => t.preview_scroll = t.preview_scroll.saturating_sub(vp),
+                KeyCode::PageDown => t.preview_scroll = t.preview_scroll.saturating_add(vp),
+                KeyCode::Home => t.preview_scroll = 0,
+                KeyCode::End => t.preview_scroll = usize::MAX,
+                _ => {}
+            }
+            return Some(Action::Render);
         }
         self.follow_cursor = true;
         let hl = &self.hl;
@@ -174,23 +220,33 @@ impl Component for EditorComponent {
     }
 
     fn handle_mouse(&mut self, mouse: MouseEvent) -> Option<Action> {
-        let prose = self
+        let (prose, preview) = self
             .tabs
             .get(self.active)
-            .is_some_and(|t| is_prose(&t.ext()));
+            .map(|t| {
+                (
+                    is_prose(&t.ext()),
+                    t.markdown_preview && is_markdown(&t.ext()),
+                )
+            })
+            .unwrap_or_default();
         let height = self.last_body_h;
         self.follow_cursor = false;
         let t = self.tabs.get_mut(self.active)?;
         match mouse.kind {
             MouseEventKind::ScrollUp => {
-                if prose {
+                if preview {
+                    t.preview_scroll = t.preview_scroll.saturating_sub(WHEEL_ROWS as usize);
+                } else if prose {
                     t.visual_scroll = t.visual_scroll.saturating_sub(WHEEL_ROWS as usize);
                 } else {
                     t.scroll_lines(-WHEEL_ROWS, height);
                 }
             }
             MouseEventKind::ScrollDown => {
-                if prose {
+                if preview {
+                    t.preview_scroll = t.preview_scroll.saturating_add(WHEEL_ROWS as usize);
+                } else if prose {
                     t.visual_scroll = t.visual_scroll.saturating_add(WHEEL_ROWS as usize);
                 } else {
                     t.scroll_lines(WHEEL_ROWS, height);
@@ -211,11 +267,20 @@ impl Component for EditorComponent {
     }
 
     fn draw(&mut self, frame: &mut Frame, area: Rect) {
-        let (title, dirty) = match self.tabs.get(self.active) {
-            Some(t) => (t.name().to_uppercase(), t.dirty),
-            None => ("EDITOR".to_string(), false),
+        let (title, dirty, preview) = match self.tabs.get(self.active) {
+            Some(t) => (
+                t.name().to_uppercase(),
+                t.dirty,
+                t.markdown_preview && is_markdown(&t.ext()),
+            ),
+            None => ("EDITOR".to_string(), false, false),
         };
-        let state = dirty.then_some("unsaved");
+        let state = match (preview, dirty) {
+            (true, true) => Some("preview · unsaved"),
+            (true, false) => Some("preview"),
+            (false, true) => Some("unsaved"),
+            (false, false) => None,
+        };
         let body = panel::draw(frame, area, &title, state, self.focused);
         self.selection_body = body;
         if body.width == 0 {
@@ -224,13 +289,39 @@ impl Component for EditorComponent {
         }
         frame.render_widget(Block::default().style(Style::default().bg(theme::BG)), body);
         self.last_body_h = body.height as usize;
-        self.last_text_w = body.width.saturating_sub(GUTTER_W) as usize;
 
         let Some(t) = self.tabs.get_mut(self.active) else {
             self.selection_top = 0;
             panel::footer(frame, area, " no file open");
             return;
         };
+
+        if preview {
+            self.last_text_w = body.width as usize;
+            let source = t
+                .lines
+                .iter()
+                .map(|line| sanitize_line(line))
+                .collect::<Vec<_>>()
+                .join("\n");
+            let rendered = self.markdown.render(&source);
+            let paragraph = Paragraph::new(rendered.lines)
+                .style(Style::default().bg(theme::BG))
+                .block(Block::default().padding(Padding::horizontal(PREVIEW_PAD_X)))
+                .wrap(Wrap { trim: false });
+            let content_width = body.width.saturating_sub(PREVIEW_PAD_X.saturating_mul(2));
+            let wrapped_rows = paragraph.line_count(content_width);
+            let max_scroll = wrapped_rows
+                .saturating_sub(body.height as usize)
+                .min(u16::MAX as usize);
+            t.preview_scroll = t.preview_scroll.min(max_scroll);
+            self.selection_top = t.preview_scroll;
+            frame.render_widget(paragraph.scroll((t.preview_scroll as u16, 0)), body);
+            panel::footer(frame, area, " preview · ^P source · ↑↓ scroll");
+            return;
+        }
+
+        self.last_text_w = body.width.saturating_sub(GUTTER_W) as usize;
         let text_w = self.last_text_w.max(1);
         let prose = is_prose(&t.ext());
         let (lines, cursor) = if prose {
@@ -256,14 +347,23 @@ impl Component for EditorComponent {
                 }
             }
         }
-        let mode = if prose { "wrap" } else { "scroll" };
-        panel::footer(
-            frame,
-            area,
-            &format!(" {}:{} · {mode}", t.cursor_row + 1, t.cursor_col + 1),
-        );
+        let footer = if is_markdown(&t.ext()) {
+            format!(
+                " {}:{} · source · ^P preview",
+                t.cursor_row + 1,
+                t.cursor_col + 1
+            )
+        } else {
+            let mode = if prose { "wrap" } else { "scroll" };
+            format!(" {}:{} · {mode}", t.cursor_row + 1, t.cursor_col + 1)
+        };
+        panel::footer(frame, area, &footer);
         let _ = Modifier::BOLD;
     }
+}
+
+fn is_markdown(ext: &str) -> bool {
+    matches!(ext.to_ascii_lowercase().as_str(), "md" | "markdown" | "mdx")
 }
 
 fn is_prose(ext: &str) -> bool {
@@ -556,5 +656,101 @@ mod tests {
 
         let _ = prose_view(&mut tab, 3, 20, true);
         assert_eq!(tab.visual_scroll, 0);
+    }
+
+    fn focused_editor(path: &str) -> EditorComponent {
+        let mut editor = EditorComponent::new(PathBuf::from("."));
+        editor.focused = true;
+        editor.open(PathBuf::from(path));
+        editor
+    }
+
+    fn press(code: KeyCode, modifiers: KeyModifiers) -> KeyEvent {
+        KeyEvent::new(code, modifiers)
+    }
+
+    #[test]
+    fn markdown_preview_is_read_only_and_preserves_source_state() {
+        let mut editor = focused_editor("missing.md");
+        let tab = &mut editor.tabs[0];
+        tab.lines = vec!["# Draft".into(), "body".into()];
+        tab.cursor_row = 1;
+        tab.cursor_col = 4;
+        tab.dirty = true;
+        tab.visual_scroll = 7;
+
+        let before = editor.tabs[0].lines.clone();
+        editor.handle_key(press(KeyCode::Char('x'), KeyModifiers::NONE));
+        assert_eq!(editor.tabs[0].lines, before);
+        assert_eq!(editor.tabs[0].cursor_row, 1);
+        assert_eq!(editor.tabs[0].cursor_col, 4);
+        assert!(editor.tabs[0].dirty);
+        assert_eq!(editor.tabs[0].visual_scroll, 7);
+
+        editor.handle_key(press(KeyCode::Down, KeyModifiers::NONE));
+        assert_eq!(editor.tabs[0].preview_scroll, 1);
+        editor.handle_key(press(KeyCode::Char('p'), KeyModifiers::CONTROL));
+        assert!(!editor.tabs[0].markdown_preview);
+        editor.handle_key(press(KeyCode::Char('x'), KeyModifiers::NONE));
+        assert_eq!(editor.tabs[0].lines[1], "bodyx");
+    }
+
+    #[test]
+    fn preview_toggle_is_markdown_only() {
+        let mut editor = focused_editor("missing.rs");
+        assert!(editor
+            .handle_key(press(KeyCode::Char('p'), KeyModifiers::CONTROL))
+            .is_none());
+        assert!(!editor.tabs[0].markdown_preview);
+    }
+
+    #[test]
+    fn preview_renders_unsaved_markdown_without_control_sequences() {
+        use ratatui::{backend::TestBackend, Terminal};
+
+        let mut editor = focused_editor("missing.md");
+        editor.tabs[0].lines = vec![
+            "# Ocean Preview".into(),
+            String::new(),
+            "A **bold**\tview\u{1b} from the unsaved buffer.".into(),
+            String::new(),
+            "- [x] styled lists".into(),
+        ];
+        editor.tabs[0].dirty = true;
+
+        let backend = TestBackend::new(72, 16);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|frame| editor.draw(frame, frame.area()))
+            .unwrap();
+        let buffer = terminal.backend().buffer();
+        let screen = (0..buffer.area.height)
+            .map(|y| {
+                (0..buffer.area.width)
+                    .map(|x| buffer[(x, y)].symbol())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        assert!(screen.contains("Ocean Preview"), "{screen}");
+        assert!(!screen.contains("# Ocean Preview"), "{screen}");
+        assert!(
+            screen.contains("A bold    view from the unsaved buffer."),
+            "{screen}"
+        );
+        assert!(screen.contains("☑ styled lists") || screen.contains("[x] styled lists"));
+        assert!(screen.contains("preview · unsaved"), "{screen}");
+        assert!(screen.contains("^P source"), "{screen}");
+        assert!(!screen.contains('\u{1b}'), "{screen:?}");
+    }
+
+    #[test]
+    fn markdown_extensions_are_distinct_from_other_prose() {
+        assert!(is_markdown("md"));
+        assert!(is_markdown("MARKDOWN"));
+        assert!(is_markdown("mdx"));
+        assert!(!is_markdown("txt"));
+        assert!(!is_markdown("rs"));
     }
 }

@@ -220,7 +220,15 @@ This crate owns the full-screen terminal steering cockpit (`ocean` binary) for i
   accent bars, Unicode-cell fitting, visible hierarchy guides, selected-only
   row actions, and extension identity at narrow widths; do not fork the visual
   grammar between rails.
-- Editor viewport behavior is content-aware: prose extensions soft-wrap vertically, source code scrolls horizontally, mouse-wheel scrolling stays independent until the next keyboard edit/navigation, and rendered text/cursor geometry share terminal sanitization plus Unicode cell widths.
+- Editor viewport behavior is content-aware: Markdown files open in terminal-safe
+  read-only preview mode and `Ctrl-P` flips per-tab between that live unsaved-buffer
+  projection and raw source without rewriting source, cursor, dirty, or source-scroll
+  state. Preview uses the existing Ocean Markdown renderer (not terminal escape or
+  graphics overlays), owns independent wrapped-row keyboard/mouse scroll, and keeps
+  raw paste/edit disabled. Other prose extensions soft-wrap vertically, source code
+  scrolls horizontally, mouse-wheel scrolling stays independent until the next
+  keyboard edit/navigation, and rendered text/cursor geometry share terminal
+  sanitization plus Unicode cell widths.
 - Coordinate API/event changes with `ocean-daemon` and `ocean-core`.
 - The model registry lives in `ocean-providers` (`known_models` + resolver
   arms + `Model` constructors in `ocean-protocol` + the claude-code mapping in
