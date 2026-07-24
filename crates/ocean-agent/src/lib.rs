@@ -5252,6 +5252,47 @@ done
         );
     }
 
+    // The other half of the OCEAN-182 contract, and the acceptance criterion
+    // issue #24 states alongside "no lost updates": serializing same-session
+    // turns must NOT serialize different sessions. A timing race would be a
+    // flaky way to assert that, so we assert the lock registry's shape
+    // directly — holding session A's lane leaves B's lane free, and only A's
+    // own re-entry reports busy.
+    #[tokio::test]
+    async fn session_lanes_are_per_session_so_distinct_sessions_never_block() {
+        let rt = lock_runtime("lock-cross-session");
+        let a = SessionId::new_v4();
+        let b = SessionId::new_v4();
+
+        // A turn on `a` holds a's lane for its whole load → run → save.
+        let a_lease = rt.session_operation(a).await;
+
+        // A second turn on `a` must be told the lane is busy rather than
+        // racing the first one's read-modify-write.
+        assert!(
+            rt.try_session_operation(a).is_err(),
+            "a second operation on the SAME session must report busy"
+        );
+
+        // A turn on a DIFFERENT session must not wait behind `a` at all.
+        let b_lease = rt
+            .try_session_operation(b)
+            .expect("a distinct session must acquire its own lane immediately");
+
+        // Both lanes are held at once — that is the parallelism guarantee.
+        assert_eq!(rt.session_lock_count(), 2, "one live lane per session");
+
+        // Releasing `a` frees only `a`; `b` stays held by its own turn.
+        drop(a_lease);
+        rt.try_session_operation(a)
+            .expect("a's lane is free once its turn ends");
+        assert!(
+            rt.try_session_operation(b).is_err(),
+            "b's lane is still held by its own in-flight turn"
+        );
+        drop(b_lease);
+    }
+
     #[test]
     fn load_resumable_returns_none_for_unknown_session() {
         let config_dir = temp_config_dir("resumable-none");

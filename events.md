@@ -4985,3 +4985,23 @@ area:      [automations]
 
 Rebased the existing PR #309 packaging commit onto origin/main e088c37f with no conflicts and reconciled the tag-triggered release lane with PR #337's launch-license contract. The npm package now declares `MIT OR Apache-2.0`; its exact 12-file payload and the GitHub archive's exact nine-file payload both carry the root license texts, NOTICE, credits, trademark policy, and a generated full-text dependency-license inventory. Hosted validation exposed that a clean two-binary build had not hydrated every locked source Cargo metadata resolves, so the workflow now prefetches locked Cargo sources before the generator's frozen/offline pass. It downloads cargo-about 0.9.1 only after matching its pinned arm64 asset SHA-256, generates the exact TUI and daemon macOS arm64 normal/build/transitive graphs under `--frozen --fail` twice, requires byte-identical output, and reproduces the applicable Moka and LiveKit protocol NOTICE files discovered in those graphs. Payload tests byte-compare project legal files, inventory/notices, archive membership, checksums, npm/Bun installs, executable links, and sibling binaries. The existing fail-closed ruleset 19331797, artifact-digest-before-extraction, live-tag peel, retry-safe publication, monotonic npm latest, and installer-owned launchd boundary remain intact; `ocean-update` neither flips `~/.local/libexec/ocean-daemon/current` nor claims to hot-swap a running daemon.
 _________________________________________________________________________________
+time:      [13:48] [24-07-26]
+agent:     [claude] [opus 5]
+worktree:  test/session-lock-cross-session-parallelism
+type:      [review]
+area:      [testing]
+
+Issue #24 (P0, silent history loss on concurrent same-session turns) is already
+fixed in tree by the OCEAN-182 per-session lock registry, but only half of its
+stated acceptance was covered by tests: `concurrent_turns_on_same_session_serialize_without_lost_updates`
+and `many_concurrent_turns_serialize_with_exact_transcript_integrity` prove no
+turn is lost, while nothing pinned the second criterion — that serializing one
+session must not serialize the others. Added
+`session_lanes_are_per_session_so_distinct_sessions_never_block`, which asserts
+the registry's shape rather than racing two turns and timing them: holding
+session A's lane makes a second A operation report busy, leaves B's lane
+immediately acquirable, keeps both lanes live at once, and frees only A when A's
+lease drops. Verified as a real regression guard by mutating `session_lock` to
+key every session to one nil id — the new test fails under that mutation and
+passes once reverted.
+_________________________________________________________________________________
