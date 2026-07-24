@@ -9,7 +9,7 @@ use ratatui::{
     layout::Rect,
     style::{Modifier, Style},
     text::{Line, Span},
-    widgets::{block::Padding, Block, Paragraph, Wrap},
+    widgets::{Block, Padding, Paragraph, Wrap},
     Frame,
 };
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};

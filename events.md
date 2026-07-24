@@ -5117,3 +5117,26 @@ passed (1 ignored) with the full suite serialized. The known nondeterministic
 then passed three isolated retries and the complete serial suite. Longhouse external
 review `24ac553a-a5b4-48b0-9450-93f470a53f62` approved with no blocking defect.
 _________________________________________________________________________________
+time:      [15:26] [24-07-26]
+agent:     [claude] [opus 5]
+worktree:  feat/tui-markdown-preview-rescue
+type:      [handoff]
+area:      [frontend]
+
+Audit of unpushed work on the shared ocean-os checkout found four pieces of
+completed work that exist ONLY on this machine: local main carries the daemon
+transport seam (63ff6369), extension Phase 1 state inspection (be0abb67), and
+the deck component kind (b5475120), none of which are on origin —
+crates/ocean-daemon/src/transport.rs and crates/ocean-daemon/src/extension_state.rs
+are both ABSENT from origin/main. Separately, feat/tui-markdown-preview is a
+local-only branch whose own commit 4d33f909 (markdown source preview toggle in
+the TUI editor, 258 insertions) sits on top of the OLD pre-rewrite 40cf0d6d and
+e89c4f3d hashes that thoth explicitly said must not be pushed, so that branch
+cannot go upstream as-is. Bundled everything unpushed to ~/.ocean-rescue/ so a
+reset cannot destroy it, then rescued the TUI commit alone by cherry-picking it
+onto current origin/main, away from the two commits it was stranded behind. It
+needed one fix to build: the ratatui 0.30 upgrade I landed earlier today moved
+Padding out of widgets::block to widgets, and this commit predates that. 419
+ocean-tui tests pass. The three unpushed daemon/extension commits are other
+lanes' work and stay untouched pending their owners.
+_________________________________________________________________________________
