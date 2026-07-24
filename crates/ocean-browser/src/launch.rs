@@ -268,7 +268,13 @@ mod tests {
 
     #[cfg(unix)]
     async fn wait_for_pid(path: &Path) -> i32 {
-        for _ in 0..100 {
+        // Waits for the spawned fake browser to write its PID marker. The old
+        // 2s budget (100 * 20ms) flaked under full-suite parallel load, where
+        // the spawn can take longer than two seconds to land its write — the
+        // same anatomy as the herdr marker flake (see
+        // `ocean-tui::shell::herdr::wait_for_marker`). Widen to 5s; the parse
+        // succeeding, not the clock, still decides success.
+        for _ in 0..250 {
             if let Ok(text) = std::fs::read_to_string(path) {
                 if let Ok(pid) = text.trim().parse::<i32>() {
                     return pid;
@@ -277,7 +283,7 @@ mod tests {
             tokio::time::sleep(std::time::Duration::from_millis(20)).await;
         }
         panic!(
-            "fake browser PID marker was not written: {}",
+            "fake browser PID marker was not written within 5s: {}",
             path.display()
         );
     }
@@ -313,7 +319,11 @@ mod tests {
 
     #[cfg(unix)]
     async fn wait_until_not_running(pid: i32) -> bool {
-        for _ in 0..100 {
+        // Same 2s-budget exposure as `wait_for_pid` above, one hop removed:
+        // the only caller asserts on this bool, so a teardown that takes
+        // longer than the budget under parallel load fails the test rather
+        // than waiting for the process to actually go. Widened to match.
+        for _ in 0..250 {
             if !process_is_running(pid) {
                 return true;
             }
