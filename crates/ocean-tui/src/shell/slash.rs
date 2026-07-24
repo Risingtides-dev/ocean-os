@@ -101,6 +101,12 @@ pub const COMMANDS: &[SlashCommand] = &[
     },
     // ── workspace ──────────────────────────────────────────────────────────
     SlashCommand {
+        name: "/cd",
+        desc: "switch the workspace root (/cd <path>; bare shows the current one)",
+        group: "workspace",
+        soon: false,
+    },
+    SlashCommand {
         name: "/files",
         desc: "focus the file tree",
         group: "workspace",

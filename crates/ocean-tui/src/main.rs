@@ -19,7 +19,8 @@ struct Cli {
     url: String,
 
     /// Working directory / project root. Overrides OCEAN_PROJECT and the
-    /// current directory. Switch projects at runtime from the session rail.
+    /// current directory. Switch projects at runtime with `/cd <path>` or from
+    /// the session rail.
     #[arg(long, env = "OCEAN_PROJECT")]
     project: Option<String>,
 

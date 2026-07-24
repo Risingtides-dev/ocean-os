@@ -32,6 +32,14 @@ This crate owns the full-screen terminal steering cockpit (`ocean` binary) for i
   the transcript (dark modules on a light field for dark terminals). Point
   `OCEAN_SURFACE_URL` at the public surface (e.g.
   `https://ocean.agentsworld.org`) so beams land on reachable URLs.
+- `/cd <path>` is the runtime half of `--project` / `OCEAN_PROJECT`: it routes
+  through the same `set_active_project` re-root the session rail already uses,
+  so the turn cwd, file tree, graph, and `@` picker all follow. Relative paths
+  resolve against the CURRENT root (not the process cwd — after one `/cd` those
+  differ), and the path is canonicalized and proven to be a directory before
+  anything moves, so a typo cannot leave the workbench rooted somewhere
+  unreadable. The session rail deliberately stays on the launch project, and
+  the PTY is left alone because it may hold a live shell.
 - The `shell/` workbench is the sole TUI. Do not reintroduce `--legacy`, nested TUI session resume, Track-0 room tabs, the mesh parity subcommand, or room-scoped `AgentTurnRequest` fields.
 - Do not introduce agent/session logic into the TUI; session state lives in the daemon via `ocean-agent`.
 - Preserve the Kairav Mittal / `aclfe/inertia` attribution and audited donor revision in `src/shell/spatial.rs`; the project-graph implementation reuses its 3D camera/projection mathematics under the elected MIT terms.

@@ -20,7 +20,7 @@
 //! terminal dock) · ⌃Q quits (⌃C passes to the PTY).
 
 use std::collections::{BTreeMap, HashMap, HashSet};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -2671,6 +2671,28 @@ impl App {
                     self.set_notice(format!("image not found: {}", abs.display()));
                 }
             }
+            // `/cd [path]`: switch the workspace at runtime instead of
+            // restarting the TUI somewhere else. Bare `/cd` answers with the
+            // current root; a bad path reports why in the status line and
+            // leaves the workbench where it was.
+            Action::SwitchProject(raw) => {
+                let raw = raw.trim();
+                if raw.is_empty() {
+                    self.set_notice(format!("workspace: {}", self.workspace_root));
+                } else {
+                    match Self::resolve_project_path(raw, Path::new(&self.workspace_root)) {
+                        Ok(dir) => {
+                            if dir.to_string_lossy() == self.workspace_root {
+                                self.set_notice(format!("already in {}", dir.display()));
+                            } else {
+                                self.set_notice(format!("workspace → {}", dir.display()));
+                                self.set_active_project(dir);
+                            }
+                        }
+                        Err(why) => self.set_notice(why),
+                    }
+                }
+            }
             // `/login [claude|codex]`: run the REAL OAuth flow off-thread
             // (begin → browser → token exchange → persist) so the TUI never
             // blocks on the callback server or browser/OS integration. A second
@@ -3000,6 +3022,43 @@ impl App {
     /// Mint-path bind: fresh chat, replay the session's buffered head.
     fn bind_session(&mut self, id: AgentSessionId) {
         self.bind_session_with(id, true);
+    }
+
+    /// Resolve a `/cd` argument to a real directory, or say why it isn't one.
+    ///
+    /// `~`/`~/…` expands against `HOME`, an absolute path is taken as written,
+    /// and anything else resolves against the CURRENT workspace root rather
+    /// than the process cwd — after a `/cd` those differ, and "relative to
+    /// where I am now" is what an operator means. Canonicalizing last both
+    /// normalizes `..` and proves the directory exists, so a typo can never
+    /// re-root the workbench at a path the file tree would then fail to scan.
+    fn resolve_project_path(raw: &str, current_root: &Path) -> Result<PathBuf, String> {
+        let candidate = if raw == "~" {
+            Self::home_dir()
+        } else if let Some(rest) = raw.strip_prefix("~/") {
+            Self::home_dir().join(rest)
+        } else {
+            let p = PathBuf::from(raw);
+            if p.is_absolute() {
+                p
+            } else {
+                current_root.join(p)
+            }
+        };
+        let resolved = candidate
+            .canonicalize()
+            .map_err(|_| format!("no such directory: {}", candidate.display()))?;
+        if !resolved.is_dir() {
+            return Err(format!("not a directory: {}", resolved.display()));
+        }
+        Ok(resolved)
+    }
+
+    /// Home directory, falling back to `/tmp` when `HOME` is unset.
+    fn home_dir() -> PathBuf {
+        std::env::var("HOME")
+            .map(PathBuf::from)
+            .unwrap_or_else(|_| PathBuf::from("/tmp"))
     }
 
     /// Re-root the active project: the cwd new turns mint against AND the roots
@@ -7250,6 +7309,125 @@ mod tests {
 
         app.dispatch(Action::OpenInSurface(SurfaceTarget::Desktop));
         assert_eq!(app.status, "no session yet — send a message first");
+    }
+
+    /// A throwaway directory that exists on disk, for the `/cd` tests.
+    fn scratch_dir(tag: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "ocean-tui-cd-{tag}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos(),
+        ));
+        std::fs::create_dir_all(&dir).expect("create scratch dir");
+        dir.canonicalize().expect("canonicalize scratch dir")
+    }
+
+    #[test]
+    fn cd_reroots_the_workbench_at_an_existing_directory() {
+        // `/cd <dir>` is the runtime half of --project/OCEAN_PROJECT: new turns
+        // mint against the new root and the file tree follows it.
+        let mut app = offline_app();
+        let before = app.workspace_root.clone();
+        let target = scratch_dir("reroot");
+
+        app.dispatch(Action::SwitchProject(target.to_string_lossy().into_owned()));
+
+        assert_ne!(app.workspace_root, before, "the root must actually move");
+        assert_eq!(app.workspace_root, target.to_string_lossy());
+        assert!(
+            app.status.contains(&target.to_string_lossy().to_string()),
+            "the notice names where we landed: {}",
+            app.status
+        );
+        let _ = std::fs::remove_dir_all(&target);
+    }
+
+    #[test]
+    fn cd_resolves_a_relative_path_against_the_current_root_not_the_process_cwd() {
+        // The distinction only shows up after a first `/cd`: the process cwd is
+        // wherever the TUI was launched, while "here" is the active workspace.
+        // Resolving against the process cwd would send the operator somewhere
+        // unrelated (or fail) for a path that plainly exists beside them.
+        let mut app = offline_app();
+        let root = scratch_dir("relative-root");
+        std::fs::create_dir_all(root.join("sub")).expect("create child dir");
+        app.dispatch(Action::SwitchProject(root.to_string_lossy().into_owned()));
+        assert_eq!(app.workspace_root, root.to_string_lossy());
+
+        app.dispatch(Action::SwitchProject("sub".into()));
+
+        assert_eq!(
+            app.workspace_root,
+            root.join("sub").to_string_lossy(),
+            "a bare relative name resolves beside the active root"
+        );
+
+        // And `..` walks back up from there, not from the process cwd.
+        app.dispatch(Action::SwitchProject("..".into()));
+        assert_eq!(app.workspace_root, root.to_string_lossy());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn cd_to_a_path_that_is_not_a_directory_leaves_the_workspace_alone() {
+        // A typo, a deleted worktree, or a file path must report honestly and
+        // change nothing — re-rooting at a bad path would leave the file tree
+        // and graph scanning somewhere that cannot be read.
+        let mut app = offline_app();
+        let before = app.workspace_root.clone();
+        let dir = scratch_dir("not-a-dir");
+        let file = dir.join("notes.md");
+        std::fs::write(&file, b"x").expect("write file");
+
+        app.dispatch(Action::SwitchProject(
+            dir.join("nope").to_string_lossy().into_owned(),
+        ));
+        assert_eq!(app.workspace_root, before, "a missing path moves nothing");
+        assert!(
+            app.status.starts_with("no such directory:"),
+            "missing path says so: {}",
+            app.status
+        );
+
+        app.dispatch(Action::SwitchProject(file.to_string_lossy().into_owned()));
+        assert_eq!(app.workspace_root, before, "a file moves nothing");
+        assert!(
+            app.status.starts_with("not a directory:"),
+            "a file says so: {}",
+            app.status
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn bare_cd_reports_the_current_workspace_without_moving() {
+        let mut app = offline_app();
+        let before = app.workspace_root.clone();
+
+        app.dispatch(Action::SwitchProject(String::new()));
+
+        assert_eq!(app.workspace_root, before);
+        assert_eq!(app.status, format!("workspace: {before}"));
+    }
+
+    #[test]
+    fn cd_expands_a_leading_tilde_against_home() {
+        // Read-only: uses the ambient HOME rather than mutating the process
+        // environment, which would race the other tests in this binary.
+        let home = App::home_dir();
+        let Ok(expected) = home.canonicalize() else {
+            return; // no readable HOME in this environment; nothing to assert
+        };
+        let root = scratch_dir("tilde");
+
+        assert_eq!(
+            App::resolve_project_path("~", &root).expect("~ resolves"),
+            expected
+        );
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]

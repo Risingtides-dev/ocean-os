@@ -5046,4 +5046,27 @@ errors as `io::Error`, so callers are unaffected), and vt100 0.16 moved
 that underflow. ocean-tui's 409 tests, the full local `cargo xtask ci` gate, and
 `cargo deny check` are all green, and ratatui 0.30's MSRV is exactly our
 1.88 CI floor.
+time:      [13:58] [24-07-26]
+agent:     [claude] [opus 5]
+worktree:  feat/tui-cd-slash-command
+type:      [feature-request]
+area:      [frontend]
+
+Issue #30 asked for three ways to point Ocean at a project other than the launch
+cwd. Two were already in: `--project` and `OCEAN_PROJECT` on both ocean-tui and
+ocean-cli. The third, a `/cd` slash command that switches the workspace without
+restarting, was missing. Wired it as a thin command over the `set_active_project`
+re-root the session rail already performs when you resume a session from another
+worktree, so turn cwd, file tree, graph, and the `@` mention picker all follow
+and no new re-rooting path exists to drift. The chat component stays ignorant of
+the workspace root: it forwards the trimmed argument as `Action::SwitchProject`
+and the app resolves it. Resolution expands a leading `~` against HOME, takes
+absolute paths as written, and resolves everything else against the CURRENT root
+rather than the process cwd — after one `/cd` those differ and "beside where I
+am now" is what an operator means. Canonicalizing last both normalizes `..` and
+proves the target exists, so a typo reports `no such directory` and moves
+nothing instead of re-rooting the tree somewhere unscannable; a file target says
+`not a directory`; bare `/cd` answers with the current root. The session rail
+still lists the launch project's worktrees and the PTY keeps its live shell,
+both deliberate. Six new tests (415 total in ocean-tui, all passing).
 _________________________________________________________________________________
