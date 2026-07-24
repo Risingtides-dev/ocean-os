@@ -27,18 +27,24 @@ export PATH="$HOME/.rustup/toolchains/stable-aarch64-apple-darwin/bin:$HOME/.car
 # a feature-branch binary while every operator contract claims production is
 # main-built, so branch mismatch is a hard configuration error.
 branch="$(git -C "$REPO" rev-parse --abbrev-ref HEAD 2>/dev/null || echo '?')"
-if [[ "$branch" != "main" ]]; then
-  # TASK-15: a detached worktree whose HEAD is main CONTENT satisfies the
-  # build-from-main rule — deploys routinely run from clean throwaway
-  # worktrees at origin/main precisely so the dev checkout's state can't
-  # leak into production. Only content that main doesn't contain is fatal.
-  git -C "$REPO" fetch origin main --quiet 2>/dev/null || true
-  if ! git -C "$REPO" merge-base --is-ancestor HEAD origin/main 2>/dev/null; then
-    echo "FATAL: repo at $REPO is on '$branch' and HEAD is not contained in origin/main." >&2
-    echo "       Operator rule: build/deploy the daemon from MAIN content only." >&2
-    echo "       Use the main branch or a worktree detached at origin/main." >&2
-    exit 64 # EX_USAGE
-  fi
+# TASK-15: a detached worktree whose HEAD is main CONTENT satisfies the
+# build-from-main rule — deploys routinely run from clean throwaway worktrees
+# at origin/main precisely so the dev checkout's state can't leak into
+# production. Only content that main doesn't contain is fatal.
+#
+# The containment check runs for EVERY branch name, `main` included. Being on a
+# branch called `main` proves nothing: a shared dev checkout whose local main
+# sits ahead of origin will happily build commits that were never pushed, never
+# reviewed, and never seen by CI. That is not hypothetical — the supervised
+# daemon on the primary host reported rev 40cf0d6d-dirty, an unpushed local-main
+# commit, for days. `--is-ancestor` is the check that actually enforces the rule.
+git -C "$REPO" fetch origin main --quiet 2>/dev/null || true
+if ! git -C "$REPO" merge-base --is-ancestor HEAD origin/main 2>/dev/null; then
+  echo "FATAL: repo at $REPO is on '$branch' and HEAD is not contained in origin/main." >&2
+  echo "       Operator rule: build/deploy the daemon from MAIN content only." >&2
+  echo "       Local commits ahead of origin/main count as 'not contained' — push" >&2
+  echo "       and merge them first, or deploy from a worktree at origin/main." >&2
+  exit 64 # EX_USAGE
 fi
 if [[ -n "$(git -C "$REPO" status --porcelain --untracked-files=no 2>/dev/null)" ]]; then
   echo "FATAL: repo at $REPO has tracked modifications — deploy trees must be clean." >&2
