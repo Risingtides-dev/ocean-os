@@ -43,6 +43,7 @@ const VALID_KINDS: &[&str] = &[
     "confirm",
     "map",
     "video",
+    "deck",
 ];
 
 // ---------------------------------------------------------------------------
@@ -82,6 +83,9 @@ impl AgentTool for ComponentRenderTool {
          'map' (a live, pannable Google Map). Far better than describing coordinates in text.\n\
          • A video to watch inline — a TikTok/Reel/YouTube link, or a direct video file → \
          'video' (embeds and plays in the chat). Use for campaign clips, sound previews, references.\n\
+         • A stream of items needing a fast human verdict on each — emails to triage, PRs to \
+         approve, drafts to accept/reject → 'deck' (a swipeable card queue; then component_wait \
+         for the batch verdict).\n\
          • Several of the above at once → 'dashboard'. Long prose → 'markdown' (or plain text).\n\
          \
          PROPS SCHEMA BY KIND (props must match exactly):\n\
@@ -107,6 +111,13 @@ impl AgentTool for ComponentRenderTool {
          • video — { url, title?, autoplay?, start? }. `url` is a TikTok / Instagram Reel / \
          YouTube / Vimeo link OR a direct .mp4/.webm/.m3u8 URL — the surface picks the right \
          embed automatically. `start` is seconds offset (YouTube/file). Display only.\n\
+         • deck — { title?, actions: { left: {label, variant?}, right: {label, variant?} }, \
+         cards: [{id, title, badge?, summary?, detail_md?, suggested?}] }. A swipeable decision \
+         queue: the operator judges each card left/right (the actions define what the gestures \
+         mean); cards expand in place to show `detail_md`; `suggested` (\"left\"|\"right\") ghosts \
+         your recommendation on the card. Emits card_swiped { card_id, direction, action_label }, \
+         card_expanded { card_id }, and deck_drained { judged: [{card_id, direction}] } when every \
+         card is judged — component_wait for deck_drained to collect the batch verdict.\n\
          \
          Set replace:true to overwrite an existing component with the same id. \
          Full reference: docs/AGENT_RENDER_PROTOCOL.md."
@@ -125,7 +136,7 @@ impl AgentTool for ComponentRenderTool {
                     "enum": [
                         "kanban", "form", "table", "progress", "markdown", "dashboard",
                         "chart", "interactive_plot", "timeline", "stat", "file_tree", "diff", "code",
-                        "callout", "gallery", "confirm", "map", "video"
+                        "callout", "gallery", "confirm", "map", "video", "deck"
                     ],
                     "description": "Component type. Defines the shape of `props`."
                 },
@@ -142,7 +153,8 @@ impl AgentTool for ComponentRenderTool {
                         file_tree: {root?, entries:[{name,type,path?,children?}]}. \
                         diff: {filename?, lines:[{kind,text}]} or {filename?, unified:str}. \
                         code: {language?, filename?, code}. callout: {variant,title?,body?}. \
-                        gallery: {images:[{src,caption?}]}. confirm: {title,body?,confirm_label?,cancel_label?,variant?}."
+                        gallery: {images:[{src,caption?}]}. confirm: {title,body?,confirm_label?,cancel_label?,variant?}. \
+                        deck: {title?, actions:{left:{label,variant?},right:{label,variant?}}, cards:[{id,title,badge?,summary?,detail_md?,suggested?}]}."
                 },
                 "replace": {
                     "type": "boolean",

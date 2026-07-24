@@ -336,6 +336,39 @@ optional `GOOGLE_MAPS_MAP_ID` for custom styling).
 `.mp4/.webm/.m3u8` file — the surface auto-selects the embed. `start` is a seconds
 offset (YouTube/file). Display only.
 
+#### `deck`
+
+```json
+{ "id": "triage-1", "kind": "deck",
+  "props": {
+    "title": "Inbox triage",
+    "actions": { "left":  { "label": "Archive",    "variant": "danger"  },
+                 "right": { "label": "Prioritize", "variant": "success" } },
+    "cards": [
+      { "id": "em-042", "badge": "urgent",
+        "title": "Contract renewal — reply needed",
+        "summary": "Legal needs sign-off by Friday.",
+        "detail_md": "Full body, attachments, context…",
+        "suggested": "right" } ] } }
+```
+
+A swipeable decision queue — the agent deals cards, the operator judges each
+with a horizontal swipe (or the fallback buttons). Left/right mean whatever
+`actions` says, so one component covers email triage, PR review, memory
+retention, draft acceptance, and any other stream needing fast human verdicts.
+Cards expand in place (tap) to show `detail_md` (markdown) before judging.
+`badge` renders a colored chip (`urgent`/`error` red, `important`/`warn` amber,
+anything else accent). `suggested` (`"left"`|`"right"`) ghosts the agent's
+recommendation on the card.
+
+Emits per interaction:
+
+- `card_swiped` `{ card_id, direction, action_label }` — one verdict.
+- `card_expanded` `{ card_id }` — the operator opened the detail view.
+- `deck_drained` `{ judged: [{ card_id, direction }] }` — every card judged;
+  the batch verdict in deal order. Pair with `component_wait` to collect all
+  verdicts in one round-trip instead of N confirm dialogs.
+
 ## Agent interface
 
 Exposed to the agent as a new tool:
