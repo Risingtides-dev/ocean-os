@@ -5024,4 +5024,26 @@ Widened it too. Note this crate went default-off behind `legacy-chromium` in
 feature — the flake is dormant on default CI rather than gone. Verified with
 `cargo test -p ocean-browser --features legacy-chromium`: 12 passed,
 including `cancelled_browser_launch_does_not_orphan_spawned_process`.
+time:      [13:54] [24-07-26]
+agent:     [claude] [opus 5]
+worktree:  deps/ratatui-0.30-lru-advisory
+type:      [refactor]
+area:      [frontend]
+
+GHSA-rhfx-m35p-ff5j (lru `IterMut` unsoundness) was the last open dependabot
+alert and the daily red `cargo in /. for lru` job, because dependabot could not
+fix it on its own: lru 0.12.5 is pinned transitively by ratatui 0.29 and the
+lowest non-vulnerable release is 0.16.3. Upgraded ratatui 0.29 to 0.30 (which
+resolves lru to 0.18.1), tui-term 0.2 to 0.3.4, and vt100 0.15 to 0.16 —
+tui-term 0.3.4 and our direct vt100 dependency must agree on the `Screen` type,
+so those two move together. Only ocean-tui depends on ratatui, so the blast
+radius is one crate and three call sites: ratatui 0.30 gave `Backend` an
+associated `Error` type instead of hardcoding `io::Error`, so the generic
+`splash::play` needs an `io::Error: From<B::Error>` bound (crossterm still
+errors as `io::Error`, so callers are unaffected), and vt100 0.16 moved
+`set_size`/`set_scrollback` from `Parser` onto `Screen` behind
+`screen_mut()`. The 1-column-grid floor stays: 0.16 does not claim a fix for
+that underflow. ocean-tui's 409 tests, the full local `cargo xtask ci` gate, and
+`cargo deny check` are all green, and ratatui 0.30's MSRV is exactly our
+1.88 CI floor.
 _________________________________________________________________________________

@@ -70,7 +70,14 @@ fn banner_width() -> u16 {
     BANNER.iter().map(|l| l.len()).max().unwrap_or(0) as u16
 }
 
-pub fn play<B: Backend>(terminal: &mut Terminal<B>) -> io::Result<()> {
+// ratatui 0.30 gave `Backend` an associated `Error` type instead of hardcoding
+// `io::Error`, so a generic backend's draw error only reaches our `io::Result`
+// when it converts. Our real backend (crossterm) still errors as `io::Error`,
+// so the bound costs callers nothing.
+pub fn play<B: Backend>(terminal: &mut Terminal<B>) -> io::Result<()>
+where
+    io::Error: From<B::Error>,
+{
     let banner_h = BANNER.len() as u16;
     let banner_w = banner_width();
 

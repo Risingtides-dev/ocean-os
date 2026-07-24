@@ -11,7 +11,8 @@ use anyhow::Result;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use portable_pty::{native_pty_system, Child, CommandBuilder, MasterPty, PtySize};
 
-// vt100 0.15 underflows on 1-column grids; keep the PTY at a safe floor.
+// vt100 underflows on 1-column grids (seen on 0.15; 0.16 doesn't claim a fix
+// either), so keep the PTY at a safe floor.
 const MIN_ROWS: u16 = 2;
 const MIN_COLS: u16 = 8;
 
@@ -94,7 +95,7 @@ impl TermPane {
         }
         self.rows = rows;
         self.cols = cols;
-        self.parser.set_size(rows, cols);
+        self.parser.screen_mut().set_size(rows, cols);
         let _ = self.master.resize(PtySize {
             rows,
             cols,
@@ -111,7 +112,7 @@ impl TermPane {
     pub fn send_key(&mut self, k: KeyEvent) {
         if self.scrollback != 0 {
             self.scrollback = 0;
-            self.parser.set_scrollback(0);
+            self.parser.screen_mut().set_scrollback(0);
         }
         let bytes = key_to_bytes(k);
         if !bytes.is_empty() {
@@ -127,7 +128,7 @@ impl TermPane {
     pub fn paste(&mut self, text: &str) {
         if self.scrollback != 0 {
             self.scrollback = 0;
-            self.parser.set_scrollback(0);
+            self.parser.screen_mut().set_scrollback(0);
         }
         let bytes = paste_bytes(text, self.parser.screen().bracketed_paste());
         if !bytes.is_empty() {
