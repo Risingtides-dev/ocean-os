@@ -1,0 +1,479 @@
+name: Release
+
+# Validate the distributable wrapper on relevant PRs. A stable vMAJOR.MINOR.PATCH
+# tag whose commit is already contained in main additionally publishes the exact
+# validated artifact to GitHub Packages and a GitHub Release.
+on:
+  pull_request:
+    paths:
+      - ".github/workflows/release.yml"
+      - "packaging/**"
+      - "rust-toolchain.toml"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "deny.toml"
+      - "LICENSE"
+      - "LICENSE-APACHE"
+      - "LICENSE-MIT"
+      - "NOTICE.md"
+      - "CREDITS.md"
+      - "TRADEMARKS.md"
+      - "crates/**/Cargo.toml"
+      - "crates/**/LICENSE*"
+      - "crates/**/NOTICE*"
+      - "crates/ocean-tui/**"
+      - "crates/ocean-daemon/**"
+  push:
+    tags: ["v*"]
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_ABOUT_VERSION: "0.9.1"
+  CARGO_ABOUT_SHA256: 6a38fe166d17a674269d4373256c0b6bd93acc2553e12de0517cb9ecc73c9c02
+  RELEASE_TAG_RULESET_ID: "19331797"
+  RELEASE_TAG_RULESET_NAME: Ocean immutable release tags
+
+jobs:
+  validate:
+    name: validate package (macos-arm64)
+    runs-on: macos-latest
+    timeout-minutes: 60
+    permissions:
+      contents: read
+    outputs:
+      release-artifact-id: ${{ steps.release-artifact.outputs.artifact-id }}
+      release-artifact-digest: ${{ steps.release-artifact.outputs.artifact-digest }}
+    steps:
+      - name: Checkout exact source
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Validate stable release tag is contained in main
+        if: github.event_name == 'push'
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ ! "$GITHUB_REF_NAME" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]; then
+            echo "error: release tags must be stable vMAJOR.MINOR.PATCH" >&2
+            exit 64
+          fi
+          git fetch --no-tags origin main:refs/remotes/origin/main
+          if ! git merge-base --is-ancestor "$GITHUB_SHA" refs/remotes/origin/main; then
+            echo "error: release tag commit is not contained in origin/main" >&2
+            exit 64
+          fi
+
+      - name: Install system deps (macOS)
+        run: brew install pkg-config
+
+      - name: Verify arm64 release runner
+        run: test "$(uname -m)" = "arm64"
+
+      - name: Install repository-pinned Rust toolchain
+        shell: bash
+        run: |
+          set -euo pipefail
+          toolchain="$(awk -F '"' '/^channel = / { print $2; exit }' rust-toolchain.toml)"
+          test -n "$toolchain"
+          rustup toolchain install "$toolchain" --profile minimal
+          export RUSTUP_TOOLCHAIN="$toolchain"
+          echo "RUSTUP_TOOLCHAIN=$toolchain" >> "$GITHUB_ENV"
+          test "$(rustc --version | awk '{ print $2 }')" = "$toolchain"
+          rustc --version
+          cargo --version
+
+      - name: Cache cargo + target
+        uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+
+      # cargo-about invokes Cargo metadata for workspace resolution. A clean
+      # runner's two-binary build does not necessarily hydrate every locked
+      # source that metadata needs, so fetch them before frozen generation.
+      - name: Prefetch locked metadata sources
+        run: cargo fetch --locked
+
+      - name: Build release binaries
+        run: cargo build --locked --release -p ocean-tui -p ocean-daemon
+
+      - name: Stage and verify arm64 binaries
+        run: |
+          mkdir -p packaging/npm/bin
+          cp target/release/ocean-tui packaging/npm/bin/ocean
+          cp target/release/ocean-daemon packaging/npm/bin/ocean-daemon
+          chmod +x packaging/generate-license-inventory.sh packaging/npm/bin/ocean packaging/npm/bin/ocean-daemon packaging/npm/ocean-update.sh packaging/npm/test-package.sh
+          test "$(lipo -archs packaging/npm/bin/ocean)" = "arm64"
+          test "$(lipo -archs packaging/npm/bin/ocean-daemon)" = "arm64"
+
+      - name: Install checksum-pinned cargo-about
+        shell: bash
+        run: |
+          set -euo pipefail
+          [[ "$CARGO_ABOUT_VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]
+          [[ "$CARGO_ABOUT_SHA256" =~ ^[0-9a-f]{64}$ ]]
+          asset="cargo-about-$CARGO_ABOUT_VERSION-aarch64-apple-darwin.tar.gz"
+          download_dir="$RUNNER_TEMP/cargo-about-download"
+          install_dir="$RUNNER_TEMP/cargo-about"
+          mkdir -p "$download_dir" "$install_dir"
+          curl --fail --location --proto '=https' --tlsv1.2 \
+            --output "$download_dir/$asset" \
+            "https://github.com/EmbarkStudios/cargo-about/releases/download/$CARGO_ABOUT_VERSION/$asset"
+          actual_digest="$(shasum -a 256 "$download_dir/$asset" | awk '{ print $1 }')"
+          test "$actual_digest" = "$CARGO_ABOUT_SHA256"
+          tar -xzf "$download_dir/$asset" -C "$install_dir" --strip-components=1
+          cargo_about="$install_dir/cargo-about"
+          test -x "$cargo_about"
+          test "$("$cargo_about" --version)" = "cargo-about $CARGO_ABOUT_VERSION"
+          echo "CARGO_ABOUT=$cargo_about" >> "$GITHUB_ENV"
+
+      - name: Setup Node
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: 22
+
+      - name: Setup Bun
+        uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
+        with:
+          bun-version: 1.3.14
+
+      - name: Derive package version
+        working-directory: packaging/npm
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ "$GITHUB_EVENT_NAME" == "push" ]]; then
+            version="${GITHUB_REF_NAME#v}"
+            npm version --no-git-tag-version --allow-same-version "$version"
+          else
+            version="0.0.0-dev"
+          fi
+          test "$(node -p 'require("./package.json").version')" = "$version"
+          echo "RELEASE_VERSION=$version" >> "$GITHUB_ENV"
+
+      - name: Generate deterministic dependency-license inventory
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p release-staging/generated
+          packaging/generate-license-inventory.sh \
+            "$CARGO_ABOUT" release-staging/generated/THIRD-PARTY-LICENSES.first.txt
+          packaging/generate-license-inventory.sh \
+            "$CARGO_ABOUT" release-staging/generated/THIRD-PARTY-LICENSES.second.txt
+          cmp \
+            release-staging/generated/THIRD-PARTY-LICENSES.first.txt \
+            release-staging/generated/THIRD-PARTY-LICENSES.second.txt
+          mv \
+            release-staging/generated/THIRD-PARTY-LICENSES.first.txt \
+            release-staging/generated/THIRD-PARTY-LICENSES.txt
+          rm release-staging/generated/THIRD-PARTY-LICENSES.second.txt
+
+      - name: Assemble and verify retry-safe release artifact
+        shell: bash
+        run: |
+          set -euo pipefail
+          legal_files=(LICENSE LICENSE-APACHE LICENSE-MIT NOTICE.md CREDITS.md TRADEMARKS.md)
+          mkdir -p release-staging/npm/bin release-staging/binary
+          cp packaging/npm/package.json packaging/npm/README.md packaging/npm/ocean-update.sh release-staging/npm/
+          cp packaging/npm/bin/ocean packaging/npm/bin/ocean-daemon release-staging/npm/bin/
+          cp packaging/npm/bin/ocean packaging/npm/bin/ocean-daemon release-staging/binary/
+          for legal_file in "${legal_files[@]}"; do
+            cp "$legal_file" release-staging/npm/
+            cp "$legal_file" release-staging/binary/
+          done
+          cp release-staging/generated/THIRD-PARTY-LICENSES.txt release-staging/npm/
+          cp release-staging/generated/THIRD-PARTY-LICENSES.txt release-staging/binary/
+          chmod +x release-staging/npm/ocean-update.sh release-staging/npm/bin/ocean release-staging/npm/bin/ocean-daemon
+          chmod +x release-staging/binary/ocean release-staging/binary/ocean-daemon
+
+          COPYFILE_DISABLE=1 tar -czf release-staging/ocean-macos-arm64.tar.gz \
+            -C release-staging/binary \
+            ocean ocean-daemon LICENSE LICENSE-APACHE LICENSE-MIT NOTICE.md \
+            CREDITS.md TRADEMARKS.md THIRD-PARTY-LICENSES.txt
+          actual_files="$(tar -tzf release-staging/ocean-macos-arm64.tar.gz | sed '/\/$/d' | LC_ALL=C sort)"
+          expected_files="$(cat <<'FILES' | LC_ALL=C sort
+          CREDITS.md
+          LICENSE
+          LICENSE-APACHE
+          LICENSE-MIT
+          NOTICE.md
+          THIRD-PARTY-LICENSES.txt
+          TRADEMARKS.md
+          ocean
+          ocean-daemon
+          FILES
+          )"
+          if [[ "$actual_files" != "$expected_files" ]]; then
+            echo "error: binary release payload differs from the nine-file contract" >&2
+            diff -u <(printf '%s\n' "$expected_files") <(printf '%s\n' "$actual_files") || true
+            exit 1
+          fi
+
+          extract_dir="$RUNNER_TEMP/ocean-release-smoke"
+          mkdir -p "$extract_dir"
+          tar -xzf release-staging/ocean-macos-arm64.tar.gz -C "$extract_dir"
+          for legal_file in "${legal_files[@]}"; do
+            cmp "$legal_file" "$extract_dir/$legal_file"
+          done
+          cmp release-staging/generated/THIRD-PARTY-LICENSES.txt "$extract_dir/THIRD-PARTY-LICENSES.txt"
+          test -x "$extract_dir/ocean"
+          test -x "$extract_dir/ocean-daemon"
+          (cd release-staging && shasum -a 256 ocean-macos-arm64.tar.gz > ocean-macos-arm64.tar.gz.sha256)
+          (cd release-staging && shasum -a 256 -c ocean-macos-arm64.tar.gz.sha256)
+          rm -rf release-staging/binary release-staging/generated
+
+      - name: Smoke-test twelve-file npm and Bun installs
+        run: |
+          SOURCE_ROOT="$GITHUB_WORKSPACE" RUN_BUN_SMOKE=1 \
+            EXPECTED_VERSION="$RELEASE_VERSION" \
+            packaging/npm/test-package.sh release-staging/npm
+
+      - name: Upload validated release artifact
+        id: release-artifact
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: ocean-release-${{ github.sha }}
+          path: release-staging/
+          if-no-files-found: error
+          retention-days: 7
+
+  publish:
+    name: publish stable release
+    if: github.event_name == 'push'
+    needs: validate
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      actions: read
+      contents: write
+      packages: write
+    steps:
+      # download-artifact v4 only warns on a digest mismatch. Download the same
+      # run's immutable artifact ZIP by id and compare its SHA-256 to the upload
+      # action's recorded digest before extracting or executing any payload.
+      - name: Download and verify exact validated artifact
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          ARTIFACT_ID: ${{ needs.validate.outputs.release-artifact-id }}
+          EXPECTED_DIGEST: ${{ needs.validate.outputs.release-artifact-digest }}
+        run: |
+          set -euo pipefail
+          [[ "$ARTIFACT_ID" =~ ^[0-9]+$ ]]
+          [[ "$EXPECTED_DIGEST" =~ ^[0-9a-f]{64}$ ]]
+          gh api "repos/$GITHUB_REPOSITORY/actions/artifacts/$ARTIFACT_ID/zip" > "$RUNNER_TEMP/ocean-release.zip"
+          actual_digest="$(sha256sum "$RUNNER_TEMP/ocean-release.zip" | awk '{ print $1 }')"
+          test "$actual_digest" = "$EXPECTED_DIGEST"
+          mkdir -p release-staging
+          unzip -q "$RUNNER_TEMP/ocean-release.zip" -d release-staging
+
+      - name: Restore executable modes
+        run: chmod +x release-staging/npm/ocean-update.sh release-staging/npm/bin/ocean release-staging/npm/bin/ocean-daemon
+
+      - name: Setup Node for GitHub Packages
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: 22
+          registry-url: "https://npm.pkg.github.com"
+          scope: "@risingtides-dev"
+
+      - name: Preflight npm payload integrity
+        working-directory: release-staging/npm
+        shell: bash
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          package="@risingtides-dev/ocean"
+          version="${GITHUB_REF_NAME#v}"
+          pack_json="$(npm pack --ignore-scripts --json --pack-destination "$RUNNER_TEMP")"
+          local_integrity="$(printf '%s' "$pack_json" | node -e '
+            let input = "";
+            process.stdin.setEncoding("utf8");
+            process.stdin.on("data", chunk => input += chunk);
+            process.stdin.on("end", () => process.stdout.write(JSON.parse(input)[0].integrity));
+          ')"
+          echo "LOCAL_NPM_INTEGRITY=$local_integrity" >> "$GITHUB_ENV"
+
+          view_error="$RUNNER_TEMP/npm-view-error.log"
+          if published_json="$(npm view "$package@$version" dist.integrity --json 2>"$view_error")"; then
+            published_integrity="$(printf '%s' "$published_json" | node -e '
+              let input = "";
+              process.stdin.setEncoding("utf8");
+              process.stdin.on("data", chunk => input += chunk);
+              process.stdin.on("end", () => process.stdout.write(JSON.parse(input)));
+            ')"
+            test "$published_integrity" = "$local_integrity"
+            echo "PACKAGE_ALREADY_PUBLISHED=1" >> "$GITHUB_ENV"
+          else
+            if ! grep -q "E404" "$view_error"; then
+              cat "$view_error" >&2
+              exit 1
+            fi
+            echo "PACKAGE_ALREADY_PUBLISHED=0" >> "$GITHUB_ENV"
+          fi
+
+      - name: Verify immutable tag policy and live event tag
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          [[ "$RELEASE_TAG_RULESET_ID" =~ ^[0-9]+$ ]]
+          echo "verifying required ruleset '$RELEASE_TAG_RULESET_NAME' (id $RELEASE_TAG_RULESET_ID)"
+          gh api "repos/$GITHUB_REPOSITORY/rulesets/$RELEASE_TAG_RULESET_ID" | node -e '
+            let input = "";
+            process.stdin.setEncoding("utf8");
+            process.stdin.on("data", chunk => input += chunk);
+            process.stdin.on("end", () => {
+              const ruleset = JSON.parse(input);
+              const requiredId = Number(process.env.RELEASE_TAG_RULESET_ID);
+              const requiredName = process.env.RELEASE_TAG_RULESET_NAME;
+              const includes = ruleset.conditions?.ref_name?.include ?? [];
+              const excludes = ruleset.conditions?.ref_name?.exclude ?? [];
+              const ruleTypes = new Set((ruleset.rules ?? []).map(rule => rule.type));
+              if (ruleset.id !== requiredId) throw new Error(`required ruleset ${requiredName} has the wrong id`);
+              if (ruleset.name !== requiredName) throw new Error(`required ruleset id ${requiredId} was renamed`);
+              if (ruleset.target !== "tag") throw new Error("release ruleset target is not tag");
+              if (ruleset.enforcement !== "active") throw new Error("release ruleset is not active");
+              if ((ruleset.bypass_actors ?? []).length !== 0) throw new Error("release ruleset has bypass actors");
+              if (ruleset.current_user_can_bypass !== "never") throw new Error("release workflow can bypass the ruleset");
+              if (!includes.includes("refs/tags/v*")) throw new Error("release ruleset does not include refs/tags/v*");
+              if (excludes.length !== 0) throw new Error("release ruleset has exclusions");
+              for (const required of ["update", "deletion", "non_fast_forward"]) {
+                if (!ruleTypes.has(required)) throw new Error(`release ruleset is missing ${required}`);
+              }
+              if (ruleTypes.has("creation")) throw new Error("release ruleset blocks tag creation");
+            });
+          '
+
+          read -r object_type object_sha < <(
+            gh api "repos/$GITHUB_REPOSITORY/git/ref/tags/$GITHUB_REF_NAME" \
+              --jq '.object.type + " " + .object.sha'
+          )
+          for _ in 1 2 3 4 5 6 7 8; do
+            [[ "$object_type" == "tag" ]] || break
+            read -r object_type object_sha < <(
+              gh api "repos/$GITHUB_REPOSITORY/git/tags/$object_sha" \
+                --jq '.object.type + " " + .object.sha'
+            )
+          done
+          test "$object_type" = "commit"
+          test "$object_sha" = "$GITHUB_SHA"
+
+      # Create/update the GitHub Release before first-time npm publication. If
+      # npm later fails, a rerun safely overwrites these same tag-owned assets;
+      # integrity preflight plus the peeled live-tag check prevents a moved tag
+      # from replacing assets for a different payload.
+      - name: Attach binaries to GitHub Release
+        uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2.6.2
+        with:
+          files: |
+            release-staging/ocean-macos-arm64.tar.gz
+            release-staging/ocean-macos-arm64.tar.gz.sha256
+          generate_release_notes: true
+          prerelease: false
+          overwrite_files: true
+          target_commitish: ${{ github.sha }}
+          # Tag-addressed assets are authoritative. Never let completion order
+          # mutate GitHub's repository-wide Latest Release pointer.
+          make_latest: false
+
+      - name: Publish package idempotently and reconcile latest
+        working-directory: release-staging/npm
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          NODE_AUTH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          package="@risingtides-dev/ocean"
+          version="${GITHUB_REF_NAME#v}"
+          version_tag="version-$version"
+
+          # Re-peel immediately before npm mutation too; the release and package
+          # must both remain bound to the event commit if the ref changes mid-job.
+          read -r object_type object_sha < <(
+            gh api "repos/$GITHUB_REPOSITORY/git/ref/tags/$GITHUB_REF_NAME" \
+              --jq '.object.type + " " + .object.sha'
+          )
+          for _ in 1 2 3 4 5 6 7 8; do
+            [[ "$object_type" == "tag" ]] || break
+            read -r object_type object_sha < <(
+              gh api "repos/$GITHUB_REPOSITORY/git/tags/$object_sha" \
+                --jq '.object.type + " " + .object.sha'
+            )
+          done
+          test "$object_type" = "commit"
+          test "$object_sha" = "$GITHUB_SHA"
+
+          if [[ "$PACKAGE_ALREADY_PUBLISHED" == "0" ]]; then
+            if npm publish --ignore-scripts --tag "$version_tag"; then
+              echo "published $package@$version"
+            else
+              echo "publish returned nonzero; checking for a concurrent identical publish"
+            fi
+          else
+            echo "$package@$version already exists with the validated integrity"
+          fi
+
+          published_integrity=""
+          for attempt in 1 2 3 4 5 6; do
+            if published_json="$(npm view "$package@$version" dist.integrity --json 2>/dev/null)"; then
+              published_integrity="$(printf '%s' "$published_json" | node -e '
+                let input = "";
+                process.stdin.setEncoding("utf8");
+                process.stdin.on("data", chunk => input += chunk);
+                process.stdin.on("end", () => process.stdout.write(JSON.parse(input)));
+              ')"
+              break
+            fi
+            sleep 5
+          done
+          test "$published_integrity" = "$LOCAL_NPM_INTEGRITY"
+
+          registry_max() {
+            npm view "$package" versions --json | node -e '
+              let input = "";
+              process.stdin.setEncoding("utf8");
+              process.stdin.on("data", chunk => input += chunk);
+              process.stdin.on("end", () => {
+                const decoded = JSON.parse(input);
+                const versions = (Array.isArray(decoded) ? decoded : [decoded])
+                  .filter(v => /^\d+\.\d+\.\d+$/.test(v))
+                  .sort((a, b) => {
+                    const aa = a.split(".").map(BigInt);
+                    const bb = b.split(".").map(BigInt);
+                    for (let i = 0; i < 3; i++) {
+                      if (aa[i] < bb[i]) return -1;
+                      if (aa[i] > bb[i]) return 1;
+                    }
+                    return 0;
+                  });
+                if (!versions.length) throw new Error("registry has no stable package version");
+                process.stdout.write(versions[versions.length - 1]);
+              });
+            '
+          }
+
+          # Converge rather than trusting a stale read-then-write. Every
+          # successfully completing tag job recomputes after its own write and
+          # requires two consecutive observations of registry-max == @latest.
+          reconciled=0
+          for attempt in 1 2 3 4 5 6 7 8; do
+            candidate="$(registry_max)"
+            npm dist-tag add "$package@$candidate" latest
+            sleep 2
+            expected="$(registry_max)"
+            actual="$(npm view "$package" dist-tags.latest)"
+            if [[ "$actual" == "$expected" ]]; then
+              sleep 2
+              confirmed_expected="$(registry_max)"
+              confirmed_actual="$(npm view "$package" dist-tags.latest)"
+              if [[ "$confirmed_actual" == "$confirmed_expected" ]]; then
+                reconciled=1
+                echo "latest converged at $confirmed_actual"
+                break
+              fi
+            fi
+          done
+          test "$reconciled" = "1"

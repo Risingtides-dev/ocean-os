@@ -1,0 +1,37 @@
+{
+  "name": "@risingtides-dev/ocean",
+  "version": "0.0.0-dev",
+  "description": "Ocean TUI + daemon prebuilt binaries (macOS arm64). Install with bun or npm; update with `ocean-update`.",
+  "license": "MIT OR Apache-2.0",
+  "private": false,
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Risingtides-dev/ocean-os.git"
+  },
+  "bin": {
+    "ocean": "bin/ocean",
+    "ocean-daemon": "bin/ocean-daemon",
+    "ocean-update": "ocean-update.sh"
+  },
+  "files": [
+    "bin/",
+    "ocean-update.sh",
+    "README.md",
+    "LICENSE",
+    "LICENSE-APACHE",
+    "LICENSE-MIT",
+    "NOTICE.md",
+    "CREDITS.md",
+    "TRADEMARKS.md",
+    "THIRD-PARTY-LICENSES.txt"
+  ],
+  "os": [
+    "darwin"
+  ],
+  "cpu": [
+    "arm64"
+  ],
+  "publishConfig": {
+    "registry": "https://npm.pkg.github.com"
+  }
+}
