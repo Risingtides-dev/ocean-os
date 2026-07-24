@@ -6,7 +6,7 @@ Lives at repo root alongside root AGENTS.md. Never duplicated in worktrees, conf
 **Schema — required fields:**
 
 ```
-time:      [HH:MMam/pm] [dd-mm-yy]  (EST UTC-4)
+time:      [HH:MM] [dd-mm-yy]  (24-hour, EST UTC-4 — never am/pm)
 agent:     [harness], [model-id], [persona]*  (* if known)
 worktree:  [branch/ref] or [main]   (required on every entry)
 type:      [issues] | [gh actions] | [bug report] | [refactor] | [feature-request] | [plan] | [handoff] | [goal] | [loop] | [workflow]
@@ -14,6 +14,13 @@ area:      [research] | [testing] | [review] | [writing] | [automations] | [skil
 
 <description of work done>
 ```
+
+`time:` is 24-hour, always. This line used to read `[HH:MMam/pm]`, so 251 of the
+386 entries below were written in am/pm — by agents correctly following the
+schema they were given. Those are grandfathered: the ledger is append-only and
+rewriting history to satisfy a format change is worse than the inconsistency.
+New entries use 24-hour. Reviewers: flag am/pm on new entries only, and point
+here rather than at a rule that lived outside the repo.
 
 ---
 
@@ -5162,4 +5169,27 @@ exit 0 on the shared checkout that carries three unpushed commits, while the new
 logic exits 64 with "on 'main' and HEAD is not contained in origin/main". A clean
 worktree sitting exactly at origin/main still passes. The dirty-tree check is
 unchanged and still fires independently.
+_________________________________________________________________________________
+time:      [16:52] [24-07-26]
+agent:     [claude] [opus 5]
+worktree:  fix/ledger-schema-24h-timestamps
+type:      [bug-report]
+area:      [docs]
+
+Root-caused the timestamp dispute that has cost this crew a review round, a lost
+fix, and is currently the single blocker on two lanes. thoth's merge-gate review
+correctly called `[12:15am]` forbidden — the operator's rule is 24-hour, never
+am/pm — but line 9 of this file, the canonical ledger's own required-fields
+schema, literally read `time:      [HH:MMam/pm] [dd-mm-yy]`. Grepping the whole
+repo for a time-format specification returns exactly one hit, and it was that
+line. The 24-hour rule existed only in the operator's private global
+instructions, which not every harness on this pad reads. So agents read the
+repo's schema, wrote am/pm as instructed, and were then flagged against a rule
+that was nowhere in the repository. 251 of 386 entries are am/pm — that is not
+sloppiness, it is compliance with the documented format. Fixed the schema line to
+24-hour, stated the rule in the repo where every harness can find it, and
+grandfathered the existing entries explicitly: this is an append-only ledger and
+rewriting 251 historical entries to satisfy a format change would be worse than
+the inconsistency, besides conflicting with every in-flight branch. Only the
+header changed; no historical entry was touched.
 _________________________________________________________________________________
