@@ -3160,11 +3160,12 @@ fn model_from_provider_config(config: &ProviderConfig) -> anyhow::Result<Model> 
             selection.max_output_tokens,
         )),
         ProviderId::Anthropic => Ok(match selection.model.as_str() {
+            "claude-opus-5" => Model::anthropic_claude_opus_5(),
             "claude-sonnet-5" => Model::anthropic_claude_sonnet_5(),
-            "claude-opus-4-8" => Model::anthropic_claude_opus_4_8(),
             "claude-haiku-4-5" => Model::anthropic_claude_haiku_4_5(),
             "claude-fable-5" => Model::anthropic_claude_fable_5(),
             // Legacy ids — pinned sessions from before the 2026-07 refresh.
+            "claude-opus-4-8" => Model::anthropic_claude_opus_4_8(),
             "claude-sonnet-4-6" => Model::anthropic_claude_sonnet_4_6(),
             "claude-opus-4-7" => Model::anthropic_claude_opus_4_7(),
             _ => {
@@ -3181,10 +3182,11 @@ fn model_from_provider_config(config: &ProviderConfig) -> anyhow::Result<Model> 
             // The claude-code alias maps to the REAL Anthropic API model id on
             // the wire — "claude-code-sonnet-5" is never sent to the API.
             "claude-code-fable-5" => Model::anthropic_claude_fable_5(),
-            "claude-code-opus-4-8" | "claude-opus-4-8" => Model::anthropic_claude_opus_4_8(),
+            "claude-code-opus-5" | "claude-opus-5" => Model::anthropic_claude_opus_5(),
             "claude-code-sonnet-5" | "claude-sonnet-5" => Model::anthropic_claude_sonnet_5(),
             "claude-code-haiku-4-5" | "claude-haiku-4-5" => Model::anthropic_claude_haiku_4_5(),
             // Legacy ids — pinned sessions from before the 2026-07 refresh.
+            "claude-code-opus-4-8" | "claude-opus-4-8" => Model::anthropic_claude_opus_4_8(),
             "claude-code-sonnet-4-6" | "claude-sonnet-4-6" => Model::anthropic_claude_sonnet_4_6(),
             "claude-code-opus-4-7" | "claude-opus-4-7" => Model::anthropic_claude_opus_4_7(),
             _ => {
@@ -4978,6 +4980,22 @@ done
         assert_eq!(model.provider, "anthropic");
         assert_eq!(model.api, "anthropic-messages");
         assert_eq!(model.id, "claude-opus-4-7");
+    }
+
+    #[test]
+    fn claude_code_opus_5_alias_maps_to_real_anthropic_id() {
+        // "claude-code-opus-5" is never sent on the wire — it must map to the
+        // real Anthropic API id for the current Opus generation.
+        let config = provider_config(ProviderId::ClaudeCode, "claude-code-opus-5", true);
+        let model = model_from_provider_config(&config).expect("claude-code opus 5 resolves");
+        assert_eq!(model.provider, "anthropic");
+        assert_eq!(model.api, "anthropic-messages");
+        assert_eq!(model.id, "claude-opus-5");
+
+        // Legacy pinned sessions on Opus 4.8 still resolve.
+        let legacy = provider_config(ProviderId::ClaudeCode, "claude-opus-4-8", true);
+        let model = model_from_provider_config(&legacy).expect("legacy opus 4.8 resolves");
+        assert_eq!(model.id, "claude-opus-4-8");
     }
 
     #[test]

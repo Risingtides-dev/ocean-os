@@ -309,7 +309,23 @@ impl Model {
         }
     }
 
-    /// Anthropic Claude Opus 4.8 — current Opus generation (verified 2026-07-08).
+    /// Anthropic Claude Opus 5 — current Opus generation (2026-07 release).
+    pub fn anthropic_claude_opus_5() -> Self {
+        Self {
+            id: "claude-opus-5".into(),
+            name: "Claude Opus 5".into(),
+            api: "anthropic-messages".into(),
+            provider: "anthropic".into(),
+            base_url: "https://api.anthropic.com".into(),
+            reasoning: true,
+            supports_images: true,
+            context_window: 200_000,
+            max_tokens: 16_384,
+        }
+    }
+
+    /// Anthropic Claude Opus 4.8 — previous Opus generation (retired from the
+    /// menu at the Opus 5 release; stays routable for pinned sessions).
     pub fn anthropic_claude_opus_4_8() -> Self {
         Self {
             id: "claude-opus-4-8".into(),

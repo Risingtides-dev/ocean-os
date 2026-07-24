@@ -706,7 +706,7 @@ pub fn known_models() -> Vec<KnownModel> {
         // not a direct Anthropic API key. `claude-code-*` aliases are dropped
         // from the menu (they resolved to the same models); `fable` has no
         // plain alias so it keeps its `claude-code-fable-5` id.
-        m("claude-opus-4-8", "claude-code", "Claude Opus 4.8"),
+        m("claude-opus-5", "claude-code", "Claude Opus 5"),
         m("claude-sonnet-5", "claude-code", "Claude Sonnet 5"),
         m("claude-haiku-4-5", "claude-code", "Claude Haiku 4.5"),
         m("claude-code-fable-5", "claude-code", "Claude Code Fable 5"),
@@ -910,9 +910,9 @@ pub fn resolve_model_selection(env: &ProviderEnv) -> Result<ModelSelection, Prov
             200_000,
             16_384,
         )),
-        "claude-opus-4-8" | "claude-opus" | "opus" => Ok(model_selection(
+        "claude-opus-5" | "claude-opus" | "opus" => Ok(model_selection(
             ProviderId::ClaudeCode,
-            "claude-opus-4-8",
+            "claude-opus-5",
             ANTHROPIC_BASE_URL,
             200_000,
             16_384,
@@ -926,6 +926,13 @@ pub fn resolve_model_selection(env: &ProviderEnv) -> Result<ModelSelection, Prov
         )),
         // LEGACY Claude ids — retired from the menu, kept routable so sessions
         // pinned before the refresh still resolve. Also OAuth (ClaudeCode).
+        "claude-opus-4-8" => Ok(model_selection(
+            ProviderId::ClaudeCode,
+            "claude-opus-4-8",
+            ANTHROPIC_BASE_URL,
+            200_000,
+            16_384,
+        )),
         "claude-sonnet-4-6" => Ok(model_selection(
             ProviderId::ClaudeCode,
             "claude-sonnet-4-6",
@@ -950,7 +957,14 @@ pub fn resolve_model_selection(env: &ProviderEnv) -> Result<ModelSelection, Prov
             200_000,
             16_384,
         )),
-        "claude-code-opus-4-8" | "claude-code-opus" | "cc-opus" => Ok(model_selection(
+        "claude-code-opus-5" | "claude-code-opus" | "cc-opus" => Ok(model_selection(
+            ProviderId::ClaudeCode,
+            "claude-code-opus-5",
+            ANTHROPIC_BASE_URL,
+            200_000,
+            16_384,
+        )),
+        "claude-code-opus-4-8" => Ok(model_selection(
             ProviderId::ClaudeCode,
             "claude-code-opus-4-8",
             ANTHROPIC_BASE_URL,
@@ -1763,6 +1777,27 @@ mod tests {
     }
 
     #[test]
+    fn opus_aliases_track_opus_5_and_legacy_4_8_stays_routable() {
+        // The convenience aliases follow the newest Opus generation.
+        for alias in ["opus", "claude-opus", "claude-opus-5"] {
+            let s = resolve_model_selection(&env(&[("OCEAN_MODEL", alias)])).unwrap();
+            assert_eq!(s.provider, ProviderId::ClaudeCode, "{alias}");
+            assert_eq!(s.model, "claude-opus-5", "{alias}");
+        }
+        for alias in ["claude-code-opus", "cc-opus"] {
+            let s = resolve_model_selection(&env(&[("OCEAN_MODEL", alias)])).unwrap();
+            assert_eq!(s.model, "claude-code-opus-5", "{alias}");
+        }
+        // Pinned sessions on the retired ids keep resolving (off the menu).
+        let legacy = resolve_model_selection(&env(&[("OCEAN_MODEL", "claude-opus-4-8")])).unwrap();
+        assert_eq!(legacy.provider, ProviderId::ClaudeCode);
+        assert_eq!(legacy.model, "claude-opus-4-8");
+        let legacy_cc =
+            resolve_model_selection(&env(&[("OCEAN_MODEL", "claude-code-opus-4-8")])).unwrap();
+        assert_eq!(legacy_cc.model, "claude-code-opus-4-8");
+    }
+
+    #[test]
     fn ocean_auth_file_can_supply_key() {
         let dir = std::env::temp_dir().join(format!("ocean-providers-test-{}", std::process::id()));
         let _ = fs::remove_dir_all(&dir);
@@ -1948,10 +1983,11 @@ mod tests {
             "gpt-5.4",
             "gpt-5.4-mini",
             "gpt-5.3-codex-spark",
-            // Current Claude generation (2026-07 refresh). The retired
-            // 4-6/4-7 ids stay ROUTABLE (legacy arms, pinned sessions) but are
-            // deliberately NOT in the menu, so they're absent here too.
-            "claude-opus-4-8",
+            // Current Claude generation (2026-07 refresh + Opus 5 release).
+            // The retired 4-6/4-7/4-8 ids stay ROUTABLE (legacy arms, pinned
+            // sessions) but are deliberately NOT in the menu, so they're
+            // absent here too.
+            "claude-opus-5",
             "claude-sonnet-5",
             "claude-haiku-4-5",
             "claude-code-fable-5",
@@ -2312,7 +2348,7 @@ mod tests {
         let listed: std::collections::BTreeSet<String> =
             known_models().into_iter().map(|m| m.id).collect();
         assert!(listed.contains("claude-sonnet-5"));
-        assert!(listed.contains("claude-opus-4-8"));
+        assert!(listed.contains("claude-opus-5"));
         assert!(listed.contains("claude-haiku-4-5"));
         assert!(listed.contains("claude-code-fable-5"));
 
