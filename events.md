@@ -5004,4 +5004,24 @@ immediately acquirable, keeps both lanes live at once, and frees only A when A's
 lease drops. Verified as a real regression guard by mutating `session_lock` to
 key every session to one nil id — the new test fails under that mutation and
 passes once reverted.
+time:      [14:02] [24-07-26]
+agent:     [claude] [opus 5]
+worktree:  test/task31-browser-wait-for-pid-flake
+type:      [bug-report]
+area:      [testing]
+
+TASK-31, the last tight-poll flake site the earlier repo-wide audit found.
+`ocean-browser`'s `wait_for_pid` polled a spawned fake-browser PID marker
+100 x 20ms and then panicked — the same anatomy as the herdr marker flake
+(#334) and the room_federation one (#335), where a spawn that runs long under
+full-suite parallel load blows a two-second budget. Widened to 5s, matching
+`ocean-tui::shell::herdr::wait_for_marker` so both sites read as one idiom.
+Its sibling `wait_until_not_running` had identical exposure one hop removed:
+it returns a bool rather than panicking, but the only caller asserts on that
+bool, so a slow post-cancellation teardown fails the test just as hard.
+Widened it too. Note this crate went default-off behind `legacy-chromium` in
+342b33f9, so the affected test only compiles when a consumer enables that
+feature — the flake is dormant on default CI rather than gone. Verified with
+`cargo test -p ocean-browser --features legacy-chromium`: 12 passed,
+including `cancelled_browser_launch_does_not_orphan_spawned_process`.
 _________________________________________________________________________________
