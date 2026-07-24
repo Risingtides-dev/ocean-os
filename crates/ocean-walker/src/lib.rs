@@ -4453,10 +4453,25 @@ mod tests {
         }
     }
 
+    /// Block until a cache entry written *now* would report a nonzero
+    /// `cache_age_ms`.
+    ///
+    /// A flat 1 ms spin was not enough: `cache_age_ms` has millisecond
+    /// resolution, so on a loaded runner the write and the read can still land
+    /// in the same millisecond bucket and the age rounds to 0 (this failed CI
+    /// on an unrelated PR). Sleep past a full tick, then confirm the observable
+    /// clock actually advanced instead of trusting the duration.
     fn wait_for_nonzero_cache_age() {
-        let started = std::time::Instant::now();
-        while started.elapsed() < Duration::from_millis(1) {
-            std::thread::yield_now();
+        let started = std::time::SystemTime::now();
+        loop {
+            std::thread::sleep(Duration::from_millis(5));
+            let advanced = std::time::SystemTime::now()
+                .duration_since(started)
+                .map(|elapsed| elapsed.as_millis() >= 2)
+                .unwrap_or(false);
+            if advanced {
+                return;
+            }
         }
     }
 
@@ -4707,27 +4722,44 @@ mod tests {
             .filter(WalkFilter::files_only())
             .empty_recheck(EmptyRecheck::Never);
 
-        let primed = request
-            .collect()
-            .expect("empty request should collect successfully");
-        assert_eq!(primed.backend, WalkBackend::Fresh);
-        assert!(
-            primed.entries.is_empty(),
-            "empty root should prime an empty files-only cache entry, got {:?}",
-            primed.entries
-        );
+        // The scan cache is process-global with a 1 s default TTL and a
+        // 16-entry cap, so under a loaded parallel run the primed entry can
+        // expire or be evicted before the stale observation — environmental,
+        // not a regression. Re-establish the precondition and retry a bounded
+        // number of times; a genuine cache bug still fails every attempt.
+        let created_path = tree.path().join("created.txt");
+        let mut observed_stale = None;
+        for _ in 0..5 {
+            invalidate_path(tree.path());
+            if created_path.exists() {
+                fs::remove_file(&created_path).expect("stale retry should reset created.txt");
+            }
 
-        fs::write(tree.path().join("created.txt"), "created")
-            .expect("file created after cache prime should be written");
-        wait_for_nonzero_cache_age();
+            let primed = request
+                .collect()
+                .expect("empty request should collect successfully");
+            assert_eq!(primed.backend, WalkBackend::Fresh);
+            assert!(
+                primed.entries.is_empty(),
+                "empty root should prime an empty files-only cache entry, got {:?}",
+                primed.entries
+            );
 
-        let stale = request
-            .collect()
-            .expect("empty recheck disabled request should read the cached empty result");
-        assert_eq!(stale.backend, WalkBackend::Cached);
-        assert!(
-            stale.stats.cache_age_ms > 0,
-            "cached empty result should be old enough to exercise empty recheck"
+            fs::write(&created_path, "created")
+                .expect("file created after cache prime should be written");
+            wait_for_nonzero_cache_age();
+
+            let stale = request
+                .collect()
+                .expect("empty recheck disabled request should read the cached empty result");
+            if stale.backend == WalkBackend::Cached && stale.stats.cache_age_ms > 0 {
+                observed_stale = Some(stale);
+                break;
+            }
+        }
+        let stale = observed_stale.expect(
+            "no attempt observed an aged cached-empty result; the cache is \
+             dropping or mis-aging entries even without parallel-load pressure",
         );
         assert!(
             stale.entries.is_empty(),

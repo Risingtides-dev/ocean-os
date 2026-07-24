@@ -11,13 +11,17 @@ and Python filters, tests, and fixtures.
   Copyright (c) 2025-2026 Can Bölük
 
 The pytest state-machine concepts in the pinned OMP source adapt
-build_pytest_summary from RTK, also used under the MIT License.
+`build_pytest_summary` from RTK, used under the Apache License 2.0.
 
 Upstream repository: https://github.com/rtk-ai/rtk
 Pinned revision: 878af7de99e0ba71da2e8fd996f6b52a1836e06c
 Upstream path: src/cmds/python/pytest_cmd.rs
 
-  Copyright (c) the RTK authors (rtk-ai/rtk)
+  Copyright (c) 2024 Patrick Szymkowiak
+
+RTK had no `NOTICE` file at the pinned revision. Ocean's implementation is
+modified and reimplemented; the Apache License 2.0 text is distributed
+alongside this notice as `LICENSE-APACHE`.
 
 Ocean's implementation is dependency-free, consumes already-tokenized
 invocations, and intentionally omits OMP's shell parsing, TOML pipelines,

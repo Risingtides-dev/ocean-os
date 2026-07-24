@@ -801,6 +801,39 @@ async fn main() -> anyhow::Result<()> {
         }
     }
 
+    // TASK-23: when launchd owns the dev.risingtides.ocean-daemon job, only the
+    // process launchd launched may bind. Long-lived TUIs carry old autostart
+    // code in memory, so this invariant cannot be enforced client-side —
+    // installing a fixed binary never upgrades running processes. Exit 0: for a
+    // supervised box a second daemon is an intentional no-op, not an error.
+    // `OCEAN_UNSUPERVISED=1` is the explicit dev/test escape hatch.
+    #[cfg(target_os = "macos")]
+    {
+        let unsupervised = matches!(
+            env::var("OCEAN_UNSUPERVISED").as_deref(),
+            Ok("1") | Ok("true") | Ok("yes") | Ok("on")
+        );
+        match startup::supervision_verdict(
+            startup::probe_launchd_job(startup::LAUNCHD_LABEL),
+            std::process::id(),
+            unsupervised,
+        ) {
+            startup::SupervisionVerdict::Proceed => {}
+            startup::SupervisionVerdict::RefuseForeignSupervisor { job_pid } => {
+                eprintln!(
+                    "ocean-daemon: launchd owns the {} job{} — refusing to bind; the \
+                     supervised instance serves this box. Set OCEAN_UNSUPERVISED=1 for a \
+                     deliberate supervisor-free run.",
+                    startup::LAUNCHD_LABEL,
+                    job_pid
+                        .map(|pid| format!(" (running as pid {pid})"))
+                        .unwrap_or_else(|| " (registered, not running)".to_string()),
+                );
+                return Ok(());
+            }
+        }
+    }
+
     let bind = env::var("OCEAN_BIND").unwrap_or_else(|_| "127.0.0.1:4780".to_string());
 
     // The Longhouse read-side topic registry. Built BEFORE the runtime so the
@@ -2942,6 +2975,157 @@ struct SkillFetchRequest {
 /// `spawn_blocking`. Errors map to typed `{ ok: false, error }` bodies:
 /// `404` for an unknown id, `500` only if the matched file became unreadable
 /// between index + read (a TOCTOU race) — mirrors the topic-fetch error shape.
+/// Read a skill body such that a symlink planted in the UNTRUSTED portion of
+/// the path is refused rather than followed (TASK-30, #333 done right).
+///
+/// The cached index can name a path that was a regular file at walk time and a
+/// symlink now, and `SkillRoots::for_cwd` adds the repo-local `<cwd>/skills`
+/// root — so the retarget can be shipped by an untrusted repository, not just
+/// the operator. Two earlier path-check attempts were unsound (Codex P1/P2 on
+/// #333): canonicalizing the roots at fetch time moves the allowed boundary if
+/// a root is swapped, and any resolve-then-reopen follows whatever the pathname
+/// points to at read time.
+///
+/// Design: split the path into a TRUSTED PREFIX and an UNTRUSTED REMAINDER.
+/// * Home roots (`~/.config/ocean-rs`, `~/.spawner`, `~/.codex`) are the user's
+///   own config; the whole root is trusted (a symlinked `~/.codex` is legit).
+/// * The repo root trusts only the operator-supplied cwd — the repo controls
+///   `skills/` and everything under it, so `skills` is part of the remainder.
+///
+/// The trusted prefix is canonicalized (resolving LEGITIMATE symlinks such as
+/// macOS `/var -> /private/var` so we do not false-reject real skills), then the
+/// full path is opened with a no-follow open. On the macOS deploy target that is
+/// `O_NOFOLLOW_ANY`, which fails if ANY component is a symlink — checked
+/// atomically at open, and the body is read from THAT handle, so there is no
+/// check-then-read TOCTOU. Because the canonical prefix is already symlink-free,
+/// only a symlink in the untrusted remainder can trip it.
+fn read_skill_body_guarded(
+    source_path: &std::path::Path,
+    roots: &ocean_longhouse::SkillRoots,
+) -> Result<String, String> {
+    use std::path::{Path, PathBuf};
+    // (trusted_prefix, full_root). Home roots trust the whole root; the repo
+    // root trusts only its parent (the operator cwd).
+    let mut candidates: Vec<(PathBuf, &Path)> = Vec::new();
+    for home in [
+        roots.ocean.as_deref(),
+        roots.spawner.as_deref(),
+        roots.codex.as_deref(),
+    ]
+    .into_iter()
+    .flatten()
+    {
+        candidates.push((home.to_path_buf(), home));
+    }
+    if let Some(repo) = roots.repo.as_deref() {
+        let trusted = repo.parent().unwrap_or(repo).to_path_buf();
+        candidates.push((trusted, repo));
+    }
+
+    let (trusted_prefix, _root) = candidates
+        .iter()
+        .find(|(_, root)| source_path.starts_with(root))
+        .ok_or_else(|| "skill path is not under any configured root".to_string())?;
+
+    let remainder = source_path
+        .strip_prefix(trusted_prefix)
+        .map_err(|_| "skill path escapes its trusted prefix".to_string())?;
+
+    // Resolve legitimate symlinks in the TRUSTED prefix only.
+    let canonical_prefix = std::fs::canonicalize(trusted_prefix).map_err(|err| err.to_string())?;
+    let full = canonical_prefix.join(remainder);
+    open_nofollow_read(&full)
+}
+
+/// No-follow open + read: refuse a symlink in ANY component of `path` and read
+/// from the resulting handle (no reopen). Sound on both deploy and CI targets:
+/// * macOS (deploy): `O_NOFOLLOW_ANY`.
+/// * Linux (CI): `openat2` with `RESOLVE_NO_SYMLINKS`.
+///
+/// Both fail the open if any component is a symlink, checked atomically, so a
+/// swapped final component, ancestor directory, or root is rejected rather than
+/// followed. `path` is `canonical_prefix.join(remainder)` — the prefix is
+/// already symlink-free, so only a symlink in the untrusted remainder trips it.
+fn open_nofollow_read(path: &std::path::Path) -> Result<String, String> {
+    use std::io::Read;
+
+    #[cfg(target_os = "linux")]
+    let mut file = open_nofollow_linux(path)?;
+
+    #[cfg(not(target_os = "linux"))]
+    let mut file = {
+        use std::os::unix::fs::OpenOptionsExt;
+        // macOS: O_NOFOLLOW_ANY rejects a symlink in ANY component. Other Unix
+        // (not a supported target) falls back to O_NOFOLLOW, which guards only
+        // the final component — no such platform is a deploy or CI target.
+        // O_CLOEXEC for the same fd-isolation reason as the Linux path.
+        #[cfg(target_os = "macos")]
+        let flags = libc::O_NOFOLLOW_ANY | libc::O_CLOEXEC;
+        #[cfg(not(target_os = "macos"))]
+        let flags = libc::O_NOFOLLOW | libc::O_CLOEXEC;
+        std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(flags)
+            .open(path)
+            .map_err(|err| {
+                tracing::warn!(path = %path.display(), %err, "refusing skill fetch: no-follow open failed");
+                "skill path could not be opened without following a symlink".to_string()
+            })?
+    };
+
+    let mut body = String::new();
+    file.read_to_string(&mut body)
+        .map_err(|err| err.to_string())?;
+    Ok(body)
+}
+
+/// Linux no-follow open via `openat2(RESOLVE_NO_SYMLINKS)` — rejects a symlink
+/// in any path component, unlike `O_NOFOLLOW` which only guards the final one.
+#[cfg(target_os = "linux")]
+fn open_nofollow_linux(path: &std::path::Path) -> Result<std::fs::File, String> {
+    use std::os::fd::FromRawFd;
+    use std::os::unix::ffi::OsStrExt;
+
+    // struct open_how { u64 flags; u64 mode; u64 resolve; }
+    #[repr(C)]
+    struct OpenHow {
+        flags: u64,
+        mode: u64,
+        resolve: u64,
+    }
+    const RESOLVE_NO_SYMLINKS: u64 = 0x04;
+    const SYS_OPENAT2: libc::c_long = 437;
+
+    let c_path = std::ffi::CString::new(path.as_os_str().as_bytes())
+        .map_err(|_| "skill path contains an interior NUL".to_string())?;
+    let how = OpenHow {
+        // O_CLOEXEC so a concurrent exec in the multithreaded daemon cannot
+        // leak the readable skill fd to a child (Rust's std open sets this by
+        // default; openat2 does not — Codex P2 on #336).
+        flags: (libc::O_RDONLY | libc::O_CLOEXEC) as u64,
+        mode: 0,
+        resolve: RESOLVE_NO_SYMLINKS,
+    };
+    // SAFETY: openat2 with a valid CString path, a correctly-sized open_how, and
+    // AT_FDCWD. The returned fd (>= 0) is owned by the File below.
+    let fd = unsafe {
+        libc::syscall(
+            SYS_OPENAT2,
+            libc::AT_FDCWD,
+            c_path.as_ptr(),
+            &how as *const OpenHow,
+            std::mem::size_of::<OpenHow>(),
+        )
+    };
+    if fd < 0 {
+        let err = std::io::Error::last_os_error();
+        tracing::warn!(path = %path.display(), %err, "refusing skill fetch: openat2 no-follow open failed");
+        return Err("skill path could not be opened without following a symlink".to_string());
+    }
+    // SAFETY: fd is a fresh, owned, valid file descriptor from openat2.
+    Ok(unsafe { std::fs::File::from_raw_fd(fd as i32) })
+}
+
 async fn skills_fetch(Json(req): Json<SkillFetchRequest>) -> (StatusCode, Json<serde_json::Value>) {
     let SkillFetchRequest { id, cwd } = req;
 
@@ -2972,13 +3156,15 @@ async fn skills_fetch(Json(req): Json<SkillFetchRequest>) -> (StatusCode, Json<s
             .cloned();
 
         match matched {
-            // Known skill: read its full body. A read failure here is a TOCTOU
-            // race (file vanished/changed perms after the index walk).
-            Some(brief) => match std::fs::read_to_string(&brief.source_path) {
+            // Known skill: read its full body through the symlink-safe guard
+            // (TASK-30). The cached index can name a path that has since been
+            // retargeted, and the repo-local `<cwd>/skills` root means the
+            // retarget can be shipped by an UNTRUSTED repository, so a plain
+            // `read_to_string` (which follows symlinks in the final component
+            // AND every ancestor) would be an arbitrary file read.
+            Some(brief) => match read_skill_body_guarded(&brief.source_path, &roots) {
                 Ok(body) => SkillFetchOutcome::Found { brief, body },
-                Err(err) => SkillFetchOutcome::Unreadable {
-                    error: err.to_string(),
-                },
+                Err(error) => SkillFetchOutcome::Unreadable { error },
             },
             // Not in the index → unknown id. Never read the raw `id` path.
             None => SkillFetchOutcome::Unknown,
@@ -6648,6 +6834,9 @@ async fn agent_turn(
     // W3 harness profile: surfaces whose effective profile grants it spill
     // oversized output to session artifacts; voice stays plain.
     .with_artifact_spill(harness_caps.artifact_spill)
+    // TASK-26: voice turns don't get the `lsp` tool — spoken replies can't
+    // carry definitions/references/diagnostics.
+    .with_code_intelligence(harness_caps.code_intelligence)
     .with_event_sink(event_tx)
     // Per-turn reasoning override (OCEAN-28/41): threads the optional
     // request `thinking_level` into this turn's config only, leaving the
@@ -7956,14 +8145,51 @@ async fn validate_voice_planner_context(
     })
 }
 
+/// Resolve a normal realtime conversation's workspace from daemon-owned
+/// session state. Project-less, missing, or inaccessible sessions fail closed
+/// to the original conversation tool set; the browser cannot nominate a root.
+async fn validated_conversation_workspace(
+    runtime: &AgentRuntime,
+    detail: &SessionDetail,
+) -> Option<ValidatedPlannerContext> {
+    let root = detail
+        .workspace_root
+        .as_deref()
+        .filter(|root| !root.trim().is_empty())
+        .or_else(|| detail.cwd.as_deref().filter(|cwd| !cwd.trim().is_empty()))?
+        .trim();
+    if root.chars().count() > voice_realtime::PLANNER_WORKSPACE_ROOT_MAX_CHARS {
+        return None;
+    }
+    let project = runtime.owning_project_for_root(root)?;
+    validate_voice_planner_context(
+        runtime,
+        &voice_realtime::VoicePlannerContext {
+            project_id: project.id,
+            workspace_root: root.to_string(),
+        },
+    )
+    .await
+    .ok()
+}
+
 /// Mint an ephemeral OpenAI Realtime client secret. Conversation mode preserves
 /// the original session briefing; planner mode is pre-session and propose-only.
 async fn voice_realtime_client_secret(
     State(state): State<AppState>,
     Json(req): Json<voice_realtime::RealtimeSecretRequest>,
 ) -> (StatusCode, Json<Value>) {
-    // Validate mode/context before credential resolution so malformed or
-    // unauthorized planner requests return 400 rather than a credential error.
+    // Resolve one daemon-owned session snapshot up front. Conversation workspace
+    // authority and transcript briefing must come from the same session identity.
+    let session_detail = req
+        .session_id
+        .as_deref()
+        .and_then(|raw| raw.parse::<SessionId>().ok())
+        .and_then(|id| state.runtime.session_detail(id).ok());
+
+    // Validate planner mode/context before credential resolution. Conversation
+    // mode never accepts a browser-supplied workspace; it derives a registered
+    // project root/live worktree from the daemon-owned session snapshot above.
     let planner = match req.purpose {
         voice_realtime::RealtimePurpose::Conversation => {
             if req.planner_context.is_some() {
@@ -7993,6 +8219,14 @@ async fn voice_realtime_client_secret(
             }
         }
     };
+    let conversation_workspace = if req.purpose == voice_realtime::RealtimePurpose::Conversation {
+        match session_detail.as_ref() {
+            Some(detail) => validated_conversation_workspace(&state.runtime, detail).await,
+            None => None,
+        }
+    } else {
+        None
+    };
 
     let Some(credential) = ocean_providers::resolve_openai_realtime_api_key() else {
         return (
@@ -8003,13 +8237,10 @@ async fn voice_realtime_client_secret(
         );
     };
 
-    // Briefing: best-effort. A bad/unknown session id degrades to the
-    // header-only instructions rather than blocking the voice session.
-    let transcript: Vec<(String, String)> = req
-        .session_id
-        .as_deref()
-        .and_then(|raw| raw.parse::<SessionId>().ok())
-        .and_then(|id| state.runtime.session_detail(id).ok())
+    // Briefing is best-effort. A bad/unknown session id degrades to the
+    // header-only, no-workspace-tools conversation rather than blocking voice.
+    let transcript: Vec<(String, String)> = session_detail
+        .as_ref()
         .map(|detail| {
             detail
                 .transcript
@@ -8033,13 +8264,19 @@ async fn voice_realtime_client_secret(
         let body = voice_realtime::planner_upstream_body(&model, &instructions);
         (instructions, body)
     } else {
-        let instructions = voice_realtime::build_instructions(&transcript);
-        let body = voice_realtime::upstream_body(&model, &instructions);
+        let workspace_tools = conversation_workspace.is_some();
+        let instructions = voice_realtime::build_instructions(&transcript, workspace_tools);
+        let body = voice_realtime::upstream_body(&model, &instructions, workspace_tools);
         (instructions, body)
     };
     let _ = instructions;
     match voice_realtime::mint_client_secret(&credential, &model, &body).await {
-        Ok(normalized) => (StatusCode::OK, Json(normalized)),
+        Ok(mut normalized) => {
+            if let Some(context) = conversation_workspace {
+                normalized["workspace_root"] = json!(context.workspace_root);
+            }
+            (StatusCode::OK, Json(normalized))
+        }
         Err(err) => {
             tracing::warn!(error = %err, "realtime client-secret mint failed");
             (StatusCode::BAD_GATEWAY, Json(json!({ "error": err })))
@@ -8343,6 +8580,87 @@ fn event_type_name(event: &OceanEvent) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ---- TASK-30: symlink-safe skill read (#333 done right) --------------
+    #[cfg(test)]
+    fn roots_with_repo(cwd: &std::path::Path) -> ocean_longhouse::SkillRoots {
+        ocean_longhouse::SkillRoots {
+            ocean: None,
+            spawner: None,
+            codex: None,
+            repo: Some(cwd.join("skills")),
+        }
+    }
+
+    /// Happy path: a real skill file under a repo whose cwd sits below a
+    /// LEGITIMATE system symlink (macOS tempdirs live under /var -> /private/var).
+    /// The earlier absolute-path O_NOFOLLOW_ANY attempt WRONGLY rejected this.
+    #[test]
+    fn guarded_read_allows_a_real_file_under_a_legit_system_symlink() {
+        let cwd = tempfile::tempdir().expect("cwd");
+        std::fs::create_dir_all(cwd.path().join("skills/a")).expect("mkdir");
+        std::fs::write(cwd.path().join("skills/a/SKILL.md"), "real body").expect("write");
+        let roots = roots_with_repo(cwd.path());
+        let got = read_skill_body_guarded(&cwd.path().join("skills/a/SKILL.md"), &roots);
+        assert_eq!(got.as_deref(), Ok("real body"), "legit file must read");
+    }
+
+    /// Final-component swap: the skill file itself becomes a symlink.
+    #[test]
+    fn guarded_read_refuses_final_component_symlink() {
+        let cwd = tempfile::tempdir().expect("cwd");
+        let secret = cwd.path().join("secret.txt");
+        std::fs::write(&secret, "CANARY").expect("secret");
+        std::fs::create_dir_all(cwd.path().join("skills")).expect("mkdir");
+        let skill = cwd.path().join("skills/SKILL.md");
+        std::fs::write(&skill, "real").expect("write");
+        std::fs::remove_file(&skill).expect("rm");
+        std::os::unix::fs::symlink(&secret, &skill).expect("symlink");
+        let roots = roots_with_repo(cwd.path());
+        assert!(
+            read_skill_body_guarded(&skill, &roots).is_err(),
+            "final symlink refused"
+        );
+    }
+
+    /// Ancestor swap (Codex P1 round 1): a parent dir under skills/ is a symlink.
+    // Sound on macOS (O_NOFOLLOW_ANY) and Linux (openat2 RESOLVE_NO_SYMLINKS).
+    #[test]
+    fn guarded_read_refuses_ancestor_symlink() {
+        let cwd = tempfile::tempdir().expect("cwd");
+        let outside = tempfile::tempdir().expect("outside");
+        std::fs::write(outside.path().join("SKILL.md"), "CANARY").expect("secret");
+        std::fs::create_dir_all(cwd.path().join("skills/a")).expect("mkdir");
+        std::fs::remove_dir_all(cwd.path().join("skills/a")).expect("rm");
+        std::os::unix::fs::symlink(outside.path(), cwd.path().join("skills/a")).expect("symlink");
+        let roots = roots_with_repo(cwd.path());
+        let indexed = cwd.path().join("skills/a/SKILL.md");
+        assert!(
+            read_skill_body_guarded(&indexed, &roots).is_err(),
+            "ancestor symlink refused"
+        );
+    }
+
+    /// Root swap (Codex P1 round 2): `<cwd>/skills` itself is retargeted. The
+    /// repo controls `skills`, so it is part of the untrusted remainder and the
+    /// no-follow open must refuse it.
+    // Sound on macOS (O_NOFOLLOW_ANY) and Linux (openat2 RESOLVE_NO_SYMLINKS).
+    #[test]
+    fn guarded_read_refuses_root_directory_swap() {
+        let cwd = tempfile::tempdir().expect("cwd");
+        let outside = tempfile::tempdir().expect("outside");
+        std::fs::create_dir_all(outside.path().join("a")).expect("mkdir out");
+        std::fs::write(outside.path().join("a/SKILL.md"), "CANARY").expect("secret");
+        // `<cwd>/skills` is a symlink to the attacker dir.
+        std::os::unix::fs::symlink(outside.path(), cwd.path().join("skills"))
+            .expect("symlink root");
+        let roots = roots_with_repo(cwd.path());
+        let indexed = cwd.path().join("skills/a/SKILL.md");
+        assert!(
+            read_skill_body_guarded(&indexed, &roots).is_err(),
+            "a swapped repo skills root must be refused"
+        );
+    }
 
     #[test]
     fn planner_handoff_uses_exact_truthful_marker() {
@@ -21060,8 +21378,14 @@ mod tests {
         assert!(outcomes.contains("Err(err) => {"));
         assert!(outcomes.contains("\n            None\n"));
         assert!(!prepare.contains("current_dir"));
-        assert!(prepare.contains("Dropping the join handle does not cancel this read-only task."));
+        assert!(prepare.contains("Dropping the join handle does not cancel this read-only task,"));
         assert!(prepare.contains("process-wide cache lock"));
+        // TASK-21: the boundary is now single-flight — an abandoned consult
+        // holds its permit until it truly finishes, so a stalled load can never
+        // be amplified into one detached blocking task per turn.
+        assert!(prepare.contains("try_acquire_owned()"));
+        assert!(prepare.contains("already in flight; injecting no brief"));
+        assert!(prepare.contains("let _permit = permit;"));
         assert_eq!(prepare.matches("tracing::warn!(").count(), 2);
         let timeout_warning_start = prepare.find("tracing::warn!(").unwrap();
         let timeout_warning_end = prepare[timeout_warning_start..]
@@ -21115,6 +21439,10 @@ mod tests {
             );
         }
         if is_extracted {
+            // The guard bounds PRODUCTION surface in this private leaf; the
+            // #[cfg(test)] module is excluded so regressions can be added
+            // without loosening the real constraint (TASK-21).
+            let source = source.split("#[cfg(test)]").next().unwrap_or(&source);
             let definitions = source
                 .lines()
                 .map(str::trim_start)
@@ -21125,7 +21453,9 @@ mod tests {
                         || line.starts_with("pub(super) async fn ")
                 })
                 .count();
-            assert_eq!(definitions, 4, "private owner gained an extra function");
+            // 5 = the original 4 + prep_permit(), the TASK-21 single-flight
+            // accessor that bounds detached blocking work.
+            assert_eq!(definitions, 5, "private owner gained an extra function");
             assert_eq!(source.matches(&deadline_prefix).count(), 1);
             assert!(!source.contains("\nstruct "));
             assert!(!source.contains("\nenum "));
@@ -23801,6 +24131,32 @@ prunable gitdir file points to non-existent location
         validate_voice_planner_context(&state.runtime, &context(&live))
             .await
             .expect("live linked worktree is valid");
+
+        let (conversation_id, _, _) = state
+            .runtime
+            .create_session(&live.to_string_lossy(), Some("surface-web".into()))
+            .expect("conversation session");
+        let conversation = state.runtime.session_detail(conversation_id).unwrap();
+        let scoped = validated_conversation_workspace(&state.runtime, &conversation)
+            .await
+            .expect("registered live-worktree session receives project reads");
+        assert_eq!(
+            scoped.workspace_root,
+            std::fs::canonicalize(&live).unwrap().to_string_lossy()
+        );
+
+        let projectless = tmp.path().join("projectless");
+        std::fs::create_dir(&projectless).unwrap();
+        let (projectless_id, _, _) = state
+            .runtime
+            .create_session(&projectless.to_string_lossy(), None)
+            .expect("project-less session");
+        let projectless_detail = state.runtime.session_detail(projectless_id).unwrap();
+        assert!(
+            validated_conversation_workspace(&state.runtime, &projectless_detail)
+                .await
+                .is_none()
+        );
 
         let unrelated = tmp.path().join("unrelated");
         std::fs::create_dir(&unrelated).unwrap();

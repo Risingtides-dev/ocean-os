@@ -322,6 +322,7 @@ mod tests {
             session_id: Some("test".into()),
             hashline: false,
             artifacts: false,
+            code_intelligence: true,
         }
     }
 

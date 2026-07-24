@@ -273,6 +273,28 @@ impl Model {
     /// Anthropic Claude Sonnet 5 — current Sonnet generation. Verified live
     /// against api.anthropic.com (2026-07-08): the undated id is recognized on
     /// both API-key and Claude-subscription OAuth auth.
+    /// Kimi CODING SUBSCRIPTION K3 — the "kimi code" plan model, spoken over the
+    /// Anthropic Messages wire at api.kimi.com/coding (verified live). Uses the
+    /// anthropic-messages path so it reuses Ocean's Claude request/stream/thinking
+    /// handling; auth is x-api-key with the subscription key (TASK-19).
+    pub fn kimi_coding_k3(
+        base_url: impl Into<String>,
+        context_window: u32,
+        max_tokens: u32,
+    ) -> Self {
+        Self {
+            id: "k3".into(),
+            name: "Kimi K3 (coding plan)".into(),
+            api: "anthropic-messages".into(),
+            provider: "kimi-coding".into(),
+            base_url: base_url.into(),
+            reasoning: true,
+            supports_images: true,
+            context_window,
+            max_tokens,
+        }
+    }
+
     pub fn anthropic_claude_sonnet_5() -> Self {
         Self {
             id: "claude-sonnet-5".into(),

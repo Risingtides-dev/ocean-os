@@ -101,11 +101,50 @@ fi
 
 echo "==> [3/3] (re)bootstrapping launchd job $LABEL in $DOMAIN"
 # Tear down any previous instance so this is a clean (re)install.
+#
+# TASK-22: `bootout` is ASYNCHRONOUS. Bootstrapping immediately after it races
+# the teardown and fails with "Bootstrap failed: 5: Input/output error" — and
+# because the bootout itself already succeeded, that leaves the daemon DOWN
+# while the installer exits nonzero. (This took production offline on the
+# 07-20 deploy.) Wait for the job to actually disappear before bootstrapping.
 launchctl bootout "$DOMAIN/$LABEL" 2>/dev/null || true
-launchctl bootstrap "$DOMAIN" "$PLIST_DST"
+for _ in $(seq 1 50); do
+  launchctl print "$DOMAIN/$LABEL" >/dev/null 2>&1 || break
+  sleep 0.2
+done
+if launchctl print "$DOMAIN/$LABEL" >/dev/null 2>&1; then
+  echo "FATAL: $LABEL did not tear down within 10s; refusing to race bootstrap." >&2
+  echo "       Inspect: launchctl print $DOMAIN/$LABEL" >&2
+  exit 75 # EX_TEMPFAIL
+fi
+
+# Bootstrap, with one retry — and never exit quietly leaving the box daemonless.
+if ! launchctl bootstrap "$DOMAIN" "$PLIST_DST" 2>/dev/null; then
+  sleep 1
+  if ! launchctl bootstrap "$DOMAIN" "$PLIST_DST"; then
+    echo "FATAL: bootstrap failed twice — THE DAEMON IS DOWN." >&2
+    echo "       Recover with:" >&2
+    echo "         launchctl bootstrap $DOMAIN $PLIST_DST" >&2
+    echo "       Then verify: curl -fsS http://127.0.0.1:4780/health" >&2
+    exit 70 # EX_SOFTWARE
+  fi
+fi
 launchctl enable "$DOMAIN/$LABEL"
 # Force an immediate (re)start so we don't wait for the next event.
 launchctl kickstart -k "$DOMAIN/$LABEL"
+
+# Prove the install actually produced a serving daemon: an installer that
+# returns 0 while the box has no daemon is the failure mode TASK-22 exists to
+# kill.
+for _ in $(seq 1 30); do
+  curl -fsS -m 2 http://127.0.0.1:4780/health >/dev/null 2>&1 && break
+  sleep 1
+done
+if ! curl -fsS -m 2 http://127.0.0.1:4780/health >/dev/null 2>&1; then
+  echo "FATAL: launchd job installed but nothing is serving /health after 30s." >&2
+  echo "       Inspect: launchctl print $DOMAIN/$LABEL; tail /private/tmp/ocean-daemon.log" >&2
+  exit 70 # EX_SOFTWARE
+fi
 
 echo
 echo "==> done. status:"

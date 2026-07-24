@@ -19,6 +19,7 @@ This is the root devlog contract for the `ocean-os` repository. Every agent ente
 - Cross-repo routing map: `docs/OCEAN_PROJECT_MAP.md`.
 - Canonical workspace package/entry/test index: `crates/AGENTS.md`. Do not maintain a second crate inventory here.
 - After any meaningful change, do a devlog pass: update the nearest owning `AGENTS.md`, refresh affected child indexes, remove stale text, and append a root `events.md` entry with `worktree:`.
+- Project code is `MIT OR Apache-2.0`, copyright © 2026 Rising Tides. Preserve `NOTICE.md` and local donor notices; Ocean names, logos, and distinctive brand assets remain outside the open-source grants under `TRADEMARKS.md`.
 
 ## Workspace Routing
 
@@ -84,3 +85,4 @@ CI consumes the repository and compatibility manifests on macOS and Ubuntu, runs
 - `crates/` — canonical Rust workspace ownership/entry/test index and crate contracts → `crates/AGENTS.md`
 - `docs/` — architecture, operator documentation, active plans, and historical archive policy → `docs/AGENTS.md`
 - `integrations/` — distributable adapters for external host extension surfaces → `integrations/AGENTS.md`
+- `packaging/` — team distribution: npm wrapper package publishing prebuilt `ocean` + `ocean-daemon` binaries via the tag-triggered release workflow → `packaging/AGENTS.md`

@@ -399,6 +399,100 @@ fn configured_providers() -> Vec<&'static str> {
         .collect()
 }
 
+// ---------------------------------------------------------------------------
+// Launchd supervision guard (TASK-23)
+//
+// Long-lived TUIs keep old autostart code in memory, so the orphan race cannot
+// be closed client-side: installing a fixed binary does not upgrade running
+// processes. The durable invariant lives here — if launchd owns the
+// `dev.risingtides.ocean-daemon` job and this process was not launched by it,
+// refuse to bind and exit cleanly. `OCEAN_UNSUPERVISED=1` is the explicit
+// escape hatch for deliberately supervisor-free runs (dev boxes, tests).
+
+/// The launchd job label whose ownership of the port this guard enforces.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+pub const LAUNCHD_LABEL: &str = "dev.risingtides.ocean-daemon";
+
+/// Probe result for the launchd job: `None` = no job registered;
+/// `Some(None)` = job registered but not currently running;
+/// `Some(Some(pid))` = job running as `pid`.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+pub type LaunchdJob = Option<Option<u32>>;
+
+/// What the supervision guard decided at boot.
+#[derive(Debug, PartialEq, Eq)]
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+pub enum SupervisionVerdict {
+    /// Bind normally.
+    Proceed,
+    /// Launchd owns the job and this process is not it: do not bind, exit 0.
+    RefuseForeignSupervisor {
+        /// The supervised daemon's pid, when the job is currently running.
+        job_pid: Option<u32>,
+    },
+}
+
+/// Pure decision: refuse whenever the launchd job exists and this process is
+/// not the one it launched — including a registered-but-idle job, which
+/// launchd may kickstart onto the port at any moment.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+pub fn supervision_verdict(
+    job: LaunchdJob,
+    self_pid: u32,
+    unsupervised_override: bool,
+) -> SupervisionVerdict {
+    if unsupervised_override {
+        return SupervisionVerdict::Proceed;
+    }
+    match job {
+        None => SupervisionVerdict::Proceed,
+        Some(Some(pid)) if pid == self_pid => SupervisionVerdict::Proceed,
+        Some(job_pid) => SupervisionVerdict::RefuseForeignSupervisor { job_pid },
+    }
+}
+
+/// Extract `pid = N` from `launchctl print` output. Absent for idle jobs.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+pub fn parse_launchd_pid(output: &str) -> Option<u32> {
+    output.lines().find_map(|line| {
+        let trimmed = line.trim();
+        trimmed
+            .strip_prefix("pid = ")
+            .and_then(|value| value.trim().parse::<u32>().ok())
+    })
+}
+
+/// Ask launchd about the job in the current user's GUI domain. Non-macOS
+/// platforms have no launchd; the guard is a no-op there.
+#[cfg(target_os = "macos")]
+pub fn probe_launchd_job(label: &str) -> LaunchdJob {
+    let uid = std::process::Command::new("id")
+        .arg("-u")
+        .output()
+        .ok()
+        .filter(|out| out.status.success())
+        .and_then(|out| {
+            String::from_utf8_lossy(&out.stdout)
+                .trim()
+                .parse::<u32>()
+                .ok()
+        });
+    // No uid → cannot address the GUI domain → fail open like a probe failure.
+    let uid = uid?;
+    let output = std::process::Command::new("launchctl")
+        .arg("print")
+        .arg(format!("gui/{uid}/{label}"))
+        .output();
+    match output {
+        Ok(out) if out.status.success() => {
+            Some(parse_launchd_pid(&String::from_utf8_lossy(&out.stdout)))
+        }
+        // Nonzero exit = no such job; probe failure = fail open (a broken
+        // launchctl must not brick a dev box; the installer still owns prod).
+        _ => None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -548,5 +642,40 @@ mod tests {
         assert!(err.contains("OCEAN_BIND"), "got: {err}");
         assert!(err.contains("OCEAN_RETRY_MAX_ATTEMPTS"), "got: {err}");
         clear_all();
+    }
+
+    // ---- TASK-23 supervision guard -------------------------------------
+
+    #[test]
+    fn supervision_verdict_is_exhaustive_over_job_states() {
+        use SupervisionVerdict::*;
+        // No job registered: any process may bind.
+        assert_eq!(supervision_verdict(None, 42, false), Proceed);
+        // Job running as this process: launchd launched us.
+        assert_eq!(supervision_verdict(Some(Some(42)), 42, false), Proceed);
+        // Job running as someone else: refuse.
+        assert_eq!(
+            supervision_verdict(Some(Some(7)), 42, false),
+            RefuseForeignSupervisor { job_pid: Some(7) }
+        );
+        // Job registered but idle: launchd may kickstart any moment — refuse.
+        assert_eq!(
+            supervision_verdict(Some(None), 42, false),
+            RefuseForeignSupervisor { job_pid: None }
+        );
+        // Explicit override always proceeds, even against a running job.
+        assert_eq!(supervision_verdict(Some(Some(7)), 42, true), Proceed);
+        assert_eq!(supervision_verdict(Some(None), 42, true), Proceed);
+    }
+
+    #[test]
+    fn launchd_pid_parses_from_print_output_only_when_present() {
+        let running = "\tstate = running\n\tpid = 16021\n\tprogram = /x\n";
+        assert_eq!(parse_launchd_pid(running), Some(16021));
+        let idle = "\tstate = not running\n\tprogram = /x\n";
+        assert_eq!(parse_launchd_pid(idle), None);
+        // A pid-like token inside another key must not match.
+        let tricky = "\tspawn pid = abc\n\txpid = 99\n";
+        assert_eq!(parse_launchd_pid(tricky), None);
     }
 }

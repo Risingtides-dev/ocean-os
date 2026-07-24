@@ -1,189 +1,130 @@
-# Ocean project map
+# Ocean Project Map
 
-Status: canonical current-state ownership and connection map for the Ocean
-repositories. Local source and each target repository's `AGENTS.md` remain the
-final authority for implementation work.
+Status: active cross-repository ownership and routing map.
 
-Documentation policy: [`OCEAN_DOCUMENTATION_CONTRACT.md`](OCEAN_DOCUMENTATION_CONTRACT.md).
+This map identifies repository boundaries. Read the target repository's
+`AGENTS.md` chain before editing.
 
-## Route work by authority
+## Visibility and role
 
-| Work concerns | Start in | Authority |
+| Repository | Visibility | Role |
 | --- | --- | --- |
-| daemon, agent loop, providers, models, tools, permissions, sessions, events, TUI, CLI, ACP, MCP client, local browser/call/room execution | [`ocean-os`](https://github.com/Risingtides-dev/ocean-os) | Rust runtime and local execution plane |
-| web/PWA UI, Chrome extension, Tauri shell, proxy, product interaction, visual design, responsive/mobile presentation | [`ocean-surface`](https://github.com/Risingtides-dev/ocean-surface) | Thin product surfaces over the daemon |
-| assistant profiles, surface prompts, named specialist packages, couriers, package SOPs and harness declarations | [`ocean-agents`](https://github.com/Risingtides-dev/ocean-agents) | Provider-agnostic behavior/package layer |
-| authenticated shared files, mounts, ledger, ingest, source registry, graph, semantic search, shared context, Bedrock API/MCP | `ocean-bedrock` (private repository) | Shared knowledge and data plane |
+| [`ocean-os`](https://github.com/Risingtides-dev/ocean-os) | public | Rust runtime, daemon, tools, providers, sessions, permissions, TUI/CLI/ACP, and generic coordination seams |
+| [`ocean-surface`](https://github.com/Risingtides-dev/ocean-surface) | public | Thin client surfaces: Leptos/WASM UI, Tauri and editor hosts, browser/PWA, voice and canvas presentation |
+| [`ocean-agents`](https://github.com/Risingtides-dev/ocean-agents) | public | Organization-neutral surface profiles, package conventions, generic transport, and reference packages |
+| `risingtides-agents` | private | Rising Tides production assistants, couriers, Slack intake, SOPs, internal workflows, and deployment behavior |
+| `ocean-bedrock` | private, optional | Authenticated shared knowledge/data plane, context, handoffs, ledger, graph/search, workflows, and team records |
 
-Read the target repository's `AGENTS.md` before editing. Do not infer ownership
-from a similarly named historical document in another repository.
+Public Ocean use must not require either private repository.
 
-Visibility: `ocean-os`, `ocean-surface`, and `ocean-agents` are public.
-`ocean-bedrock` is a private repository; it is the optional authenticated
-knowledge/data plane for a team deployment, and no public Ocean feature may
-hard-require it.
+## First routing rule
 
-## Implemented system shape
+| Request concerns | Start in |
+| --- | --- |
+| Runtime, daemon API, tools, permissions, models/providers, sessions, events, TUI, ACP, MCP client | `../../ocean-os` |
+| Web/native/editor/browser/mobile/voice/canvas client behavior | `../../ocean-surface` |
+| Generic surface profile, package schema, Bonzai, manifest router, file-courier, reusable transport | `../../ocean-agents` |
+| Rising Tides content, campaign, artist, distribution, email, Slack app, production courier, factory SOP, internal workflow | `../../risingtides-agents` (authorized checkout) |
+| Shared team knowledge, context, handoff, ledger, semantic search, graph, workflow record, Bedrock API | `../../ocean-bedrock` (authorized checkout) |
+
+## System shape
 
 ```text
-operator
-  |
-  v
-ocean-surface / ocean-tui / ocean-cli / ocean-acp
-  |
-  | session, cwd/project intent, client_type, prompt
-  v
-ocean-os daemon :4780
-  |- ocean-agent: prompt assembly, capabilities, sessions/history
-  |- ocean-runtime: provider rounds, tools, permissions, cancellation
-  |- ocean-protocol/providers: model wire, credentials, readiness
-  `- local stores: rooms, memory, Longhouse titles/coordination
-  |
-  `-- session-scoped events/results --> clients
+client surfaces
+  ocean-surface / TUI / ACP
+            |
+            | sessions, turns, SSE, permissions
+            v
+      ocean-os daemon :4780
+            |
+            | loads reusable profile/package data
+            v
+    public ocean-agents
 
-ocean-agents
-  `-- editable surface profiles + specialist/courier packages consumed by turns
+Authorized Rising Tides deployment only:
 
-ocean-bedrock :8080 (default)
-  `-- authenticated shared files + ledger + ingest/search/graph/API services
+  risingtides-agents  ---> production behavior and SOPs
+            |
+            +--------> optional authenticated ocean-bedrock context/data
 ```
 
-Ocean Agents and Bedrock are not alternate execution runtimes. Ocean Agents
-declares behavior and deterministic/agentic package entry points. Bedrock owns
-shared knowledge and records. Local machine effects still execute through Ocean
-OS permissions and cwd/tool policy.
+## Ownership contracts
 
-## Repository boundaries
+### `ocean-os`
 
-### ocean-os
+Owns execution authority: agent loop, provider/model routing, permission gates,
+tools, cancellation, sessions, queues, events, local memory primitives, and the
+daemon API. It does not own organization-specific agents or product UI chrome.
 
-Owns:
+### `ocean-surface`
 
-- local daemon HTTP/SSE authority on `127.0.0.1:4780` by default;
-- provider/model routing and wire protocols;
-- agent turns, tools, permissions, cancellation, cwd binding, and local sessions;
-- TUI, CLI, ACP bridge, MCP client, browser control, call pipeline;
-- durable local rooms and local coordination/memory primitives;
-- standalone `ocean-walker` traversal and trusted-root `ocean-search` typed-search
-  libraries, neither of which is a live runtime capability or path-authorization boundary.
+Owns presentation and client interaction. Surfaces select sessions, send turns,
+subscribe to daemon events, and render state. They do not call providers
+directly or become session/tool authority. The client is one shared Leptos/WASM
+Surface UI hosted by the browser/PWA (through `ocean-surface-proxy`), the Chrome
+extension, and the Tauri desktop/mobile shell; retired desktop implementations
+are not design or prompt inputs.
 
-Does not own product UI chrome, agent-package content, or Bedrock's shared cloud
-storage and ingest service.
+### Public `ocean-agents`
 
-### ocean-surface
+Owns reusable package data and examples. Public files must remain usable without
+Rising Tides accounts, knowledge, destinations, campaigns, media, private SOPs,
+or Bedrock. Packages request capabilities; they cannot grant permissions.
 
-Owns:
+### Private `risingtides-agents`
 
-- one Leptos/WASM product UI;
-- browser/PWA hosting through `ocean-surface-proxy`;
-- Chrome extension and Tauri hosts around the same UI bundle;
-- product interaction, responsive behavior, host-capability seam, and design
-  system;
-- the shared Leptos/WASM Surface UI and its Tauri desktop/mobile shell.
+Owns deployed Rising Tides agent behavior: named production assistants,
+automation couriers, Slack intake, campaign/artist workflows, internal skills,
+and factory/orchestrator references. It may extend public packages and request
+optional Bedrock context through normal runtime capability and permission seams.
 
-Does not own provider calls, tool execution, permission policy, or session
-persistence. The proxy may relay requests but must not become another agent
-runtime or credential owner.
+### Private `ocean-bedrock`
 
-### ocean-agents
+Owns authenticated shared records and knowledge services for authorized team
+deployments. It is not a local execution shell and does not replace daemon
+permission, session, provider, or tool authority.
 
-Owns:
+## Shared invariants
 
-- composed surface profiles loaded by Ocean OS from
-  `assistants/<SURFACE>/system.md`;
-- named assistant packages, their protocols/SOPs, and thin harness declarations;
-- courier manifests and the slash-command router;
-- package-side authoring and composition checks.
+- `Project -> Workspace -> Session -> Turns -> Events` is daemon-side state.
+- A surface explicitly creates or selects a session before submitting a turn.
+- `client_type` identifies the medium, not a session or workspace.
+- Public packages contain no credentials, destinations, private data, or
+  organization-specific operating procedures.
+- Private package behavior remains separate from Bedrock data/storage authority.
+- Local side effects always route through Ocean runtime permission gates.
+- Subagent definitions and orchestration policy remain extension-owned; core
+  exposes only generic execution, cancellation, capability-provider, and event
+  seams.
 
-Does not own runtime enforcement, model credentials, or daemon session state.
-An external engine referenced by a package remains in its own repository; Ocean
-Agents stores the package identity and integration contract, not a vendored copy.
+## Live defaults
 
-### ocean-bedrock
-
-Owns:
-
-- bearer-authenticated shared filesystem and mount routing;
-- scoped roles, tokens/invites, locks, and audit history;
-- Ocean Ledger and context/semantic/graph services;
-- source adapters, sync-run lineage, ingest workers, and MCP/API access;
-- shared collaboration artifacts and data-plane persistence.
-
-Does not own the user's local shell/filesystem authority, provider routing, or
-product session state.
-
-## Cross-repository contracts
-
-### Surface to runtime
-
-The first-party product path is daemon-owned and session-scoped:
-
-```text
-POST /v1/agent/sessions
-GET  /v1/agent/events?session_id=<id>
-POST /v1/agent/turns
-```
-
-A surface renders daemon state and sends intent. It must not adopt a session
-from an unrelated global stream or invent a second transcript authority.
-
-### Profiles and packages to runtime
-
-Ocean OS resolves a turn's `client_type` to a surface flag and prefers the
-published profile under the configured assistants root. Named folder-as-agent
-turns use the daemon's agent-folder contract. Agentic couriers submit prompts to
-the daemon; deterministic couriers execute their declared harness directly.
-
-The daemon currently loads one published profile file per surface. Ocean Agents
-performs `_shared` + `_base/<SURFACE>` composition before publication; runtime
-composition is not implemented.
-
-### Runtime and Bedrock
-
-Ocean OS may read or write shared context through Bedrock API/MCP contracts, but
-Bedrock does not execute local tools. The local and shared halves of Longhouse
-remain distinct: `ocean-longhouse` provides local coordination logic;
-Ocean Bedrock provides shared data-plane services.
-
-### Surface and Bedrock
-
-Surface features should normally use daemon-owned product contracts or a thin
-proxy. Direct Bedrock access must remain authenticated and must not transfer
-shared-storage or federation authority into browser state.
-
-## Default endpoints
-
-| Service | Default | Repository |
+| Service | Default | Owner |
 | --- | --- | --- |
-| Ocean daemon | `http://127.0.0.1:4780` | `ocean-os` |
-| Ocean Surface local/prod proxy | `http://127.0.0.1:8790` | `ocean-surface` |
-| Ocean Bedrock | `http://127.0.0.1:8080` for local use (`0.0.0.0:8080` bind by default) | `ocean-bedrock` |
-| Ocean Agents | no standalone core service | `ocean-agents` |
+| Ocean daemon | `127.0.0.1:4780` | `ocean-os` |
+| Standalone Longhouse direction | `127.0.0.1:4781` | `ocean-os` / extension boundary |
+| Surface proxy/dev app | `0.0.0.0:8790` | `ocean-surface` |
+| Bedrock service | deployment-defined; local default `:8080` | private `ocean-bedrock` |
 
-Deployment URLs and process identifiers are operational state and belong in
-the owning repository's current runbook, not this architecture map.
-
-## Current Tauri boundary
-
-`ocean-surface` emits `client_type = "surface-tauri"` inside its Tauri host.
-`ocean-agent::surface_flag` maps that string to `TAURI` and supplies the
-native-shell Leptos/component prompt guidance. The daemon's separate effective
-harness seam still classifies the external tag through its CLI-compatible
-hashline/artifact fallback. Choosing a distinct Tauri harness capability bundle
-remains a code-level cross-repository policy decision tracked in
-[`../ROADMAP.md`](../ROADMAP.md), not a documentation convention.
+Daemon health is `GET /health`. Provider credentials resolve only inside
+`ocean-os`.
 
 ## Source anchors
 
-- Ocean OS: [`../AGENTS.md`](../AGENTS.md), [`../crates/AGENTS.md`](../crates/AGENTS.md),
-  [`ARCHITECTURE.md`](ARCHITECTURE.md)
-- Ocean Surface: `ocean-surface/AGENTS.md`, `Cargo.toml`,
-  `crates/ocean-surface-ui/src/daemon.rs`, `ops/README.md`
-- Ocean Agents: `ocean-agents/AGENTS.md`, `assistants/README.md`,
-  `couriers/hub/router.py`, each `courier.toml`
-- Ocean Bedrock: `ocean-bedrock/AGENTS.md`, `package.json`, `src/server.mjs`,
-  `docs/openapi.yaml`
+Public:
 
-When a connection contract changes, update this canonical map first. Sibling
-repositories keep only a local boundary summary plus a link here; they do not
-maintain another full copy.
+- `../../ocean-os/AGENTS.md`
+- `../../ocean-os/docs/ARCHITECTURE.md`
+- `../../ocean-surface/AGENTS.md`
+- `../../ocean-agents/AGENTS.md`
+- `../../ocean-agents/docs/AGENT_FILESYSTEM_ARCHITECTURE.md`
+
+Authorized private maintainers may additionally inspect:
+
+- `../../risingtides-agents/AGENTS.md`
+- `../../risingtides-agents/docs/PUBLIC_PRIVATE_REPOSITORY_SEPARATION_2026-07-20.md`
+- `../../ocean-bedrock/AGENTS.md`
+- `../../ocean-bedrock/docs/API.md`
+
+When private repositories are unavailable, route from public contracts and
+state the limitation instead of inventing private behavior.

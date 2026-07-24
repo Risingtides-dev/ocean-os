@@ -1,11 +1,13 @@
 //! 3D camera, projection, and rendering primitives for the project graph.
 //!
 //! NOTICE — attribution (upstream correction, spec-graph3d.md): the mathematics
-//! in this module is ported from **aclfe/inertia**
-//! (<https://github.com/aclfe/inertia>), dual-licensed MIT OR Apache-2.0. It is
-//! re-implemented in ocean-tui's style with a local, dependency-free `f64`
-//! [`Vec3`] (instead of `nalgebra`) and adapted to the graph's unit-radius world
-//! volume. Algorithms ported, each cited to its upstream source:
+//! in this module is ported from **Kairav Mittal's aclfe/inertia**
+//! (<https://github.com/aclfe/inertia>) at audited revision
+//! `99196825d5f62bd7524485c411f4b1e58d4f8a98`, dual-licensed MIT OR Apache-2.0.
+//! Ocean elects the MIT terms for this donor material. It is reimplemented in
+//! ocean-tui's style with a local, dependency-free `f64` [`Vec3`] (instead of
+//! `nalgebra`) and adapted to the graph's unit-radius world volume. Algorithms
+//! ported, each cited to its upstream source:
 //!
 //! - World → camera transform: dot-product basis change
 //!   (`src/render/camera.rs`, `View::transform`).

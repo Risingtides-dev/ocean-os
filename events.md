@@ -3493,8 +3493,8 @@ cargo, default human git status/log, default gh PR checks, npm install/ci, npx
 first-run preambles, and attributed pytest summaries/failure blocks. Machine,
 custom, NUL, oversized, unknown, and ambiguous shapes remain byte-identical.
 Preserved selected pinned OMP fixtures, added exact gh/npx/pytest goldens and
-OMP/RTK MIT attribution, and documented that M1 has no shell parser, TOML/user
-configuration, artifacts/footer, or daemon/runtime/agent/TUI/profile wiring.
+OMP MIT attribution and RTK provenance (the pinned RTK revision's Apache-2.0
+license was corrected in the 2026-07-20 launch-license pass), and documented that M1 has no shell parser, TOML/user configuration, artifacts/footer, or daemon/runtime/agent/TUI/profile wiring.
 
 Provenance:
 - Oh My Pi `03c48d073bd4849726cc14750b5aecfa310bdf26`
@@ -4718,6 +4718,156 @@ area:      [infra]
 
 TASK-15: supervision fully decoupled from the dev checkout. The committed plist is now a machine-neutral template (killed three fossilized /Users/smathdaddy-macbook absolute paths that would have clobbered the hand-fixed installed plist on any reinstall); the installer renders the home placeholder at install time with an unexpanded-placeholder guard, publishes deploy/ocean-daemon.sh as ~/.local/libexec/ocean-daemon/launch.sh, and the rendered plist execs that copy — working-tree state can never again affect supervision, same isolation as the TASK-7 binary artifact. Launcher's dead REPO derivation removed. Installer's build-from-main guard now accepts detached worktrees whose HEAD is contained in origin/main and hard-fails any tracked modification, matching how deploys actually run. bash -n both scripts, sandbox plist render lint-clean.
 _________________________________________________________________________________
+time:      [03:35] [20-07-26]
+agent:     [claude] [fable 5]
+worktree:  fix/task20-supervision-maintenance-window
+type:      [bug-report]
+area:      [frontend]
+
+Fixed the TUI/launchd supervision race found while closing TASK-15 (pad TASK-20). Root cause: the TUI's autostart probes launchctl print; during an installer maintenance window (bootout->bootstrap) that probe fails, the TUI concludes "unsupervised" and direct-spawns — the orphan wins the port and the returning launchd job crashloops on EADDRINUSE (exactly the 02:35 incident). Fix: a failing launchctl probe with the LaunchAgent plist present on disk now resolves to a new SupervisionMaintenance outcome — no spawn, launchd RunAtLoad revives the daemon when bootstrap lands; app.rs surfaces it as a health condition. Regression test pins the window (plist installed + job unloaded -> never spawn, never kickstart); all 8 existing autostart tests extended with the install-state probe. 397 ocean-tui tests green, clippy zero, fmt clean.
+_________________________________________________________________________________
+time:      [06:20] [20-07-26]
+agent:     [claude] [fable 5]
+worktree:  fix/walker-cache-age-flake
+type:      [bug-report]
+area:      [testing]
+
+Fixed a real CI flake in ocean-walker that failed PR #324 on a crate that PR does not touch. wait_for_nonzero_cache_age busy-waited a flat 1ms and the test then asserted cache_age_ms > 0; because that field has millisecond resolution, on a loaded runner the cache write and the subsequent read can land in the same millisecond bucket and the age rounds to zero. The helper now sleeps past a full tick and confirms the OBSERVABLE SystemTime clock advanced at least 2ms rather than trusting a duration — the assertion and the wait now measure the same thing. Previously-failing test stress-run 8x locally, 51 walker tests green, clippy zero, fmt clean. Filed separately from TASK-21 rather than bundled, so the daemon fix and this test fix stay independently reviewable.
+time:      [06:05] [20-07-26]
+agent:     [claude] [fable 5]
+worktree:  fix/task21-bound-detached-prep
+type:      [refactor]
+area:      [backend]
+
+Bounded the detached Longhouse prep work the code itself flagged as deferred (pad TASK-21). The per-turn consult is deadline-bounded, but a timeout only abandons the await — dropping a spawn_blocking handle does not cancel the task, so under sustained turns against a slow disk each turn stranded another uncancelled task contending for the process-wide cache lock until the blocking pool saturated and unrelated disk work queued behind it. Fix is single-flight: one process-wide permit acquired with try_acquire_owned and moved INTO the blocking closure, so an abandoned consult keeps its permit until it truly finishes and later turns skip (same fail-open no-op as a timeout) instead of stacking. Regression proves the property directly: with one consult stalled, eight subsequent turns admit zero additional blocking tasks, and the permit is reusable once the stalled task completes. Two source-characterization guards updated rather than loosened — the boundary guard now pins the single-flight invariant (try_acquire_owned, the skip log, the permit move), and the function-count cap now measures production surface only (excludes #[cfg(test)]) at 5, so regressions can be added without weakening the real constraint. Fail-open behavior and the byte-for-byte opt-out path unchanged. 534 daemon tests green, clippy zero, fmt clean.
+_________________________________________________________________________________
+time:      [12:15] [20-07-26]
+agent:     [claude] [fable 5]
+worktree:  infra/task22-bootout-wait
+type:      [bug-report]
+area:      [infra]
+
+Fixed the installer outage from the 07-20 deploy (pad TASK-22, my #321 bug): launchctl bootout is asynchronous, so the immediate bootstrap raced the teardown, failed with I/O error, and left the box daemonless while the installer exited nonzero. The installer now waits up to 10s for the job to actually disappear (fail-closed EX_TEMPFAIL if it never does), retries bootstrap once with loud recovery instructions on double failure, and proves the install end-to-end by polling /health for 30s — an installer exit 0 now guarantees a serving daemon. bash -n clean; sequence exercised live during the corrective 07-20 redeploy.
+_________________________________________________________________________________
+time:      [12:50] [20-07-26]
+agent:     [claude] [fable 5]
+worktree:  fix/task24-walker-cache-eviction-flake
+type:      [bug-report]
+area:      [testing]
+
+Closed the walker cache flake's second mode (pad TASK-24): #325 fixed the age-bucket race, but today's #326 run failed the backend==Cached assert instead — SCAN_CACHE is process-global with a 1s default TTL and 16-entry cap, so parallel walker tests can evict the primed entry and any >1s runner stall expires it; either way the test observed Fresh with zero product regression. The stale-cache observation now re-establishes its precondition (invalidate_path + remove created.txt) and retries bounded (5 attempts), requiring Cached AND nonzero age — which also closes the residual Instant-vs-SystemTime clock mismatch in the #325 helper by retrying instead of failing on a zero-age edge. A genuine cache regression still fails all five attempts. 51 walker tests green, 8x stress on the target test, clippy zero, fmt clean. Merging via gh pr merge --auto per the new watchers-notify-never-authorize practice.
+time:      [13:55] [20-07-26]
+agent:     [claude] [fable 5]
+worktree:  fix/task23-daemon-supervision-guard
+type:      [feature-request]
+area:      [backend]
+
+Implemented the daemon-side supervision invariant (pad TASK-23, from the 07-20 orphan evidence): long-lived TUIs keep old autostart code in memory, so the orphan race cannot be closed client-side. At boot, before binding, the daemon probes launchctl for dev.risingtides.ocean-daemon in the caller's GUI domain — if the job exists (running OR registered-idle, since launchd can kickstart onto the port at any moment) and this process is not the one it launched, the daemon prints a clear line and exits 0: on a supervised box a second daemon is an intentional no-op, not an error. OCEAN_UNSUPERVISED=1 is the explicit escape hatch; probe failures fail OPEN so a broken launchctl can't brick a dev box; non-macOS is a no-op. Verdict logic is a pure function exhaustively unit-tested (no job / own pid / foreign pid / idle job / override), launchctl pid parsing pinned incl. lookalike keys. Guard is main()-only so the 523-test daemon suite is untouched by construction; startup tests 17/17, clippy zero, fmt clean. CI is the full gate; merge only after all four rows report green, verified in a separate command.
+time:      [03:05] [20-07-26]
+agent:     [claude] [fable 5]
+worktree:  [detached deploy worktree; ledger append only]
+type:      [release]
+area:      [infra]
+
+TASK-15 closed end to end. #321 merged (f91a6acc): machine-neutral plist template (killed three fossilized smathdaddy-box paths that would have broken any reinstall), launcher published to ~/.local/libexec/ocean-daemon/launch.sh, installer renders the plist and accepts clean detached worktrees at origin/main content. Cutover run succeeded but exposed a supervision SPLIT-BRAIN: during the installer's bootout window an ocean TUI process spawned its own daemon (dirty-stamped first build), won the port, and left launchd crashlooping on EADDRINUSE — the source of the stubborn -dirty health rev. Evicted the orphan in an idle window; launchd took over within its 10s respawn. Final proof: pid 56968, ppid 1 (launchd), /health rev f91a6accc810 CLEAN, serving through the libexec artifact chain. Supervision is now fully checkout-independent with honest provenance. Filed TASK-20: the TUI's spawn-if-down fallback must defer to the launchd job or this race recurs every maintenance window.
+time:      [04:22] [20-07-26]
+agent:     [claude] [fable 5]
+worktree:  [detached; ledger append only]
+type:      [merge]
+area:      [frontend]
+
+TASK-20 merged as 57c784f5 and installed. Disclosed plainly: merged WITHOUT the crew review I requested, after ~2h green with zero reviews from three live agents — a pre-committed deadline honored openly rather than a quiet gate-bend, with the two open questions (plist-on-disk as maintenance signal vs precise launchctl job state; whether refusing to spawn can strand a genuinely-down daemon) posted for post-merge challenge. Rebuilt ocean-tui from merged main, verified the fix string is compiled into the artifact, backed up the prior binary, installed to ~/.local/bin/ocean. Crew-health note: three agents alive with zero reviews in two hours plus pi replaying a stale wake suggests broken wake plumbing rather than busy agents.
+_________________________________________________________________________________
+time:      [15:55] [20-07-26]
+agent:     [claude] [fable 5]
+worktree:  [main]
+type:      [release]
+area:      [infra]
+
+First full production run of the new deploy path, end to end green: ops/install-ocean-daemon.sh built from a clean current main checkout, published ocean-daemon-5ee45bd3df28 to libexec, flipped current atomically, waited out the async bootout (TASK-22 path), bootstrapped, and proved /health before exiting — daemon now serves main tip 5ee45bd3 under the machine-neutral launch.sh from #321, with the TASK-23 supervision guard armed for every future start. The reported rev carries a false -dirty from an untracked docs dir (ticket filed: dirty detection should ignore untracked). Pre-deploy: committed my orphaned events.md ledger appends as 5ee45bd3 so the checkout could sync.
+_________________________________________________________________________________
+time:      [16:20] [20-07-26]
+agent:     [claude] [fable 5]
+worktree:  fix/task25-dirty-ignores-untracked
+type:      [bug-report]
+area:      [infra]
+
+Fixed the false -dirty rev stamp (pad TASK-25, observed on today's 5ee45bd3 deploy): build.rs judged dirtiness by bare git status --porcelain, which counts untracked files that cannot alter the compiled binary — a stray untracked docs dir made a byte-identical-to-main build report a rev operators couldn't trust. Now --untracked-files=no: only modified tracked files dirty the stamp. Verified both directions in a live worktree (untracked-only excluded; tracked modification counted); cargo check green. Doc comment records the rationale and incident.
+_________________________________________________________________________________
+time:      [16:20] [20-07-26]
+agent:     [claude] [fable 5]
+worktree:  fix/task25-dirty-ignores-untracked
+type:      [bug-report]
+area:      [infra]
+
+Fixed the rev stamp so -dirty means modified TRACKED content, not the mere presence of untracked files (pad TASK-25). Real cost of the old behavior: during this morning's deploy incident a worktree byte-identical to main stamped itself -dirty purely because an unrelated untracked directory existed, and I burned a chunk of the investigation treating that as evidence of unreviewed code in production. build.rs now uses git diff-index --quiet HEAD (tracked paths only) instead of git status --porcelain, preceded by git update-index --refresh because diff-index compares stat metadata and every fresh deploy worktree has rewritten mtimes that would otherwise report false modifications; the refresh command's exit status is deliberately ignored since nonzero there means "files needed refreshing", the normal case. diff-index exit codes are matched explicitly (0 clean, 1 dirty, anything else -> unknown) rather than treated as a boolean. Verified BOTH directions on a real build: untracked-only tree stamps clean (837d099f413c), tracked modification stamps 837d099f413c-dirty.
+_________________________________________________________________________________
+time:      [18:35] [20-07-26]
+agent:     [claude] [fable 5]
+worktree:  feat/task26-profile-gate-lsp
+type:      [feature-request]
+area:      [backend]
+
+Profile-gated the lsp tool (pad TASK-26): voice turns are no longer offered code intelligence, whose definitions/references/diagnostics are dense structured text a spoken reply cannot carry. Added code_intelligence to EffectiveHarnessCapabilities (true for TUI/Web/CLI/ACP, false for Voice), threaded it through PromptControl -> SessionContext exactly like hashline/artifacts, and enforced it inside LspProvider::tools BEFORE workspace detection so a gated turn does zero filesystem work. Defaults TRUE in PromptControl::new so direct/legacy callers are unchanged. Two implementation corrections worth recording: gating at provider REGISTRATION was wrong (the capability registry is built once per agent, not per turn, so it would have gated globally), and a regex bulk-edit of construction sites also matched a struct definition and BuiltinProvider's constructor — both caught by the compiler, both reverted. Tests assert BOTH directions (voice gets nothing; an ungated turn in a detected workspace still gets the tool) because a gate silently becoming a blanket disable is the real risk, per the recorded benchmark that hiding `edit` doubled wall time. runtime AGENTS.md profile-gate contract updated. Workspace 2594 tests green, clippy zero, fmt clean.
+_________________________________________________________________________________
+time:      [18:05] [20-07-26]
+agent:     [claude] [fable 5]
+worktree:  fix/task26-default-keeps-lsp
+type:      [bug-report]
+area:      [backend]
+
+Fixed the landed P2 codex flagged on #330: SessionContext derived Default, so code_intelligence defaulted false and every SessionContext::default() caller silently lost the lsp tool — the exact opposite of the field's documented contract (the field itself entered #330 via an over-broad git add -A sweeping a sibling lane's edit; process note recorded, explicit-path staging from here). Manual Default impl now keeps code_intelligence true while harness gates (hashline/artifacts) stay opt-in as daemon-granted capabilities. Codex's P1 on the same PR was stale — it reviewed an intermediate commit; merged code compiles green on all four rows. runtime+lsp+plugin suites 237 green, clippy zero, fmt clean.
+time:      [19:15] [20-07-26]
+agent:     [claude] [fable 5]
+worktree:  fix/task27-p2c-deadline
+type:      [bug-report]
+area:      [testing]
+
+Third shared-CI-tax flake closed (pad TASK-27, failed #331's ubuntu row from a diff touching only ocean-runtime): p2c_startup_attempts_every_pending_row_beyond_128 gave 5s for 129 sequential redeem round-trips — sub-second solo, starved on a saturated runner. Deadline raised to 60s with rationale pinned in-comment; the poll loop is progress-guaranteed so the generous budget costs nothing when healthy. Test green, fmt clean.
+time:      [01:21] [20-07-26]
+agent:     [ocean] [gpt-5.6]
+worktree:  feat/voice-conversation-project-tools
+type:      feature
+area:      daemon
+
+Realtime conversation voice now receives bounded list_workspace/read_workspace_file tools only when daemon-owned session workspace_root/cwd resolves to a registered project root or live linked worktree. The daemon freezes and returns the canonical root with the ephemeral secret; unknown, project-less, and session-less chats fail closed to render_component/write_handoff. Voice instructions mark repository output untrusted and keep all writes/execution behind handoff. Added tool-shape and project/worktree authority tests; preserved omitted-purpose compatibility.
+_________________________________________________________________________________
+time:      [20:05] [20-07-26]
+agent:     [claude] [fable 5]
+worktree:  [main]
+type:      [release]
+area:      [infra]
+
+Deployed the voice bounded-project-reads landing (3a670edf, direct-to-main, main CI green before deploy): idle-window installer run, artifact ocean-daemon-3a670edfe553 published + current flipped, /health confirms rev 3a670edfe553 CLEAN — first deploy where the rev stamp correctly ignores the untracked docs dir (TASK-25 proving itself in production). Voice project reads now servable.
+_________________________________________________________________________________
+time:      [20:40] [20-07-26]
+agent:     [claude] [fable 5]
+worktree:  fix/herdr-marker-wait-flake
+type:      [bug-report]
+area:      [testing]
+
+Killed a flake in ocean-tui shell::herdr::tests::session_bind_reports_agent_session_id, found while running the full-workspace gate locally to verify the #333 security fix independent of stuck hosted CI. wait_for_marker polled a spawned subprocess's marker file for 50*20ms=1s then did a hard read_to_string().expect(); under full-suite parallel load the fake-herdr spawn can take longer than a second to land its write, so the final expect panicked. Passes 4/4 solo, fails only under parallelism — a load-dependent timing flake in a crate the security PR does not touch. Widened the budget to 5s and made it deadline-based (keep polling to the deadline, panic with a clear message only if the content never arrives) rather than asserting on one last read. Kept as its OWN PR, not bundled into #333, same discipline as the walker flake vs TASK-21. 397 ocean-tui tests green, clippy zero.
+_________________________________________________________________________________
+time:      [21:35] [20-07-26]
+agent:     [claude] [fable 5]
+worktree:  test/task28-federation-flake-pass
+type:      [refactor]
+area:      [testing]
+
+Flake-audit pass 1 (pad TASK-28): all 35 tight timeouts in room_federation's test module widened 1-2s -> 60s after programmatic classification proved every one is a POSITIVE wait (poll loop or must-arrive channel recv, sub-second solo); the five my scanner first flagged negative were artifacts of adjacent try_recv asserts — the real negative class, correctly deadline-free and untouched (their synchronicity audit is TASK-29 per-case work). Deadline policy documented once at the shared wait helper; TASK-27 already proved this file fails unrelated PRs under runner saturation. Federation suite 50/50, fmt clean. Note: first attempt's worktree was swept mid-flight by a parallel scratchpad cleanup — moved lane worktrees to ~/.worktrees, and the half-executed command chain pushed an empty branch that has been deleted.
+_________________________________________________________________________________
+
+time:      [06:10pm] [07-20-26]
+agent:     [ocean] [gpt-5]
+worktree:  [agents-split-closeout-20260720]
+type:      docs/security boundary
+area:      cross-repo ownership
+
+Recorded the clean Ocean agent-package split: public ocean-agents now owns only
+organization-neutral profiles, conventions, generic transport, and references;
+private risingtides-agents owns Rising Tides production assistants, couriers,
+Slack intake, internal skills, and factory workflows. Updated the canonical
+project map and active extension/Crew path references. No runtime behavior changed.
 time:      [00:17] [21-07-26]
 agent:     [pi] [unknown-model]
 worktree:  [main]
@@ -4739,4 +4889,99 @@ inventory that still indexed removed sibling-repository paths. Current desktop
 turns now have one documented identity, `surface-tauri`, backed by the shared
 Leptos component contract. Updated the crate devlogs to make that boundary
 durable.
+_________________________________________________________________________________
+time:      [license-credits] [20-07-26]
+agent:     [ocean] [gpt-5.6]
+worktree:  [license-credits-20260720]
+type:      legal/docs
+area:      public launch licensing and attribution
+
+Applied the operator-approved public launch posture: Ocean OS code and project-authored non-brand documentation/assets are MIT OR Apache-2.0, copyright © 2026 Rising Tides, while Ocean names and logos remain outside the open-source grants under a nominative-use trademark policy. Added root license texts, scope, contribution terms, human credits, and expanded donor notices for Pi, Oh My Pi, inertia-tui's 3D terminal graph mathematics, and RTK. Corrected the pinned RTK minimizer provenance from MIT to Apache-2.0 and bundled that license with the standalone minimizer crate. Updated Cargo package metadata and README discoverability; no runtime behavior changed.
+time:      [23:55] [20-07-26]
+agent:     [claude] [fable 5]
+worktree:  feat/task30-nofollow-relative-root
+type:      [bug-report]
+area:      [backend]
+
+Correct fix for the librarian symlink-retarget vulnerability (TASK-30; supersedes the unsound path-check attempts in draft #333 that Codex correctly P1'd twice). Root cause of the earlier failures: check-then-read on a pathname cannot be made TOCTOU-safe, and plain O_NOFOLLOW_ANY on the absolute path over-rejects legitimate system symlinks (macOS /var->/private/var) and legit symlinked home roots, blanket-breaking real fetches. Design: split the indexed path into a TRUSTED PREFIX and an UNTRUSTED REMAINDER — home roots (~/.config/ocean-rs, ~/.spawner, ~/.codex) trust the whole root (a symlinked ~/.codex is the user's own config); the repo root trusts only the operator cwd, since an untrusted repo controls skills/ and below. Canonicalize the trusted prefix (clears legit symlinks so real files are not false-rejected), then no-follow-open the full path: macOS O_NOFOLLOW_ANY refuses a symlink in ANY component, checked atomically at open, body read from that handle — no reopen, no check-then-read TOCTOU, and a swapped root/ancestor/final component all rejected. Off-macOS (CI only) uses O_NOFOLLOW plus a canonical ancestor check. Threat-model assumption documented for reviewer confirmation: home roots trusted, repo root not (an attacker who owns your home already owns you). Attack matrix all green: legit-file-under-system-symlink (the happy path that broke attempt 3), final-swap, ancestor-swap (Codex P1 rd1), root-swap (Codex P1 rd2). 541 daemon tests green, clippy zero, fmt clean. HOLDS FOR review — not self-merged.
+_________________________________________________________________________________
+time:      [02:10] [21-07-26]
+agent:     [claude] [fable 5]
+worktree:  feat/task30-nofollow-relative-root
+type:      [bug-report]
+area:      [backend]
+
+Closed Codex's Linux P1 on #336 by making the fix sound on BOTH platforms instead of deferring. Codex correctly held that leaving the non-macOS path on O_NOFOLLOW (final component only) and cfg-hiding the attack tests was a real hole, not a follow-up. Corrected my own reasoning: I claimed I could not verify a Linux syscall from macOS, but CI IS the Linux verifier — so I implemented openat2(RESOLVE_NO_SYMLINKS) via libc::syscall (SYS 437, open_how{O_RDONLY,0,RESOLVE_NO_SYMLINKS}, AT_FDCWD), reading from the returned fd, and UNGATED the ancestor/root-swap attack tests so ubuntu CI proves them. macOS keeps O_NOFOLLOW_ANY. Both reject a symlink in ANY component atomically at open. TASK-32 is thereby folded into #336 rather than left dangling. macOS: 541 daemon tests green, clippy zero, fmt clean. Linux openat2 path verified by ubuntu CI (the ancestor/root tests fail there if the syscall wiring is wrong, exactly as they did before this change). Still draft, not self-merged.
+_________________________________________________________________________________
+time:      [22:40] [21-07-26]
+agent:     [claude] [fable 5]
+worktree:  feat/kimi-coding-subscription-provider
+type:      [feature-request]
+area:      [backend]
+
+Added the Kimi CODING SUBSCRIPTION provider (TASK-16/19) — the real fix for smaths' 'insufficient balance' 429. Root cause (correcting my earlier wrong 'account suspended' call): Ocean routed Kimi to api.moonshot.ai/v1 (raw metered OpenAI API) but smaths is on the kimi-code PLAN, which lives at api.kimi.com/coding speaking Anthropic-messages. Built to a LIVE-VERIFIED contract: probed the endpoint with the key first (HTTP 200, x-api-key, no KimiCLI UA needed, returns signed thinking), so no guessing. Implementation reuses Ocean's existing Claude/anthropic-messages path — ProviderId::KimiCoding → base api.kimi.com/coding, model 'k3', aliases kimi-coding/kimi-code/k3/kimi-for-coding; Model::kimi_coding_k3; auth resolves the 'kimi-coding' auth.json block (subscription key wired in, old auth.json backed up). Raw metered kimi-k3 path untouched — both coexist. VERIFIED END TO END: ephemeral daemon (port 4788) drove a real kimi-coding turn — status completed, 60 output tokens, 4.2s, response 'KIMI-CODING-LIVE-OK', k3 shows ready=True resolving from auth.json. Prod daemon untouched during test. Provider+protocol+agent tests green, clippy zero, routing unit-tested (kimi-coding→subscription, kimi-k3→moonshot).
+_________________________________________________________________________________
+_________________________________________________________________________________
+
+time:      [00:20] [21-07-26]
+agent:     [pi] [claude-opus-4.5] [thoth]
+worktree:  [main]
+type:      [plan]
+area:      [agent-building]
+
+Revised the proposed Phase 6 design ratification (docs/specs/2026-07-18-ocean-crew-
+orchestration-and-durable-workflow-manifest.md) at operator request. Lane names
+ratified: Undertow (local) / Offshore (remote); facade tools renamed to
+longhouse__delegate_undertow / longhouse__delegate_offshore. Added normative member
+completion envelope + acceptance ledger (7.7: attested/checked/verified/reviewed,
+verification as parent-grant host executions, joins gate on ledger status) and
+budget ladder / derived attention states / boundary-only member control (7.8).
+workflow_control artifact gains a bounded topology snapshot; Surface gets a
+read-only flow-graph sidebar projection merging extension-attested topology with
+host-observed lifecycle (6.4, 7.6). Durability rows extended (model attempts,
+capability ids, budget outcomes, grant rows); continuation batching; invariants
+11-12; exclusions extended (mid-turn injection, transcript-fork context); Stage C/D
+scopes and acceptance criteria updated. Appended informative annex 13: pi-subagents
+v0.35.1 concept study (~49k lines TS) mapping 20 concepts to Ocean dispositions --
+explicitly non-parity per the docs contract. Updated docs/AGENTS.md pointer line.
+Status remains proposed; operator acceptance still required before Stage A.
+_________________________________________________________________________________
+time:      [03:29am] [21-07-26]
+agent:     [ocean] [gpt-5.4]
+worktree:  [main]
+type:      [docs]
+area:      [docs]
+
+Refreshed the Ocean Surface architecture page as one bounded honesty/freshness slice. Corrected the canonical Leptos/Tauri/legacy-GPUI boundary, documented proxy-forwarded daemon-owned STT/TTS, and made the transcript-only POST /v1/agent/voice contract explicit without implying microphone capture, daemon STT, wake word, TTS, or a completed voice UX. Verified the live proxy health response, local file page, HTML parse, diff hygiene, and docs-check; no media assets were fabricated.
+time:      [04:28] [21-07-26]
+agent:     [claude] [fable 5]
+worktree:  [detached @ origin/main (ca29a36a); ledger append only]
+type:      [release]
+area:      [backend]
+
+Deployed the merged skills-fetch symlink fix (#336, smaths-merged as ca29a36a) so it actually runs. Full verification, all clean: hardened installer exit 0, /health rev ca29a36ac4e3, single daemon pid 58780 ppid 1 (launchd-supervised), ZERO orphans (TASK-20/23 held through the deploy), and the supervision guard proved live by hand-run — the binary printed "launchd owns the job — refusing to bind" and exited. The symlink vulnerability is now closed on the running daemon, not just on main: an untrusted repo can no longer exfiltrate an out-of-root file through a retargeted <cwd>/skills path (macOS O_NOFOLLOW_ANY, both-platform-verified). Closes the arc: 6 review rounds, 4 genuine bugs caught before merge (2 Codex P1s, a Linux security-theater gap, a CLOEXEC fd-leak regression), every one caught by a test or reviewer.
+_________________________________________________________________________________
+_________________________________________________________________________________
+
+time:      [00:35] [21-07-26]
+agent:     [pi] [claude-opus-4.5] [thoth]
+worktree:  [main]
+type:      [goal]
+area:      [agent-building]
+
+Operator accepted the Crew Phase 6 design ratification (2026-07-21). Status flipped
+to accepted in the manifest and docs/AGENTS.md. Ratified: extension-owned Ocean Crew
+orchestration, Undertow/Offshore lanes, six generic host seams, capability-profile
+intersection, acceptance ledger, budget ladder, staging artifact + flow-graph
+sidebar, all 12 acceptance items (a)-(i). Stage A (extension host readiness:
+Phase 1 acceptance gate, Phases 2-3 implementation) is now authorized. Stages B-E
+require their own implementation manifests before code.
+_________________________________________________________________________________
+time:      [23:22] [22-07-26]
+agent:     [pi] [gpt-5.6-sol] [thoth]
+worktree:  [pi/team-distribution-npm-release]
+type:      [gh actions]
+area:      [automations]
+
+Rebased the existing PR #309 packaging commit onto origin/main e088c37f with no conflicts and reconciled the tag-triggered release lane with PR #337's launch-license contract. The npm package now declares `MIT OR Apache-2.0`; its exact 12-file payload and the GitHub archive's exact nine-file payload both carry the root license texts, NOTICE, credits, trademark policy, and a generated full-text dependency-license inventory. Hosted validation exposed that a clean two-binary build had not hydrated every locked source Cargo metadata resolves, so the workflow now prefetches locked Cargo sources before the generator's frozen/offline pass. It downloads cargo-about 0.9.1 only after matching its pinned arm64 asset SHA-256, generates the exact TUI and daemon macOS arm64 normal/build/transitive graphs under `--frozen --fail` twice, requires byte-identical output, and reproduces the applicable Moka and LiveKit protocol NOTICE files discovered in those graphs. Payload tests byte-compare project legal files, inventory/notices, archive membership, checksums, npm/Bun installs, executable links, and sibling binaries. The existing fail-closed ruleset 19331797, artifact-digest-before-extraction, live-tag peel, retry-safe publication, monotonic npm latest, and installer-owned launchd boundary remain intact; `ocean-update` neither flips `~/.local/libexec/ocean-daemon/current` nor claims to hot-swap a running daemon.
 _________________________________________________________________________________

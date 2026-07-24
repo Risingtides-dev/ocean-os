@@ -1279,12 +1279,24 @@ impl AgentRuntime {
     }
 
     /// Resolve the project that owns a session's workspace, following git
-    /// worktrees back to their main checkout. First tries an exact match on the
-    /// given root; if that misses, resolves the git common-dir's main worktree
-    /// (`git -C <root> rev-parse --path-format=absolute --git-common-dir` → the
-    /// enclosing repo root) and matches THAT. None on any git/lookup failure.
+    /// worktrees back to their main checkout. First tries an exact stored-root
+    /// match, then compares canonical roots (so macOS `/var` ↔ `/private/var`
+    /// aliases do not lose ownership), and finally resolves the git common-dir's
+    /// main worktree and canonically matches THAT. None on any git/lookup failure.
     pub fn owning_project_for_root(&self, workspace_root: &str) -> Option<Project> {
         if let Ok(Some(project)) = self.project_for_workspace(workspace_root) {
+            return Some(project);
+        }
+
+        let projects = self.list_projects().ok()?;
+        let workspace_canonical = std::fs::canonicalize(workspace_root).ok()?;
+        let canonical_owner = |candidate: &Path| {
+            projects.iter().find_map(|project| {
+                let project_root = std::fs::canonicalize(&project.workspace_root).ok()?;
+                (project_root == candidate).then(|| project.clone())
+            })
+        };
+        if let Some(project) = canonical_owner(&workspace_canonical) {
             return Some(project);
         }
 
@@ -1313,13 +1325,16 @@ impl AgentRuntime {
         };
         let common_dir = common_dir.canonicalize().ok()?;
         let main_root = common_dir.parent()?.canonicalize().ok()?;
-        let main_root = main_root.to_string_lossy();
-        let main_root = main_root.trim_end_matches(std::path::MAIN_SEPARATOR);
-        if main_root.is_empty() {
+        let main_root_str = main_root.to_string_lossy();
+        let main_root_str = main_root_str.trim_end_matches(std::path::MAIN_SEPARATOR);
+        if main_root_str.is_empty() {
             return None;
         }
 
-        self.project_for_workspace(main_root).ok().flatten()
+        self.project_for_workspace(main_root_str)
+            .ok()
+            .flatten()
+            .or_else(|| canonical_owner(&main_root))
     }
 
     /// A cheap owning-project index: each project's `workspace_root` → the
@@ -2044,6 +2059,7 @@ impl AgentRuntime {
             tools_disabled,
             hashline_edits,
             artifact_spill,
+            code_intelligence,
             // Already consumed above (session label at the first durable save);
             // named here so the destructure stays exhaustive.
             display_title: _,
@@ -2056,6 +2072,7 @@ impl AgentRuntime {
             session_id: Some(session_id.to_string()),
             hashline: hashline_edits,
             artifacts: artifact_spill,
+            code_intelligence,
         };
         let tools = self.capabilities.tools_for_session(&tool_ctx).await;
         // `tools_disabled` is a fail-closed authorization boundary. Unlike an
@@ -2484,6 +2501,13 @@ pub struct PromptControl {
     /// legacy caller, while TUI/ACP/CLI/web daemon turns enable it (defaults off
     /// in `PromptControl::new`).
     pub artifact_spill: bool,
+    /// When true, the `lsp` code-intelligence tool is offered for workspaces
+    /// with a ready language server. Set by the daemon from the surface's
+    /// effective `HarnessProfile`; `false` for voice, whose replies are spoken
+    /// and cannot carry definitions/references/diagnostics (TASK-26). Defaults
+    /// TRUE in `PromptControl::new` so direct/legacy callers keep today's
+    /// behavior unchanged.
+    pub code_intelligence: bool,
     /// Human-facing session label for the first-turn case: the ORIGINAL user
     /// prompt, captured by the daemon BEFORE any prompt composition (room /
     /// operator guidance, folder-as-agent instructions, the Longhouse advisory,
@@ -2538,6 +2562,9 @@ impl PromptControl {
             tools_disabled: false,
             hashline_edits: false,
             artifact_spill: false,
+            // TRUE by default: direct/legacy callers keep today's behavior; only
+            // the daemon's profile resolution turns it off (voice) — TASK-26.
+            code_intelligence: true,
             display_title: None,
         }
     }
@@ -2554,6 +2581,13 @@ impl PromptControl {
     /// surface's effective `HarnessProfile` capabilities on the daemon side.
     pub fn with_hashline_edits(mut self, on: bool) -> Self {
         self.hashline_edits = on;
+        self
+    }
+
+    /// Gate the `lsp` code-intelligence tool for this turn (TASK-26). Set from
+    /// the surface's effective `HarnessProfile` capabilities on the daemon side.
+    pub fn with_code_intelligence(mut self, on: bool) -> Self {
+        self.code_intelligence = on;
         self
     }
 
@@ -3117,6 +3151,11 @@ fn model_from_provider_config(config: &ProviderConfig) -> anyhow::Result<Model> 
         }),
         ProviderId::OpenAiCodex => Ok(Model::codex(
             selection.model.clone(),
+            selection.context_window,
+            selection.max_output_tokens,
+        )),
+        ProviderId::KimiCoding => Ok(Model::kimi_coding_k3(
+            selection.base_url.clone(),
             selection.context_window,
             selection.max_output_tokens,
         )),

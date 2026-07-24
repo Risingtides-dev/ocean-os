@@ -80,6 +80,12 @@ pub enum AutostartOutcome {
     /// the daemon. Autostart is blocked to avoid racing launchd with a
     /// direct-spawn orphan.
     SupervisionUnknown,
+    /// The LaunchAgent plist is installed but the job is not currently loaded
+    /// — an installer maintenance window (bootout → bootstrap). Direct-spawning
+    /// here races the returning launchd job for the port (TASK-20: exactly how
+    /// the 02:35 orphan won 4780 and left launchd crashlooping on EADDRINUSE).
+    /// Do nothing; launchd RunAtLoad restarts the daemon when bootstrap lands.
+    SupervisionMaintenance,
 }
 
 // ── URL eligibility ─────────────────────────────────────────────────────────────
@@ -225,6 +231,23 @@ pub fn launchd_supervises() -> Option<bool> {
         Some(false)
     }
 }
+/// Whether the daemon LaunchAgent plist is installed on disk, independent of
+/// whether the job is currently loaded. A present plist with a failing
+/// `launchctl print` means an installer maintenance window, not an
+/// unsupervised box (TASK-20).
+pub fn launchd_job_installed() -> bool {
+    #[cfg(target_os = "macos")]
+    {
+        home_dir()
+            .join("Library/LaunchAgents/dev.risingtides.ocean-daemon.plist")
+            .is_file()
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        false
+    }
+}
+
 /// Home directory. Falls back to `/tmp` if `HOME` is unset (containers, etc.).
 fn home_dir() -> PathBuf {
     std::env::var("HOME")
@@ -316,6 +339,7 @@ pub fn maybe_autostart_with(
     guard: &AutostartGuard,
     autostart_env: Option<&str>,
     probe_launchd: impl FnOnce() -> bool,
+    probe_installed: impl FnOnce() -> bool,
     do_kickstart: impl FnOnce() -> Result<(), String>,
     do_discover_and_spawn: impl FnOnce() -> AutostartOutcome,
 ) -> AutostartOutcome {
@@ -331,6 +355,8 @@ pub fn maybe_autostart_with(
             Ok(()) => AutostartOutcome::Started,
             Err(e) => AutostartOutcome::SpawnFailed(e),
         }
+    } else if probe_installed() {
+        AutostartOutcome::SupervisionMaintenance
     } else {
         do_discover_and_spawn()
     }
@@ -356,6 +382,12 @@ pub fn maybe_autostart_prod(url: &str, guard: &AutostartGuard) -> AutostartOutco
             Ok(()) => AutostartOutcome::Started,
             Err(e) => AutostartOutcome::SpawnFailed(e),
         }
+    } else if launchd_job_installed() {
+        // Plist on disk but job not loaded: an installer is mid-maintenance
+        // (bootout → bootstrap). Never direct-spawn into that window — the
+        // orphan wins the port race and the returning launchd job crashloops
+        // on EADDRINUSE (TASK-20). RunAtLoad revives the daemon momentarily.
+        AutostartOutcome::SupervisionMaintenance
     } else {
         match discover_binary() {
             Some(bin) => match direct_spawn(&bin) {
@@ -508,6 +540,7 @@ mod tests {
             &g,
             None, // autostart env missing (eligible if URL were right)
             || unreachable!("should not probe when not eligible"),
+            || unreachable!("should not probe install state when not eligible"),
             || unreachable!("should not kickstart when not eligible"),
             || unreachable!("should not spawn when not eligible"),
         );
@@ -522,6 +555,7 @@ mod tests {
             &g,
             Some("0"), // OCEAN_TUI_AUTOSTART=0
             || unreachable!("should not probe when env=0"),
+            || unreachable!("should not probe install state when env=0"),
             || unreachable!("should not kickstart when env=0"),
             || unreachable!("should not spawn when env=0"),
         );
@@ -537,6 +571,7 @@ mod tests {
             &g,
             None,
             || false, // no launchd
+            || false, // plist not installed
             || unreachable!(),
             || AutostartOutcome::Started,
         );
@@ -548,6 +583,7 @@ mod tests {
             &g,
             None,
             || unreachable!("should not probe when rate-limited"),
+            || unreachable!("should not probe install state when rate-limited"),
             || unreachable!("should not kickstart when rate-limited"),
             || unreachable!("should not spawn when rate-limited"),
         );
@@ -562,6 +598,7 @@ mod tests {
             &g,
             None,
             || true,   // probe says supervised
+            || false,  // installed probe unused on the supervised path
             || Ok(()), // kickstart succeeds
             || unreachable!("should not spawn when launchd supervised"),
         );
@@ -576,10 +613,29 @@ mod tests {
             &g,
             None,
             || false, // no launchd
+            || false, // plist not installed either — genuinely unsupervised
             || unreachable!("should not kickstart when no launchd"),
             || AutostartOutcome::Started, // spawn succeeds
         );
         assert_eq!(outcome, AutostartOutcome::Started);
+    }
+
+    /// TASK-20 regression: plist installed + job not loaded = installer
+    /// maintenance window. The TUI must NOT direct-spawn (the orphan wins the
+    /// port race and launchd crashloops on EADDRINUSE when bootstrap returns).
+    #[test]
+    fn autostart_defers_during_launchd_maintenance_window() {
+        let g = AutostartGuard::new();
+        let outcome = maybe_autostart_with(
+            "http://127.0.0.1:4780",
+            &g,
+            None,
+            || false, // launchctl print fails — job not loaded
+            || true,  // but the LaunchAgent plist IS installed
+            || unreachable!("must not kickstart an unloaded job"),
+            || unreachable!("must NEVER direct-spawn into a maintenance window"),
+        );
+        assert_eq!(outcome, AutostartOutcome::SupervisionMaintenance);
     }
 
     #[test]
@@ -590,6 +646,7 @@ mod tests {
             &g,
             None,
             || false, // no launchd
+            || false, // plist not installed
             || unreachable!(),
             || AutostartOutcome::BinaryNotFound,
         );
@@ -615,6 +672,7 @@ mod tests {
                 probe_count.set(probe_count.get() + 1);
                 false
             },
+            || false,
             || {
                 kick_count.set(kick_count.get() + 1);
                 Ok(())
@@ -649,6 +707,7 @@ mod tests {
                 probe_count.set(probe_count.get() + 1);
                 false
             },
+            || false,
             || {
                 kick_count.set(kick_count.get() + 1);
                 Ok(())
@@ -679,6 +738,7 @@ mod tests {
                 probe_count.set(probe_count.get() + 1);
                 false // not supervised → spawn path
             },
+            || false, // plist not installed
             || unreachable!(),
             || AutostartOutcome::Started,
         );

@@ -3245,8 +3245,14 @@ mod tests {
         (format!("http://{addr}"), task)
     }
 
+    // TASK-28 deadline policy: every timeout in this module is a POSITIVE wait
+    // (the event must arrive; sub-second solo). 60s, not 1-2s — a saturated CI
+    // runner sharing 500+ parallel tests starves these tasks and tight
+    // deadlines fail PRs that touch unrelated crates (TASK-27 fired exactly
+    // here). Progress-guaranteed waits lose nothing from a generous budget.
+    // Negative nothing-arrives claims use try_recv asserts, never timeouts.
     async fn wait_for_control_call(fake: &ControlBedrock, path: &str) {
-        tokio::time::timeout(Duration::from_secs(2), async {
+        tokio::time::timeout(Duration::from_secs(60), async {
             loop {
                 if fake.calls.lock().await.iter().any(|call| call.path == path) {
                     return;
@@ -4599,7 +4605,7 @@ mod tests {
         let supervisor = test_control_supervisor(&base, rooms.clone());
 
         supervisor.startup().await;
-        tokio::time::timeout(Duration::from_secs(2), async {
+        tokio::time::timeout(Duration::from_secs(60), async {
             while fake.redeem_active.load(Ordering::Acquire) != 4 {
                 tokio::time::sleep(Duration::from_millis(5)).await;
             }
@@ -4618,7 +4624,7 @@ mod tests {
             "fifth row must wait for a recovery permit"
         );
         fake.release_redeem.add_permits(4);
-        tokio::time::timeout(Duration::from_secs(2), async {
+        tokio::time::timeout(Duration::from_secs(60), async {
             loop {
                 let calls = fake
                     .calls
@@ -4636,7 +4642,7 @@ mod tests {
         .await
         .expect("fifth row admitted after a permit releases");
         fake.release_redeem.add_permits(1);
-        tokio::time::timeout(Duration::from_secs(2), async {
+        tokio::time::timeout(Duration::from_secs(60), async {
             while !with_rooms_handle(&rooms, |s| s.list_pending_redemptions())
                 .unwrap()
                 .is_empty()
@@ -4671,14 +4677,14 @@ mod tests {
         let supervisor = test_control_supervisor(&base, rooms);
 
         supervisor.startup().await;
-        tokio::time::timeout(Duration::from_secs(2), async {
+        tokio::time::timeout(Duration::from_secs(60), async {
             while fake.redeem_active.load(Ordering::Acquire) != 4 {
                 tokio::time::sleep(Duration::from_millis(5)).await;
             }
         })
         .await
         .expect("four recovery requests started");
-        tokio::time::timeout(Duration::from_secs(1), supervisor.shutdown())
+        tokio::time::timeout(Duration::from_secs(60), supervisor.shutdown())
             .await
             .expect("shutdown cancels and joins recovery requests");
         tokio::time::sleep(Duration::from_millis(25)).await;
@@ -4716,7 +4722,13 @@ mod tests {
         let supervisor = test_control_supervisor(&base, rooms.clone());
 
         supervisor.startup().await;
-        tokio::time::timeout(Duration::from_secs(5), async {
+        // 60s, not 5s: 129 sequential redeem round-trips finish in well under a
+        // second solo, but a saturated CI runner sharing 500+ parallel tests
+        // starves this task — the tight deadline failed #331's ubuntu row on a
+        // diff touching only ocean-runtime (TASK-27). The loop is
+        // progress-guaranteed, so a generous deadline costs nothing when
+        // healthy and only trades flake for latency under pathological load.
+        tokio::time::timeout(Duration::from_secs(60), async {
             loop {
                 let attempts = fake
                     .calls
@@ -4725,7 +4737,14 @@ mod tests {
                     .iter()
                     .filter(|call| call.path == "redeem")
                     .count();
-                if attempts == 129 {
+                // `>= 129`, not `== 129` (TASK-33): a 403-failed redeem can be
+                // re-attempted, so the count can climb past 129 — and even
+                // absent retries, the exact-129 moment is a transient the 10ms
+                // poll can skip under load, hanging until the 60s deadline. The
+                // completeness invariant is "every one of the 129 rows was
+                // attempted"; the pending-list-empty assertion AFTER this loop
+                // is the real correctness check (it catches any row skipped).
+                if attempts >= 129 {
                     break;
                 }
                 tokio::time::sleep(Duration::from_millis(10)).await;
@@ -4733,9 +4752,24 @@ mod tests {
         })
         .await
         .expect("all pending rows attempted once");
-        assert!(with_rooms_handle(&rooms, |s| s.list_pending_redemptions())
-            .unwrap()
-            .is_empty());
+        // The attempt counter increments when the fake RECEIVES a call, but a
+        // row leaves the pending store only after its 403 response is
+        // processed — an instantaneous emptiness assert races that final
+        // write under load (this fired on #339's ubuntu row). Poll the
+        // observable end state under the same generous deadline.
+        tokio::time::timeout(Duration::from_secs(60), async {
+            loop {
+                let pending = with_rooms_handle(&rooms, |s| s.list_pending_redemptions())
+                    .unwrap()
+                    .len();
+                if pending == 0 {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("every attempted row must drain from the pending store");
         supervisor.shutdown().await;
         server.abort();
     }
@@ -4772,7 +4806,7 @@ mod tests {
             Duration::from_millis(20),
         );
         supervisor.startup().await;
-        tokio::time::timeout(Duration::from_secs(1), async {
+        tokio::time::timeout(Duration::from_secs(60), async {
             loop {
                 let connected = fake.sse_tx.lock().await.is_some();
                 let live = with_rooms_handle(&rooms, |s| s.room_access(&key))
@@ -4800,7 +4834,7 @@ mod tests {
                 .data(data.to_string())))
             .await
             .unwrap();
-        tokio::time::timeout(Duration::from_secs(1), async {
+        tokio::time::timeout(Duration::from_secs(60), async {
             loop {
                 let projection = with_rooms_handle(&rooms, |s| s.room_access(&key)).unwrap();
                 if projection.state == RoomAccessState::Recovering
@@ -4900,7 +4934,7 @@ mod tests {
             .members
             .iter()
             .all(|m| m.derived_presence == Some(MemberPresence::Unavailable)));
-        tokio::time::timeout(Duration::from_secs(1), access_rx.recv())
+        tokio::time::timeout(Duration::from_secs(60), access_rx.recv())
             .await
             .expect("atomic startup access wake")
             .expect("access bus open");
@@ -4953,7 +4987,7 @@ mod tests {
             Duration::from_millis(20),
         );
         supervisor.startup().await;
-        tokio::time::timeout(Duration::from_secs(1), async {
+        tokio::time::timeout(Duration::from_secs(60), async {
             loop {
                 let projection = with_rooms_handle(&rooms, |s| s.room_access(&key)).unwrap();
                 if projection.state == RoomAccessState::Recovering
@@ -5023,7 +5057,7 @@ mod tests {
             .members
             .iter()
             .all(|m| m.derived_presence == Some(MemberPresence::Unavailable)));
-        tokio::time::timeout(Duration::from_secs(1), access_rx.recv())
+        tokio::time::timeout(Duration::from_secs(60), access_rx.recv())
             .await
             .expect("state+presence access wake")
             .expect("access bus open");
@@ -5119,7 +5153,7 @@ mod tests {
 
         // No wake_sender call: periodic durable scan must find the Pending row.
         supervisor.startup().await;
-        tokio::time::timeout(Duration::from_secs(2), async {
+        tokio::time::timeout(Duration::from_secs(60), async {
             while fake.posts.lock().await.is_empty() {
                 tokio::time::sleep(Duration::from_millis(5)).await;
             }
@@ -5206,7 +5240,7 @@ mod tests {
             .await
             .unwrap();
 
-        tokio::time::timeout(Duration::from_secs(2), async {
+        tokio::time::timeout(Duration::from_secs(60), async {
             loop {
                 let done = with_rooms_handle(&rooms, |s| {
                     let room = s.get(&key).unwrap().unwrap();
@@ -5221,12 +5255,12 @@ mod tests {
         })
         .await
         .expect("SSE confirmation committed");
-        tokio::time::timeout(Duration::from_secs(1), message_rx.recv())
+        tokio::time::timeout(Duration::from_secs(60), message_rx.recv())
             .await
             .expect("message wake")
             .expect("message wake open");
         // Startup + roster can precede this; assert at least one access wake.
-        tokio::time::timeout(Duration::from_secs(1), access_rx.recv())
+        tokio::time::timeout(Duration::from_secs(60), access_rx.recv())
             .await
             .expect("access wake")
             .expect("access wake open");
@@ -5273,7 +5307,7 @@ mod tests {
             .data(non_message.to_string())))
             .await
             .unwrap();
-        tokio::time::timeout(Duration::from_secs(1), async {
+        tokio::time::timeout(Duration::from_secs(60), async {
             loop {
                 if with_rooms_handle(&rooms, |s| s.room_access(&key))
                     .unwrap()
@@ -5296,7 +5330,7 @@ mod tests {
             1
         );
         assert!(message_rx.try_recv().is_err());
-        tokio::time::timeout(Duration::from_secs(1), access_rx.recv())
+        tokio::time::timeout(Duration::from_secs(60), access_rx.recv())
             .await
             .expect("non-message access wake")
             .expect("access bus open");
@@ -5309,7 +5343,7 @@ mod tests {
             .data(json!({"sequence":"2"}).to_string())))
             .await
             .unwrap();
-        tokio::time::timeout(Duration::from_secs(1), access_rx.recv())
+        tokio::time::timeout(Duration::from_secs(60), access_rx.recv())
             .await
             .expect("heartbeat roster wake")
             .expect("access bus open");
@@ -5356,7 +5390,7 @@ mod tests {
             .data(remote_row.to_string())))
             .await
             .unwrap();
-        tokio::time::timeout(Duration::from_secs(1), async {
+        tokio::time::timeout(Duration::from_secs(60), async {
             loop {
                 let is_agent = with_rooms_handle(&rooms, |s| {
                     s.get(&key)
@@ -5375,11 +5409,11 @@ mod tests {
         })
         .await
         .expect("unknown author refreshed and mapped as Agent");
-        tokio::time::timeout(Duration::from_secs(1), message_rx.recv())
+        tokio::time::timeout(Duration::from_secs(60), message_rx.recv())
             .await
             .expect("unknown-author message wake")
             .expect("message bus open");
-        tokio::time::timeout(Duration::from_secs(1), access_rx.recv())
+        tokio::time::timeout(Duration::from_secs(60), access_rx.recv())
             .await
             .expect("unknown-author coalesced access wake")
             .expect("access bus open");
@@ -5420,7 +5454,7 @@ mod tests {
         fake.events_status.store(500, Ordering::Release);
         drop(tx);
         fake.sse_tx.lock().await.take();
-        tokio::time::timeout(Duration::from_secs(1), async {
+        tokio::time::timeout(Duration::from_secs(60), async {
             loop {
                 let projection = with_rooms_handle(&rooms, |s| s.room_access(&key)).unwrap();
                 if projection.state == RoomAccessState::Recovering
@@ -5448,7 +5482,7 @@ mod tests {
             Duration::from_millis(20),
         );
         restarted.startup().await;
-        tokio::time::timeout(Duration::from_secs(1), async {
+        tokio::time::timeout(Duration::from_secs(60), async {
             while fake.request_meta.lock().await.len() < 2 {
                 tokio::time::sleep(Duration::from_millis(5)).await;
             }
@@ -5460,7 +5494,7 @@ mod tests {
             requests.last().unwrap().2.as_deref(),
             Some("9007199254740993")
         );
-        tokio::time::timeout(Duration::from_secs(1), async {
+        tokio::time::timeout(Duration::from_secs(60), async {
             loop {
                 let projection = with_rooms_handle(&rooms, |s| s.room_access(&key)).unwrap();
                 if projection.state == RoomAccessState::Live
@@ -5521,14 +5555,14 @@ mod tests {
             Duration::from_millis(20),
         );
         supervisor.startup().await;
-        tokio::time::timeout(Duration::from_secs(1), async {
+        tokio::time::timeout(Duration::from_secs(60), async {
             while fake.posts.lock().await.is_empty() {
                 tokio::time::sleep(Duration::from_millis(5)).await;
             }
         })
         .await
         .expect("fake server received POST");
-        tokio::time::timeout(Duration::from_secs(1), async {
+        tokio::time::timeout(Duration::from_secs(60), async {
             loop {
                 let projection = with_rooms_handle(&rooms, |s| s.room_access(&key)).unwrap();
                 let row = projection.outbox.first().unwrap();
@@ -5642,7 +5676,7 @@ mod tests {
             Duration::from_millis(20),
         );
         supervisor.startup().await;
-        tokio::time::timeout(Duration::from_secs(1), async {
+        tokio::time::timeout(Duration::from_secs(60), async {
             loop {
                 let projection = with_rooms_handle(&rooms, |s| s.room_access(&key)).unwrap();
                 let row = projection.outbox.first().unwrap();
@@ -5733,7 +5767,7 @@ mod tests {
             Duration::from_millis(20),
         );
         supervisor.startup().await;
-        tokio::time::timeout(Duration::from_secs(1), async {
+        tokio::time::timeout(Duration::from_secs(60), async {
             while fake.posts.lock().await.len() < 2 {
                 tokio::time::sleep(Duration::from_millis(5)).await;
             }
@@ -5771,7 +5805,7 @@ mod tests {
             Duration::from_millis(20),
         );
         restarted.startup().await;
-        tokio::time::timeout(Duration::from_secs(1), async {
+        tokio::time::timeout(Duration::from_secs(60), async {
             while fake.posts.lock().await.len() < 4 {
                 tokio::time::sleep(Duration::from_millis(5)).await;
             }
@@ -5818,7 +5852,7 @@ mod tests {
             Duration::from_millis(20),
         );
         supervisor.start_room(key.clone()).await;
-        tokio::time::timeout(Duration::from_secs(1), async {
+        tokio::time::timeout(Duration::from_secs(60), async {
             while fake.request_meta.lock().await.is_empty() {
                 tokio::time::sleep(Duration::from_millis(5)).await;
             }
@@ -5840,7 +5874,7 @@ mod tests {
         };
         stopping.await.unwrap();
         starting.await.unwrap();
-        tokio::time::timeout(Duration::from_secs(1), async {
+        tokio::time::timeout(Duration::from_secs(60), async {
             while fake.request_meta.lock().await.len() < 2 {
                 tokio::time::sleep(Duration::from_millis(5)).await;
             }
@@ -5913,7 +5947,7 @@ mod tests {
             Duration::from_millis(20),
         );
         supervisor.startup().await;
-        tokio::time::timeout(Duration::from_secs(2), async {
+        tokio::time::timeout(Duration::from_secs(60), async {
             loop {
                 if fake.sse_tx.lock().await.is_some() {
                     break;
@@ -5923,7 +5957,7 @@ mod tests {
         })
         .await
         .expect("SSE connected");
-        tokio::time::timeout(Duration::from_secs(1), async {
+        tokio::time::timeout(Duration::from_secs(60), async {
             while fake.posts.lock().await.is_empty() {
                 tokio::time::sleep(Duration::from_millis(5)).await;
             }
@@ -5945,7 +5979,7 @@ mod tests {
             .await
             .unwrap();
 
-        tokio::time::timeout(Duration::from_secs(1), async {
+        tokio::time::timeout(Duration::from_secs(60), async {
             loop {
                 let projection = with_rooms_handle(&rooms, |s| s.room_access(&key)).unwrap();
                 if projection.state == RoomAccessState::Revoked
@@ -5965,7 +5999,7 @@ mod tests {
         })
         .await
         .expect("revoke cleanup committed");
-        tokio::time::timeout(Duration::from_secs(1), access_rx.recv())
+        tokio::time::timeout(Duration::from_secs(60), access_rx.recv())
             .await
             .expect("one revoke access wake")
             .expect("access bus open");
