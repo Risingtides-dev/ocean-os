@@ -2370,6 +2370,10 @@ impl ChatComponent {
                     }
                 }
             }
+            // `/cd [path]`: the app owns the workspace root, so hand it the raw
+            // argument and let it resolve, validate, and re-root. Bare `/cd`
+            // reports the current root rather than erroring.
+            "/cd" => Some(Action::SwitchProject(args.trim().to_string())),
             "/providers" => Some(Action::OpenProviders),
             "/compact" => Some(Action::CompactSession),
             "/copy" => match self.last_reply() {
@@ -4957,6 +4961,24 @@ mod tests {
         assert!(matches!(
             chat.run_slash("/beam", ""),
             Some(Action::BeamSession)
+        ));
+    }
+
+    #[test]
+    fn slash_cd_hands_the_raw_path_to_the_app() {
+        // The chat doesn't know the workspace root, so it must not try to
+        // resolve or validate — it forwards the trimmed argument and lets the
+        // app (which owns the root) decide. Bare `/cd` forwards an empty
+        // string, which the app answers with the current root.
+        let mut chat = ChatComponent::default();
+
+        assert!(matches!(
+            chat.run_slash("/cd", "  ../sibling  "),
+            Some(Action::SwitchProject(p)) if p == "../sibling"
+        ));
+        assert!(matches!(
+            chat.run_slash("/cd", ""),
+            Some(Action::SwitchProject(p)) if p.is_empty()
         ));
     }
 
