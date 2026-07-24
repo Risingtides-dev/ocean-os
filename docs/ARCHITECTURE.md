@@ -62,7 +62,19 @@ First-party surfaces create or select a session before steering it:
 5. runtime emits text, tool, permission, component, and completion events
 6. daemon streams the session-scoped projection to attached clients
 7. ocean-agent persists the completed session/history
+8. configured `[[hooks.Stop]]` commands run; a `block` decision continues the
+   session with the hook's reason before the turn is released
 ```
+
+Step 8 is the `ocean-hooks` seam. Each hook gets `{cwd, session_id,
+stop_hook_active}` on stdin; `{"decision":"block","reason":…}` runs the reason as
+the next user message, and continuation turns re-fire the hooks with
+`stop_hook_active: true` so a well-behaved hook self-limits. Continuations run
+under the same session lock, so they are part of the originating turn's
+transaction, and are capped independently of hook behavior. The posture is
+fail-open throughout: spawn errors, non-zero exits, bad JSON, and timeouts become
+warnings on stderr and never fail an already-completed turn. With no hooks
+configured the path costs nothing.
 
 `AgentTurnRequest` is defined in `ocean-agent-sdk`. Its current optional controls
 include project binding, named agent selection, model/role, thinking level,
@@ -190,6 +202,5 @@ Ocean OS does not currently claim:
 - sandbox-grade isolation beyond its documented permission/cwd/process controls;
 - bounded live per-turn MPSC memory;
 - runtime composition of Ocean Agents `_shared`/`_base` profile sources;
-- wired production execution of configured lifecycle hooks;
 - a distinct `surface-tauri` effective harness profile beyond its current CLI-compatible gates;
 - shared cloud storage authority (Ocean Bedrock owns that plane).

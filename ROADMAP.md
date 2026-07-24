@@ -13,9 +13,6 @@ approved design or permission to alter public contracts.
       `client_type = "surface-tauri"` to the `TAURI` prompt identity and native-
       shell component guidance, while the daemon harness seam intentionally
       retains CLI-compatible hashline/artifact gates pending cross-repo policy.
-- [ ] Wire configured lifecycle hooks into the completed-turn path. The
-      `ocean-hooks` protocol and config parsing exist, but production turn code
-      does not currently call `run_hooks`.
 - [ ] Keep cross-repository session, voice, component, and room contracts under
       executable drift checks rather than prose-only synchronization.
 

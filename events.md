@@ -5070,3 +5070,26 @@ nothing instead of re-rooting the tree somewhere unscannable; a file target says
 still lists the launch project's worktrees and the PTY keeps its live shell,
 both deliberate. Six new tests (415 total in ocean-tui, all passing).
 _________________________________________________________________________________
+time:      [14:25] [24-07-26]
+agent:     [claude] [opus 5]
+worktree:  docs/roadmap-hooks-already-wired
+type:      [review]
+area:      [docs]
+
+Two documents claimed Ocean does not run configured lifecycle hooks, and both
+were wrong. ROADMAP.md listed "wire configured lifecycle hooks into the
+completed-turn path — production turn code does not currently call run_hooks"
+as open work, and docs/ARCHITECTURE.md listed "wired production execution of
+configured lifecycle hooks" under Deliberate non-claims. Production code has
+done it for some time: crates/ocean-agent/src/lib.rs:1060 calls
+run_stop_hook_continuations on the completed-turn path, after persistence and
+still under the session lock, with a hard MAX_STOP_HOOK_CONTINUATIONS bound, the
+stop_hook_active self-limit, and fail-open handling of spawn errors, non-zero
+exits, bad JSON, and timeouts. Verified by running the test that covers it:
+stop_hook_block_runs_one_continuation_turn_then_stops passes. Removed the stale
+roadmap line (that file is open work only, by its own header) and the stale
+non-claim, and described the actual behavior as step 8 of the product turn flow.
+One more stale copy of the same claim survives at
+docs/specs/2026-07-14-ocean-extensions-architecture-and-migration-manifest.md:33;
+that is a ratified manifest in pi's lane, so I flagged it rather than editing it.
+_________________________________________________________________________________
