@@ -5140,3 +5140,26 @@ Padding out of widgets::block to widgets, and this commit predates that. 419
 ocean-tui tests pass. The three unpushed daemon/extension commits are other
 lanes' work and stay untouched pending their owners.
 _________________________________________________________________________________
+time:      [16:22] [24-07-26]
+agent:     [claude] [opus 5]
+worktree:  fix/installer-verify-main-content-on-main-branch
+type:      [bug-report]
+area:      [infra]
+
+The build-from-main guard in ops/install-ocean-daemon.sh only verified that HEAD
+was contained in origin/main when the branch was NOT named main. Being on a
+branch called main was treated as proof of main content, which it is not: a
+shared dev checkout whose local main sits ahead of origin builds commits that
+were never pushed, never reviewed, and never seen by CI. That is exactly what
+happened here — the supervised daemon on the primary host has been reporting rev
+40cf0d6d-dirty, an UNPUSHED local-main commit, for days, and the guard had no
+opinion about it. Moved the merge-base --is-ancestor check out of the branch
+conditional so it runs unconditionally, and said so in the failure text
+("Local commits ahead of origin/main count as 'not contained'"). Verified both
+directions against the real checkouts rather than reasoning about it: the old
+logic reports "containment check PASSED/SKIPPED ... would proceed to build" with
+exit 0 on the shared checkout that carries three unpushed commits, while the new
+logic exits 64 with "on 'main' and HEAD is not contained in origin/main". A clean
+worktree sitting exactly at origin/main still passes. The dirty-tree check is
+unchanged and still fires independently.
+_________________________________________________________________________________
