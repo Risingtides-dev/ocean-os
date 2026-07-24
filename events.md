@@ -5093,3 +5093,50 @@ One more stale copy of the same claim survives at
 docs/specs/2026-07-14-ocean-extensions-architecture-and-migration-manifest.md:33;
 that is a ratified manifest in pi's lane, so I flagged it rather than editing it.
 _________________________________________________________________________________
+_________________________________________________________________________________
+time:      [17:06] [23-07-26]
+agent:     [ocean] [coding]
+worktree:  [feat/tui-markdown-preview]
+type:      [feature-request]
+area:      [frontend]
+
+Added an mdfried-inspired, terminal-native Markdown file experience to Ocean TUI
+without importing or depending on GPL-licensed mdfried code. Markdown files now
+open as styled, read-only previews rendered from the current unsaved source buffer;
+Ctrl-P flips each tab between preview and raw editing without changing its source,
+cursor, dirty bit, or source viewport. Preview owns independent keyboard/mouse
+scrolling, applies a document margin, sanitizes terminal controls before spans, and
+keeps paste/edit disabled. The existing Ocean Markdown renderer supplies headings,
+lists, code, tables, links, and terminal-safe image cards; oversized text and
+terminal graphics overlays remain deliberately outside Ratatui's cell renderer.
+Focused render/input/sanitization tests and crate quality gates cover the behavior.
+Verification: `cargo fmt --all -- --check`, `cargo check -p ocean-tui`, strict
+all-target/all-feature Clippy, `cargo xtask docs-check`, and all 405 ocean-tui tests
+passed (1 ignored) with the full suite serialized. The known nondeterministic
+`resume_discovery_returns_through_action_channel` test timed out in parallel runs,
+then passed three isolated retries and the complete serial suite. Longhouse external
+review `24ac553a-a5b4-48b0-9450-93f470a53f62` approved with no blocking defect.
+_________________________________________________________________________________
+time:      [15:26] [24-07-26]
+agent:     [claude] [opus 5]
+worktree:  feat/tui-markdown-preview-rescue
+type:      [handoff]
+area:      [frontend]
+
+Audit of unpushed work on the shared ocean-os checkout found four pieces of
+completed work that exist ONLY on this machine: local main carries the daemon
+transport seam (63ff6369), extension Phase 1 state inspection (be0abb67), and
+the deck component kind (b5475120), none of which are on origin —
+crates/ocean-daemon/src/transport.rs and crates/ocean-daemon/src/extension_state.rs
+are both ABSENT from origin/main. Separately, feat/tui-markdown-preview is a
+local-only branch whose own commit 4d33f909 (markdown source preview toggle in
+the TUI editor, 258 insertions) sits on top of the OLD pre-rewrite 40cf0d6d and
+e89c4f3d hashes that thoth explicitly said must not be pushed, so that branch
+cannot go upstream as-is. Bundled everything unpushed to ~/.ocean-rescue/ so a
+reset cannot destroy it, then rescued the TUI commit alone by cherry-picking it
+onto current origin/main, away from the two commits it was stranded behind. It
+needed one fix to build: the ratatui 0.30 upgrade I landed earlier today moved
+Padding out of widgets::block to widgets, and this commit predates that. 419
+ocean-tui tests pass. The three unpushed daemon/extension commits are other
+lanes' work and stay untouched pending their owners.
+_________________________________________________________________________________

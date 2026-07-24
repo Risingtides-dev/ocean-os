@@ -16,6 +16,11 @@ pub struct EditorTab {
     pub visual_scroll: usize,
     /// Left terminal-cell offset for unwrapped source-code mode.
     pub horizontal_scroll: usize,
+    /// Pretty, read-only Markdown projection for this tab. The source buffer
+    /// remains authoritative and is never rewritten by preview rendering.
+    pub markdown_preview: bool,
+    /// Top wrapped row in Markdown preview mode; independent from source scroll.
+    pub preview_scroll: usize,
     pub highlighted: Vec<StyledLine>,
     pub git_lines: HashMap<usize, Mark>,
     // incremental-highlight bookkeeping: edits re-highlight only the touched
@@ -50,6 +55,8 @@ impl EditorTab {
             dirty: false,
             visual_scroll: 0,
             horizontal_scroll: 0,
+            markdown_preview: false,
+            preview_scroll: 0,
             highlighted,
             git_lines: HashMap::new(),
             needs_full_hl: false,
