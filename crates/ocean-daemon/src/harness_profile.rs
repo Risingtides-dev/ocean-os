@@ -146,8 +146,6 @@ mod tests {
         // silently reclassifies it.
         for client_type in [
             "surface-tauri",
-            "surface-gpui",
-            "surface-native",
             "surface-slack",
             "surface-canvas",
             "surface-mobile",

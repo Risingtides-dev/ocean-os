@@ -203,20 +203,6 @@ Reference docs in this repo:
 - `docs/PAGE_LEVEL_AGENT_SURFACE_UI_NOTE.md`
 "#;
 
-const GPUI_SURFACE_PROMPT: &str = r#"
-## Ocean GPUI surface UX
-
-You are inside Ocean GUI, an agent-native desktop work surface.
-When the user asks for canvas, board, workflow, storyboard, diagram, or spatial work, use `surface_patch`.
-Do not draw ASCII diagrams in chat.
-Do not tell the user to draw manually.
-Use the injected canvas ledger to choose ids, coordinates, containers, and update targets.
-If exact x/y is not important, omit it and let the app place the component.
-Always include a short text summary after patching.
-
-Do not use Leptos/web-only component rendering for chat UI. Use `surface_patch` for native canvas mutations. The native surface does not render Leptos components or arbitrary HTML inside chat, so avoid `component_render`, `component_wait`, and web/HTML-oriented widgets unless the user explicitly asks for a protocol test. For non-canvas output, use compact markdown, file paths, commands, and short status text.
-"#;
-
 const TUI_SURFACE_PROMPT: &str = r#"
 ## Ocean TUI surface UX
 
@@ -303,12 +289,6 @@ is the user's real, signed-in browser session.\n\n\
     )
 }
 
-fn gpui_surface_prompt(prompt: &str, client_label: &str) -> String {
-    format!(
-            "{prompt}\n\n## Current client\n\nYou are speaking through **{client_label}**.\n\n{GPUI_SURFACE_PROMPT}\n"
-        )
-}
-
 fn tui_surface_prompt(prompt: &str) -> String {
     format!("{prompt}\n\n## Current client\n\n{TUI_SURFACE_PROMPT}\n")
 }
@@ -337,7 +317,6 @@ pub fn surface_flag(client_type: Option<&str>) -> &'static str {
         Some("tui") => "TUI",
         Some("surface-web") => "WEB",
         Some("surface-tauri") => "TAURI",
-        Some("surface-gpui") | Some("surface-native") => "GUI",
         Some("cli") => "CLI",
         Some("leo-voice") => "VOX",
         Some("acp-zed") => "ACP",
@@ -450,8 +429,6 @@ fn append_client_type_from(
                 "Ocean Surface (Tauri desktop) — the native shell hosting the canonical Leptos/WASM Surface",
             ),
             Some("surface-extension") => extension_surface_prompt(prompt),
-            Some("surface-gpui") => gpui_surface_prompt(prompt, "Ocean GUI (GPUI native desktop)"),
-            Some("surface-native") => gpui_surface_prompt(prompt, "Ocean native surface"),
             Some("cli") => cli_surface_prompt(prompt),
             Some("leo-voice") => voice_surface_prompt(prompt),
             // Slack / Canvas / Mobile are first-class now (ocean-agents R3).
@@ -662,8 +639,6 @@ mod tests {
         assert_eq!(surface_flag(Some("tui")), "TUI");
         assert_eq!(surface_flag(Some("surface-web")), "WEB");
         assert_eq!(surface_flag(Some("surface-tauri")), "TAURI");
-        assert_eq!(surface_flag(Some("surface-gpui")), "GUI");
-        assert_eq!(surface_flag(Some("surface-native")), "GUI");
         assert_eq!(surface_flag(Some("cli")), "CLI");
         assert_eq!(surface_flag(Some("leo-voice")), "VOX");
         assert_eq!(surface_flag(Some("acp-zed")), "ACP");
@@ -796,55 +771,6 @@ mod tests {
         assert!(prompt.contains("browser_read_page"));
         // It must NOT claim to be a browser PWA like surface-web does.
         assert!(!prompt.contains("a browser PWA"));
-    }
-
-    #[test]
-    fn gpui_surface_avoids_web_component_guidance() {
-        let root = empty_assistants_root();
-        let prompt = build_system_prompt_from(None, Some("surface-gpui"), Some(root.path()), None);
-
-        assert!(prompt.contains("Ocean GUI"));
-        assert!(prompt.contains("GPUI"));
-        // Web-only Leptos rendering is still discouraged, but now scoped to
-        // chat UI rather than blanket-blocked.
-        assert!(prompt.contains("does not render Leptos components"));
-        assert!(prompt.contains("Use `surface_patch` for native canvas mutations"));
-        assert!(!prompt.contains("Responses render as HTML"));
-    }
-
-    /// OCEAN-154 / Slice 7: the GPUI surface guidance must point the model at
-    /// `surface_patch` for canvas work and must NOT carry the old prompt that
-    /// blocked all surface/visual tools ("It is not a browser/WebView surface
-    /// and it does not render Leptos components or arbitrary HTML inside
-    /// chat" + a blanket `component_render` ban with no `surface_patch`
-    /// alternative).
-    #[test]
-    fn gpui_surface_guides_to_surface_patch_not_ascii() {
-        let root = empty_assistants_root();
-        let prompt = build_system_prompt_from(None, Some("surface-gpui"), Some(root.path()), None);
-
-        // The keystone: the model is told the canvas tool exists and how to
-        // use it.
-        assert!(prompt.contains("surface_patch"));
-        assert!(prompt.contains("agent-native desktop work surface"));
-        assert!(prompt.contains("Do not draw ASCII diagrams in chat"));
-        assert!(prompt.contains("injected canvas ledger"));
-
-        // The old over-broad blocking text is gone.
-        assert!(!prompt.contains(
-                "It is not a browser/WebView surface and it does not render Leptos components or arbitrary HTML inside chat"
-            ));
-    }
-
-    #[test]
-    fn legacy_native_surface_is_not_treated_as_webview() {
-        let root = empty_assistants_root();
-        let prompt =
-            build_system_prompt_from(None, Some("surface-native"), Some(root.path()), None);
-
-        assert!(prompt.contains("Ocean native surface"));
-        assert!(prompt.contains("surface_patch"));
-        assert!(!prompt.contains("Responses render as HTML"));
     }
 
     #[test]

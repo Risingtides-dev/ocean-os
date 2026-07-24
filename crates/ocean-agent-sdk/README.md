@@ -108,7 +108,7 @@ Tagged by a snake_case `type` field. The ones an integrator cares about most:
 | `session_created` | A session was implicitly created by a turn with `session_id: null`. |
 | `component_render` / `component_unmount` | Agent-driven interactive UI (see `docs/AGENT_RENDER_PROTOCOL.md`). |
 | `browser_activity` | A browser tool started/stopped. |
-| `surface_patch` | Validated canvas patches (GPUI Masterbuild); see the `surface` module. |
+| `surface_patch` | Validated canvas patches; see the `surface` module. |
 | `extension` | Catch-all for extension events (e.g. Longhouse council events). |
 
 Clients should ignore unrecognised `type` values to stay forward-compatible.

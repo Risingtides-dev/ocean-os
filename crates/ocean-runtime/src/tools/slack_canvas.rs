@@ -1,8 +1,7 @@
 //! `slack_canvas` — the agent's Slack-canvas-as-playground tool (OCEAN-214 ph2).
 //!
-//! Slack canvases become a persistent, **bidirectional** surface the agent owns —
-//! the Slack analogue of the GPUI canvas (`surface_patch` to write + a ledger to
-//! read back). Through this tool the agent can:
+//! Slack canvases become a persistent, **bidirectional** surface the agent owns:
+//! structured writes plus a ledger read path. Through this tool the agent can:
 //!
 //! - `create` a new canvas (optional title + initial markdown, optional channel),
 //! - `read` back a canvas's current contents — the **awareness** op — so it can

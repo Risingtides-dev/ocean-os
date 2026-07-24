@@ -1037,9 +1037,9 @@ async fn main() -> anyhow::Result<()> {
     // any loopback port (`trunk serve` → :8080, vite → :5173, the proxy → :8790)
     // and the Chrome side-panel runs from a per-install `chrome-extension://<id>`
     // origin we can't enumerate ahead of time. `is_trusted_origin` matches those
-    // classes by shape, so we don't have to hardcode every port. The proxy and
-    // native GPUI client are server-side/native HTTP callers and never send a
-    // browser `Origin`, so CORS does not gate them at all.
+    // classes by shape, so we don't have to hardcode every port. The proxy is a
+    // server-side HTTP caller and never sends a browser `Origin`, so CORS does
+    // not gate it.
     let extra_origins = env::var("OCEAN_ALLOWED_ORIGINS").unwrap_or_default();
     let extra_origins: Vec<String> = parse_allowed_origins(&extra_origins);
     if !extra_origins.is_empty() {
@@ -6517,7 +6517,7 @@ async fn agent_turn(
                         .map(|patch| SurfacePatchEnvelope {
                             patch_id: PatchId::new(Uuid::new_v4().to_string()),
                             session_id: bridge_session_id,
-                            surface_id: SurfaceId::new("gpui:local"),
+                            surface_id: SurfaceId::new("surface:local"),
                             canvas_id: canvas.clone(),
                             actor: ActorRef::agent(None),
                             created_at_ms,
@@ -9420,7 +9420,7 @@ mod tests {
             patches: vec![SurfacePatchEnvelope {
                 patch_id: PatchId::new(Uuid::new_v4().to_string()),
                 session_id,
-                surface_id: SurfaceId::new("gpui:local"),
+                surface_id: SurfaceId::new("surface:local"),
                 canvas_id,
                 actor: ActorRef::agent(None),
                 created_at_ms: 0,

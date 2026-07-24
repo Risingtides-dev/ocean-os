@@ -27,6 +27,9 @@ This child contract governs current architecture, operations, cross-repository r
 - `ocean-longhouse` owns deterministic exact-token advisory preparation, its explained-ranking projection, SOP/workflow coordination, and quorum/council behavior without bypassing daemon authority. Inspection remains read-only and path-redacted at the daemon boundary. Local typed memory belongs to `ocean-memory`; shared knowledge belongs to Ocean Bedrock.
 - Subagent definitions, dispatch, lifecycle, and orchestration policy belong to extensions, not core crates. Existing core subagent-shaped APIs and metadata are compatibility surfaces pending a separately approved migration. `specs/2026-07-18-ocean-crew-orchestration-and-durable-workflow-manifest.md` is the proposed (not yet accepted) Phase 6 design ratification for that extension-owned orchestration: Ocean Crew owns the durable graph engine behind extension-provided `longhouse__delegate_local` / `longhouse__delegate_offshore` facade tools, with real role capability profiles intersected by host authority; the generic host seams and absorbed R5 engine remain unimplemented.
 - Active docs must not require `docs/.agentarchive/`. Archive material is loaded only when the operator explicitly asks for historical or forensic context.
+- Active client documentation treats the shared Leptos Surface UI and its
+  Tauri host as the desktop implementation; removed desktop implementations
+  are not design, migration, or prompt inputs.
 - A document under `specs/` or `superpowers/` is not current architecture merely because it exists. Preserve its status and verify implementation before using it as a work order.
 - Rooms means durable `/v1/rooms/persistent/*` collaboration plus the independent LiveKit token route; Track-0 projection-room material is historical.
 

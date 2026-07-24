@@ -126,7 +126,7 @@ It now only accepts:
   "$OCEAN_DAEMON_BIN")
 ```
 
-The surface proxy and native GPUI client are server-side/native HTTP callers and do not send a browser `Origin`. Direct browser, extension, and Tauri webview requests are origin-checked against the policy above.
+The surface proxy and other native HTTP callers do not send a browser `Origin`. Direct browser, extension, and Tauri webview requests are origin-checked against the policy above.
 
 ### Daemon URL for clients
 

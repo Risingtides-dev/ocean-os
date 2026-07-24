@@ -29,8 +29,8 @@ pub enum ToolSideEffect {
     /// canvas. The agent loop forwards this onto the event bus; Slice 3 wires the
     /// daemon to wrap each patch in a [`SurfacePatchEnvelope`] (stamping
     /// session/surface/actor/timestamp) and stream it over `/v1/agent/events`.
-    /// The GPUI ledger (Slice 4/6) owns the authoritative revision; the runtime
-    /// only reports the patches it accepted.
+    /// The client ledger owns the authoritative revision; the runtime only
+    /// reports the patches it accepted.
     ///
     /// [`SurfacePatchEnvelope`]: ocean_agent_sdk::surface::SurfacePatchEnvelope
     SurfacePatch {
@@ -372,7 +372,7 @@ pub enum AgentEvent {
         active: bool,
     },
     /// The agent applied one or more validated `surface_patch` operations to a
-    /// canvas (GPUI Masterbuild Slice 3). The daemon stamps each patch into a
+    /// canvas. The daemon stamps each patch into a
     /// `SurfacePatchEnvelope` and relays it onto `/v1/agent/events` as
     /// `AgentTurnEvent::SurfacePatch`, scoped to this session.
     SurfacePatch {

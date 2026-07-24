@@ -174,7 +174,8 @@ audit trail. The differentiator — a browser whose primitives are built for an 
 - `crates/ocean-runtime/src/tools/browser/` — agent-facing tools
   (`nav`/`input`/`inspect`/`perceive`) registered via `BrowserProvider`.
 - `crates/ocean-agent` surface taxonomy — `[BRWSR]` surface, `surface_flag`/
-  `surface_dir`; an embedded browser is the `[BRWSR]`/`[GUI]` surface made real.
+  `surface_dir`; the browser host is represented by the browser capability
+  profile rather than a desktop-client alias.
 - `ClientContext.browser` (planned, per control-plane doc) — the live shell state
   (active tab URL/title/selection, tab list) the agent reads each turn.
 

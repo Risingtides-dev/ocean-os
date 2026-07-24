@@ -1,6 +1,6 @@
 # Client spec: Projects (named workspaces)
 
-For the web-surface, GPUI, and TUI agents. The **daemon side is built, live, and
+For the web/PWA, Tauri, and TUI clients. The **daemon side is built, live, and
 verified** (commit `bd6aebb`). This spec is the contract each client implements
 so sessions stop reverting to `ocean-os` and the operator can steer by project.
 
@@ -59,7 +59,7 @@ Add `project_id: Option<Uuid/String>` to the turn-request type, serialized as
 
 ### State
 Hold `projects: Vec<Project>` and `current_project: Option<ProjectId>` (persist
-the current choice — localStorage for web, app state for GPUI/TUI — so it
+the current choice — localStorage for the shared Surface UI and app state for TUI — so it
 survives reload, like the model selection).
 
 ### Calls (mirror the model-picker you already built)
@@ -89,9 +89,9 @@ survives reload, like the model selection).
   `current_project` in localStorage. Proxy already forwards `/v1/*` so no proxy
   change needed (it reverse-proxies unknown `/v1/` paths; if `/v1/projects`
   isn't forwarded, add the routes mirroring `proxy_models`).
-- **GPUI** (`ocean-gui`): you already added `fetch_models`/`set_model` to
-  `shell/daemon.rs` — add `fetch_projects`/`create_project` the same way, hold
-  state in `ShellState`, add the picker to `view.rs`, send `project_id` on turns.
+- **Tauri** (`ocean-tauri`): it hosts the same `ocean-surface-ui` implementation
+  as the web/PWA, so project state and turn submission stay in the shared UI
+  rather than a separate desktop client implementation.
 - **TUI** (`ocean-tui`): it already knows its own working directory, so the
   minimum fix is just to **send its real `cwd`** on every turn (it may already);
   the project picker is optional polish. Sending a correct non-empty cwd alone

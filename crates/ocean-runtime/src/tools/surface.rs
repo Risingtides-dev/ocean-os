@@ -1,5 +1,4 @@
-//! `surface_patch` — the agent-native canvas mutation tool (GPUI Masterbuild
-//! Slice 2, OCEAN-149).
+//! `surface_patch` — the agent-native canvas mutation tool (OCEAN-149).
 //!
 //! The agent calls this to apply one or more structured patches to the current
 //! Ocean surface canvas. Each patch is validated against the shared SDK
@@ -13,9 +12,9 @@
 //! each patch in a [`SurfacePatchEnvelope`](ocean_agent_sdk::surface::SurfacePatchEnvelope)
 //! and streams it over `/v1/agent/events`.
 //!
-//! The `revision` is a passthrough/echo for now: the GPUI `CanvasLedger`
-//! (Slice 4/6) owns the authoritative revision, so the tool only reports what it
-//! accepted. An optional `revision` arg lets a caller echo the ledger's current
+//! The `revision` is a passthrough/echo for now: the client canvas ledger owns
+//! the authoritative revision, so the tool only reports what it accepted. An
+//! optional `revision` arg lets a caller echo the ledger's current
 //! revision back; absent, it reports `0`.
 
 use async_trait::async_trait;
@@ -117,7 +116,7 @@ impl AgentTool for SurfacePatchTool {
         // --- collect the component ids touched by the accepted patches ---
         let component_ids: Vec<String> = patches.iter().filter_map(component_id_of).collect();
 
-        // The GPUI ledger owns the real revision (Slice 4/6). Echo an optional
+        // The client ledger owns the real revision. Echo an optional
         // caller-supplied revision; otherwise report 0.
         let revision = args.get("revision").and_then(|v| v.as_u64()).unwrap_or(0);
 

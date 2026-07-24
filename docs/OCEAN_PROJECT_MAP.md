@@ -79,7 +79,7 @@ Owns:
 - Chrome extension and Tauri hosts around the same UI bundle;
 - product interaction, responsive behavior, host-capability seam, and design
   system;
-- a retained, soft-deprecated GPUI crate for reference only.
+- the shared Leptos/WASM Surface UI and its Tauri desktop/mobile shell.
 
 Does not own provider calls, tool execution, permission policy, or session
 persistence. The proxy may relay requests but must not become another agent

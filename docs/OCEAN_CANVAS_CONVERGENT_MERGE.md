@@ -1,20 +1,17 @@
 # Ocean Canvas — Convergent Merge for Concurrent Edits (OCEAN-258)
 
-Status: foundation landed in `ocean-os` (`ocean-agent-sdk`). Surface application is
-a documented follow-up (see [Surface integration](#surface-integration-the-ledger-is-the-merge-point)).
+Status: landed in `ocean-os` (`ocean-agent-sdk`) and the shared
+`ocean-surface-ui` canvas ledger.
 
 This is the bounded **CRDT-lite** that lets the operator and an agent edit the
 *same* canvas concurrently without clobbering each other. It is the staged answer
-to the open CRDT decision in `gpui_masterbuild.md` §17 — built on the existing
-patch log, **not** a full CRDT engine.
+for the existing patch log, **not** a full CRDT engine.
 
 ## The problem
 
-`docs/OCEAN_ECOSYSTEM_CONTRACT.md` calls a Canvas "a tldraw/CRDT document," but
-patches today are a serialized append list applied in **arrival order**. The
-ledger's `apply_patch` (in `ocean-surface`, `crates/ocean-gui/src/shell/canvas/ledger.rs`)
-is blind last-writer-wins: whichever patch the daemon happened to fan out last
-wins, and two surfaces can diverge. Two writers on the same component clobber.
+`docs/OCEAN_ECOSYSTEM_CONTRACT.md` calls a Canvas "a tldraw/CRDT document."
+Without a merge gate, its serialized patch stream would be applied in arrival
+order, so two writers updating the same component could diverge.
 
 The patch log is already **deterministic** (replay the same envelopes in the same
 order → same ledger). The missing piece is **concurrent-edit merge**: when the
@@ -87,49 +84,24 @@ will (`two_concurrent_patches_to_same_component_converge_via_envelopes`,
 
 ## Surface integration (the ledger is the merge point)
 
-> **Why the ledger, not the daemon?** `gpui_masterbuild.md` §4: *"No daemon table
-> should become the source of truth for the canvas."* The operator's **local**
-> drags/resizes and the agent's **streamed** patches actually *meet* in the
-> `ocean-surface` `CanvasLedger`. That is the one place both writers' patches are
-> seen, so that is where the merge runs. The daemon stays a transport and relays
-> agent patches with `version: None` (see `crates/ocean-daemon/src/main.rs`, the
-> `AgentEvent::SurfacePatch` relay).
+The daemon remains transport. Local operator changes and streamed agent patches
+meet in the shared Surface ledger, so that ledger owns the merge decision.
 
-The follow-up work in **`ocean-surface`** (`crates/ocean-gui/src/shell/canvas/`):
+The implementation lives in:
 
-1. **Mirror the SDK types.** `ocean-surface` keeps a structural copy of the patch
-   wire types in `canvas/patch.rs` (it doesn't depend on the ocean-os workspace).
-   Add the mirror of `ComponentVersion` / `ActorId` and the optional
-   `version` field on its `SurfacePatchEnvelope`, exactly as the SDK has them. (The
-   JSON is identical; the only existing intentional difference is `session_id` is a
-   `String` there.)
+- `../ocean-surface/crates/ocean-surface-ui/src/daemon.rs`: structural wire
+  mirrors for `ActorId`, `ComponentVersion`, `LamportClock`,
+  `CanvasMergeState`, and the envelope's optional `version`.
+- `../ocean-surface/crates/ocean-surface-ui/src/canvas.rs`:
+  `WebCanvasLedger` holds one merge state and logical clock per canvas.
+  `apply_envelope` observes carried versions, stamps unversioned daemon patches,
+  accepts `Applied`, skips `Superseded`, and directly applies patches that do
+  not target one component.
+- `MultiCanvasLedger` keeps merge state isolated by `canvas_id` and reconstructs
+  the same merge-gated scene during replay.
 
-2. **Hold a `CanvasMergeState` + per-actor `LamportClock` on the ledger.** Add both
-   to `CanvasLedger` (`canvas/ledger.rs`) next to `patch_log`. Seed the clock with
-   `CanvasMergeState::max_rev()` when resuming from disk (`canvas/persistence.rs`)
-   so fresh local writes are strictly greater than the replayed history.
-
-3. **Gate `apply_patch` through the merge.** Today `CanvasLedger::apply_patch`
-   (ledger.rs ~line 229) applies unconditionally. Change the apply path so that for
-   a patch with `patch.target_component() == Some(id)`:
-   - **local edit** (operator drag/resize): `let rev = clock.tick();` stamp
-     `ComponentVersion { rev, actor: operator }`, `merge_state.merge(id, v)` (always
-     wins locally), then apply + record the version on the envelope.
-   - **remote/agent patch** (from the daemon `SurfacePatch` event, applied in
-     `shell/view.rs` `apply_patches_to_ledger_with_store` ~line 8135): if the
-     envelope carries a `version`, `clock.observe(version.rev)` then
-     `match merge_state.merge(id, version) { Applied => apply, Superseded => skip }`.
-     If the envelope has **no** version (legacy), fall back to today's direct apply.
-   - Patches with `target_component() == None` apply directly as today.
-
-4. **Stamp agent patches with a version somewhere authoritative.** Because the daemon
-   relays `version: None`, the surface assigns the agent patch's `rev` from the
-   canvas clock at apply time (step 3, remote branch). This keeps a single clock per
-   canvas on the ledger — no split-brain.
-
-The merge call site is small and local; the SDK already proves the convergence math
-and the envelope routing. The surface change is "where to call `merge` and which
-branch stamps the version," documented above.
+This keeps the rendered state and the next-turn canvas context on the same
+authoritative client-side ledger path.
 
 ## Scope — foundation, not full multiplayer
 
@@ -139,8 +111,7 @@ convergence test suite.
 
 **Out of scope (follow-up):**
 
-- A full CRDT library (Loro / Yjs / Automerge) and rich text/tree CRDTs. Per
-  masterbuild §17 this is deferred until "after patch semantics stabilize"; the
+- A full CRDT library (Loro / Yjs / Automerge) and rich text/tree CRDTs. The
   version-vector merge here is the staged step before it. Loro becomes worth it when
   per-component LWW is too coarse — e.g. two writers editing *different fields of the
   same component's content* should both survive (LWW currently picks one whole

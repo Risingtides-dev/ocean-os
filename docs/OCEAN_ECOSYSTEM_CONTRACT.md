@@ -7,7 +7,7 @@ Status: active contract for runtime and first-party surfaces.
 - `Project`: repo/product identity. A project is the durable named thing Ocean recognizes, configures, and caretakes.
 - `Workspace`: one concrete checkout/worktree/local directory on disk. A workspace has a path and may belong to a project.
 - `Session`: one daemon-owned agent/human work thread with a persisted workspace binding that an explicit later request may rebind under current workspace-resolution rules.
-- `Surface`: a UI/client attached to a session, such as GPUI, the Chrome extension, web, TUI, ACP, CLI, or voice.
+- `Surface`: a UI/client attached to a session, such as the Tauri desktop app, Chrome extension, web/PWA, TUI, ACP, CLI, or voice.
 - `Canvas`: a tldraw/CRDT document visible from a surface. Concurrent
   operator+agent edits converge via the per-component version-vector merge
   (OCEAN-258); see `docs/OCEAN_CANVAS_CONVERGENT_MERGE.md`.
@@ -74,11 +74,11 @@ implicit create-on-turn path. Shape:
 POST /v1/agent/sessions
   { "workspace_root": "<path>",       # required; resolved to git toplevel if inside a repo
     "project_id": "<uuid>",           # optional; falls back to the project's workspace_root
-    "client_type": "surface-gpui" }   # optional render/communication medium
+    "client_type": "surface-tauri" }  # optional render/communication medium
 
 -> { "session_id": "<id>",
      "cwd": "<resolved working dir>",
-     "client_type": "surface-gpui" }
+     "client_type": "surface-tauri" }
 ```
 
 The returned `session_id` is then carried on `GET /v1/agent/events?session_id=<id>` and on every `POST /v1/agent/turns`. Resuming does not make `cwd` optional: each turn must provide it, or provide an empty value with `project_id` so the daemon can resolve the project workspace. A different valid binding intentionally rebinds the persisted session.
@@ -96,7 +96,7 @@ POST /v1/agent/turns
   { "prompt": "<operator instruction>",   # required
     "cwd": "<working directory>",         # required (may be empty when project_id is set)
     "session_id": "<id>",                 # optional; a new session is created if omitted
-    "client_type": "surface-gpui",        # optional render/communication medium
+    "client_type": "surface-tauri",       # optional render/communication medium
     "project_id": "<uuid>",               # optional; with empty cwd the daemon binds the
                                           #   turn to the project's workspace_root
     "guidance": ["focus on tests"],       # optional list of guidance hints
@@ -203,10 +203,11 @@ Runtime side:
 
 Surface side:
 
-- `../ocean-surface/crates/ocean-gui/src/shell/daemon.rs`: GPUI daemon client
-  wire types and scoped event URL.
-- `../ocean-surface/crates/ocean-gui/src/shell/view.rs`: create-session-before-turn flow.
-- `../ocean-surface/crates/ocean-surface-ui/src/daemon.rs`: web/extension create-session-before-turn flow.
+- `../ocean-surface/crates/ocean-surface-ui/src/daemon.rs`: shared
+  web/extension/Tauri daemon client, scoped event URL, and
+  create-session-before-turn flow.
+- `../ocean-surface/crates/ocean-tauri/src/lib.rs`: native shell composition
+  around the shared Surface UI.
 - `../ocean-surface/crates/ocean-surface-proxy/src/main.rs`: forwards
   `POST /v1/agent/sessions` and preserves `?session_id=...` on SSE.
 
@@ -214,4 +215,4 @@ Surface side:
 
 Older docs may discuss TUI rooms, tmux layouts, or room guidance. Treat those as
 TUI/runtime reference material unless they explicitly point back to this
-contract. They are not the GPUI canvas/LiveKit collaboration spec.
+contract. Archived client implementation plans are not current architecture.

@@ -4,7 +4,7 @@ This is the short, agent-facing guidance that Ocean should inject when the curre
 
 Ocean Surface renders live Leptos components from agent-emitted `component_render` events. The browser PWA and Tauri desktop shell host the same canonical Leptos/WASM bundle, so both support these components as real UI, not decoration.
 
-Do not inject this guide for `surface-gpui`, `surface-native`, `tui`, `cli`, or voice clients. Those surfaces do not render Leptos components inside chat; they need native/terminal/plain-language responses unless they explicitly advertise matching component capabilities.
+Do not inject this guide for `tui`, `cli`, or voice clients unless they explicitly advertise matching component capabilities. The shared web and Tauri Surface UI renders these Leptos components.
 
 ## Core rule
 

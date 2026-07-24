@@ -99,10 +99,9 @@ impl Default for LiveKitTokenRequest {
 /// checks `ok`. `room` echoes the room id back for the SDK status line.
 ///
 /// `expires_at` is the instant `token` stops being valid (`now + TOKEN_TTL`),
-/// emitted as an RFC3339/UTC string. The surface declares this field with NO
-/// serde default (`ocean-gui` `shell::daemon::LiveKitTokenResponse`) and threads
-/// it into live connection state so it can pre-emptively refresh before the TTL
-/// cliff (OCEAN-240). Emitting it is a contract requirement, not optional —
+/// emitted as an RFC3339/UTC string. The Surface threads it into live connection
+/// state so it can pre-emptively refresh before the TTL cliff (OCEAN-240).
+/// Emitting it is a contract requirement, not optional —
 /// omit it and the surface either fails to deserialize the payload or
 /// zero-values the expiry and drops mid-call at the 6h boundary.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]

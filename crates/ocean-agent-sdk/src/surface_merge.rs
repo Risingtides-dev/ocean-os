@@ -12,15 +12,7 @@
 //! last-writer-wins), one silently stomps the other, and the two surfaces can
 //! diverge depending on which patch the daemon happened to fan out first.
 //!
-//! `gpui_masterbuild.md` §17 frames CRDT as a deliberate staged decision:
-//!
-//! > Start with local snapshot + patch log. Evaluate Loro after patch semantics
-//! > stabilize.
-//! >
-//! > Decision test: *Can two users move/update different components and converge
-//! > without stomping? Can the patch log replay deterministically?*
-//!
-//! This module is the bounded answer to that decision test, built on the existing
+//! This module is the bounded answer to the concurrent-edit decision test, built on the existing
 //! patch log rather than a full CRDT engine. It is **not** full multiplayer
 //! (presence cursors, a real-time sync transport, and a Loro/Yjs/Automerge
 //! document model are explicitly scoped as follow-up — see the `Scope` section
@@ -425,8 +417,7 @@ mod tests {
 
     /// Two concurrent writes to the SAME component must converge to the SAME
     /// winner regardless of the order each replica applies them. This is the P3
-    /// acceptance test from gpui_masterbuild.md §17 ("two users move/update ...
-    /// and converge without stomping").
+    /// acceptance test for converging concurrent writes without stomping.
     #[test]
     fn same_component_converges_regardless_of_order() {
         let id = ComponentId::new("brief-1");
@@ -601,7 +592,7 @@ mod tests {
         SurfacePatchEnvelope {
             patch_id: PatchId::new(format!("{id}@{rev}:{actor}")),
             session_id: AgentSessionId::new_v4(),
-            surface_id: SurfaceId::new("gpui:local"),
+            surface_id: SurfaceId::new("surface:local"),
             canvas_id: CanvasId::new("canvas:main"),
             actor: ActorRef {
                 kind: actor

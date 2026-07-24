@@ -42,8 +42,8 @@ pub struct ContextUsage {
     pub measured_at_ms: i64,
 }
 
-/// Surface patch protocol — the shared agent-native canvas mutation contract
-/// (GPUI Masterbuild Slice 1). See [`surface`] for the wire types.
+/// Surface patch protocol — the shared agent-native canvas mutation contract.
+/// See [`surface`] for the wire types.
 pub mod surface;
 
 /// Surface convergent-merge layer — the CRDT-lite that lets the operator and an
@@ -298,7 +298,8 @@ pub struct AgentTurnRequest {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub project_id: Option<uuid::Uuid>,
     /// Identifies the client surface so the agent can tailor responses.
-    /// Known values: "tui", "surface-web", "surface-gpui", "surface-native", "cli", "leo-voice"
+    /// Known values include "tui", "surface-web", "surface-tauri",
+    /// "surface-extension", "cli", and "leo-voice".
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub client_type: Option<String>,
     /// Named folder-as-agent to run this turn (OCEAN folder-as-agent). When set,
@@ -435,8 +436,8 @@ pub struct AgentSessionCreateRequest {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub project_id: Option<Uuid>,
     /// Identifies the client surface so the agent can tailor responses on the
-    /// first turn. Known values: "tui", "surface-web", "surface-gpui",
-    /// "surface-native", "cli", "leo-voice".
+    /// first turn. Known values include "tui", "surface-web",
+    /// "surface-tauri", "surface-extension", "cli", and "leo-voice".
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub client_type: Option<String>,
 }
@@ -673,13 +674,12 @@ pub enum AgentTurnEvent {
         session_id: AgentSessionId,
         active: bool,
     },
-    /// The agent applied one or more validated patches to a canvas surface
-    /// (GPUI Masterbuild Slice 3). Each patch is carried as a fully-stamped
-    /// [`SurfacePatchEnvelope`] (session/surface/canvas/actor/timestamp) so the
-    /// GPUI canvas (Slice 6) can apply it to the active session's ledger without
-    /// re-deriving routing context. Scoped to `session_id` like every other
-    /// session-bearing event, so a second session never receives another
-    /// session's patches.
+    /// The agent applied one or more validated patches to a canvas surface.
+    /// Each patch is carried as a fully-stamped [`SurfacePatchEnvelope`]
+    /// (session/surface/canvas/actor/timestamp) so a client can apply it to the
+    /// active session's ledger without re-deriving routing context. Scoped to
+    /// `session_id` like every other session-bearing event, so a second session
+    /// never receives another session's patches.
     ///
     /// [`SurfacePatchEnvelope`]: crate::surface::SurfacePatchEnvelope
     SurfacePatch {
@@ -740,7 +740,7 @@ pub enum AgentTurnEvent {
 impl AgentTurnEvent {
     /// The session this event belongs to, when it carries one. The daemon's SSE
     /// handler uses this to scope a per-subscriber stream to a single session so
-    /// two concurrent sessions (e.g. the GPUI app and the Chrome extension)
+    /// two concurrent sessions (for example, Tauri and the Chrome extension)
     /// don't interleave their output into each other's transcript.
     ///
     /// `Extension` events carry an optional `scope`: a session-associated
@@ -1275,7 +1275,7 @@ mod tests {
                 patches: vec![crate::surface::SurfacePatchEnvelope {
                     patch_id: crate::surface::PatchId::new("patch-1"),
                     session_id: sid,
-                    surface_id: crate::surface::SurfaceId::new("gpui:local"),
+                    surface_id: crate::surface::SurfaceId::new("surface:local"),
                     canvas_id: crate::surface::CanvasId::new("canvas:main"),
                     actor: crate::surface::ActorRef::agent(None),
                     created_at_ms: 1234,

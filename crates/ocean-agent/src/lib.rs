@@ -1935,9 +1935,9 @@ impl AgentRuntime {
         session.bind_workspace(Path::new(&req.cwd));
 
         // Surface identity (Fixes 1–3). The session remembers the surface it
-        // was last steered from. Detect a switch (e.g. a session started in the
-        // GPUI app, continued from the Chrome extension) so the agent is told,
-        // then record the new surface on the session for next turn / resume.
+        // was last steered from. Detect a switch (for example, from the desktop
+        // Surface to the Chrome extension) so the agent is told, then record
+        // the new surface on the session for next turn / resume.
         let prev_surface = session.client_type.clone();
         let surface_switched = match (prev_surface.as_deref(), req.client_type.as_deref()) {
             (Some(old), Some(new)) => old != new,
@@ -5259,14 +5259,14 @@ done
         let model = ocean_protocol::Model::anthropic_claude_sonnet_4_6();
         let mut s = session::Session::new(&model);
         s.bind_workspace(Path::new("."));
-        s.client_type = Some("surface-gpui".into());
+        s.client_type = Some("surface-tauri".into());
         let id = s.id;
         session::save(&config_dir, &s).unwrap();
 
         let loaded = session::load_resumable(&config_dir, id).unwrap().unwrap();
         assert_eq!(
             loaded.client_type.as_deref(),
-            Some("surface-gpui"),
+            Some("surface-tauri"),
             "the session must remember which surface it was bound to so a \
              surface switch can be detected on the next turn"
         );

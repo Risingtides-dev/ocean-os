@@ -1,15 +1,13 @@
 //! Ocean **surface patch protocol** — the shared wire contract for agent-native
 //! canvas mutation.
 //!
-//! This module is Slice 1 of the GPUI Masterbuild epic (OCEAN-147). It defines
-//! the typed, serde-stable vocabulary that three independent consumers must all
-//! agree on:
+//! This module defines the typed, serde-stable vocabulary that three independent
+//! consumers must agree on:
 //!
-//! - the **GPUI native canvas** (`ocean-surface/crates/ocean-gui`), which applies
-//!   patches to its `CanvasLedger` and renders them,
-//! - the **runtime `surface_patch` tool** (Slice 2), which an agent calls to emit
+//! - the **Ocean Surface canvas**, which applies patches to its client ledger,
+//! - the **runtime `surface_patch` tool**, which an agent calls to emit
 //!   structured patches, and
-//! - the **daemon event stream** (Slice 3), which fans patches out to the right
+//! - the **daemon event stream**, which fans patches out to the right
 //!   session over `/v1/agent/events`.
 //!
 //! # Wire contract rules
@@ -17,8 +15,8 @@
 //! - Identifiers are string-backed `serde(transparent)` newtypes. On the wire a
 //!   `ComponentId` is just `"brief-1"`, never `{ "0": "brief-1" }`.
 //! - [`SurfacePatch`] is **internally tagged** on `"op"` with `snake_case`
-//!   rename, so `{ "op": "upsert_component", "component": { … } }` from §6 of the
-//!   masterbuild plan deserializes directly.
+//!   rename, so `{ "op": "upsert_component", "component": { … } }`
+//!   deserializes directly.
 //! - Geometry (`x`/`y`/`w`/`h`/`width`/`height`) is `f32` and roundtrips as JSON
 //!   numbers, never strings.
 //! - Every type carrying free-form metadata uses `serde_json::Value`, so unknown
@@ -78,7 +76,7 @@ macro_rules! string_id {
 }
 
 string_id!(
-    /// Identifies a *surface* — one client face onto a session (e.g. `gpui:local`).
+    /// Identifies a *surface* — one client face onto a session (e.g. `surface:local`).
     SurfaceId
 );
 string_id!(
@@ -416,8 +414,8 @@ mod tests {
     use super::*;
     use serde_json::json;
 
-    /// The EXACT `upsert_component` JSON from gpui_masterbuild.md §6 must
-    /// deserialize into `SurfacePatch::UpsertComponent`.
+    /// The canonical `upsert_component` JSON must deserialize into
+    /// `SurfacePatch::UpsertComponent`.
     #[test]
     fn deserializes_section_6_upsert_component() {
         let raw = json!({
@@ -610,7 +608,7 @@ mod tests {
         let env = SurfacePatchEnvelope {
             patch_id: PatchId::new("patch-1"),
             session_id: AgentSessionId::new_v4(),
-            surface_id: SurfaceId::new("gpui:local"),
+            surface_id: SurfaceId::new("surface:local"),
             canvas_id: CanvasId::new("canvas:main"),
             actor: ActorRef::agent(Some("sage".to_string())),
             created_at_ms: 1_725_000_000_000,

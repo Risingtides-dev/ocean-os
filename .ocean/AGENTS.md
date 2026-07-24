@@ -8,7 +8,7 @@ This child doc governs the `.ocean/` directory only — Ocean runtime artifacts,
 
 - **Scope:** `.ocean/` tree only
 - **Parent contract:** `/AGENTS.md` (repo root) — read it first
-- **What lives here:** runtime config, session snapshots, worktree state, GPUI assets, operational artifacts
+- **What lives here:** runtime config, session snapshots, worktree state, and operational artifacts
 
 ## Local Contracts
 

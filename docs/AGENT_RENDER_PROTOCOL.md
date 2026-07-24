@@ -388,13 +388,6 @@ The result includes the interaction event. This lets the agent do:
 - The current session component tray derives todo projections from correlated tool events and is separate from the file tree.
 - Posting `/v1/component/event` from TUI interactions remains a future phase. The current TUI does not enter a general component-interaction mode.
 
-### ocean-gui (GPUI native)
-
-- GPUI is a native desktop surface, not a Leptos/WebView renderer.
-- Do not assume Leptos components, HTML, maps, dashboards, or web widgets render inside chat.
-- Until GPUI has native component implementations for a kind, agents should prefer concise markdown, file paths, command/status summaries, and native surface-state descriptions.
-- GPUI clients identify turns with `client_type: "surface-gpui"` so the daemon can inject GPUI-safe guidance instead of the web component playbook.
-
 ### CLI
 
 - The CLI has no general component renderer.

@@ -116,7 +116,7 @@ Generic transports and live external-system harnesses should move out only after
 
 ### 4.4 `ocean-surface` — first-party Ocean clients
 
-Owns first-party GPUI, web/PWA, desktop/mobile, browser/editor, voice, canvas, and shared rendering products that steer the daemon.
+Owns first-party web/PWA, Tauri desktop/mobile, browser/editor, voice, canvas, and shared rendering products that steer the daemon.
 
 A bridge hosted inside another product is normally a service adapter, not automatically an `ocean-surface` product. Herdr and generic Slack integration therefore begin in `ocean-extensions`.
 

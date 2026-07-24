@@ -2,9 +2,8 @@
 //! Slack-canvas-as-playground tool (OCEAN-214).
 //!
 //! This is the typed, serde-stable vocabulary for the `slack_canvas` runtime tool
-//! (Phase 2). It mirrors the role [`crate::surface`] plays for the GPUI canvas:
-//! a small set of structured **ops** the agent emits to drive a persistent,
-//! bidirectional surface — except the surface here is a Slack Canvas.
+//! (Phase 2): a small set of structured **ops** the agent emits to drive a
+//! persistent, bidirectional Slack Canvas.
 //!
 //! Two independent consumers must agree on these types:
 //!
@@ -16,8 +15,7 @@
 //!
 //! # Bidirectional by design
 //!
-//! Like the GPUI canvas (`surface_patch` to write + a ledger to read back), the
-//! Slack canvas is meant to be a surface the agent *owns*: it can create canvases,
+//! The Slack canvas is meant to be a surface the agent *owns*: it can create canvases,
 //! mutate them (`update`/`append`), and **read back** their current contents
 //! ([`SlackCanvasOp::Read`]) to reason over what they hold. The read op's result
 //! ([`SlackCanvasResult::contents`]) is the awareness channel — Phase 2 contracts
