@@ -562,6 +562,12 @@ pub struct App {
     image_view: Option<PathBuf>,
     image_body: Rect,
     image_placed: bool,
+    /// Inline image placements from the last frame's chat + editor. Diffed
+    /// after every Ratatui draw so static images aren't retransmitted.
+    previous_placements: Vec<kitty::Placement>,
+    /// True when the image viewer was open in the previous frame — used to
+    /// trigger one CLEAR_ALL when it closes.
+    image_view_was_open: bool,
     /// Mouse text selection. Chat and editor selections use stable content rows;
     /// other panes use terminal screen rows. `sel_rect` keeps the sweep bounded
     /// to the pane where it began. Releasing auto-copies the swept text.
@@ -737,6 +743,8 @@ impl App {
             image_view: None,
             image_body: Rect::default(),
             image_placed: false,
+            previous_placements: Vec::new(),
+            image_view_was_open: false,
             sel_press: None,
             sel_rect: None,
             selection: None,
@@ -999,14 +1007,31 @@ impl App {
                 self.dispatch(action);
                 dirty = true;
             }
-            // The image viewer closed (or switched images): delete the placed
-            // kitty image and force a full repaint so the workbench comes back
-            // clean underneath where the pixels were.
+            // Close / switch the full-screen image viewer: clear its pixels and
+            // force a repaint so the workbench comes back clean.
             if self.image_placed && self.image_view.is_none() {
                 kitty::emit(kitty::CLEAR_ALL);
                 self.image_placed = false;
+                self.previous_placements.clear();
                 let _ = terminal.clear();
                 dirty = true;
+            }
+            // Any modal overlay open clears inline images so they don't bleed
+            // through. Same for the image viewer itself (it owns the layer).
+            let overlay_open = self.launch_open
+                || self.resume_open
+                || self.settings_open
+                || self.permissions_open
+                || self.models_open
+                || self.advisor_open
+                || self.memory_open
+                || self.lsp_open
+                || self.providers_open;
+            if (overlay_open || self.image_view.is_some())
+                && !self.previous_placements.is_empty()
+            {
+                kitty::emit(kitty::CLEAR_ALL);
+                self.previous_placements.clear();
             }
             // While the viewer is open and its pixels are already placed, it's a
             // STATIC takeover — skip redraws (a redraw would need to re-place the
@@ -1017,22 +1042,67 @@ impl App {
             if !viewer_static && (immediate || (is_render && dirty)) {
                 terminal.draw(|f| self.draw(f))?;
                 dirty = false;
-                // Just painted the viewer frame: now lay the pixels into the
-                // reserved body rect, once (kitty images float above ratatui's
-                // cells — see `kitty`).
+                // --- full-screen viewer: place pixels once ---
                 if self.image_view.is_some() && !self.image_placed {
                     if let Some(path) = self.image_view.clone() {
                         let b = self.image_body;
                         if let Some(seq) = kitty::place_png_at(&path, b.x, b.y, b.width, b.height) {
                             kitty::emit(&seq);
                         }
-                        // Mark placed even when kitty declined (non-kitty /
-                        // non-PNG): the frame's note is the render, and this
-                        // keeps the static-takeover gate from redrawing.
                         self.image_placed = true;
                     }
                 }
+                // --- inline images: collect, diff, emit ---
+                //
+                // kitty images float ABOVE ratatui's cell buffer, so ratatui
+                // repainting a row does not erase pixels sitting on it. Any
+                // placement that disappears or moves must therefore be cleared
+                // explicitly, or scrolling smears stale images down the pane.
+                //
+                // Retransmitting every frame would re-upload the PNG at the
+                // render cadence, so: unchanged set → emit nothing; pure
+                // additions (nothing removed/moved) → place only the new ones;
+                // anything removed or moved → one CLEAR_ALL, then re-place the
+                // whole visible set.
+                if self.image_view.is_none() && !overlay_open {
+                    let mut current: Vec<kitty::Placement> = Vec::new();
+                    current.extend_from_slice(self.chat.image_placements());
+                    current.extend_from_slice(self.editor.image_placements());
+                    if current != self.previous_placements {
+                        let purely_additive = self
+                            .previous_placements
+                            .iter()
+                            .all(|old| current.contains(old));
+                        if !purely_additive && !self.previous_placements.is_empty() {
+                            kitty::emit(kitty::CLEAR_ALL);
+                        }
+                        for placement in &current {
+                            let already_on_screen =
+                                purely_additive && self.previous_placements.contains(placement);
+                            if already_on_screen {
+                                continue;
+                            }
+                            let rect = placement.rect;
+                            if let Some(seq) = kitty::place_png_at(
+                                &placement.path,
+                                rect.x,
+                                rect.y,
+                                rect.width,
+                                rect.height,
+                            ) {
+                                kitty::emit(&seq);
+                            }
+                        }
+                        self.previous_placements = current;
+                    }
+                }
+            } else if self.image_view.is_none() && !overlay_open && self.image_view_was_open {
+                // No redraw this iteration, but the viewer just closed: drop
+                // stale placements so the next real draw starts clean.
+                kitty::emit(kitty::CLEAR_ALL);
+                self.previous_placements.clear();
             }
+            self.image_view_was_open = self.image_view.is_some();
         }
         Ok(())
     }
