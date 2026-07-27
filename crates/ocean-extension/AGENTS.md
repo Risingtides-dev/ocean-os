@@ -2,7 +2,7 @@
 
 ## Purpose
 
-Own schema-v1 `ocean-extension.toml` parsing, SemVer compatibility, and canonical package-resource validation without executing package code.
+Own schema-v1 `ocean-extension.toml` parsing, filesystem-independent metadata validation, SemVer compatibility, and canonical package-resource validation without executing package code.
 
 ## Ownership
 
@@ -12,8 +12,8 @@ Own schema-v1 `ocean-extension.toml` parsing, SemVer compatibility, and canonica
 
 ## Local Contracts
 
-- Keep raw parsed manifests distinct from validated canonical resources.
-- Schema v1 fails closed on unknown fields and resource kinds.
+- Keep raw parsed manifests distinct from filesystem-independent validated metadata and validated canonical resources.
+- Schema v1 fails closed on unknown fields/resource kinds and service events outside the versioned observer vocabulary.
 - Validation is filesystem inspection only: it must never launch package code.
 - Every declared filesystem resource canonicalizes beneath the canonical package root.
 - Manifests contain capability names/references, never secret or environment values. Schema-v1 secret references use the host-resolvable `<scheme>:<key>` grammar documented by `SecretReference`; syntax validation does not prove publisher intent.

@@ -414,6 +414,14 @@ impl AgentRuntime {
         Ok(runtime)
     }
 
+    /// The daemon-owned configuration root captured when this runtime was built.
+    /// Read-only adapters use this instead of re-reading process-global
+    /// environment variables, keeping one coherent authority in parallel tests
+    /// and for the lifetime of the daemon.
+    pub fn config_dir(&self) -> &Path {
+        &self.config_dir
+    }
+
     /// Connect configured MCP servers and fold their tools into the capability
     /// registry, on top of the built-ins. Reads `<config_dir>/ocean.toml`;
     /// absent/empty config leaves the registry built-ins-only. Each server is

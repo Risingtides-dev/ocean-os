@@ -134,6 +134,7 @@ tree-sitter-typescript = "=0.23.2"
 sha2 = "0.10"
 getrandom = "0.3"
 ocean-oauth = { path = "crates/ocean-oauth" }
+fs2 = "0.4"
 parking_lot = "0.12"
 globset = "0.4"
 grep-regex = "0.1"

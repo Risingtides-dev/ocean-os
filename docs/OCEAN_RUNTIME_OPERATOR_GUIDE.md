@@ -533,6 +533,10 @@ POST   /v1/prompt                         synchronous one-shot prompt
 GET    /v1/observatory/snapshot           consistent projection at a watermark cursor (nodes, edges, attention, instance ids)
 GET    /v1/observatory/events             SSE live tail with durable resume (Last-Event-ID or ?after=), reset/gap frames, 3s keepalive
 GET    /v1/observatory/replay             ascending bounded JSON event pages (?after=<cursor>&through=&limit=&filter=), 410 on retention-crossed ranges
+
+# Extensions (read-only Phase 1 state; never executes package code)
+GET    /v1/extensions/{id}/inspect        installed/trusted/enabled projection (?project_id=<registered-uuid>)
+GET    /v1/extensions/{id}/doctor         static state/digest/manifest/trust diagnostics (?project_id=<registered-uuid>)
 GET    /v1/requests                       list async requests
 POST   /v1/requests                       enqueue an async request
 POST   /v1/requests/{id}/cancel           cancel an in-flight request

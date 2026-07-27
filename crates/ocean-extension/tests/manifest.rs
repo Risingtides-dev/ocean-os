@@ -350,6 +350,25 @@ fn every_path_bearing_resource_type_is_checked() {
 }
 
 #[test]
+fn service_events_are_bounded_to_the_versioned_observer_vocabulary() {
+    let package = Package::new("service-events");
+    package.make("run.sh");
+    for events in [
+        "[\"before_turn\"]",
+        "[\"turn_started\", \"turn_started\"]",
+        "[\"TOKEN=secret\"]",
+    ] {
+        let input = format!(
+            "{MINIMAL}\n[[services]]\nid = \"svc\"\nentry = \"run.sh\"\nevents = {events}\n"
+        );
+        assert!(matches!(
+            package.validate(&input, "1.0.0"),
+            Err(ExtensionManifestError::InvalidServiceEvent { .. })
+        ));
+    }
+}
+
+#[test]
 fn capability_assignments_whitespace_paths_and_raw_values_are_rejected() {
     let package = Package::new("capabilities");
     package.make("run.sh");
@@ -384,6 +403,24 @@ fn capability_assignments_whitespace_paths_and_raw_values_are_rejected() {
             "accepted {field}={value}"
         );
     }
+}
+
+#[test]
+fn metadata_validation_is_filesystem_independent_but_keeps_schema_checks() {
+    let input =
+        format!("{MINIMAL}\n[[plugins]]\nid = \"missing\"\npath = \"plugins/not-installed\"\n");
+    let metadata = RawOceanExtensionManifest::parse(&input)
+        .unwrap()
+        .validate_metadata(&Version::parse("1.0.0").unwrap())
+        .expect("metadata validation does not touch package paths");
+    assert_eq!(metadata.plugins[0].id, "missing");
+    assert_eq!(metadata.plugins[0].path, "plugins/not-installed");
+
+    let package = Package::new("metadata-vs-filesystem");
+    assert!(matches!(
+        package.validate(&input, "1.0.0"),
+        Err(ExtensionManifestError::InvalidResourcePath { .. })
+    ));
 }
 
 #[cfg(unix)]
