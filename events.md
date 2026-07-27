@@ -5274,3 +5274,19 @@ check; strict all-target Clippy for ocean-extension/ocean-agent/ocean-cli/
 ocean-daemon; formatting; docs-check (30 packages, 127 active Markdown files,
 155 local links); and diff whitespace checks.
 _________________________________________________________________________________
+time:      [18:31] [27-07-26]
+agent:     [pi], [unknown-model], [worker]
+worktree:  [docs/extensions-stage-a-implementation-manifest]
+type:      [plan]
+area:      [docs]
+
+Drafted the proposed Ocean Extension Host Stage A implementation manifest for
+Phase 1 rescue A0 and ordered slices A1–A5. The exact contract selects a
+host-authenticated bidirectional stdio NDJSON v1 service channel, metadata-only
+boot-local bounded lifecycle delivery, honest non-emission of `session_stopped`,
+macOS/Linux process-group supervision, explicit secret-to-child bindings,
+daemon-confined mutable roots, and journaled daemon-only local/pinned-Git package
+mutations with separate install/trust/enable transitions. Indexed the proposal
+and corrected only adjacent stale Phase 1/Crew status claims. No code, PR,
+deployment, or daemon operation was performed. `cargo xtask docs-check` and
+`git diff --check` passed before commit.
