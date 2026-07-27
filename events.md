@@ -5310,3 +5310,19 @@ independently reviewed sub-slices, and narrowly reconciles active Phase 1 and
 Undertow naming prose. No code, Stage B-D, integration, UI, PR, deployment, or
 operator ratification was added.
 _________________________________________________________________________________
+_________________________________________________________________________________
+time:      [19:15] [27-07-26]
+agent:     [pi] [gpt-5.4] [thoth]
+worktree:  [docs/extensions-stage-a-implementation-manifest]
+type:      [review]
+area:      [writing]
+
+Closed the final two independent-review defects in the still-proposed Stage A
+manifest. Registry publication now names the first state-file rename as the
+irreversible commit point, requires journal-proven roll-forward under the
+exclusive lock, and exposes an unambiguous committed recovery-error response
+instead of claiming the old revision survives mixed state. Pinned Git now uses
+a non-expiring per-process CURLOPT_RESOLVE entry, including bracketed IPv6, so
+the 60-second acquisition cannot fall back to DNS after cache expiry. No code,
+ratification, PR, deployment, Stage B-D, UI, or integration work was added.
+_________________________________________________________________________________

@@ -702,24 +702,36 @@ Install/update uses two distinct phases; other mutations begin at step 2:
 5. Atomically publish the immutable artifact if applicable.
 6. Rename `installs.json`, `trust.json`, `enabled.json`, and
    `service-grants.json` to the complete staged files while the exclusive lock
-   prevents a reader from observing the intermediate set.
-7. Fsync each file and the extensions directory, mark the journal `committed`,
-   fsync, then remove staging/journal and fsync their parent directories.
-8. Release the lock and reconcile the supervisor to the committed revision.
+   prevents a reader from observing the intermediate set. The first successful
+   state-file rename is the irreversible durable commit point.
+7. After that commit point, roll forward every remaining verified new file under
+   the same exclusive lock, fsync each file and the extensions directory, mark
+   the journal `committed`, fsync it, then remove staging/journal and fsync their
+   parent directories.
+8. Release the lock only after the four-file generation is coherent or recovery
+   has declared `registry_recovery_required`; reconcile the supervisor only to a
+   coherent committed revision.
 
 All four documents carry the same nonzero revision after the first Stage A
 mutation; the A0-only absence exception is only §12.1's read upgrade. Recovery
-validates journal and staged hashes. If no state file was replaced, it removes
-staging and an unreferenced just-published artifact. If any state file reached
-the new revision, it rolls forward all remaining verified new files; it never
-guesses a rollback from a mixed generation. A corrupt/missing required staged
-file fails closed with `registry_recovery_required` and starts no extension.
-Orphan quarantine/staging/store payloads are non-executable and may be removed
-only after proving no install or journal references them.
+validates journal and staged hashes. Before the commit point, failure removes
+staging and an unreferenced just-published artifact and leaves the old coherent
+revision effective. Once any state file reaches the new revision, the mutation
+is committed and recovery rolls forward all remaining verified new files; it
+never guesses a rollback from a mixed generation. No shared reader or supervisor
+reconciliation may run between the first rename and coherent roll-forward. If a
+required staged file is corrupt or missing after the commit point, the registry
+fails closed as committed `registry_recovery_required`, starts no extension, and
+cannot claim the old revision remains effective. Orphan quarantine/staging/store
+payloads are non-executable and may be removed only after proving no install or
+journal references them.
 
-Any failure through step 7 is pre-commit and leaves the old coherent revision
-effective. Reconciliation happens after durable commit and therefore cannot
-make that claim; its exact committed response is §15. Acquisition concurrency
+Failures before step 6's first successful rename are pre-commit and use
+`committed:false`. An in-process error after that point must attempt roll-forward
+before responding; successful recovery returns the committed envelope, while
+unrecoverable mixed state uses §15's explicit committed recovery-error envelope.
+A process crash may lose the HTTP response, but next startup performs the same
+journal-proven recovery before readers or services start. Acquisition concurrency
 is four daemon-wide, while registry publication remains one writer. Tests hold a
 60-second fake acquisition open while list/inspect/doctor continue coherent
 shared-lock reads and three other acquisitions proceed.
@@ -792,12 +804,14 @@ unspecified, documentation-only, or otherwise non-public. The hostname URL
 remains the TLS URL so certificate and SNI verification are unchanged. For each
 connection attempt, the host launches Git with exactly one already-checked
 address pinned by
-`-c http.curloptResolve=+<host>:443:<address>` (Git's
-`CURLOPT_RESOLVE` binding); it never gives Git an unpinned hostname attempt.
+`-c http.curloptResolve=<host>:443:<address-literal>` (Git's
+`CURLOPT_RESOLVE` binding), using brackets around an IPv6 address literal. The
+entry deliberately has no leading `+`, so it is non-expiring for the lifetime of
+the bounded Git process; the host never gives Git an unpinned hostname attempt.
 Fallback tries another member of the originally checked set under the same total
 deadline and a fresh pinned process. DNS is not consulted by Git/libcurl for the
-pinned host, redirects are disabled, and a resolved/redirected second host is
-never accepted.
+pinned host, including retries or additional connections, redirects are disabled,
+and a resolved/redirected second host is never accepted.
 
 Pinned Git requires host Git **2.37.0 or newer**, the first release carrying
 `http.curloptResolve`, and the normal libcurl HTTPS transport. Before acquisition
@@ -908,10 +922,17 @@ Every applied mutation returns the same post-commit envelope:
 ```
 
 HTTP `200` means reconciliation required by the operation is complete. HTTP
-`202` means registry commit succeeded but startup reconciliation or reap remains
-`pending|blocked`; it is never encoded as a pre-commit error and the committed
-revision is immediately authoritative. Startup failure after enable is runtime
-status (`unhealthy|circuit_open`), not mutation rollback. Disable commits filter
+`202` means a coherent registry commit succeeded but startup reconciliation or
+reap remains `pending|blocked`; it is never encoded as a pre-commit error and the
+committed revision is immediately authoritative. If the irreversible commit
+point was crossed but journal-proven roll-forward cannot restore a coherent
+four-file generation, HTTP `500` uses
+`{"ok":false,"mutation":{"operation_id":"<uuid>","committed":true,"state_revision":9},"error":{"code":"registry_recovery_required","message":"extension registry recovery is required"}}`.
+The daemon admits no shared registry read or service reconciliation from that
+mixed generation; the CLI prints the committed revision, exits with dedicated
+code 4, and directs the operator to restart/recover rather than retry the
+mutation. Startup failure after enable is runtime status
+(`unhealthy|circuit_open`), not mutation rollback. Disable commits filter
 removal first and returns `200` only after required reap; a bounded reap failure
 returns `202`, leaves update/remove guarded by `extension_active`, and remains
 operator-visible until cleanup. Remove itself requires already-reaped state.
@@ -950,7 +971,11 @@ absent through all operations above.
 - Failed service startup does not roll back install/trust/enable state; status is
   unhealthy/circuit-open and ordinary Ocean remains available. Operator
   rollback is disable, inspect/doctor, then exact pinned update/remove.
-- Failed registry mutation preserves the old coherent revision through §12.3.
+- A registry mutation that fails before the first state-file rename preserves
+  the old coherent revision. After that irreversible commit point it must roll
+  forward to the new revision or fail closed as committed
+  `registry_recovery_required`; it never claims the old revision remains
+  effective.
 - A successful update can be rolled back only by an explicit update to the old
   local tree or exact Git revision, followed by separate trust and enable. There
   is no implicit `latest` or auto-trust rollback.
