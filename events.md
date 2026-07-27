@@ -5290,3 +5290,23 @@ mutations with separate install/trust/enable transitions. Indexed the proposal
 and corrected only adjacent stale Phase 1/Crew status claims. No code, PR,
 deployment, or daemon operation was performed. `cargo xtask docs-check` and
 `git diff --check` passed before commit.
+_________________________________________________________________________________
+time:      [19:07] [27-07-26]
+agent:     [pi] [gpt-5.4] [worker]
+worktree:  [docs/extensions-stage-a-implementation-manifest]
+type:      [plan]
+area:      [writing]
+
+Corrected the still-proposed Ocean Extension Host Stage A implementation
+manifest after rebasing its original draft onto Phase 1 merge 77630bda. The
+revision binds replay to activation epochs and historical scope, states native
+services have daemon-user-equivalent authority, requires generation-safe process
+group cleanup, names all lifecycle terminal/admission/tool/project authorities,
+defines one ACK/control contract and the strict service-grants.json schema,
+moves acquisition outside the state lock, pins checked DNS addresses to Git's
+actual libcurl connection, and specifies committed reconciliation responses plus
+exact retention transitions. It removes Git subdir from v1, splits A2/A3 into
+independently reviewed sub-slices, and narrowly reconciles active Phase 1 and
+Undertow naming prose. No code, Stage B-D, integration, UI, PR, deployment, or
+operator ratification was added.
+_________________________________________________________________________________
