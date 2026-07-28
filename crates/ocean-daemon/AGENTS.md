@@ -47,7 +47,9 @@ This crate owns the long-running Ocean HTTP service on `:4780`, including API ro
 
 - `POST /v1/ocean-buddy/events` is the deliberately narrow first Buddy ingress: it accepts only a typed mocked `attached` lifecycle event, carries attachment metadata but no image bytes, performs no camera/session/tool work, and returns a typed Watch result card. Watch approval remains in the Watch-to-iPhone adapter flow.
 - Session behavior lives in `ocean-agent`; route changes must not create a separate session model.
-- `extension_lifecycle.rs` is the Stage A1 pure, metadata-only lifecycle boundary: it owns deterministic source adaptation, bounded per-request runtime-tool-id to host-UUID correlation, permission pairing, validate-before-commit publication, lifecycle-bounded cloneable request-scoped atomic terminal authority with fail-closed active registration, terminal cleanup of abandoned request state, publication-time project classification, and bounded boot-local event retention. It is intentionally unwired until A2b and must not gain process launch, service transport, registry mutation, routes, Observatory coupling, or producer call sites in A1.
+- `extension_lifecycle.rs` is the accepted Stage A1 pure, metadata-only lifecycle boundary: it owns deterministic source adaptation, bounded correlation, request-scoped terminal authority, cleanup, and boot-local retention. It remains intentionally unwired until A2b and must not gain process launch, transport, registry mutation, routes, Observatory coupling, or live producer call sites.
+- `extension_registry.rs` is the sole coherent read-only extension registry authority. It preserves the three accepted A0 schemas, treats absent `service-grants.json` as the one empty A0 upgrade form, strictly validates a present equal-revision companion against exact trust and descriptor-anchored service metadata, and is the only source of activation records. Inspect/doctor remain Phase 1-compatible and execute/probe nothing.
+- `extension_service.rs` is only the Stage A2a minimum supervisor: exact acknowledged native services, strict hello/ready stdio, descriptor-bound executable/cwd, daemon-assigned private roots, `env_clear` plus explicit ordinary/`env:` secret bindings, read-only status cache, and retained-leader generation-safe macOS/Linux process-group cleanup. It owns no events/replay/queues, ping health, restart/backoff/circuit breaking, stderr retention, mutation, or route.
 - Product turns and legacy/call turns (legacy requests pin a session id before
   admission) take the shared non-blocking session operation lease before
   `TurnStarted`, invalidation, or request registration and retain it through
@@ -119,7 +121,7 @@ This crate owns the long-running Ocean HTTP service on `:4780`, including API ro
 - `cargo test -p ocean-daemon cors::tests:: -- --nocapture`
 - `cargo test -p ocean-daemon component_event_ -- --nocapture`
 - `cargo test -p ocean-daemon event_adapter::tests:: -- --nocapture`
-- `cargo test -p ocean-daemon extension_lifecycle -- --nocapture`
+- `cargo test -p ocean-daemon extension_ -- --nocapture --test-threads=1`
 - `cargo test -p ocean-daemon fs_ -- --nocapture`
 - `cargo test -p ocean-daemon metrics::tests:: -- --nocapture`
 - `cargo test -p ocean-daemon model_catalog_ -- --nocapture`

@@ -1,13 +1,13 @@
-//! Read-only Extension Phase 1 state inspection.
+//! Sole read-only authority for the daemon-owned extension registry.
 //!
-//! The daemon is the sole authority for `<config_dir>/extensions`. This module
-//! reads separately persisted install, trust, and enablement documents under one
-//! shared lock. State and package traversal are descriptor-relative: every
-//! untrusted path component is opened with `O_NOFOLLOW`, package bytes are
-//! hashed from those exact handles, and manifest metadata is validated against
-//! the same anchored inventory without reopening package pathnames.
+//! The accepted Phase 1 install/trust/enable schemas remain unchanged. Stage A2a
+//! adds the strict `service-grants.json` companion, with the one ratified upgrade
+//! exception: absence means an empty grant set for an otherwise coherent A0
+//! three-file snapshot. State and package traversal remain descriptor-relative
+//! under one shared lock; this module is also the only source of supervised
+//! activation records consumed by `extension_service`.
 
-use std::collections::{BTreeSet, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::ffi::{CStr, CString, OsStr};
 use std::fmt;
 use std::fs::{self, File};
@@ -25,9 +25,11 @@ use axum::{
     http::StatusCode,
     Json,
 };
+use ocean_agent_sdk::extension_lifecycle::LifecycleEventKind;
 use ocean_extension::{
-    validate_extension_id, ExtensionManifestError, ExternalKind, OceanExtensionMetadata,
-    RawOceanExtensionManifest, RestartPolicy, SecretReference, ServiceHealthKind,
+    validate_extension_id, ExtensionManifestError, ExternalKind, MetadataServiceResource,
+    OceanExtensionMetadata, RawOceanExtensionManifest, RestartPolicy, SecretReference,
+    ServiceHealthKind,
 };
 use semver::Version;
 use serde::{Deserialize, Serialize};
@@ -42,6 +44,8 @@ const STATE_SCHEMA_VERSION: u32 = 1;
 const STATE_FILE_LIMIT: u64 = 1024 * 1024;
 const MANIFEST_FILE_LIMIT: u64 = 1024 * 1024;
 const MAX_STATE_ENTRIES: usize = 1024;
+const MAX_SERVICE_GRANTS: usize = 1024;
+const MAX_SECRET_BINDINGS: usize = 256;
 const MAX_CAPABILITY_ITEMS: usize = 256;
 const MAX_STRING_BYTES: usize = 4096;
 const MAX_PACKAGE_ENTRIES: usize = 10_000;
@@ -82,6 +86,31 @@ struct EnabledFile {
     schema_version: u32,
     state_revision: u64,
     extensions: Vec<ExtensionEnablement>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ServiceGrantsFile {
+    schema_version: u32,
+    state_revision: u64,
+    service_grants: Vec<ServiceGrant>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct ServiceGrant {
+    id: String,
+    digest: String,
+    service_id: String,
+    native_process_ack: bool,
+    secret_bindings: Vec<SecretBinding>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct SecretBinding {
+    pub(crate) target_env: String,
+    pub(crate) reference: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -153,6 +182,30 @@ struct StateSnapshot {
     installs: Vec<InstalledArtifact>,
     grants: Vec<ArtifactTrustGrant>,
     enablement: Vec<ExtensionEnablement>,
+    service_grants: Vec<ServiceGrant>,
+}
+
+/// One immutable, descriptor-anchored native service activation.
+///
+/// File descriptors keep the exact verified package and executable generation
+/// alive after the shared registry lock is released. Secret values are never
+/// part of this record.
+pub(crate) struct ServiceActivation {
+    pub(crate) package_id: String,
+    pub(crate) package_version: String,
+    pub(crate) package_digest: String,
+    pub(crate) service_id: String,
+    pub(crate) activation_revision: u64,
+    pub(crate) config_dir: PathBuf,
+    pub(crate) package_path: PathBuf,
+    pub(crate) package_directory: File,
+    pub(crate) executable: File,
+    pub(crate) executable_path: PathBuf,
+    pub(crate) args: Vec<String>,
+    pub(crate) events: Vec<LifecycleEventKind>,
+    pub(crate) environment: Vec<String>,
+    pub(crate) secret_bindings: Vec<SecretBinding>,
+    pub(crate) startup_timeout: Duration,
 }
 
 struct LockedState {
@@ -310,7 +363,7 @@ pub(super) struct ExtensionStateQuery {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-enum StateError {
+pub(crate) enum StateError {
     MissingComponent(&'static str),
     InvalidComponent(&'static str),
     LockBusy,
@@ -323,7 +376,7 @@ enum StateError {
 }
 
 impl StateError {
-    const fn code(&self) -> &'static str {
+    pub(crate) const fn code(&self) -> &'static str {
         match self {
             Self::MissingComponent(_) => "extension_state_incomplete",
             Self::InvalidComponent(_) => "extension_state_unsafe_path",
@@ -366,6 +419,7 @@ fn empty_state() -> LockedState {
             installs: Vec::new(),
             grants: Vec::new(),
             enablement: Vec::new(),
+            service_grants: Vec::new(),
         },
         _lock: None,
     }
@@ -381,6 +435,7 @@ fn read_locked_state(config_dir: &FsPath) -> Result<LockedState, StateError> {
     let installs: InstallsFile = read_state_json_at(&root, "installs.json")?;
     let trust: TrustFile = read_state_json_at(&root, "trust.json")?;
     let enabled: EnabledFile = read_state_json_at(&root, "enabled.json")?;
+    let service_grants = read_optional_service_grants(&root)?;
 
     for (file, schema) in [
         ("installs.json", installs.schema_version),
@@ -391,9 +446,18 @@ fn read_locked_state(config_dir: &FsPath) -> Result<LockedState, StateError> {
             return Err(StateError::UnsupportedSchema(file));
         }
     }
+    if service_grants
+        .as_ref()
+        .is_some_and(|grants| grants.schema_version != STATE_SCHEMA_VERSION)
+    {
+        return Err(StateError::UnsupportedSchema("service-grants.json"));
+    }
     if installs.state_revision == 0
         || installs.state_revision != trust.state_revision
         || installs.state_revision != enabled.state_revision
+        || service_grants
+            .as_ref()
+            .is_some_and(|grants| grants.state_revision != installs.state_revision)
     {
         return Err(StateError::RevisionMismatch);
     }
@@ -403,8 +467,13 @@ fn read_locked_state(config_dir: &FsPath) -> Result<LockedState, StateError> {
         installs: installs.installs,
         grants: trust.grants,
         enablement: enabled.extensions,
+        // The sole A0 upgrade exception is absence => empty. No file is written.
+        service_grants: service_grants
+            .map(|grants| grants.service_grants)
+            .unwrap_or_default(),
     };
     validate_snapshot(&mut snapshot)?;
+    validate_service_grants_against_artifacts(&root, &snapshot)?;
 
     Ok(LockedState {
         root: Some(root),
@@ -457,6 +526,14 @@ fn read_state_json_at<T: for<'de> Deserialize<'de>>(
     let mut file = open_regular_file_at(root, OsStr::new(name), name)?;
     let bytes = read_capped(&mut file, STATE_FILE_LIMIT, name)?;
     serde_json::from_slice(&bytes).map_err(|_| StateError::Parse(name))
+}
+
+fn read_optional_service_grants(root: &File) -> Result<Option<ServiceGrantsFile>, StateError> {
+    match read_state_json_at(root, "service-grants.json") {
+        Ok(grants) => Ok(Some(grants)),
+        Err(StateError::MissingComponent("service-grants.json")) => Ok(None),
+        Err(error) => Err(error),
+    }
 }
 
 fn read_capped(file: &mut File, limit: u64, label: &'static str) -> Result<Vec<u8>, StateError> {
@@ -686,6 +763,173 @@ fn validate_snapshot(snapshot: &mut StateSnapshot) -> Result<(), StateError> {
     snapshot
         .enablement
         .sort_by(|left, right| left.id.cmp(&right.id));
+
+    if snapshot.service_grants.len() > MAX_SERVICE_GRANTS {
+        return Err(StateError::InvalidRecord("service-grant-count"));
+    }
+    let mut previous: Option<(&str, &str, &str)> = None;
+    for grant in &snapshot.service_grants {
+        validate_extension_id(&grant.id).map_err(|_| StateError::InvalidRecord("service-grant"))?;
+        validate_resource_id(&grant.service_id)?;
+        if digest_hex(&grant.digest).is_none() || !grant.native_process_ack {
+            return Err(StateError::InvalidRecord("service-grant"));
+        }
+        let identity = (
+            grant.id.as_str(),
+            grant.digest.as_str(),
+            grant.service_id.as_str(),
+        );
+        if previous.is_some_and(|prior| prior >= identity) {
+            return Err(StateError::InvalidRecord("service-grant-order"));
+        }
+        previous = Some(identity);
+        validate_secret_bindings(&grant.secret_bindings)?;
+    }
+    Ok(())
+}
+
+fn validate_resource_id(value: &str) -> Result<(), StateError> {
+    let mut bytes = value.bytes();
+    let valid = bytes
+        .next()
+        .is_some_and(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit())
+        && bytes.all(|byte| {
+            byte.is_ascii_lowercase() || byte.is_ascii_digit() || matches!(byte, b'-' | b'_')
+        });
+    if valid {
+        Ok(())
+    } else {
+        Err(StateError::InvalidRecord("service-grant"))
+    }
+}
+
+fn validate_secret_bindings(bindings: &[SecretBinding]) -> Result<(), StateError> {
+    if bindings.len() > MAX_SECRET_BINDINGS {
+        return Err(StateError::InvalidRecord("secret-binding-count"));
+    }
+    let mut previous: Option<(&str, &str)> = None;
+    let mut targets = HashSet::new();
+    let mut references = HashSet::new();
+    for binding in bindings {
+        let identity = (binding.target_env.as_str(), binding.reference.as_str());
+        if previous.is_some_and(|prior| prior >= identity)
+            || !targets.insert(binding.target_env.as_str())
+            || !references.insert(binding.reference.as_str())
+            || !valid_child_environment_name(&binding.target_env)
+            || reserved_child_environment_name(&binding.target_env)
+            || env_secret_source(&binding.reference).is_none()
+        {
+            return Err(StateError::InvalidRecord("secret-binding"));
+        }
+        previous = Some(identity);
+    }
+    Ok(())
+}
+
+pub(crate) fn valid_child_environment_name(value: &str) -> bool {
+    let bytes = value.as_bytes();
+    !bytes.is_empty()
+        && bytes.len() <= 128
+        && matches!(bytes[0], b'A'..=b'Z' | b'_')
+        && bytes[1..]
+            .iter()
+            .all(|byte| matches!(byte, b'A'..=b'Z' | b'0'..=b'9' | b'_'))
+}
+
+pub(crate) fn reserved_child_environment_name(value: &str) -> bool {
+    matches!(
+        value,
+        "PATH" | "PWD" | "HOME" | "XDG_STATE_HOME" | "XDG_CACHE_HOME" | "TMPDIR"
+    ) || value.starts_with("OCEAN_EXTENSION_")
+}
+
+pub(crate) fn env_secret_source(reference: &str) -> Option<&str> {
+    let key = reference.strip_prefix("env:")?;
+    valid_child_environment_name(key).then_some(key)
+}
+
+fn validate_service_grants_against_artifacts(
+    root: &File,
+    snapshot: &StateSnapshot,
+) -> Result<(), StateError> {
+    let mut metadata_by_artifact = HashMap::new();
+    for grant in &snapshot.service_grants {
+        let install = snapshot
+            .installs
+            .iter()
+            .find(|install| install.id == grant.id && install.digest == grant.digest)
+            .ok_or(StateError::InvalidRecord("service-grant-install"))?;
+        let trust = snapshot
+            .grants
+            .iter()
+            .find(|trust| trust.id == grant.id && trust.digest == grant.digest)
+            .ok_or(StateError::InvalidRecord("service-grant-trust"))?;
+        let key = (grant.id.clone(), grant.digest.clone());
+        if !metadata_by_artifact.contains_key(&key) {
+            let package = open_package(root, install)?;
+            let package = snapshot_package(&package)?;
+            if package.digest != install.digest {
+                return Err(StateError::InvalidRecord("artifact-digest"));
+            }
+            let raw = RawOceanExtensionManifest::parse(&package.manifest)
+                .map_err(|_| StateError::InvalidRecord("manifest"))?;
+            let metadata = raw
+                .validate_metadata(&Version::new(u64::MAX, u64::MAX, u64::MAX))
+                .map_err(|_| StateError::InvalidRecord("manifest"))?;
+            if metadata.id != install.id
+                || metadata.version.to_string() != install.version
+                || !metadata_paths_exist(&metadata, &package.entries)
+            {
+                return Err(StateError::InvalidRecord("manifest-identity"));
+            }
+            metadata_by_artifact.insert(key.clone(), metadata);
+        }
+        let metadata = metadata_by_artifact
+            .get(&key)
+            .ok_or(StateError::InvalidRecord("manifest"))?;
+        let service = metadata
+            .services
+            .iter()
+            .find(|service| service.id == grant.service_id)
+            .ok_or(StateError::InvalidRecord("service-grant-service"))?;
+        validate_binding_authority(grant, trust, service)?;
+    }
+    Ok(())
+}
+
+fn validate_binding_authority(
+    grant: &ServiceGrant,
+    trust: &ArtifactTrustGrant,
+    service: &MetadataServiceResource,
+) -> Result<(), StateError> {
+    let requested_env: HashSet<&str> = service
+        .capabilities
+        .env
+        .iter()
+        .map(String::as_str)
+        .collect();
+    let requested_secrets: HashSet<String> = service
+        .capabilities
+        .secrets
+        .iter()
+        .map(ToString::to_string)
+        .collect();
+    let trusted_env: HashSet<&str> = trust.capabilities.env.iter().map(String::as_str).collect();
+    let trusted_secrets: HashSet<&str> = trust
+        .capabilities
+        .secrets
+        .iter()
+        .map(String::as_str)
+        .collect();
+    for binding in &grant.secret_bindings {
+        if !requested_env.contains(binding.target_env.as_str())
+            || !requested_secrets.contains(&binding.reference)
+            || !trusted_env.contains(binding.target_env.as_str())
+            || !trusted_secrets.contains(binding.reference.as_str())
+        {
+            return Err(StateError::InvalidRecord("secret-binding-authority"));
+        }
+    }
     Ok(())
 }
 
@@ -1254,6 +1498,276 @@ fn grants_are_subset(granted: &CapabilitySet, requested: &CapabilitySet) -> bool
         && subset(&granted.secrets, &requested.secrets)
 }
 
+/// Read one coherent generation and derive only exact-grant, currently effective
+/// native service activations. No package code or secret value is touched.
+pub(crate) fn read_service_activations(
+    config_dir: &FsPath,
+    registered_projects: &HashSet<Uuid>,
+) -> Result<Vec<ServiceActivation>, StateError> {
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    {
+        let _ = (config_dir, registered_projects);
+        return Ok(Vec::new());
+    }
+
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    {
+        let state = read_locked_state(config_dir)?;
+        let Some(root) = state.root.as_ref() else {
+            return Ok(Vec::new());
+        };
+        let canonical_config =
+            fs::canonicalize(config_dir).map_err(|_| StateError::Read("config directory"))?;
+        let host_version = Version::parse(env!("CARGO_PKG_VERSION"))
+            .expect("daemon package version is valid SemVer");
+        let mut activations = Vec::new();
+
+        for install in &state.snapshot.installs {
+            let Some(enablement) = state
+                .snapshot
+                .enablement
+                .iter()
+                .find(|entry| entry.id == install.id)
+            else {
+                continue;
+            };
+            if !enablement.global
+                && !enablement.projects.iter().any(|project| {
+                    project.enabled && registered_projects.contains(&project.project_id)
+                })
+            {
+                continue;
+            }
+            let Some(trust) = state
+                .snapshot
+                .grants
+                .iter()
+                .find(|grant| grant.id == install.id && grant.digest == install.digest)
+            else {
+                continue;
+            };
+            let package_directory = open_package(root, install)?;
+            let package = snapshot_package(&package_directory)?;
+            if package.digest != install.digest {
+                return Err(StateError::InvalidRecord("artifact-digest"));
+            }
+            let raw = RawOceanExtensionManifest::parse(&package.manifest)
+                .map_err(|_| StateError::InvalidRecord("manifest"))?;
+            let metadata = match raw.validate_metadata(&host_version) {
+                Ok(metadata) => metadata,
+                Err(ExtensionManifestError::IncompatibleHost { .. }) => continue,
+                Err(_) => return Err(StateError::InvalidRecord("manifest")),
+            };
+            if metadata.id != install.id
+                || metadata.version.to_string() != install.version
+                || !metadata_paths_exist(&metadata, &package.entries)
+            {
+                return Err(StateError::InvalidRecord("manifest-identity"));
+            }
+            let requested = requested_capabilities(&metadata);
+            if !grants_are_subset(&trust.capabilities, &requested)
+                || metadata.services.iter().any(|service| {
+                    !service.capabilities.network.is_empty()
+                        || !service.capabilities.filesystem.is_empty()
+                })
+            {
+                // Declaration policy is package-wide and is not represented as
+                // containment. One broad service blocks every native service in
+                // the package from A2a activation.
+                continue;
+            }
+
+            let hex = digest_hex(&install.digest).ok_or(StateError::InvalidRecord("install"))?;
+            let package_path = canonical_config
+                .join("extensions/store")
+                .join(&install.id)
+                .join(hex);
+            verify_open_directory_path(&package_directory, &package_path)?;
+
+            for service in &metadata.services {
+                let Some(service_grant) = state.snapshot.service_grants.iter().find(|grant| {
+                    grant.id == install.id
+                        && grant.digest == install.digest
+                        && grant.service_id == service.id
+                }) else {
+                    continue;
+                };
+                if !service_is_fully_authorized(service, trust, service_grant) {
+                    continue;
+                }
+                let executable = open_relative_entry(&package_directory, &service.entry)?;
+                validate_service_executable(&executable)?;
+                let executable_path = package_path.join(
+                    normalized_resource_path(&service.entry)
+                        .ok_or(StateError::InvalidRecord("service-entry"))?,
+                );
+                verify_open_file_path(&executable, &executable_path)?;
+                let events = service
+                    .events
+                    .iter()
+                    .map(|event| lifecycle_event_kind(event))
+                    .collect::<Result<Vec<_>, _>>()?;
+                let bound_targets: HashSet<&str> = service_grant
+                    .secret_bindings
+                    .iter()
+                    .map(|binding| binding.target_env.as_str())
+                    .collect();
+                let environment = service
+                    .capabilities
+                    .env
+                    .iter()
+                    .filter(|name| !bound_targets.contains(name.as_str()))
+                    .cloned()
+                    .collect();
+                let package_directory = package_directory
+                    .try_clone()
+                    .map_err(|_| StateError::Read("extension payload"))?;
+                let startup_timeout = Duration::from_millis(
+                    service
+                        .health
+                        .as_ref()
+                        .and_then(|health| health.startup_timeout_ms)
+                        .unwrap_or(5_000),
+                );
+                activations.push(ServiceActivation {
+                    package_id: install.id.clone(),
+                    package_version: install.version.clone(),
+                    package_digest: install.digest.clone(),
+                    service_id: service.id.clone(),
+                    activation_revision: state.snapshot.revision,
+                    config_dir: canonical_config.clone(),
+                    package_path: package_path.clone(),
+                    package_directory,
+                    executable,
+                    executable_path,
+                    args: service.args.clone(),
+                    events,
+                    environment,
+                    secret_bindings: service_grant.secret_bindings.clone(),
+                    startup_timeout,
+                });
+            }
+        }
+        Ok(activations)
+    }
+}
+
+fn service_is_fully_authorized(
+    service: &MetadataServiceResource,
+    trust: &ArtifactTrustGrant,
+    grant: &ServiceGrant,
+) -> bool {
+    if !grant.native_process_ack
+        || !service.capabilities.network.is_empty()
+        || !service.capabilities.filesystem.is_empty()
+        || service.capabilities.env.iter().any(|name| {
+            !valid_child_environment_name(name) || reserved_child_environment_name(name)
+        })
+    {
+        return false;
+    }
+    let requested_env: HashSet<&str> = service
+        .capabilities
+        .env
+        .iter()
+        .map(String::as_str)
+        .collect();
+    if requested_env.len() != service.capabilities.env.len() {
+        return false;
+    }
+    let trusted_env: HashSet<&str> = trust.capabilities.env.iter().map(String::as_str).collect();
+    let trusted_secrets: HashSet<&str> = trust
+        .capabilities
+        .secrets
+        .iter()
+        .map(String::as_str)
+        .collect();
+    if service
+        .capabilities
+        .env
+        .iter()
+        .any(|name| !trusted_env.contains(name.as_str()))
+    {
+        return false;
+    }
+    let requested_secrets: HashSet<String> = service
+        .capabilities
+        .secrets
+        .iter()
+        .map(ToString::to_string)
+        .collect();
+    let bound_secrets: HashSet<&str> = grant
+        .secret_bindings
+        .iter()
+        .map(|binding| binding.reference.as_str())
+        .collect();
+    requested_secrets.len() == service.capabilities.secrets.len()
+        && requested_secrets.len() == bound_secrets.len()
+        && requested_secrets
+            .iter()
+            .all(|reference| trusted_secrets.contains(reference.as_str()))
+        && requested_secrets
+            .iter()
+            .all(|reference| bound_secrets.contains(reference.as_str()))
+}
+
+#[cfg(unix)]
+fn verify_open_directory_path(directory: &File, path: &FsPath) -> Result<(), StateError> {
+    use std::os::unix::fs::MetadataExt;
+
+    let opened = directory
+        .metadata()
+        .map_err(|_| StateError::Read("extension payload"))?;
+    let named = fs::metadata(path).map_err(|_| StateError::Read("extension payload"))?;
+    if !named.is_dir() || opened.dev() != named.dev() || opened.ino() != named.ino() {
+        return Err(StateError::InvalidComponent("extension payload"));
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn verify_open_file_path(file: &File, path: &FsPath) -> Result<(), StateError> {
+    use std::os::unix::fs::MetadataExt;
+
+    let opened = file
+        .metadata()
+        .map_err(|_| StateError::Read("service executable"))?;
+    let named = fs::metadata(path).map_err(|_| StateError::Read("service executable"))?;
+    if !named.is_file() || opened.dev() != named.dev() || opened.ino() != named.ino() {
+        return Err(StateError::InvalidComponent("service executable"));
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn validate_service_executable(executable: &File) -> Result<(), StateError> {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+    let metadata = executable
+        .metadata()
+        .map_err(|_| StateError::Read("service executable"))?;
+    if !metadata.is_file() || metadata.nlink() != 1 || metadata.permissions().mode() & 0o111 == 0 {
+        return Err(StateError::InvalidComponent("service executable"));
+    }
+    Ok(())
+}
+
+fn lifecycle_event_kind(value: &str) -> Result<LifecycleEventKind, StateError> {
+    match value {
+        "daemon_started" => Ok(LifecycleEventKind::DaemonStarted),
+        "session_started" => Ok(LifecycleEventKind::SessionStarted),
+        "turn_started" => Ok(LifecycleEventKind::TurnStarted),
+        "permission_requested" => Ok(LifecycleEventKind::PermissionRequested),
+        "permission_resolved" => Ok(LifecycleEventKind::PermissionResolved),
+        "tool_started" => Ok(LifecycleEventKind::ToolStarted),
+        "tool_finished" => Ok(LifecycleEventKind::ToolFinished),
+        "turn_finished" => Ok(LifecycleEventKind::TurnFinished),
+        "session_stopped" => Ok(LifecycleEventKind::SessionStopped),
+        "daemon_stopping" => Ok(LifecycleEventKind::DaemonStopping),
+        _ => Err(StateError::InvalidRecord("service-event")),
+    }
+}
+
 fn inspect_extension(
     state: &LockedState,
     id: &str,
@@ -1659,7 +2173,11 @@ env = ["EXAMPLE_ENV"]
         fs::create_dir_all(staging.join("plugins/reader")).unwrap();
         fs::create_dir_all(staging.join("services")).unwrap();
         fs::write(staging.join("ocean-extension.toml"), package_manifest()).unwrap();
-        fs::write(staging.join("services/bridge"), "static service fixture").unwrap();
+        fs::write(
+            staging.join("services/bridge"),
+            format!("#!/bin/sh\nprintf ran > '{}'\n", marker.display()),
+        )
+        .unwrap();
         fs::write(
             staging.join("run-me"),
             format!("#!/bin/sh\nprintf ran > '{}'\n", marker.display()),
@@ -1668,9 +2186,12 @@ env = ["EXAMPLE_ENV"]
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
-            let mut permissions = fs::metadata(staging.join("run-me")).unwrap().permissions();
-            permissions.set_mode(0o755);
-            fs::set_permissions(staging.join("run-me"), permissions).unwrap();
+            for executable in ["run-me", "services/bridge"] {
+                let path = staging.join(executable);
+                let mut permissions = fs::metadata(&path).unwrap().permissions();
+                permissions.set_mode(0o755);
+                fs::set_permissions(path, permissions).unwrap();
+            }
         }
     }
 
@@ -1749,6 +2270,262 @@ env = ["EXAMPLE_ENV"]
         assert_eq!(state.snapshot.revision, 0);
         assert!(state.snapshot.installs.is_empty());
         assert!(!config.path().join("extensions").exists());
+    }
+
+    fn service_grants_value(fixture: &Fixture, ack: bool) -> Value {
+        json!({
+            "schema_version": 1,
+            "state_revision": 7,
+            "service_grants": [{
+                "id": ID,
+                "digest": fixture.digest,
+                "service_id": "bridge",
+                "native_process_ack": ack,
+                "secret_bindings": []
+            }]
+        })
+    }
+
+    #[test]
+    fn hand_authored_service_grant_fixtures_cover_valid_invalid_and_bounds() {
+        let valid: ServiceGrantsFile = serde_json::from_str(include_str!(
+            "../tests/fixtures/extension-registry/valid-service-grants.json"
+        ))
+        .unwrap();
+        assert_eq!(valid.schema_version, 1);
+        assert_eq!(valid.service_grants.len(), 1);
+        assert!(valid.service_grants[0].native_process_ack);
+        assert!(validate_secret_bindings(&valid.service_grants[0].secret_bindings).is_ok());
+
+        let invalid: ServiceGrantsFile = serde_json::from_str(include_str!(
+            "../tests/fixtures/extension-registry/invalid-service-grants.json"
+        ))
+        .unwrap();
+        assert!(!invalid.service_grants[0].native_process_ack);
+
+        let duplicate_binding = vec![
+            SecretBinding {
+                target_env: "TOKEN_A".to_owned(),
+                reference: "env:SOURCE_A".to_owned(),
+            },
+            SecretBinding {
+                target_env: "TOKEN_A".to_owned(),
+                reference: "env:SOURCE_B".to_owned(),
+            },
+        ];
+        assert_eq!(
+            validate_secret_bindings(&duplicate_binding),
+            Err(StateError::InvalidRecord("secret-binding"))
+        );
+        for (target, reference) in [
+            ("PATH", "env:SOURCE"),
+            ("lowercase", "env:SOURCE"),
+            ("TARGET", "vault:SOURCE"),
+            ("TARGET", "env:lowercase"),
+        ] {
+            assert!(validate_secret_bindings(&[SecretBinding {
+                target_env: target.to_owned(),
+                reference: reference.to_owned(),
+            }])
+            .is_err());
+        }
+        let too_many = (0..=MAX_SECRET_BINDINGS)
+            .map(|index| SecretBinding {
+                target_env: format!("TARGET_{index:03}"),
+                reference: format!("env:SOURCE_{index:03}"),
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            validate_secret_bindings(&too_many),
+            Err(StateError::InvalidRecord("secret-binding-count"))
+        );
+    }
+
+    #[test]
+    fn a0_absence_four_file_mixed_generation_and_downgrade_are_exact() {
+        let fixture = fixture(true, true);
+        let root = fixture.config.path().join("extensions");
+
+        let a0 = read_locked_state(fixture.config.path()).unwrap();
+        assert!(a0.snapshot.service_grants.is_empty());
+        assert!(!root.join("service-grants.json").exists());
+
+        write_json(
+            &root.join("service-grants.json"),
+            &service_grants_value(&fixture, true),
+        );
+        let upgraded = read_locked_state(fixture.config.path()).unwrap();
+        assert_eq!(upgraded.snapshot.service_grants.len(), 1);
+
+        fs::write(
+            root.join("service-grants.json"),
+            include_str!(
+                "../tests/fixtures/extension-registry/mixed-generation-service-grants.json"
+            ),
+        )
+        .unwrap();
+        assert_eq!(
+            read_locked_state(fixture.config.path()).err(),
+            Some(StateError::RevisionMismatch)
+        );
+
+        fs::write(
+            root.join("service-grants.json"),
+            include_str!("../tests/fixtures/extension-registry/downgrade-service-grants.json"),
+        )
+        .unwrap();
+        // Simulate the accepted A0 reader: it reads the unchanged strict three
+        // files and ignores the additive companion entirely.
+        let installs: InstallsFile =
+            read_state_json_at(upgraded.root.as_ref().unwrap(), "installs.json").unwrap();
+        let trust: TrustFile =
+            read_state_json_at(upgraded.root.as_ref().unwrap(), "trust.json").unwrap();
+        let enabled: EnabledFile =
+            read_state_json_at(upgraded.root.as_ref().unwrap(), "enabled.json").unwrap();
+        assert_eq!(
+            (
+                installs.state_revision,
+                trust.state_revision,
+                enabled.state_revision
+            ),
+            (7, 7, 7)
+        );
+        assert_eq!(
+            read_locked_state(fixture.config.path())
+                .unwrap()
+                .snapshot
+                .revision,
+            7
+        );
+    }
+
+    #[test]
+    fn native_acknowledgement_is_exact_and_absence_executes_nothing() {
+        let fixture = fixture(true, true);
+        let root = fixture.config.path().join("extensions");
+        assert!(
+            read_service_activations(fixture.config.path(), &HashSet::new())
+                .unwrap()
+                .is_empty()
+        );
+        assert!(!fixture.marker.exists());
+
+        write_json(
+            &root.join("service-grants.json"),
+            &service_grants_value(&fixture, false),
+        );
+        assert_eq!(
+            read_locked_state(fixture.config.path()).err(),
+            Some(StateError::InvalidRecord("service-grant"))
+        );
+        assert!(!fixture.marker.exists());
+    }
+
+    #[test]
+    fn sole_reader_derives_exact_noop_activation_without_resolving_or_executing() {
+        let fixture = fixture(true, true);
+        let root = fixture.config.path().join("extensions");
+        let package = root
+            .join("store")
+            .join(ID)
+            .join(digest_hex(&fixture.digest).unwrap());
+        let manifest = fs::read_to_string(package.join("ocean-extension.toml"))
+            .unwrap()
+            .replace("network = [\"api.example.com\"]\n", "")
+            + "secrets = [\"env:OCEAN_EXAMPLE_SECRET\"]\n";
+        fs::write(package.join("ocean-extension.toml"), manifest).unwrap();
+        let package_file = File::open(&package).unwrap();
+        let digest = snapshot_package(&package_file).unwrap().digest;
+        drop(package_file);
+        let new_package = package.parent().unwrap().join(digest_hex(&digest).unwrap());
+        fs::rename(&package, &new_package).unwrap();
+        write_json(
+            &root.join("installs.json"),
+            &json!({
+                "schema_version": 1,
+                "state_revision": 7,
+                "installs": [{
+                    "id": ID,
+                    "version": VERSION,
+                    "digest": digest,
+                    "source": {"kind": "local-path", "locator": "/tmp/example"}
+                }]
+            }),
+        );
+        write_json(
+            &root.join("trust.json"),
+            &json!({
+                "schema_version": 1,
+                "state_revision": 7,
+                "grants": [{
+                    "id": ID,
+                    "digest": digest,
+                    "capabilities": {
+                        "env": ["EXAMPLE_ENV"],
+                        "secrets": ["env:OCEAN_EXAMPLE_SECRET"]
+                    }
+                }]
+            }),
+        );
+        write_json(
+            &root.join("service-grants.json"),
+            &json!({
+                "schema_version": 1,
+                "state_revision": 7,
+                "service_grants": [{
+                    "id": ID,
+                    "digest": digest,
+                    "service_id": "bridge",
+                    "native_process_ack": true,
+                    "secret_bindings": [{
+                        "target_env": "EXAMPLE_ENV",
+                        "reference": "env:OCEAN_EXAMPLE_SECRET"
+                    }]
+                }]
+            }),
+        );
+
+        let mut activations =
+            read_service_activations(fixture.config.path(), &HashSet::new()).unwrap();
+        assert_eq!(activations.len(), 1);
+        let activation = activations.pop().unwrap();
+        assert_eq!(activation.package_id, ID);
+        assert_eq!(activation.service_id, "bridge");
+        assert!(activation.environment.is_empty());
+        assert_eq!(activation.secret_bindings[0].target_env, "EXAMPLE_ENV");
+        assert!(!fixture.marker.exists());
+    }
+
+    #[test]
+    fn service_grant_order_duplicates_unknown_fields_and_revision_fail_closed() {
+        let fixture = fixture(true, true);
+        let root = fixture.config.path().join("extensions");
+        let grant = service_grants_value(&fixture, true)["service_grants"][0].clone();
+        write_json(
+            &root.join("service-grants.json"),
+            &json!({
+                "schema_version": 1,
+                "state_revision": 7,
+                "service_grants": [grant.clone(), grant]
+            }),
+        );
+        assert_eq!(
+            read_locked_state(fixture.config.path()).err(),
+            Some(StateError::InvalidRecord("service-grant-order"))
+        );
+        write_json(
+            &root.join("service-grants.json"),
+            &json!({
+                "schema_version": 1,
+                "state_revision": 7,
+                "service_grants": [],
+                "unexpected": true
+            }),
+        );
+        assert_eq!(
+            read_locked_state(fixture.config.path()).err(),
+            Some(StateError::Parse("service-grants.json"))
+        );
     }
 
     #[test]

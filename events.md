@@ -5530,6 +5530,25 @@ type:  [bug report]: Keep LiveKit server SDK on rustls
 area:  [backend]: Call dependency transport
 
 Recovered the focused LiveKit feature correction from the divergent Mini main. `livekit-api` now uses rustls native roots, removing `native-tls`, `hyper-tls`, and `openssl-sys` from the supported workspace graph. All 160 ocean-call tests, workspace test compilation, compatibility feature Clippy lanes, release all-target compilation, docs-check, and dependency-tree assertions pass.
+time:      [23:50] [27-07-26]
+agent:     [pi] [gpt-5.4] [worker]
+worktree:  [feat/extensions-stage-a2a]
+type:      [feature-request]
+area:      [backend]
+
+Implemented the ratified Stage A2a boundary from base 63a62b87: renamed the
+accepted Phase 1 reader into the sole read-only extension registry authority,
+added strict equal-generation service grants with the A0 absence exception, and
+added fail-soft startup reconciliation into the minimum native stdio supervisor.
+The supervisor enforces exact native acknowledgement, descriptor-bound package
+identity, assigned private roots, env_clear plus explicit env:/ordinary grants,
+strict bounded hello/ready framing and ACK posture, a non-probing cache, and
+retained-leader generation-safe process-group cleanup on macOS/Linux. Added
+hand-authored registry fixtures and schema, no-execution, environment, secret,
+framing, handshake, shutdown, grandchild, and PGID-reuse tests. A1 remains
+unwired; no lifecycle replay/producer wiring, health/restart policy, mutation,
+route, CLI, Crew, UI, or integration behavior was added. A2a remains pending
+independent acceptance; A2b is not authorized to start before that gate.
 _________________________________________________________________________________
 
 _________________________________________________________________________________
