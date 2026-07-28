@@ -42,6 +42,9 @@ pub struct ContextUsage {
     pub measured_at_ms: i64,
 }
 
+/// Ocean Buddy watch/iPhone/backend card and event vocabulary.
+pub mod buddy;
+
 /// Strict metadata-only lifecycle/service protocol DTOs for native extensions.
 pub mod extension_lifecycle;
 

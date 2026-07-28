@@ -31,7 +31,8 @@ Ocean OS; they do not become alternate agent runtimes.
 | Path | Host surface | Entry point | Narrow validation |
 |---|---|---|---|
 | `herdr/` | Herdr workflow plugin and managed Ocean pane | `herdr-plugin.toml`, `start.py`, `run-ocean.sh` | `python3 -m unittest integrations/herdr/test_start.py && sh -n integrations/herdr/run-ocean.sh` |
+| `ocean-buddy/` | Native Apple Watch/iPhone foreground Realtime voice apps plus package-level bounded card and sensor-mock logic | `OceanBuddy.xcodeproj`, `Package.swift`, `Sources/OceanBuddyCore/OceanBuddyRealtimeController.swift` | `swift test --package-path integrations/ocean-buddy` plus the iOS/watchOS generic simulator builds in `ocean-buddy/AGENTS.md` |
 
 ## Child Devlog Index
 
-No child `AGENTS.md` boundaries are currently defined.
+- `ocean-buddy/` — native Apple device shells and shared bounded Buddy transport → `ocean-buddy/AGENTS.md`

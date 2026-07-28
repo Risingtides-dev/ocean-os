@@ -5406,3 +5406,12 @@ normal/orphan/panic convergence, and bounded boot retention. The 2,305-request
 proof removes the former cumulative terminal cliff. A1 remains intentionally
 unwired and launches nothing; A2a is the next authorized slice.
 _________________________________________________________________________________
+
+time:  [22:28] [27-07-26]
+agent: [pi] [gpt-5.4] [Thoth]
+worktree: [detached origin/main integration at /private/tmp/ocean-consolidate]
+type:  [feature-request]: Ocean Buddy vertical slice consolidation
+area:  [backend]: Native Apple companion and typed attachment ingress
+
+Consolidated the recovered Ocean Buddy iPhone/watchOS app, typed SDK contract, and narrow daemon attachment route onto current main. Review repairs route Watch approval through reachable iPhone WatchConnectivity, canonicalize UUID session bindings, retain completion-backed truncation credit while audio drains, clear stale pairing state, and enforce the exact attached-event shape. Swift package tests, focused Rust tests, iOS/watchOS generic simulator builds, docs-check, formatting, and patch checks pass.
+_________________________________________________________________________________

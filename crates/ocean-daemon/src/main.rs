@@ -125,6 +125,9 @@ mod model_roles;
 mod observatory;
 /// Redacting bridge from runtime agent events into durable Observatory facts.
 mod observatory_adapter;
+/// First Ocean Buddy attachment-event ingress and watch result-card response.
+mod ocean_buddy;
+
 /// Scoped observer authentication extractor and startup state.
 mod observatory_auth;
 /// Durable persistent-room HTTP lifecycle, paging, and auto-convene adapter.
@@ -163,6 +166,8 @@ use longhouse_preparation::{longhouse_inspect, longhouse_prepare, workflows_prep
 use longhouse_topics::{longhouse_demo, longhouse_topic, longhouse_topics};
 use longhouse_turn_preparation::{apply_longhouse_prep, longhouse_prep_for_turn};
 use metrics::{InFlightGuard, TurnMetrics};
+use ocean_buddy::ocean_buddy_event;
+
 use model_catalog::{model_get, model_set, models_list};
 #[cfg(test)]
 use model_roles::resolve_effective_model_id;
@@ -626,6 +631,7 @@ fn app_router(cors: CorsLayer) -> Router<AppState> {
         .route("/v1/agent/turns", post(agent_turn))
         .route("/v1/agent/voice", post(agent_voice))
         .route("/v1/agent/events", get(agent_events))
+        .route("/v1/ocean-buddy/events", post(ocean_buddy_event))
         .route("/v1/observatory/snapshot", get(observatory::snapshot))
         .route("/v1/observatory/events", get(observatory::events))
         .route("/v1/observatory/replay", get(observatory::replay))
@@ -1385,6 +1391,7 @@ fn banner_routes() -> &'static [&'static str] {
         "POST /v1/agent/turns",
         "POST /v1/agent/voice",
         "GET /v1/agent/events",
+        "POST /v1/ocean-buddy/events",
         "GET /v1/observatory/snapshot",
         "GET /v1/observatory/events",
         "GET /v1/observatory/replay",
@@ -22827,7 +22834,7 @@ mod tests {
         );
         assert_eq!(
             banner.len(),
-            94,
+            95,
             "route baseline changed; review the manifest"
         );
 

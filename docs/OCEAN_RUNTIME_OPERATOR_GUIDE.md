@@ -501,6 +501,9 @@ POST   /v1/voice/realtime/client-secret   mint an ephemeral OpenAI Realtime clie
 POST   /v1/voice/stt                      transcribe audio through xAI speech-to-text
 POST   /v1/voice/tts                      synthesize speech through xAI text-to-speech
 
+# Ocean Buddy (typed attachment ingress; native iPhone/watchOS voice reuses the Realtime secret route above)
+POST   /v1/ocean-buddy/events              accept a mocked attached lifecycle event and return a Watch result card
+
 The Realtime secret request defaults to conversation when `purpose` is omitted.
 A conversation bound by daemon-owned session `workspace_root`/`cwd` to a registered project or
 live linked worktree receives `render_component`, `write_handoff`, and bounded

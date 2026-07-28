@@ -45,6 +45,7 @@ This crate owns the long-running Ocean HTTP service on `:4780`, including API ro
   Surface fulfillment; never accept a browser/model-nominated conversation root,
   and keep project-less/session-less conversations on render + handoff only.
 
+- `POST /v1/ocean-buddy/events` is the deliberately narrow first Buddy ingress: it accepts only a typed mocked `attached` lifecycle event, carries attachment metadata but no image bytes, performs no camera/session/tool work, and returns a typed Watch result card. Watch approval remains in the Watch-to-iPhone adapter flow.
 - Session behavior lives in `ocean-agent`; route changes must not create a separate session model.
 - `extension_lifecycle.rs` is the Stage A1 pure, metadata-only lifecycle boundary: it owns deterministic source adaptation, bounded per-request runtime-tool-id to host-UUID correlation, permission pairing, validate-before-commit publication, lifecycle-bounded cloneable request-scoped atomic terminal authority with fail-closed active registration, terminal cleanup of abandoned request state, publication-time project classification, and bounded boot-local event retention. It is intentionally unwired until A2b and must not gain process launch, service transport, registry mutation, routes, Observatory coupling, or producer call sites in A1.
 - Product turns and legacy/call turns (legacy requests pin a session id before

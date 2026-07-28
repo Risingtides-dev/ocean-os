@@ -1,0 +1,97 @@
+name: OceanBuddy
+options:
+  bundleIdPrefix: dev.risingtides.oceanbuddy
+  createIntermediateGroups: true
+  deploymentTarget:
+    iOS: "17.0"
+    watchOS: "10.0"
+packages:
+  OceanBuddyCore:
+    path: .
+settings:
+  base:
+    SWIFT_VERSION: "6.0"
+    SWIFT_STRICT_CONCURRENCY: complete
+    MARKETING_VERSION: 0.1.0
+    CURRENT_PROJECT_VERSION: 1
+    CODE_SIGN_STYLE: Automatic
+    DEVELOPMENT_TEAM: G4889SDMJ4
+    ENABLE_USER_SCRIPT_SANDBOXING: YES
+targets:
+  OceanBuddyPhone:
+    type: application
+    platform: iOS
+    deploymentTarget: "17.0"
+    sources:
+      - path: Apps/Shared
+      - path: Apps/iOS
+    info:
+      path: Config/iOS-Info.plist
+      properties:
+        CFBundleDisplayName: Ocean Buddy
+        CFBundleShortVersionString: $(MARKETING_VERSION)
+        CFBundleVersion: $(CURRENT_PROJECT_VERSION)
+        LSRequiresIPhoneOS: true
+        NSAppTransportSecurity:
+          NSAllowsLocalNetworking: true
+        NSLocalNetworkUsageDescription: Ocean Buddy connects to your local Ocean daemon.
+        NSMicrophoneUsageDescription: Ocean Buddy uses the microphone for foreground conversations with Ocean.
+        NSCameraUsageDescription: Ocean Buddy scans the QR code shown by your Ocean desktop to pair.
+        CFBundleURLTypes:
+          - CFBundleURLName: dev.risingtides.oceanbuddy.pairing
+            CFBundleURLSchemes:
+              - ocean-buddy
+        UILaunchScreen: {}
+    dependencies:
+      - package: OceanBuddyCore
+        product: OceanBuddyCore
+      - target: OceanBuddyWatch
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: dev.risingtides.oceanbuddy.phone
+        PRODUCT_NAME: OceanBuddyPhone
+        TARGETED_DEVICE_FAMILY: "1,2"
+  OceanBuddyWatch:
+    type: application
+    platform: watchOS
+    deploymentTarget: "10.0"
+    sources:
+      - path: Apps/Shared
+      - path: Apps/watchOS
+    info:
+      path: Config/watchOS-Info.plist
+      properties:
+        CFBundleDisplayName: Ocean Buddy
+        CFBundleShortVersionString: $(MARKETING_VERSION)
+        CFBundleVersion: $(CURRENT_PROJECT_VERSION)
+        NSAppTransportSecurity:
+          NSAllowsLocalNetworking: true
+        NSLocalNetworkUsageDescription: Ocean Buddy connects to your local Ocean daemon.
+        NSMicrophoneUsageDescription: Ocean Buddy uses the microphone for foreground conversations with Ocean.
+        WKApplication: true
+        WKCompanionAppBundleIdentifier: dev.risingtides.oceanbuddy.phone
+        WKRunsIndependentlyOfCompanionApp: true
+    dependencies:
+      - package: OceanBuddyCore
+        product: OceanBuddyCore
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: dev.risingtides.oceanbuddy.phone.watchkitapp
+        PRODUCT_NAME: OceanBuddyWatch
+schemes:
+  OceanBuddyPhone:
+    build:
+      targets:
+        OceanBuddyPhone: all
+    run:
+      config: Debug
+    archive:
+      config: Release
+  OceanBuddyWatch:
+    build:
+      targets:
+        OceanBuddyWatch: all
+    run:
+      config: Debug
+    archive:
+      config: Release

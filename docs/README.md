@@ -32,6 +32,7 @@ Documentation policy: [`OCEAN_DOCUMENTATION_CONTRACT.md`](OCEAN_DOCUMENTATION_CO
 - [`OCEAN_RUNTIME_OPERATOR_GUIDE.md`](OCEAN_RUNTIME_OPERATOR_GUIDE.md) — extended API/configuration/troubleshooting reference; the concise `OPERATIONS.md`, executable route parity, and source override stale examples.
 - [`AGENT_RENDER_PROTOCOL.md`](AGENT_RENDER_PROTOCOL.md) — render-protocol design and implementation reference; verify interaction behavior against daemon handlers and SDK types.
 - [`OCEAN_BROWSER_CONTROL_PLANE.md`](OCEAN_BROWSER_CONTROL_PLANE.md) and [`OCEAN_BROWSER_CONTROL_SURFACE.md`](OCEAN_BROWSER_CONTROL_SURFACE.md) — browser planning and presentation references; current tools and typed context live in source.
+- [`../oceanbuddy.md`](../oceanbuddy.md) — Ocean Buddy free-device workstation: typed attachment mock plus installable iPhone/watchOS shells for bounded foreground Realtime voice, with explicit hardware/non-goals.
 - [`OCEAN_CALL_SETUP.md`](OCEAN_CALL_SETUP.md) — optional call/voice setup reference; external account, phone, and end-to-end status require live revalidation.
 - [`LONGHOUSE.md`](LONGHOUSE.md) and [`LONGHOUSE_ORCHESTRATION.md`](LONGHOUSE_ORCHESTRATION.md) — current Longhouse subsystem overview, entry-path behavior, orchestration boundaries, and explicitly labeled target work.
 - [`OCEAN_NATIVE_INTERNALS_MAP.md`](OCEAN_NATIVE_INTERNALS_MAP.md) — focused

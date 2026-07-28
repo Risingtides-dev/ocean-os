@@ -1,0 +1,517 @@
+// !$*UTF8*$!
+{
+	archiveVersion = 1;
+	classes = {
+	};
+	objectVersion = 77;
+	objects = {
+
+/* Begin PBXBuildFile section */
+		02CF09E79069D0FAC6752245 /* BuddyCardView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 972E7F04CFF2AC6CE22E1E62 /* BuddyCardView.swift */; };
+		0A693868E70D1BBCBC777E2E /* BuddyCardInboxController.swift in Sources */ = {isa = PBXBuildFile; fileRef = 3A7136986FE24F968C5599CF /* BuddyCardInboxController.swift */; };
+		145C802E8F744CE7797FF793 /* OceanBuddyPhoneApp.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0929F5B6546A84B81D6DE874 /* OceanBuddyPhoneApp.swift */; };
+		5143B97340FCB256255F043B /* BuddyQRScannerView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 44E45F590753EC612DB7DBD2 /* BuddyQRScannerView.swift */; };
+		6F87818BB2480AFB52E0739F /* OceanBuddyCore in Frameworks */ = {isa = PBXBuildFile; productRef = 43CD090F349150DD71B68F61 /* OceanBuddyCore */; };
+		80B8F483B4DD22DA7EB45BFE /* BuddyCardInboxController.swift in Sources */ = {isa = PBXBuildFile; fileRef = 3A7136986FE24F968C5599CF /* BuddyCardInboxController.swift */; };
+		8A6117F792F77241EB22E372 /* OceanBuddyWatch.app in Embed Watch Content */ = {isa = PBXBuildFile; fileRef = 879E3E4CAFA60122A56C4290 /* OceanBuddyWatch.app */; settings = {ATTRIBUTES = (RemoveHeadersOnCopy, ); }; };
+		9E230AC6143C171E9F8F8FB1 /* OceanBuddyCore in Frameworks */ = {isa = PBXBuildFile; productRef = 60F670EEC7F8755CB8377CC7 /* OceanBuddyCore */; };
+		A4B4AE4C65B5B88FEDDDC32D /* OceanBuddyWatchApp.swift in Sources */ = {isa = PBXBuildFile; fileRef = 1FADEFE27F64D78264699B6A /* OceanBuddyWatchApp.swift */; };
+		C8BE3BDAEE84662BD6E7EFD7 /* BuddyDeviceSync.swift in Sources */ = {isa = PBXBuildFile; fileRef = C7C90F4C5F4863433BE822E4 /* BuddyDeviceSync.swift */; };
+		C9C9E7F94B430410A1F68F9E /* BuddyCardView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 972E7F04CFF2AC6CE22E1E62 /* BuddyCardView.swift */; };
+		CEFD384790FF152AE1FC7407 /* BuddyWatchView.swift in Sources */ = {isa = PBXBuildFile; fileRef = B650C6395C587FA8FA092B24 /* BuddyWatchView.swift */; };
+		DCB6074A863370AB74BD1FA1 /* BuddyDeviceSync.swift in Sources */ = {isa = PBXBuildFile; fileRef = C7C90F4C5F4863433BE822E4 /* BuddyDeviceSync.swift */; };
+		E873E21CCCAEAAA3DCC0168B /* BuddyPhoneView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 511FCB9A8EDA45F50C71CFEE /* BuddyPhoneView.swift */; };
+/* End PBXBuildFile section */
+
+/* Begin PBXContainerItemProxy section */
+		0945F4A3F266224553F485D4 /* PBXContainerItemProxy */ = {
+			isa = PBXContainerItemProxy;
+			containerPortal = F31E87E723DD397BA8263A13 /* Project object */;
+			proxyType = 1;
+			remoteGlobalIDString = 3882EA14CC0FA5F8B00568BD;
+			remoteInfo = OceanBuddyWatch;
+		};
+/* End PBXContainerItemProxy section */
+
+/* Begin PBXCopyFilesBuildPhase section */
+		61EB52D527B5142DC5F69911 /* Embed Watch Content */ = {
+			isa = PBXCopyFilesBuildPhase;
+			buildActionMask = 2147483647;
+			dstPath = "$(CONTENTS_FOLDER_PATH)/Watch";
+			dstSubfolderSpec = 16;
+			files = (
+				8A6117F792F77241EB22E372 /* OceanBuddyWatch.app in Embed Watch Content */,
+			);
+			name = "Embed Watch Content";
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+/* End PBXCopyFilesBuildPhase section */
+
+/* Begin PBXFileReference section */
+		0929F5B6546A84B81D6DE874 /* OceanBuddyPhoneApp.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = OceanBuddyPhoneApp.swift; sourceTree = "<group>"; };
+		1FADEFE27F64D78264699B6A /* OceanBuddyWatchApp.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = OceanBuddyWatchApp.swift; sourceTree = "<group>"; };
+		300DEB37CB49E9E5BD6E2CE1 /* ocean-buddy */ = {isa = PBXFileReference; lastKnownFileType = folder; name = "ocean-buddy"; path = .; sourceTree = SOURCE_ROOT; };
+		3A7136986FE24F968C5599CF /* BuddyCardInboxController.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = BuddyCardInboxController.swift; sourceTree = "<group>"; };
+		44E45F590753EC612DB7DBD2 /* BuddyQRScannerView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = BuddyQRScannerView.swift; sourceTree = "<group>"; };
+		511FCB9A8EDA45F50C71CFEE /* BuddyPhoneView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = BuddyPhoneView.swift; sourceTree = "<group>"; };
+		676A052B503F9501E13BB415 /* OceanBuddyPhone.app */ = {isa = PBXFileReference; includeInIndex = 0; lastKnownFileType = wrapper.application; path = OceanBuddyPhone.app; sourceTree = BUILT_PRODUCTS_DIR; };
+		879E3E4CAFA60122A56C4290 /* OceanBuddyWatch.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = OceanBuddyWatch.app; sourceTree = BUILT_PRODUCTS_DIR; };
+		972E7F04CFF2AC6CE22E1E62 /* BuddyCardView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = BuddyCardView.swift; sourceTree = "<group>"; };
+		B650C6395C587FA8FA092B24 /* BuddyWatchView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = BuddyWatchView.swift; sourceTree = "<group>"; };
+		C7C90F4C5F4863433BE822E4 /* BuddyDeviceSync.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = BuddyDeviceSync.swift; sourceTree = "<group>"; };
+/* End PBXFileReference section */
+
+/* Begin PBXFrameworksBuildPhase section */
+		5C665644D1BCB57587146A0E /* Frameworks */ = {
+			isa = PBXFrameworksBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				6F87818BB2480AFB52E0739F /* OceanBuddyCore in Frameworks */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+		98AFD682759D145808F77CBE /* Frameworks */ = {
+			isa = PBXFrameworksBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				9E230AC6143C171E9F8F8FB1 /* OceanBuddyCore in Frameworks */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+/* End PBXFrameworksBuildPhase section */
+
+/* Begin PBXGroup section */
+		01DF716865DB42AC03CE2191 /* Products */ = {
+			isa = PBXGroup;
+			children = (
+				676A052B503F9501E13BB415 /* OceanBuddyPhone.app */,
+				879E3E4CAFA60122A56C4290 /* OceanBuddyWatch.app */,
+			);
+			name = Products;
+			sourceTree = "<group>";
+		};
+		2EA0C75B4684DAD682D5A612 /* watchOS */ = {
+			isa = PBXGroup;
+			children = (
+				B650C6395C587FA8FA092B24 /* BuddyWatchView.swift */,
+				1FADEFE27F64D78264699B6A /* OceanBuddyWatchApp.swift */,
+			);
+			path = watchOS;
+			sourceTree = "<group>";
+		};
+		5F3FF4CE2E7D0C9F9877E5E0 /* iOS */ = {
+			isa = PBXGroup;
+			children = (
+				511FCB9A8EDA45F50C71CFEE /* BuddyPhoneView.swift */,
+				44E45F590753EC612DB7DBD2 /* BuddyQRScannerView.swift */,
+				0929F5B6546A84B81D6DE874 /* OceanBuddyPhoneApp.swift */,
+			);
+			path = iOS;
+			sourceTree = "<group>";
+		};
+		72882CA337960696E6014A26 /* Packages */ = {
+			isa = PBXGroup;
+			children = (
+				300DEB37CB49E9E5BD6E2CE1 /* ocean-buddy */,
+			);
+			name = Packages;
+			sourceTree = "<group>";
+		};
+		AE484F5059156DBCAEE31B45 /* Apps */ = {
+			isa = PBXGroup;
+			children = (
+				5F3FF4CE2E7D0C9F9877E5E0 /* iOS */,
+				F2B123AED512DF7AEEA9A0B4 /* Shared */,
+				2EA0C75B4684DAD682D5A612 /* watchOS */,
+			);
+			path = Apps;
+			sourceTree = "<group>";
+		};
+		F2B123AED512DF7AEEA9A0B4 /* Shared */ = {
+			isa = PBXGroup;
+			children = (
+				3A7136986FE24F968C5599CF /* BuddyCardInboxController.swift */,
+				972E7F04CFF2AC6CE22E1E62 /* BuddyCardView.swift */,
+				C7C90F4C5F4863433BE822E4 /* BuddyDeviceSync.swift */,
+			);
+			path = Shared;
+			sourceTree = "<group>";
+		};
+		F64FB36678E3FF6BB19F840E = {
+			isa = PBXGroup;
+			children = (
+				AE484F5059156DBCAEE31B45 /* Apps */,
+				72882CA337960696E6014A26 /* Packages */,
+				01DF716865DB42AC03CE2191 /* Products */,
+			);
+			sourceTree = "<group>";
+		};
+/* End PBXGroup section */
+
+/* Begin PBXNativeTarget section */
+		3882EA14CC0FA5F8B00568BD /* OceanBuddyWatch */ = {
+			isa = PBXNativeTarget;
+			buildConfigurationList = DCD87C51EB3DDA621C2CBDE2 /* Build configuration list for PBXNativeTarget "OceanBuddyWatch" */;
+			buildPhases = (
+				1CF3E453152FFB1B6974A48E /* Sources */,
+				5C665644D1BCB57587146A0E /* Frameworks */,
+			);
+			buildRules = (
+			);
+			dependencies = (
+			);
+			name = OceanBuddyWatch;
+			packageProductDependencies = (
+				43CD090F349150DD71B68F61 /* OceanBuddyCore */,
+			);
+			productName = OceanBuddyWatch;
+			productReference = 879E3E4CAFA60122A56C4290 /* OceanBuddyWatch.app */;
+			productType = "com.apple.product-type.application";
+		};
+		E7AC3AE83F8933A0E7B77DEF /* OceanBuddyPhone */ = {
+			isa = PBXNativeTarget;
+			buildConfigurationList = B8DFF2E102EC230ABAD4BA24 /* Build configuration list for PBXNativeTarget "OceanBuddyPhone" */;
+			buildPhases = (
+				7A4CD65091E6B801C62A5D8D /* Sources */,
+				98AFD682759D145808F77CBE /* Frameworks */,
+				61EB52D527B5142DC5F69911 /* Embed Watch Content */,
+			);
+			buildRules = (
+			);
+			dependencies = (
+				6E820BD59CA200C30D5CF685 /* PBXTargetDependency */,
+			);
+			name = OceanBuddyPhone;
+			packageProductDependencies = (
+				60F670EEC7F8755CB8377CC7 /* OceanBuddyCore */,
+			);
+			productName = OceanBuddyPhone;
+			productReference = 676A052B503F9501E13BB415 /* OceanBuddyPhone.app */;
+			productType = "com.apple.product-type.application";
+		};
+/* End PBXNativeTarget section */
+
+/* Begin PBXProject section */
+		F31E87E723DD397BA8263A13 /* Project object */ = {
+			isa = PBXProject;
+			attributes = {
+				BuildIndependentTargetsInParallel = YES;
+				LastUpgradeCheck = 1430;
+				TargetAttributes = {
+					3882EA14CC0FA5F8B00568BD = {
+						DevelopmentTeam = G4889SDMJ4;
+						ProvisioningStyle = Automatic;
+					};
+					E7AC3AE83F8933A0E7B77DEF = {
+						DevelopmentTeam = G4889SDMJ4;
+						ProvisioningStyle = Automatic;
+					};
+				};
+			};
+			buildConfigurationList = B8A9E7F0FF7B98FCB40C4475 /* Build configuration list for PBXProject "OceanBuddy" */;
+			developmentRegion = en;
+			hasScannedForEncodings = 0;
+			knownRegions = (
+				Base,
+				en,
+			);
+			mainGroup = F64FB36678E3FF6BB19F840E;
+			minimizedProjectReferenceProxies = 1;
+			packageReferences = (
+				6DA08D5E059911380727B698 /* XCLocalSwiftPackageReference "." */,
+			);
+			preferredProjectObjectVersion = 77;
+			productRefGroup = 01DF716865DB42AC03CE2191 /* Products */;
+			projectDirPath = "";
+			projectRoot = "";
+			targets = (
+				E7AC3AE83F8933A0E7B77DEF /* OceanBuddyPhone */,
+				3882EA14CC0FA5F8B00568BD /* OceanBuddyWatch */,
+			);
+		};
+/* End PBXProject section */
+
+/* Begin PBXSourcesBuildPhase section */
+		1CF3E453152FFB1B6974A48E /* Sources */ = {
+			isa = PBXSourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				80B8F483B4DD22DA7EB45BFE /* BuddyCardInboxController.swift in Sources */,
+				02CF09E79069D0FAC6752245 /* BuddyCardView.swift in Sources */,
+				C8BE3BDAEE84662BD6E7EFD7 /* BuddyDeviceSync.swift in Sources */,
+				CEFD384790FF152AE1FC7407 /* BuddyWatchView.swift in Sources */,
+				A4B4AE4C65B5B88FEDDDC32D /* OceanBuddyWatchApp.swift in Sources */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+		7A4CD65091E6B801C62A5D8D /* Sources */ = {
+			isa = PBXSourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				0A693868E70D1BBCBC777E2E /* BuddyCardInboxController.swift in Sources */,
+				C9C9E7F94B430410A1F68F9E /* BuddyCardView.swift in Sources */,
+				DCB6074A863370AB74BD1FA1 /* BuddyDeviceSync.swift in Sources */,
+				E873E21CCCAEAAA3DCC0168B /* BuddyPhoneView.swift in Sources */,
+				5143B97340FCB256255F043B /* BuddyQRScannerView.swift in Sources */,
+				145C802E8F744CE7797FF793 /* OceanBuddyPhoneApp.swift in Sources */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+/* End PBXSourcesBuildPhase section */
+
+/* Begin PBXTargetDependency section */
+		6E820BD59CA200C30D5CF685 /* PBXTargetDependency */ = {
+			isa = PBXTargetDependency;
+			target = 3882EA14CC0FA5F8B00568BD /* OceanBuddyWatch */;
+			targetProxy = 0945F4A3F266224553F485D4 /* PBXContainerItemProxy */;
+		};
+/* End PBXTargetDependency section */
+
+/* Begin XCBuildConfiguration section */
+		197CDCAF3D9CAA7B0760C9AE /* Release */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
+				INFOPLIST_FILE = "Config/watchOS-Info.plist";
+				PRODUCT_BUNDLE_IDENTIFIER = dev.risingtides.oceanbuddy.phone.watchkitapp;
+				PRODUCT_NAME = OceanBuddyWatch;
+				SDKROOT = watchos;
+				SKIP_INSTALL = YES;
+				TARGETED_DEVICE_FAMILY = 4;
+				WATCHOS_DEPLOYMENT_TARGET = 10.0;
+			};
+			name = Release;
+		};
+		5671E2C5D90EE680FE14934C /* Debug */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
+				CODE_SIGN_IDENTITY = "iPhone Developer";
+				INFOPLIST_FILE = "Config/iOS-Info.plist";
+				IPHONEOS_DEPLOYMENT_TARGET = 17.0;
+				LD_RUNPATH_SEARCH_PATHS = (
+					"$(inherited)",
+					"@executable_path/Frameworks",
+				);
+				PRODUCT_BUNDLE_IDENTIFIER = dev.risingtides.oceanbuddy.phone;
+				PRODUCT_NAME = OceanBuddyPhone;
+				SDKROOT = iphoneos;
+				TARGETED_DEVICE_FAMILY = "1,2";
+			};
+			name = Debug;
+		};
+		5F0A386FEE7C6936E45F0167 /* Release */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
+				CODE_SIGN_IDENTITY = "iPhone Developer";
+				INFOPLIST_FILE = "Config/iOS-Info.plist";
+				IPHONEOS_DEPLOYMENT_TARGET = 17.0;
+				LD_RUNPATH_SEARCH_PATHS = (
+					"$(inherited)",
+					"@executable_path/Frameworks",
+				);
+				PRODUCT_BUNDLE_IDENTIFIER = dev.risingtides.oceanbuddy.phone;
+				PRODUCT_NAME = OceanBuddyPhone;
+				SDKROOT = iphoneos;
+				TARGETED_DEVICE_FAMILY = "1,2";
+			};
+			name = Release;
+		};
+		AC6680B297F8C4C83A53E224 /* Debug */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				ALWAYS_SEARCH_USER_PATHS = NO;
+				CLANG_ANALYZER_NONNULL = YES;
+				CLANG_ANALYZER_NUMBER_OBJECT_CONVERSION = YES_AGGRESSIVE;
+				CLANG_CXX_LANGUAGE_STANDARD = "gnu++14";
+				CLANG_CXX_LIBRARY = "libc++";
+				CLANG_ENABLE_MODULES = YES;
+				CLANG_ENABLE_OBJC_ARC = YES;
+				CLANG_ENABLE_OBJC_WEAK = YES;
+				CLANG_WARN_BLOCK_CAPTURE_AUTORELEASING = YES;
+				CLANG_WARN_BOOL_CONVERSION = YES;
+				CLANG_WARN_COMMA = YES;
+				CLANG_WARN_CONSTANT_CONVERSION = YES;
+				CLANG_WARN_DEPRECATED_OBJC_IMPLEMENTATIONS = YES;
+				CLANG_WARN_DIRECT_OBJC_ISA_USAGE = YES_ERROR;
+				CLANG_WARN_DOCUMENTATION_COMMENTS = YES;
+				CLANG_WARN_EMPTY_BODY = YES;
+				CLANG_WARN_ENUM_CONVERSION = YES;
+				CLANG_WARN_INFINITE_RECURSION = YES;
+				CLANG_WARN_INT_CONVERSION = YES;
+				CLANG_WARN_NON_LITERAL_NULL_CONVERSION = YES;
+				CLANG_WARN_OBJC_IMPLICIT_RETAIN_SELF = YES;
+				CLANG_WARN_OBJC_LITERAL_CONVERSION = YES;
+				CLANG_WARN_OBJC_ROOT_CLASS = YES_ERROR;
+				CLANG_WARN_QUOTED_INCLUDE_IN_FRAMEWORK_HEADER = YES;
+				CLANG_WARN_RANGE_LOOP_ANALYSIS = YES;
+				CLANG_WARN_STRICT_PROTOTYPES = YES;
+				CLANG_WARN_SUSPICIOUS_MOVE = YES;
+				CLANG_WARN_UNGUARDED_AVAILABILITY = YES_AGGRESSIVE;
+				CLANG_WARN_UNREACHABLE_CODE = YES;
+				CLANG_WARN__DUPLICATE_METHOD_MATCH = YES;
+				CODE_SIGN_STYLE = Automatic;
+				COPY_PHASE_STRIP = NO;
+				CURRENT_PROJECT_VERSION = 1;
+				DEBUG_INFORMATION_FORMAT = dwarf;
+				DEVELOPMENT_TEAM = G4889SDMJ4;
+				ENABLE_STRICT_OBJC_MSGSEND = YES;
+				ENABLE_TESTABILITY = YES;
+				ENABLE_USER_SCRIPT_SANDBOXING = YES;
+				GCC_C_LANGUAGE_STANDARD = gnu11;
+				GCC_DYNAMIC_NO_PIC = NO;
+				GCC_NO_COMMON_BLOCKS = YES;
+				GCC_OPTIMIZATION_LEVEL = 0;
+				GCC_PREPROCESSOR_DEFINITIONS = (
+					"$(inherited)",
+					"DEBUG=1",
+				);
+				GCC_WARN_64_TO_32_BIT_CONVERSION = YES;
+				GCC_WARN_ABOUT_RETURN_TYPE = YES_ERROR;
+				GCC_WARN_UNDECLARED_SELECTOR = YES;
+				GCC_WARN_UNINITIALIZED_AUTOS = YES_AGGRESSIVE;
+				GCC_WARN_UNUSED_FUNCTION = YES;
+				GCC_WARN_UNUSED_VARIABLE = YES;
+				IPHONEOS_DEPLOYMENT_TARGET = 17.0;
+				MARKETING_VERSION = 0.1.0;
+				MTL_ENABLE_DEBUG_INFO = INCLUDE_SOURCE;
+				MTL_FAST_MATH = YES;
+				ONLY_ACTIVE_ARCH = YES;
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				SWIFT_ACTIVE_COMPILATION_CONDITIONS = DEBUG;
+				SWIFT_OPTIMIZATION_LEVEL = "-Onone";
+				SWIFT_STRICT_CONCURRENCY = complete;
+				SWIFT_VERSION = 6.0;
+				WATCHOS_DEPLOYMENT_TARGET = 10.0;
+			};
+			name = Debug;
+		};
+		BD4CF7E987A2DF0D53A0D8B2 /* Debug */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
+				INFOPLIST_FILE = "Config/watchOS-Info.plist";
+				PRODUCT_BUNDLE_IDENTIFIER = dev.risingtides.oceanbuddy.phone.watchkitapp;
+				PRODUCT_NAME = OceanBuddyWatch;
+				SDKROOT = watchos;
+				SKIP_INSTALL = YES;
+				TARGETED_DEVICE_FAMILY = 4;
+				WATCHOS_DEPLOYMENT_TARGET = 10.0;
+			};
+			name = Debug;
+		};
+		F729E39CA492DCE1BC012567 /* Release */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				ALWAYS_SEARCH_USER_PATHS = NO;
+				CLANG_ANALYZER_NONNULL = YES;
+				CLANG_ANALYZER_NUMBER_OBJECT_CONVERSION = YES_AGGRESSIVE;
+				CLANG_CXX_LANGUAGE_STANDARD = "gnu++14";
+				CLANG_CXX_LIBRARY = "libc++";
+				CLANG_ENABLE_MODULES = YES;
+				CLANG_ENABLE_OBJC_ARC = YES;
+				CLANG_ENABLE_OBJC_WEAK = YES;
+				CLANG_WARN_BLOCK_CAPTURE_AUTORELEASING = YES;
+				CLANG_WARN_BOOL_CONVERSION = YES;
+				CLANG_WARN_COMMA = YES;
+				CLANG_WARN_CONSTANT_CONVERSION = YES;
+				CLANG_WARN_DEPRECATED_OBJC_IMPLEMENTATIONS = YES;
+				CLANG_WARN_DIRECT_OBJC_ISA_USAGE = YES_ERROR;
+				CLANG_WARN_DOCUMENTATION_COMMENTS = YES;
+				CLANG_WARN_EMPTY_BODY = YES;
+				CLANG_WARN_ENUM_CONVERSION = YES;
+				CLANG_WARN_INFINITE_RECURSION = YES;
+				CLANG_WARN_INT_CONVERSION = YES;
+				CLANG_WARN_NON_LITERAL_NULL_CONVERSION = YES;
+				CLANG_WARN_OBJC_IMPLICIT_RETAIN_SELF = YES;
+				CLANG_WARN_OBJC_LITERAL_CONVERSION = YES;
+				CLANG_WARN_OBJC_ROOT_CLASS = YES_ERROR;
+				CLANG_WARN_QUOTED_INCLUDE_IN_FRAMEWORK_HEADER = YES;
+				CLANG_WARN_RANGE_LOOP_ANALYSIS = YES;
+				CLANG_WARN_STRICT_PROTOTYPES = YES;
+				CLANG_WARN_SUSPICIOUS_MOVE = YES;
+				CLANG_WARN_UNGUARDED_AVAILABILITY = YES_AGGRESSIVE;
+				CLANG_WARN_UNREACHABLE_CODE = YES;
+				CLANG_WARN__DUPLICATE_METHOD_MATCH = YES;
+				CODE_SIGN_STYLE = Automatic;
+				COPY_PHASE_STRIP = NO;
+				CURRENT_PROJECT_VERSION = 1;
+				DEBUG_INFORMATION_FORMAT = "dwarf-with-dsym";
+				DEVELOPMENT_TEAM = G4889SDMJ4;
+				ENABLE_NS_ASSERTIONS = NO;
+				ENABLE_STRICT_OBJC_MSGSEND = YES;
+				ENABLE_USER_SCRIPT_SANDBOXING = YES;
+				GCC_C_LANGUAGE_STANDARD = gnu11;
+				GCC_NO_COMMON_BLOCKS = YES;
+				GCC_WARN_64_TO_32_BIT_CONVERSION = YES;
+				GCC_WARN_ABOUT_RETURN_TYPE = YES_ERROR;
+				GCC_WARN_UNDECLARED_SELECTOR = YES;
+				GCC_WARN_UNINITIALIZED_AUTOS = YES_AGGRESSIVE;
+				GCC_WARN_UNUSED_FUNCTION = YES;
+				GCC_WARN_UNUSED_VARIABLE = YES;
+				IPHONEOS_DEPLOYMENT_TARGET = 17.0;
+				MARKETING_VERSION = 0.1.0;
+				MTL_ENABLE_DEBUG_INFO = NO;
+				MTL_FAST_MATH = YES;
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				SWIFT_COMPILATION_MODE = wholemodule;
+				SWIFT_OPTIMIZATION_LEVEL = "-O";
+				SWIFT_STRICT_CONCURRENCY = complete;
+				SWIFT_VERSION = 6.0;
+				WATCHOS_DEPLOYMENT_TARGET = 10.0;
+			};
+			name = Release;
+		};
+/* End XCBuildConfiguration section */
+
+/* Begin XCConfigurationList section */
+		B8A9E7F0FF7B98FCB40C4475 /* Build configuration list for PBXProject "OceanBuddy" */ = {
+			isa = XCConfigurationList;
+			buildConfigurations = (
+				AC6680B297F8C4C83A53E224 /* Debug */,
+				F729E39CA492DCE1BC012567 /* Release */,
+			);
+			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = Debug;
+		};
+		B8DFF2E102EC230ABAD4BA24 /* Build configuration list for PBXNativeTarget "OceanBuddyPhone" */ = {
+			isa = XCConfigurationList;
+			buildConfigurations = (
+				5671E2C5D90EE680FE14934C /* Debug */,
+				5F0A386FEE7C6936E45F0167 /* Release */,
+			);
+			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = Debug;
+		};
+		DCD87C51EB3DDA621C2CBDE2 /* Build configuration list for PBXNativeTarget "OceanBuddyWatch" */ = {
+			isa = XCConfigurationList;
+			buildConfigurations = (
+				BD4CF7E987A2DF0D53A0D8B2 /* Debug */,
+				197CDCAF3D9CAA7B0760C9AE /* Release */,
+			);
+			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = Debug;
+		};
+/* End XCConfigurationList section */
+
+/* Begin XCLocalSwiftPackageReference section */
+		6DA08D5E059911380727B698 /* XCLocalSwiftPackageReference "." */ = {
+			isa = XCLocalSwiftPackageReference;
+			relativePath = .;
+		};
+/* End XCLocalSwiftPackageReference section */
+
+/* Begin XCSwiftPackageProductDependency section */
+		43CD090F349150DD71B68F61 /* OceanBuddyCore */ = {
+			isa = XCSwiftPackageProductDependency;
+			productName = OceanBuddyCore;
+		};
+		60F670EEC7F8755CB8377CC7 /* OceanBuddyCore */ = {
+			isa = XCSwiftPackageProductDependency;
+			productName = OceanBuddyCore;
+		};
+/* End XCSwiftPackageProductDependency section */
+	};
+	rootObject = F31E87E723DD397BA8263A13 /* Project object */;
+}

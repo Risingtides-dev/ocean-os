@@ -1,0 +1,47 @@
+[
+  {
+    "event_id": "50000000-0000-4000-8000-000000000001",
+    "flow_id": "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb",
+    "state": "requested",
+    "occurred_at": "2026-07-22T12:10:00Z",
+    "action": {
+      "id": "60000000-0000-4000-8000-000000000001",
+      "label": "Approve",
+      "kind": "photo_to_context",
+      "requires_confirmation": true,
+      "target_device": "i_phone"
+    }
+  },
+  {
+    "event_id": "50000000-0000-4000-8000-000000000002",
+    "flow_id": "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb",
+    "causation_id": "50000000-0000-4000-8000-000000000001",
+    "state": "approved",
+    "occurred_at": "2026-07-22T12:10:01Z",
+    "action": {
+      "id": "60000000-0000-4000-8000-000000000001",
+      "label": "Approve",
+      "kind": "photo_to_context",
+      "requires_confirmation": true,
+      "target_device": "i_phone"
+    }
+  },
+  {
+    "event_id": "50000000-0000-4000-8000-000000000003",
+    "flow_id": "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb",
+    "causation_id": "50000000-0000-4000-8000-000000000002",
+    "state": "failed",
+    "occurred_at": "2026-07-22T12:10:02Z",
+    "failure": {
+      "code": "phone_unavailable",
+      "message": "iPhone is unavailable.",
+      "retryable": true
+    },
+    "card": {
+      "id": "70000000-0000-4000-8000-000000000001",
+      "kind": "error_card",
+      "title": "Photo was not attached.",
+      "detail": "iPhone is unavailable. Bring it online and try again."
+    }
+  }
+]
