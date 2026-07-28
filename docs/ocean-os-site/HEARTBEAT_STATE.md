@@ -14,7 +14,7 @@ Continue maintaining `docs/ocean-os-site` as a polished, paginated architecture/
 - `docs/ocean-os-site/pages/daemon.html` — daemon API, live checks, route map, turn lifecycle, permissions note, root-route mismatch; freshness pass updated line refs and CTA.
 - `docs/ocean-os-site/pages/runtime.html` — runtime loop, capability registry, side effects, permission hooks, cancellation, context/token guardrails; freshness pass updated line refs and CTA.
 - `docs/ocean-os-site/pages/protocol.html` — SDK vs legacy protocol layers, session creation before turns, `/v1/agent/turns`, scoped `/v1/agent/events`, event lifecycle, components/browser activity, compatibility map; latest contract refresh updated line refs.
-- `docs/ocean-os-site/pages/surface.html` — Ocean Surface PWA/proxy architecture, SSE/session model, component rendering, voice/proxy routes, and explicitly labeled controlled demonstrations.
+- `docs/ocean-os-site/pages/surface.html` — Ocean Surface PWA/proxy architecture, SSE/session model, component rendering, and explicitly labeled controlled demonstrations; the honesty pass distinguishes proxy-forwarded STT/TTS from the transcript-only `/v1/agent/voice` seam and correctly identifies Tauri as the current native shell with GPUI retained only as legacy source.
 - `docs/ocean-os-site/pages/tui.html` — TUI cockpit architecture: daemon client routes, F1-F7 rooms, SDK turn submission, SSE parsing, PM block rendering, sessions/permissions/status; freshness pass updated line refs and CTA.
 - `docs/ocean-os-site/pages/desktop.html` — current Tauri shell architecture, shared Leptos UI boundary, native bridge responsibilities, daemon client contract, and `surface-tauri` turn identity.
 - `docs/ocean-os-site/pages/cli-sdk.html` — CLI command surface, one-shot prompt flow, SDK identifiers/sessions/requests/events, and compatibility map; the sensitive prior CLI capture was removed.
@@ -27,7 +27,7 @@ Continue maintaining `docs/ocean-os-site` as a polished, paginated architecture/
 - Governing contract: `docs/ocean-os-site/PUBLIC_EVIDENCE_POLICY.md`.
 
 ## Next page order
-All originally queued core/client pages are filled. Next recommended small slice: refresh `daemon.html` or `sessions.html` for the session-creation/project-workspace contract; otherwise capture real TUI/desktop screenshots if runnable.
+All originally queued core/client pages are filled. Next recommended small slice: inspect `pages/sessions.html` against the current strict Project -> Workspace -> Session -> Turns -> Events contract. The larger product-site gap remains truthful motion media: no Remotion project or rendered `.mp4`/`.mov` pipeline exists in this repo.
 
 ## Slice rules
 - One small page/slice per heartbeat.
@@ -50,11 +50,14 @@ All originally queued core/client pages are filled. Next recommended small slice
 Old shell LaunchAgent was brittle under launchd. A Rust runner crate `ocean-heartbeat` now exists with `run`, `init`, `launchd`, and `component` commands, but the old LaunchAgent has not been migrated/installed to the Rust runner yet.
 
 ## Latest slice
-- Refreshed `docs/ocean-os-site/pages/protocol.html` for the active session-first product contract: `POST /v1/agent/sessions`, then scoped SSE, then session-bound turns.
-- Files changed: `docs/ocean-os-site/pages/protocol.html`, `docs/ocean-os-site/HEARTBEAT_STATE.md`.
-- Assets captured: none.
-- QA result: parsed all local HTML links and image sources across `index.html` and `pages/*.html`; no broken internal links/images found.
-- Gotcha: `AgentTurnRequest` still allows omitted `session_id` for compatibility, but first-party surfaces should create/choose a session first per `docs/OCEAN_ECOSYSTEM_CONTRACT.md`.
+- Refreshed `docs/ocean-os-site/pages/surface.html` against current `ocean-os` and sibling `ocean-surface` sources.
+- Corrected the client boundary: one Leptos/WASM bundle serves PWA, Tauri, and extension; GPUI is legacy. The proxy forwards STT/TTS to daemon-owned endpoints and holds no provider credential.
+- Clarified that `POST /v1/agent/voice` accepts an already-transcribed `transcript`, tags `client_type: "leo-voice"`, and delegates to the normal turn path; it is not microphone capture, daemon STT, wake word, TTS, or a complete voice UX.
+- Preserved the public-evidence policy: retained images are labeled controlled demonstrations, the runtime observation is dated 2026-07-20, and the rejected host-revealing tool capture remains deleted.
+- Files changed: `docs/ocean-os-site/pages/surface.html`, `docs/ocean-os-site/HEARTBEAT_STATE.md`, `events.md`.
+- Assets captured: none. Queued: only real runnable TUI/desktop captures or a future genuine motion pipeline; do not manufacture video evidence.
+- QA: HTML parse, local link/image validation, `git diff --check`, and `cargo xtask docs-check` pass.
+- Gotcha: sibling `../ocean-surface` has unrelated uncommitted work; it was read only and not modified.
 
 ## Compaction protocol
 At the start of every heartbeat:

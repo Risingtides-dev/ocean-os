@@ -5531,3 +5531,14 @@ area:  [backend]: Call dependency transport
 
 Recovered the focused LiveKit feature correction from the divergent Mini main. `livekit-api` now uses rustls native roots, removing `native-tls`, `hyper-tls`, and `openssl-sys` from the supported workspace graph. All 160 ocean-call tests, workspace test compilation, compatibility feature Clippy lanes, release all-target compilation, docs-check, and dependency-tree assertions pass.
 _________________________________________________________________________________
+
+_________________________________________________________________________________
+
+time:  [00:23] [28-07-26]
+agent: [pi] [gpt-5.4] [Thoth]
+worktree: [detached origin/main integration at /private/tmp/ocean-consolidate]
+type:  [workflow]: Refresh Ocean Surface documentation truth
+area:  [writing]: Client and voice boundaries
+
+Recovered the Surface-site honesty pass while preserving the new public-evidence policy. The page now identifies the shared Leptos bundle across PWA/Tauri/extension, treats GPUI as legacy, records proxy-forwarded daemon-owned STT/TTS, and distinguishes the transcript-only `/v1/agent/voice` seam from complete voice UX. Retained images are controlled demonstrations and the runtime observation remains dated point-in-time evidence.
+_________________________________________________________________________________
