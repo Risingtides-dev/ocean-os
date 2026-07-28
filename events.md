@@ -5652,3 +5652,16 @@ and actual-source Linux/Windows cross-build evidence. A2a adds no live lifecycle
 delivery, replay, health/restart policy, registry mutation surface, Crew, UI, or
 integration behavior. A2b is the next authorized slice.
 _________________________________________________________________________________
+_________________________________________________________________________________
+time:      [02:53] [28-07-26]
+agent:     [pi] [gpt-5.4] [thoth]
+worktree:  [feat/extensions-stage-a2a]
+type:      [gh actions]
+area:      [testing]
+
+Repaired the sole hosted A2a failure after macOS, MSRV, cargo-deny, and package
+validation passed: Linux defines stat.st_dev as u64, so two portable generation
+identity checks now use checked conversion instead of a platform-redundant cast.
+The security comparison and behavior are unchanged. This was found only by the
+Ubuntu Rust 1.97 denied-warning Clippy lane.
+_________________________________________________________________________________

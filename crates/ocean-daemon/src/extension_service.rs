@@ -628,7 +628,9 @@ fn remove_directory_contents(directory: &File) -> io::Result<()> {
             }
             // SAFETY: fstatat initialized named on success.
             let named = unsafe { named.assume_init() };
-            if opened.dev() != named.st_dev as u64 || opened.ino() != named.st_ino {
+            if u64::try_from(named.st_dev).ok() != Some(opened.dev())
+                || opened.ino() != named.st_ino
+            {
                 return Err(io::Error::new(
                     io::ErrorKind::PermissionDenied,
                     "temp generation changed during cleanup",
@@ -677,7 +679,9 @@ fn cleanup_temp_root(roots: &AssignedRoots) -> bool {
     }
     // SAFETY: fstatat initialized named on success.
     let named = unsafe { named.assume_init() };
-    if opened.dev() != named.st_dev as u64 || opened.ino() != named.st_ino {
+    if u64::try_from(named.st_dev).ok() != Some(opened.dev())
+        || opened.ino() != named.st_ino
+    {
         return false;
     }
     // SAFETY: the verified empty connection root is removed relative to its
