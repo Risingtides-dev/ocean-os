@@ -8,25 +8,23 @@ Continue maintaining `docs/ocean-os-site` as a polished, paginated architecture/
 
 ## Done pages
 - `docs/ocean-os-site/index.html` — architecture overview; latest update aligns Product API section with the active Project -> Workspace -> Session -> Turns -> Events contract and confirms no broken internal links.
-- `docs/ocean-os-site/pages/surfaces.html` — surface inventory, live daemon/surface status, screenshot assets, CLI capture, Longhouse capture, honest remaining capture queue.
-- `docs/ocean-os-site/pages/longhouse.html` — Longhouse architecture, event model, live deck capture from `:8795` after `/v1/longhouse/demo`.
+- `docs/ocean-os-site/pages/surfaces.html` — surface inventory, source-grounded architecture notes, and explicitly labeled controlled demonstrations; sensitive, blank, and host-revealing captures are rejected.
+- `docs/ocean-os-site/pages/longhouse.html` — Longhouse architecture and event model; the blank controlled-demo frame is no longer presented as live evidence.
 - `docs/ocean-os-site/pages/browser.html` — Chrome extension/browser cockpit page. Includes browser mock, animated system diagram, Remotion storyboard, context pipe, MV3 details, ocean-browser API.
 - `docs/ocean-os-site/pages/daemon.html` — daemon API, live checks, route map, turn lifecycle, permissions note, root-route mismatch; freshness pass updated line refs and CTA.
 - `docs/ocean-os-site/pages/runtime.html` — runtime loop, capability registry, side effects, permission hooks, cancellation, context/token guardrails; freshness pass updated line refs and CTA.
 - `docs/ocean-os-site/pages/protocol.html` — SDK vs legacy protocol layers, session creation before turns, `/v1/agent/turns`, scoped `/v1/agent/events`, event lifecycle, components/browser activity, compatibility map; latest contract refresh updated line refs.
-- `docs/ocean-os-site/pages/surface.html` — Ocean Surface PWA/proxy architecture, live local check, SSE/session model, component rendering, voice/proxy routes, runnable captures; freshness pass updated line refs, native shell note, and CTA.
+- `docs/ocean-os-site/pages/surface.html` — Ocean Surface PWA/proxy architecture, SSE/session model, component rendering, voice/proxy routes, and explicitly labeled controlled demonstrations.
 - `docs/ocean-os-site/pages/tui.html` — TUI cockpit architecture: daemon client routes, F1-F7 rooms, SDK turn submission, SSE parsing, PM block rendering, sessions/permissions/status; freshness pass updated line refs and CTA.
 - `docs/ocean-os-site/pages/desktop.html` — current Tauri shell architecture, shared Leptos UI boundary, native bridge responsibilities, daemon client contract, and `surface-tauri` turn identity.
-- `docs/ocean-os-site/pages/cli-sdk.html` — CLI command surface, one-shot prompt flow, existing CLI capture, SDK identifiers/sessions/requests/events, compatibility map; freshness pass updated line refs and CTA.
+- `docs/ocean-os-site/pages/cli-sdk.html` — CLI command surface, one-shot prompt flow, SDK identifiers/sessions/requests/events, and compatibility map; the sensitive prior CLI capture was removed.
 - `docs/ocean-os-site/pages/providers.html` — provider registry, model catalogue, credential resolution, readiness, daemon model API, protocol transport mapping, live `/ready`/`/v1/models` check; freshness pass updated line refs and CTA.
-- `docs/ocean-os-site/pages/sessions.html` — local-first session storage, workspace buckets, atomic JSON saves, strict resume semantics, history caps, session APIs, SDK bridge gap; freshness pass updated line refs.
+- `docs/ocean-os-site/pages/sessions.html` — local-first session storage, workspace buckets, atomic JSON saves, strict resume semantics, history caps, session APIs, and privacy-safe source-grounded evidence.
 
-## Assets added
-- `docs/ocean-os-site/assets/surfaces/model-dropdown-halt.png`
-- `docs/ocean-os-site/assets/surfaces/tool-group-collapsed.png`
-- `docs/ocean-os-site/assets/surfaces/map-render-test.png`
-- `docs/ocean-os-site/assets/surfaces/longhouse-deck-live.png`
-- `docs/ocean-os-site/assets/surfaces/cli-capture.txt`
+## Public evidence inventory
+- Retained as controlled demonstrations: `model-dropdown-halt.png`, `map-render-test.png`.
+- Removed from the current tree: `tool-group-collapsed.png` (local host metadata), `cli-capture.txt` (session IDs and local paths), `longhouse-deck-live.png` (blank demo frame).
+- Governing contract: `docs/ocean-os-site/PUBLIC_EVIDENCE_POLICY.md`.
 
 ## Next page order
 All originally queued core/client pages are filled. Next recommended small slice: refresh `daemon.html` or `sessions.html` for the session-creation/project-workspace contract; otherwise capture real TUI/desktop screenshots if runnable.

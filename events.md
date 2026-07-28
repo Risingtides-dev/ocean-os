@@ -5437,3 +5437,14 @@ area:  [frontend]: Chat lifecycle, queueing, scrollback, and installed artifact 
 
 Consolidated unknown-ack reconciliation, exact-request Esc cancellation, tool-local failure color, FIFO follow-up queueing, quiet interrupted turns, and detached scroll anchoring. Review repairs fence queues across session history, handle finish-before-ack, preserve FIFO through 409 and fenced recovery, retain cancellation across transient reconnects, clear stale targets on authoritative sync, and make the revisioned installer truly immutable. The TUI suite passes 432 tests with 4 ignored; release/check/docs/format/shell/patch gates and final review pass.
 _________________________________________________________________________________
+
+_________________________________________________________________________________
+
+time:  [23:33] [27-07-26]
+agent: [pi] [gpt-5.4] [Thoth]
+worktree: [detached origin/main integration at /private/tmp/ocean-consolidate]
+type:  [workflow]: Classify public operational evidence
+area:  [writing]: Public documentation security hygiene
+
+Established the public-evidence contract. Retained two synthetic captures as controlled demonstrations; removed a tool capture exposing host metadata, a CLI capture exposing session UUIDs and absolute local paths, and a blank Longhouse demo frame. Updated site claims so dated observations, source-grounded architecture, demonstrations, and live evidence are not conflated.
+_________________________________________________________________________________
