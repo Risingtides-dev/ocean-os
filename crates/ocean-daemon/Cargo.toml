@@ -13,6 +13,10 @@ path = "src/main.rs"
 
 [features]
 default = []
+# Internal source-inclusion mode for the isolated Windows registry portability
+# harness. It removes only daemon AppState/Axum route coupling so the harness
+# compiles the actual common reader and unsupported supervisor modules.
+registry-portability-check = []
 # Activates the live call-session audio loop (OCEAN-CALL): joins the LiveKit
 # room, taps remote PCM, and publishes Ocean's voice back. Pulls native
 # libwebrtc via ocean-call's own `livekit-tap` feature, so it is OPT-IN — the

@@ -5627,3 +5627,12 @@ area:      [backend]: Extension registry and native-service security boundary
 
 Consolidated unsupported reconciliation onto the sole descriptor/reparse-safe coherent reader and its exact artifact, service, capability, and secret-binding authority; removed the second pathname parser and added Windows relative-handle traversal primitives. Unsupported startup now projects only common-validated grants and remains no-child/non-probing. Added real supervisor valid/malformed/nonexistent-service/unauthorized-binding tests, the serialized 1,024/1,025 full-reader boundary, post-ready protocol-violation classification, a macOS unlink/fail-closed generation fixture, and a retained cleanup-authority lane for exceptional signal/membership-proof failures. The reviewed syscall/identity seam combines a real reaped leader with deterministic simulated same-number unrelated PGID membership and proves the signal syscall is never reached; forcing the kernel PID allocator to wrap would be nondeterministic and unsafe. A2b+ behavior remains absent.
 _________________________________________________________________________________
+_________________________________________________________________________________
+time:      [01:36] [28-07-26]
+agent:     [api] [gpt-5.4] [worker]
+worktree:  [feat/extensions-stage-a2a]
+type:      [bug report]: Close final Stage A2a acceptance blockers
+area:      [backend]: Extension transport classification and Windows portability
+
+Separated clean EOF, read I/O, and protocol frame failures in the native-service transport. Post-ready EOF/read failures and the leader-poll race now deterministically retain `unexpected_exit`, while malformed, truncated, unknown, and oversized frames retain `protocol_violation`; repeated real early-exit and injected I/O fixtures cover the boundary. Added an isolated repository-owned Windows cross-build package that includes the actual registry and unsupported-supervisor source modules, compiles the real NtCreateFile/NtQueryDirectoryFile reader and no-child supervisor path, and documents the separate pre-existing full-daemon ocean-observatory Windows blockers. Focused extension tests (77), all daemon tests (620), SDK tests (63), workspace/MSRV checks, denied-warning daemon/SDK Clippy, Linux musl and isolated Windows GNU cross-builds, formatting, docs, and diff checks pass.
+_________________________________________________________________________________

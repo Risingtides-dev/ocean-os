@@ -7,6 +7,11 @@
 //! under one shared lock; this module is also the only source of supervised
 //! activation records consumed by `extension_service`.
 
+#![cfg_attr(
+    all(feature = "registry-portability-check", not(test)),
+    allow(dead_code)
+)]
+
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::ffi::OsStr;
 #[cfg(unix)]
@@ -24,9 +29,11 @@ use std::os::windows::{
     io::{AsRawHandle, FromRawHandle},
 };
 use std::path::{Component, Path as FsPath, PathBuf};
+#[cfg(any(test, not(feature = "registry-portability-check")))]
 use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
+#[cfg(any(test, not(feature = "registry-portability-check")))]
 use axum::{
     extract::{Path, Query, State},
     http::StatusCode,
@@ -40,11 +47,14 @@ use ocean_extension::{
 };
 use semver::Version;
 use serde::{Deserialize, Serialize};
+#[cfg(any(test, not(feature = "registry-portability-check")))]
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
+#[cfg(any(test, not(feature = "registry-portability-check")))]
 use tokio::sync::Semaphore;
 use uuid::Uuid;
 
+#[cfg(any(test, not(feature = "registry-portability-check")))]
 use super::AppState;
 
 const STATE_SCHEMA_VERSION: u32 = 1;
@@ -59,12 +69,15 @@ const MAX_PACKAGE_ENTRIES: usize = 10_000;
 const MAX_PACKAGE_DEPTH: usize = 64;
 const MAX_PACKAGE_BYTES: u64 = 256 * 1024 * 1024;
 const LOCK_WAIT: Duration = Duration::from_millis(250);
+#[cfg(any(test, not(feature = "registry-portability-check")))]
 const INSPECTION_CONCURRENCY: usize = 4;
 const TREE_DIGEST_DOMAIN: &[u8] = b"ocean-extension-tree-v1\0";
 const FILE_DIGEST_DOMAIN: &[u8] = b"ocean-extension-file-v1\0";
 
+#[cfg(any(test, not(feature = "registry-portability-check")))]
 static INSPECTION_LIMITER: OnceLock<Arc<Semaphore>> = OnceLock::new();
 
+#[cfg(any(test, not(feature = "registry-portability-check")))]
 fn inspection_limiter() -> Arc<Semaphore> {
     INSPECTION_LIMITER
         .get_or_init(|| Arc::new(Semaphore::new(INSPECTION_CONCURRENCY)))
@@ -372,6 +385,7 @@ struct ExtensionInspection {
     diagnostics: Vec<ExtensionDiagnostic>,
 }
 
+#[cfg(any(test, not(feature = "registry-portability-check")))]
 #[derive(Debug, Clone, Serialize)]
 struct DoctorChecks {
     coherent_state: bool,
@@ -382,6 +396,7 @@ struct DoctorChecks {
     package_code_executed: bool,
 }
 
+#[cfg(any(test, not(feature = "registry-portability-check")))]
 #[derive(Debug, Deserialize, Default)]
 #[serde(deny_unknown_fields)]
 pub(super) struct ExtensionStateQuery {
@@ -2348,6 +2363,7 @@ fn inspect_extension(
     })
 }
 
+#[cfg(any(test, not(feature = "registry-portability-check")))]
 #[derive(Debug)]
 enum LoadError {
     BadExtensionId,
@@ -2359,6 +2375,7 @@ enum LoadError {
     Join,
 }
 
+#[cfg(any(test, not(feature = "registry-portability-check")))]
 async fn load_inspection(
     state: AppState,
     id: String,
@@ -2400,6 +2417,7 @@ async fn load_inspection(
     .map_err(|_| LoadError::Join)?
 }
 
+#[cfg(any(test, not(feature = "registry-portability-check")))]
 fn load_error_response(error: LoadError, doctor: bool) -> (StatusCode, Json<Value>) {
     match error {
         LoadError::BadExtensionId => (
@@ -2450,6 +2468,7 @@ fn load_error_response(error: LoadError, doctor: bool) -> (StatusCode, Json<Valu
 }
 
 /// Read one extension's separately persisted install/trust/enablement state.
+#[cfg(any(test, not(feature = "registry-portability-check")))]
 pub(super) async fn inspect(
     State(state): State<AppState>,
     Path(id): Path<String>,
@@ -2470,6 +2489,7 @@ pub(super) async fn inspect(
 
 /// Run static package/state diagnostics. No plugin, service, hook, Git, shell,
 /// provider, health probe, or package executable is invoked.
+#[cfg(any(test, not(feature = "registry-portability-check")))]
 pub(super) async fn doctor(
     State(state): State<AppState>,
     Path(id): Path<String>,
@@ -2507,6 +2527,16 @@ pub(super) async fn doctor(
         Err(error) => load_error_response(error, true),
     }
 }
+
+// The daemon binary is still type-checked when Cargo enables every feature.
+// These inert handlers exist only in the source-inclusion mode; that mode is
+// not a runnable daemon configuration and the isolated harness never mounts a
+// router.
+#[cfg(all(feature = "registry-portability-check", not(test)))]
+pub(super) async fn inspect() {}
+
+#[cfg(all(feature = "registry-portability-check", not(test)))]
+pub(super) async fn doctor() {}
 
 #[cfg(test)]
 mod tests {

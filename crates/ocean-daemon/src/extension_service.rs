@@ -935,8 +935,11 @@ async fn run_service(
                     Ok(ChildFrame::ShutdownComplete(_)) => {
                         break (ShutdownReason::Unhealthy, RuntimeReason::ProtocolViolation);
                     }
-                    Err(_) => {
-                        break (ShutdownReason::Unhealthy, RuntimeReason::ProtocolViolation);
+                    Err(error) => {
+                        break (
+                            ShutdownReason::Unhealthy,
+                            post_ready_frame_failure_reason(error),
+                        );
                     }
                 }
             }
@@ -1093,7 +1096,7 @@ where
         },
     };
     write_frame(stdin, &hello).await?;
-    let service_hello: ServiceHello = read_frame(stdout).await?;
+    let service_hello: ServiceHello = read_frame(stdout).await.map_err(|_| ())?;
     if service_hello.resume.is_some()
         || service_hello
             .validate_subscriptions(&activation.events)
@@ -1126,27 +1129,48 @@ async fn write_frame(
         .map_err(|_| ())
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FrameReadError {
+    Eof,
+    Io,
+    ProtocolViolation,
+}
+
+fn post_ready_frame_failure_reason(error: FrameReadError) -> RuntimeReason {
+    match error {
+        FrameReadError::Eof | FrameReadError::Io => RuntimeReason::UnexpectedExit,
+        FrameReadError::ProtocolViolation => RuntimeReason::ProtocolViolation,
+    }
+}
+
 async fn read_frame<T: for<'de> Deserialize<'de>, R: AsyncBufRead + Unpin>(
     reader: &mut R,
-) -> Result<T, ()> {
+) -> Result<T, FrameReadError> {
     let mut encoded = Vec::with_capacity(1024);
     loop {
-        let available = reader.fill_buf().await.map_err(|_| ())?;
+        let available = reader.fill_buf().await.map_err(|_| FrameReadError::Io)?;
         if available.is_empty() {
-            return Err(());
+            return Err(if encoded.is_empty() {
+                FrameReadError::Eof
+            } else {
+                FrameReadError::ProtocolViolation
+            });
         }
         let count = available
             .iter()
             .position(|byte| *byte == b'\n')
             .map_or(available.len(), |index| index + 1);
-        let next = encoded.len().checked_add(count).ok_or(())?;
+        let next = encoded
+            .len()
+            .checked_add(count)
+            .ok_or(FrameReadError::ProtocolViolation)?;
         if next > MAX_FRAME_BYTES {
-            return Err(());
+            return Err(FrameReadError::ProtocolViolation);
         }
         encoded.extend_from_slice(&available[..count]);
         reader.consume(count);
         if encoded.last() == Some(&b'\n') {
-            return decode_frame(&encoded).map_err(|_| ());
+            return decode_frame(&encoded).map_err(|_| FrameReadError::ProtocolViolation);
         }
     }
 }
@@ -1180,7 +1204,10 @@ async fn finish_process(
     let _ = write_frame(&mut stdin, &shutdown).await;
     let response = async {
         loop {
-            match read_frame::<ChildFrame, _>(&mut stdout).await? {
+            match read_frame::<ChildFrame, _>(&mut stdout)
+                .await
+                .map_err(|_| ())?
+            {
                 ChildFrame::ShutdownComplete(_) => return Ok::<(), ()>(()),
                 ChildFrame::Status(_) => {}
                 ChildFrame::Ack(ack) => {
@@ -1612,7 +1639,7 @@ mod tests {
 
     #[tokio::test]
     async fn transport_rejects_oversize_duplicate_unknown_and_resume_frames() {
-        async fn decode_service_hello(bytes: Vec<u8>) -> Result<ServiceHello, ()> {
+        async fn decode_service_hello(bytes: Vec<u8>) -> Result<ServiceHello, FrameReadError> {
             let capacity = bytes.len().saturating_add(1);
             let (mut writer, reader) = tokio::io::duplex(capacity);
             let write = tokio::spawn(async move { writer.write_all(&bytes).await.unwrap() });
@@ -1622,19 +1649,26 @@ mod tests {
         }
 
         let oversized = vec![b'x'; MAX_FRAME_BYTES + 1];
-        assert!(decode_service_hello(oversized).await.is_err());
-        assert!(decode_service_hello(
-            b"{\"protocol\":\"ocean.extension.service\",\"version\":1,\"version\":1,\"frame\":\"service_hello\",\"subscriptions\":[],\"resume\":null}\n"
-                .to_vec()
-        )
-        .await
-        .is_err());
-        assert!(decode_service_hello(
-            b"{\"protocol\":\"ocean.extension.service\",\"version\":1,\"frame\":\"service_hello\",\"subscriptions\":[],\"resume\":null,\"identity\":\"override\"}\n"
-                .to_vec()
-        )
-        .await
-        .is_err());
+        assert_eq!(
+            decode_service_hello(oversized).await,
+            Err(FrameReadError::ProtocolViolation)
+        );
+        assert_eq!(
+            decode_service_hello(
+                b"{\"protocol\":\"ocean.extension.service\",\"version\":1,\"version\":1,\"frame\":\"service_hello\",\"subscriptions\":[],\"resume\":null}\n"
+                    .to_vec()
+            )
+            .await,
+            Err(FrameReadError::ProtocolViolation)
+        );
+        assert_eq!(
+            decode_service_hello(
+                b"{\"protocol\":\"ocean.extension.service\",\"version\":1,\"frame\":\"service_hello\",\"subscriptions\":[],\"resume\":null,\"identity\":\"override\"}\n"
+                    .to_vec()
+            )
+            .await,
+            Err(FrameReadError::ProtocolViolation)
+        );
 
         let (_temp, activation) = executable_fixture("#!/bin/sh\nexit 0\n");
         let resume = format!(
@@ -1663,6 +1697,64 @@ mod tests {
         .await
         .is_err());
         child.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn frame_read_failures_separate_exit_io_and_protocol_causes() {
+        use std::{
+            pin::Pin,
+            task::{Context, Poll},
+        };
+        use tokio::io::{AsyncRead, ReadBuf};
+
+        struct FailingReader;
+
+        impl AsyncRead for FailingReader {
+            fn poll_read(
+                self: Pin<&mut Self>,
+                _context: &mut Context<'_>,
+                _buffer: &mut ReadBuf<'_>,
+            ) -> Poll<io::Result<()>> {
+                Poll::Ready(Err(io::Error::other("injected read failure")))
+            }
+        }
+
+        let mut eof = BufReader::new(tokio::io::empty());
+        assert!(matches!(
+            read_frame::<ChildFrame, _>(&mut eof).await,
+            Err(FrameReadError::Eof)
+        ));
+
+        let mut io_failure = BufReader::new(FailingReader);
+        assert!(matches!(
+            read_frame::<ChildFrame, _>(&mut io_failure).await,
+            Err(FrameReadError::Io)
+        ));
+
+        for bytes in [
+            b"{truncated".as_slice(),
+            b"{\"protocol\":\"ocean.extension.service\",\"version\":1,\"frame\":\"unknown\"}\n"
+                .as_slice(),
+        ] {
+            let mut invalid = BufReader::new(bytes);
+            assert!(matches!(
+                read_frame::<ChildFrame, _>(&mut invalid).await,
+                Err(FrameReadError::ProtocolViolation)
+            ));
+        }
+
+        assert_eq!(
+            post_ready_frame_failure_reason(FrameReadError::Eof),
+            RuntimeReason::UnexpectedExit
+        );
+        assert_eq!(
+            post_ready_frame_failure_reason(FrameReadError::Io),
+            RuntimeReason::UnexpectedExit
+        );
+        assert_eq!(
+            post_ready_frame_failure_reason(FrameReadError::ProtocolViolation),
+            RuntimeReason::ProtocolViolation
+        );
     }
 
     #[tokio::test]
@@ -2097,6 +2189,42 @@ printf '%s\n' '{"protocol":"ocean.extension.service","version":1,"frame":"shutdo
             status.snapshot()[0].reason,
             Some(RuntimeReason::ProtocolViolation)
         );
+    }
+
+    #[tokio::test]
+    async fn post_ready_clean_eof_racing_leader_poll_is_always_unexpected_exit() {
+        let script = r#"#!/bin/sh
+IFS= read -r hello || exit 10
+printf '%s\n' '{"protocol":"ocean.extension.service","version":1,"frame":"service_hello","subscriptions":[],"resume":null}'
+IFS= read -r ready || exit 11
+exit 0
+"#;
+
+        // Repeat the fixture so both stdout EOF and the 50 ms leader poll can
+        // win scheduling without changing the fixed operator-visible cause.
+        for _ in 0..8 {
+            let (temp, mut activation) = executable_fixture(script);
+            install_fixture_store(&temp, &mut activation);
+            activation.events.clear();
+            let status = RuntimeStatusCache::default();
+            let retained = tokio::time::timeout(
+                Duration::from_secs(5),
+                run_service(
+                    activation,
+                    Uuid::new_v4(),
+                    CancellationToken::new(),
+                    status.clone(),
+                ),
+            )
+            .await
+            .unwrap();
+            assert!(retained.is_none());
+            assert_eq!(status.snapshot()[0].state, RuntimeState::Unhealthy);
+            assert_eq!(
+                status.snapshot()[0].reason,
+                Some(RuntimeReason::UnexpectedExit)
+            );
+        }
     }
 
     #[tokio::test]
