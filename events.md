@@ -5457,5 +5457,5 @@ worktree: [detached origin/main integration at /private/tmp/ocean-consolidate]
 type:  [workflow]: Recover public community and publication safeguards
 area:  [review]: Repository policy and package metadata
 
-Recovered the post-PR community documents, vulnerability/support routes, contribution templates, and workspace-wide `publish = false` inheritance onto current main. Cargo metadata, workspace index parity, docs-check, and manifest coverage verification pass.
+Recovered the post-PR community documents, vulnerability/support routes, contribution templates, and workspace-wide `publish = false` inheritance onto current main. Review repairs provide an explicit confidential conduct-reporting path, remove template whitespace, and make `cargo xtask docs-check` enforce the root/member publication safeguards for future packages. Cargo metadata, workspace index parity, docs-check, and manifest coverage verification pass.
 _________________________________________________________________________________

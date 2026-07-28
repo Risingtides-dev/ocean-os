@@ -46,8 +46,12 @@ pub fn check_repo(root: &Path) -> Result<CheckStats, Vec<String>> {
     if members.is_empty() {
         errors.push("Cargo.toml workspace members could not be parsed".into());
     }
+    if !workspace_publish_is_disabled(&cargo) {
+        errors.push("Cargo.toml [workspace.package] must set publish = false".into());
+    }
 
     let package_names = names_for_member_paths(root, &members, &mut errors);
+    check_member_publish(root, &members, &mut errors);
     let index = read(&root.join("crates/AGENTS.md"), &mut errors);
     let indexed_names = parse_index_packages(&index);
     compare_sets(
@@ -178,6 +182,53 @@ fn package_name(manifest: &str) -> Option<String> {
         }
     }
     None
+}
+
+fn toml_section<'a>(manifest: &'a str, heading: &str) -> &'a str {
+    let Some(start) = manifest.find(heading) else {
+        return "";
+    };
+    let tail = &manifest[start + heading.len()..];
+    let end = tail
+        .lines()
+        .scan(0usize, |offset, line| {
+            let start = *offset;
+            *offset += line.len() + 1;
+            Some((start, line))
+        })
+        .find_map(|(offset, line)| line.trim_start().starts_with('[').then_some(offset))
+        .unwrap_or(tail.len());
+    &tail[..end]
+}
+
+fn workspace_publish_is_disabled(manifest: &str) -> bool {
+    toml_section(manifest, "[workspace.package]")
+        .lines()
+        .map(|line| line.split('#').next().unwrap_or("").trim())
+        .any(|line| line == "publish = false")
+}
+
+fn package_publish_is_safe(manifest: &str) -> bool {
+    let package = toml_section(manifest, "[package]");
+    package.lines().any(|raw| {
+        let line = raw.split('#').next().unwrap_or("").trim();
+        line == "publish = false"
+            || line == "publish.workspace = true"
+            || (line.starts_with("publish") && line.contains("workspace") && line.contains("true"))
+    })
+}
+
+fn check_member_publish(root: &Path, members: &[String], errors: &mut Vec<String>) {
+    for member in members {
+        let manifest = root.join(member).join("Cargo.toml");
+        let text = read(&manifest, errors);
+        if !package_publish_is_safe(&text) {
+            errors.push(format!(
+                "{} must inherit workspace publish=false or set publish = false",
+                display(root, &manifest)
+            ));
+        }
+    }
 }
 
 fn names_for_member_paths(
@@ -354,6 +405,29 @@ default-members = ["crates/alpha"]
     }
 
     #[test]
+    fn enforces_workspace_and_member_non_publication() {
+        let root = r#"
+[workspace]
+members = ["crates/alpha"]
+
+[workspace.package]
+publish = false
+rust-version = "1.88"
+"#;
+        assert!(workspace_publish_is_disabled(root));
+
+        assert!(package_publish_is_safe(
+            "[package]\nname = \"alpha\"\npublish.workspace = true\n\n[dependencies]\npublish = \"1\"\n"
+        ));
+        assert!(package_publish_is_safe(
+            "[package]\nname = \"xtask\"\npublish = false\n"
+        ));
+        assert!(!package_publish_is_safe(
+            "[package]\nname = \"unsafe-default\"\n\n[dependencies]\n"
+        ));
+    }
+
+    #[test]
     fn parses_only_package_index_rows() {
         let input = "| Package | Role |\n| `ocean-core` | Core |\n| prose | text |\n";
         assert_eq!(
@@ -390,12 +464,12 @@ default-members = ["crates/alpha"]
         fs::create_dir_all(root.join("docs")).expect("create docs");
         fs::write(
             root.join("Cargo.toml"),
-            "[workspace]\nmembers = [\"crates/alpha\"]\ndefault-members = [\"crates/alpha\"]\n",
+            "[workspace]\nmembers = [\"crates/alpha\"]\ndefault-members = [\"crates/alpha\"]\n\n[workspace.package]\npublish = false\n",
         )
         .expect("write workspace");
         fs::write(
             root.join("crates/alpha/Cargo.toml"),
-            "[package]\nname = \"alpha\"\nversion = \"0.1.0\"\n",
+            "[package]\nname = \"alpha\"\nversion = \"0.1.0\"\npublish.workspace = true\n",
         )
         .expect("write package");
         fs::write(

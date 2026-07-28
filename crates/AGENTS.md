@@ -17,6 +17,7 @@ This child doc governs `crates/` and is the canonical ownership, entry-point, an
 - Read the target package's local `AGENTS.md` when the index links one.
 - Do not introduce cross-crate coupling without documenting the contract in affected owner docs.
 - When adding/removing/renaming a workspace package, update this index in the same change and verify it against `cargo metadata --no-deps --format-version=1`.
+- Every package manifest must inherit the root non-publication contract with `publish.workspace = true` / `publish = { workspace = true }`, or set `publish = false` explicitly. `cargo xtask docs-check` rejects a workspace member that omits this safeguard.
 - Keep entry points and narrow validation current; stale routing information is a correctness defect for agent work.
 - Agent turns are session/workspace scoped and do not carry a Track-0 `room_id`. Durable collaboration uses `RoomKey` and `/v1/rooms/persistent/*`; LiveKit token minting remains independent at `/v1/rooms/{room_id}/livekit-token`.
 - The current desktop product client is `surface-tauri`; removed client

@@ -20,6 +20,7 @@ This is the root devlog contract for the `ocean-os` repository. Every agent ente
 - Canonical workspace package/entry/test index: `crates/AGENTS.md`. Do not maintain a second crate inventory here.
 - After any meaningful change, do a devlog pass: update the nearest owning `AGENTS.md`, refresh affected child indexes, remove stale text, and append a root `events.md` entry with `worktree:`.
 - Project code is `MIT OR Apache-2.0`, copyright © 2026 Rising Tides. Preserve `NOTICE.md` and local donor notices; Ocean names, logos, and distinctive brand assets remain outside the open-source grants under `TRADEMARKS.md`.
+- Rust workspace packages are private distribution inputs, not crates.io releases: `[workspace.package] publish = false`, and every member must inherit it or set `publish = false` explicitly. `cargo xtask docs-check` enforces this for new members.
 
 ## Workspace Routing
 

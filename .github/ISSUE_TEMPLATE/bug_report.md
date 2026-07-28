@@ -10,9 +10,9 @@ Brief description of the problem.
 
 ## Reproduction
 
-1. 
-2. 
-3. 
+1.
+2.
+3.
 
 ## Expected behavior
 

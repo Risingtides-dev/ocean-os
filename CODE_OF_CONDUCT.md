@@ -49,9 +49,11 @@ an individual is officially representing the community in public spaces.
 ## Enforcement
 
 Instances of abusive, harassing, or otherwise unacceptable behavior may be
-reported to the repository maintainers via GitHub Private Vulnerability
-Reporting (see [SECURITY.md](SECURITY.md)) or by opening a private issue if
-available.
+reported confidentially through the repository's
+[private reporting form](https://github.com/Risingtides-dev/ocean-os/security/advisories/new).
+Prefix the report title with `[conduct]`; maintainers route it as a conduct
+complaint rather than vulnerability triage. Do not include sensitive conduct
+reports in public issues.
 
 All complaints will be reviewed and investigated promptly and fairly.
 

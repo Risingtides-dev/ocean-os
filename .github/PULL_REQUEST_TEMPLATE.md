@@ -4,7 +4,7 @@ Brief description of what this PR changes and why.
 
 ## Changes
 
-- 
+-
 
 ## Verification
 
