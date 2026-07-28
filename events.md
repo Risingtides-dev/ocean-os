@@ -5391,3 +5391,18 @@ and terminal bookkeeping cleanup. A1 remains unwired and at independent review;
 no transport, process, route, registry mutation, live producer, or A2+ behavior
 was added.
 _________________________________________________________________________________
+_________________________________________________________________________________
+time:      [23:05] [27-07-26]
+agent:     [pi] [gpt-5.4] [thoth]
+worktree:  [feat/extensions-stage-a1]
+type:      [review]
+area:      [testing]
+
+Accepted Stage A1 after three independent review rounds and corrective deltas.
+The final PASS confirms strict bounded metadata-only SDK v1 framing, recursive
+duplicate rejection, request-scoped tool/permission correlation, validate-before-
+commit state, lifecycle-bounded shared atomic terminal authority, exactly-once
+normal/orphan/panic convergence, and bounded boot retention. The 2,305-request
+proof removes the former cumulative terminal cliff. A1 remains intentionally
+unwired and launches nothing; A2a is the next authorized slice.
+_________________________________________________________________________________
