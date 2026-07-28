@@ -1,10 +1,10 @@
 # Ocean Daemon Longhouse Governance-Control Extraction Manifest
 
 **Date:** 2026-07-19
-**Status:** Characterization accepted; extraction authorized only for the exact 13-definition governance-control boundary
+**Status:** Published; exact 13-definition governance-control boundary extracted and independently re-reviewed on current main
 **Owner:** Ocean OS
-**Source baseline:** fetched and rebased `origin/main` `729542b`
-**Rollback point:** characterization import-contract commit `0e7a4dc` (seven-test characterization `f1971c0` plus test-only parent-import correction)
+**Source baseline:** current `origin/main` `7a51f5bb` before reconciliation
+**Rollback points:** original characterization import-contract commit `0e7a4dc`; current-base pre-extraction replay `299de7bd`
 
 ## Purpose
 
@@ -226,7 +226,13 @@ Fresh correctness/test-adequacy and security/architecture/lifecycle review round
 
 Test-only correction `0e7a4dc` updates the extraction-aware parent import expectation so `with_titles` remains a separate `#[cfg(test)]` import instead of creating a release-build unused import; production behavior and the seven tests are unchanged.
 
-Extraction is authorized only from rollback point `0e7a4dc`, only for the exact 13 definitions/comments listed above, and only with the manifested imports and visibility. Real convene remains excluded.
+Extraction was authorized only from rollback point `0e7a4dc`, only for the exact 13 definitions/comments listed above, and only with the manifested imports and visibility. Real convene remains excluded.
+
+## Publication result
+
+Current-main replay commit `f64cda59` moves the exact boundary into private `crates/ocean-daemon/src/longhouse_governance_control.rs`. Mechanical comparison against original rollback `0e7a4dc`, current-base replay `299de7bd`, and the extraction parent is exact after removing only the authorized `pub(super)` visibility modifiers. `AppState`, route composition, startup authority assembly, Revoker/recall construction, real convene, durable title grant/bind, provider execution, and raw-token delivery remain in `main.rs`.
+
+The reconciled checkpoint passed all 592 daemon tests serialized, the seven focused governance-control tests, denied-warning daemon all-target Clippy, formatting, docs, and diff checks. Fresh independent correctness/security review reported CLEAR with no blocker, high, or medium finding. Preserved risks remain the pre-existing unauthenticated local mutation posture, caller-supplied recall voter UUIDs, synchronous SQLite mutex work, memory-only/unbounded abandoned recalls, latent request `Debug`, post-close breach 200/zero-strike behavior, and board poison publication/projection divergence.
 
 ## Validation matrix
 

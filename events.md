@@ -5509,3 +5509,14 @@ type:      [testing]: correct governance-control parent import contract
 area:      [testing]: ocean-daemon Phase 2C governance control
 
 Corrected only the extraction-aware test's future parent import expectation: the five route handlers remain one production import block while parent-test-only `with_titles` uses a separate `#[cfg(test)]` import, avoiding a denied-warning release unused import without broadening request fields or production authority. Focused source-boundary characterization passed. Rollback and extraction authorization now bind to `0e7a4dc`, which contains the accepted seven-test characterization `f1971c0` plus this test-only correction. No production behavior, handler, route, response, schema, credential, process, or deployment changed.
+
+_________________________________________________________________________________
+
+time:  [00:04] [28-07-26]
+agent: [pi] [gpt-5.4] [Thoth]
+worktree: [detached origin/main integration at /private/tmp/ocean-consolidate]
+type:  [refactor]: Publish Longhouse governance-control extraction
+area:  [backend]: Daemon composition boundary
+
+Reconciled the authorized exact 13-definition claim/revoke/recall/breach/board adapter extraction onto current main as private `longhouse_governance_control.rs`. Mechanical comparison against the original and rebased rollback points is exact apart from authorized parent visibility. All 592 daemon tests, seven focused governance tests, denied-warning daemon Clippy, formatting/docs/diff checks, and fresh independent correctness/security review pass. Real convene, route/state authority, title grant/bind, provider execution, and raw-token delivery remain in composition.
+_________________________________________________________________________________
