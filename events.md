@@ -5722,3 +5722,21 @@ process runs, all 649 daemon tests, all workspace tests, strict workspace Clippy
 format/docs/diff checks, compatibility, Rust 1.88 MSRV, full repository CI,
 Linux musl, and actual-source Windows GNU portability cross-builds pass.
 _________________________________________________________________________________
+_________________________________________________________________________________
+time:      [19:19] [28-07-26]
+agent:     [api] [gpt-5.4] [worker]
+worktree:  [feat/extensions-stage-a2b]
+type:      [bug report]: Stabilize final Stage A2b loaded-host process proofs
+area:      [testing]: Extension protocol rejection and descendant cleanup
+
+Replaced two undersized five-second aggregate fixture deadlines with explicit
+child-to-test phase barriers and a fixture-only watchdog sized above the intact
+production shutdown/write/TERM/KILL budget. The invalid-ACK proof now begins its
+cleanup bound only after the child has written the illegal frame. The abrupt-exit
+proof establishes a live inherited-pipe grandchild before releasing the leader,
+then checks the process group has no live member without depending on unrelated
+OS zombie reaping. Ten focused repeats and three full 97-test extension repeats
+passed while fresh workspace check and strict Clippy compilation ran concurrently;
+the complete local repository CI gate also passed. Production protocol and
+cleanup deadlines are unchanged, and no A3 scope was added.
+_________________________________________________________________________________

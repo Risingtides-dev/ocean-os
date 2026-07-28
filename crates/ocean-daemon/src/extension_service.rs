@@ -3339,6 +3339,29 @@ mod tests {
         panic!("runtime state {wanted:?} was not observed")
     }
 
+    async fn wait_for_fixture_marker(marker: &Path) {
+        tokio::time::timeout(Duration::from_secs(20), async {
+            while !marker.exists() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap_or_else(|_| panic!("fixture marker was not created: {}", marker.display()));
+    }
+
+    async fn await_fixture_service(
+        task: JoinHandle<Option<CleanupAuthority>>,
+    ) -> Option<CleanupAuthority> {
+        // A cleanup attempt may legitimately consume the 2s shutdown write,
+        // 2s graceful response, 2s TERM, and 2s KILL bounds. Keep this
+        // fixture-only watchdog above that contracted total plus loaded-host
+        // scheduling margin; changing production deadlines would weaken proof.
+        tokio::time::timeout(Duration::from_secs(15), task)
+            .await
+            .expect("fixture service exceeded bounded protocol/cleanup time")
+            .expect("fixture service task panicked")
+    }
+
     #[test]
     fn prioritized_control_lane_coalesces_without_an_unbounded_control_queue() {
         let controls = ControlLane::default();
@@ -4490,33 +4513,28 @@ IFS= read -r hello || exit 10
 printf '%s\n' '{"protocol":"ocean.extension.service","version":1,"frame":"service_hello","subscriptions":[],"resume":null}'
 IFS= read -r ready || exit 11
 printf '%s\n' '{"protocol":"ocean.extension.service","version":1,"frame":"ack","sequence":"1"}'
+printf ready > "$HOME/invalid-ack-sent"
 IFS= read -r shutdown || exit 12
 printf '%s\n' '{"protocol":"ocean.extension.service","version":1,"frame":"shutdown_complete"}'
 "#;
         let (temp, mut activation) = executable_fixture(script);
+        install_fixture_store(&temp, &mut activation);
         activation.events.clear();
-        let config = temp.path().join("config");
-        fs::create_dir(&config).unwrap();
-        activation.config_dir = config.clone();
-        fs::create_dir(config.join("extensions")).unwrap();
-        let store = config
-            .join("extensions/store/example.noop")
-            .join("a".repeat(64));
-        fs::create_dir_all(store.parent().unwrap()).unwrap();
-        fs::rename(&activation.package_path, &store).unwrap();
-        activation.package_path = store;
+        let marker = activation
+            .config_dir
+            .join("extensions/state/example.noop/data/invalid-ack-sent");
         let status = RuntimeStatusCache::default();
-        let retained = tokio::time::timeout(
-            Duration::from_secs(5),
-            run_service(
-                activation,
-                Uuid::new_v4(),
-                CancellationToken::new(),
-                status.clone(),
-            ),
-        )
-        .await
-        .unwrap();
+        let task = tokio::spawn(run_service(
+            activation,
+            Uuid::new_v4(),
+            CancellationToken::new(),
+            status.clone(),
+        ));
+
+        // Synchronize on the invalid frame reaching the host pipe so startup
+        // scheduling is not charged to the cleanup watchdog.
+        wait_for_fixture_marker(&marker).await;
+        let retained = await_fixture_service(task).await;
         assert!(retained.is_none());
         assert_eq!(status.snapshot()[0].state, RuntimeState::Unhealthy);
         assert_eq!(
@@ -4601,49 +4619,54 @@ exit 0
 IFS= read -r hello || exit 10
 printf '%s\n' '{"protocol":"ocean.extension.service","version":1,"frame":"service_hello","subscriptions":[],"resume":null}'
 IFS= read -r ready || exit 11
-sleep 30 &
+(
+  printf ready > "$HOME/grandchild-ready"
+  exec sleep 30
+) &
 printf '%s' "$!" > "$HOME/grandchild.pid"
+while [ ! -f "$HOME/grandchild-ready" ]; do sleep 0.01; done
+printf '%s' "$$" > "$HOME/leader.pid"
+printf ready > "$HOME/leader-ready"
+while [ ! -f "$HOME/release-leader" ]; do sleep 0.01; done
 exit 0
 "#;
         let (temp, mut activation) = executable_fixture(script);
+        install_fixture_store(&temp, &mut activation);
         activation.events.clear();
-        let config = temp.path().join("config");
-        fs::create_dir(&config).unwrap();
-        activation.config_dir = config.clone();
-        fs::create_dir(config.join("extensions")).unwrap();
-        let store = config
-            .join("extensions/store/example.noop")
-            .join("a".repeat(64));
-        fs::create_dir_all(store.parent().unwrap()).unwrap();
-        fs::rename(&activation.package_path, &store).unwrap();
-        activation.package_path = store;
+        let data = activation
+            .config_dir
+            .join("extensions/state/example.noop/data");
         let status = RuntimeStatusCache::default();
-        let retained = tokio::time::timeout(
-            Duration::from_secs(5),
-            run_service(activation, Uuid::new_v4(), CancellationToken::new(), status),
-        )
-        .await
-        .unwrap();
+        let task = tokio::spawn(run_service(
+            activation,
+            Uuid::new_v4(),
+            CancellationToken::new(),
+            status,
+        ));
+
+        // The child-originated marker proves the descendant is running before
+        // the test releases the leader to exit; this removes the fork/exit race
+        // without changing the inherited-pipe cleanup case under test.
+        wait_for_fixture_marker(&data.join("leader-ready")).await;
+        let leader: libc::pid_t = fs::read_to_string(data.join("leader.pid"))
+            .unwrap()
+            .parse()
+            .unwrap();
+        let grandchild: libc::pid_t = fs::read_to_string(data.join("grandchild.pid"))
+            .unwrap()
+            .parse()
+            .unwrap();
+        // SAFETY: signal 0 performs an existence check only.
+        assert_eq!(unsafe { libc::kill(grandchild, 0) }, 0);
+        assert!(group_has_live_members(leader).unwrap());
+        fs::write(data.join("release-leader"), b"release").unwrap();
+
+        let retained = await_fixture_service(task).await;
         assert!(retained.is_none());
-        let grandchild: libc::pid_t =
-            fs::read_to_string(config.join("extensions/state/example.noop/data/grandchild.pid"))
-                .unwrap()
-                .parse()
-                .unwrap();
-        let gone = tokio::time::timeout(Duration::from_secs(5), async {
-            loop {
-                // SAFETY: signal 0 performs an existence check only.
-                if unsafe { libc::kill(grandchild, 0) } != 0 {
-                    break;
-                }
-                // A killed descendant may remain briefly visible as a
-                // reparented zombie while the OS reaper is under parallel load.
-                tokio::time::sleep(Duration::from_millis(10)).await;
-            }
-        })
-        .await
-        .is_ok();
-        assert!(gone, "surviving grandchild was not cleaned");
+        assert!(
+            !group_has_live_members(leader).unwrap(),
+            "surviving grandchild remained live after group cleanup"
+        );
     }
 
     #[tokio::test]
