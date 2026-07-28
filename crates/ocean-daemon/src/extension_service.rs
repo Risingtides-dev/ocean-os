@@ -399,6 +399,16 @@ struct AssignedRoots {
     connection_name: CString,
 }
 
+#[cfg(target_os = "linux")]
+fn same_device_identity(opened: u64, named: libc::dev_t) -> bool {
+    opened == named
+}
+
+#[cfg(target_os = "macos")]
+fn same_device_identity(opened: u64, named: libc::dev_t) -> bool {
+    opened == named as u64
+}
+
 fn assigned_roots(
     config_dir: &Path,
     package_id: &str,
@@ -628,9 +638,7 @@ fn remove_directory_contents(directory: &File) -> io::Result<()> {
             }
             // SAFETY: fstatat initialized named on success.
             let named = unsafe { named.assume_init() };
-            if u64::try_from(named.st_dev).ok() != Some(opened.dev())
-                || opened.ino() != named.st_ino
-            {
+            if !same_device_identity(opened.dev(), named.st_dev) || opened.ino() != named.st_ino {
                 return Err(io::Error::new(
                     io::ErrorKind::PermissionDenied,
                     "temp generation changed during cleanup",
@@ -679,7 +687,7 @@ fn cleanup_temp_root(roots: &AssignedRoots) -> bool {
     }
     // SAFETY: fstatat initialized named on success.
     let named = unsafe { named.assume_init() };
-    if u64::try_from(named.st_dev).ok() != Some(opened.dev()) || opened.ino() != named.st_ino {
+    if !same_device_identity(opened.dev(), named.st_dev) || opened.ino() != named.st_ino {
         return false;
     }
     // SAFETY: the verified empty connection root is removed relative to its

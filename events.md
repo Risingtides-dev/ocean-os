@@ -5665,3 +5665,15 @@ identity checks now use checked conversion instead of a platform-redundant cast.
 The security comparison and behavior are unchanged. This was found only by the
 Ubuntu Rust 1.97 denied-warning Clippy lane.
 _________________________________________________________________________________
+_________________________________________________________________________________
+time:      [03:04] [28-07-26]
+agent:     [pi] [gpt-5.4] [thoth]
+worktree:  [feat/extensions-stage-a2a]
+type:      [gh actions]
+area:      [testing]
+
+Made the retained file-device identity comparison target-specific after Ubuntu
+Clippy correctly rejected a generic checked conversion that is a no-op for
+Linux dev_t. Linux compares native u64 directly; macOS performs its required
+signed-to-u64 cast. The security predicate and generation binding are unchanged.
+_________________________________________________________________________________
