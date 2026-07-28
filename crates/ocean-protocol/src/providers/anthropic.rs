@@ -175,27 +175,32 @@ fn convert_messages(messages: &[Message]) -> Vec<Value> {
                 }
             }
             Message::ToolResult(tr) => {
+                // Empty text blocks are invalid INSIDE tool_result content
+                // too, so filter them; a tool that produced no output omits
+                // `content` entirely (the field is optional for tool_result).
                 let body: Vec<Value> = tr
                     .content
                     .iter()
-                    .map(|c| match c {
-                        Content::Text { text } => json!({"type": "text", "text": text}),
-                        Content::Image { data, mime_type } => json!({
+                    .filter_map(|c| match c {
+                        Content::Text { text } if !text.is_empty() => {
+                            Some(json!({"type": "text", "text": text}))
+                        }
+                        Content::Image { data, mime_type } => Some(json!({
                             "type": "image",
                             "source": {"type": "base64", "media_type": mime_type, "data": data}
-                        }),
-                        _ => json!({"type": "text", "text": ""}),
+                        })),
+                        _ => None,
                     })
                     .collect();
-                out.push(json!({
-                    "role": "user",
-                    "content": [{
-                        "type": "tool_result",
-                        "tool_use_id": tr.tool_call_id,
-                        "content": body,
-                        "is_error": tr.is_error,
-                    }]
-                }));
+                let mut result = json!({
+                    "type": "tool_result",
+                    "tool_use_id": tr.tool_call_id,
+                    "is_error": tr.is_error,
+                });
+                if !body.is_empty() {
+                    result["content"] = json!(body);
+                }
+                out.push(json!({"role": "user", "content": [result]}));
             }
         }
     }
@@ -204,6 +209,12 @@ fn convert_messages(messages: &[Message]) -> Vec<Value> {
 
 fn content_to_block(c: &Content) -> Option<Value> {
     match c {
+        // Anthropic rejects empty text blocks outright ("text content blocks
+        // must be non-empty"), and models with interleaved thinking (opus-5)
+        // can close a streamed text block with zero deltas, leaving an empty
+        // Content::Text in stored history. Drop them at the replay boundary so
+        // both fresh turns and already-persisted sessions stay valid.
+        Content::Text { text } if text.is_empty() => None,
         Content::Text { text } => Some(json!({"type": "text", "text": text})),
         Content::Thinking {
             thinking,
@@ -410,8 +421,15 @@ fn build_body(model: &Model, context: &Context, options: &StreamOptions) -> Valu
                 let target = n - 2;
                 if let Some(content) = arr[target].get_mut("content").and_then(Value::as_array_mut)
                 {
-                    if let Some(last_block) = content.last_mut() {
-                        if let Some(obj) = last_block.as_object_mut() {
+                    // cache_control may not sit on thinking blocks, so anchor
+                    // the breakpoint on the last block that can carry it.
+                    if let Some(block) = content.iter_mut().rev().find(|b| {
+                        !matches!(
+                            b.get("type").and_then(Value::as_str),
+                            Some("thinking") | Some("redacted_thinking")
+                        )
+                    }) {
+                        if let Some(obj) = block.as_object_mut() {
                             obj.insert("cache_control".into(), cache_control());
                         }
                     }
@@ -918,6 +936,114 @@ mod tests {
         assert!(
             convert_messages(&messages).is_empty(),
             "filtering unsigned thinking must not leave an empty assistant message"
+        );
+    }
+
+    // Opus-5 with interleaved thinking can close a streamed text block with
+    // zero deltas, leaving Content::Text("") in stored history. Anthropic
+    // rejects such blocks on replay ("text content blocks must be non-empty" /
+    // "cache_control cannot be set for empty text blocks"), so they must be
+    // dropped at the conversion boundary.
+    #[test]
+    fn empty_text_blocks_are_dropped_from_anthropic_replay() {
+        let messages = vec![
+            Message::User {
+                content: vec![Content::text("")],
+                timestamp: now_ms(),
+            },
+            Message::Assistant(AssistantMessage {
+                content: vec![
+                    Content::text(""),
+                    Content::text("visible answer"),
+                    Content::text(""),
+                ],
+                api: "anthropic-messages".into(),
+                provider: "anthropic".into(),
+                model: "claude-opus-5".into(),
+                usage: Usage::default(),
+                stop_reason: StopReason::Stop,
+                error_message: None,
+                timestamp: now_ms(),
+            }),
+        ];
+
+        let out = convert_messages(&messages);
+        assert_eq!(
+            out.len(),
+            1,
+            "all-empty user message must be omitted: {out:?}"
+        );
+        let blocks = out[0]["content"].as_array().expect("content blocks");
+        assert_eq!(blocks, &[json!({"type": "text", "text": "visible answer"})]);
+    }
+
+    #[test]
+    fn empty_tool_result_text_is_filtered_and_content_omitted() {
+        let messages = vec![Message::ToolResult(crate::types::ToolResultMessage {
+            tool_call_id: "toolu_1".into(),
+            tool_name: "bash".into(),
+            content: vec![Content::text("")],
+            is_error: false,
+            timestamp: now_ms(),
+        })];
+
+        let out = convert_messages(&messages);
+        let result = &out[0]["content"][0];
+        assert_eq!(result["type"], "tool_result");
+        assert_eq!(result["tool_use_id"], "toolu_1");
+        assert!(
+            result.get("content").is_none(),
+            "empty tool output must omit content, not send an empty text block: {result}"
+        );
+    }
+
+    // The rolling cache breakpoint must never land on an empty or thinking
+    // block: with two messages, the breakpoint targets the first (stable)
+    // message, whose trailing empty text block is filtered out — so
+    // cache_control lands on the surviving non-empty block.
+    #[test]
+    fn cache_breakpoint_skips_filtered_empty_and_thinking_blocks() {
+        let mut ctx = ctx_with_history();
+        ctx.messages = vec![
+            Message::Assistant(AssistantMessage {
+                content: vec![
+                    Content::Thinking {
+                        thinking: "signed reasoning".into(),
+                        thinking_signature: Some("sig-1".into()),
+                    },
+                    Content::text("stable answer"),
+                    Content::text(""),
+                ],
+                api: "anthropic-messages".into(),
+                provider: "anthropic".into(),
+                model: "claude-opus-5".into(),
+                usage: Usage::default(),
+                stop_reason: StopReason::Stop,
+                error_message: None,
+                timestamp: now_ms(),
+            }),
+            Message::user_text("newest turn"),
+        ];
+
+        let body = build_body(
+            &Model::anthropic_claude_sonnet_4_6(),
+            &ctx,
+            &StreamOptions::default(),
+        );
+        let stable = body["messages"][0]["content"].as_array().unwrap();
+        // Thinking block survives (signed) but must not carry the breakpoint.
+        assert!(
+            stable[0].get("cache_control").is_none(),
+            "cache_control must not sit on a thinking block: {body}"
+        );
+        assert_eq!(
+            stable[1]["cache_control"]["type"], "ephemeral",
+            "breakpoint must land on the last cacheable block: {body}"
+        );
+        let serialized = serde_json::to_string(&body).unwrap();
+        assert!(
+            !serialized.contains(r#""text":"""#),
+            "no empty text block may reach Anthropic: {body}"
         );
     }
 

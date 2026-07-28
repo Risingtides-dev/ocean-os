@@ -5459,3 +5459,14 @@ area:  [review]: Repository policy and package metadata
 
 Recovered the post-PR community documents, vulnerability/support routes, contribution templates, and workspace-wide `publish = false` inheritance onto current main. Review repairs provide an explicit confidential conduct-reporting path, remove template whitespace, and make `cargo xtask docs-check` enforce the root/member publication safeguards for future packages. Cargo metadata, workspace index parity, docs-check, and manifest coverage verification pass.
 _________________________________________________________________________________
+
+_________________________________________________________________________________
+
+time:  [23:52] [27-07-26]
+agent: [pi] [gpt-5.4] [Thoth]
+worktree: [detached origin/main integration at /private/tmp/ocean-consolidate]
+type:  [bug report]: Recover Anthropic empty-block replay repair
+area:  [backend]: Provider request encoding
+
+Recovered the focused replay repair from the divergent Mini main. Anthropic encoding drops empty history and tool-result text blocks, omits empty optional tool-result content, and keeps rolling cache breakpoints off thinking blocks. Focused protocol tests and workspace checks verify the current-main integration.
+_________________________________________________________________________________

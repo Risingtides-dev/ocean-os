@@ -23,6 +23,7 @@ This crate owns the multi-provider LLM wire protocol layer for Anthropic, OpenAI
 - Anthropic assistant thinking history is replayable only with a non-empty
   provider signature. Drop unsigned cross-provider reasoning at wire encoding;
   never convert it into visible text or reject the shared persisted schema.
+- Anthropic replay must omit empty text blocks, including empty tool-result text; an empty tool result omits optional `content`. Rolling cache breakpoints skip thinking/redacted-thinking blocks and bind to the last cacheable block.
 - Codex OAuth turns with a bound Ocean session must use that stable session id
   for both `prompt_cache_key` and the HTTP `session_id`; a fresh UUID is only
   valid for ad-hoc provider calls with no session.
