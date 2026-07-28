@@ -5677,3 +5677,21 @@ Clippy correctly rejected a generic checked conversion that is a no-op for
 Linux dev_t. Linux compares native u64 directly; macOS performs its required
 signed-to-u64 cast. The security predicate and generation binding are unchanged.
 _________________________________________________________________________________
+_________________________________________________________________________________
+time:      [04:33] [28-07-26]
+agent:     [api] [gpt-5.4] [worker]
+worktree:  [feat/extensions-stage-a2b]
+type:      [feature-request]
+area:      [backend]
+
+Completed the bounded Stage A2b implementation without registry mutation or A3
+scope. Wired the nine authoritative metadata-only lifecycle producers with
+request-scoped terminal and host tool correlation; added synchronous in-memory
+project snapshots, immutable activation epochs, replay/ACK/lag/reset and
+prioritized controls; and completed heartbeat, restart/backoff/circuit, redacted
+stderr, unsupported-platform reprojection, and generation-safe startup,
+reconfigure, and shutdown cleanup. Focused/fanout/full workspace gates, strict
+Clippy, formatting/docs, compatibility, Rust 1.88 MSRV, Linux musl, and the
+actual-source Windows portability cross-build pass. A2b remains pending
+independent review and authorizes no A3 work.
+_________________________________________________________________________________
