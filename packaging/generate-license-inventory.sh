@@ -50,7 +50,9 @@ render_graph() {
     --output-file "$json_destination"
   test -s "$text_destination"
   test -s "$json_destination"
-  grep -q -- "- $package " "$text_destination"
+  # cargo-about inventories third-party packages in the selected binary graph.
+  # The workspace root package is publish=false and is intentionally omitted;
+  # its project licenses are shipped separately beside this inventory.
 }
 
 render_graph ocean-tui "$tmp_dir/ocean-tui.txt" "$tmp_dir/ocean-tui.json"

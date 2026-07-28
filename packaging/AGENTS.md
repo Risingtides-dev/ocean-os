@@ -43,7 +43,9 @@ Distribution artifacts for shipping prebuilt Ocean binaries to teammates.
   pre-license five-file/binary-only payloads.
 - The dependency inventory is generated separately for the `ocean-tui` and
   `ocean-daemon` macOS arm64 normal/build/transitive graphs, excluding dev-only
-  dependencies. The validation job first runs `cargo fetch --locked` so a clean
+  dependencies. Cargo-about lists third-party graph packages; the workspace
+  roots are `publish=false` and intentionally absent because the six project
+  legal files ship separately beside the generated inventory. The validation job first runs `cargo fetch --locked` so a clean
   runner hydrates every locked source Cargo metadata may require; inventory
   generation itself remains frozen and offline. Generation uses cargo-about
   0.9.1 from the official arm64 asset pinned to SHA-256

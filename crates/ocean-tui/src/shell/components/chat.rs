@@ -5233,8 +5233,10 @@ mod tests {
 
     #[test]
     fn escape_while_busy_requests_interrupt() {
-        let mut chat = ChatComponent::default();
-        chat.busy = true;
+        let mut chat = ChatComponent {
+            busy: true,
+            ..Default::default()
+        };
         assert!(matches!(
             chat.handle_key(key(KeyCode::Esc)),
             Some(Action::InterruptTurn)
