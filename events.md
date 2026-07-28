@@ -5553,3 +5553,16 @@ area:  [design]: Public evidence and measurement graphics
 
 Recovered the 2026-07-18 local harness-footprint measurement as two editable SVG/PNG social graphics with AI-generated text-free backplates. Review prep verified all arithmetic, dimensions, visible text, and absence of personal/local identifiers. The daemon-accounting graphic now names its OpenCode 1.17.15 baseline instead of making an unsupported standalone comparison, and the README binds the assets to the public-evidence policy and reproducible Chrome SVG rendering.
 _________________________________________________________________________________
+_________________________________________________________________________________
+time:      [01:52] [28-07-26]
+agent:     [pi] [gpt-5.4] [thoth]
+worktree:  [fix/tui-clippy-unblock]
+type:      [gh actions]
+area:      [testing]
+
+Unblocked the repository CI gate by rewriting one existing TUI test fixture to
+initialize its busy field in the Default struct expression, satisfying Rust
+1.97's field_reassign_with_default Clippy lint. No product behavior or contract
+changed. This failure was already present on origin/main and blocked both macOS
+and Ubuntu validation for the independently accepted Stage A2a PR #357.
+_________________________________________________________________________________
