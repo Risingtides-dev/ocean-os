@@ -10,9 +10,9 @@ use std::{
 };
 
 use ocean_agent_sdk::extension_lifecycle::{
-    encode_frame, DaemonStartedMetadata, DaemonStopReason, DaemonStoppingMetadata, EmptyMetadata,
-    EventFrame, LifecycleEvent, LifecycleEventKind, LifecycleMetadata, LifecycleScope,
-    MillisecondTimestamp, PermissionOutcome, PermissionRequestedMetadata,
+    encode_frame, DaemonStartedMetadata, DaemonStopReason, DaemonStoppingMetadata, DaemonVersion,
+    EmptyMetadata, EventFrame, FrameError, LifecycleEvent, LifecycleEventKind, LifecycleMetadata,
+    LifecycleScope, MillisecondTimestamp, PermissionOutcome, PermissionRequestedMetadata,
     PermissionResolvedMetadata, ProtocolName, ProtocolV1, Sequence, ToolFinishedMetadata, ToolName,
     ToolOutcome, ToolStartedMetadata, TurnFinishedMetadata, TurnOutcome,
 };
@@ -21,6 +21,10 @@ use uuid::Uuid;
 
 pub(crate) const BOOT_RING_MAX_EVENTS: usize = 2_048;
 pub(crate) const BOOT_RING_MAX_BYTES: usize = 8 * 1024 * 1024;
+const MAX_ACTIVE_TOOL_CORRELATIONS: usize = BOOT_RING_MAX_EVENTS;
+const MAX_OPEN_PERMISSIONS: usize = BOOT_RING_MAX_EVENTS;
+const MAX_FINALIZED_REQUESTS: usize = BOOT_RING_MAX_EVENTS;
+const MAX_RUNTIME_TOOL_CALL_ID_BYTES: usize = 1_024;
 
 /// Deterministic host inputs used for one emitted envelope.
 #[derive(Debug, Clone, Copy)]
@@ -176,7 +180,12 @@ pub(crate) enum DiagnosticCode {
     CompatibilityPermissionDenied,
     SessionStoppedUnproduced,
     OversizedEvent,
+    InvalidEvent,
     InvalidEventId,
+    SequenceExhausted,
+    BookkeepingCapacity,
+    InvalidCorrelationScope,
+    InvalidRuntimeToolId,
 }
 
 impl DiagnosticCode {
@@ -190,7 +199,12 @@ impl DiagnosticCode {
             Self::CompatibilityPermissionDenied => "compatibility_permission_denied",
             Self::SessionStoppedUnproduced => "session_stopped_unproduced",
             Self::OversizedEvent => "oversized_event",
+            Self::InvalidEvent => "invalid_event",
             Self::InvalidEventId => "invalid_event_id",
+            Self::SequenceExhausted => "sequence_exhausted",
+            Self::BookkeepingCapacity => "bookkeeping_capacity",
+            Self::InvalidCorrelationScope => "invalid_correlation_scope",
+            Self::InvalidRuntimeToolId => "invalid_runtime_tool_id",
         }
     }
 }
@@ -200,6 +214,40 @@ struct ToolCorrelation {
     host_tool_call_id: Uuid,
     tool_name: ToolName,
     started_at_ms: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+struct RequestCorrelationScope {
+    turn_id: Uuid,
+    request_id: Uuid,
+}
+
+impl RequestCorrelationScope {
+    fn from_source(scope: SourceScope) -> Option<Self> {
+        Some(Self {
+            turn_id: scope.turn_id?,
+            request_id: scope.request_id?,
+        })
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct ToolCorrelationKey {
+    request: RequestCorrelationScope,
+    runtime_tool_call_id: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+struct PermissionCorrelationKey {
+    request: RequestCorrelationScope,
+    permission_id: Uuid,
+}
+
+#[derive(Debug, Clone)]
+struct PreparedEvent {
+    event: LifecycleEvent,
+    encoded_bytes: usize,
+    next_sequence: Option<u64>,
 }
 
 #[derive(Debug, Clone)]
@@ -233,24 +281,49 @@ impl BootRing {
 /// Pure adapter and boot-local correlation state.
 #[derive(Default)]
 struct TerminalGuard {
+    // Terminal tombstones are retained for the boot. At the fixed bound, new
+    // requests fail closed rather than evicting an exactly-once authority.
     finalized_requests: Mutex<HashSet<Uuid>>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TerminalClaim {
+    Claimed,
+    Duplicate,
+    AtCapacity,
+}
+
 impl TerminalGuard {
-    fn claim(&self, request_id: Uuid) -> bool {
+    fn claim(&self, request_id: Uuid) -> TerminalClaim {
+        let mut finalized = self
+            .finalized_requests
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if finalized.contains(&request_id) {
+            return TerminalClaim::Duplicate;
+        }
+        if finalized.len() == MAX_FINALIZED_REQUESTS {
+            return TerminalClaim::AtCapacity;
+        }
+        finalized.insert(request_id);
+        TerminalClaim::Claimed
+    }
+
+    #[cfg(test)]
+    fn len(&self) -> usize {
         self.finalized_requests
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .insert(request_id)
+            .len()
     }
 }
 
 pub(crate) struct LifecycleAdapter {
     daemon_boot_id: Uuid,
-    next_sequence: u64,
+    next_sequence: Option<u64>,
     ring: BootRing,
-    tools: HashMap<String, ToolCorrelation>,
-    open_permissions: HashSet<Uuid>,
+    tools: HashMap<ToolCorrelationKey, ToolCorrelation>,
+    open_permissions: HashSet<PermissionCorrelationKey>,
     terminal_guard: TerminalGuard,
     diagnostics: HashMap<DiagnosticCode, u64>,
 }
@@ -259,7 +332,7 @@ impl LifecycleAdapter {
     pub(crate) fn new(daemon_boot_id: Uuid) -> Self {
         Self {
             daemon_boot_id,
-            next_sequence: 1,
+            next_sequence: Some(1),
             ring: BootRing::default(),
             tools: HashMap::new(),
             open_permissions: HashSet::new(),
@@ -275,12 +348,18 @@ impl LifecycleAdapter {
             LifecycleSource::DaemonStarted {
                 daemon_version,
                 stamp,
-            } => self.one(
-                LifecycleEventKind::DaemonStarted,
-                LifecycleScope::default(),
-                LifecycleMetadata::DaemonStarted(DaemonStartedMetadata { daemon_version }),
-                stamp,
-            ),
+            } => {
+                let Ok(daemon_version) = DaemonVersion::new(daemon_version) else {
+                    self.count(DiagnosticCode::InvalidEvent);
+                    return Vec::new();
+                };
+                self.one(
+                    LifecycleEventKind::DaemonStarted,
+                    LifecycleScope::default(),
+                    LifecycleMetadata::DaemonStarted(DaemonStartedMetadata { daemon_version }),
+                    stamp,
+                )
+            }
             LifecycleSource::ExplicitSessionCreated {
                 succeeded,
                 scope,
@@ -446,20 +525,39 @@ impl LifecycleAdapter {
         tool_name: ToolName,
         stamp: EventStamp,
     ) -> Vec<LifecycleEvent> {
-        let Some(permission_id) = scope.permission_id else {
-            self.count(DiagnosticCode::DuplicatePermissionRequest);
+        let (Some(request), Some(permission_id)) = (
+            RequestCorrelationScope::from_source(scope),
+            scope.permission_id,
+        ) else {
+            self.count(DiagnosticCode::InvalidCorrelationScope);
             return Vec::new();
         };
-        if !self.open_permissions.insert(permission_id) {
+        let key = PermissionCorrelationKey {
+            request,
+            permission_id,
+        };
+        if self.open_permissions.contains(&key) {
             self.count(DiagnosticCode::DuplicatePermissionRequest);
             return Vec::new();
         }
-        self.one(
+        if self.open_permissions.len() == MAX_OPEN_PERMISSIONS {
+            self.count(DiagnosticCode::BookkeepingCapacity);
+            return Vec::new();
+        }
+        let prepared = match self.prepare_one(
             LifecycleEventKind::PermissionRequested,
             scope.lifecycle(None),
             LifecycleMetadata::PermissionRequested(PermissionRequestedMetadata { tool_name }),
             stamp,
-        )
+        ) {
+            Ok(prepared) => prepared,
+            Err(code) => {
+                self.count(code);
+                return Vec::new();
+            }
+        };
+        self.open_permissions.insert(key);
+        self.commit_one(prepared)
     }
 
     fn permission_resolved(
@@ -468,11 +566,18 @@ impl LifecycleAdapter {
         resolution: PermissionResolution,
         stamp: EventStamp,
     ) -> Vec<LifecycleEvent> {
-        let Some(permission_id) = scope.permission_id else {
+        let (Some(request), Some(permission_id)) = (
+            RequestCorrelationScope::from_source(scope),
+            scope.permission_id,
+        ) else {
             self.count(DiagnosticCode::UnmatchedPermissionResolution);
             return Vec::new();
         };
-        if !self.open_permissions.remove(&permission_id) {
+        let key = PermissionCorrelationKey {
+            request,
+            permission_id,
+        };
+        if !self.open_permissions.contains(&key) {
             self.count(DiagnosticCode::UnmatchedPermissionResolution);
             return Vec::new();
         }
@@ -485,12 +590,20 @@ impl LifecycleAdapter {
                 PermissionOutcome::Cancelled
             }
         };
-        self.one(
+        let prepared = match self.prepare_one(
             LifecycleEventKind::PermissionResolved,
             scope.lifecycle(None),
             LifecycleMetadata::PermissionResolved(PermissionResolvedMetadata { outcome }),
             stamp,
-        )
+        ) {
+            Ok(prepared) => prepared,
+            Err(code) => {
+                self.count(code);
+                return Vec::new();
+            }
+        };
+        self.open_permissions.remove(&key);
+        self.commit_one(prepared)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -503,24 +616,51 @@ impl LifecycleAdapter {
         started_at_ms: u64,
         stamp: EventStamp,
     ) -> Vec<LifecycleEvent> {
-        if self.tools.contains_key(&runtime_tool_call_id) {
+        let Some(request) = RequestCorrelationScope::from_source(scope) else {
+            self.count(DiagnosticCode::InvalidCorrelationScope);
+            return Vec::new();
+        };
+        if runtime_tool_call_id.is_empty()
+            || runtime_tool_call_id.len() > MAX_RUNTIME_TOOL_CALL_ID_BYTES
+        {
+            self.count(DiagnosticCode::InvalidRuntimeToolId);
+            return Vec::new();
+        }
+        let key = ToolCorrelationKey {
+            request,
+            runtime_tool_call_id,
+        };
+        if self.tools.contains_key(&key) {
             self.count(DiagnosticCode::DuplicateToolStart);
             return Vec::new();
         }
+        if self.tools.len() == MAX_ACTIVE_TOOL_CORRELATIONS {
+            self.count(DiagnosticCode::BookkeepingCapacity);
+            return Vec::new();
+        }
+        let prepared = match self.prepare_one(
+            LifecycleEventKind::ToolStarted,
+            scope.lifecycle(Some(host_tool_call_id)),
+            LifecycleMetadata::ToolStarted(ToolStartedMetadata {
+                tool_name: tool_name.clone(),
+            }),
+            stamp,
+        ) {
+            Ok(prepared) => prepared,
+            Err(code) => {
+                self.count(code);
+                return Vec::new();
+            }
+        };
         self.tools.insert(
-            runtime_tool_call_id,
+            key,
             ToolCorrelation {
                 host_tool_call_id,
-                tool_name: tool_name.clone(),
+                tool_name,
                 started_at_ms,
             },
         );
-        self.one(
-            LifecycleEventKind::ToolStarted,
-            scope.lifecycle(Some(host_tool_call_id)),
-            LifecycleMetadata::ToolStarted(ToolStartedMetadata { tool_name }),
-            stamp,
-        )
+        self.commit_one(prepared)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -534,7 +674,15 @@ impl LifecycleAdapter {
         ended_at_ms: u64,
         stamp: EventStamp,
     ) -> Vec<LifecycleEvent> {
-        let Some(correlation) = self.tools.remove(runtime_tool_call_id) else {
+        let Some(request) = RequestCorrelationScope::from_source(scope) else {
+            self.count(DiagnosticCode::UnmatchedToolEnd);
+            return Vec::new();
+        };
+        let key = ToolCorrelationKey {
+            request,
+            runtime_tool_call_id: runtime_tool_call_id.to_owned(),
+        };
+        let Some(correlation) = self.tools.get(&key).cloned() else {
             self.count(DiagnosticCode::UnmatchedToolEnd);
             return Vec::new();
         };
@@ -546,7 +694,7 @@ impl LifecycleAdapter {
             ToolOutcome::Success
         };
         let _ = details.private;
-        self.one(
+        let prepared = match self.prepare_one(
             LifecycleEventKind::ToolFinished,
             scope.lifecycle(Some(correlation.host_tool_call_id)),
             LifecycleMetadata::ToolFinished(ToolFinishedMetadata {
@@ -556,7 +704,15 @@ impl LifecycleAdapter {
                 output_bytes,
             }),
             stamp,
-        )
+        ) {
+            Ok(prepared) => prepared,
+            Err(code) => {
+                self.count(code);
+                return Vec::new();
+            }
+        };
+        self.tools.remove(&key);
+        self.commit_one(prepared)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -575,10 +731,10 @@ impl LifecycleAdapter {
             self.count(DiagnosticCode::TurnAlreadyFinalized);
             return Vec::new();
         };
-        if !self.terminal_guard.claim(request_id) {
-            self.count(DiagnosticCode::TurnAlreadyFinalized);
+        let Some(request) = RequestCorrelationScope::from_source(scope) else {
+            self.count(DiagnosticCode::InvalidCorrelationScope);
             return Vec::new();
-        }
+        };
         let outcome = match (final_state, source) {
             (FinalRequestState::Completed, _) => TurnOutcome::Completed,
             (FinalRequestState::Cancelled, _) => TurnOutcome::Cancelled,
@@ -587,7 +743,7 @@ impl LifecycleAdapter {
                 TurnOutcome::Failed
             }
         };
-        self.one(
+        let prepared = match self.prepare_one(
             LifecycleEventKind::TurnFinished,
             scope.lifecycle(None),
             LifecycleMetadata::TurnFinished(TurnFinishedMetadata {
@@ -598,7 +754,31 @@ impl LifecycleAdapter {
                 cache_read_tokens,
             }),
             stamp,
-        )
+        ) {
+            Ok(prepared) => prepared,
+            Err(code) => {
+                self.count(code);
+                return Vec::new();
+            }
+        };
+        match self.terminal_guard.claim(request_id) {
+            TerminalClaim::Claimed => {}
+            TerminalClaim::Duplicate => {
+                self.count(DiagnosticCode::TurnAlreadyFinalized);
+                return Vec::new();
+            }
+            TerminalClaim::AtCapacity => {
+                self.count(DiagnosticCode::BookkeepingCapacity);
+                return Vec::new();
+            }
+        }
+
+        // Terminal settlement is the explicit cleanup boundary for abandoned
+        // per-request tool and permission state. The request tombstone remains
+        // boot-local so competing terminal authorities can never republish it.
+        self.tools.retain(|key, _| key.request != request);
+        self.open_permissions.retain(|key| key.request != request);
+        self.commit_one(prepared)
     }
 
     fn one(
@@ -608,29 +788,56 @@ impl LifecycleAdapter {
         metadata: LifecycleMetadata,
         stamp: EventStamp,
     ) -> Vec<LifecycleEvent> {
-        if stamp.event_id.get_version_num() != 4 {
-            self.count(DiagnosticCode::InvalidEventId);
-            return Vec::new();
+        match self.prepare_one(kind, scope, metadata, stamp) {
+            Ok(prepared) => self.commit_one(prepared),
+            Err(code) => {
+                self.count(code);
+                Vec::new()
+            }
         }
+    }
+
+    fn prepare_one(
+        &self,
+        kind: LifecycleEventKind,
+        scope: LifecycleScope,
+        metadata: LifecycleMetadata,
+        stamp: EventStamp,
+    ) -> Result<PreparedEvent, DiagnosticCode> {
+        if stamp.event_id.get_version_num() != 4 {
+            return Err(DiagnosticCode::InvalidEventId);
+        }
+        let sequence = self
+            .next_sequence
+            .ok_or(DiagnosticCode::SequenceExhausted)?;
         let event = LifecycleEvent {
             protocol: ProtocolName,
             version: ProtocolV1,
             frame: EventFrame,
             daemon_boot_id: self.daemon_boot_id,
-            sequence: Sequence(self.next_sequence),
+            sequence: Sequence(sequence),
             event_id: stamp.event_id,
             occurred_at: stamp.occurred_at,
             kind,
             scope,
             metadata,
         };
-        let Ok(encoded) = encode_frame(&event) else {
-            self.count(DiagnosticCode::OversizedEvent);
-            return Vec::new();
-        };
-        self.next_sequence = self.next_sequence.saturating_add(1);
-        self.ring.push(event.clone(), encoded.len());
-        vec![event]
+        let encoded = encode_frame(&event).map_err(|error| match error {
+            FrameError::TooLarge { .. } => DiagnosticCode::OversizedEvent,
+            FrameError::InvalidFraming | FrameError::InvalidFrame => DiagnosticCode::InvalidEvent,
+        })?;
+        Ok(PreparedEvent {
+            event,
+            encoded_bytes: encoded.len(),
+            next_sequence: sequence.checked_add(1),
+        })
+    }
+
+    fn commit_one(&mut self, prepared: PreparedEvent) -> Vec<LifecycleEvent> {
+        self.next_sequence = prepared.next_sequence;
+        self.ring
+            .push(prepared.event.clone(), prepared.encoded_bytes);
+        vec![prepared.event]
     }
 
     fn count(&mut self, code: DiagnosticCode) {
@@ -702,9 +909,20 @@ mod tests {
             project_id: Some(id(10)),
             project_registered: true,
             session_id: Some(id(11)),
-            turn_id: Some(id(12)),
+            turn_id: Some(id(request + 10_000)),
             request_id: Some(id(request)),
             permission_id: None,
+        }
+    }
+
+    fn invalid_stamp(millis: i64) -> EventStamp {
+        EventStamp {
+            event_id: Uuid::nil(),
+            occurred_at: MillisecondTimestamp::new(
+                Utc.timestamp_millis_opt(millis)
+                    .single()
+                    .expect("timestamp"),
+            ),
         }
     }
 
@@ -1002,6 +1220,252 @@ mod tests {
     }
 
     #[test]
+    fn identical_opaque_tool_ids_are_isolated_per_request_and_project_out_of_order() {
+        let mut adapter = LifecycleAdapter::new(id(1));
+        let scope_a = SourceScope {
+            project_id: Some(id(201)),
+            ..scope(202)
+        };
+        let scope_b = SourceScope {
+            project_id: Some(id(203)),
+            ..scope(204)
+        };
+        for (scope, host_id, stamp_id) in [(scope_a, id(205), 206), (scope_b, id(207), 208)] {
+            assert_eq!(
+                adapter
+                    .adapt(LifecycleSource::ToolExecutionStart {
+                        scope,
+                        runtime_tool_call_id: "same-opaque-id".to_owned(),
+                        host_tool_call_id: host_id,
+                        tool_name: tool("read"),
+                        started_at_ms: 10,
+                        stamp: stamp(stamp_id, 0),
+                        arguments: Value::Null,
+                    })
+                    .len(),
+                1
+            );
+        }
+        assert_eq!(adapter.tools.len(), 2);
+
+        let finish_b = adapter.adapt(LifecycleSource::ToolExecutionEnd {
+            scope: scope_b,
+            runtime_tool_call_id: "same-opaque-id".to_owned(),
+            is_error: false,
+            rendered_output: Vec::new(),
+            details: ToolEndDetails {
+                cancelled: false,
+                private: Value::Null,
+            },
+            ended_at_ms: 12,
+            stamp: stamp(209, 1),
+        });
+        let finish_a = adapter.adapt(LifecycleSource::ToolExecutionEnd {
+            scope: scope_a,
+            runtime_tool_call_id: "same-opaque-id".to_owned(),
+            is_error: false,
+            rendered_output: Vec::new(),
+            details: ToolEndDetails {
+                cancelled: false,
+                private: Value::Null,
+            },
+            ended_at_ms: 13,
+            stamp: stamp(210, 2),
+        });
+        assert_eq!(finish_b[0].scope.tool_call_id, Some(id(207)));
+        assert_eq!(finish_b[0].scope.project_id, Some(id(203)));
+        assert_eq!(finish_a[0].scope.tool_call_id, Some(id(205)));
+        assert_eq!(finish_a[0].scope.project_id, Some(id(201)));
+        assert!(adapter.tools.is_empty());
+    }
+
+    #[test]
+    fn rejected_publications_do_not_orphan_consume_or_block_valid_retries() {
+        let mut adapter = LifecycleAdapter::new(id(1));
+        let permission_scope = SourceScope {
+            permission_id: Some(id(301)),
+            ..scope(302)
+        };
+        assert!(adapter
+            .adapt(LifecycleSource::PermissionWaiting {
+                scope: permission_scope,
+                tool_name: tool("bash"),
+                stamp: invalid_stamp(0),
+                arguments: Value::Null,
+                reason: String::new(),
+            })
+            .is_empty());
+        assert!(adapter.open_permissions.is_empty());
+        assert!(adapter
+            .adapt(LifecycleSource::PermissionResolved {
+                scope: permission_scope,
+                resolution: PermissionResolution::Allow,
+                stamp: stamp(303, 1),
+                reason: None,
+            })
+            .is_empty());
+        assert_eq!(
+            adapter
+                .adapt(LifecycleSource::PermissionWaiting {
+                    scope: permission_scope,
+                    tool_name: tool("bash"),
+                    stamp: stamp(304, 2),
+                    arguments: Value::Null,
+                    reason: String::new(),
+                })
+                .len(),
+            1
+        );
+        assert!(adapter
+            .adapt(LifecycleSource::PermissionResolved {
+                scope: permission_scope,
+                resolution: PermissionResolution::Allow,
+                stamp: invalid_stamp(3),
+                reason: None,
+            })
+            .is_empty());
+        assert_eq!(adapter.open_permissions.len(), 1);
+        assert_eq!(
+            adapter
+                .adapt(LifecycleSource::PermissionResolved {
+                    scope: permission_scope,
+                    resolution: PermissionResolution::Allow,
+                    stamp: stamp(305, 4),
+                    reason: None,
+                })
+                .len(),
+            1
+        );
+
+        let tool_scope = scope(310);
+        assert!(adapter
+            .adapt(LifecycleSource::ToolExecutionStart {
+                scope: tool_scope,
+                runtime_tool_call_id: "retry-tool".to_owned(),
+                host_tool_call_id: id(311),
+                tool_name: tool("read"),
+                started_at_ms: 0,
+                stamp: invalid_stamp(5),
+                arguments: Value::Null,
+            })
+            .is_empty());
+        assert!(adapter.tools.is_empty());
+        assert!(adapter
+            .adapt(LifecycleSource::ToolExecutionEnd {
+                scope: tool_scope,
+                runtime_tool_call_id: "retry-tool".to_owned(),
+                is_error: false,
+                rendered_output: Vec::new(),
+                details: ToolEndDetails {
+                    cancelled: false,
+                    private: Value::Null,
+                },
+                ended_at_ms: 1,
+                stamp: stamp(312, 6),
+            })
+            .is_empty());
+        assert_eq!(
+            adapter
+                .adapt(LifecycleSource::ToolExecutionStart {
+                    scope: tool_scope,
+                    runtime_tool_call_id: "retry-tool".to_owned(),
+                    host_tool_call_id: id(311),
+                    tool_name: tool("read"),
+                    started_at_ms: 0,
+                    stamp: stamp(313, 7),
+                    arguments: Value::Null,
+                })
+                .len(),
+            1
+        );
+        assert!(adapter
+            .adapt(LifecycleSource::ToolExecutionEnd {
+                scope: tool_scope,
+                runtime_tool_call_id: "retry-tool".to_owned(),
+                is_error: false,
+                rendered_output: Vec::new(),
+                details: ToolEndDetails {
+                    cancelled: false,
+                    private: Value::Null,
+                },
+                ended_at_ms: 1,
+                stamp: invalid_stamp(8),
+            })
+            .is_empty());
+        assert_eq!(adapter.tools.len(), 1);
+        assert_eq!(
+            adapter
+                .adapt(LifecycleSource::ToolExecutionEnd {
+                    scope: tool_scope,
+                    runtime_tool_call_id: "retry-tool".to_owned(),
+                    is_error: false,
+                    rendered_output: Vec::new(),
+                    details: ToolEndDetails {
+                        cancelled: false,
+                        private: Value::Null,
+                    },
+                    ended_at_ms: 2,
+                    stamp: stamp(314, 9),
+                })
+                .len(),
+            1
+        );
+
+        let terminal_scope = scope(320);
+        assert!(adapter
+            .adapt(LifecycleSource::TurnTerminal {
+                scope: terminal_scope,
+                source: TerminalSource::NormalCompletion,
+                final_state: FinalRequestState::Completed,
+                duration_ms: 1,
+                input_tokens: None,
+                output_tokens: None,
+                cache_read_tokens: None,
+                stamp: invalid_stamp(10),
+                error: None,
+            })
+            .is_empty());
+        assert_eq!(adapter.terminal_guard.len(), 0);
+        assert_eq!(
+            adapter
+                .adapt(LifecycleSource::TurnTerminal {
+                    scope: terminal_scope,
+                    source: TerminalSource::NormalCompletion,
+                    final_state: FinalRequestState::Completed,
+                    duration_ms: 1,
+                    input_tokens: None,
+                    output_tokens: None,
+                    cache_read_tokens: None,
+                    stamp: stamp(321, 11),
+                    error: None,
+                })
+                .len(),
+            1
+        );
+    }
+
+    #[test]
+    fn invalid_or_oversized_daemon_versions_leave_all_bookkeeping_unchanged() {
+        let mut adapter = LifecycleAdapter::new(id(1));
+        let invalid = adapter.adapt(LifecycleSource::DaemonStarted {
+            daemon_version: "latest".to_owned(),
+            stamp: stamp(330, 0),
+        });
+        let oversized = adapter.adapt(LifecycleSource::DaemonStarted {
+            daemon_version: format!("1.0.0+{}", "a".repeat(70_000)),
+            stamp: stamp(331, 1),
+        });
+        assert!(invalid.is_empty());
+        assert!(oversized.is_empty());
+        assert!(adapter.tools.is_empty());
+        assert!(adapter.open_permissions.is_empty());
+        assert_eq!(adapter.terminal_guard.len(), 0);
+        assert_eq!(adapter.next_sequence, Some(1));
+        assert_eq!(adapter.retained().count(), 0);
+        assert_eq!(adapter.diagnostic_count(DiagnosticCode::InvalidEvent), 2);
+    }
+
+    #[test]
     fn compatibility_permission_denial_never_fabricates_execution() {
         let mut adapter = LifecycleAdapter::new(id(1));
         assert!(adapter
@@ -1241,6 +1705,176 @@ mod tests {
     }
 
     #[test]
+    fn terminal_settlement_cleans_abandoned_request_state_and_retains_tombstone() {
+        let mut adapter = LifecycleAdapter::new(id(1));
+        let request_scope = SourceScope {
+            permission_id: Some(id(401)),
+            ..scope(402)
+        };
+        assert_eq!(
+            adapter
+                .adapt(LifecycleSource::PermissionWaiting {
+                    scope: request_scope,
+                    tool_name: tool("bash"),
+                    stamp: stamp(403, 0),
+                    arguments: Value::Null,
+                    reason: String::new(),
+                })
+                .len(),
+            1
+        );
+        assert_eq!(
+            adapter
+                .adapt(LifecycleSource::ToolExecutionStart {
+                    scope: request_scope,
+                    runtime_tool_call_id: "abandoned".to_owned(),
+                    host_tool_call_id: id(404),
+                    tool_name: tool("bash"),
+                    started_at_ms: 0,
+                    stamp: stamp(405, 1),
+                    arguments: Value::Null,
+                })
+                .len(),
+            1
+        );
+        assert_eq!(adapter.open_permissions.len(), 1);
+        assert_eq!(adapter.tools.len(), 1);
+
+        assert_eq!(
+            adapter
+                .adapt(LifecycleSource::TurnTerminal {
+                    scope: request_scope,
+                    source: TerminalSource::OrphanSettlement,
+                    final_state: FinalRequestState::Failed,
+                    duration_ms: 2,
+                    input_tokens: None,
+                    output_tokens: None,
+                    cache_read_tokens: None,
+                    stamp: stamp(406, 2),
+                    error: None,
+                })
+                .len(),
+            1
+        );
+        assert!(adapter.open_permissions.is_empty());
+        assert!(adapter.tools.is_empty());
+        assert_eq!(adapter.terminal_guard.len(), 1);
+        assert!(adapter
+            .adapt(LifecycleSource::TurnTerminal {
+                scope: request_scope,
+                source: TerminalSource::NormalCompletion,
+                final_state: FinalRequestState::Completed,
+                duration_ms: 3,
+                input_tokens: None,
+                output_tokens: None,
+                cache_read_tokens: None,
+                stamp: stamp(407, 3),
+                error: None,
+            })
+            .is_empty());
+        assert_eq!(adapter.terminal_guard.len(), 1);
+    }
+
+    #[test]
+    fn bookkeeping_caps_fail_closed_under_stress_without_evicting_terminal_authority() {
+        let guard = TerminalGuard::default();
+        for index in 0..MAX_FINALIZED_REQUESTS {
+            assert_eq!(
+                guard.claim(id(10_000 + index as u128)),
+                TerminalClaim::Claimed
+            );
+        }
+        assert_eq!(guard.len(), MAX_FINALIZED_REQUESTS);
+        assert_eq!(guard.claim(id(10_000)), TerminalClaim::Duplicate);
+        assert_eq!(guard.claim(id(99_999)), TerminalClaim::AtCapacity);
+        assert_eq!(guard.len(), MAX_FINALIZED_REQUESTS);
+
+        let mut adapter = LifecycleAdapter::new(id(1));
+        for index in 0..MAX_ACTIVE_TOOL_CORRELATIONS {
+            let request = RequestCorrelationScope::from_source(scope(20_000 + index as u128))
+                .expect("request scope");
+            adapter.tools.insert(
+                ToolCorrelationKey {
+                    request,
+                    runtime_tool_call_id: format!("tool-{index}"),
+                },
+                ToolCorrelation {
+                    host_tool_call_id: id(30_000 + index as u128),
+                    tool_name: tool("read"),
+                    started_at_ms: 0,
+                },
+            );
+        }
+        assert!(adapter
+            .adapt(LifecycleSource::ToolExecutionStart {
+                scope: scope(50_000),
+                runtime_tool_call_id: "over-cap".to_owned(),
+                host_tool_call_id: id(50_001),
+                tool_name: tool("read"),
+                started_at_ms: 0,
+                stamp: stamp(50_002, 0),
+                arguments: Value::Null,
+            })
+            .is_empty());
+        assert_eq!(adapter.tools.len(), MAX_ACTIVE_TOOL_CORRELATIONS);
+        assert_eq!(
+            adapter.diagnostic_count(DiagnosticCode::BookkeepingCapacity),
+            1
+        );
+
+        let mut permissions = LifecycleAdapter::new(id(1));
+        for index in 0..MAX_OPEN_PERMISSIONS {
+            let source = scope(70_000 + index as u128);
+            permissions
+                .open_permissions
+                .insert(PermissionCorrelationKey {
+                    request: RequestCorrelationScope::from_source(source).expect("request scope"),
+                    permission_id: id(80_000 + index as u128),
+                });
+        }
+        let over_scope = SourceScope {
+            permission_id: Some(id(90_001)),
+            ..scope(90_000)
+        };
+        assert!(permissions
+            .adapt(LifecycleSource::PermissionWaiting {
+                scope: over_scope,
+                tool_name: tool("bash"),
+                stamp: stamp(90_002, 0),
+                arguments: Value::Null,
+                reason: String::new(),
+            })
+            .is_empty());
+        assert_eq!(permissions.open_permissions.len(), MAX_OPEN_PERMISSIONS);
+        assert_eq!(
+            permissions.diagnostic_count(DiagnosticCode::BookkeepingCapacity),
+            1
+        );
+    }
+
+    #[test]
+    fn sequence_exhaustion_emits_u64_max_once_then_fails_closed() {
+        let mut adapter = LifecycleAdapter::new(id(1));
+        adapter.next_sequence = Some(u64::MAX);
+        let last = adapter.adapt(LifecycleSource::DaemonStarted {
+            daemon_version: "1.0.0".to_owned(),
+            stamp: stamp(60_000, 0),
+        });
+        assert_eq!(last[0].sequence, Sequence(u64::MAX));
+        assert_eq!(adapter.next_sequence, None);
+        assert!(adapter
+            .adapt(LifecycleSource::DaemonStopping {
+                stamp: stamp(60_001, 1),
+            })
+            .is_empty());
+        assert_eq!(adapter.retained().count(), 1);
+        assert_eq!(
+            adapter.diagnostic_count(DiagnosticCode::SequenceExhausted),
+            1
+        );
+    }
+
+    #[test]
     fn terminal_guard_is_atomic_under_competing_sources() {
         let guard = std::sync::Arc::new(TerminalGuard::default());
         let request_id = id(999);
@@ -1255,7 +1889,13 @@ mod tests {
                 .map(|thread| thread.join().expect("claim thread"))
                 .collect::<Vec<_>>()
         });
-        assert_eq!(claims.into_iter().filter(|claimed| *claimed).count(), 1);
+        assert_eq!(
+            claims
+                .into_iter()
+                .filter(|claim| *claim == TerminalClaim::Claimed)
+                .count(),
+            1
+        );
     }
 
     #[test]

@@ -232,7 +232,7 @@ can't answer.
 
 - **Name / version:** `ocean-agent-sdk` `0.1.0`.
 - **Depends on** `ocean-protocol` (for the re-exported `ThinkingLevel`),
-  `serde` / `serde_json`, `chrono`, `uuid`. It has **no** HTTP client and **no**
+  `serde` / `serde_json`, `semver`, `chrono`, `uuid`. It has **no** HTTP client and **no**
   runtime dependency — it is pure data types. Native-extension lifecycle wire
   types and strict 65,536-byte NDJSON framing live in `extension_lifecycle`.
 - **Sibling crates:** `ocean-core` (lower-level protocol types incl. the

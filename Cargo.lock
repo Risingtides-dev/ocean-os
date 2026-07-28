@@ -3546,6 +3546,7 @@ dependencies = [
  "chrono",
  "ocean-core",
  "ocean-protocol",
+ "semver",
  "serde",
  "serde_json",
  "tokio",

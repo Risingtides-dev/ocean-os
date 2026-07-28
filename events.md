@@ -5351,3 +5351,22 @@ type:      [feature-request]: Implement ratified extension Stage A slice A1
 area:      [backend]: Strict lifecycle DTOs and pure daemon adapter
 
 Implemented only Stage A1: strict metadata-only `ocean.extension.service` v1 SDK DTOs and golden/negative fixtures, plus the unwired daemon lifecycle source adapter, UUID tool correlation, permission pairing, atomic terminal finalizer, project-scope filter, and bounded boot ring. Added narrow tests for all nine produced kinds, reserved non-produced `session_stopped`, strict framing/version/unknown-field bounds, admission ordering, cancellation, exactly-once terminal mapping, deterministic inputs, and forbidden-payload absence. No service launch, transport wiring, registry mutation, routes/CLI, Crew, UI, or integration behavior was added.
+_________________________________________________________________________________
+time:      [22:40] [27-07-26]
+agent:     [api], [gpt-5.4], [worker]
+worktree:  [feat/extensions-stage-a1]
+type:      [bug report]: Correct Stage A1 review findings
+area:      [backend]: Strict lifecycle wire and bounded adapter state
+
+Corrected the A1 candidate after independent FAIL findings: all JSON object
+levels now reject duplicate keys, parser diagnostics are fixed, serialization
+allocation and SemVer daemon versions are bounded, and the exact 65,536-byte
+boundary is covered. Tool and permission correlation is request-scoped and
+bounded; publication validates before state mutation; terminal settlement
+cleans abandoned request state while boot-retained tombstones fail closed at a
+fixed cap; sequence exhaustion also fails closed. Added collision, retry,
+invalid-stamp, oversized/version, concurrency, cleanup, stress, and boundary
+tests. The prior A1 completion wording is superseded: A1 remains at independent
+acceptance and A2a is blocked. No live wiring, transport, process, route,
+registry mutation, A2+, Crew, UI, or integration behavior was added.
+_________________________________________________________________________________

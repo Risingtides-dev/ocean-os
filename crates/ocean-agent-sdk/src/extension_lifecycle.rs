@@ -3,11 +3,19 @@
 //! This module defines wire vocabulary only. It owns no process, transport,
 //! registry, replay, or execution behavior.
 
-use std::{error::Error, fmt};
+use std::{
+    collections::HashSet,
+    error::Error,
+    fmt,
+    io::{self, Write},
+};
 
 use chrono::{DateTime, SecondsFormat, Utc};
+use semver::Version;
 use serde::{
-    de::DeserializeOwned, ser::SerializeStruct, Deserialize, Deserializer, Serialize, Serializer,
+    de::{DeserializeOwned, DeserializeSeed, MapAccess, SeqAccess, Visitor},
+    ser::SerializeStruct,
+    Deserialize, Deserializer, Serialize, Serializer,
 };
 use uuid::Uuid;
 
@@ -19,8 +27,13 @@ pub const PROTOCOL_VERSION: u8 = 1;
 pub const MAX_FRAME_BYTES: usize = 65_536;
 /// Maximum UTF-8 byte length of a lifecycle tool identifier.
 pub const MAX_TOOL_NAME_BYTES: usize = 256;
+/// Maximum UTF-8 byte length of the daemon's semantic version.
+pub const MAX_DAEMON_VERSION_BYTES: usize = 256;
 
 /// Error returned by strict NDJSON encoding or decoding.
+///
+/// Variants deliberately carry no parser text or input fragments so callers at
+/// future untrusted transport boundaries can report them without reflection.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum FrameError {
     /// The encoded frame exceeds [`MAX_FRAME_BYTES`].
@@ -28,7 +41,7 @@ pub enum FrameError {
     /// The frame is not exactly one JSON object followed by one newline.
     InvalidFraming,
     /// JSON or DTO validation failed.
-    InvalidFrame(String),
+    InvalidFrame,
 }
 
 impl fmt::Display for FrameError {
@@ -43,30 +56,170 @@ impl fmt::Display for FrameError {
             Self::InvalidFraming => {
                 f.write_str("frame must be one JSON object followed by newline")
             }
-            Self::InvalidFrame(message) => write!(f, "invalid frame: {message}"),
+            Self::InvalidFrame => f.write_str("invalid frame"),
         }
     }
 }
 
 impl Error for FrameError {}
 
+struct BoundedJsonWriter {
+    encoded: Vec<u8>,
+    overflowed: bool,
+}
+
+impl BoundedJsonWriter {
+    fn new() -> Self {
+        Self {
+            encoded: Vec::with_capacity(MAX_FRAME_BYTES),
+            overflowed: false,
+        }
+    }
+}
+
+impl Write for BoundedJsonWriter {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        let Some(next_len) = self.encoded.len().checked_add(bytes.len()) else {
+            self.overflowed = true;
+            return Err(io::Error::other("frame limit exceeded"));
+        };
+        if next_len > MAX_FRAME_BYTES {
+            self.overflowed = true;
+            return Err(io::Error::other("frame limit exceeded"));
+        }
+        self.encoded.extend_from_slice(bytes);
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
 /// Encode one strict NDJSON frame, including its trailing newline.
+///
+/// Serialization uses a fixed-capacity writer and never allocates more than
+/// [`MAX_FRAME_BYTES`] for the output buffer.
 pub fn encode_frame<T: Serialize>(frame: &T) -> Result<Vec<u8>, FrameError> {
-    let mut encoded =
-        serde_json::to_vec(frame).map_err(|error| FrameError::InvalidFrame(error.to_string()))?;
-    encoded.push(b'\n');
-    if encoded.len() > MAX_FRAME_BYTES {
+    let mut writer = BoundedJsonWriter::new();
+    if serde_json::to_writer(&mut writer, frame).is_err() {
+        return if writer.overflowed {
+            Err(FrameError::TooLarge {
+                encoded_bytes: MAX_FRAME_BYTES + 1,
+            })
+        } else {
+            Err(FrameError::InvalidFrame)
+        };
+    }
+    if writer.encoded.len() == MAX_FRAME_BYTES {
         return Err(FrameError::TooLarge {
-            encoded_bytes: encoded.len(),
+            encoded_bytes: MAX_FRAME_BYTES + 1,
         });
     }
-    Ok(encoded)
+    writer.encoded.push(b'\n');
+    Ok(writer.encoded)
+}
+
+struct DuplicateRejectingSeed;
+
+impl<'de> DeserializeSeed<'de> for DuplicateRejectingSeed {
+    type Value = ();
+
+    fn deserialize<D>(self, deserializer: D) -> Result<Self::Value, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        deserializer.deserialize_any(DuplicateRejectingVisitor)
+    }
+}
+
+struct DuplicateRejectingVisitor;
+
+impl<'de> Visitor<'de> for DuplicateRejectingVisitor {
+    type Value = ();
+
+    fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("a JSON value")
+    }
+
+    fn visit_bool<E>(self, _value: bool) -> Result<Self::Value, E> {
+        Ok(())
+    }
+
+    fn visit_i64<E>(self, _value: i64) -> Result<Self::Value, E> {
+        Ok(())
+    }
+
+    fn visit_u64<E>(self, _value: u64) -> Result<Self::Value, E> {
+        Ok(())
+    }
+
+    fn visit_f64<E>(self, _value: f64) -> Result<Self::Value, E> {
+        Ok(())
+    }
+
+    fn visit_str<E>(self, _value: &str) -> Result<Self::Value, E> {
+        Ok(())
+    }
+
+    fn visit_string<E>(self, _value: String) -> Result<Self::Value, E> {
+        Ok(())
+    }
+
+    fn visit_none<E>(self) -> Result<Self::Value, E> {
+        Ok(())
+    }
+
+    fn visit_some<D>(self, deserializer: D) -> Result<Self::Value, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        DuplicateRejectingSeed.deserialize(deserializer)
+    }
+
+    fn visit_unit<E>(self) -> Result<Self::Value, E> {
+        Ok(())
+    }
+
+    fn visit_seq<A>(self, mut sequence: A) -> Result<Self::Value, A::Error>
+    where
+        A: SeqAccess<'de>,
+    {
+        while sequence
+            .next_element_seed(DuplicateRejectingSeed)?
+            .is_some()
+        {}
+        Ok(())
+    }
+
+    fn visit_map<A>(self, mut object: A) -> Result<Self::Value, A::Error>
+    where
+        A: MapAccess<'de>,
+    {
+        let mut keys = HashSet::new();
+        while let Some(key) = object.next_key::<String>()? {
+            if !keys.insert(key) {
+                return Err(serde::de::Error::custom("duplicate object key"));
+            }
+            object.next_value_seed(DuplicateRejectingSeed)?;
+        }
+        Ok(())
+    }
+}
+
+fn reject_duplicate_keys(encoded: &[u8]) -> Result<(), FrameError> {
+    let mut deserializer = serde_json::Deserializer::from_slice(encoded);
+    DuplicateRejectingSeed
+        .deserialize(&mut deserializer)
+        .map_err(|_| FrameError::InvalidFrame)?;
+    deserializer.end().map_err(|_| FrameError::InvalidFrame)
 }
 
 /// Decode exactly one strict NDJSON frame.
 ///
-/// Blank input, missing or duplicate newlines, leading/trailing whitespace,
-/// arrays/scalars, invalid UTF-8, trailing bytes, and oversized input fail.
+/// Blank input, missing or duplicate newlines, duplicate keys in any object,
+/// leading/trailing whitespace, arrays/scalars, invalid UTF-8, trailing bytes,
+/// and oversized input fail.
 pub fn decode_frame<T: DeserializeOwned>(encoded: &[u8]) -> Result<T, FrameError> {
     if encoded.len() > MAX_FRAME_BYTES {
         return Err(FrameError::TooLarge {
@@ -82,8 +235,9 @@ pub fn decode_frame<T: DeserializeOwned>(encoded: &[u8]) -> Result<T, FrameError
     {
         return Err(FrameError::InvalidFraming);
     }
-    serde_json::from_slice(&encoded[..encoded.len() - 1])
-        .map_err(|error| FrameError::InvalidFrame(error.to_string()))
+    let json = &encoded[..encoded.len() - 1];
+    reject_duplicate_keys(json)?;
+    serde_json::from_slice(json).map_err(|_| FrameError::InvalidFrame)
 }
 
 /// Exact protocol-name marker.
@@ -272,9 +426,7 @@ impl ToolName {
     pub fn new(value: impl Into<String>) -> Result<Self, FrameError> {
         let value = value.into();
         if value.is_empty() || value.len() > MAX_TOOL_NAME_BYTES {
-            return Err(FrameError::InvalidFrame(
-                "tool name must contain 1..=256 UTF-8 bytes".to_owned(),
-            ));
+            return Err(FrameError::InvalidFrame);
         }
         Ok(Self(value))
     }
@@ -388,14 +540,10 @@ impl ServiceHello {
         let mut seen = std::collections::HashSet::with_capacity(self.subscriptions.len());
         for subscription in &self.subscriptions {
             if !seen.insert(*subscription) {
-                return Err(FrameError::InvalidFrame(
-                    "subscriptions must not contain duplicates".to_owned(),
-                ));
+                return Err(FrameError::InvalidFrame);
             }
             if !declared.contains(subscription) {
-                return Err(FrameError::InvalidFrame(
-                    "subscription exceeds declared event ceiling".to_owned(),
-                ));
+                return Err(FrameError::InvalidFrame);
             }
         }
         Ok(())
@@ -480,10 +628,59 @@ pub enum DaemonStopReason {
 #[serde(deny_unknown_fields)]
 pub struct EmptyMetadata {}
 
+/// Semantic daemon version bounded to 256 UTF-8 bytes.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct DaemonVersion(String);
+
+impl DaemonVersion {
+    /// Validate and construct a bounded semantic version.
+    pub fn new(value: impl Into<String>) -> Result<Self, FrameError> {
+        let value = value.into();
+        if value.is_empty()
+            || value.len() > MAX_DAEMON_VERSION_BYTES
+            || Version::parse(&value).is_err()
+        {
+            return Err(FrameError::InvalidFrame);
+        }
+        Ok(Self(value))
+    }
+
+    /// Borrow the admitted semantic version.
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+
+    fn validate(&self) -> Result<(), FrameError> {
+        Self::new(self.0.clone()).map(|_| ())
+    }
+}
+
+impl Serialize for DaemonVersion {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        self.validate()
+            .map_err(|_| serde::ser::Error::custom("invalid daemon version"))?;
+        serializer.serialize_str(&self.0)
+    }
+}
+
+impl<'de> Deserialize<'de> for DaemonVersion {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        Self::new(String::deserialize(deserializer)?)
+            .map_err(|_| serde::de::Error::custom("invalid daemon version"))
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct DaemonStartedMetadata {
-    pub daemon_version: String,
+    pub daemon_version: DaemonVersion,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -825,4 +1022,15 @@ pub struct Shutdown {
     pub version: ProtocolV1,
     pub frame: ShutdownFrame,
     pub reason: ShutdownReason,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn daemon_version_serialize_revalidates_private_invariant() {
+        let invalid = DaemonVersion("not-semver".to_owned());
+        assert_eq!(encode_frame(&invalid), Err(FrameError::InvalidFrame));
+    }
 }
