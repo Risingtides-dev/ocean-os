@@ -5448,3 +5448,14 @@ area:  [writing]: Public documentation security hygiene
 
 Established the public-evidence contract. Retained two synthetic captures as controlled demonstrations; removed a tool capture exposing host metadata, a CLI capture exposing session UUIDs and absolute local paths, and a blank Longhouse demo frame. Updated site claims so dated observations, source-grounded architecture, demonstrations, and live evidence are not conflated.
 _________________________________________________________________________________
+
+_________________________________________________________________________________
+
+time:  [23:39] [27-07-26]
+agent: [pi] [gpt-5.4] [Thoth]
+worktree: [detached origin/main integration at /private/tmp/ocean-consolidate]
+type:  [workflow]: Recover public community and publication safeguards
+area:  [review]: Repository policy and package metadata
+
+Recovered the post-PR community documents, vulnerability/support routes, contribution templates, and workspace-wide `publish = false` inheritance onto current main. Cargo metadata, workspace index parity, docs-check, and manifest coverage verification pass.
+_________________________________________________________________________________
