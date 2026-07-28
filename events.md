@@ -5370,3 +5370,24 @@ tests. The prior A1 completion wording is superseded: A1 remains at independent
 acceptance and A2a is blocked. No live wiring, transport, process, route,
 registry mutation, A2+, Crew, UI, or integration behavior was added.
 _________________________________________________________________________________
+time:      [23:04] [27-07-26]
+agent:     [api], [gpt-5.4], [worker]
+worktree:  [feat/extensions-stage-a1]
+type:      [bug report]: Remove Stage A1 terminal publication cliff
+area:      [backend]: Request-scoped lifecycle terminal authority
+
+Replaced the boot-cumulative finalized-request tombstone set with a cloneable
+request-scoped atomic terminal authority minted at request registration. Normal
+completion and orphan/panic settlement now require clones of the same authority
+and use compare-exchange so only one prepared terminal fact wins; foreign or
+missing authority cannot enter the terminal adaptation path. Active weak
+registration is capped and fail-closed, prunes only after all racing owners
+drop, and no longer accumulates across sequential traffic. Terminal settlement
+still cleans request-scoped tool and permission state. Removed Debug derivation
+from sensitive transient lifecycle/tool-detail inputs and added tests for more
+than 2,048 sequential exactly-once terminal publications with bounded retention,
+competing owners, distinct-request isolation, atomic claims, active-cap cleanup,
+and terminal bookkeeping cleanup. A1 remains unwired and at independent review;
+no transport, process, route, registry mutation, live producer, or A2+ behavior
+was added.
+_________________________________________________________________________________

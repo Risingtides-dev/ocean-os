@@ -46,7 +46,7 @@ This crate owns the long-running Ocean HTTP service on `:4780`, including API ro
   and keep project-less/session-less conversations on render + handoff only.
 
 - Session behavior lives in `ocean-agent`; route changes must not create a separate session model.
-- `extension_lifecycle.rs` is the Stage A1 pure, metadata-only lifecycle boundary: it owns deterministic source adaptation, bounded per-request runtime-tool-id to host-UUID correlation, permission pairing, validate-before-commit publication, the atomic boot-retained/fail-closed terminal guard, terminal cleanup of abandoned request state, publication-time project classification, and bounded boot-local event retention. It is intentionally unwired until A2b and must not gain process launch, service transport, registry mutation, routes, Observatory coupling, or producer call sites in A1.
+- `extension_lifecycle.rs` is the Stage A1 pure, metadata-only lifecycle boundary: it owns deterministic source adaptation, bounded per-request runtime-tool-id to host-UUID correlation, permission pairing, validate-before-commit publication, lifecycle-bounded cloneable request-scoped atomic terminal authority with fail-closed active registration, terminal cleanup of abandoned request state, publication-time project classification, and bounded boot-local event retention. It is intentionally unwired until A2b and must not gain process launch, service transport, registry mutation, routes, Observatory coupling, or producer call sites in A1.
 - Product turns and legacy/call turns (legacy requests pin a session id before
   admission) take the shared non-blocking session operation lease before
   `TurnStarted`, invalidation, or request registration and retain it through

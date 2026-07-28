@@ -6,7 +6,10 @@
 
 use std::{
     collections::{HashMap, HashSet, VecDeque},
-    sync::Mutex,
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc, Weak,
+    },
 };
 
 use ocean_agent_sdk::extension_lifecycle::{
@@ -23,7 +26,7 @@ pub(crate) const BOOT_RING_MAX_EVENTS: usize = 2_048;
 pub(crate) const BOOT_RING_MAX_BYTES: usize = 8 * 1024 * 1024;
 const MAX_ACTIVE_TOOL_CORRELATIONS: usize = BOOT_RING_MAX_EVENTS;
 const MAX_OPEN_PERMISSIONS: usize = BOOT_RING_MAX_EVENTS;
-const MAX_FINALIZED_REQUESTS: usize = BOOT_RING_MAX_EVENTS;
+const MAX_ACTIVE_TERMINAL_AUTHORITIES: usize = BOOT_RING_MAX_EVENTS;
 const MAX_RUNTIME_TOOL_CALL_ID_BYTES: usize = 1_024;
 
 /// Deterministic host inputs used for one emitted envelope.
@@ -86,14 +89,14 @@ pub(crate) enum PermissionResolution {
 
 /// Runtime details needed for the one honest cancellation bit. All other
 /// details remain private and are discarded structurally.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub(crate) struct ToolEndDetails {
     pub(crate) cancelled: bool,
     pub(crate) private: Value,
 }
 
 /// Exhaustive pure input vocabulary for current Stage A source authorities.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub(crate) enum LifecycleSource {
     DaemonStarted {
         daemon_version: String,
@@ -154,6 +157,7 @@ pub(crate) enum LifecycleSource {
     },
     TurnTerminal {
         scope: SourceScope,
+        authority: TerminalAuthority,
         source: TerminalSource,
         final_state: FinalRequestState,
         duration_ms: u64,
@@ -278,43 +282,21 @@ impl BootRing {
     }
 }
 
-/// Pure adapter and boot-local correlation state.
-#[derive(Default)]
-struct TerminalGuard {
-    // Terminal tombstones are retained for the boot. At the fixed bound, new
-    // requests fail closed rather than evicting an exactly-once authority.
-    finalized_requests: Mutex<HashSet<Uuid>>,
+/// Cloneable exactly-once authority minted once when a request is registered.
+///
+/// Normal completion and orphan/panic settlement must carry clones of this
+/// same value. No terminal adaptation API exists without it.
+#[derive(Clone)]
+pub(crate) struct TerminalAuthority {
+    request: RequestCorrelationScope,
+    claimed: Arc<AtomicBool>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum TerminalClaim {
-    Claimed,
-    Duplicate,
-    AtCapacity,
-}
-
-impl TerminalGuard {
-    fn claim(&self, request_id: Uuid) -> TerminalClaim {
-        let mut finalized = self
-            .finalized_requests
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        if finalized.contains(&request_id) {
-            return TerminalClaim::Duplicate;
-        }
-        if finalized.len() == MAX_FINALIZED_REQUESTS {
-            return TerminalClaim::AtCapacity;
-        }
-        finalized.insert(request_id);
-        TerminalClaim::Claimed
-    }
-
-    #[cfg(test)]
-    fn len(&self) -> usize {
-        self.finalized_requests
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .len()
+impl TerminalAuthority {
+    fn try_claim(&self) -> bool {
+        self.claimed
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
     }
 }
 
@@ -324,7 +306,7 @@ pub(crate) struct LifecycleAdapter {
     ring: BootRing,
     tools: HashMap<ToolCorrelationKey, ToolCorrelation>,
     open_permissions: HashSet<PermissionCorrelationKey>,
-    terminal_guard: TerminalGuard,
+    terminal_authorities: HashMap<RequestCorrelationScope, Weak<AtomicBool>>,
     diagnostics: HashMap<DiagnosticCode, u64>,
 }
 
@@ -336,9 +318,38 @@ impl LifecycleAdapter {
             ring: BootRing::default(),
             tools: HashMap::new(),
             open_permissions: HashSet::new(),
-            terminal_guard: TerminalGuard::default(),
+            terminal_authorities: HashMap::new(),
             diagnostics: HashMap::new(),
         }
+    }
+
+    /// Register one admitted request and mint its request-scoped terminal authority.
+    ///
+    /// Re-registration while any racing owner remains returns the same atomic
+    /// authority. Dead weak entries are pruned before enforcing the active cap,
+    /// so sequential traffic does not accumulate boot-lifetime tombstones.
+    pub(crate) fn register_request(&mut self, scope: SourceScope) -> Option<TerminalAuthority> {
+        let Some(request) = RequestCorrelationScope::from_source(scope) else {
+            self.count(DiagnosticCode::InvalidCorrelationScope);
+            return None;
+        };
+        self.terminal_authorities
+            .retain(|_, authority| authority.strong_count() != 0);
+        if let Some(claimed) = self
+            .terminal_authorities
+            .get(&request)
+            .and_then(Weak::upgrade)
+        {
+            return Some(TerminalAuthority { request, claimed });
+        }
+        if self.terminal_authorities.len() == MAX_ACTIVE_TERMINAL_AUTHORITIES {
+            self.count(DiagnosticCode::BookkeepingCapacity);
+            return None;
+        }
+        let claimed = Arc::new(AtomicBool::new(false));
+        self.terminal_authorities
+            .insert(request, Arc::downgrade(&claimed));
+        Some(TerminalAuthority { request, claimed })
     }
 
     /// Adapt one source fact. The vector has two events only for a successfully
@@ -437,6 +448,7 @@ impl LifecycleAdapter {
             }
             LifecycleSource::TurnTerminal {
                 scope,
+                authority,
                 source,
                 final_state,
                 duration_ms,
@@ -447,6 +459,7 @@ impl LifecycleAdapter {
                 error: _,
             } => self.finalize_turn(
                 scope,
+                authority,
                 source,
                 final_state,
                 duration_ms,
@@ -719,6 +732,7 @@ impl LifecycleAdapter {
     fn finalize_turn(
         &mut self,
         scope: SourceScope,
+        authority: TerminalAuthority,
         source: TerminalSource,
         final_state: FinalRequestState,
         duration_ms: u64,
@@ -727,10 +741,6 @@ impl LifecycleAdapter {
         cache_read_tokens: Option<u64>,
         stamp: EventStamp,
     ) -> Vec<LifecycleEvent> {
-        let Some(request_id) = scope.request_id else {
-            self.count(DiagnosticCode::TurnAlreadyFinalized);
-            return Vec::new();
-        };
         let Some(request) = RequestCorrelationScope::from_source(scope) else {
             self.count(DiagnosticCode::InvalidCorrelationScope);
             return Vec::new();
@@ -761,21 +771,18 @@ impl LifecycleAdapter {
                 return Vec::new();
             }
         };
-        match self.terminal_guard.claim(request_id) {
-            TerminalClaim::Claimed => {}
-            TerminalClaim::Duplicate => {
-                self.count(DiagnosticCode::TurnAlreadyFinalized);
-                return Vec::new();
-            }
-            TerminalClaim::AtCapacity => {
-                self.count(DiagnosticCode::BookkeepingCapacity);
-                return Vec::new();
-            }
+        if authority.request != request {
+            self.count(DiagnosticCode::InvalidCorrelationScope);
+            return Vec::new();
+        }
+        if !authority.try_claim() {
+            self.count(DiagnosticCode::TurnAlreadyFinalized);
+            return Vec::new();
         }
 
         // Terminal settlement is the explicit cleanup boundary for abandoned
-        // per-request tool and permission state. The request tombstone remains
-        // boot-local so competing terminal authorities can never republish it.
+        // per-request tool and permission state. The shared atomic authority
+        // remains alive only while a potential racing owner retains a clone.
         self.tools.retain(|key, _| key.request != request);
         self.open_permissions.retain(|key| key.request != request);
         self.commit_one(prepared)
@@ -992,8 +999,10 @@ mod tests {
             ended_at_ms: 14,
             stamp: stamp(107, 6),
         }));
+        let terminal_authority = adapter.register_request(scope(13)).expect("authority");
         events.extend(adapter.adapt(LifecycleSource::TurnTerminal {
             scope: scope(13),
+            authority: terminal_authority,
             source: TerminalSource::NormalCompletion,
             final_state: FinalRequestState::Completed,
             duration_ms: 7,
@@ -1412,9 +1421,11 @@ mod tests {
         );
 
         let terminal_scope = scope(320);
+        let terminal_authority = adapter.register_request(terminal_scope).expect("authority");
         assert!(adapter
             .adapt(LifecycleSource::TurnTerminal {
                 scope: terminal_scope,
+                authority: terminal_authority.clone(),
                 source: TerminalSource::NormalCompletion,
                 final_state: FinalRequestState::Completed,
                 duration_ms: 1,
@@ -1425,11 +1436,12 @@ mod tests {
                 error: None,
             })
             .is_empty());
-        assert_eq!(adapter.terminal_guard.len(), 0);
+        assert!(!terminal_authority.claimed.load(Ordering::Acquire));
         assert_eq!(
             adapter
                 .adapt(LifecycleSource::TurnTerminal {
                     scope: terminal_scope,
+                    authority: terminal_authority,
                     source: TerminalSource::NormalCompletion,
                     final_state: FinalRequestState::Completed,
                     duration_ms: 1,
@@ -1459,7 +1471,7 @@ mod tests {
         assert!(oversized.is_empty());
         assert!(adapter.tools.is_empty());
         assert!(adapter.open_permissions.is_empty());
-        assert_eq!(adapter.terminal_guard.len(), 0);
+        assert!(adapter.terminal_authorities.is_empty());
         assert_eq!(adapter.next_sequence, Some(1));
         assert_eq!(adapter.retained().count(), 0);
         assert_eq!(adapter.diagnostic_count(DiagnosticCode::InvalidEvent), 2);
@@ -1522,8 +1534,11 @@ mod tests {
             ),
         ] {
             let mut adapter = LifecycleAdapter::new(id(1));
+            let terminal_scope = scope(50 + index);
+            let authority = adapter.register_request(terminal_scope).expect("authority");
             let terminal = adapter.adapt(LifecycleSource::TurnTerminal {
-                scope: scope(50 + index),
+                scope: terminal_scope,
+                authority: authority.clone(),
                 source,
                 final_state: state,
                 duration_ms: 12,
@@ -1541,7 +1556,8 @@ mod tests {
             }
             assert!(adapter
                 .adapt(LifecycleSource::TurnTerminal {
-                    scope: scope(50 + index),
+                    scope: terminal_scope,
+                    authority,
                     source: TerminalSource::OrphanSettlement,
                     final_state: FinalRequestState::Failed,
                     duration_ms: 13,
@@ -1557,6 +1573,148 @@ mod tests {
                 1
             );
         }
+    }
+
+    #[test]
+    fn more_than_ring_capacity_sequential_requests_each_finalize_once() {
+        const REQUESTS: usize = BOOT_RING_MAX_EVENTS + 257;
+        let mut adapter = LifecycleAdapter::new(id(1));
+        let mut published = 0;
+
+        for index in 0..REQUESTS {
+            let request_scope = scope(100_000 + index as u128);
+            let authority = adapter
+                .register_request(request_scope)
+                .expect("sequential request authority");
+            published += adapter
+                .adapt(LifecycleSource::TurnTerminal {
+                    scope: request_scope,
+                    authority: authority.clone(),
+                    source: TerminalSource::NormalCompletion,
+                    final_state: FinalRequestState::Completed,
+                    duration_ms: 1,
+                    input_tokens: None,
+                    output_tokens: None,
+                    cache_read_tokens: None,
+                    stamp: stamp(200_000 + index as u128, index as i64),
+                    error: None,
+                })
+                .len();
+            published += adapter
+                .adapt(LifecycleSource::TurnTerminal {
+                    scope: request_scope,
+                    authority,
+                    source: TerminalSource::OrphanSettlement,
+                    final_state: FinalRequestState::Failed,
+                    duration_ms: 2,
+                    input_tokens: None,
+                    output_tokens: None,
+                    cache_read_tokens: None,
+                    stamp: stamp(300_000 + index as u128, index as i64),
+                    error: None,
+                })
+                .len();
+            assert!(adapter.terminal_authorities.len() <= 1);
+        }
+
+        assert_eq!(published, REQUESTS);
+        assert_eq!(adapter.retained().count(), BOOT_RING_MAX_EVENTS);
+        assert!(adapter.ring.encoded_bytes <= BOOT_RING_MAX_BYTES);
+        assert_eq!(
+            adapter.diagnostic_count(DiagnosticCode::TurnAlreadyFinalized),
+            REQUESTS as u64
+        );
+    }
+
+    #[test]
+    fn normal_orphan_and_panic_settlement_owners_share_one_authority() {
+        let mut adapter = LifecycleAdapter::new(id(1));
+        let request_scope = scope(400_000);
+        let authority = adapter.register_request(request_scope).expect("authority");
+        let sources = [
+            TerminalSource::NormalCompletion,
+            TerminalSource::OrphanSettlement,
+            // Panic handling converges through the orphan-settlement authority.
+            TerminalSource::OrphanSettlement,
+        ];
+        let published = sources
+            .into_iter()
+            .enumerate()
+            .map(|(index, source)| {
+                adapter
+                    .adapt(LifecycleSource::TurnTerminal {
+                        scope: request_scope,
+                        authority: authority.clone(),
+                        source,
+                        final_state: FinalRequestState::Failed,
+                        duration_ms: index as u64,
+                        input_tokens: None,
+                        output_tokens: None,
+                        cache_read_tokens: None,
+                        stamp: stamp(400_001 + index as u128, index as i64),
+                        error: None,
+                    })
+                    .len()
+            })
+            .sum::<usize>();
+
+        assert_eq!(published, 1);
+        assert_eq!(
+            adapter.diagnostic_count(DiagnosticCode::TurnAlreadyFinalized),
+            2
+        );
+    }
+
+    #[test]
+    fn distinct_request_authorities_never_collide_or_accept_a_foreign_scope() {
+        let mut adapter = LifecycleAdapter::new(id(1));
+        let scope_a = scope(500_000);
+        let scope_b = scope(500_001);
+        let authority_a = adapter.register_request(scope_a).expect("authority a");
+        let authority_b = adapter.register_request(scope_b).expect("authority b");
+
+        assert!(adapter
+            .adapt(LifecycleSource::TurnTerminal {
+                scope: scope_b,
+                authority: authority_a.clone(),
+                source: TerminalSource::NormalCompletion,
+                final_state: FinalRequestState::Completed,
+                duration_ms: 1,
+                input_tokens: None,
+                output_tokens: None,
+                cache_read_tokens: None,
+                stamp: stamp(500_002, 0),
+                error: None,
+            })
+            .is_empty());
+        assert!(!authority_a.claimed.load(Ordering::Acquire));
+        assert!(!authority_b.claimed.load(Ordering::Acquire));
+
+        let mut published = 0;
+        for (request_scope, authority, stamp_id) in [
+            (scope_a, authority_a, 500_003),
+            (scope_b, authority_b, 500_004),
+        ] {
+            published += adapter
+                .adapt(LifecycleSource::TurnTerminal {
+                    scope: request_scope,
+                    authority,
+                    source: TerminalSource::NormalCompletion,
+                    final_state: FinalRequestState::Completed,
+                    duration_ms: 1,
+                    input_tokens: None,
+                    output_tokens: None,
+                    cache_read_tokens: None,
+                    stamp: stamp(stamp_id, 1),
+                    error: None,
+                })
+                .len();
+        }
+        assert_eq!(published, 2);
+        assert_eq!(
+            adapter.diagnostic_count(DiagnosticCode::InvalidCorrelationScope),
+            1
+        );
     }
 
     #[test]
@@ -1705,7 +1863,7 @@ mod tests {
     }
 
     #[test]
-    fn terminal_settlement_cleans_abandoned_request_state_and_retains_tombstone() {
+    fn terminal_settlement_cleans_abandoned_request_state_and_rejects_shared_retry() {
         let mut adapter = LifecycleAdapter::new(id(1));
         let request_scope = SourceScope {
             permission_id: Some(id(401)),
@@ -1739,11 +1897,13 @@ mod tests {
         );
         assert_eq!(adapter.open_permissions.len(), 1);
         assert_eq!(adapter.tools.len(), 1);
+        let authority = adapter.register_request(request_scope).expect("authority");
 
         assert_eq!(
             adapter
                 .adapt(LifecycleSource::TurnTerminal {
                     scope: request_scope,
+                    authority: authority.clone(),
                     source: TerminalSource::OrphanSettlement,
                     final_state: FinalRequestState::Failed,
                     duration_ms: 2,
@@ -1758,10 +1918,10 @@ mod tests {
         );
         assert!(adapter.open_permissions.is_empty());
         assert!(adapter.tools.is_empty());
-        assert_eq!(adapter.terminal_guard.len(), 1);
         assert!(adapter
             .adapt(LifecycleSource::TurnTerminal {
                 scope: request_scope,
+                authority,
                 source: TerminalSource::NormalCompletion,
                 final_state: FinalRequestState::Completed,
                 duration_ms: 3,
@@ -1772,22 +1932,31 @@ mod tests {
                 error: None,
             })
             .is_empty());
-        assert_eq!(adapter.terminal_guard.len(), 1);
     }
 
     #[test]
-    fn bookkeeping_caps_fail_closed_under_stress_without_evicting_terminal_authority() {
-        let guard = TerminalGuard::default();
-        for index in 0..MAX_FINALIZED_REQUESTS {
-            assert_eq!(
-                guard.claim(id(10_000 + index as u128)),
-                TerminalClaim::Claimed
+    fn active_bookkeeping_caps_fail_closed_without_eviction() {
+        let mut guarded = LifecycleAdapter::new(id(1));
+        let mut authorities = Vec::with_capacity(MAX_ACTIVE_TERMINAL_AUTHORITIES);
+        for index in 0..MAX_ACTIVE_TERMINAL_AUTHORITIES {
+            authorities.push(
+                guarded
+                    .register_request(scope(10_000 + index as u128))
+                    .expect("authority within cap"),
             );
         }
-        assert_eq!(guard.len(), MAX_FINALIZED_REQUESTS);
-        assert_eq!(guard.claim(id(10_000)), TerminalClaim::Duplicate);
-        assert_eq!(guard.claim(id(99_999)), TerminalClaim::AtCapacity);
-        assert_eq!(guard.len(), MAX_FINALIZED_REQUESTS);
+        assert_eq!(
+            guarded.terminal_authorities.len(),
+            MAX_ACTIVE_TERMINAL_AUTHORITIES
+        );
+        assert!(guarded.register_request(scope(99_999)).is_none());
+        assert_eq!(
+            guarded.terminal_authorities.len(),
+            MAX_ACTIVE_TERMINAL_AUTHORITIES
+        );
+        drop(authorities);
+        assert!(guarded.register_request(scope(99_999)).is_some());
+        assert_eq!(guarded.terminal_authorities.len(), 1);
 
         let mut adapter = LifecycleAdapter::new(id(1));
         for index in 0..MAX_ACTIVE_TOOL_CORRELATIONS {
@@ -1875,27 +2044,49 @@ mod tests {
     }
 
     #[test]
-    fn terminal_guard_is_atomic_under_competing_sources() {
-        let guard = std::sync::Arc::new(TerminalGuard::default());
-        let request_id = id(999);
+    fn terminal_authority_lives_until_every_racing_owner_drops() {
+        let mut adapter = LifecycleAdapter::new(id(1));
+        let request_scope = scope(998);
+        let authority = adapter.register_request(request_scope).expect("authority");
+        let racing_owner = authority.clone();
+        let request = RequestCorrelationScope::from_source(request_scope).expect("request");
+        let retained = adapter
+            .terminal_authorities
+            .get(&request)
+            .expect("registered weak authority")
+            .clone();
+
+        drop(authority);
+        assert!(retained.upgrade().is_some());
+        drop(racing_owner);
+        assert!(retained.upgrade().is_none());
+
+        assert!(adapter.register_request(scope(999)).is_some());
+        assert_eq!(adapter.terminal_authorities.len(), 1);
+        assert!(!adapter.terminal_authorities.contains_key(&request));
+    }
+
+    #[test]
+    fn terminal_authority_compare_exchange_allows_one_competing_owner() {
+        let mut adapter = LifecycleAdapter::new(id(1));
+        let request_scope = scope(999);
+        let request = RequestCorrelationScope::from_source(request_scope).expect("request");
+        let authority = adapter.register_request(request_scope).expect("authority");
         let claims = std::thread::scope(|scope| {
             (0..16)
                 .map(|_| {
-                    let guard = std::sync::Arc::clone(&guard);
-                    scope.spawn(move || guard.claim(request_id))
+                    let authority = authority.clone();
+                    scope.spawn(move || {
+                        assert_eq!(authority.request, request);
+                        authority.try_claim()
+                    })
                 })
                 .collect::<Vec<_>>()
                 .into_iter()
                 .map(|thread| thread.join().expect("claim thread"))
                 .collect::<Vec<_>>()
         });
-        assert_eq!(
-            claims
-                .into_iter()
-                .filter(|claim| *claim == TerminalClaim::Claimed)
-                .count(),
-            1
-        );
+        assert_eq!(claims.into_iter().filter(|claimed| *claimed).count(), 1);
     }
 
     #[test]
