@@ -5695,3 +5695,30 @@ Clippy, formatting/docs, compatibility, Rust 1.88 MSRV, Linux musl, and the
 actual-source Windows portability cross-build pass. A2b remains pending
 independent review and authorizes no A3 work.
 _________________________________________________________________________________
+_________________________________________________________________________________
+time:      [05:33] [28-07-26]
+agent:     [api] [gpt-5.4] [worker]
+worktree:  [feat/extensions-stage-a2b]
+type:      [bug report]: Repair Stage A2b independent-review findings
+area:      [backend]: Extension lifecycle scope, replay, reconciliation, and cleanup
+
+Corrected the reviewed A2b lifecycle host without widening into A3: authoritative project identity now rejects explicit workspace/session scope mismatch; terminal authority and the captured orphan guard precede admission; cancellation deterministically resolves permission lifecycle as cancelled. Replay concurrently drains legal child frames under one cancellation-aware attach deadline, uses a fixed delivered-sequence ACK ledger with fail-closed exhaustion, requires a real retained floor cursor, and starts pong time only after ping write success. Project mutations now return success only after checked snapshot/epoch/reap reconciliation and otherwise expose a committed recovery error. Scope-only epochs preserve failure/circuit history, status rows prune removed services, temp cleanup failures are counted, and exceptional stderr/supervisor shutdown paths retain cleanup ownership instead of detaching it. Added mismatch, cancellation, pre-poll guard, project-recovery, maximum ACK-every-replay, no-ACK, cursor-floor, circuit-scope, slow-ping, cleanup-failure, status-bound, and repeated process-load coverage.
+_________________________________________________________________________________
+_________________________________________________________________________________
+time:      [18:18] [28-07-26]
+agent:     [api] [gpt-5.4] [worker]
+worktree:  [feat/extensions-stage-a2b]
+type:      [bug report]: Complete Stage A2b review-fix validation
+area:      [testing]: Extension process stability and portability gates
+
+Finished the uncommitted A2b review repairs and made their process fixtures
+stable under real parallel workspace load without changing production timeout
+policy. The attach path now preserves legal child status received during replay;
+replay fixtures use an explicit release barrier, heartbeat time pauses only after
+the real child is healthy, descendant cleanup tolerates bounded zombie reaping,
+and the common daemon test state injects its config root directly instead of
+racing process-global policy tests. Five consecutive parallel 36-test extension
+process runs, all 649 daemon tests, all workspace tests, strict workspace Clippy,
+format/docs/diff checks, compatibility, Rust 1.88 MSRV, full repository CI,
+Linux musl, and actual-source Windows GNU portability cross-builds pass.
+_________________________________________________________________________________

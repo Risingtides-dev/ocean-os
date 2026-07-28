@@ -2448,24 +2448,40 @@ impl PermissionPolicy for DaemonPermissionPolicy {
             },
         );
 
+        let cancelled = || {
+            (
+                AgentPermissionDecision::Deny {
+                    reason: "request cancelled while waiting for permission".into(),
+                },
+                LifecyclePermissionResolution::RequestCancelled,
+            )
+        };
         let (decision, lifecycle_resolution) = tokio::select! {
-            decision = rx => match decision {
-                Ok(decision @ AgentPermissionDecision::Allow) => {
-                    (decision, LifecyclePermissionResolution::Allow)
+            biased;
+            _ = self.cancel.cancelled() => cancelled(),
+            decision = rx => {
+                // cancel_request sets the token before releasing the synthetic
+                // deny waiter. Even if both become ready in one scheduler turn,
+                // cancellation is the deterministic lifecycle authority.
+                if self.cancel.is_cancelled() {
+                    cancelled()
+                } else {
+                    match decision {
+                        Ok(decision @ AgentPermissionDecision::Allow) => {
+                            (decision, LifecyclePermissionResolution::Allow)
+                        }
+                        Ok(decision @ AgentPermissionDecision::AllowSession) => {
+                            (decision, LifecyclePermissionResolution::AllowSession)
+                        }
+                        Ok(decision @ AgentPermissionDecision::Deny { .. }) => {
+                            (decision, LifecyclePermissionResolution::Deny)
+                        }
+                        Err(_) => (AgentPermissionDecision::Deny {
+                            reason: "permission decision channel closed".into(),
+                        }, LifecyclePermissionResolution::WaiterClosed),
+                    }
                 }
-                Ok(decision @ AgentPermissionDecision::AllowSession) => {
-                    (decision, LifecyclePermissionResolution::AllowSession)
-                }
-                Ok(decision @ AgentPermissionDecision::Deny { .. }) => {
-                    (decision, LifecyclePermissionResolution::Deny)
-                }
-                Err(_) => (AgentPermissionDecision::Deny {
-                    reason: "permission decision channel closed".into(),
-                }, LifecyclePermissionResolution::WaiterClosed),
             },
-            _ = self.cancel.cancelled() => (AgentPermissionDecision::Deny {
-                reason: "request cancelled while waiting for permission".into(),
-            }, LifecyclePermissionResolution::RequestCancelled),
         };
 
         if let Some(context) = &self.lifecycle {
@@ -6099,7 +6115,28 @@ async fn agent_turn(
             );
         }
     };
-    let lifecycle_project_id = resolved_lifecycle_project_id(&state, project_id, &cwd);
+    let lifecycle_project_id = match resolved_lifecycle_project_id(&state, project_id, &cwd) {
+        Ok(project_id) => project_id,
+        Err(error) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(AgentTurnResponse {
+                    ok: false,
+                    turn_id,
+                    session_id,
+                    status: AgentTurnStatus::Failed,
+                    event_id_prefix: event_prefix,
+                    error: Some(error),
+                    output_tokens: None,
+                    input_tokens: None,
+                    cache_read_tokens: None,
+                    tokens_per_second: None,
+                    context_usage: None,
+                    wall_ms: None,
+                }),
+            );
+        }
+    };
     let lifecycle_scope = state.extension_lifecycle.source_scope(
         lifecycle_project_id,
         Some(session_id.inner()),
@@ -6107,40 +6144,6 @@ async fn agent_turn(
         Some(request_id),
         None,
     );
-    state
-        .extension_lifecycle
-        .publish(LifecycleSource::OrdinaryTurnAdmission {
-            admitted: true,
-            new_session: is_new_session,
-            scope: lifecycle_scope,
-            session_stamp: lifecycle_stamp(),
-            turn_stamp: lifecycle_stamp(),
-            title: prompt.chars().take(60).collect(),
-            cwd: cwd.clone(),
-        });
-    if is_new_session {
-        emit_agent(
-            &state.events,
-            &state.agent_events,
-            session_id,
-            AgentTurnEvent::SessionCreated {
-                session_id,
-                title: prompt.chars().take(60).collect(),
-                cwd: cwd.clone(),
-            },
-        );
-    }
-    emit_agent(
-        &state.events,
-        &state.agent_events,
-        session_id,
-        AgentTurnEvent::TurnStarted {
-            turn_id,
-            session_id,
-            model: Some(model_resolution.announced_model.clone()),
-        },
-    );
-
     // Longhouse pre-turn consult (OCEAN-283, default-ON). Unless the operator
     // opted out (`OCEAN_LONGHOUSE_PREPARE=0|false|no|off`), rank this turn's
     // prompt against the CACHED local skill libraries (off the hot path via
@@ -6211,6 +6214,51 @@ async fn agent_turn(
             turn_id: turn_id.inner(),
             request_id,
         });
+    // Construct the terminal guard before publishing admission. From this point
+    // onward, handler drop, panic, or spawned-task abort-before-first-poll owns a
+    // terminal authority; no admitted turn can be orphaned in an await gap.
+    let turn_guard = TurnTerminalGuard::arm_with_lifecycle(
+        state.requests.clone(),
+        state.events.clone(),
+        state.agent_events.clone(),
+        request_id,
+        session_id,
+        turn_id,
+        lifecycle_terminal.clone(),
+    );
+    state
+        .extension_lifecycle
+        .publish(LifecycleSource::OrdinaryTurnAdmission {
+            admitted: true,
+            new_session: is_new_session,
+            scope: lifecycle_scope,
+            session_stamp: lifecycle_stamp(),
+            turn_stamp: lifecycle_stamp(),
+            title: prompt.chars().take(60).collect(),
+            cwd: prompt_req.cwd.clone(),
+        });
+    if is_new_session {
+        emit_agent(
+            &state.events,
+            &state.agent_events,
+            session_id,
+            AgentTurnEvent::SessionCreated {
+                session_id,
+                title: prompt.chars().take(60).collect(),
+                cwd: prompt_req.cwd.clone(),
+            },
+        );
+    }
+    emit_agent(
+        &state.events,
+        &state.agent_events,
+        session_id,
+        AgentTurnEvent::TurnStarted {
+            turn_id,
+            session_id,
+            model: Some(model_resolution.announced_model.clone()),
+        },
+    );
 
     // Wire up the runtime → bus streaming bridge. Every TextDelta /
     // ThinkingDelta / ToolExecution* event the agent emits gets forwarded
@@ -6647,15 +6695,7 @@ async fn agent_turn(
         // transition + `TurnFinished(Failed)` on unwind; it is disarmed on the
         // normal path once both have run, so a completed turn keeps exactly one
         // terminal frame.
-        let mut turn_guard = TurnTerminalGuard::arm_with_lifecycle(
-            bg_state.requests.clone(),
-            bg_state.events.clone(),
-            bg_state.agent_events.clone(),
-            request_id,
-            session_id,
-            turn_id,
-            lifecycle_terminal.clone(),
-        );
+        let mut turn_guard = turn_guard;
         let res = bg_state
             .runtime
             .prompt_with_lease(prompt_req, control, &session_lease)
@@ -7446,11 +7486,24 @@ async fn agent_sessions_create(
         }
     };
 
+    let lifecycle_project_id = match resolved_lifecycle_project_id(&state, project_id, &cwd) {
+        Ok(project_id) => project_id,
+        Err(error) => {
+            tracing::warn!(%error, "agent_sessions_create: project/workspace mismatch");
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(AgentSessionCreateResponse {
+                    session_id: AgentSessionId::new_v4(),
+                    cwd: String::new(),
+                    client_type: None,
+                }),
+            );
+        }
+    };
+
     match state.runtime.create_session(&cwd, client_type) {
         Ok((core_id, bound_cwd, stored_client_type)) => {
             let session_id = sdk_sid(core_id);
-            let lifecycle_project_id =
-                resolved_lifecycle_project_id(&state, project_id, &bound_cwd);
             let lifecycle_scope = state.extension_lifecycle.source_scope(
                 lifecycle_project_id,
                 Some(session_id.inner()),
@@ -8150,12 +8203,43 @@ fn resolved_lifecycle_project_id(
     state: &AppState,
     explicit: Option<Uuid>,
     workspace: &str,
-) -> Option<Uuid> {
-    explicit.or_else(|| {
-        state
-            .extension_lifecycle
-            .project_id_for_workspace(workspace)
-    })
+) -> Result<Option<Uuid>, String> {
+    let workspace_root = state
+        .runtime
+        .workspace_root_for(std::path::Path::new(workspace));
+    let authoritative = workspace_root
+        .to_str()
+        .and_then(|root| state.runtime.owning_project_for_root(root))
+        .or_else(|| state.runtime.owning_project_for_root(workspace));
+
+    let Some(explicit) = explicit else {
+        return Ok(authoritative.map(|project| project.id).or_else(|| {
+            state
+                .extension_lifecycle
+                .project_id_for_workspace(workspace)
+        }));
+    };
+    let declared = state
+        .runtime
+        .find_project(explicit)
+        .map_err(|_| "project identity could not be resolved".to_string())?
+        .ok_or_else(|| "unknown project_id".to_string())?;
+    if authoritative
+        .as_ref()
+        .is_some_and(|project| project.id != explicit)
+    {
+        return Err("project_id does not own the resolved workspace/session scope".into());
+    }
+    if authoritative.is_none() {
+        let workspace = std::fs::canonicalize(workspace)
+            .map_err(|_| "resolved workspace is inaccessible".to_string())?;
+        let declared_root = std::fs::canonicalize(&declared.workspace_root)
+            .map_err(|_| "project workspace is inaccessible".to_string())?;
+        if !workspace.starts_with(&declared_root) {
+            return Err("project_id does not own the resolved workspace/session scope".into());
+        }
+    }
+    Ok(Some(explicit))
 }
 
 /// Wrap a raw Uuid in a SessionId type alias.
@@ -10358,6 +10442,86 @@ mod tests {
         assert_eq!(control.status.state, RequestState::Errored);
         assert!(control.is_terminal(), "orphaned entry must be GC-eligible");
         assert_eq!(control.status.message.as_deref(), Some(ORPHANED_TURN_ERROR));
+    }
+
+    #[tokio::test]
+    async fn captured_terminal_guard_survives_abort_before_spawned_future_first_poll() {
+        let request_id = RequestId::new_v4();
+        let session_id = AgentSessionId::new_v4();
+        let turn_id = AgentTurnId::new_v4();
+        let requests: RequestRegistry = Arc::new(RwLock::new(HashMap::from([(
+            request_id,
+            status(request_id, RequestState::Running),
+        )])));
+        let events = EventBus::new(16);
+        let agent_events = AgentEventBus::new(64);
+        let mut rx = agent_events.subscribe_with_replay(None).1;
+        let dispatcher = LifecycleDispatcher::new(Uuid::new_v4(), HashSet::new());
+        let scope = dispatcher.source_scope(
+            None,
+            Some(session_id.inner()),
+            Some(turn_id.inner()),
+            Some(request_id),
+            None,
+        );
+        let authority = dispatcher.register_request(scope).unwrap();
+        let terminal = LifecycleTerminalContext {
+            dispatcher: Arc::clone(&dispatcher),
+            authority,
+            project_id: None,
+            session_id: session_id.inner(),
+            turn_id: turn_id.inner(),
+            request_id,
+        };
+        let guard = TurnTerminalGuard::arm_with_lifecycle(
+            requests.clone(),
+            events,
+            agent_events,
+            request_id,
+            session_id,
+            turn_id,
+            Some(terminal),
+        );
+        dispatcher.publish(LifecycleSource::OrdinaryTurnAdmission {
+            admitted: true,
+            new_session: false,
+            scope,
+            session_stamp: lifecycle_stamp(),
+            turn_stamp: lifecycle_stamp(),
+            title: "discarded".into(),
+            cwd: "/discarded".into(),
+        });
+        let task = tokio::spawn(async move {
+            let _guard = guard;
+            std::future::pending::<()>().await;
+        });
+        task.abort();
+        let _ = task.await;
+
+        let (finished_status, _) = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            next_turn_finished(&mut rx),
+        )
+        .await
+        .expect("captured guard did not settle aborted task");
+        assert_eq!(finished_status, AgentTurnStatus::Failed);
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                if dispatcher.attach().retained.iter().any(|event| {
+                    event.kind
+                        == ocean_agent_sdk::extension_lifecycle::LifecycleEventKind::TurnFinished
+                }) {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("captured lifecycle authority did not settle aborted task");
+        assert_eq!(
+            requests.read().await[&request_id].status.state,
+            RequestState::Errored
+        );
     }
 
     /// The disarmed guard is inert: on the normal path the turn records its own
@@ -13361,6 +13525,86 @@ mod tests {
             .any(|window| { window == "must-not-serialize".as_bytes() }));
     }
 
+    #[tokio::test]
+    async fn permission_waiter_cancel_race_is_deterministically_lifecycle_cancelled() {
+        use std::time::Duration;
+
+        let dispatcher = LifecycleDispatcher::new(Uuid::new_v4(), HashSet::new());
+        let mut policy = gating_policy(false);
+        let permissions = policy.permissions.clone();
+        let cancel = policy.cancel.clone();
+        policy.lifecycle = Some(LifecyclePermissionContext {
+            dispatcher: Arc::clone(&dispatcher),
+            project_id: None,
+            session_id: Some(Uuid::new_v4()),
+            turn_id: Some(Uuid::new_v4()),
+            request_id: policy.request_id,
+        });
+        let request_id = policy.request_id;
+        let check = tokio::spawn(async move { policy.check("write", &json!({})).await });
+        let permission_id = tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                if let Some(id) = permissions.read().await.keys().next().copied() {
+                    break id;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        cancel.cancel();
+        cancel_permission_waiter(&permissions, permission_id, request_id).await;
+        assert!(matches!(
+            check.await.unwrap(),
+            AgentPermissionDecision::Deny { .. }
+        ));
+        let encoded = ocean_agent_sdk::extension_lifecycle::encode_frame(
+            dispatcher.attach().retained.last().unwrap(),
+        )
+        .unwrap();
+        assert!(String::from_utf8(encoded)
+            .unwrap()
+            .contains("\"outcome\":\"cancelled\""));
+    }
+
+    #[tokio::test]
+    async fn permission_waiter_closure_is_separately_classified_as_cancelled() {
+        let dispatcher = LifecycleDispatcher::new(Uuid::new_v4(), HashSet::new());
+        let mut policy = gating_policy(false);
+        let permissions = policy.permissions.clone();
+        policy.lifecycle = Some(LifecyclePermissionContext {
+            dispatcher: Arc::clone(&dispatcher),
+            project_id: None,
+            session_id: Some(Uuid::new_v4()),
+            turn_id: Some(Uuid::new_v4()),
+            request_id: policy.request_id,
+        });
+        let check = tokio::spawn(async move { policy.check("write", &json!({})).await });
+        loop {
+            let sender = permissions
+                .write()
+                .await
+                .values_mut()
+                .next()
+                .and_then(|waiter| waiter.sender.take());
+            if let Some(sender) = sender {
+                drop(sender);
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert!(matches!(
+            check.await.unwrap(),
+            AgentPermissionDecision::Deny { .. }
+        ));
+        let encoded = ocean_agent_sdk::extension_lifecycle::encode_frame(
+            dispatcher.attach().retained.last().unwrap(),
+        )
+        .unwrap();
+        let encoded = String::from_utf8(encoded).unwrap();
+        assert!(encoded.contains("\"outcome\":\"cancelled\""));
+    }
+
     #[test]
     fn permission_modes_choose_the_runtime_check_boundary() {
         let args = json!({"path": "src/lib.rs"});
@@ -13416,9 +13660,13 @@ mod tests {
     /// registries for direct handler-level tests. No runtime turn is run.
     fn permission_test_state() -> AppState {
         let tmp = tempfile::tempdir().expect("tempdir");
-        std::env::set_var("OCEAN_CONFIG_DIR", tmp.path());
         std::env::set_var("OCEAN_MODEL", "fake-ok");
-        let runtime = Arc::new(AgentRuntime::from_env().expect("fake runtime"));
+        // Inject this helper's on-disk root directly. Mutating the process-wide
+        // config-dir variable made unrelated parallel policy tests read this
+        // helper's transient directory despite their own environment locks.
+        let runtime = Arc::new(
+            AgentRuntime::with_config_dir(tmp.path().to_path_buf()).expect("fake runtime"),
+        );
         let store = ocean_store::SqliteRoomStore::open_in_memory().expect("in-mem store");
         let rooms = Arc::new(Mutex::new(store));
         let room_wakes = RoomWakeBus::default();
@@ -13746,6 +13994,81 @@ mod tests {
             Some(created.session_id.inner())
         );
         assert_eq!(retained[0].scope.turn_id, None);
+    }
+
+    #[tokio::test]
+    async fn explicit_project_workspace_and_resumed_session_mismatches_publish_nothing() {
+        let _guard = AUTO_CONVENE_ENV_LOCK.lock().await;
+        let _env = TestEnvRestore::capture(&["OCEAN_CONFIG_DIR", "OCEAN_MODEL", "OCEAN_YOLO"]);
+        let state = capped_turn_state(2);
+        let workspace_a = tempfile::tempdir().unwrap();
+        let workspace_b = tempfile::tempdir().unwrap();
+        let project_a = state
+            .runtime
+            .upsert_project(
+                Project {
+                    id: Uuid::new_v4(),
+                    name: "project-a".into(),
+                    workspace_root: workspace_a.path().to_string_lossy().into_owned(),
+                    config: ProjectConfig::default(),
+                    created_ms: 1,
+                    updated_ms: 1,
+                },
+                1,
+            )
+            .unwrap();
+        let project_b = state
+            .runtime
+            .upsert_project(
+                Project {
+                    id: Uuid::new_v4(),
+                    name: "project-b".into(),
+                    workspace_root: workspace_b.path().to_string_lossy().into_owned(),
+                    config: ProjectConfig::default(),
+                    created_ms: 2,
+                    updated_ms: 2,
+                },
+                2,
+            )
+            .unwrap();
+        state
+            .extension_lifecycle
+            .update_registered_project_snapshot(HashMap::from([
+                (project_a.workspace_root.clone(), project_a.id),
+                (project_b.workspace_root.clone(), project_b.id),
+            ]));
+
+        let (status, _) = agent_sessions_create(
+            State(state.clone()),
+            Json(AgentSessionCreateRequest {
+                workspace_root: project_a.workspace_root.clone(),
+                project_id: Some(project_b.id),
+                client_type: Some("test".into()),
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert!(state.runtime.list_sessions(None).unwrap().is_empty());
+
+        let mut mismatched_turn = sample_agent_turn();
+        mismatched_turn.cwd = project_a.workspace_root.clone();
+        mismatched_turn.project_id = Some(project_b.id);
+        let (status, response) = agent_turn(State(state.clone()), Json(mismatched_turn)).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert!(!response.ok);
+
+        let (resumed, _, _) = state
+            .runtime
+            .create_session(&project_a.workspace_root, Some("test".into()))
+            .unwrap();
+        let mut resumed_turn = sample_agent_turn();
+        resumed_turn.session_id = Some(AgentSessionId(resumed));
+        resumed_turn.cwd = project_a.workspace_root;
+        resumed_turn.project_id = Some(project_b.id);
+        let (status, response) = agent_turn(State(state.clone()), Json(resumed_turn)).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert!(!response.ok);
+        assert!(state.extension_lifecycle.attach().retained.is_empty());
     }
 
     #[tokio::test]
@@ -23039,13 +23362,25 @@ mod tests {
         let agent_apply = agent.find(&apply_call).unwrap();
         let browser = agent.find("apply_browser_context(").unwrap();
         let registration = agent.find("register_running_request(").unwrap();
+        let terminal_authority = agent
+            .find("state.extension_lifecycle.register_request(lifecycle_scope)")
+            .unwrap();
+        let terminal_guard = agent
+            .find("let turn_guard = TurnTerminalGuard::arm_with_lifecycle(")
+            .unwrap();
+        let lifecycle_admission = agent
+            .find(".publish(LifecycleSource::OrdinaryTurnAdmission {")
+            .unwrap();
         assert!(
             agent_cwd < named_agent_end
-                && named_agent_end < turn_started
-                && turn_started < agent_prep
+                && named_agent_end < agent_prep
                 && agent_prep < agent_apply
                 && agent_apply < browser
                 && browser < registration
+                && registration < terminal_authority
+                && terminal_authority < terminal_guard
+                && terminal_guard < lifecycle_admission
+                && lifecycle_admission < turn_started
         );
         assert!(agent.contains("prompt.clone(), cwd.clone()"));
         assert!(agent.contains("apply_longhouse_prep(&guided_prompt, consult.as_ref())"));
@@ -25447,6 +25782,106 @@ mod tests {
     }
 
     // ---- Project create: mkdir-on-create ------------------------------------
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn committed_project_create_returns_recovery_error_when_supervisor_reconcile_fails() {
+        let _guard = AUTO_CONVENE_ENV_LOCK.lock().await;
+        let _env = TestEnvRestore::capture(&["OCEAN_CONFIG_DIR", "OCEAN_MODEL", "OCEAN_YOLO"]);
+        let tmp = tempfile::tempdir().unwrap();
+        let mut state = fake_convene_state(&tmp);
+        let bad_config = tmp.path().join("not-a-config-directory");
+        std::fs::write(&bad_config, "blocked").unwrap();
+        let supervisor = extension_service::ExtensionSupervisor::new_with_lifecycle(Arc::clone(
+            &state.extension_lifecycle,
+        ));
+        supervisor.start(bad_config, HashSet::new()).await;
+        state.extension_supervisor = Some(Arc::clone(&supervisor));
+        let workspace = tmp.path().join("committed-project");
+
+        let (status, Json(response)) = project_create(
+            State(state.clone()),
+            Json(CreateProjectRequest {
+                name: "committed".into(),
+                workspace_root: workspace.to_string_lossy().into_owned(),
+                config: ProjectConfig::default(),
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+        assert!(!response.ok);
+        assert!(response.project.is_some(), "mutation is durably committed");
+        assert_eq!(
+            response.error.as_deref(),
+            Some("extension_project_reconciliation_recovery_required")
+        );
+        assert_eq!(state.runtime.list_projects().unwrap().len(), 1);
+        supervisor.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn committed_project_delete_returns_recovery_error_when_supervisor_reap_fails() {
+        let _guard = AUTO_CONVENE_ENV_LOCK.lock().await;
+        let _env = TestEnvRestore::capture(&["OCEAN_CONFIG_DIR", "OCEAN_MODEL", "OCEAN_YOLO"]);
+        let tmp = tempfile::tempdir().unwrap();
+        let mut state = fake_convene_state(&tmp);
+        let project = state
+            .runtime
+            .upsert_project(
+                Project {
+                    id: Uuid::new_v4(),
+                    name: "delete-me".into(),
+                    workspace_root: tmp.path().join("workspace").to_string_lossy().into_owned(),
+                    config: ProjectConfig::default(),
+                    created_ms: 1,
+                    updated_ms: 1,
+                },
+                1,
+            )
+            .unwrap();
+        let bad_config = tmp.path().join("not-a-config-directory");
+        std::fs::write(&bad_config, "blocked").unwrap();
+        let supervisor = extension_service::ExtensionSupervisor::new_with_lifecycle(Arc::clone(
+            &state.extension_lifecycle,
+        ));
+        supervisor.start(bad_config, HashSet::new()).await;
+        state.extension_supervisor = Some(Arc::clone(&supervisor));
+
+        let (status, Json(response)) = project_delete(State(state.clone()), Path(project.id)).await;
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(response["ok"], false);
+        assert_eq!(response["committed"], true);
+        assert_eq!(
+            response["error"],
+            "extension_project_reconciliation_recovery_required"
+        );
+        assert!(state.runtime.find_project(project.id).unwrap().is_none());
+        supervisor.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn unreadable_committed_project_snapshot_fails_closed_without_reclassification() {
+        let _guard = AUTO_CONVENE_ENV_LOCK.lock().await;
+        let _env = TestEnvRestore::capture(&["OCEAN_CONFIG_DIR", "OCEAN_MODEL", "OCEAN_YOLO"]);
+        let tmp = tempfile::tempdir().unwrap();
+        let state = fake_convene_state(&tmp);
+        let original = Uuid::new_v4();
+        state
+            .extension_lifecycle
+            .update_registered_projects(HashSet::from([original]));
+        std::fs::write(tmp.path().join("projects.json"), "{malformed").unwrap();
+        assert_eq!(
+            project_registry::publish_extension_project_snapshot(&state).await,
+            Err("extension_project_snapshot_recovery_required")
+        );
+        assert_eq!(
+            state
+                .extension_lifecycle
+                .subscribe_registered_projects()
+                .borrow()
+                .clone(),
+            HashSet::from([original])
+        );
+    }
 
     /// Creating a project with a workspace_root that doesn't exist yet succeeds
     /// — the daemon creates the directory and stores its canonical path.

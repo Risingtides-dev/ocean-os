@@ -15,15 +15,21 @@ use std::collections::HashSet;
 /// Publish the committed registered-project snapshot synchronously before a
 /// create/delete response returns. Lifecycle publication thereafter performs no
 /// project-registry or filesystem I/O.
-async fn publish_extension_project_snapshot(state: &AppState) {
-    let Ok(projects) = state.runtime.list_projects() else {
+pub(super) async fn publish_extension_project_snapshot(
+    state: &AppState,
+) -> Result<(), &'static str> {
+    let projects = state.runtime.list_projects().map_err(|_| {
         tracing::warn!(
             reason = "project_snapshot_unavailable",
             "committed extension project snapshot could not be refreshed"
         );
-        return;
-    };
+        "extension_project_snapshot_recovery_required"
+    })?;
     let project_ids: HashSet<uuid::Uuid> = projects.iter().map(|project| project.id).collect();
+    // Change publication-time classification first so a committed delete can
+    // never leak new facts through the obsolete scope while process reaping is
+    // reconciled. A supervisor failure remains an explicit committed recovery
+    // error rather than a false success response.
     state
         .extension_lifecycle
         .update_registered_project_snapshot(
@@ -33,8 +39,18 @@ async fn publish_extension_project_snapshot(state: &AppState) {
                 .collect(),
         );
     if let Some(supervisor) = &state.extension_supervisor {
-        supervisor.update_project_snapshot(project_ids).await;
+        supervisor
+            .update_project_snapshot(project_ids)
+            .await
+            .map_err(|_| {
+                tracing::warn!(
+                    reason = "project_supervisor_reconciliation_failed",
+                    "committed extension project snapshot requires recovery"
+                );
+                "extension_project_reconciliation_recovery_required"
+            })?;
     }
+    Ok(())
 }
 
 #[derive(serde::Deserialize)]
@@ -165,17 +181,24 @@ pub(super) async fn project_create(
         updated_ms: now,
     };
     match state.runtime.upsert_project(project, now) {
-        Ok(project) => {
-            publish_extension_project_snapshot(&state).await;
-            (
+        Ok(project) => match publish_extension_project_snapshot(&state).await {
+            Ok(()) => (
                 StatusCode::CREATED,
                 Json(ProjectResponse {
                     ok: true,
                     project: Some(project),
                     error: None,
                 }),
-            )
-        }
+            ),
+            Err(error) => (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ProjectResponse {
+                    ok: false,
+                    project: Some(project),
+                    error: Some(error.into()),
+                }),
+            ),
+        },
         Err(e) => (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(ProjectResponse {
@@ -417,17 +440,24 @@ pub(super) async fn project_patch(
         ..existing
     };
     match state.runtime.upsert_project(updated, now) {
-        Ok(project) => {
-            publish_extension_project_snapshot(&state).await;
-            (
+        Ok(project) => match publish_extension_project_snapshot(&state).await {
+            Ok(()) => (
                 StatusCode::OK,
                 Json(ProjectResponse {
                     ok: true,
                     project: Some(project),
                     error: None,
                 }),
-            )
-        }
+            ),
+            Err(error) => (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ProjectResponse {
+                    ok: false,
+                    project: Some(project),
+                    error: Some(error.into()),
+                }),
+            ),
+        },
         Err(e) => (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(ProjectResponse {
@@ -446,10 +476,17 @@ pub(super) async fn project_delete(
     Path(id): Path<ProjectId>,
 ) -> (StatusCode, Json<serde_json::Value>) {
     match state.runtime.delete_project(id) {
-        Ok(true) => {
-            publish_extension_project_snapshot(&state).await;
-            (StatusCode::OK, Json(json!({ "ok": true })))
-        }
+        Ok(true) => match publish_extension_project_snapshot(&state).await {
+            Ok(()) => (StatusCode::OK, Json(json!({ "ok": true }))),
+            Err(error) => (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({
+                    "ok": false,
+                    "committed": true,
+                    "error": error,
+                })),
+            ),
+        },
         Ok(false) => (
             StatusCode::NOT_FOUND,
             Json(json!({ "ok": false, "error": format!("unknown project {id}") })),

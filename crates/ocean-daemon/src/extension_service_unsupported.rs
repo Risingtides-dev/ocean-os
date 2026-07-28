@@ -137,33 +137,48 @@ impl ExtensionSupervisor {
     }
 
     #[cfg(not(feature = "registry-portability-check"))]
-    pub(crate) async fn update_project_snapshot(&self, projects: HashSet<Uuid>) {
+    pub(crate) async fn update_project_snapshot(&self, projects: HashSet<Uuid>) -> Result<(), ()> {
         let config_dir = self
             .config_dir
             .read()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .clone();
         if let Some(config_dir) = config_dir {
-            self.reconcile(config_dir, projects).await;
+            self.reconcile(config_dir, projects).await
+        } else {
+            Err(())
         }
     }
 
-    async fn reconcile(&self, config_dir: PathBuf, registered_projects: HashSet<Uuid>) {
+    async fn reconcile(
+        &self,
+        config_dir: PathBuf,
+        registered_projects: HashSet<Uuid>,
+    ) -> Result<(), ()> {
         let _serial = self.reconciliation.lock().await;
         let result = tokio::task::spawn_blocking(move || {
             read_unsupported_service_activations(&config_dir, &registered_projects)
         })
         .await;
         match result {
-            Ok(Ok(activations)) => self.status.replace_unsupported(activations),
-            Ok(Err(error)) => tracing::warn!(
-                reason = error.code(),
-                "unsupported extension reconciliation blocked"
-            ),
-            Err(_) => tracing::warn!(
-                reason = "registry_reader_failed",
-                "unsupported extension reconciliation blocked"
-            ),
+            Ok(Ok(activations)) => {
+                self.status.replace_unsupported(activations);
+                Ok(())
+            }
+            Ok(Err(error)) => {
+                tracing::warn!(
+                    reason = error.code(),
+                    "unsupported extension reconciliation blocked"
+                );
+                Err(())
+            }
+            Err(_) => {
+                tracing::warn!(
+                    reason = "registry_reader_failed",
+                    "unsupported extension reconciliation blocked"
+                );
+                Err(())
+            }
         }
     }
 
@@ -182,7 +197,7 @@ impl ExtensionSupervisor {
             .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(config_dir.clone());
         let supervisor = Arc::clone(self);
         let task = tokio::spawn(async move {
-            supervisor.reconcile(config_dir, registered_projects).await;
+            let _ = supervisor.reconcile(config_dir, registered_projects).await;
         });
         *self.root_task.lock().await = Some(task);
     }
