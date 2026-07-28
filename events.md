@@ -5636,3 +5636,19 @@ area:      [backend]: Extension transport classification and Windows portability
 
 Separated clean EOF, read I/O, and protocol frame failures in the native-service transport. Post-ready EOF/read failures and the leader-poll race now deterministically retain `unexpected_exit`, while malformed, truncated, unknown, and oversized frames retain `protocol_violation`; repeated real early-exit and injected I/O fixtures cover the boundary. Added an isolated repository-owned Windows cross-build package that includes the actual registry and unsupported-supervisor source modules, compiles the real NtCreateFile/NtQueryDirectoryFile reader and no-child supervisor path, and documents the separate pre-existing full-daemon ocean-observatory Windows blockers. Focused extension tests (77), all daemon tests (620), SDK tests (63), workspace/MSRV checks, denied-warning daemon/SDK Clippy, Linux musl and isolated Windows GNU cross-builds, formatting, docs, and diff checks pass.
 _________________________________________________________________________________
+_________________________________________________________________________________
+time:      [01:45] [28-07-26]
+agent:     [pi] [gpt-5.4] [thoth]
+worktree:  [feat/extensions-stage-a2a]
+type:      [review]
+area:      [testing]
+
+Accepted Stage A2a after four independent review/correction rounds. Final PASS
+confirms the sole coherent exact-grant registry authority, strict hello/ready
+transport, descriptor/file-id-bound executable and assigned-root generations,
+minimal secret-safe child environment, typed transport failure causes, bounded
+generation-safe process cleanup, validated unsupported-platform no-child status,
+and actual-source Linux/Windows cross-build evidence. A2a adds no live lifecycle
+delivery, replay, health/restart policy, registry mutation surface, Crew, UI, or
+integration behavior. A2b is the next authorized slice.
+_________________________________________________________________________________
