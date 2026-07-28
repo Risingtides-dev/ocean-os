@@ -679,9 +679,7 @@ fn cleanup_temp_root(roots: &AssignedRoots) -> bool {
     }
     // SAFETY: fstatat initialized named on success.
     let named = unsafe { named.assume_init() };
-    if u64::try_from(named.st_dev).ok() != Some(opened.dev())
-        || opened.ino() != named.st_ino
-    {
+    if u64::try_from(named.st_dev).ok() != Some(opened.dev()) || opened.ino() != named.st_ino {
         return false;
     }
     // SAFETY: the verified empty connection root is removed relative to its
