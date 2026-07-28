@@ -5415,3 +5415,14 @@ area:  [backend]: Native Apple companion and typed attachment ingress
 
 Consolidated the recovered Ocean Buddy iPhone/watchOS app, typed SDK contract, and narrow daemon attachment route onto current main. Review repairs route Watch approval through reachable iPhone WatchConnectivity, canonicalize UUID session bindings, retain completion-backed truncation credit while audio drains, clear stale pairing state, and enforce the exact attached-event shape. Swift package tests, focused Rust tests, iOS/watchOS generic simulator builds, docs-check, formatting, and patch checks pass.
 _________________________________________________________________________________
+
+_________________________________________________________________________________
+
+time:  [22:53] [27-07-26]
+agent: [pi] [gpt-5.4] [Thoth]
+worktree: [detached origin/main integration at /private/tmp/ocean-consolidate]
+type:  [feature-request]: Fixed-pair local iMessage adapter consolidation
+area:  [backend]: Native Messages boundary and daemon client
+
+Consolidated the signed local iMessage adapter source with the exact 571-to-703 inbound and 571-only outbound policy. Review repairs moved exact pair and participant checks into the SQL prefilter, require the operator-enrolled Messages account, constrain delivery to the loopback Ocean daemon, make SSE gaps fatal, serialize and deduplicate cross-process state, and remove an incompatible extension service declaration pending a separately ratified privileged-service contract. Eleven Swift tests, release build, docs-check, shell syntax, patch checks, and final security review pass.
+_________________________________________________________________________________

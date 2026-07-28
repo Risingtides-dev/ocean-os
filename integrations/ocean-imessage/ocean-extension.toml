@@ -1,0 +1,7 @@
+schema_version = 1
+id = "risingtides.ocean-imessage"
+name = "Ocean iMessage"
+version = "0.1.0"
+min_ocean_version = "0.1.0"
+description = "Local fixed-pair macOS iMessage adapter source. No executable extension resources are declared."
+license = "MIT OR Apache-2.0"

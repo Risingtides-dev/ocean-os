@@ -1,0 +1,8 @@
+#!/bin/sh
+set -eu
+
+# Deliberately does not build, download, or install anything. This is an
+# operator-managed convenience wrapper, not an Ocean extension service entry.
+# Invoke only after reviewing the fixed-pair FDA/Automation checklist.
+ROOT=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd -P)
+exec "$ROOT/.build/release/ocean-imessage" "$@"
