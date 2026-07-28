@@ -518,6 +518,11 @@ Evidence recorded on 2026-07-14:
 
 ### Phase 2 — lifecycle observers and supervised services
 
+Phase 1 is accepted and merged. The operator ratified the exact Stage A contract
+in [`2026-07-27-ocean-extension-stage-a-implementation-manifest.md`](2026-07-27-ocean-extension-stage-a-implementation-manifest.md)
+on 2026-07-27; Phase 2 implementation is authorized only through that document's
+ordered A1 → A2a → A2b sequence and binding review/stop gates.
+
 1. Add the versioned read-only lifecycle envelope.
 2. Implement bounded subscriptions and service supervision.
 3. Prove daemon/session behavior is unaffected by observer absence, timeout, crash, or restart loop.

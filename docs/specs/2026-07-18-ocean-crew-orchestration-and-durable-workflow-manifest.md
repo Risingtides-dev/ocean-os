@@ -1,8 +1,8 @@
 # Ocean Crew Orchestration and Durable Workflow Manifest
 
-**Status:** accepted by the operator 2026-07-21 — ratifies §12 items (a)–(i); Stage A authorized. Stages B–E still require their own implementation manifests before code.
+**Status:** accepted by the operator 2026-07-21 — ratifies §12 items (a)–(i); Stage A's exact implementation contract was separately ratified 2026-07-27. Stages B–E still require their own implementation manifests before code.
 **Date:** 2026-07-18
-**Revision:** 2026-07-21 — operator-ratified lane names **Undertow** (local) / **Offshore** (remote) with facade tools renamed accordingly; normative member completion envelope + acceptance ledger (§7.7) and budget ladder / attention states / member control (§7.8); artifact topology snapshot and Surface flow-graph sidebar projection (§6.4, §7.6); durable per-attempt facts, batched continuations, grant rows (§7.4–7.5); informative pi-subagents concept study (§13)
+**Revision:** 2026-07-27 — `2026-07-27-ocean-extension-stage-a-implementation-manifest.md` accepted for its ordered A1–A5 sequence; the 2026-07-21 Undertow/Offshore lane names and facade tools, member completion/acceptance/budget contracts, artifact topology, Surface projection, durable attempt facts, continuations, grant rows, and informative pi-subagents study remain unchanged.
 **Scope:** design ratification only — no code changes are authorized by this document alone
 **Parent contracts:** [`2026-07-14-ocean-extensions-architecture-and-migration-manifest.md`](2026-07-14-ocean-extensions-architecture-and-migration-manifest.md) (extension architecture; Phase 6 requires this ratification), [`2026-07-17-ocean-observatory-architecture.md`](2026-07-17-ocean-observatory-architecture.md) (read-only execution truth), [`2026-07-17-observatory-gate0-decisions.md`](2026-07-17-observatory-gate0-decisions.md), [`2026-07-17-observatory-gate1-implementation-manifest.md`](2026-07-17-observatory-gate1-implementation-manifest.md)
 
@@ -17,7 +17,7 @@ This manifest is the separate design ratification that Phase 6 of the extension 
 ## 2. Why a manifest, not an implementation wave
 
 - Phase 6 of the extension manifest explicitly forbids building orchestration transport without ratified design.
-- The extension host is not ready: Phase 1 (schema/tool lane) is implemented but not accepted; Phases 2–5 (lifecycle observers, supervised services, package management, reference packages) are pending. Crew depends on them.
+- The extension host is not ready: Phase 1 (schema/tool lane plus strict installed/trusted/enabled inspect/doctor state) is accepted and merged; Phases 2–5 (lifecycle observers, supervised services, package management, reference packages) are pending. Crew depends on them.
 - The interaction surface (interactive pinned workflow artifacts) touches `ocean-os`, `ocean-surface`, and the render protocol at once; an unratified contract would fragment across repos.
 - Prior art must be reconciled, not duplicated: Bedrock workflow specs (data), the OCEAN-338/340 `WorkflowBrief` loader and `POST /v1/workflows/prepare` (discovery), and the R5 design (execution, never built) are three layers of one system.
 
@@ -58,11 +58,11 @@ Owns, unchanged in authority: sessions, turns, tools, permissions, cwd/workspace
 
 ### 5.2 Longhouse delegation facade (extension-provided)
 
-The Crew package registers `longhouse__delegate_local` and `longhouse__delegate_offshore` through the generic extension tool lane. Longhouse owns the product vocabulary, advisory preparation, relevant skill/SOP retrieval, and delegation request shape; Crew owns every execution decision behind the facade. The existing `ocean-longhouse` core crate gains no spawning, scheduling, lifecycle, or remote-compute code.
+The Crew package registers `longhouse__delegate_undertow` and `longhouse__delegate_offshore` through the generic extension tool lane. Longhouse owns the product vocabulary, advisory preparation, relevant skill/SOP retrieval, and delegation request shape; Crew owns every execution decision behind the facade. The existing `ocean-longhouse` core crate gains no spawning, scheduling, lifecycle, or remote-compute code.
 
 ### 5.3 Ocean Crew (extension)
 
-Owns and tests: member roles/definitions/prompts, capability profiles and local/offshore target adapters, task-graph shape and validation, spawn/join/retry/cycle semantics, budgets and recursion policy, grace-period staging, result aggregation, its own SQLite durable state, staging-artifact content, and extension-attested topology labels.
+Owns and tests: member roles/definitions/prompts, capability profiles and Undertow/Offshore target adapters, task-graph shape and validation, spawn/join/retry/cycle semantics, budgets and recursion policy, grace-period staging, result aggregation, its own SQLite durable state, staging-artifact content, and extension-attested topology labels.
 
 ### 5.4 `ocean-agents`
 
@@ -85,7 +85,7 @@ Six seams, each meaningful for any extension (deploys, imports, approval flows),
 3. **Scoped lifecycle delivery.** The service receives lifecycle facts only for executions it owns or was granted: turn start/finish, tool start/finish metadata, permission waiting/resolved, cancellation, model reroute, session interruption. Extends the Phase 2 observer vocabulary; no transcript or argument payloads beyond the ratified metadata envelope.
 4. **Extension UI artifact lane.** Publish/update/unmount one session-scoped interactive artifact per artifact id; receive authenticated, revisioned, idempotent operator commands for owned artifacts. Producer identity and session scope are host-injected into the envelope, never extension-asserted. Artifacts recover as inert (`paused`) after service restart until re-validated.
 5. **Continuation request.** Request one ordinary, package-attributed turn in an originating session, carrying bounded structured results. Deduplicated, rate-limited, audit-visible, rejected if the session no longer permits it. Not an interceptor and not context injection.
-6. **Extension state directory.** A confined per-package state directory (under the daemon-owned local state root from §12.1 of the extension manifest). Crew keeps SQLite here. Extensions never touch daemon session JSON.
+6. **Extension state directory.** A daemon-assigned per-package state directory (under the daemon-owned local state root from §12.1 of the extension manifest). Crew is authorized to keep SQLite here and not in daemon session JSON; Stage A native authority is not filesystem containment.
 
 The interactive artifact lane additionally requires one generic render-protocol kind (working name `workflow_control`: phase, deadline, rows with bounded editable fields, actions, revision, and a bounded topology snapshot — node ids, kinds, labels, edges, per-node lifecycle/acceptance/attention status — sufficient for graph rendering without transcript content) rendered by the TUI pinned slot and by Surface. The existing TUI gap — confirm interactions resolve locally and never POST to `/v1/component/event` (`crates/ocean-tui/src/shell/components/chat.rs`) — is closed as part of this seam, benefiting all components, not just Crew.
 
@@ -131,7 +131,7 @@ Runtime states: `proposed → staged → running → (waiting_for_dependency | w
 
 ### 7.4 Durability (the absorbed R5 model)
 
-- SQLite in the confined state directory; every meaningful transition checkpointed in a transaction: graph revision, node state, attempt number, input/output references, host execution id, command-dedup ids, per-attempt model record (requested role→alias resolution, tried model, failure class), requested and host-effective capability ids, budget-ladder outcomes, acceptance-ledger status, operator grant rows, aggregate usage, pending operator action.
+- SQLite in the daemon-assigned state directory; every meaningful transition checkpointed in a transaction: graph revision, node state, attempt number, input/output references, host execution id, command-dedup ids, per-attempt model record (requested role→alias resolution, tried model, failure class), requested and host-effective capability ids, budget-ladder outcomes, acceptance-ledger status, operator grant rows, aggregate usage, pending operator action.
 - **At-least-once recovery:** execution requests carry idempotency keys; UI commands carry command ids; retries are explicit new attempts with new host execution ids; completion reconciliation queries host truth before relaunching anything.
 - **Immutable revisions:** operator edits and (later) planner expansions create a new validated graph revision; running nodes stay bound to the revision that admitted them.
 - **Closeouts:** every terminal state runs a closeout (cancel orphans, release artifacts, final ledger row) — the R5 closeout policy, extension-side.
@@ -175,7 +175,7 @@ Member control uses only existing seams: **interrupt** is generic host cancellat
 
 Strict order; each stage gates the next. Stages A–C live in `ocean-os` and follow the extension manifest's own phases; D–E live in the extension package repo.
 
-- **Stage A — extension host readiness.** Accept Phase 1; implement Phases 2–3 (lifecycle observers, supervised services, installed/trusted/enabled state, inspect/doctor, local/Git install). *Gate:* a supervised no-op service survives restart with confined state and scoped events.
+- **Stage A — extension host readiness.** Starting from accepted Phase 1, implement Phases 2–3 (lifecycle observers, supervised services, installed/trusted/enabled state, inspect/doctor, local/Git install) only under a separately ratified implementation manifest. *Gate:* a supervised no-op service survives restart with daemon-assigned state and scoped events. Assigned state is not a native-process sandbox.
 - **Stage B — generic seams.** Execution request + cancellation + scoped delivery + continuation + state directory (§6.1–6.3, 6.5–6.6). *Gate:* host conformance tests prove grant non-widening, session isolation, idempotent replay, dedup, audit identity, and package-removal safety — with no orchestration vocabulary in core.
 - **Stage C — interactive workflow artifacts.** SDK types, daemon artifact registry/routing, TUI renderer + component-event transport, Surface renderer including the read-only flow-graph sidebar projection. *Gate:* revision/idempotency tests; a non-Crew demo extension drives the artifact end to end.
 - **Stage D — Crew v1.** Package registers the two Longhouse delegation facade tools; implements the Undertow and Offshore lane adapters plus the four versioned capability profiles from §7.2; implements the member completion envelope, acceptance ledger, and budget ladder (§7.7–7.8); supports fixed fan-out ≤3, join, reduce, one batched continuation; SQLite durability with crash-recovery tests; staging→running hot-swap; Observatory attestation; Ocean Floor deep link. *Gate:* host conformance proves capability non-widening and requested/effective audit records; Undertow/Offshore policy-equivalence fixtures pass; acceptance-ledger and budget-ladder fixtures pass; kill-and-recover tests (daemon restart, service restart, child failure, budget exhaustion, cancellation) all reconcile against host truth.
@@ -188,7 +188,7 @@ Strict order; each stage gates the next. Stages A–C live in `ocean-os` and fol
 3. Longhouse facade tools are extension-provided and route only to staged Crew proposals; the compiled `ocean-longhouse` crate remains advisory/read-only.
 4. Bedrock supplies bounded provenance-labeled knowledge only; it never carries grants, secrets, or live scheduler state.
 5. Observatory stays read-only; control never travels through it; proposals never enter it.
-6. Extension state lives only in the confined state directory; daemon session JSON is never touched by extensions.
+6. Cooperative extension state is assigned under the daemon-owned state directory; daemon session JSON is never an authorized extension target. Native services remain daemon-user-equivalent unless a later sandbox is ratified.
 7. All extension-originated effects (executions, commands, continuations) are idempotent and package-attributed.
 8. Auto-start requires operator opt-in, surface acknowledgement, and passing re-validation; restarts never auto-launch.
 9. Graph ceilings are validated before staging and before start; running nodes bind to immutable revisions.

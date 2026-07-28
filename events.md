@@ -5274,3 +5274,70 @@ check; strict all-target Clippy for ocean-extension/ocean-agent/ocean-cli/
 ocean-daemon; formatting; docs-check (30 packages, 127 active Markdown files,
 155 local links); and diff whitespace checks.
 _________________________________________________________________________________
+time:      [18:31] [27-07-26]
+agent:     [pi], [unknown-model], [worker]
+worktree:  [docs/extensions-stage-a-implementation-manifest]
+type:      [plan]
+area:      [docs]
+
+Drafted the proposed Ocean Extension Host Stage A implementation manifest for
+Phase 1 rescue A0 and ordered slices A1–A5. The exact contract selects a
+host-authenticated bidirectional stdio NDJSON v1 service channel, metadata-only
+boot-local bounded lifecycle delivery, honest non-emission of `session_stopped`,
+macOS/Linux process-group supervision, explicit secret-to-child bindings,
+daemon-confined mutable roots, and journaled daemon-only local/pinned-Git package
+mutations with separate install/trust/enable transitions. Indexed the proposal
+and corrected only adjacent stale Phase 1/Crew status claims. No code, PR,
+deployment, or daemon operation was performed. `cargo xtask docs-check` and
+`git diff --check` passed before commit.
+_________________________________________________________________________________
+time:      [19:07] [27-07-26]
+agent:     [pi] [gpt-5.4] [worker]
+worktree:  [docs/extensions-stage-a-implementation-manifest]
+type:      [plan]
+area:      [writing]
+
+Corrected the still-proposed Ocean Extension Host Stage A implementation
+manifest after rebasing its original draft onto Phase 1 merge 77630bda. The
+revision binds replay to activation epochs and historical scope, states native
+services have daemon-user-equivalent authority, requires generation-safe process
+group cleanup, names all lifecycle terminal/admission/tool/project authorities,
+defines one ACK/control contract and the strict service-grants.json schema,
+moves acquisition outside the state lock, pins checked DNS addresses to Git's
+actual libcurl connection, and specifies committed reconciliation responses plus
+exact retention transitions. It removes Git subdir from v1, splits A2/A3 into
+independently reviewed sub-slices, and narrowly reconciles active Phase 1 and
+Undertow naming prose. No code, Stage B-D, integration, UI, PR, deployment, or
+operator ratification was added.
+_________________________________________________________________________________
+_________________________________________________________________________________
+time:      [19:15] [27-07-26]
+agent:     [pi] [gpt-5.4] [thoth]
+worktree:  [docs/extensions-stage-a-implementation-manifest]
+type:      [review]
+area:      [writing]
+
+Closed the final two independent-review defects in the still-proposed Stage A
+manifest. Registry publication now names the first state-file rename as the
+irreversible commit point, requires journal-proven roll-forward under the
+exclusive lock, and exposes an unambiguous committed recovery-error response
+instead of claiming the old revision survives mixed state. Pinned Git now uses
+a non-expiring per-process CURLOPT_RESOLVE entry, including bracketed IPv6, so
+the 60-second acquisition cannot fall back to DNS after cache expiry. No code,
+ratification, PR, deployment, Stage B-D, UI, or integration work was added.
+_________________________________________________________________________________
+_________________________________________________________________________________
+time:      [21:48] [27-07-26]
+agent:     [pi] [gpt-5.4] [thoth]
+worktree:  [docs/extensions-stage-a-implementation-manifest]
+type:      [plan]
+area:      [writing]
+
+Recorded the operator's explicit ratification of the independently reviewed
+Ocean Extension Host Stage A implementation contract in PR #355. The accepted
+contract authorizes only the ordered A1 → A2a → A2b → A3a → A3b → A4 → A5
+sequence with its review, stop, compatibility, E2E, and deployment gates. Parent
+status/index text now reflects acceptance. Stages B–E, Crew implementation, UI,
+Telegram/integration-specific behavior, and core orchestration remain outside
+this ratification.
+_________________________________________________________________________________
