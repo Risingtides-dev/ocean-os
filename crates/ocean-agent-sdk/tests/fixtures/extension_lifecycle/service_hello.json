@@ -1,0 +1,1 @@
+{"protocol":"ocean.extension.service","version":1,"frame":"service_hello","subscriptions":["daemon_started","turn_started"],"resume":null}

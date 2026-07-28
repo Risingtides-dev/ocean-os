@@ -42,6 +42,9 @@ pub struct ContextUsage {
     pub measured_at_ms: i64,
 }
 
+/// Strict metadata-only lifecycle/service protocol DTOs for native extensions.
+pub mod extension_lifecycle;
+
 /// Surface patch protocol — the shared agent-native canvas mutation contract.
 /// See [`surface`] for the wire types.
 pub mod surface;

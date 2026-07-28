@@ -5341,3 +5341,13 @@ status/index text now reflects acceptance. Stages B–E, Crew implementation, UI
 Telegram/integration-specific behavior, and core orchestration remain outside
 this ratification.
 _________________________________________________________________________________
+
+---
+
+time:      [22:11] [27-07-26]
+agent:     [api], [gpt-5.4], [worker]
+worktree:  [feat/extensions-stage-a1]
+type:      [feature-request]: Implement ratified extension Stage A slice A1
+area:      [backend]: Strict lifecycle DTOs and pure daemon adapter
+
+Implemented only Stage A1: strict metadata-only `ocean.extension.service` v1 SDK DTOs and golden/negative fixtures, plus the unwired daemon lifecycle source adapter, UUID tool correlation, permission pairing, atomic terminal finalizer, project-scope filter, and bounded boot ring. Added narrow tests for all nine produced kinds, reserved non-produced `session_stopped`, strict framing/version/unknown-field bounds, admission ordering, cancellation, exactly-once terminal mapping, deterministic inputs, and forbidden-payload absence. No service launch, transport wiring, registry mutation, routes/CLI, Crew, UI, or integration behavior was added.

@@ -46,6 +46,7 @@ This crate owns the long-running Ocean HTTP service on `:4780`, including API ro
   and keep project-less/session-less conversations on render + handoff only.
 
 - Session behavior lives in `ocean-agent`; route changes must not create a separate session model.
+- `extension_lifecycle.rs` is the Stage A1 pure, metadata-only lifecycle boundary: it owns deterministic source adaptation, private runtime-tool-id to host-UUID correlation, permission pairing, the atomic terminal guard, publication-time project classification, and bounded boot-local retention. It is intentionally unwired until A2b and must not gain process launch, service transport, registry mutation, routes, Observatory coupling, or producer call sites in A1.
 - Product turns and legacy/call turns (legacy requests pin a session id before
   admission) take the shared non-blocking session operation lease before
   `TurnStarted`, invalidation, or request registration and retain it through
@@ -116,6 +117,7 @@ This crate owns the long-running Ocean HTTP service on `:4780`, including API ro
 - `cargo test -p ocean-daemon cors::tests:: -- --nocapture`
 - `cargo test -p ocean-daemon component_event_ -- --nocapture`
 - `cargo test -p ocean-daemon event_adapter::tests:: -- --nocapture`
+- `cargo test -p ocean-daemon extension_lifecycle -- --nocapture`
 - `cargo test -p ocean-daemon fs_ -- --nocapture`
 - `cargo test -p ocean-daemon metrics::tests:: -- --nocapture`
 - `cargo test -p ocean-daemon model_catalog_ -- --nocapture`

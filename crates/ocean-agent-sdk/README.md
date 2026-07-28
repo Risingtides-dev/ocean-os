@@ -85,6 +85,7 @@ legacy event rail and uses `ocean-core` types, **not** the types in this crate.
 | [`AgentSessionCreateRequest`] / [`AgentSessionCreateResponse`] | Explicit `POST /v1/agent/sessions` create. |
 | [`AgentSessionId`], [`AgentTurnId`], [`ToolCallId`] | UUID newtypes that thread through every payload. |
 | [`AgentTurnStatus`] | `queued` / `running` / `completed` / `failed` / `cancelled`. |
+| [`extension_lifecycle`] | Strict, metadata-only `ocean.extension.service` v1 handshake/control/event DTOs plus bounded NDJSON encode/decode. It owns no transport or execution. |
 
 It re-exports [`ThinkingLevel`] from `ocean-protocol` so you can set
 `AgentTurnRequest::thinking_level` without depending on the protocol crate
@@ -232,7 +233,8 @@ can't answer.
 - **Name / version:** `ocean-agent-sdk` `0.1.0`.
 - **Depends on** `ocean-protocol` (for the re-exported `ThinkingLevel`),
   `serde` / `serde_json`, `chrono`, `uuid`. It has **no** HTTP client and **no**
-  runtime dependency — it is pure data types.
+  runtime dependency — it is pure data types. Native-extension lifecycle wire
+  types and strict 65,536-byte NDJSON framing live in `extension_lifecycle`.
 - **Sibling crates:** `ocean-core` (lower-level protocol types incl. the
   permission types above), `ocean-runtime` / `ocean-agent` (the actual agent
   loop + sessions), `ocean-daemon` (the HTTP service you talk to).
@@ -247,5 +249,6 @@ can't answer.
 [`AgentTurnId`]: src/lib.rs
 [`ToolCallId`]: src/lib.rs
 [`AgentTurnStatus`]: src/lib.rs
+[`extension_lifecycle`]: src/extension_lifecycle.rs
 [`ThinkingLevel`]: https://docs.rs/ocean-protocol
 [`ocean_core::PermissionDecisionRequest`]: ../ocean-core/src/lib.rs
