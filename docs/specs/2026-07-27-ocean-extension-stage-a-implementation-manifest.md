@@ -2,18 +2,18 @@
 
 **Date:** 2026-07-27
 
-**Status:** proposed — awaiting operator ratification
+**Status:** accepted by the operator 2026-07-27
 
 **Program:** Ocean Crew Stage A / Ocean Extension Phases 2–3
 
-**Implementation authority:** none until operator ratification
+**Implementation authority:** A1 → A2a → A2b → A3a → A3b → A4 → A5 under the review and stop gates in §18–§21
 
 **Parents:** [`2026-07-14-ocean-extensions-architecture-and-migration-manifest.md`](2026-07-14-ocean-extensions-architecture-and-migration-manifest.md), [`2026-07-18-ocean-crew-orchestration-and-durable-workflow-manifest.md`](2026-07-18-ocean-crew-orchestration-and-durable-workflow-manifest.md)
 **Evidence baseline:** `ocean-os` `77630bdaccb2829c45b0f137e3750d2ec089d212`; accepted Phase 1 implementation `399713b9fa1927a56a2cfaf4018cf5fa5c81658b`
 
-## 1. Decision requested
+## 1. Ratified decision
 
-Ratify one exact implementation contract for Crew Stage A on the accepted
+The operator ratified this exact implementation contract for Crew Stage A on the accepted
 Extension Phase 1 state reader now merged on `main`: add a metadata-only
 lifecycle protocol and supervised native-service host, then add daemon-owned
 local/pinned-Git package mutations. The gate is a no-op service installed,
@@ -103,7 +103,7 @@ Phase 1 is accepted and merged by PR #354 at `77630bda` (implementation commit
 `399713b9`). It provides strict installed/trusted/enabled reads,
 descriptor-anchored digest verification, read-only/no-execution inspect/doctor,
 and the CLI read path. This satisfies prerequisite A0; it is evidence, not an
-implementation slice authorized by this still-proposed document.
+implementation slice in the ratified A1–A5 sequence.
 
 A1 starts only from a verified descendant of `77630bda`. A2a owns the bounded
 read-only upgrade from accepted three-file state to the strict four-file Stage A
@@ -1256,8 +1256,8 @@ Stop and request a design amendment if implementation would:
 
 ## 22. Acceptance criteria
 
-The operator may ratify this implementation manifest when an independent review
-confirms:
+The operator ratified this implementation manifest on 2026-07-27 after independent review
+confirmed:
 
 - every requested design gap has one exact contract or an explicit recommended
   ratification choice;
@@ -1274,5 +1274,7 @@ confirms:
 - Observer and Observatory remain read-only and Ocean core remains free of Crew
   vocabulary.
 
-Until ratification, this document is a proposal and authorizes no code, PR,
-merge, deployment, daemon restart, or package activation.
+Ratification authorizes only the ordered A1 → A2a → A2b → A3a → A3b → A4 → A5
+implementation sequence, with every review, stop, validation, E2E, and deployment
+gate in this document still binding. It authorizes no Stage B–E, Crew engine, UI,
+Telegram/integration-specific, or core-orchestration work.

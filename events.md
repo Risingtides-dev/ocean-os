@@ -5326,3 +5326,18 @@ a non-expiring per-process CURLOPT_RESOLVE entry, including bracketed IPv6, so
 the 60-second acquisition cannot fall back to DNS after cache expiry. No code,
 ratification, PR, deployment, Stage B-D, UI, or integration work was added.
 _________________________________________________________________________________
+_________________________________________________________________________________
+time:      [21:48] [27-07-26]
+agent:     [pi] [gpt-5.4] [thoth]
+worktree:  [docs/extensions-stage-a-implementation-manifest]
+type:      [plan]
+area:      [writing]
+
+Recorded the operator's explicit ratification of the independently reviewed
+Ocean Extension Host Stage A implementation contract in PR #355. The accepted
+contract authorizes only the ordered A1 → A2a → A2b → A3a → A3b → A4 → A5
+sequence with its review, stop, compatibility, E2E, and deployment gates. Parent
+status/index text now reflects acceptance. Stages B–E, Crew implementation, UI,
+Telegram/integration-specific behavior, and core orchestration remain outside
+this ratification.
+_________________________________________________________________________________

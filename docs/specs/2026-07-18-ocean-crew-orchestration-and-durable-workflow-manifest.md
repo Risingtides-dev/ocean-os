@@ -1,8 +1,8 @@
 # Ocean Crew Orchestration and Durable Workflow Manifest
 
-**Status:** accepted by the operator 2026-07-21 — ratifies §12 items (a)–(i); Stage A authorized. Stages B–E still require their own implementation manifests before code.
+**Status:** accepted by the operator 2026-07-21 — ratifies §12 items (a)–(i); Stage A's exact implementation contract was separately ratified 2026-07-27. Stages B–E still require their own implementation manifests before code.
 **Date:** 2026-07-18
-**Revision:** 2026-07-21 — operator-ratified lane names **Undertow** (local) / **Offshore** (remote) with facade tools renamed accordingly; normative member completion envelope + acceptance ledger (§7.7) and budget ladder / attention states / member control (§7.8); artifact topology snapshot and Surface flow-graph sidebar projection (§6.4, §7.6); durable per-attempt facts, batched continuations, grant rows (§7.4–7.5); informative pi-subagents concept study (§13)
+**Revision:** 2026-07-27 — `2026-07-27-ocean-extension-stage-a-implementation-manifest.md` accepted for its ordered A1–A5 sequence; the 2026-07-21 Undertow/Offshore lane names and facade tools, member completion/acceptance/budget contracts, artifact topology, Surface projection, durable attempt facts, continuations, grant rows, and informative pi-subagents study remain unchanged.
 **Scope:** design ratification only — no code changes are authorized by this document alone
 **Parent contracts:** [`2026-07-14-ocean-extensions-architecture-and-migration-manifest.md`](2026-07-14-ocean-extensions-architecture-and-migration-manifest.md) (extension architecture; Phase 6 requires this ratification), [`2026-07-17-ocean-observatory-architecture.md`](2026-07-17-ocean-observatory-architecture.md) (read-only execution truth), [`2026-07-17-observatory-gate0-decisions.md`](2026-07-17-observatory-gate0-decisions.md), [`2026-07-17-observatory-gate1-implementation-manifest.md`](2026-07-17-observatory-gate1-implementation-manifest.md)
 
