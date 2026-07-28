@@ -5341,3 +5341,68 @@ status/index text now reflects acceptance. Stages B–E, Crew implementation, UI
 Telegram/integration-specific behavior, and core orchestration remain outside
 this ratification.
 _________________________________________________________________________________
+
+---
+
+time:      [22:11] [27-07-26]
+agent:     [api], [gpt-5.4], [worker]
+worktree:  [feat/extensions-stage-a1]
+type:      [feature-request]: Implement ratified extension Stage A slice A1
+area:      [backend]: Strict lifecycle DTOs and pure daemon adapter
+
+Implemented only Stage A1: strict metadata-only `ocean.extension.service` v1 SDK DTOs and golden/negative fixtures, plus the unwired daemon lifecycle source adapter, UUID tool correlation, permission pairing, atomic terminal finalizer, project-scope filter, and bounded boot ring. Added narrow tests for all nine produced kinds, reserved non-produced `session_stopped`, strict framing/version/unknown-field bounds, admission ordering, cancellation, exactly-once terminal mapping, deterministic inputs, and forbidden-payload absence. No service launch, transport wiring, registry mutation, routes/CLI, Crew, UI, or integration behavior was added.
+_________________________________________________________________________________
+time:      [22:40] [27-07-26]
+agent:     [api], [gpt-5.4], [worker]
+worktree:  [feat/extensions-stage-a1]
+type:      [bug report]: Correct Stage A1 review findings
+area:      [backend]: Strict lifecycle wire and bounded adapter state
+
+Corrected the A1 candidate after independent FAIL findings: all JSON object
+levels now reject duplicate keys, parser diagnostics are fixed, serialization
+allocation and SemVer daemon versions are bounded, and the exact 65,536-byte
+boundary is covered. Tool and permission correlation is request-scoped and
+bounded; publication validates before state mutation; terminal settlement
+cleans abandoned request state while boot-retained tombstones fail closed at a
+fixed cap; sequence exhaustion also fails closed. Added collision, retry,
+invalid-stamp, oversized/version, concurrency, cleanup, stress, and boundary
+tests. The prior A1 completion wording is superseded: A1 remains at independent
+acceptance and A2a is blocked. No live wiring, transport, process, route,
+registry mutation, A2+, Crew, UI, or integration behavior was added.
+_________________________________________________________________________________
+time:      [23:04] [27-07-26]
+agent:     [api], [gpt-5.4], [worker]
+worktree:  [feat/extensions-stage-a1]
+type:      [bug report]: Remove Stage A1 terminal publication cliff
+area:      [backend]: Request-scoped lifecycle terminal authority
+
+Replaced the boot-cumulative finalized-request tombstone set with a cloneable
+request-scoped atomic terminal authority minted at request registration. Normal
+completion and orphan/panic settlement now require clones of the same authority
+and use compare-exchange so only one prepared terminal fact wins; foreign or
+missing authority cannot enter the terminal adaptation path. Active weak
+registration is capped and fail-closed, prunes only after all racing owners
+drop, and no longer accumulates across sequential traffic. Terminal settlement
+still cleans request-scoped tool and permission state. Removed Debug derivation
+from sensitive transient lifecycle/tool-detail inputs and added tests for more
+than 2,048 sequential exactly-once terminal publications with bounded retention,
+competing owners, distinct-request isolation, atomic claims, active-cap cleanup,
+and terminal bookkeeping cleanup. A1 remains unwired and at independent review;
+no transport, process, route, registry mutation, live producer, or A2+ behavior
+was added.
+_________________________________________________________________________________
+_________________________________________________________________________________
+time:      [23:05] [27-07-26]
+agent:     [pi] [gpt-5.4] [thoth]
+worktree:  [feat/extensions-stage-a1]
+type:      [review]
+area:      [testing]
+
+Accepted Stage A1 after three independent review rounds and corrective deltas.
+The final PASS confirms strict bounded metadata-only SDK v1 framing, recursive
+duplicate rejection, request-scoped tool/permission correlation, validate-before-
+commit state, lifecycle-bounded shared atomic terminal authority, exactly-once
+normal/orphan/panic convergence, and bounded boot retention. The 2,305-request
+proof removes the former cumulative terminal cliff. A1 remains intentionally
+unwired and launches nothing; A2a is the next authorized slice.
+_________________________________________________________________________________

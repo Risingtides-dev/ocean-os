@@ -98,6 +98,9 @@ mod component_interaction;
 mod cors;
 /// Pure adapters between full-fidelity SDK agent events and the legacy core rail.
 mod event_adapter;
+/// Pure, unwired Stage A lifecycle adaptation and boot-local retention.
+#[allow(dead_code)]
+mod extension_lifecycle;
 /// Read-only installed/trusted/enabled extension state inspection and diagnostics.
 mod extension_state;
 /// Home-sandboxed directory listing and capped file-read HTTP policy.
