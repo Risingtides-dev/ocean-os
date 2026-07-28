@@ -28,7 +28,12 @@ tracing.workspace = true
 # trunk/dispatch provisioning. Verified against livekit-api 0.5.0 source. The
 # `room_tap` audio subscribe uses the `livekit` client crate (0.7.44) — added
 # when that adapter lands so the pure logic stays buildable without native deps.
-livekit-api = { version = "0.5", default-features = false, features = ["services-tokio", "access-token", "webhooks", "native-tls"] }
+# TLS backend must stay rustls to match the workspace `reqwest` declaration
+# (default-features = false, features = ["rustls-tls"]). Selecting livekit-api's
+# `native-tls` here re-enables `reqwest/native-tls` through feature unification,
+# pulling hyper-tls -> native-tls -> openssl-sys into the workspace and breaking
+# musl/static cross-builds that do not provide system OpenSSL.
+livekit-api = { version = "0.5", default-features = false, features = ["services-tokio", "access-token", "webhooks", "rustls-tls-native-roots"] }
 livekit-protocol = "0.5"
 
 # Heavy native libwebrtc client, only for the live room_tap. Opt-in via the

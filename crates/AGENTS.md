@@ -27,6 +27,7 @@ This child doc governs `crates/` and is the canonical ownership, entry-point, an
 - Feature credentials remain isolated from agent routing: xAI speech uses `xai`,
   OpenAI Realtime voice uses `openai-realtime`, and future embedding providers
   require dedicated blocks plus a live typed consumer before picker exposure.
+- The `ocean-call` server SDK path is rustls-only. Keep `livekit-api` on `rustls-tls-native-roots`; do not re-enable `reqwest/native-tls`, `hyper-tls`, or `openssl-sys` through feature unification.
 - The Chromium browser backend is quarantined behind the default-off
   `legacy-chromium` feature chain (`ocean-browser` → `ocean-runtime` →
   `ocean-agent` → `ocean-daemon`) while it is replaced by the OceanWebKit

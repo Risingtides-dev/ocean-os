@@ -5520,3 +5520,14 @@ area:  [backend]: Daemon composition boundary
 
 Reconciled the authorized exact 13-definition claim/revoke/recall/breach/board adapter extraction onto current main as private `longhouse_governance_control.rs`. Mechanical comparison against the original and rebased rollback points is exact apart from authorized parent visibility. All 592 daemon tests, seven focused governance tests, denied-warning daemon Clippy, formatting/docs/diff checks, and fresh independent correctness/security review pass. Real convene, route/state authority, title grant/bind, provider execution, and raw-token delivery remain in composition.
 _________________________________________________________________________________
+
+_________________________________________________________________________________
+
+time:  [00:17] [28-07-26]
+agent: [pi] [gpt-5.4] [Thoth]
+worktree: [detached origin/main integration at /private/tmp/ocean-consolidate]
+type:  [bug report]: Keep LiveKit server SDK on rustls
+area:  [backend]: Call dependency transport
+
+Recovered the focused LiveKit feature correction from the divergent Mini main. `livekit-api` now uses rustls native roots, removing `native-tls`, `hyper-tls`, and `openssl-sys` from the supported workspace graph. All 160 ocean-call tests, workspace test compilation, compatibility feature Clippy lanes, release all-target compilation, docs-check, and dependency-tree assertions pass.
+_________________________________________________________________________________
