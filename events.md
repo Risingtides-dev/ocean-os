@@ -5571,6 +5571,13 @@ type:  [workflow]: Recover dated harness-footprint social assets
 area:  [design]: Public evidence and measurement graphics
 
 Recovered the 2026-07-18 local harness-footprint measurement as two editable SVG/PNG social graphics with AI-generated text-free backplates. Review prep verified all arithmetic, dimensions, visible text, and absence of personal/local identifiers. The daemon-accounting graphic now names its OpenCode 1.17.15 baseline instead of making an unsupported standalone comparison, and the README binds the assets to the public-evidence policy and reproducible Chrome SVG rendering.
+time:      [00:40] [28-07-26]
+agent:     [pi], [gpt-5.4], [worker]
+worktree:  [feat/extensions-stage-a2a]
+type:      [bug report]: Repair Stage A2a exact-generation supervision blockers
+area:      [backend]: Extension native-service security boundary
+
+Corrected the independent A2a review blockers without widening into A2b: macOS now launches the retained executable by stable volfs device/file identity instead of reopening the registry pathname; macOS/Linux assigned data, cache, and temp paths name retained descriptor/file-id generations; temp cleanup is descriptor-relative and refuses replacement generations; terminal status preserves protocol/startup causes; and unsupported platforms project coherent exact grants as non-probing `unsupported_platform` rows without opening package artifacts, secrets, roots, or processes. Added adversarial executable and assigned-root replacement tests, descriptor-relative cleanup refusal, blocked-write deadline, startup-timeout cleanup/cause retention, spawned-secret target/source/redaction coverage, exact 1,024-row boundary, unsupported projection, and a real reaped-leader/live-group ownership fixture. The A0 missing-companion exception remains unchanged because only A3a may add its durable first-publication marker. Focused A2a tests (71), the serial full daemon suite (614), SDK tests (63), workspace test-target check, denied-warning daemon Clippy, formatting, docs, and diff checks pass. The unrelated upstream `ocean-tui/src/chat.rs` `field_reassign_with_default` full-CI warning remains outside this slice and was not edited.
 _________________________________________________________________________________
 _________________________________________________________________________________
 time:      [01:52] [28-07-26]

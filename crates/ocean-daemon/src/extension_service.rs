@@ -8,11 +8,14 @@
 
 use std::{
     collections::{BTreeMap, HashSet},
-    ffi::{OsStr, OsString},
+    ffi::{CStr, CString, OsStr, OsString},
     fs::{self, File},
     io,
     os::fd::AsRawFd,
-    os::unix::ffi::{OsStrExt, OsStringExt},
+    os::unix::{
+        ffi::{OsStrExt, OsStringExt},
+        fs::MetadataExt,
+    },
     path::{Path, PathBuf},
     process::Stdio,
     sync::{Arc, RwLock},
@@ -365,13 +368,13 @@ struct AssignedRoots {
     data: PathBuf,
     cache: PathBuf,
     temp: PathBuf,
-    // Keeping descriptors live closes rename/replacement races through spawn.
     _data_handle: File,
     _cache_handle: File,
-    _temp_handle: File,
+    temp_handle: File,
+    service_temp_handle: File,
+    connection_name: CString,
 }
 
-#[cfg(unix)]
 fn assigned_roots(
     config_dir: &Path,
     package_id: &str,
@@ -386,46 +389,52 @@ fn assigned_roots(
     let data_handle = open_or_create_private_dir_at(&package, "data")?;
     let cache_handle = open_or_create_private_dir_at(&package, "cache")?;
     let tmp = open_or_create_private_dir_at(&package, "tmp")?;
-    let service_tmp = open_or_create_private_dir_at(&tmp, service_id)?;
-    let connection = connection_id.to_string();
-    let temp_handle = open_or_create_private_dir_at(&service_tmp, &connection)?;
+    let service_temp_handle = open_or_create_private_dir_at(&tmp, service_id)?;
+    let connection_name = CString::new(connection_id.to_string())
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "invalid connection id"))?;
+    let temp_handle = open_or_create_private_dir_at_cstr(&service_temp_handle, &connection_name)?;
 
     let state_path = canonical_config.join("extensions/state");
-    let data = state_path.join(package_id).join("data");
-    let cache = state_path.join(package_id).join("cache");
-    let temp = state_path
+    let data_path = state_path.join(package_id).join("data");
+    let cache_path = state_path.join(package_id).join("cache");
+    let temp_path = state_path
         .join(package_id)
         .join("tmp")
         .join(service_id)
-        .join(connection);
-    for path in [&data, &cache, &temp] {
+        .join(connection_name.to_string_lossy().as_ref());
+    for (path, handle) in [
+        (&data_path, &data_handle),
+        (&cache_path, &cache_handle),
+        (&temp_path, &temp_handle),
+    ] {
         let canonical = fs::canonicalize(path)?;
-        if !canonical.starts_with(&state_path) || canonical != *path {
+        if !canonical.starts_with(&state_path)
+            || canonical != *path
+            || !same_open_generation(handle, path)?
+        {
             return Err(io::Error::new(
                 io::ErrorKind::PermissionDenied,
                 "unsafe assigned root",
             ));
         }
     }
+
+    // Linux names inherited descriptors; macOS names the retained device/file
+    // identities through volfs. Neither child path reopens the mutable registry
+    // pathname after this validation, so replacement cannot redirect a root.
     Ok(AssignedRoots {
-        data,
-        cache,
-        temp,
+        data: assigned_directory_path(&data_handle)?,
+        cache: assigned_directory_path(&cache_handle)?,
+        temp: assigned_directory_path(&temp_handle)?,
         _data_handle: data_handle,
         _cache_handle: cache_handle,
-        _temp_handle: temp_handle,
+        temp_handle,
+        service_temp_handle,
+        connection_name,
     })
 }
 
-#[cfg(unix)]
-fn open_existing_dir_at(parent: &File, name: &str) -> io::Result<File> {
-    open_dir_at(parent, name).and_then(validate_private_or_registry_dir)
-}
-
-#[cfg(unix)]
-fn open_or_create_private_dir_at(parent: &File, name: &str) -> io::Result<File> {
-    let name = std::ffi::CString::new(name)
-        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "invalid directory name"))?;
+fn open_or_create_private_dir_at_cstr(parent: &File, name: &CStr) -> io::Result<File> {
     // SAFETY: parent is a live directory descriptor and name is NUL-terminated.
     let result = unsafe { libc::mkdirat(parent.as_raw_fd(), name.as_ptr(), 0o700) };
     if result != 0 {
@@ -434,8 +443,39 @@ fn open_or_create_private_dir_at(parent: &File, name: &str) -> io::Result<File> 
             return Err(error);
         }
     }
-    let directory = open_dir_at_cstr(parent, &name)?;
+    let directory = open_dir_at_cstr(parent, name)?;
     validate_private_dir(directory)
+}
+
+fn assigned_directory_path(directory: &File) -> io::Result<PathBuf> {
+    #[cfg(target_os = "linux")]
+    {
+        Ok(PathBuf::from(format!(
+            "/proc/self/fd/{}",
+            directory.as_raw_fd()
+        )))
+    }
+    #[cfg(target_os = "macos")]
+    {
+        macos_file_id_path(directory)
+    }
+}
+
+fn same_open_generation(handle: &File, path: &Path) -> io::Result<bool> {
+    let opened = handle.metadata()?;
+    let named = fs::metadata(path)?;
+    Ok(opened.dev() == named.dev() && opened.ino() == named.ino())
+}
+
+#[cfg(unix)]
+fn open_existing_dir_at(parent: &File, name: &str) -> io::Result<File> {
+    open_dir_at(parent, name).and_then(validate_private_or_registry_dir)
+}
+
+fn open_or_create_private_dir_at(parent: &File, name: &str) -> io::Result<File> {
+    let name = CString::new(name)
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "invalid directory name"))?;
+    open_or_create_private_dir_at_cstr(parent, &name)
 }
 
 #[cfg(unix)]
@@ -476,7 +516,7 @@ fn validate_private_or_registry_dir(directory: File) -> io::Result<File> {
 
 #[cfg(unix)]
 fn validate_private_dir(directory: File) -> io::Result<File> {
-    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+    use std::os::unix::fs::PermissionsExt;
 
     let metadata = directory.metadata()?;
     if !metadata.is_dir()
@@ -489,6 +529,142 @@ fn validate_private_dir(directory: File) -> io::Result<File> {
         ));
     }
     Ok(directory)
+}
+
+struct DirectoryStream(*mut libc::DIR);
+
+impl Drop for DirectoryStream {
+    fn drop(&mut self) {
+        // SAFETY: this guard exclusively owns the stream returned by fdopendir.
+        unsafe { libc::closedir(self.0) };
+    }
+}
+
+fn remove_directory_contents(directory: &File) -> io::Result<()> {
+    let duplicate = unsafe { libc::fcntl(directory.as_raw_fd(), libc::F_DUPFD_CLOEXEC, 0) };
+    if duplicate < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: duplicate is a fresh readable directory descriptor. fdopendir
+    // takes ownership on success.
+    let raw = unsafe { libc::fdopendir(duplicate) };
+    if raw.is_null() {
+        // SAFETY: fdopendir did not take ownership on failure.
+        unsafe { libc::close(duplicate) };
+        return Err(io::Error::last_os_error());
+    }
+    let stream = DirectoryStream(raw);
+    loop {
+        // SAFETY: stream owns a valid DIR pointer for this loop.
+        let entry = unsafe { libc::readdir(stream.0) };
+        if entry.is_null() {
+            break;
+        }
+        // SAFETY: d_name is NUL-terminated for this readdir row and is copied
+        // before the next call can reuse the storage.
+        let name = unsafe { CStr::from_ptr((*entry).d_name.as_ptr()) }.to_owned();
+        if matches!(name.to_bytes(), b"." | b"..") {
+            continue;
+        }
+        let mut metadata = std::mem::MaybeUninit::<libc::stat>::zeroed();
+        // SAFETY: directory and name are live; metadata is writable.
+        if unsafe {
+            libc::fstatat(
+                directory.as_raw_fd(),
+                name.as_ptr(),
+                metadata.as_mut_ptr(),
+                libc::AT_SYMLINK_NOFOLLOW,
+            )
+        } != 0
+        {
+            let error = io::Error::last_os_error();
+            if error.raw_os_error() == Some(libc::ENOENT) {
+                continue;
+            }
+            return Err(error);
+        }
+        // SAFETY: fstatat initialized metadata on success.
+        let metadata = unsafe { metadata.assume_init() };
+        if metadata.st_mode & libc::S_IFMT == libc::S_IFDIR {
+            let child = open_dir_at_cstr(directory, &name)?;
+            remove_directory_contents(&child)?;
+            let opened = child.metadata()?;
+            let mut named = std::mem::MaybeUninit::<libc::stat>::zeroed();
+            // SAFETY: same validated descriptor-relative lookup as above.
+            if unsafe {
+                libc::fstatat(
+                    directory.as_raw_fd(),
+                    name.as_ptr(),
+                    named.as_mut_ptr(),
+                    libc::AT_SYMLINK_NOFOLLOW,
+                )
+            } != 0
+            {
+                return Err(io::Error::last_os_error());
+            }
+            // SAFETY: fstatat initialized named on success.
+            let named = unsafe { named.assume_init() };
+            if opened.dev() != named.st_dev as u64 || opened.ino() != named.st_ino {
+                return Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    "temp generation changed during cleanup",
+                ));
+            }
+            // SAFETY: the verified name is relative to the retained parent.
+            if unsafe { libc::unlinkat(directory.as_raw_fd(), name.as_ptr(), libc::AT_REMOVEDIR) }
+                != 0
+            {
+                return Err(io::Error::last_os_error());
+            }
+        } else {
+            // SAFETY: unlinkat removes only this non-directory row beneath the
+            // retained temp descriptor and never follows a symlink.
+            if unsafe { libc::unlinkat(directory.as_raw_fd(), name.as_ptr(), 0) } != 0 {
+                let error = io::Error::last_os_error();
+                if error.raw_os_error() != Some(libc::ENOENT) {
+                    return Err(error);
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+fn cleanup_temp_root(roots: &AssignedRoots) -> bool {
+    if remove_directory_contents(&roots.temp_handle).is_err() {
+        return false;
+    }
+    let opened = match roots.temp_handle.metadata() {
+        Ok(metadata) => metadata,
+        Err(_) => return false,
+    };
+    let mut named = std::mem::MaybeUninit::<libc::stat>::zeroed();
+    // SAFETY: the parent descriptor and connection name remain live.
+    if unsafe {
+        libc::fstatat(
+            roots.service_temp_handle.as_raw_fd(),
+            roots.connection_name.as_ptr(),
+            named.as_mut_ptr(),
+            libc::AT_SYMLINK_NOFOLLOW,
+        )
+    } != 0
+    {
+        return false;
+    }
+    // SAFETY: fstatat initialized named on success.
+    let named = unsafe { named.assume_init() };
+    if opened.dev() != named.st_dev as u64 || opened.ino() != named.st_ino {
+        return false;
+    }
+    // SAFETY: the verified empty connection root is removed relative to its
+    // retained parent descriptor.
+    unsafe {
+        libc::unlinkat(
+            roots.service_temp_handle.as_raw_fd(),
+            roots.connection_name.as_ptr(),
+            libc::AT_REMOVEDIR,
+        ) == 0
+    }
 }
 
 async fn run_service(
@@ -554,7 +730,7 @@ async fn run_service(
                 None,
                 Some(reason),
             );
-            let _ = fs::remove_dir_all(&roots.temp);
+            let _ = cleanup_temp_root(&roots);
             return;
         }
     };
@@ -569,7 +745,7 @@ async fn run_service(
                 None,
                 Some(RuntimeReason::SpawnFailed),
             );
-            let _ = fs::remove_dir_all(&roots.temp);
+            let _ = cleanup_temp_root(&roots);
             return;
         }
     };
@@ -582,13 +758,14 @@ async fn run_service(
             None,
             Some(RuntimeReason::SpawnFailed),
         );
+        let _ = cleanup_temp_root(&roots);
         return;
     };
     let mut owner = ProcessGroupOwner::new(pid);
     let (Some(stdin), Some(stdout)) = (child.stdin.take(), child.stdout.take()) else {
         let cleaned = terminate_process_group(&mut child, &mut owner).await;
         if cleaned {
-            let _ = fs::remove_dir_all(&roots.temp);
+            let _ = cleanup_temp_root(&roots);
         }
         status.update(
             &activation,
@@ -632,8 +809,9 @@ async fn run_service(
             &mut owner,
             stdin,
             stdout,
-            &roots.temp,
+            &roots,
             ShutdownReason::DaemonStopping,
+            RuntimeReason::Shutdown,
         )
         .await;
         return;
@@ -655,8 +833,9 @@ async fn run_service(
                 &mut owner,
                 stdin,
                 stdout,
-                &roots.temp,
+                &roots,
                 ShutdownReason::Unhealthy,
+                RuntimeReason::ProtocolViolation,
             )
             .await;
             return;
@@ -676,8 +855,9 @@ async fn run_service(
                 &mut owner,
                 stdin,
                 stdout,
-                &roots.temp,
+                &roots,
                 ShutdownReason::Unhealthy,
+                RuntimeReason::StartupTimeout,
             )
             .await;
             return;
@@ -693,12 +873,14 @@ async fn run_service(
 
     let mut leader_poll = tokio::time::interval(LEADER_POLL_INTERVAL);
     leader_poll.tick().await;
-    let reason = loop {
+    let (shutdown_reason, runtime_reason) = loop {
         tokio::select! {
-            _ = cancel.cancelled() => break ShutdownReason::DaemonStopping,
+            _ = cancel.cancelled() => {
+                break (ShutdownReason::DaemonStopping, RuntimeReason::Shutdown);
+            }
             _ = leader_poll.tick() => {
                 if owner.leader_exited() {
-                    break ShutdownReason::Unhealthy;
+                    break (ShutdownReason::Unhealthy, RuntimeReason::UnexpectedExit);
                 }
             }
             frame = read_frame::<ChildFrame, _>(&mut stdout) => {
@@ -720,14 +902,17 @@ async fn run_service(
                     }
                     Ok(ChildFrame::Ack(ack)) => {
                         let _invalid_sequence = ack.sequence;
-                        break ShutdownReason::Unhealthy;
+                        break (ShutdownReason::Unhealthy, RuntimeReason::ProtocolViolation);
                     }
                     Ok(ChildFrame::Pong(pong)) => {
                         let _unexpected_nonce = pong.nonce;
-                        break ShutdownReason::Unhealthy;
+                        break (ShutdownReason::Unhealthy, RuntimeReason::ProtocolViolation);
                     }
-                    Ok(ChildFrame::ShutdownComplete(_)) | Err(_) => {
-                        break ShutdownReason::Unhealthy;
+                    Ok(ChildFrame::ShutdownComplete(_)) => {
+                        break (ShutdownReason::Unhealthy, RuntimeReason::ProtocolViolation);
+                    }
+                    Err(_) => {
+                        break (ShutdownReason::Unhealthy, RuntimeReason::UnexpectedExit);
                     }
                 }
             }
@@ -740,8 +925,9 @@ async fn run_service(
         &mut owner,
         stdin,
         stdout,
-        &roots.temp,
-        reason,
+        &roots,
+        shutdown_reason,
+        runtime_reason,
     )
     .await;
 }
@@ -751,15 +937,20 @@ fn spawn_service(
     roots: &AssignedRoots,
     environment: &[(String, SensitiveValue)],
 ) -> io::Result<Child> {
+    #[cfg(target_os = "linux")]
     let executable_fd = activation.executable.as_raw_fd();
     let package_fd = activation.package_directory.as_raw_fd();
     #[cfg(target_os = "linux")]
-    let mut command = Command::new(format!("/proc/self/fd/{executable_fd}"));
+    let data_fd = roots._data_handle.as_raw_fd();
+    #[cfg(target_os = "linux")]
+    let cache_fd = roots._cache_handle.as_raw_fd();
+    #[cfg(target_os = "linux")]
+    let temp_fd = roots.temp_handle.as_raw_fd();
+    #[cfg(target_os = "linux")]
+    let executable = PathBuf::from(format!("/proc/self/fd/{executable_fd}"));
     #[cfg(target_os = "macos")]
-    let mut command = Command::new(&activation.executable_path);
-    #[cfg(target_os = "macos")]
-    let executable_path = std::ffi::CString::new(activation.executable_path.as_os_str().as_bytes())
-        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "invalid executable path"))?;
+    let executable = macos_file_id_path(&activation.executable)?;
+    let mut command = Command::new(executable);
     command
         .args(&activation.args)
         .env_clear()
@@ -777,31 +968,15 @@ fn spawn_service(
     for (name, value) in environment {
         command.env(name, value.as_os_str());
     }
-    // SAFETY: the descriptors stay owned by activation through spawn. The child
-    // changes only its copied descriptor flags/cwd/process group before exec.
+    // SAFETY: every descriptor stays owned in the parent through spawn. Linux
+    // clears CLOEXEC only for descriptors named in the environment or executable
+    // path; macOS volfs paths need no inherited descriptor. Both platforms then
+    // change cwd and process group. The package cwd descriptor stays CLOEXEC.
     unsafe {
         command.pre_exec(move || {
             #[cfg(target_os = "linux")]
-            if libc::fcntl(executable_fd, libc::F_SETFD, 0) < 0 {
-                return Err(io::Error::last_os_error());
-            }
-            #[cfg(target_os = "macos")]
-            {
-                let mut opened = std::mem::MaybeUninit::<libc::stat>::zeroed();
-                let mut named = std::mem::MaybeUninit::<libc::stat>::zeroed();
-                if libc::fstat(executable_fd, opened.as_mut_ptr()) != 0
-                    || libc::stat(executable_path.as_ptr(), named.as_mut_ptr()) != 0
-                {
-                    return Err(io::Error::last_os_error());
-                }
-                let opened = opened.assume_init();
-                let named = named.assume_init();
-                if opened.st_dev != named.st_dev || opened.st_ino != named.st_ino {
-                    return Err(io::Error::new(
-                        io::ErrorKind::PermissionDenied,
-                        "executable generation changed",
-                    ));
-                }
+            for descriptor in [data_fd, cache_fd, temp_fd, executable_fd] {
+                inherit_descriptor(descriptor)?;
             }
             if libc::fchdir(package_fd) != 0 {
                 return Err(io::Error::last_os_error());
@@ -813,6 +988,39 @@ fn spawn_service(
         });
     }
     command.spawn()
+}
+
+#[cfg(target_os = "macos")]
+fn macos_file_id_path(file: &File) -> io::Result<PathBuf> {
+    let metadata = file.metadata()?;
+    // macOS volfs resolves this stable (device,file-id) tuple directly. The
+    // retained descriptor prevents file-id reuse; replacement of the verified
+    // store pathname cannot redirect this lookup, and unlink makes it fail
+    // closed rather than selecting another generation.
+    let path = PathBuf::from(format!("/.vol/{}/{}", metadata.dev(), metadata.ino()));
+    let resolved = File::open(&path)?;
+    let resolved_metadata = resolved.metadata()?;
+    if metadata.dev() != resolved_metadata.dev() || metadata.ino() != resolved_metadata.ino() {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "file-id execution primitive changed generation",
+        ));
+    }
+    Ok(path)
+}
+
+#[cfg(target_os = "linux")]
+unsafe fn inherit_descriptor(descriptor: libc::c_int) -> io::Result<()> {
+    // SAFETY: called after fork in pre_exec with a live inherited descriptor.
+    let flags = unsafe { libc::fcntl(descriptor, libc::F_GETFD) };
+    if flags < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: only the descriptor-local CLOEXEC bit is cleared.
+    if unsafe { libc::fcntl(descriptor, libc::F_SETFD, flags & !libc::FD_CLOEXEC) } < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
 }
 
 #[derive(Deserialize)]
@@ -918,7 +1126,7 @@ async fn read_frame<T: for<'de> Deserialize<'de>, R: AsyncBufRead + Unpin>(
     }
 }
 
-#[allow(clippy::too_many_arguments)] // Explicitly owns child, PGID token, both pipes, temp root, and reason.
+#[allow(clippy::too_many_arguments)] // Explicitly owns child, PGID token, pipes, roots, and both fixed reasons.
 async fn finish_process(
     activation: &ServiceActivation,
     status: &RuntimeStatusCache,
@@ -926,11 +1134,18 @@ async fn finish_process(
     owner: &mut ProcessGroupOwner,
     mut stdin: ChildStdin,
     mut stdout: BufReader<ChildStdout>,
-    temp: &Path,
+    roots: &AssignedRoots,
     reason: ShutdownReason,
+    runtime_reason: RuntimeReason,
 ) {
     let pid = child.id();
-    status.update(activation, RuntimeState::Stopping, pid, None, None);
+    status.update(
+        activation,
+        RuntimeState::Stopping,
+        pid,
+        None,
+        Some(runtime_reason),
+    );
     let shutdown = Shutdown {
         protocol: ProtocolName,
         version: ProtocolV1,
@@ -957,25 +1172,24 @@ async fn finish_process(
     let _ = tokio::time::timeout(GRACEFUL_RESPONSE_TIMEOUT, response).await;
     drop(stdin);
 
-    let cleaned = terminate_process_group(child, owner).await;
-    let terminal_reason = if cleaned {
-        let _ = fs::remove_dir_all(temp);
-        if reason == ShutdownReason::DaemonStopping {
-            RuntimeReason::Shutdown
-        } else {
-            RuntimeReason::UnexpectedExit
-        }
-    } else {
+    let group_cleaned = terminate_process_group(child, owner).await;
+    let roots_cleaned = group_cleaned && cleanup_temp_root(roots);
+    let fully_cleaned = group_cleaned && roots_cleaned;
+    let terminal_reason = if !fully_cleaned && runtime_reason == RuntimeReason::Shutdown {
         RuntimeReason::CleanupFailed
+    } else {
+        // Cleanup must not destroy the operator-visible cause of a handshake,
+        // startup, or protocol failure.
+        runtime_reason
     };
     status.update(
         activation,
-        if reason == ShutdownReason::DaemonStopping && cleaned {
+        if reason == ShutdownReason::DaemonStopping && fully_cleaned {
             RuntimeState::Inactive
         } else {
             RuntimeState::Unhealthy
         },
-        if cleaned { None } else { pid },
+        if group_cleaned { None } else { pid },
         None,
         Some(terminal_reason),
     );
@@ -1206,7 +1420,6 @@ mod tests {
                 package_path: package,
                 package_directory,
                 executable,
-                executable_path: entry,
                 args: Vec::new(),
                 events: vec![LifecycleEventKind::DaemonStarted],
                 environment: Vec::new(),
@@ -1214,6 +1427,19 @@ mod tests {
                 startup_timeout: Duration::from_secs(2),
             },
         )
+    }
+
+    fn install_fixture_store(temp: &tempfile::TempDir, activation: &mut ServiceActivation) {
+        let config = temp.path().join("config");
+        fs::create_dir(&config).unwrap();
+        activation.config_dir = config.clone();
+        fs::create_dir(config.join("extensions")).unwrap();
+        let store = config
+            .join("extensions/store/example.noop")
+            .join("a".repeat(64));
+        fs::create_dir_all(store.parent().unwrap()).unwrap();
+        fs::rename(&activation.package_path, &store).unwrap();
+        activation.package_path = store;
     }
 
     #[test]
@@ -1354,7 +1580,6 @@ printf '%s\n' '{"protocol":"ocean.extension.service","version":1,"frame":"shutdo
             .join("a".repeat(64));
         fs::create_dir_all(store.parent().unwrap()).unwrap();
         fs::rename(&package_path, &store).unwrap();
-        activation.executable_path = store.join("service");
         activation.package_path = store;
         let cancel = CancellationToken::new();
         let status = RuntimeStatusCache::default();
@@ -1413,6 +1638,255 @@ printf '%s\n' '{"protocol":"ocean.extension.service","version":1,"frame":"shutdo
     }
 
     #[tokio::test]
+    async fn verified_executable_generation_survives_concurrent_path_replacement() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let (temp, activation) =
+            executable_fixture("#!/bin/sh\nprintf '%s\\n' trusted >> \"$OUTPUT\"\n");
+        let config = temp.path().join("config");
+        fs::create_dir_all(config.join("extensions")).unwrap();
+        let roots = assigned_roots(
+            &config,
+            &activation.package_id,
+            &activation.service_id,
+            Uuid::new_v4(),
+        )
+        .unwrap();
+        let output = temp.path().join("executed");
+        let environment = vec![(
+            "OUTPUT".to_owned(),
+            SensitiveValue(output.as_os_str().as_bytes().to_vec()),
+        )];
+        let entry = activation.package_path.join("service");
+        let retained = activation.package_path.join("verified-generation");
+        fs::hard_link(&entry, &retained).unwrap();
+        let stop = Arc::new(AtomicBool::new(false));
+        let replacer_stop = Arc::clone(&stop);
+        let replacer = std::thread::spawn(move || {
+            let mut generation = 0_u64;
+            while !replacer_stop.load(Ordering::Acquire) {
+                let candidate = entry.with_extension(format!("candidate-{generation}"));
+                fs::write(
+                    &candidate,
+                    "#!/bin/sh\nprintf '%s\\n' malicious >> \"$OUTPUT\"\n",
+                )
+                .unwrap();
+                fs::set_permissions(&candidate, fs::Permissions::from_mode(0o700)).unwrap();
+                fs::rename(&candidate, &entry).unwrap();
+                generation = generation.wrapping_add(1);
+            }
+        });
+
+        for _ in 0..32 {
+            let mut child = spawn_service(&activation, &roots, &environment).unwrap();
+            assert!(child.wait().await.unwrap().success());
+        }
+        stop.store(true, Ordering::Release);
+        replacer.join().unwrap();
+        let lines = fs::read_to_string(output).unwrap();
+        assert_eq!(lines.lines().count(), 32);
+        assert!(lines.lines().all(|line| line == "trusted"));
+        assert!(retained.exists());
+    }
+
+    #[tokio::test]
+    async fn assigned_root_descriptors_survive_leaf_and_state_replacement_through_spawn() {
+        let (temp, mut activation) = executable_fixture(
+            r#"#!/bin/sh
+printf data > "$HOME/data-proof"
+printf cache > "$XDG_CACHE_HOME/cache-proof"
+printf temp > "$TMPDIR/temp-proof"
+"#,
+        );
+        install_fixture_store(&temp, &mut activation);
+        let roots = assigned_roots(
+            &activation.config_dir,
+            &activation.package_id,
+            &activation.service_id,
+            Uuid::new_v4(),
+        )
+        .unwrap();
+        let state = activation.config_dir.join("extensions/state");
+        let retained_state = activation.config_dir.join("extensions/state-retained");
+        fs::rename(&state, &retained_state).unwrap();
+        let replacement = state.join("example.noop");
+        fs::create_dir_all(replacement.join("data")).unwrap();
+        fs::create_dir_all(replacement.join("cache")).unwrap();
+        fs::create_dir_all(replacement.join("tmp/lifecycle/replacement")).unwrap();
+
+        let mut child = spawn_service(&activation, &roots, &[]).unwrap();
+        assert!(child.wait().await.unwrap().success());
+        assert_eq!(
+            fs::read_to_string(retained_state.join("example.noop/data/data-proof")).unwrap(),
+            "data"
+        );
+        assert_eq!(
+            fs::read_to_string(retained_state.join("example.noop/cache/cache-proof")).unwrap(),
+            "cache"
+        );
+        let retained_temp = retained_state.join("example.noop/tmp/lifecycle");
+        let proof = fs::read_dir(&retained_temp)
+            .unwrap()
+            .filter_map(Result::ok)
+            .map(|entry| entry.path().join("temp-proof"))
+            .find(|path| path.exists())
+            .unwrap();
+        assert_eq!(fs::read_to_string(proof).unwrap(), "temp");
+        assert!(!replacement.join("data/data-proof").exists());
+        assert!(!replacement.join("cache/cache-proof").exists());
+    }
+
+    #[test]
+    fn temp_cleanup_is_descriptor_relative_and_refuses_a_replacement_generation() {
+        let temp = tempfile::tempdir().unwrap();
+        let config = temp.path().join("config");
+        fs::create_dir_all(config.join("extensions")).unwrap();
+        let connection = Uuid::new_v4();
+        let roots = assigned_roots(&config, "example.noop", "lifecycle", connection).unwrap();
+        let named = config
+            .join("extensions/state/example.noop/tmp/lifecycle")
+            .join(connection.to_string());
+        fs::write(roots.temp.join("owned"), "owned").unwrap();
+        let retained = named.with_extension("retained");
+        fs::rename(&named, &retained).unwrap();
+        fs::create_dir(&named).unwrap();
+        fs::write(named.join("replacement"), "replacement").unwrap();
+
+        assert!(!cleanup_temp_root(&roots));
+        assert!(!retained.join("owned").exists());
+        assert_eq!(
+            fs::read_to_string(named.join("replacement")).unwrap(),
+            "replacement"
+        );
+    }
+
+    #[tokio::test]
+    async fn blocked_stdin_fails_at_the_two_second_connection_deadline() {
+        let (mut writer, _reader) = tokio::io::duplex(1);
+        let frame = serde_json::json!({"payload": "x".repeat(1024)});
+        let started = tokio::time::Instant::now();
+        assert!(write_frame(&mut writer, &frame).await.is_err());
+        let elapsed = started.elapsed();
+        assert!(elapsed >= Duration::from_millis(1_900));
+        assert!(elapsed < Duration::from_secs(3));
+    }
+
+    #[tokio::test]
+    async fn startup_timeout_cleans_process_group_and_preserves_reason() {
+        let (temp, mut activation) =
+            executable_fixture("#!/bin/sh\nprintf '%s' $$ > \"$HOME/leader.pid\"\nsleep 30\n");
+        install_fixture_store(&temp, &mut activation);
+        activation.events.clear();
+        activation.startup_timeout = Duration::from_millis(150);
+        let config = activation.config_dir.clone();
+        let status = RuntimeStatusCache::default();
+        tokio::time::timeout(
+            Duration::from_secs(8),
+            run_service(
+                activation,
+                Uuid::new_v4(),
+                CancellationToken::new(),
+                status.clone(),
+            ),
+        )
+        .await
+        .unwrap();
+        let leader: libc::pid_t =
+            fs::read_to_string(config.join("extensions/state/example.noop/data/leader.pid"))
+                .unwrap()
+                .parse()
+                .unwrap();
+        // SAFETY: signal 0 performs an existence check only.
+        assert_ne!(unsafe { libc::kill(leader, 0) }, 0);
+        let row = &status.snapshot()[0];
+        assert_eq!(row.state, RuntimeState::Unhealthy);
+        assert_eq!(row.reason, Some(RuntimeReason::StartupTimeout));
+        assert!(!config
+            .join("extensions/state/example.noop/tmp/lifecycle")
+            .read_dir()
+            .unwrap()
+            .any(|_| true));
+    }
+
+    #[tokio::test]
+    async fn spawned_secret_target_is_exact_and_sentinel_never_reaches_status_surfaces() {
+        struct EnvGuard(String);
+        impl Drop for EnvGuard {
+            fn drop(&mut self) {
+                // SAFETY: this unique test-only name is not read by another test.
+                unsafe { std::env::remove_var(&self.0) };
+            }
+        }
+
+        let source = format!(
+            "A2A_SECRET_SOURCE_{}",
+            Uuid::new_v4().simple().to_string().to_uppercase()
+        );
+        let sentinel = format!("secret-sentinel-{}", Uuid::new_v4());
+        // SAFETY: the source name is unique to this test and is removed by the guard.
+        unsafe { std::env::set_var(&source, &sentinel) };
+        let _guard = EnvGuard(source.clone());
+        let script = format!(
+            r#"#!/bin/sh
+IFS= read -r hello || exit 10
+printf '%s\n' '{{"protocol":"ocean.extension.service","version":1,"frame":"service_hello","subscriptions":[],"resume":null}}'
+IFS= read -r ready || exit 11
+[ "$SECRET_TARGET" = "{sentinel}" ] || exit 12
+[ -z "${{{source}+present}}" ] || exit 13
+printf ok > "$HOME/secret-proof"
+printf '%s\n' "$SECRET_TARGET" >&2
+IFS= read -r shutdown || exit 14
+printf '%s\n' '{{"protocol":"ocean.extension.service","version":1,"frame":"shutdown_complete"}}'
+"#
+        );
+        let (temp, mut activation) = executable_fixture(&script);
+        install_fixture_store(&temp, &mut activation);
+        activation.events.clear();
+        activation.secret_bindings = vec![SecretBinding {
+            target_env: "SECRET_TARGET".to_owned(),
+            reference: format!("env:{source}"),
+        }];
+        let config = activation.config_dir.clone();
+        let cancel = CancellationToken::new();
+        let status = RuntimeStatusCache::default();
+        let task = tokio::spawn(run_service(
+            activation,
+            Uuid::new_v4(),
+            cancel.clone(),
+            status.clone(),
+        ));
+        tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                if status.snapshot().first().is_some_and(|row| {
+                    matches!(row.state, RuntimeState::Healthy | RuntimeState::Unhealthy)
+                }) {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(
+            status.snapshot()[0].state,
+            RuntimeState::Healthy,
+            "status: {:?}",
+            status.snapshot()
+        );
+        cancel.cancel();
+        task.await.unwrap();
+        assert_eq!(
+            fs::read_to_string(config.join("extensions/state/example.noop/data/secret-proof"))
+                .unwrap(),
+            "ok"
+        );
+        let projected = serde_json::to_string(&status.snapshot()).unwrap();
+        assert!(!projected.contains(&sentinel));
+        assert!(!projected.contains(&source));
+        assert_eq!(status.snapshot()[0].reason, Some(RuntimeReason::Shutdown));
+    }
+
+    #[tokio::test]
     async fn ack_without_a_delivered_event_is_a_protocol_violation() {
         let script = r#"#!/bin/sh
 IFS= read -r hello || exit 10
@@ -1433,7 +1907,6 @@ printf '%s\n' '{"protocol":"ocean.extension.service","version":1,"frame":"shutdo
             .join("a".repeat(64));
         fs::create_dir_all(store.parent().unwrap()).unwrap();
         fs::rename(&activation.package_path, &store).unwrap();
-        activation.executable_path = store.join("service");
         activation.package_path = store;
         let status = RuntimeStatusCache::default();
         tokio::time::timeout(
@@ -1450,7 +1923,7 @@ printf '%s\n' '{"protocol":"ocean.extension.service","version":1,"frame":"shutdo
         assert_eq!(status.snapshot()[0].state, RuntimeState::Unhealthy);
         assert_eq!(
             status.snapshot()[0].reason,
-            Some(RuntimeReason::UnexpectedExit)
+            Some(RuntimeReason::ProtocolViolation)
         );
     }
 
@@ -1475,7 +1948,6 @@ exit 0
             .join("a".repeat(64));
         fs::create_dir_all(store.parent().unwrap()).unwrap();
         fs::rename(&activation.package_path, &store).unwrap();
-        activation.executable_path = store.join("service");
         activation.package_path = store;
         let status = RuntimeStatusCache::default();
         tokio::time::timeout(
@@ -1495,22 +1967,53 @@ exit 0
     }
 
     #[tokio::test]
-    async fn lost_leader_authority_never_signals_a_reused_group() {
-        let mut unrelated = Command::new("/bin/sleep")
-            .arg("30")
+    async fn reaped_real_leader_loses_authority_while_its_real_group_remains_live() {
+        let temp = tempfile::tempdir().unwrap();
+        let descendant_path = temp.path().join("descendant.pid");
+        let mut command = Command::new("/bin/sh");
+        command
+            .arg("-c")
+            .arg(format!(
+                "sleep 30 & printf '%s' $! > '{}'",
+                descendant_path.display()
+            ))
             .stdin(Stdio::null())
             .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()
-            .unwrap();
-        let pid = unrelated.id().unwrap();
+            .stderr(Stdio::null());
+        // SAFETY: the child changes only its process group before exec.
+        unsafe {
+            command.pre_exec(|| {
+                if libc::setpgid(0, 0) != 0 {
+                    return Err(io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+        let mut leader = command.spawn().unwrap();
+        let pid = leader.id().unwrap();
         let mut owner = ProcessGroupOwner::new(pid);
+        tokio::time::timeout(Duration::from_secs(3), async {
+            while !owner.leader_exited() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        leader.wait().await.unwrap();
         owner.reaped = true;
+        let descendant: libc::pid_t = fs::read_to_string(descendant_path)
+            .unwrap()
+            .parse()
+            .unwrap();
         assert_eq!(owner.signal(libc::SIGKILL), Err(SignalError::LostOwnership));
         // SAFETY: signal 0 performs an existence check only.
-        assert_eq!(unsafe { libc::kill(pid as libc::pid_t, 0) }, 0);
-        unrelated.kill().await.unwrap();
-        unrelated.wait().await.unwrap();
+        assert_eq!(unsafe { libc::kill(descendant, 0) }, 0);
+        // This is the strongest deterministic reuse proof available without
+        // forcing the kernel PID allocator to wrap: a real reaped leader and a
+        // still-live process in its numeric PGID cannot be signaled through the
+        // generation owner. Clean the fixture explicitly, outside that API.
+        // SAFETY: the test owns this fixture process group.
+        unsafe { libc::kill(-owner.pgid, libc::SIGKILL) };
     }
 
     #[cfg(unix)]

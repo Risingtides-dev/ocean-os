@@ -104,8 +104,15 @@ mod extension_lifecycle;
 /// Sole coherent read-only install/trust/enable/service-grant registry authority.
 mod extension_registry;
 /// Stage A2a minimum native-service transport and process-group supervisor.
-#[cfg(unix)]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 mod extension_service;
+/// Fail-closed exact-grant status projection where native supervision is unsupported.
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+#[path = "extension_service_unsupported.rs"]
+mod extension_service;
+#[cfg(all(test, any(target_os = "macos", target_os = "linux")))]
+#[path = "extension_service_unsupported.rs"]
+mod extension_service_unsupported_test;
 /// Home-sandboxed directory listing and capped file-read HTTP policy.
 mod filesystem;
 /// Public, read-only GitHub projection for registered project origins.
@@ -922,7 +929,6 @@ async fn main() -> anyhow::Result<()> {
 
     // A2a startup reconciliation is fail-soft and asynchronous. It consumes the
     // sole coherent registry reader and owns no lifecycle producer wiring.
-    #[cfg(unix)]
     let extension_supervisor = {
         let registered_extension_projects = runtime
             .list_projects()
@@ -1213,7 +1219,6 @@ async fn main() -> anyhow::Result<()> {
 
     // Native extension groups are drained before other daemon task trees and
     // before the Tokio runtime can drop their direct-child handles.
-    #[cfg(unix)]
     extension_supervisor.shutdown().await;
 
     // All room task trees share the daemon shutdown token, but retain and join

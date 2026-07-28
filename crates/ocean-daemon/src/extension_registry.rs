@@ -200,12 +200,21 @@ pub(crate) struct ServiceActivation {
     pub(crate) package_path: PathBuf,
     pub(crate) package_directory: File,
     pub(crate) executable: File,
-    pub(crate) executable_path: PathBuf,
     pub(crate) args: Vec<String>,
     pub(crate) events: Vec<LifecycleEventKind>,
     pub(crate) environment: Vec<String>,
     pub(crate) secret_bindings: Vec<SecretBinding>,
     pub(crate) startup_timeout: Duration,
+}
+
+#[cfg(any(test, not(any(target_os = "macos", target_os = "linux"))))]
+#[derive(Debug, Clone)]
+pub(crate) struct UnsupportedServiceActivation {
+    pub(crate) package_id: String,
+    pub(crate) package_version: String,
+    pub(crate) package_digest: String,
+    pub(crate) service_id: String,
+    pub(crate) activation_revision: u64,
 }
 
 struct LockedState {
@@ -467,7 +476,11 @@ fn read_locked_state(config_dir: &FsPath) -> Result<LockedState, StateError> {
         installs: installs.installs,
         grants: trust.grants,
         enablement: enabled.extensions,
-        // The sole A0 upgrade exception is absence => empty. No file is written.
+        // The sole A0 upgrade exception is absence => empty. A2a owns no
+        // mutation or durable "first Stage A publication" marker, so it cannot
+        // distinguish a later deleted companion without preempting A3a. A3a
+        // must add that marker atomically and make this branch fail closed when
+        // the marker is present. No file is written here.
         service_grants: service_grants
             .map(|grants| grants.service_grants)
             .unwrap_or_default(),
@@ -1498,6 +1511,129 @@ fn grants_are_subset(granted: &CapabilitySet, requested: &CapabilitySet) -> bool
         && subset(&granted.secrets, &requested.secrets)
 }
 
+#[cfg(any(test, not(any(target_os = "macos", target_os = "linux"))))]
+fn derive_unsupported_service_activations(
+    snapshot: &StateSnapshot,
+    registered_projects: &HashSet<Uuid>,
+) -> Vec<UnsupportedServiceActivation> {
+    snapshot
+        .service_grants
+        .iter()
+        .filter_map(|service_grant| {
+            let install = snapshot.installs.iter().find(|install| {
+                install.id == service_grant.id && install.digest == service_grant.digest
+            })?;
+            snapshot.grants.iter().find(|grant| {
+                grant.id == service_grant.id && grant.digest == service_grant.digest
+            })?;
+            let enablement = snapshot
+                .enablement
+                .iter()
+                .find(|entry| entry.id == service_grant.id)?;
+            if !enablement.global
+                && !enablement.projects.iter().any(|project| {
+                    project.enabled && registered_projects.contains(&project.project_id)
+                })
+            {
+                return None;
+            }
+            Some(UnsupportedServiceActivation {
+                package_id: install.id.clone(),
+                package_version: install.version.clone(),
+                package_digest: install.digest.clone(),
+                service_id: service_grant.service_id.clone(),
+                activation_revision: snapshot.revision,
+            })
+        })
+        .collect()
+}
+
+#[cfg(any(test, not(any(target_os = "macos", target_os = "linux"))))]
+pub(crate) fn read_unsupported_service_activations(
+    config_dir: &FsPath,
+    registered_projects: &HashSet<Uuid>,
+) -> Result<Vec<UnsupportedServiceActivation>, StateError> {
+    fn direct_json<T: for<'de> Deserialize<'de>>(
+        root: &FsPath,
+        name: &'static str,
+    ) -> Result<T, StateError> {
+        let path = root.join(name);
+        let metadata = fs::symlink_metadata(&path).map_err(|error| {
+            if error.kind() == std::io::ErrorKind::NotFound {
+                StateError::MissingComponent(name)
+            } else {
+                StateError::Read(name)
+            }
+        })?;
+        if !metadata.is_file() || metadata.file_type().is_symlink() {
+            return Err(StateError::InvalidComponent(name));
+        }
+        let mut file = File::open(path).map_err(|_| StateError::Read(name))?;
+        let bytes = read_capped(&mut file, STATE_FILE_LIMIT, name)?;
+        serde_json::from_slice(&bytes).map_err(|_| StateError::Parse(name))
+    }
+
+    let root = match fs::canonicalize(config_dir.join("extensions")) {
+        Ok(root) => root,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(_) => return Err(StateError::Read("extensions/")),
+    };
+    let lock_path = root.join(".state.lock");
+    let lock_metadata =
+        fs::symlink_metadata(&lock_path).map_err(|_| StateError::Read(".state.lock"))?;
+    if !lock_metadata.is_file() || lock_metadata.file_type().is_symlink() {
+        return Err(StateError::InvalidComponent(".state.lock"));
+    }
+    let lock = File::open(lock_path).map_err(|_| StateError::Read(".state.lock"))?;
+    acquire_shared_lock(&lock)?;
+    let installs: InstallsFile = direct_json(&root, "installs.json")?;
+    let trust: TrustFile = direct_json(&root, "trust.json")?;
+    let enabled: EnabledFile = direct_json(&root, "enabled.json")?;
+    let service_grants = match direct_json::<ServiceGrantsFile>(&root, "service-grants.json") {
+        Ok(grants) => Some(grants),
+        Err(StateError::MissingComponent("service-grants.json")) => None,
+        Err(error) => return Err(error),
+    };
+    for (file, schema) in [
+        ("installs.json", installs.schema_version),
+        ("trust.json", trust.schema_version),
+        ("enabled.json", enabled.schema_version),
+    ] {
+        if schema != STATE_SCHEMA_VERSION {
+            return Err(StateError::UnsupportedSchema(file));
+        }
+    }
+    if service_grants
+        .as_ref()
+        .is_some_and(|grants| grants.schema_version != STATE_SCHEMA_VERSION)
+    {
+        return Err(StateError::UnsupportedSchema("service-grants.json"));
+    }
+    if installs.state_revision == 0
+        || installs.state_revision != trust.state_revision
+        || installs.state_revision != enabled.state_revision
+        || service_grants
+            .as_ref()
+            .is_some_and(|grants| grants.state_revision != installs.state_revision)
+    {
+        return Err(StateError::RevisionMismatch);
+    }
+    let mut snapshot = StateSnapshot {
+        revision: installs.state_revision,
+        installs: installs.installs,
+        grants: trust.grants,
+        enablement: enabled.extensions,
+        service_grants: service_grants
+            .map(|grants| grants.service_grants)
+            .unwrap_or_default(),
+    };
+    validate_snapshot(&mut snapshot)?;
+    Ok(derive_unsupported_service_activations(
+        &snapshot,
+        registered_projects,
+    ))
+}
+
 /// Read one coherent generation and derive only exact-grant, currently effective
 /// native service activations. No package code or secret value is touched.
 pub(crate) fn read_service_activations(
@@ -1639,7 +1775,6 @@ pub(crate) fn read_service_activations(
                     package_path: package_path.clone(),
                     package_directory,
                     executable,
-                    executable_path,
                     args: service.args.clone(),
                     events,
                     environment,
@@ -2356,6 +2491,14 @@ env = ["EXAMPLE_ENV"]
         );
         let upgraded = read_locked_state(fixture.config.path()).unwrap();
         assert_eq!(upgraded.snapshot.service_grants.len(), 1);
+        let unsupported =
+            derive_unsupported_service_activations(&upgraded.snapshot, &HashSet::new());
+        assert_eq!(unsupported.len(), 1);
+        assert_eq!(unsupported[0].package_id, ID);
+        assert_eq!(unsupported[0].package_version, "0.1.0");
+        assert_eq!(unsupported[0].package_digest, fixture.digest);
+        assert_eq!(unsupported[0].service_id, "bridge");
+        assert_eq!(unsupported[0].activation_revision, 7);
 
         fs::write(
             root.join("service-grants.json"),
@@ -2494,6 +2637,47 @@ env = ["EXAMPLE_ENV"]
         assert!(activation.environment.is_empty());
         assert_eq!(activation.secret_bindings[0].target_env, "EXAMPLE_ENV");
         assert!(!fixture.marker.exists());
+    }
+
+    #[test]
+    fn service_grant_count_accepts_exactly_1024_rows_and_rejects_1025() {
+        let digest = format!("sha256:{}", "a".repeat(64));
+        let rows = (0..MAX_SERVICE_GRANTS)
+            .map(|index| ServiceGrant {
+                id: ID.to_owned(),
+                digest: digest.clone(),
+                service_id: format!("service{index:04}"),
+                native_process_ack: true,
+                secret_bindings: Vec::new(),
+            })
+            .collect::<Vec<_>>();
+        let mut boundary = StateSnapshot {
+            revision: 7,
+            installs: Vec::new(),
+            grants: Vec::new(),
+            enablement: Vec::new(),
+            service_grants: rows.clone(),
+        };
+        assert!(validate_snapshot(&mut boundary).is_ok());
+
+        let mut oversized = StateSnapshot {
+            revision: 7,
+            installs: Vec::new(),
+            grants: Vec::new(),
+            enablement: Vec::new(),
+            service_grants: rows,
+        };
+        oversized.service_grants.push(ServiceGrant {
+            id: ID.to_owned(),
+            digest,
+            service_id: "service1024".to_owned(),
+            native_process_ack: true,
+            secret_bindings: Vec::new(),
+        });
+        assert_eq!(
+            validate_snapshot(&mut oversized),
+            Err(StateError::InvalidRecord("service-grant-count"))
+        );
     }
 
     #[test]
