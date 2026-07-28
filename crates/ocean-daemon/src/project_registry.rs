@@ -10,6 +10,32 @@ use axum::{
 use chrono::Utc;
 use ocean_core::{Project, ProjectConfig, ProjectId, ProjectResponse};
 use serde_json::json;
+use std::collections::HashSet;
+
+/// Publish the committed registered-project snapshot synchronously before a
+/// create/delete response returns. Lifecycle publication thereafter performs no
+/// project-registry or filesystem I/O.
+async fn publish_extension_project_snapshot(state: &AppState) {
+    let Ok(projects) = state.runtime.list_projects() else {
+        tracing::warn!(
+            reason = "project_snapshot_unavailable",
+            "committed extension project snapshot could not be refreshed"
+        );
+        return;
+    };
+    let project_ids: HashSet<uuid::Uuid> = projects.iter().map(|project| project.id).collect();
+    state
+        .extension_lifecycle
+        .update_registered_project_snapshot(
+            projects
+                .into_iter()
+                .map(|project| (project.workspace_root, project.id))
+                .collect(),
+        );
+    if let Some(supervisor) = &state.extension_supervisor {
+        supervisor.update_project_snapshot(project_ids).await;
+    }
+}
 
 #[derive(serde::Deserialize)]
 pub(super) struct CreateProjectRequest {
@@ -139,14 +165,17 @@ pub(super) async fn project_create(
         updated_ms: now,
     };
     match state.runtime.upsert_project(project, now) {
-        Ok(project) => (
-            StatusCode::CREATED,
-            Json(ProjectResponse {
-                ok: true,
-                project: Some(project),
-                error: None,
-            }),
-        ),
+        Ok(project) => {
+            publish_extension_project_snapshot(&state).await;
+            (
+                StatusCode::CREATED,
+                Json(ProjectResponse {
+                    ok: true,
+                    project: Some(project),
+                    error: None,
+                }),
+            )
+        }
         Err(e) => (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(ProjectResponse {
@@ -388,14 +417,17 @@ pub(super) async fn project_patch(
         ..existing
     };
     match state.runtime.upsert_project(updated, now) {
-        Ok(project) => (
-            StatusCode::OK,
-            Json(ProjectResponse {
-                ok: true,
-                project: Some(project),
-                error: None,
-            }),
-        ),
+        Ok(project) => {
+            publish_extension_project_snapshot(&state).await;
+            (
+                StatusCode::OK,
+                Json(ProjectResponse {
+                    ok: true,
+                    project: Some(project),
+                    error: None,
+                }),
+            )
+        }
         Err(e) => (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(ProjectResponse {
@@ -414,7 +446,10 @@ pub(super) async fn project_delete(
     Path(id): Path<ProjectId>,
 ) -> (StatusCode, Json<serde_json::Value>) {
     match state.runtime.delete_project(id) {
-        Ok(true) => (StatusCode::OK, Json(json!({ "ok": true }))),
+        Ok(true) => {
+            publish_extension_project_snapshot(&state).await;
+            (StatusCode::OK, Json(json!({ "ok": true })))
+        }
         Ok(false) => (
             StatusCode::NOT_FOUND,
             Json(json!({ "ok": false, "error": format!("unknown project {id}") })),

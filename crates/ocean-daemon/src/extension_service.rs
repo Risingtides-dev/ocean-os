@@ -1,13 +1,13 @@
-//! Stage A2a minimum native extension-service supervisor.
+//! Stage A native extension-service supervisor.
 //!
-//! This boundary consumes only coherent activation records from
-//! `extension_registry`, launches one exact trusted executable with assigned
-//! roots and a cleared environment, performs the strict v1 hello/ready exchange,
-//! and owns generation-safe Unix process-group cleanup. It deliberately has no
-//! lifecycle delivery/replay, ping health, restart/backoff, mutation, or route.
+//! This boundary consumes coherent activation records, owns strict stdio
+//! transport, bounded lifecycle replay/live delivery, heartbeat health,
+//! deterministic restart policy, sanitized stderr diagnostics, and
+//! generation-safe Unix process-group cleanup. It has no registry mutation,
+//! route, package acquisition, or extension-originated command authority.
 
 use std::{
-    collections::{BTreeMap, HashSet},
+    collections::{BTreeMap, HashSet, VecDeque},
     ffi::{CStr, CString, OsStr, OsString},
     fs::{self, File},
     io,
@@ -18,30 +18,37 @@ use std::{
     },
     path::{Path, PathBuf},
     process::Stdio,
-    sync::{Arc, RwLock},
+    sync::{
+        atomic::{AtomicU64, AtomicUsize, Ordering},
+        Arc, RwLock,
+    },
     time::Duration,
 };
 
 use chrono::{SecondsFormat, Utc};
 use ocean_agent_sdk::extension_lifecycle::{
-    decode_frame, encode_frame, Ack, HostHello, HostHelloFrame, LifecycleEventKind, Pong,
-    ProtocolName, ProtocolV1, Ready, ReadyFrame, ReplayMode, Sequence, ServiceHello,
+    decode_frame, encode_frame, Ack, HostHello, HostHelloFrame, Lag, LagFrame, LifecycleEvent,
+    LifecycleEventKind, Ping, PingFrame, Pong, ProtocolName, ProtocolV1, Ready, ReadyFrame,
+    ReplayMode, Reset, ResetFrame, ResetReason, ResumeCursor, Sequence, ServiceHello,
     ServiceIdentity, ServiceLimits, ServiceStatus, ServiceStatusCode, ServiceStatusState, Shutdown,
     ShutdownComplete, ShutdownFrame, ShutdownReason,
 };
 use serde::{Deserialize, Serialize};
 use tokio::{
-    io::{AsyncBufRead, AsyncBufReadExt, AsyncWrite, AsyncWriteExt, BufReader},
-    process::{Child, ChildStdin, ChildStdout, Command},
-    sync::Mutex,
+    io::{AsyncBufRead, AsyncBufReadExt, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader},
+    process::{Child, ChildStderr, ChildStdin, ChildStdout, Command},
+    sync::{broadcast, mpsc, oneshot, Mutex, Notify},
     task::{JoinHandle, JoinSet},
 };
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
-use super::extension_registry::{
-    env_secret_source, read_service_activations, reserved_child_environment_name,
-    valid_child_environment_name, SecretBinding, ServiceActivation,
+use super::{
+    extension_lifecycle::{ActivationScope, LifecycleAttach, LifecycleDispatcher},
+    extension_registry::{
+        env_secret_source, read_service_activations, reserved_child_environment_name,
+        valid_child_environment_name, SecretBinding, ServiceActivation,
+    },
 };
 
 const WRITE_TIMEOUT: Duration = Duration::from_secs(2);
@@ -52,6 +59,28 @@ const REGISTRY_LOAD_TIMEOUT: Duration = Duration::from_secs(5);
 const SUPERVISOR_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(15);
 const LEADER_POLL_INTERVAL: Duration = Duration::from_millis(50);
 const MAX_FRAME_BYTES: usize = ocean_agent_sdk::extension_lifecycle::MAX_FRAME_BYTES;
+const OUTBOUND_MAX_MESSAGES: usize = 256;
+const OUTBOUND_MAX_BYTES: usize = 1024 * 1024;
+const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(10);
+const HEARTBEAT_TIMEOUT: Duration = Duration::from_secs(5);
+const HEARTBEAT_MAX_MISSES: u8 = 3;
+const FAILURE_WINDOW: Duration = Duration::from_secs(60);
+const CIRCUIT_FAILURES: usize = 5;
+const STABLE_RESET: Duration = Duration::from_secs(5 * 60);
+const BACKOFF: [Duration; 8] = [
+    Duration::from_millis(250),
+    Duration::from_millis(500),
+    Duration::from_secs(1),
+    Duration::from_secs(2),
+    Duration::from_secs(4),
+    Duration::from_secs(8),
+    Duration::from_secs(16),
+    Duration::from_secs(30),
+];
+const STDERR_MAX_LINE: usize = 8 * 1024;
+const STDERR_RING_BYTES: usize = 64 * 1024;
+const STDERR_RATE_PER_SECOND: u32 = 20;
+const STDERR_BURST: u32 = 40;
 
 #[allow(dead_code)] // A2b owns transitions for the already-ratified full state vocabulary.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -79,6 +108,7 @@ pub(crate) enum RuntimeReason {
     SpawnFailed,
     StartupTimeout,
     ProtocolViolation,
+    PingTimeout,
     UnexpectedExit,
     Shutdown,
     CleanupFailed,
@@ -115,6 +145,11 @@ pub(crate) struct RuntimeStatus {
     negotiated_subscriptions: Vec<LifecycleEventKind>,
     last_acknowledged_sequence: Option<Sequence>,
     lag_count: u64,
+    stderr_bytes: u64,
+    stderr_lines: u64,
+    stderr_discarded_bytes: u64,
+    stderr_truncated_lines: u64,
+    stderr_redactions: u64,
     reason: Option<RuntimeReason>,
 }
 
@@ -140,32 +175,105 @@ impl RuntimeStatusCache {
             .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 
-    fn insert_starting(&self, activation: &ServiceActivation, epoch: Uuid) {
-        let status = RuntimeStatus {
+    fn insert_starting(
+        &self,
+        activation: &ServiceActivation,
+        epoch: Uuid,
+        replay_floor: Sequence,
+        restart_count: u64,
+    ) {
+        let mut status = RuntimeStatus {
             package_id: activation.package_id.clone(),
             package_version: activation.package_version.clone(),
             package_digest: activation.package_digest.clone(),
             service_id: activation.service_id.clone(),
             activation_revision: activation.activation_revision,
             activation_epoch: epoch,
-            replay_floor: Sequence(0),
+            replay_floor,
             state: RuntimeState::Starting,
             pid: None,
             started_at: None,
             observed_at: now_string(),
-            restart_count: 0,
+            restart_count,
             negotiated_subscriptions: Vec::new(),
             last_acknowledged_sequence: None,
             lag_count: 0,
+            stderr_bytes: 0,
+            stderr_lines: 0,
+            stderr_discarded_bytes: 0,
+            stderr_truncated_lines: 0,
+            stderr_redactions: 0,
             reason: None,
         };
-        self.write().insert(
-            ServiceKey {
-                package_id: activation.package_id.clone(),
-                service_id: activation.service_id.clone(),
-            },
-            status,
-        );
+        let key = ServiceKey {
+            package_id: activation.package_id.clone(),
+            service_id: activation.service_id.clone(),
+        };
+        let mut statuses = self.write();
+        if let Some(previous) = statuses
+            .get(&key)
+            .filter(|previous| previous.activation_epoch == epoch)
+        {
+            // Process-failure restarts retain the activation epoch and its
+            // connection-independent progress projection. A scope/grant/digest
+            // change mints a new epoch and must not carry an old ACK or lag
+            // posture across that replay boundary.
+            status.last_acknowledged_sequence = previous.last_acknowledged_sequence;
+            status.lag_count = previous.lag_count;
+            status.stderr_bytes = previous.stderr_bytes;
+            status.stderr_lines = previous.stderr_lines;
+            status.stderr_discarded_bytes = previous.stderr_discarded_bytes;
+            status.stderr_truncated_lines = previous.stderr_truncated_lines;
+            status.stderr_redactions = previous.stderr_redactions;
+        }
+        statuses.insert(key, status);
+    }
+
+    fn key(activation: &ServiceActivation) -> ServiceKey {
+        ServiceKey {
+            package_id: activation.package_id.clone(),
+            service_id: activation.service_id.clone(),
+        }
+    }
+
+    fn clear_ack(&self, activation: &ServiceActivation) {
+        if let Some(status) = self.write().get_mut(&Self::key(activation)) {
+            status.last_acknowledged_sequence = None;
+            status.observed_at = now_string();
+        }
+    }
+
+    fn update_ack(&self, activation: &ServiceActivation, sequence: Sequence) {
+        if let Some(status) = self.write().get_mut(&Self::key(activation)) {
+            status.last_acknowledged_sequence = Some(sequence);
+            status.observed_at = now_string();
+        }
+    }
+
+    fn add_lag(&self, activation: &ServiceActivation, count: u64) {
+        if let Some(status) = self.write().get_mut(&Self::key(activation)) {
+            status.lag_count = status.lag_count.saturating_add(count);
+            status.observed_at = now_string();
+        }
+    }
+
+    fn update_diagnostics(&self, activation: &ServiceActivation, diagnostics: &DiagnosticStats) {
+        if let Some(status) = self.write().get_mut(&Self::key(activation)) {
+            status.stderr_bytes = status.stderr_bytes.saturating_add(diagnostics.input_bytes);
+            status.stderr_lines = status
+                .stderr_lines
+                .saturating_add(diagnostics.retained_lines);
+            status.stderr_discarded_bytes = status
+                .stderr_discarded_bytes
+                .saturating_add(diagnostics.discarded_bytes);
+            status.stderr_truncated_lines = status
+                .stderr_truncated_lines
+                .saturating_add(diagnostics.truncated_lines);
+            status.stderr_redactions = status
+                .stderr_redactions
+                .saturating_add(diagnostics.redactions);
+            status.observed_at = now_string();
+        }
     }
 
     fn update(
@@ -176,11 +284,7 @@ impl RuntimeStatusCache {
         subscriptions: Option<&[LifecycleEventKind]>,
         reason: Option<RuntimeReason>,
     ) {
-        let key = ServiceKey {
-            package_id: activation.package_id.clone(),
-            service_id: activation.service_id.clone(),
-        };
-        if let Some(status) = self.write().get_mut(&key) {
+        if let Some(status) = self.write().get_mut(&Self::key(activation)) {
             status.state = state;
             status.pid = pid;
             if status.started_at.is_none() && pid.is_some() {
@@ -199,26 +303,84 @@ fn now_string() -> String {
     Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true)
 }
 
-/// One boot-local supervisor. Startup is fail-soft and asynchronous; shutdown
-/// is explicitly joined under a hard wall-clock bound.
+#[derive(Clone, PartialEq, Eq)]
+struct ServiceDescriptor {
+    package_digest: String,
+    activation_revision: u64,
+    args: Vec<String>,
+    events: Vec<LifecycleEventKind>,
+    environment: Vec<String>,
+    secret_bindings: Vec<SecretBinding>,
+    restart_on_failure: bool,
+    effective_global: bool,
+    effective_projects: HashSet<Uuid>,
+}
+
+impl ServiceDescriptor {
+    fn from_activation(activation: &ServiceActivation) -> Self {
+        Self {
+            package_digest: activation.package_digest.clone(),
+            activation_revision: activation.activation_revision,
+            args: activation.args.clone(),
+            events: activation.events.clone(),
+            environment: activation.environment.clone(),
+            secret_bindings: activation.secret_bindings.clone(),
+            restart_on_failure: activation.restart_on_failure,
+            effective_global: activation.effective_global,
+            effective_projects: activation.effective_projects.clone(),
+        }
+    }
+}
+
+struct ManagedService {
+    descriptor: ServiceDescriptor,
+    cancel: CancellationToken,
+    stop_reason: Arc<std::sync::Mutex<ShutdownReason>>,
+    task: JoinHandle<Option<CleanupAuthority>>,
+}
+
+fn requested_stop_reason(reason: &std::sync::Mutex<ShutdownReason>) -> ShutdownReason {
+    *reason
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+fn request_service_stop(managed: &ManagedService, reason: ShutdownReason) {
+    *managed
+        .stop_reason
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner()) = reason;
+    managed.cancel.cancel();
+}
+
+struct ProjectSnapshotCommand {
+    projects: HashSet<Uuid>,
+    completed: oneshot::Sender<()>,
+}
+
+/// One boot-local supervisor. Startup is fail-soft and asynchronous; project
+/// reconciliation is serialized, and shutdown explicitly joins every process
+/// owner under a hard wall-clock bound.
 pub(crate) struct ExtensionSupervisor {
-    boot_id: Uuid,
+    lifecycle: Arc<LifecycleDispatcher>,
     cancel: CancellationToken,
     status: RuntimeStatusCache,
     root_task: Mutex<Option<JoinHandle<()>>>,
-    // Exceptional signal or membership-proof failures keep the unreaped child
-    // identity and PGID owner alive for one bounded shutdown retry. A2a never
-    // turns a cleanup uncertainty into permission to signal a reused group.
+    project_tx: mpsc::Sender<ProjectSnapshotCommand>,
+    project_rx: Mutex<Option<mpsc::Receiver<ProjectSnapshotCommand>>>,
     retained_cleanup: Mutex<Vec<CleanupAuthority>>,
 }
 
 impl ExtensionSupervisor {
-    pub(crate) fn new() -> Arc<Self> {
+    pub(crate) fn new_with_lifecycle(lifecycle: Arc<LifecycleDispatcher>) -> Arc<Self> {
+        let (project_tx, project_rx) = mpsc::channel(8);
         Arc::new(Self {
-            boot_id: Uuid::new_v4(),
+            lifecycle,
             cancel: CancellationToken::new(),
             status: RuntimeStatusCache::default(),
             root_task: Mutex::new(None),
+            project_tx,
+            project_rx: Mutex::new(Some(project_rx)),
             retained_cleanup: Mutex::new(Vec::new()),
         })
     }
@@ -227,75 +389,189 @@ impl ExtensionSupervisor {
         self.status.clone()
     }
 
+    pub(crate) async fn update_project_snapshot(&self, projects: HashSet<Uuid>) {
+        let (completed, wait) = oneshot::channel();
+        if self
+            .project_tx
+            .send(ProjectSnapshotCommand {
+                projects,
+                completed,
+            })
+            .await
+            .is_ok()
+        {
+            let _ = wait.await;
+        }
+    }
+
     pub(crate) async fn start(
         self: &Arc<Self>,
         config_dir: PathBuf,
         registered_projects: HashSet<Uuid>,
     ) {
+        self.lifecycle
+            .update_registered_projects(registered_projects.clone());
+        let Some(project_rx) = self.project_rx.lock().await.take() else {
+            return;
+        };
         let supervisor = Arc::clone(self);
         let task = tokio::spawn(async move {
             supervisor
-                .run_reconciliation(config_dir, registered_projects)
+                .run_reconciliation(config_dir, registered_projects, project_rx)
                 .await;
         });
         *self.root_task.lock().await = Some(task);
     }
 
-    async fn run_reconciliation(
-        self: Arc<Self>,
+    async fn load_activations(
         config_dir: PathBuf,
-        registered_projects: HashSet<Uuid>,
-    ) {
-        let load = tokio::task::spawn_blocking(move || {
-            read_service_activations(&config_dir, &registered_projects)
-        });
-        let activations = match tokio::time::timeout(REGISTRY_LOAD_TIMEOUT, load).await {
-            Ok(Ok(Ok(activations))) => activations,
+        projects: HashSet<Uuid>,
+    ) -> Option<Vec<ServiceActivation>> {
+        let load =
+            tokio::task::spawn_blocking(move || read_service_activations(&config_dir, &projects));
+        match tokio::time::timeout(REGISTRY_LOAD_TIMEOUT, load).await {
+            Ok(Ok(Ok(activations))) => Some(activations),
             Ok(Ok(Err(error))) => {
-                tracing::warn!(
-                    reason = error.code(),
-                    "extension startup reconciliation blocked"
-                );
-                return;
+                tracing::warn!(reason = error.code(), "extension reconciliation blocked");
+                None
             }
             Ok(Err(_)) => {
                 tracing::warn!(
                     reason = "registry_reader_failed",
-                    "extension startup reconciliation blocked"
+                    "extension reconciliation blocked"
                 );
-                return;
+                None
             }
             Err(_) => {
                 tracing::warn!(
                     reason = "registry_reader_timeout",
-                    "extension startup reconciliation blocked"
+                    "extension reconciliation blocked"
                 );
-                return;
+                None
             }
-        };
-        if self.cancel.is_cancelled() {
+        }
+    }
+
+    async fn stop_managed(&self, managed: ManagedService, reason: ShutdownReason) {
+        request_service_stop(&managed, reason);
+        match managed.task.await {
+            Ok(Some(authority)) => self.retained_cleanup.lock().await.push(authority),
+            Ok(None) => {}
+            Err(_) => tracing::warn!(
+                reason = "service_task_failed",
+                "extension service task failed"
+            ),
+        }
+    }
+
+    async fn reconcile(
+        &self,
+        config_dir: &Path,
+        projects: &HashSet<Uuid>,
+        services: &mut BTreeMap<ServiceKey, ManagedService>,
+    ) {
+        let Some(activations) =
+            Self::load_activations(config_dir.to_path_buf(), projects.clone()).await
+        else {
             return;
+        };
+        let mut desired = BTreeMap::new();
+        for activation in activations {
+            let key = ServiceKey {
+                package_id: activation.package_id.clone(),
+                service_id: activation.service_id.clone(),
+            };
+            desired.insert(key, activation);
         }
 
-        let mut services = JoinSet::new();
-        for activation in activations {
-            if self.cancel.is_cancelled() {
-                break;
+        let stale: Vec<ServiceKey> = services
+            .iter()
+            .filter_map(|(key, managed)| {
+                desired
+                    .get(key)
+                    .is_none_or(|activation| {
+                        managed.descriptor != ServiceDescriptor::from_activation(activation)
+                    })
+                    .then_some(key.clone())
+            })
+            .collect();
+        for key in stale {
+            if let Some(managed) = services.remove(&key) {
+                self.stop_managed(managed, ShutdownReason::Reconfigure)
+                    .await;
             }
-            let cancel = self.cancel.clone();
-            let status = self.status.clone();
-            let boot_id = self.boot_id;
-            services.spawn(async move { run_service(activation, boot_id, cancel, status).await });
         }
-        while let Some(result) = services.join_next().await {
-            match result {
-                Ok(Some(authority)) => self.retained_cleanup.lock().await.push(authority),
-                Ok(None) => {}
-                Err(_) => tracing::warn!(
-                    reason = "service_task_failed",
-                    "extension service task failed"
-                ),
+
+        for (key, activation) in desired {
+            if services.contains_key(&key) {
+                continue;
             }
+            let descriptor = ServiceDescriptor::from_activation(&activation);
+            let cancel = CancellationToken::new();
+            let task_cancel = cancel.clone();
+            let stop_reason = Arc::new(std::sync::Mutex::new(ShutdownReason::DaemonStopping));
+            let task_stop_reason = Arc::clone(&stop_reason);
+            let lifecycle = Arc::clone(&self.lifecycle);
+            let status = self.status.clone();
+            // Mint the immutable epoch and floor before reconciliation
+            // acknowledges a project-snapshot change.
+            let epoch = Uuid::new_v4();
+            let replay_floor = lifecycle.current_sequence();
+            let scope = activation_scope(&activation);
+            let task = tokio::spawn(async move {
+                run_service_with_epoch(
+                    activation,
+                    lifecycle,
+                    task_cancel,
+                    status,
+                    epoch,
+                    replay_floor,
+                    scope,
+                    task_stop_reason,
+                )
+                .await
+            });
+            services.insert(
+                key,
+                ManagedService {
+                    descriptor,
+                    cancel,
+                    stop_reason,
+                    task,
+                },
+            );
+        }
+    }
+
+    async fn run_reconciliation(
+        self: Arc<Self>,
+        config_dir: PathBuf,
+        mut projects: HashSet<Uuid>,
+        mut project_rx: mpsc::Receiver<ProjectSnapshotCommand>,
+    ) {
+        let mut services = BTreeMap::new();
+        self.reconcile(&config_dir, &projects, &mut services).await;
+        loop {
+            tokio::select! {
+                _ = self.cancel.cancelled() => break,
+                command = project_rx.recv() => {
+                    let Some(command) = command else { break };
+                    projects = command.projects;
+                    self.reconcile(&config_dir, &projects, &mut services).await;
+                    let _ = command.completed.send(());
+                }
+            }
+        }
+        // Broadcast cancellation to every owner before awaiting any one group.
+        // Each bounded cleanup then progresses concurrently; a slow first
+        // service cannot consume the whole daemon shutdown budget while later
+        // services remain running.
+        for managed in services.values() {
+            request_service_stop(managed, ShutdownReason::DaemonStopping);
+        }
+        for (_, managed) in services {
+            self.stop_managed(managed, ShutdownReason::DaemonStopping)
+                .await;
         }
     }
 
@@ -343,6 +619,10 @@ impl std::fmt::Debug for SensitiveValue {
 impl SensitiveValue {
     fn as_os_str(&self) -> &OsStr {
         OsStr::from_bytes(&self.0)
+    }
+
+    fn duplicate_for_redaction(&self) -> Self {
+        Self(self.0.clone())
     }
 }
 
@@ -701,6 +981,1005 @@ fn cleanup_temp_root(roots: &AssignedRoots) -> bool {
     }
 }
 
+#[derive(Debug, Clone, Default)]
+struct DiagnosticStats {
+    input_bytes: u64,
+    retained_lines: u64,
+    discarded_bytes: u64,
+    truncated_lines: u64,
+    redactions: u64,
+}
+
+#[derive(Default)]
+struct DiagnosticState {
+    lines: VecDeque<Vec<u8>>,
+    retained_bytes: usize,
+    stats: DiagnosticStats,
+}
+
+type SharedDiagnostics = Arc<std::sync::Mutex<DiagnosticState>>;
+
+#[derive(Debug)]
+struct QueuedEvent {
+    event: LifecycleEvent,
+    encoded_bytes: usize,
+}
+
+#[derive(Debug)]
+enum HostControl {
+    Shutdown(Shutdown),
+    Reset(Reset),
+    Lag(Lag),
+    Ping(Ping),
+}
+
+#[derive(Default)]
+struct PendingControls {
+    shutdown: Option<Shutdown>,
+    reset: Option<Reset>,
+    lag: Option<Lag>,
+    ping: Option<Ping>,
+}
+
+#[derive(Default)]
+struct ControlLane {
+    pending: std::sync::Mutex<PendingControls>,
+    notify: Notify,
+    lag_total: AtomicU64,
+}
+
+impl ControlLane {
+    fn lag(&self, first: Sequence, last: Sequence, count: u64, replay_available: bool) {
+        self.lag_total.fetch_add(count, Ordering::Relaxed);
+        let mut pending = self
+            .pending
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if pending.shutdown.is_some() || pending.reset.is_some() {
+            return;
+        }
+        match pending.lag.as_mut() {
+            Some(lag) => {
+                lag.first_lost = Sequence(lag.first_lost.0.min(first.0));
+                lag.last_lost = Sequence(lag.last_lost.0.max(last.0));
+                lag.lost_count = lag.lost_count.saturating_add(count);
+                lag.replay_available |= replay_available;
+            }
+            None => {
+                pending.lag = Some(Lag {
+                    protocol: ProtocolName,
+                    version: ProtocolV1,
+                    frame: LagFrame,
+                    first_lost: first,
+                    last_lost: last,
+                    lost_count: count,
+                    replay_available,
+                });
+            }
+        }
+        drop(pending);
+        self.notify.notify_one();
+    }
+
+    #[allow(dead_code)]
+    fn reset(&self, reset: Reset) {
+        let mut pending = self
+            .pending
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if pending.shutdown.is_none() {
+            pending.reset = Some(reset);
+            pending.lag = None;
+        }
+        drop(pending);
+        self.notify.notify_one();
+    }
+
+    fn ping(&self, nonce: Uuid) {
+        let mut pending = self
+            .pending
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if pending.shutdown.is_none() {
+            pending.ping = Some(Ping {
+                protocol: ProtocolName,
+                version: ProtocolV1,
+                frame: PingFrame,
+                nonce,
+            });
+        }
+        drop(pending);
+        self.notify.notify_one();
+    }
+
+    fn shutdown(&self, reason: ShutdownReason) {
+        let mut pending = self
+            .pending
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        pending.shutdown = Some(Shutdown {
+            protocol: ProtocolName,
+            version: ProtocolV1,
+            frame: ShutdownFrame,
+            reason,
+        });
+        pending.reset = None;
+        pending.lag = None;
+        pending.ping = None;
+        drop(pending);
+        self.notify.notify_one();
+    }
+
+    fn pop(&self) -> Option<HostControl> {
+        let mut pending = self
+            .pending
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        pending
+            .shutdown
+            .take()
+            .map(HostControl::Shutdown)
+            .or_else(|| pending.reset.take().map(HostControl::Reset))
+            .or_else(|| pending.lag.take().map(HostControl::Lag))
+            .or_else(|| pending.ping.take().map(HostControl::Ping))
+    }
+}
+
+fn activation_scope(activation: &ServiceActivation) -> ActivationScope {
+    ActivationScope {
+        global: activation.effective_global,
+        projects: activation.effective_projects.clone(),
+    }
+}
+
+fn eligible_events(
+    attach: &LifecycleAttach,
+    scope: &ActivationScope,
+    subscriptions: &[LifecycleEventKind],
+    replay_floor: Sequence,
+) -> Vec<LifecycleEvent> {
+    attach
+        .retained
+        .iter()
+        .filter(|event| {
+            scope.eligible(event)
+                && subscriptions.contains(&event.kind)
+                && (event.sequence.0 > replay_floor.0
+                    || event.kind == LifecycleEventKind::DaemonStarted)
+        })
+        .cloned()
+        .collect()
+}
+
+fn reset_frame(reason: ResetReason, eligible: &[LifecycleEvent]) -> Reset {
+    Reset {
+        protocol: ProtocolName,
+        version: ProtocolV1,
+        frame: ResetFrame,
+        reason,
+        oldest_available: eligible.first().map(|event| event.sequence),
+        latest_available: eligible.last().map(|event| event.sequence),
+    }
+}
+
+fn replay_plan(
+    resume: Option<&ResumeCursor>,
+    boot_id: Uuid,
+    epoch: Uuid,
+    replay_floor: Sequence,
+    eligible: &[LifecycleEvent],
+) -> (Option<Reset>, Vec<LifecycleEvent>) {
+    let Some(resume) = resume else {
+        return (None, eligible.to_vec());
+    };
+    let reason = if resume.daemon_boot_id != boot_id {
+        Some(ResetReason::BootChanged)
+    } else if resume.activation_epoch != epoch || resume.after_sequence.0 < replay_floor.0 {
+        Some(ResetReason::ActivationChanged)
+    } else if resume.after_sequence.0 > replay_floor.0
+        && !eligible
+            .iter()
+            .any(|event| event.sequence == resume.after_sequence)
+    {
+        let oldest = eligible
+            .first()
+            .map_or(attach_floor(replay_floor), |event| event.sequence.0);
+        Some(if resume.after_sequence.0 < oldest {
+            ResetReason::RetentionExceeded
+        } else {
+            ResetReason::InvalidCursor
+        })
+    } else {
+        None
+    };
+    match reason {
+        Some(reason) => (Some(reset_frame(reason, eligible)), Vec::new()),
+        None => (
+            None,
+            eligible
+                .iter()
+                .filter(|event| event.sequence.0 > resume.after_sequence.0)
+                .cloned()
+                .collect(),
+        ),
+    }
+}
+
+const fn attach_floor(floor: Sequence) -> u64 {
+    floor.0.saturating_add(1)
+}
+
+fn try_reserve_bytes(bytes: &AtomicUsize, amount: usize) -> bool {
+    let mut current = bytes.load(Ordering::Acquire);
+    loop {
+        let Some(next) = current.checked_add(amount) else {
+            return false;
+        };
+        if next > OUTBOUND_MAX_BYTES {
+            return false;
+        }
+        match bytes.compare_exchange_weak(current, next, Ordering::AcqRel, Ordering::Acquire) {
+            Ok(_) => return true,
+            Err(observed) => current = observed,
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn feed_live_events(
+    dispatcher: Arc<LifecycleDispatcher>,
+    mut live: broadcast::Receiver<LifecycleEvent>,
+    boundary: Sequence,
+    scope: ActivationScope,
+    subscriptions: Vec<LifecycleEventKind>,
+    tx: mpsc::Sender<QueuedEvent>,
+    queued_bytes: Arc<AtomicUsize>,
+    controls: Arc<ControlLane>,
+    cancel: CancellationToken,
+) {
+    let mut last_seen = boundary.0;
+    loop {
+        let event = tokio::select! {
+            _ = cancel.cancelled() => break,
+            event = live.recv() => event,
+        };
+        match event {
+            Ok(event) => {
+                last_seen = event.sequence.0;
+                if event.sequence.0 <= boundary.0
+                    || !scope.eligible(&event)
+                    || !subscriptions.contains(&event.kind)
+                {
+                    continue;
+                }
+                let Ok(encoded) = encode_frame(&event) else {
+                    continue;
+                };
+                let encoded_bytes = encoded.len();
+                if !try_reserve_bytes(&queued_bytes, encoded_bytes) {
+                    let replay_available = dispatcher.replay_available(
+                        &scope,
+                        &subscriptions,
+                        event.sequence,
+                        event.sequence,
+                    );
+                    controls.lag(event.sequence, event.sequence, 1, replay_available);
+                    continue;
+                }
+                match tx.try_send(QueuedEvent {
+                    event,
+                    encoded_bytes,
+                }) {
+                    Ok(()) => {}
+                    Err(error) => {
+                        queued_bytes.fetch_sub(encoded_bytes, Ordering::AcqRel);
+                        let event = error.into_inner().event;
+                        let replay_available = dispatcher.replay_available(
+                            &scope,
+                            &subscriptions,
+                            event.sequence,
+                            event.sequence,
+                        );
+                        controls.lag(event.sequence, event.sequence, 1, replay_available);
+                    }
+                }
+            }
+            Err(broadcast::error::RecvError::Lagged(skipped)) => {
+                let first = Sequence(last_seen.saturating_add(1));
+                let last = Sequence(last_seen.saturating_add(skipped));
+                last_seen = last.0;
+                let replay_available =
+                    dispatcher.replay_available(&scope, &subscriptions, first, last);
+                controls.lag(first, last, skipped, replay_available);
+            }
+            Err(broadcast::error::RecvError::Closed) => break,
+        }
+    }
+}
+
+async fn write_control(
+    writer: &mut (impl AsyncWrite + Unpin),
+    control: &HostControl,
+) -> Result<(), ()> {
+    match control {
+        HostControl::Shutdown(frame) => write_frame(writer, frame).await,
+        HostControl::Reset(frame) => write_frame(writer, frame).await,
+        HostControl::Lag(frame) => write_frame(writer, frame).await,
+        HostControl::Ping(frame) => write_frame(writer, frame).await,
+    }
+}
+
+fn redact_exact(mut input: Vec<u8>, values: &[SensitiveValue]) -> (Vec<u8>, u64) {
+    let mut redactions = 0_u64;
+    for value in values.iter().filter(|value| !value.0.is_empty()) {
+        let mut cursor = 0;
+        while cursor + value.0.len() <= input.len() {
+            let Some(relative) = input[cursor..]
+                .windows(value.0.len())
+                .position(|window| window == value.0)
+            else {
+                break;
+            };
+            let start = cursor + relative;
+            input.splice(start..start + value.0.len(), b"<redacted>".iter().copied());
+            redactions = redactions.saturating_add(1);
+            cursor = start + b"<redacted>".len();
+        }
+    }
+    (input, redactions)
+}
+
+fn retain_diagnostic_line(state: &mut DiagnosticState, line: Vec<u8>, values: &[SensitiveValue]) {
+    let (line, redactions) = redact_exact(line, values);
+    state.stats.redactions = state.stats.redactions.saturating_add(redactions);
+    let sanitized: Vec<u8> = String::from_utf8_lossy(&line)
+        .bytes()
+        .filter(|byte| !byte.is_ascii_control())
+        .collect();
+    while state.retained_bytes.saturating_add(sanitized.len()) > STDERR_RING_BYTES {
+        let Some(evicted) = state.lines.pop_front() else {
+            break;
+        };
+        state.retained_bytes = state.retained_bytes.saturating_sub(evicted.len());
+        state.stats.discarded_bytes = state
+            .stats
+            .discarded_bytes
+            .saturating_add(u64::try_from(evicted.len()).unwrap_or(u64::MAX));
+    }
+    if sanitized.len() > STDERR_RING_BYTES {
+        state.stats.discarded_bytes = state
+            .stats
+            .discarded_bytes
+            .saturating_add(u64::try_from(sanitized.len()).unwrap_or(u64::MAX));
+        return;
+    }
+    state.retained_bytes = state.retained_bytes.saturating_add(sanitized.len());
+    state.stats.retained_lines = state.stats.retained_lines.saturating_add(1);
+    state.lines.push_back(sanitized);
+}
+
+async fn capture_stderr(
+    mut stderr: ChildStderr,
+    values: Vec<SensitiveValue>,
+    shared: SharedDiagnostics,
+) {
+    let mut buffer = [0_u8; 4096];
+    let mut line = Vec::with_capacity(STDERR_MAX_LINE);
+    let mut dropping_line = false;
+    let mut tokens_milli = u64::from(STDERR_BURST) * 1000;
+    let mut replenished_at = tokio::time::Instant::now();
+    loop {
+        let read = match stderr.read(&mut buffer).await {
+            Ok(0) => break,
+            Ok(read) => read,
+            Err(_) => break,
+        };
+        {
+            let mut state = shared
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            state.stats.input_bytes = state
+                .stats
+                .input_bytes
+                .saturating_add(u64::try_from(read).unwrap_or(u64::MAX));
+        }
+        for byte in &buffer[..read] {
+            if *byte == b'\n' {
+                let now = tokio::time::Instant::now();
+                let elapsed_ms = u64::try_from(now.duration_since(replenished_at).as_millis())
+                    .unwrap_or(u64::MAX);
+                tokens_milli = tokens_milli
+                    .saturating_add(elapsed_ms.saturating_mul(u64::from(STDERR_RATE_PER_SECOND)))
+                    .min(u64::from(STDERR_BURST) * 1000);
+                replenished_at = now;
+                let mut state = shared
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                if dropping_line {
+                    state.stats.truncated_lines = state.stats.truncated_lines.saturating_add(1);
+                    dropping_line = false;
+                    line.clear();
+                } else if tokens_milli >= 1000 {
+                    tokens_milli -= 1000;
+                    retain_diagnostic_line(&mut state, std::mem::take(&mut line), &values);
+                } else {
+                    state.stats.discarded_bytes = state
+                        .stats
+                        .discarded_bytes
+                        .saturating_add(u64::try_from(line.len()).unwrap_or(u64::MAX));
+                    line.clear();
+                }
+            } else if dropping_line {
+                let mut state = shared
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                state.stats.discarded_bytes = state.stats.discarded_bytes.saturating_add(1);
+            } else if line.len() == STDERR_MAX_LINE {
+                let mut state = shared
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                state.stats.discarded_bytes = state.stats.discarded_bytes.saturating_add(
+                    u64::try_from(line.len())
+                        .unwrap_or(u64::MAX)
+                        .saturating_add(1),
+                );
+                dropping_line = true;
+                line.clear();
+            } else {
+                line.push(*byte);
+            }
+        }
+    }
+    let mut state = shared
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if dropping_line {
+        state.stats.truncated_lines = state.stats.truncated_lines.saturating_add(1);
+    } else if !line.is_empty() {
+        retain_diagnostic_line(&mut state, line, &values);
+    }
+}
+
+struct AttemptResult {
+    reason: RuntimeReason,
+    retained: Option<CleanupAuthority>,
+    healthy_for: Duration,
+}
+
+#[cfg(test)]
+async fn run_service_a2b(
+    activation: ServiceActivation,
+    lifecycle: Arc<LifecycleDispatcher>,
+    cancel: CancellationToken,
+    status: RuntimeStatusCache,
+) -> Option<CleanupAuthority> {
+    let epoch = Uuid::new_v4();
+    let replay_floor = lifecycle.current_sequence();
+    let scope = activation_scope(&activation);
+    run_service_with_epoch(
+        activation,
+        lifecycle,
+        cancel,
+        status,
+        epoch,
+        replay_floor,
+        scope,
+        Arc::new(std::sync::Mutex::new(ShutdownReason::DaemonStopping)),
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn run_service_with_epoch(
+    activation: ServiceActivation,
+    lifecycle: Arc<LifecycleDispatcher>,
+    cancel: CancellationToken,
+    status: RuntimeStatusCache,
+    epoch: Uuid,
+    replay_floor: Sequence,
+    scope: ActivationScope,
+    stop_reason: Arc<std::sync::Mutex<ShutdownReason>>,
+) -> Option<CleanupAuthority> {
+    let mut failures = VecDeque::new();
+    let mut backoff_index = 0_usize;
+    let mut restart_count = 0_u64;
+
+    loop {
+        status.insert_starting(&activation, epoch, replay_floor, restart_count);
+        let attempt = run_service_once(
+            &activation,
+            Arc::clone(&lifecycle),
+            epoch,
+            replay_floor,
+            scope.clone(),
+            cancel.clone(),
+            Arc::clone(&stop_reason),
+            &status,
+        )
+        .await;
+        if let Some(authority) = attempt.retained {
+            return Some(authority);
+        }
+        if cancel.is_cancelled() || attempt.reason == RuntimeReason::Shutdown {
+            return None;
+        }
+        if !activation.restart_on_failure {
+            status.update(
+                &activation,
+                RuntimeState::Unhealthy,
+                None,
+                None,
+                Some(attempt.reason),
+            );
+            return None;
+        }
+
+        let now = tokio::time::Instant::now();
+        if attempt.healthy_for >= STABLE_RESET {
+            failures.clear();
+            backoff_index = 0;
+        }
+        failures.push_back(now);
+        while failures
+            .front()
+            .is_some_and(|failure| now.duration_since(*failure) > FAILURE_WINDOW)
+        {
+            failures.pop_front();
+        }
+        if failures.len() >= CIRCUIT_FAILURES {
+            status.update(
+                &activation,
+                RuntimeState::CircuitOpen,
+                None,
+                None,
+                Some(attempt.reason),
+            );
+            return None;
+        }
+
+        let delay = BACKOFF[backoff_index.min(BACKOFF.len() - 1)];
+        backoff_index = backoff_index.saturating_add(1);
+        restart_count = restart_count.saturating_add(1);
+        status.update(
+            &activation,
+            RuntimeState::Backoff,
+            None,
+            None,
+            Some(attempt.reason),
+        );
+        tokio::select! {
+            _ = cancel.cancelled() => return None,
+            _ = tokio::time::sleep(delay) => {}
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn run_service_once(
+    activation: &ServiceActivation,
+    lifecycle: Arc<LifecycleDispatcher>,
+    epoch: Uuid,
+    replay_floor: Sequence,
+    scope: ActivationScope,
+    cancel: CancellationToken,
+    stop_reason: Arc<std::sync::Mutex<ShutdownReason>>,
+    status: &RuntimeStatusCache,
+) -> AttemptResult {
+    let immediate = |reason| AttemptResult {
+        reason,
+        retained: None,
+        healthy_for: Duration::ZERO,
+    };
+    if !matches!(activation.startup_timeout.as_millis(), 100..=30_000) {
+        status.update(
+            activation,
+            RuntimeState::Unhealthy,
+            None,
+            None,
+            Some(RuntimeReason::ProtocolViolation),
+        );
+        return immediate(RuntimeReason::ProtocolViolation);
+    }
+    if cancel.is_cancelled() {
+        status.update(
+            activation,
+            RuntimeState::Inactive,
+            None,
+            None,
+            Some(RuntimeReason::Shutdown),
+        );
+        return immediate(RuntimeReason::Shutdown);
+    }
+
+    let connection_id = Uuid::new_v4();
+    let roots = match assigned_roots(
+        &activation.config_dir,
+        &activation.package_id,
+        &activation.service_id,
+        connection_id,
+    ) {
+        Ok(roots) => roots,
+        Err(_) => {
+            status.update(
+                activation,
+                RuntimeState::Unhealthy,
+                None,
+                None,
+                Some(RuntimeReason::RootUnavailable),
+            );
+            return immediate(RuntimeReason::RootUnavailable);
+        }
+    };
+    let environment = match resolve_environment(activation, |name| std::env::var_os(name)) {
+        Ok(environment) => environment,
+        Err(error) => {
+            let reason = match error {
+                EnvironmentError::MissingOrdinary => RuntimeReason::EnvironmentMissing,
+                EnvironmentError::MissingSecret => RuntimeReason::SecretMissing,
+                EnvironmentError::InvalidName => RuntimeReason::InvalidEnvironment,
+            };
+            status.update(
+                activation,
+                RuntimeState::Unhealthy,
+                None,
+                None,
+                Some(reason),
+            );
+            let _ = cleanup_temp_root(&roots);
+            return immediate(reason);
+        }
+    };
+    let mut redaction_values: Vec<SensitiveValue> = environment
+        .iter()
+        .map(|(_, value)| value.duplicate_for_redaction())
+        .collect();
+    redaction_values.extend(
+        [
+            OsStr::new("/usr/bin:/bin"),
+            activation.package_path.as_os_str(),
+            roots.data.as_os_str(),
+            roots.cache.as_os_str(),
+            roots.temp.as_os_str(),
+        ]
+        .into_iter()
+        .map(|value| SensitiveValue(value.as_bytes().to_vec())),
+    );
+    let mut child = match spawn_service(activation, &roots, &environment) {
+        Ok(child) => child,
+        Err(_) => {
+            status.update(
+                activation,
+                RuntimeState::Unhealthy,
+                None,
+                None,
+                Some(RuntimeReason::SpawnFailed),
+            );
+            let _ = cleanup_temp_root(&roots);
+            return immediate(RuntimeReason::SpawnFailed);
+        }
+    };
+    drop(environment);
+    let Some(pid) = child.id() else {
+        status.update(
+            activation,
+            RuntimeState::Unhealthy,
+            None,
+            None,
+            Some(RuntimeReason::SpawnFailed),
+        );
+        let _ = cleanup_temp_root(&roots);
+        return immediate(RuntimeReason::SpawnFailed);
+    };
+    let mut owner = ProcessGroupOwner::new(pid);
+    let (Some(stdin), Some(stdout), Some(stderr)) =
+        (child.stdin.take(), child.stdout.take(), child.stderr.take())
+    else {
+        let cleaned = terminate_process_group(&mut child, &mut owner).await;
+        if cleaned {
+            let _ = cleanup_temp_root(&roots);
+        }
+        let reason = if cleaned {
+            RuntimeReason::SpawnFailed
+        } else {
+            RuntimeReason::CleanupFailed
+        };
+        status.update(
+            activation,
+            RuntimeState::Unhealthy,
+            None,
+            None,
+            Some(reason),
+        );
+        return AttemptResult {
+            reason,
+            retained: (!cleaned).then_some(CleanupAuthority { child, owner }),
+            healthy_for: Duration::ZERO,
+        };
+    };
+    let diagnostics = Arc::new(std::sync::Mutex::new(DiagnosticState::default()));
+    let diagnostics_task = tokio::spawn(capture_stderr(
+        stderr,
+        redaction_values,
+        Arc::clone(&diagnostics),
+    ));
+    let mut stdin = stdin;
+    let mut stdout = BufReader::new(stdout);
+
+    let service_hello = {
+        let handshake = tokio::time::timeout(
+            activation.startup_timeout,
+            perform_handshake_a2b(
+                activation,
+                lifecycle.daemon_boot_id(),
+                connection_id,
+                epoch,
+                replay_floor,
+                &mut stdin,
+                &mut stdout,
+            ),
+        );
+        tokio::pin!(handshake);
+        tokio::select! {
+            _ = cancel.cancelled() => None,
+            result = &mut handshake => Some(result),
+        }
+    };
+    let (shutdown_reason, runtime_reason, subscriptions, attach) = match service_hello {
+        None => (
+            requested_stop_reason(&stop_reason),
+            RuntimeReason::Shutdown,
+            None,
+            None,
+        ),
+        Some(Err(_)) => (
+            ShutdownReason::Unhealthy,
+            RuntimeReason::StartupTimeout,
+            None,
+            None,
+        ),
+        Some(Ok(Err(_))) => (
+            ShutdownReason::Unhealthy,
+            RuntimeReason::ProtocolViolation,
+            None,
+            None,
+        ),
+        Some(Ok(Ok(service_hello))) => {
+            let subscriptions = service_hello.subscriptions.clone();
+            let attach = lifecycle.attach();
+            let ready = Ready {
+                protocol: ProtocolName,
+                version: ProtocolV1,
+                frame: ReadyFrame,
+                subscriptions: subscriptions.clone(),
+                replay: ReplayMode::BootLocal,
+                activation_epoch: epoch,
+                replay_floor,
+            };
+            if write_frame(&mut stdin, &ready).await.is_err() {
+                (
+                    ShutdownReason::Unhealthy,
+                    RuntimeReason::ProtocolViolation,
+                    None,
+                    None,
+                )
+            } else {
+                let eligible = eligible_events(&attach, &scope, &subscriptions, replay_floor);
+                let (reset, replay) = replay_plan(
+                    service_hello.resume.as_ref(),
+                    lifecycle.daemon_boot_id(),
+                    epoch,
+                    replay_floor,
+                    &eligible,
+                );
+                let mut replay_ok = true;
+                if let Some(reset) = reset.as_ref() {
+                    status.clear_ack(activation);
+                    replay_ok = write_frame(&mut stdin, reset).await.is_ok();
+                }
+                if replay_ok {
+                    for event in &replay {
+                        if write_frame(&mut stdin, event).await.is_err() {
+                            replay_ok = false;
+                            break;
+                        }
+                    }
+                }
+                if replay_ok {
+                    (
+                        ShutdownReason::Unhealthy,
+                        RuntimeReason::ChildUnknown,
+                        Some((subscriptions, replay)),
+                        Some(attach),
+                    )
+                } else {
+                    (
+                        ShutdownReason::Unhealthy,
+                        RuntimeReason::ProtocolViolation,
+                        None,
+                        None,
+                    )
+                }
+            }
+        }
+    };
+
+    let started_healthy = tokio::time::Instant::now();
+    let mut shutdown_already_sent = false;
+    let runtime_reason = if let (Some((subscriptions, replay)), Some(attach)) =
+        (subscriptions, attach)
+    {
+        status.update(
+            activation,
+            RuntimeState::Healthy,
+            Some(pid),
+            Some(&subscriptions),
+            None,
+        );
+        let controls = Arc::new(ControlLane::default());
+        let queued_bytes = Arc::new(AtomicUsize::new(0));
+        let (data_tx, mut data_rx) = mpsc::channel(OUTBOUND_MAX_MESSAGES);
+        let feeder_cancel = CancellationToken::new();
+        let feeder = tokio::spawn(feed_live_events(
+            Arc::clone(&lifecycle),
+            attach.live,
+            attach.boundary,
+            scope,
+            subscriptions,
+            data_tx,
+            Arc::clone(&queued_bytes),
+            Arc::clone(&controls),
+            feeder_cancel.clone(),
+        ));
+        let mut sent_sequences: HashSet<u64> =
+            replay.iter().map(|event| event.sequence.0).collect();
+        let highest_sent = Arc::new(AtomicU64::new(
+            replay.last().map_or(0, |event| event.sequence.0),
+        ));
+        let mut last_ack = None::<u64>;
+        let mut pending_ping = None::<(Uuid, tokio::time::Instant)>;
+        let mut next_ping = tokio::time::Instant::now() + HEARTBEAT_INTERVAL;
+        let mut misses = 0_u8;
+        let mut leader_poll = tokio::time::interval(LEADER_POLL_INTERVAL);
+        leader_poll.tick().await;
+
+        let reason = loop {
+            if cancel.is_cancelled() {
+                controls.shutdown(requested_stop_reason(&stop_reason));
+            }
+            if let Some(control) = controls.pop() {
+                let is_shutdown = matches!(control, HostControl::Shutdown(_));
+                if write_control(&mut stdin, &control).await.is_err() {
+                    break RuntimeReason::ProtocolViolation;
+                }
+                if is_shutdown {
+                    shutdown_already_sent = true;
+                    break RuntimeReason::Shutdown;
+                }
+                continue;
+            }
+
+            let health_deadline =
+                pending_ping.map_or(next_ping, |(_, deadline)| deadline.min(next_ping));
+            tokio::select! {
+                biased;
+                _ = cancel.cancelled() => {
+                    controls.shutdown(requested_stop_reason(&stop_reason));
+                }
+                _ = controls.notify.notified() => {}
+                _ = tokio::time::sleep_until(health_deadline) => {
+                    let now = tokio::time::Instant::now();
+                    if pending_ping.is_some_and(|(_, deadline)| now >= deadline) {
+                        pending_ping = None;
+                        misses = misses.saturating_add(1);
+                        if misses >= HEARTBEAT_MAX_MISSES {
+                            break RuntimeReason::PingTimeout;
+                        }
+                    }
+                    if pending_ping.is_none() && now >= next_ping {
+                        let nonce = Uuid::new_v4();
+                        controls.ping(nonce);
+                        pending_ping = Some((nonce, now + HEARTBEAT_TIMEOUT));
+                        next_ping = now + HEARTBEAT_INTERVAL;
+                    }
+                }
+                _ = leader_poll.tick() => {
+                    if owner.leader_exited() {
+                        break RuntimeReason::UnexpectedExit;
+                    }
+                }
+                frame = read_frame::<ChildFrame, _>(&mut stdout) => {
+                    match frame {
+                        Ok(ChildFrame::Status(child_status)) => {
+                            let state = match child_status.state {
+                                ServiceStatusState::Ready => RuntimeState::Healthy,
+                                ServiceStatusState::Degraded => RuntimeState::Degraded,
+                            };
+                            let reason = (state == RuntimeState::Degraded).then_some(match child_status.code {
+                                ServiceStatusCode::ExternalUnavailable => RuntimeReason::ExternalUnavailable,
+                                ServiceStatusCode::ConfigurationMissing => RuntimeReason::ConfigurationMissing,
+                                ServiceStatusCode::RateLimited => RuntimeReason::RateLimited,
+                                ServiceStatusCode::Unknown => RuntimeReason::ChildUnknown,
+                            });
+                            status.update(activation, state, Some(pid), None, reason);
+                        }
+                        Ok(ChildFrame::Ack(ack)) => {
+                            let sequence = ack.sequence.0;
+                            if last_ack.is_some_and(|last| sequence <= last)
+                                || sequence > highest_sent.load(Ordering::Acquire)
+                                || !sent_sequences.contains(&sequence)
+                            {
+                                break RuntimeReason::ProtocolViolation;
+                            }
+                            last_ack = Some(sequence);
+                            sent_sequences.retain(|sent| *sent > sequence);
+                            status.update_ack(activation, ack.sequence);
+                        }
+                        Ok(ChildFrame::Pong(pong)) => {
+                            if pending_ping.is_some_and(|(nonce, _)| nonce == pong.nonce) {
+                                pending_ping = None;
+                                misses = 0;
+                            } else {
+                                break RuntimeReason::ProtocolViolation;
+                            }
+                        }
+                        Ok(ChildFrame::ShutdownComplete(_)) => break RuntimeReason::ProtocolViolation,
+                        Err(error) => break post_ready_frame_failure_reason(error),
+                    }
+                }
+                event = data_rx.recv() => {
+                    let Some(event) = event else {
+                        break RuntimeReason::UnexpectedExit;
+                    };
+                    queued_bytes.fetch_sub(event.encoded_bytes, Ordering::AcqRel);
+                    if write_frame(&mut stdin, &event.event).await.is_err() {
+                        break RuntimeReason::ProtocolViolation;
+                    }
+                    highest_sent.store(event.event.sequence.0, Ordering::Release);
+                    sent_sequences.insert(event.event.sequence.0);
+                }
+            }
+        };
+        feeder_cancel.cancel();
+        let _ = feeder.await;
+        status.add_lag(activation, controls.lag_total.swap(0, Ordering::AcqRel));
+        reason
+    } else {
+        runtime_reason
+    };
+
+    let effective_shutdown_reason = if runtime_reason == RuntimeReason::Shutdown {
+        requested_stop_reason(&stop_reason)
+    } else {
+        shutdown_reason
+    };
+    let cleaned = finish_process(
+        activation,
+        status,
+        &mut child,
+        &mut owner,
+        stdin,
+        stdout,
+        &roots,
+        effective_shutdown_reason,
+        runtime_reason,
+        shutdown_already_sent,
+    )
+    .await;
+    let _ = diagnostics_task.await;
+    let diagnostic_stats = diagnostics
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .stats
+        .clone();
+    status.update_diagnostics(activation, &diagnostic_stats);
+    AttemptResult {
+        reason: runtime_reason,
+        retained: (!cleaned).then_some(CleanupAuthority { child, owner }),
+        healthy_for: started_healthy.elapsed(),
+    }
+}
+
+#[cfg(test)]
 async fn run_service(
     activation: ServiceActivation,
     boot_id: Uuid,
@@ -708,7 +1987,7 @@ async fn run_service(
     status: RuntimeStatusCache,
 ) -> Option<CleanupAuthority> {
     let epoch = Uuid::new_v4();
-    status.insert_starting(&activation, epoch);
+    status.insert_starting(&activation, epoch, Sequence(0), 0);
     if !matches!(activation.startup_timeout.as_millis(), 100..=30_000) {
         status.update(
             &activation,
@@ -846,6 +2125,7 @@ async fn run_service(
             &roots,
             ShutdownReason::DaemonStopping,
             RuntimeReason::Shutdown,
+            false,
         )
         .await;
         return (!cleaned).then_some(CleanupAuthority { child, owner });
@@ -870,6 +2150,7 @@ async fn run_service(
                 &roots,
                 ShutdownReason::Unhealthy,
                 RuntimeReason::ProtocolViolation,
+                false,
             )
             .await;
             return (!cleaned).then_some(CleanupAuthority { child, owner });
@@ -892,6 +2173,7 @@ async fn run_service(
                 &roots,
                 ShutdownReason::Unhealthy,
                 RuntimeReason::StartupTimeout,
+                false,
             )
             .await;
             return (!cleaned).then_some(CleanupAuthority { child, owner });
@@ -965,6 +2247,7 @@ async fn run_service(
         &roots,
         shutdown_reason,
         runtime_reason,
+        false,
     )
     .await;
     (!cleaned).then_some(CleanupAuthority { child, owner })
@@ -1000,9 +2283,9 @@ fn spawn_service(
         .env("TMPDIR", &roots.temp)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
-        // Detailed bounded diagnostic capture belongs to A2b. A2a discards
-        // stderr structurally, so secret bytes cannot reach logs or status.
-        .stderr(Stdio::null());
+        // Stderr is diagnostics only and is consumed by the bounded structural
+        // redactor; it is never interpreted as protocol or logged raw.
+        .stderr(Stdio::piped());
     for (name, value) in environment {
         command.env(name, value.as_os_str());
     }
@@ -1070,6 +2353,52 @@ enum ChildFrame {
     ShutdownComplete(ShutdownComplete),
 }
 
+async fn perform_handshake_a2b<W, R>(
+    activation: &ServiceActivation,
+    boot_id: Uuid,
+    connection_id: Uuid,
+    epoch: Uuid,
+    replay_floor: Sequence,
+    stdin: &mut W,
+    stdout: &mut R,
+) -> Result<ServiceHello, ()>
+where
+    W: AsyncWrite + Unpin,
+    R: AsyncBufRead + Unpin,
+{
+    let hello = HostHello {
+        protocol: ProtocolName,
+        version: ProtocolV1,
+        frame: HostHelloFrame,
+        connection_id,
+        daemon_boot_id: boot_id,
+        identity: ServiceIdentity {
+            package_id: activation.package_id.clone(),
+            package_version: activation.package_version.clone(),
+            package_digest: activation.package_digest.clone(),
+            service_id: activation.service_id.clone(),
+            activation_revision: activation.activation_revision,
+            activation_epoch: epoch,
+            replay_floor,
+        },
+        limits: ServiceLimits {
+            max_frame_bytes: 65_536,
+            outbound_messages: u64::try_from(OUTBOUND_MAX_MESSAGES).unwrap_or(u64::MAX),
+            outbound_bytes: u64::try_from(OUTBOUND_MAX_BYTES).unwrap_or(u64::MAX),
+            heartbeat_interval_ms: u64::try_from(HEARTBEAT_INTERVAL.as_millis())
+                .unwrap_or(u64::MAX),
+            heartbeat_timeout_ms: u64::try_from(HEARTBEAT_TIMEOUT.as_millis()).unwrap_or(u64::MAX),
+        },
+    };
+    write_frame(stdin, &hello).await?;
+    let service_hello: ServiceHello = read_frame(stdout).await.map_err(|_| ())?;
+    service_hello
+        .validate_subscriptions(&activation.events)
+        .map_err(|_| ())?;
+    Ok(service_hello)
+}
+
+#[allow(dead_code)]
 async fn perform_handshake<W, R>(
     activation: &ServiceActivation,
     boot_id: Uuid,
@@ -1196,6 +2525,7 @@ async fn finish_process(
     roots: &AssignedRoots,
     reason: ShutdownReason,
     runtime_reason: RuntimeReason,
+    shutdown_already_sent: bool,
 ) -> bool {
     let pid = child.id();
     status.update(
@@ -1205,13 +2535,15 @@ async fn finish_process(
         None,
         Some(runtime_reason),
     );
-    let shutdown = Shutdown {
-        protocol: ProtocolName,
-        version: ProtocolV1,
-        frame: ShutdownFrame,
-        reason,
-    };
-    let _ = write_frame(&mut stdin, &shutdown).await;
+    if !shutdown_already_sent {
+        let shutdown = Shutdown {
+            protocol: ProtocolName,
+            version: ProtocolV1,
+            frame: ShutdownFrame,
+            reason,
+        };
+        let _ = write_frame(&mut stdin, &shutdown).await;
+    }
     let response = async {
         loop {
             match read_frame::<ChildFrame, _>(&mut stdout)
@@ -1220,14 +2552,10 @@ async fn finish_process(
             {
                 ChildFrame::ShutdownComplete(_) => return Ok::<(), ()>(()),
                 ChildFrame::Status(_) => {}
-                ChildFrame::Ack(ack) => {
-                    let _invalid_sequence = ack.sequence;
-                    return Err(());
-                }
-                ChildFrame::Pong(pong) => {
-                    let _unexpected_nonce = pong.nonce;
-                    return Err(());
-                }
+                // A previously delivered event or ping can race the prioritized
+                // shutdown write. Both frames are valid but irrelevant once
+                // shutdown begins; continue waiting for shutdown_complete.
+                ChildFrame::Ack(_) | ChildFrame::Pong(_) => {}
             }
         }
     };
@@ -1246,7 +2574,11 @@ async fn finish_process(
     };
     status.update(
         activation,
-        if reason == ShutdownReason::DaemonStopping && fully_cleaned {
+        if matches!(
+            reason,
+            ShutdownReason::Disabled | ShutdownReason::DaemonStopping | ShutdownReason::Reconfigure
+        ) && fully_cleaned
+        {
             RuntimeState::Inactive
         } else {
             RuntimeState::Unhealthy
@@ -1541,6 +2873,7 @@ fn group_has_live_members(pgid: libc::pid_t) -> io::Result<bool> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::extension_lifecycle::LifecycleSource;
     use ocean_agent_sdk::extension_lifecycle::LifecycleEventKind;
     use std::os::unix::fs::PermissionsExt;
 
@@ -1571,6 +2904,9 @@ mod tests {
                 environment: Vec::new(),
                 secret_bindings: Vec::new(),
                 startup_timeout: Duration::from_secs(2),
+                restart_on_failure: false,
+                effective_global: true,
+                effective_projects: HashSet::new(),
             },
         )
     }
@@ -1586,6 +2922,352 @@ mod tests {
         fs::create_dir_all(store.parent().unwrap()).unwrap();
         fs::rename(&activation.package_path, &store).unwrap();
         activation.package_path = store;
+    }
+
+    async fn wait_for_runtime_state(
+        status: &RuntimeStatusCache,
+        wanted: RuntimeState,
+    ) -> RuntimeStatus {
+        for _ in 0..200 {
+            if let Some(found) = status
+                .snapshot()
+                .into_iter()
+                .find(|entry| entry.state == wanted)
+            {
+                return found;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        panic!("runtime state {wanted:?} was not observed")
+    }
+
+    #[test]
+    fn prioritized_control_lane_coalesces_without_an_unbounded_control_queue() {
+        let controls = ControlLane::default();
+        controls.ping(Uuid::new_v4());
+        controls.lag(Sequence(10), Sequence(12), 3, true);
+        controls.lag(Sequence(8), Sequence(20), 5, false);
+        controls.reset(reset_frame(ResetReason::InvalidCursor, &[]));
+        assert!(matches!(controls.pop(), Some(HostControl::Reset(_))));
+        assert!(matches!(controls.pop(), Some(HostControl::Ping(_))));
+        assert!(controls.pop().is_none());
+
+        controls.ping(Uuid::new_v4());
+        controls.lag(Sequence(21), Sequence(21), 1, true);
+        controls.shutdown(ShutdownReason::DaemonStopping);
+        assert!(matches!(controls.pop(), Some(HostControl::Shutdown(_))));
+        assert!(controls.pop().is_none());
+        assert_eq!(controls.lag_total.load(Ordering::Relaxed), 9);
+    }
+
+    #[test]
+    fn activation_epoch_replay_rejects_widening_old_boot_and_ineligible_cursors() {
+        let boot = Uuid::new_v4();
+        let project_a = Uuid::new_v4();
+        let project_b = Uuid::new_v4();
+        let dispatcher = LifecycleDispatcher::new(boot, HashSet::from([project_a, project_b]));
+        dispatcher.publish(LifecycleSource::DaemonStarted {
+            daemon_version: "0.1.0".to_owned(),
+            stamp: super::super::extension_lifecycle::event_stamp(),
+        });
+        let floor = dispatcher.current_sequence();
+        for (project, session) in [(project_a, Uuid::new_v4()), (project_b, Uuid::new_v4())] {
+            dispatcher.publish(LifecycleSource::ExplicitSessionCreated {
+                succeeded: true,
+                scope: dispatcher.source_scope(Some(project), Some(session), None, None, None),
+                stamp: super::super::extension_lifecycle::event_stamp(),
+                title: "forbidden-title".to_owned(),
+                cwd: "/forbidden/path".to_owned(),
+            });
+        }
+        let attach = dispatcher.attach();
+        let scope_a = ActivationScope {
+            global: false,
+            projects: HashSet::from([project_a]),
+        };
+        let subscriptions = vec![
+            LifecycleEventKind::DaemonStarted,
+            LifecycleEventKind::SessionStarted,
+        ];
+        let eligible = eligible_events(&attach, &scope_a, &subscriptions, floor);
+        assert_eq!(
+            eligible
+                .iter()
+                .filter(|event| event.kind == LifecycleEventKind::SessionStarted)
+                .count(),
+            1
+        );
+        let epoch = Uuid::new_v4();
+        let (reset, replay) = replay_plan(
+            Some(&ResumeCursor {
+                daemon_boot_id: boot,
+                activation_epoch: epoch,
+                after_sequence: floor,
+            }),
+            boot,
+            epoch,
+            floor,
+            &eligible,
+        );
+        assert!(reset.is_none());
+        assert_eq!(replay.len(), 1);
+
+        let (reset, replay) = replay_plan(
+            Some(&ResumeCursor {
+                daemon_boot_id: Uuid::new_v4(),
+                activation_epoch: epoch,
+                after_sequence: floor,
+            }),
+            boot,
+            epoch,
+            floor,
+            &eligible,
+        );
+        assert!(matches!(
+            reset.map(|frame| frame.reason),
+            Some(ResetReason::BootChanged)
+        ));
+        assert!(replay.is_empty());
+
+        // Widening creates a floor at the current sequence. The older project-B
+        // event is therefore ineligible even though the new scope contains B.
+        let widened_floor = dispatcher.current_sequence();
+        let widened = eligible_events(
+            &dispatcher.attach(),
+            &ActivationScope {
+                global: false,
+                projects: HashSet::from([project_a, project_b]),
+            },
+            &subscriptions,
+            widened_floor,
+        );
+        assert!(widened
+            .iter()
+            .all(|event| event.kind == LifecycleEventKind::DaemonStarted));
+    }
+
+    #[tokio::test]
+    async fn live_a2b_process_replays_acks_redacts_stderr_and_cleans_on_cancel() {
+        const SENTINEL: &str = "stage-a2b-secret-sentinel";
+        #[allow(clippy::useless_format)]
+        let script = format!(
+            "#!/bin/sh\nIFS= read -r hello\nprintf '%s\\n' '{{\"protocol\":\"ocean.extension.service\",\"version\":1,\"frame\":\"service_hello\",\"subscriptions\":[\"daemon_started\"],\"resume\":null}}'\nIFS= read -r ready\nprintf '%s\\n' \"$A2B_SENTINEL\" >&2\nwhile IFS= read -r frame; do\n case \"$frame\" in\n  *'\"frame\":\"event\"'*) seq=$(printf '%s' \"$frame\" | sed -n 's/.*\"sequence\":\"\\([^\"]*\\)\".*/\\1/p'); printf '{{\"protocol\":\"ocean.extension.service\",\"version\":1,\"frame\":\"ack\",\"sequence\":\"%s\"}}\\n' \"$seq\" ;;\n  *'\"frame\":\"ping\"'*) nonce=$(printf '%s' \"$frame\" | sed -n 's/.*\"nonce\":\"\\([^\"]*\\)\".*/\\1/p'); printf '{{\"protocol\":\"ocean.extension.service\",\"version\":1,\"frame\":\"pong\",\"nonce\":\"%s\"}}\\n' \"$nonce\" ;;\n  *'\"frame\":\"shutdown\"'*) printf '%s\\n' '{{\"protocol\":\"ocean.extension.service\",\"version\":1,\"frame\":\"shutdown_complete\"}}'; exit 0 ;;\n esac\ndone\n",
+        );
+        let (temp, mut activation) = executable_fixture(&script);
+        install_fixture_store(&temp, &mut activation);
+        activation.environment = vec!["A2B_SENTINEL".to_owned()];
+        let previous = std::env::var_os("A2B_SENTINEL");
+        std::env::set_var("A2B_SENTINEL", SENTINEL);
+
+        let boot = Uuid::new_v4();
+        let lifecycle = LifecycleDispatcher::new(boot, HashSet::new());
+        lifecycle.publish(LifecycleSource::DaemonStarted {
+            daemon_version: "0.1.0".to_owned(),
+            stamp: super::super::extension_lifecycle::event_stamp(),
+        });
+        let cancel = CancellationToken::new();
+        let status = RuntimeStatusCache::default();
+        let task = tokio::spawn(run_service_a2b(
+            activation,
+            Arc::clone(&lifecycle),
+            cancel.clone(),
+            status.clone(),
+        ));
+        let healthy = wait_for_runtime_state(&status, RuntimeState::Healthy).await;
+        assert!(healthy.pid.is_some());
+        for _ in 0..100 {
+            if status.snapshot()[0].last_acknowledged_sequence == Some(Sequence(1)) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert_eq!(
+            status.snapshot()[0].last_acknowledged_sequence,
+            Some(Sequence(1))
+        );
+        cancel.cancel();
+        assert!(tokio::time::timeout(Duration::from_secs(8), task)
+            .await
+            .expect("service cleanup timeout")
+            .expect("service task")
+            .is_none());
+        let final_status = status.snapshot().pop().expect("status");
+        assert_eq!(final_status.state, RuntimeState::Inactive);
+        assert!(final_status.stderr_redactions >= 1);
+        assert!(!serde_json::to_string(&final_status)
+            .unwrap()
+            .contains(SENTINEL));
+        match previous {
+            Some(value) => std::env::set_var("A2B_SENTINEL", value),
+            None => std::env::remove_var("A2B_SENTINEL"),
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn three_missed_pongs_trigger_ping_timeout_and_full_cleanup() {
+        let script = "#!/bin/sh\nIFS= read -r hello\nprintf '%s\\n' '{\"protocol\":\"ocean.extension.service\",\"version\":1,\"frame\":\"service_hello\",\"subscriptions\":[],\"resume\":null}'\nIFS= read -r ready\nwhile IFS= read -r frame; do\n case \"$frame\" in\n  *'\"frame\":\"shutdown\"'*) printf '%s\\n' '{\"protocol\":\"ocean.extension.service\",\"version\":1,\"frame\":\"shutdown_complete\"}'; exit 0 ;;\n esac\ndone\n";
+        let (temp, mut activation) = executable_fixture(script);
+        install_fixture_store(&temp, &mut activation);
+        activation.events.clear();
+        let lifecycle = LifecycleDispatcher::new(Uuid::new_v4(), HashSet::new());
+        let status = RuntimeStatusCache::default();
+        let task = tokio::spawn(run_service_a2b(
+            activation,
+            lifecycle,
+            CancellationToken::new(),
+            status.clone(),
+        ));
+        for _ in 0..1_000 {
+            if status
+                .snapshot()
+                .iter()
+                .any(|entry| entry.state == RuntimeState::Healthy)
+            {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(1));
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(status.snapshot()[0].state, RuntimeState::Healthy);
+        for delta in [10_u64, 5, 5, 5, 5, 5] {
+            tokio::time::advance(Duration::from_secs(delta)).await;
+            tokio::task::yield_now().await;
+        }
+        // The child is a real OS process while Tokio's clock is paused. Keep
+        // advancing bounded cleanup timers and yielding real scheduler time so
+        // the shell can consume shutdown and close its pipes; a paused Tokio
+        // timeout alone can otherwise remain pending on external process I/O.
+        for _ in 0..100 {
+            if task.is_finished() {
+                break;
+            }
+            tokio::time::advance(Duration::from_millis(100)).await;
+            std::thread::sleep(Duration::from_millis(1));
+            tokio::task::yield_now().await;
+        }
+        assert!(task.is_finished(), "health cleanup did not finish");
+        assert!(task.await.expect("service task").is_none());
+        let final_status = status.snapshot().pop().expect("status");
+        assert_eq!(final_status.reason, Some(RuntimeReason::PingTimeout));
+        assert_eq!(final_status.pid, None);
+    }
+
+    #[tokio::test]
+    async fn stderr_binary_newline_free_and_rate_flood_stay_bounded_and_redacted() {
+        const SENTINEL: &str = "stderr-secret-sentinel";
+        let script = "#!/bin/sh\nIFS= read -r hello\nprintf '%s\\n' '{\"protocol\":\"ocean.extension.service\",\"version\":1,\"frame\":\"service_hello\",\"subscriptions\":[],\"resume\":null}'\nIFS= read -r ready\nhead -c 10000 /dev/zero >&2\ni=0; while [ $i -lt 100 ]; do printf '%s\\n' \"$STDERR_SENTINEL\" >&2; i=$((i+1)); done\nwhile IFS= read -r frame; do\n case \"$frame\" in\n  *'\"frame\":\"ping\"'*) nonce=$(printf '%s' \"$frame\" | sed -n 's/.*\"nonce\":\"\\([^\"]*\\)\".*/\\1/p'); printf '{\"protocol\":\"ocean.extension.service\",\"version\":1,\"frame\":\"pong\",\"nonce\":\"%s\"}\\n' \"$nonce\" ;;\n  *'\"frame\":\"shutdown\"'*) printf '%s\\n' '{\"protocol\":\"ocean.extension.service\",\"version\":1,\"frame\":\"shutdown_complete\"}'; exit 0 ;;\n esac\ndone\n";
+        let (temp, mut activation) = executable_fixture(script);
+        install_fixture_store(&temp, &mut activation);
+        activation.events.clear();
+        activation.environment = vec!["STDERR_SENTINEL".to_owned()];
+        let previous = std::env::var_os("STDERR_SENTINEL");
+        std::env::set_var("STDERR_SENTINEL", SENTINEL);
+        let lifecycle = LifecycleDispatcher::new(Uuid::new_v4(), HashSet::new());
+        let cancel = CancellationToken::new();
+        let status = RuntimeStatusCache::default();
+        let task = tokio::spawn(run_service_a2b(
+            activation,
+            lifecycle,
+            cancel.clone(),
+            status.clone(),
+        ));
+        let _ = wait_for_runtime_state(&status, RuntimeState::Healthy).await;
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        cancel.cancel();
+        assert!(task.await.expect("service task").is_none());
+        let final_status = status.snapshot().pop().expect("status");
+        assert!(final_status.stderr_bytes >= 10_000);
+        assert!(final_status.stderr_truncated_lines >= 1);
+        assert!(final_status.stderr_discarded_bytes > 0);
+        assert!(final_status.stderr_lines <= u64::from(STDERR_BURST));
+        assert!(final_status.stderr_redactions > 0);
+        assert!(!serde_json::to_string(&final_status)
+            .expect("status json")
+            .contains(SENTINEL));
+        match previous {
+            Some(value) => std::env::set_var("STDERR_SENTINEL", value),
+            None => std::env::remove_var("STDERR_SENTINEL"),
+        }
+    }
+
+    #[tokio::test]
+    async fn slow_reader_hits_bounded_data_queue_and_records_coalesced_lag() {
+        let script = "#!/bin/sh\nIFS= read -r hello\nprintf '%s\\n' '{\"protocol\":\"ocean.extension.service\",\"version\":1,\"frame\":\"service_hello\",\"subscriptions\":[\"session_started\"],\"resume\":null}'\nIFS= read -r ready\nsleep 10\n";
+        let (temp, mut activation) = executable_fixture(script);
+        install_fixture_store(&temp, &mut activation);
+        activation.events = vec![LifecycleEventKind::SessionStarted];
+        let lifecycle = LifecycleDispatcher::new(Uuid::new_v4(), HashSet::new());
+        let status = RuntimeStatusCache::default();
+        let task = tokio::spawn(run_service_a2b(
+            activation,
+            Arc::clone(&lifecycle),
+            CancellationToken::new(),
+            status.clone(),
+        ));
+        let _ = wait_for_runtime_state(&status, RuntimeState::Healthy).await;
+        for _ in 0..1_000 {
+            lifecycle.publish(LifecycleSource::ExplicitSessionCreated {
+                succeeded: true,
+                scope: lifecycle.source_scope(None, Some(Uuid::new_v4()), None, None, None),
+                stamp: super::super::extension_lifecycle::event_stamp(),
+                title: "never serialized".to_owned(),
+                cwd: "/never/serialized".to_owned(),
+            });
+        }
+        assert!(tokio::time::timeout(Duration::from_secs(8), task)
+            .await
+            .expect("blocked writer did not fail within its deadline")
+            .expect("service task")
+            .is_none());
+        let final_status = status.snapshot().pop().expect("status");
+        assert!(final_status.lag_count > 0);
+        assert_eq!(final_status.reason, Some(RuntimeReason::ProtocolViolation));
+    }
+
+    #[test]
+    fn restart_backoff_schedule_and_circuit_threshold_match_the_ratified_policy() {
+        assert_eq!(
+            BACKOFF,
+            [
+                Duration::from_millis(250),
+                Duration::from_millis(500),
+                Duration::from_secs(1),
+                Duration::from_secs(2),
+                Duration::from_secs(4),
+                Duration::from_secs(8),
+                Duration::from_secs(16),
+                Duration::from_secs(30),
+            ]
+        );
+        assert_eq!(FAILURE_WINDOW, Duration::from_secs(60));
+        assert_eq!(CIRCUIT_FAILURES, 5);
+        assert_eq!(STABLE_RESET, Duration::from_secs(5 * 60));
+    }
+
+    #[tokio::test]
+    async fn on_failure_crash_loop_opens_circuit_after_exact_threshold() {
+        let script = "#!/bin/sh\nIFS= read -r hello\nprintf '%s\\n' '{\"protocol\":\"ocean.extension.service\",\"version\":1,\"frame\":\"service_hello\",\"subscriptions\":[],\"resume\":null}'\nIFS= read -r ready\nexit 17\n";
+        let (temp, mut activation) = executable_fixture(script);
+        install_fixture_store(&temp, &mut activation);
+        activation.events.clear();
+        activation.restart_on_failure = true;
+        let lifecycle = LifecycleDispatcher::new(Uuid::new_v4(), HashSet::new());
+        let status = RuntimeStatusCache::default();
+        let result = tokio::time::timeout(
+            Duration::from_secs(10),
+            run_service_a2b(
+                activation,
+                lifecycle,
+                CancellationToken::new(),
+                status.clone(),
+            ),
+        )
+        .await
+        .expect("circuit did not open");
+        assert!(result.is_none());
+        let circuit = wait_for_runtime_state(&status, RuntimeState::CircuitOpen).await;
+        assert_eq!(circuit.restart_count, 4);
+        assert_eq!(circuit.reason, Some(RuntimeReason::UnexpectedExit));
     }
 
     #[test]
@@ -1636,14 +3318,36 @@ mod tests {
     }
 
     #[test]
+    fn runtime_status_retains_ack_only_for_process_restart_in_the_same_epoch() {
+        let (_temp, activation) = executable_fixture("#!/bin/sh\nexit 0\n");
+        let cache = RuntimeStatusCache::default();
+        let first_epoch = Uuid::new_v4();
+        cache.insert_starting(&activation, first_epoch, Sequence(7), 0);
+        cache.update_ack(&activation, Sequence(11));
+        cache.add_lag(&activation, 3);
+
+        cache.insert_starting(&activation, first_epoch, Sequence(7), 1);
+        let same_epoch = cache.snapshot().pop().expect("same epoch status");
+        assert_eq!(same_epoch.last_acknowledged_sequence, Some(Sequence(11)));
+        assert_eq!(same_epoch.lag_count, 3);
+
+        cache.insert_starting(&activation, Uuid::new_v4(), Sequence(20), 0);
+        let new_epoch = cache.snapshot().pop().expect("new epoch status");
+        assert_eq!(new_epoch.last_acknowledged_sequence, None);
+        assert_eq!(new_epoch.lag_count, 0);
+        assert_eq!(new_epoch.replay_floor, Sequence(20));
+    }
+
+    #[test]
     fn runtime_status_has_no_argv_environment_secret_or_diagnostic_text_fields() {
         let (_temp, activation) = executable_fixture("#!/bin/sh\nexit 0\n");
         let cache = RuntimeStatusCache::default();
-        cache.insert_starting(&activation, Uuid::nil());
+        cache.insert_starting(&activation, Uuid::nil(), Sequence(0), 0);
         let encoded = serde_json::to_string(&cache.snapshot()).unwrap();
-        for forbidden in ["args", "environment", "secret", "stderr", "diagnostic"] {
+        for forbidden in ["args", "environment", "secret-sentinel", "diagnostic_text"] {
             assert!(!encoded.contains(forbidden));
         }
+        assert!(encoded.contains("stderr_bytes"));
         assert_eq!(cache.snapshot()[0].state, RuntimeState::Starting);
     }
 

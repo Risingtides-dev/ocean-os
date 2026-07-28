@@ -1,5 +1,5 @@
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     convert::Infallible,
     env,
     hash::{Hash, Hasher},
@@ -98,12 +98,11 @@ mod component_interaction;
 mod cors;
 /// Pure adapters between full-fidelity SDK agent events and the legacy core rail.
 mod event_adapter;
-/// Pure, unwired Stage A lifecycle adaptation and boot-local retention.
-#[allow(dead_code)]
+/// Metadata-only Stage A lifecycle publication and boot-local replay.
 mod extension_lifecycle;
 /// Sole coherent read-only install/trust/enable/service-grant registry authority.
 mod extension_registry;
-/// Stage A2a minimum native-service transport and process-group supervisor.
+/// Stage A native-service transport, replay/health policy, and group supervisor.
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 mod extension_service;
 /// Fail-closed exact-grant status projection where native supervision is unsupported.
@@ -172,6 +171,12 @@ use browser_stream::{input as browser_input, screencast_stream as browser_screen
 use component_interaction::component_event;
 use cors::{cors_layer, parse_allowed_origins};
 use event_adapter::{agent_event_type_name, agent_to_ocean_event};
+use extension_lifecycle::{
+    event_stamp as lifecycle_stamp, FinalRequestState as LifecycleFinalRequestState,
+    LifecycleDispatcher, LifecycleSource, PermissionResolution as LifecyclePermissionResolution,
+    SourceScope as LifecycleSourceScope, TerminalAuthority as LifecycleTerminalAuthority,
+    TerminalSource as LifecycleTerminalSource, ToolEndDetails as LifecycleToolEndDetails,
+};
 use filesystem::{fs_dirs, fs_file};
 use history_search::history_search;
 #[cfg(test)]
@@ -265,6 +270,10 @@ use yolo_settings::{resolve_request_yolo, yolo_enabled, YoloSetRequest};
 struct AppState {
     runtime: Arc<AgentRuntime>,
     events: EventBus,
+    /// Dedicated metadata-only extension lifecycle authority. It is separate
+    /// from both client buses and every publication call is synchronous.
+    extension_lifecycle: Arc<LifecycleDispatcher>,
+    extension_supervisor: Option<Arc<extension_service::ExtensionSupervisor>>,
     agent_events: AgentEventBus,
     requests: RequestRegistry,
     permissions: PermissionRegistry,
@@ -590,6 +599,15 @@ fn permission_args_hash(args: &Value) -> u64 {
     hasher.finish()
 }
 
+#[derive(Clone)]
+struct LifecyclePermissionContext {
+    dispatcher: Arc<LifecycleDispatcher>,
+    project_id: Option<Uuid>,
+    session_id: Option<Uuid>,
+    turn_id: Option<Uuid>,
+    request_id: Uuid,
+}
+
 struct DaemonPermissionPolicy {
     mode: PermissionMode,
     request_id: RequestId,
@@ -611,6 +629,7 @@ struct DaemonPermissionPolicy {
     /// so the decision POST can be bound to the original submitter. `None` = the
     /// turn was submitted without binding (legacy client). Never emitted on SSE.
     decision_token: Option<String>,
+    lifecycle: Option<LifecyclePermissionContext>,
 }
 
 /// Parse a `Last-Event-ID` SSE reconnect header (RFC: EventSource sets it to the
@@ -927,23 +946,37 @@ async fn main() -> anyhow::Result<()> {
     let config_dir = ocean_agent::config_dir_from_env();
     let roles = load_model_roles(&config_dir);
 
-    // A2a startup reconciliation is fail-soft and asynchronous. It consumes the
-    // sole coherent registry reader and owns no lifecycle producer wiring.
-    let extension_supervisor = {
-        let registered_extension_projects = runtime
-            .list_projects()
-            .map(|projects| projects.into_iter().map(|project| project.id).collect())
-            .unwrap_or_default();
-        let supervisor = extension_service::ExtensionSupervisor::new();
-        supervisor
-            .start(config_dir.clone(), registered_extension_projects)
-            .await;
-        // Keep the read-only projection alive for future A3b route composition;
-        // A2a exposes no new route and performs no probe on cache reads.
-        let extension_status_cache = supervisor.status_cache();
-        let _ = extension_status_cache.snapshot();
-        supervisor
-    };
+    // The lifecycle dispatcher exists before reconciliation so daemon_started is
+    // sequence 1 and a late/restarted service can receive the retained boot fact.
+    // Reconciliation is fail-soft and asynchronous: no optional extension can
+    // delay daemon availability or an ordinary turn.
+    let registered_extension_snapshot = runtime.list_projects().unwrap_or_default();
+    let registered_extension_projects: HashSet<Uuid> = registered_extension_snapshot
+        .iter()
+        .map(|project| project.id)
+        .collect();
+    let extension_lifecycle =
+        LifecycleDispatcher::new(Uuid::new_v4(), registered_extension_projects.clone());
+    extension_lifecycle.update_registered_project_snapshot(
+        registered_extension_snapshot
+            .into_iter()
+            .map(|project| (project.workspace_root, project.id))
+            .collect(),
+    );
+    extension_lifecycle.publish(LifecycleSource::DaemonStarted {
+        daemon_version: env!("CARGO_PKG_VERSION").to_owned(),
+        stamp: lifecycle_stamp(),
+    });
+    let extension_supervisor = extension_service::ExtensionSupervisor::new_with_lifecycle(
+        Arc::clone(&extension_lifecycle),
+    );
+    extension_supervisor
+        .start(config_dir.clone(), registered_extension_projects)
+        .await;
+    // Cache inspection is truthful and non-probing; A2b adds no public status
+    // route or registry mutation surface.
+    let extension_status_cache = extension_supervisor.status_cache();
+    let _ = extension_status_cache.snapshot();
 
     // Hoist the event bus so the Observatory durability pump subscribes before
     // any turn can emit a fact. One boot id scopes auth and all read models.
@@ -1036,6 +1069,8 @@ async fn main() -> anyhow::Result<()> {
         runtime,
         roles: Arc::new(roles),
         events: EventBus::new(1024),
+        extension_lifecycle: Arc::clone(&extension_lifecycle),
+        extension_supervisor: Some(Arc::clone(&extension_supervisor)),
         agent_events: agent_event_bus.clone(),
         requests: Arc::new(RwLock::new(HashMap::new())),
         permissions: Arc::new(RwLock::new(HashMap::new())),
@@ -1217,6 +1252,9 @@ async fn main() -> anyhow::Result<()> {
         }
     }
 
+    // daemon_stopping is the last accepted lifecycle fact. Publish it
+    // immediately before native-service drain; crash/SIGKILL naturally skips it.
+    extension_lifecycle.stop_publication();
     // Native extension groups are drained before other daemon task trees and
     // before the Tokio runtime can drop their direct-child handles.
     extension_supervisor.shutdown().await;
@@ -2267,6 +2305,27 @@ fn build_prompt_control(
     cancel: CancellationToken,
     decision_token: Option<String>,
 ) -> PromptControl {
+    build_prompt_control_with_lifecycle(
+        state,
+        request_id,
+        session_id,
+        mode,
+        cancel,
+        decision_token,
+        None,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn build_prompt_control_with_lifecycle(
+    state: &AppState,
+    request_id: RequestId,
+    session_id: Option<SessionId>,
+    mode: PermissionMode,
+    cancel: CancellationToken,
+    decision_token: Option<String>,
+    lifecycle: Option<LifecyclePermissionContext>,
+) -> PromptControl {
     let control: Arc<dyn PermissionPolicy> = Arc::new(DaemonPermissionPolicy {
         mode,
         request_id,
@@ -2277,6 +2336,7 @@ fn build_prompt_control(
         cancel: cancel.clone(),
         seen_permissions: Arc::new(Mutex::new(HashMap::new())),
         decision_token,
+        lifecycle,
     });
 
     PromptControl::new(control).with_cancel(cancel)
@@ -2353,6 +2413,29 @@ impl PermissionPolicy for DaemonPermissionPolicy {
             );
         }
 
+        if let Some(context) = &self.lifecycle {
+            if let Ok(tool_name) =
+                ocean_agent_sdk::extension_lifecycle::ToolName::new(tool_name.to_owned())
+            {
+                let scope = context.dispatcher.source_scope(
+                    context.project_id,
+                    context.session_id,
+                    context.turn_id,
+                    Some(context.request_id),
+                    Some(permission_id),
+                );
+                context
+                    .dispatcher
+                    .publish(LifecycleSource::PermissionWaiting {
+                        scope,
+                        tool_name,
+                        stamp: lifecycle_stamp(),
+                        arguments: args.clone(),
+                        reason: reason.clone(),
+                    });
+            }
+        }
+
         emit(
             &self.events,
             self.session_id,
@@ -2365,17 +2448,48 @@ impl PermissionPolicy for DaemonPermissionPolicy {
             },
         );
 
-        let decision = tokio::select! {
+        let (decision, lifecycle_resolution) = tokio::select! {
             decision = rx => match decision {
-                Ok(decision) => decision,
-                Err(_) => AgentPermissionDecision::Deny {
+                Ok(decision @ AgentPermissionDecision::Allow) => {
+                    (decision, LifecyclePermissionResolution::Allow)
+                }
+                Ok(decision @ AgentPermissionDecision::AllowSession) => {
+                    (decision, LifecyclePermissionResolution::AllowSession)
+                }
+                Ok(decision @ AgentPermissionDecision::Deny { .. }) => {
+                    (decision, LifecyclePermissionResolution::Deny)
+                }
+                Err(_) => (AgentPermissionDecision::Deny {
                     reason: "permission decision channel closed".into(),
-                },
+                }, LifecyclePermissionResolution::WaiterClosed),
             },
-            _ = self.cancel.cancelled() => AgentPermissionDecision::Deny {
+            _ = self.cancel.cancelled() => (AgentPermissionDecision::Deny {
                 reason: "request cancelled while waiting for permission".into(),
-            },
+            }, LifecyclePermissionResolution::RequestCancelled),
         };
+
+        if let Some(context) = &self.lifecycle {
+            let scope = context.dispatcher.source_scope(
+                context.project_id,
+                context.session_id,
+                context.turn_id,
+                Some(context.request_id),
+                Some(permission_id),
+            );
+            context
+                .dispatcher
+                .publish(LifecycleSource::PermissionResolved {
+                    scope,
+                    resolution: lifecycle_resolution,
+                    stamp: lifecycle_stamp(),
+                    reason: match &decision {
+                        AgentPermissionDecision::Deny { reason } => Some(reason.clone()),
+                        AgentPermissionDecision::Allow | AgentPermissionDecision::AllowSession => {
+                            None
+                        }
+                    },
+                });
+        }
 
         {
             let mut permissions = self.permissions.write().await;
@@ -5105,6 +5219,28 @@ fn emit_user_message(events: &EventBus, req: &PromptRequest, request_id: Request
     );
 }
 
+#[derive(Clone)]
+struct LifecycleTerminalContext {
+    dispatcher: Arc<LifecycleDispatcher>,
+    authority: LifecycleTerminalAuthority,
+    project_id: Option<Uuid>,
+    session_id: Uuid,
+    turn_id: Uuid,
+    request_id: Uuid,
+}
+
+impl LifecycleTerminalContext {
+    fn source_scope(&self) -> LifecycleSourceScope {
+        self.dispatcher.source_scope(
+            self.project_id,
+            Some(self.session_id),
+            Some(self.turn_id),
+            Some(self.request_id),
+            None,
+        )
+    }
+}
+
 /// Close out a finished prompt/turn on the request registry and announce the
 /// outcome on the legacy event bus. `origin` is `Some(EVENT_ORIGIN_AGENT)`
 /// when the caller is the agent-turn path (OCEAN-305): there the full stdout
@@ -5113,12 +5249,13 @@ fn emit_user_message(events: &EventBus, req: &PromptRequest, request_id: Request
 /// dual-rail client doesn't render the same turn twice. The legacy
 /// `/v1/prompt` / `/v1/requests` paths pass `None` — for them these
 /// announcements are the only delivery and must render normally.
-async fn record_prompt_result(
+async fn record_prompt_result_with_lifecycle(
     state: &AppState,
     request_id: RequestId,
     res: &ocean_core::PromptResponse,
     origin: Option<&'static str>,
     agent_finished: Option<(AgentSessionId, AgentTurnEvent)>,
+    lifecycle: Option<LifecycleTerminalContext>,
 ) {
     let desired_state = if res.ok {
         RequestState::Completed
@@ -5150,6 +5287,27 @@ async fn record_prompt_result(
         desired_state,
         message,
         |final_state| {
+            if let Some(context) = lifecycle {
+                let final_request_state = match final_state {
+                    RequestState::Completed => LifecycleFinalRequestState::Completed,
+                    RequestState::Cancelled => LifecycleFinalRequestState::Cancelled,
+                    RequestState::Errored => LifecycleFinalRequestState::Failed,
+                    _ => LifecycleFinalRequestState::OtherTerminalFailure,
+                };
+                let scope = context.source_scope();
+                context.dispatcher.publish(LifecycleSource::TurnTerminal {
+                    scope,
+                    authority: context.authority,
+                    source: LifecycleTerminalSource::NormalCompletion,
+                    final_state: final_request_state,
+                    duration_ms: res.wall_ms,
+                    input_tokens: (res.usage.input > 0).then_some(res.usage.input),
+                    output_tokens: (res.usage.output > 0).then_some(res.usage.output),
+                    cache_read_tokens: (res.usage.cache_read > 0).then_some(res.usage.cache_read),
+                    stamp: lifecycle_stamp(),
+                    error: (!res.ok).then(|| res.stderr.clone()),
+                });
+            }
             match final_state {
                 RequestState::Completed => {
                     if !res.stdout.trim().is_empty() {
@@ -5221,6 +5379,16 @@ async fn record_prompt_result(
     let _ = final_state;
 }
 
+async fn record_prompt_result(
+    state: &AppState,
+    request_id: RequestId,
+    res: &ocean_core::PromptResponse,
+    origin: Option<&'static str>,
+    agent_finished: Option<(AgentSessionId, AgentTurnEvent)>,
+) {
+    record_prompt_result_with_lifecycle(state, request_id, res, origin, agent_finished, None).await;
+}
+
 /// The clear, terminal error a turn carries when its task unwound (panicked) or
 /// was dropped before it could record its own result (TASK-56). Surfaced both as
 /// the registry request's terminal message and as the `error` on the emitted
@@ -5245,13 +5413,14 @@ const ORPHANED_TURN_ERROR: &str = "turn task panicked before completing";
 /// frame. This restores all three correctness points: `GET /v1/agent/sessions`
 /// stops reporting the turn active, an events subscriber receives the terminal
 /// `TurnFinished{Failed}`, and the registry entry becomes GC-eligible.
-async fn terminate_orphaned_turn(
+async fn terminate_orphaned_turn_with_lifecycle(
     requests: &RequestRegistry,
     events: &EventBus,
     agent_events: &AgentEventBus,
     request_id: RequestId,
     session_id: AgentSessionId,
     turn_id: AgentTurnId,
+    lifecycle: Option<LifecycleTerminalContext>,
 ) {
     // TASK-61: share the ONE finalizer with the normal completion path. The
     // terminal `TurnFinished(Failed)` is emitted INSIDE the registry write lock,
@@ -5273,6 +5442,26 @@ async fn terminate_orphaned_turn(
         RequestState::Errored,
         ORPHANED_TURN_ERROR.to_string(),
         |final_state| {
+            if let Some(context) = lifecycle {
+                let request_state = if matches!(final_state, RequestState::Cancelled) {
+                    LifecycleFinalRequestState::Cancelled
+                } else {
+                    LifecycleFinalRequestState::OtherTerminalFailure
+                };
+                let scope = context.source_scope();
+                context.dispatcher.publish(LifecycleSource::TurnTerminal {
+                    scope,
+                    authority: context.authority,
+                    source: LifecycleTerminalSource::OrphanSettlement,
+                    final_state: request_state,
+                    duration_ms: 0,
+                    input_tokens: None,
+                    output_tokens: None,
+                    cache_read_tokens: None,
+                    stamp: lifecycle_stamp(),
+                    error: Some(ORPHANED_TURN_ERROR.to_owned()),
+                });
+            }
             if !matches!(final_state, RequestState::Errored) {
                 return;
             }
@@ -5308,6 +5497,27 @@ async fn terminate_orphaned_turn(
     .await;
 }
 
+#[cfg(test)]
+async fn terminate_orphaned_turn(
+    requests: &RequestRegistry,
+    events: &EventBus,
+    agent_events: &AgentEventBus,
+    request_id: RequestId,
+    session_id: AgentSessionId,
+    turn_id: AgentTurnId,
+) {
+    terminate_orphaned_turn_with_lifecycle(
+        requests,
+        events,
+        agent_events,
+        request_id,
+        session_id,
+        turn_id,
+        None,
+    )
+    .await;
+}
+
 /// RAII guard that orphan-proofs a spawned turn task (TASK-56), mirroring the
 /// [`InFlightGuard`] idiom. Armed just before `runtime.prompt(...).await` and
 /// [`disarm`](Self::disarm)ed on the normal path once `record_prompt_result` has
@@ -5337,9 +5547,11 @@ struct TurnTerminalGuard {
     request_id: RequestId,
     session_id: AgentSessionId,
     turn_id: AgentTurnId,
+    lifecycle: Option<LifecycleTerminalContext>,
 }
 
 impl TurnTerminalGuard {
+    #[cfg(test)]
     fn arm(
         requests: RequestRegistry,
         events: EventBus,
@@ -5356,6 +5568,28 @@ impl TurnTerminalGuard {
             request_id,
             session_id,
             turn_id,
+            lifecycle: None,
+        }
+    }
+
+    fn arm_with_lifecycle(
+        requests: RequestRegistry,
+        events: EventBus,
+        agent_events: AgentEventBus,
+        request_id: RequestId,
+        session_id: AgentSessionId,
+        turn_id: AgentTurnId,
+        lifecycle: Option<LifecycleTerminalContext>,
+    ) -> Self {
+        Self {
+            armed: true,
+            requests,
+            events,
+            agent_events,
+            request_id,
+            session_id,
+            turn_id,
+            lifecycle,
         }
     }
 
@@ -5378,16 +5612,18 @@ impl Drop for TurnTerminalGuard {
         let request_id = self.request_id;
         let session_id = self.session_id;
         let turn_id = self.turn_id;
+        let lifecycle = self.lifecycle.clone();
         match tokio::runtime::Handle::try_current() {
             Ok(handle) => {
                 handle.spawn(async move {
-                    terminate_orphaned_turn(
+                    terminate_orphaned_turn_with_lifecycle(
                         &requests,
                         &events,
                         &agent_events,
                         request_id,
                         session_id,
                         turn_id,
+                        lifecycle,
                     )
                     .await;
                 });
@@ -5736,18 +5972,8 @@ async fn agent_turn(
         }
     };
 
-    if is_new_session {
-        emit_agent(
-            &state.events,
-            &state.agent_events,
-            session_id,
-            AgentTurnEvent::SessionCreated {
-                session_id,
-                title: prompt.chars().take(60).collect(),
-                cwd: cwd.clone(),
-            },
-        );
-    }
+    // SessionCreated is intentionally deferred until the session-operation
+    // lease succeeds below. Rejected/busy admission must publish no session id.
 
     // Capture the global and persisted-session candidates now; the final
     // selection and truthful `TurnStarted` announcement happen after the named
@@ -5873,6 +6099,37 @@ async fn agent_turn(
             );
         }
     };
+    let lifecycle_project_id = resolved_lifecycle_project_id(&state, project_id, &cwd);
+    let lifecycle_scope = state.extension_lifecycle.source_scope(
+        lifecycle_project_id,
+        Some(session_id.inner()),
+        Some(turn_id.inner()),
+        Some(request_id),
+        None,
+    );
+    state
+        .extension_lifecycle
+        .publish(LifecycleSource::OrdinaryTurnAdmission {
+            admitted: true,
+            new_session: is_new_session,
+            scope: lifecycle_scope,
+            session_stamp: lifecycle_stamp(),
+            turn_stamp: lifecycle_stamp(),
+            title: prompt.chars().take(60).collect(),
+            cwd: cwd.clone(),
+        });
+    if is_new_session {
+        emit_agent(
+            &state.events,
+            &state.agent_events,
+            session_id,
+            AgentTurnEvent::SessionCreated {
+                session_id,
+                title: prompt.chars().take(60).collect(),
+                cwd: cwd.clone(),
+            },
+        );
+    }
     emit_agent(
         &state.events,
         &state.agent_events,
@@ -5941,12 +6198,27 @@ async fn agent_turn(
         RequestState::Running,
     )
     .await;
+    // Mint one request-scoped atomic terminal authority and distribute clones
+    // to normal completion and the orphan/panic guard. No terminal lifecycle
+    // API exists without this exact authority.
+    let lifecycle_terminal_authority = state.extension_lifecycle.register_request(lifecycle_scope);
+    let lifecycle_terminal =
+        lifecycle_terminal_authority.map(|authority| LifecycleTerminalContext {
+            dispatcher: Arc::clone(&state.extension_lifecycle),
+            authority,
+            project_id: lifecycle_project_id,
+            session_id: session_id.inner(),
+            turn_id: turn_id.inner(),
+            request_id,
+        });
 
     // Wire up the runtime → bus streaming bridge. Every TextDelta /
     // ThinkingDelta / ToolExecution* event the agent emits gets forwarded
     // onto the AgentEventBus in real time so SSE clients render as it streams.
     let (event_tx, mut event_rx) = tokio::sync::mpsc::unbounded_channel::<AgentEvent>();
     let bridge_bus = state.agent_events.clone();
+    let bridge_lifecycle = Arc::clone(&state.extension_lifecycle);
+    let bridge_project_id = lifecycle_project_id;
     let bridge_turn_id = turn_id;
     let bridge_session_id = session_id;
 
@@ -6009,7 +6281,28 @@ async fn agent_turn(
                     ..
                 } => {
                     let call_id = ToolCallId(Uuid::new_v4());
-                    tool_call_ids.insert(tool_call_id, call_id.clone());
+                    tool_call_ids.insert(tool_call_id.clone(), call_id.clone());
+                    if let Ok(lifecycle_tool_name) =
+                        ocean_agent_sdk::extension_lifecycle::ToolName::new(tool_name.clone())
+                    {
+                        let scope = bridge_lifecycle.source_scope(
+                            bridge_project_id,
+                            Some(bridge_session_id.inner()),
+                            Some(bridge_turn_id.inner()),
+                            Some(request_id),
+                            None,
+                        );
+                        bridge_lifecycle.publish(LifecycleSource::ToolExecutionStart {
+                            scope,
+                            runtime_tool_call_id: tool_call_id,
+                            host_tool_call_id: call_id.0,
+                            tool_name: lifecycle_tool_name,
+                            started_at_ms: u64::try_from(Utc::now().timestamp_millis())
+                                .unwrap_or_default(),
+                            stamp: lifecycle_stamp(),
+                            arguments: args.clone(),
+                        });
+                    }
                     bridge_bus.emit(AgentTurnEvent::ToolCallStarted {
                         session_id: bridge_session_id,
                         turn_id: bridge_turn_id,
@@ -6028,10 +6321,32 @@ async fn agent_turn(
                     details,
                     ..
                 } => {
-                    let call_id = tool_call_ids
-                        .remove(&tool_call_id)
-                        .unwrap_or_else(|| ToolCallId(Uuid::new_v4()));
+                    let call_id = tool_call_ids.remove(&tool_call_id);
                     let output = render_tool_output(&content);
+                    let scope = bridge_lifecycle.source_scope(
+                        bridge_project_id,
+                        Some(bridge_session_id.inner()),
+                        Some(bridge_turn_id.inner()),
+                        Some(request_id),
+                        None,
+                    );
+                    bridge_lifecycle.publish(LifecycleSource::ToolExecutionEnd {
+                        scope,
+                        runtime_tool_call_id: tool_call_id,
+                        is_error,
+                        rendered_output: output.as_bytes().to_vec(),
+                        details: LifecycleToolEndDetails {
+                            cancelled: details
+                                .get("cancelled")
+                                .and_then(Value::as_bool)
+                                .unwrap_or(false),
+                            private: details.clone(),
+                        },
+                        ended_at_ms: u64::try_from(Utc::now().timestamp_millis())
+                            .unwrap_or_default(),
+                        stamp: lifecycle_stamp(),
+                    });
+                    let call_id = call_id.unwrap_or_else(|| ToolCallId(Uuid::new_v4()));
                     bridge_bus.emit(AgentTurnEvent::ToolCallFinished {
                         session_id: bridge_session_id,
                         turn_id: bridge_turn_id,
@@ -6051,6 +6366,10 @@ async fn agent_turn(
                 AgentEvent::PermissionDenied {
                     tool_name, reason, ..
                 } => {
+                    bridge_lifecycle.publish(LifecycleSource::CompatibilityPermissionDenied {
+                        tool_name: tool_name.clone(),
+                        reason: reason.clone(),
+                    });
                     // OCEAN-317: emit a paired Started→Finished so clients can
                     // correlate the denial with the tool call that triggered it.
                     // A lone Finished (no Started) leaves TUI blocks in a
@@ -6237,13 +6556,20 @@ async fn agent_turn(
         }
     });
 
-    let control = build_prompt_control(
+    let control = build_prompt_control_with_lifecycle(
         &state,
         request_id,
         Some(core_sid(session_id)),
         permission_mode,
         cancel,
         decision_token,
+        Some(LifecyclePermissionContext {
+            dispatcher: Arc::clone(&state.extension_lifecycle),
+            project_id: lifecycle_project_id,
+            session_id: Some(session_id.inner()),
+            turn_id: Some(turn_id.inner()),
+            request_id,
+        }),
     )
     // TASK-40: label the session from the ORIGINAL `prompt` — captured before
     // `guided_prompt` layered on the room/operator guidance, folder-as-agent
@@ -6321,13 +6647,14 @@ async fn agent_turn(
         // transition + `TurnFinished(Failed)` on unwind; it is disarmed on the
         // normal path once both have run, so a completed turn keeps exactly one
         // terminal frame.
-        let mut turn_guard = TurnTerminalGuard::arm(
+        let mut turn_guard = TurnTerminalGuard::arm_with_lifecycle(
             bg_state.requests.clone(),
             bg_state.events.clone(),
             bg_state.agent_events.clone(),
             request_id,
             session_id,
             turn_id,
+            lifecycle_terminal.clone(),
         );
         let res = bg_state
             .runtime
@@ -6409,12 +6736,13 @@ async fn agent_turn(
         // same content already streamed delta-by-delta on /v1/agent/events. TASK-61:
         // the agent-bus `turn_finished` frame rides along and is emitted atomically
         // with the terminal transition inside this call.
-        record_prompt_result(
+        record_prompt_result_with_lifecycle(
             &bg_state,
             request_id,
             &res,
             Some(ocean_core::EVENT_ORIGIN_AGENT),
             Some((session_id, turn_finished)),
+            lifecycle_terminal,
         )
         .await;
 
@@ -7121,6 +7449,24 @@ async fn agent_sessions_create(
     match state.runtime.create_session(&cwd, client_type) {
         Ok((core_id, bound_cwd, stored_client_type)) => {
             let session_id = sdk_sid(core_id);
+            let lifecycle_project_id =
+                resolved_lifecycle_project_id(&state, project_id, &bound_cwd);
+            let lifecycle_scope = state.extension_lifecycle.source_scope(
+                lifecycle_project_id,
+                Some(session_id.inner()),
+                None,
+                None,
+                None,
+            );
+            state
+                .extension_lifecycle
+                .publish(LifecycleSource::ExplicitSessionCreated {
+                    succeeded: true,
+                    scope: lifecycle_scope,
+                    stamp: lifecycle_stamp(),
+                    title: String::new(),
+                    cwd: bound_cwd.clone(),
+                });
             // Announce the new session on the agent event bus so live consumers
             // (and the legacy mirror) see it the same way the turn path does.
             emit_agent(
@@ -7799,6 +8145,18 @@ async fn voice_tts(
 // ---------------------------------------------------------------------------
 // Conversion helpers — bridge between core SessionId/Uuid and SDK wrappers
 // ---------------------------------------------------------------------------
+
+fn resolved_lifecycle_project_id(
+    state: &AppState,
+    explicit: Option<Uuid>,
+    workspace: &str,
+) -> Option<Uuid> {
+    explicit.or_else(|| {
+        state
+            .extension_lifecycle
+            .project_id_for_workspace(workspace)
+    })
+}
 
 /// Wrap a raw Uuid in a SessionId type alias.
 fn core_sid(sdk_id: AgentSessionId) -> SessionId {
@@ -12912,6 +13270,7 @@ mod tests {
             cancel: CancellationToken::new(),
             seen_permissions: Arc::new(Mutex::new(HashMap::new())),
             decision_token,
+            lifecycle: None,
         }
     }
 
@@ -12937,6 +13296,69 @@ mod tests {
             1,
             "a pending permission waiter must be registered while gated"
         );
+    }
+
+    #[tokio::test]
+    async fn permission_policy_publishes_waiting_then_exactly_one_resolution_without_payloads() {
+        use ocean_agent_sdk::extension_lifecycle::LifecycleEventKind;
+        use std::time::Duration;
+
+        let dispatcher = LifecycleDispatcher::new(Uuid::new_v4(), HashSet::new());
+        let mut policy = gating_policy(false);
+        let permissions = policy.permissions.clone();
+        policy.lifecycle = Some(LifecyclePermissionContext {
+            dispatcher: Arc::clone(&dispatcher),
+            project_id: None,
+            session_id: Some(Uuid::new_v4()),
+            turn_id: Some(Uuid::new_v4()),
+            request_id: policy.request_id,
+        });
+        let check = tokio::spawn(async move {
+            policy
+                .check("write", &json!({"secret_arg": "must-not-serialize"}))
+                .await
+        });
+        let permission_id = tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                if let Some(permission_id) = permissions.read().await.keys().next().copied() {
+                    break permission_id;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("permission waiter");
+        let sender = permissions
+            .write()
+            .await
+            .get_mut(&permission_id)
+            .and_then(|waiter| waiter.sender.take())
+            .expect("waiter sender");
+        sender
+            .send(AgentPermissionDecision::Allow)
+            .expect("decision");
+        assert!(matches!(
+            check.await.expect("check task"),
+            AgentPermissionDecision::Allow
+        ));
+
+        let retained = dispatcher.attach().retained;
+        assert_eq!(
+            retained.iter().map(|event| event.kind).collect::<Vec<_>>(),
+            vec![
+                LifecycleEventKind::PermissionRequested,
+                LifecycleEventKind::PermissionResolved,
+            ]
+        );
+        let wire = retained
+            .iter()
+            .map(ocean_agent_sdk::extension_lifecycle::encode_frame)
+            .collect::<Result<Vec<_>, _>>()
+            .expect("encode");
+        assert!(!wire
+            .concat()
+            .windows("must-not-serialize".len())
+            .any(|window| { window == "must-not-serialize".as_bytes() }));
     }
 
     #[test]
@@ -12985,6 +13407,11 @@ mod tests {
     // `decision_token` binding closes that hole: the token is required on the
     // decision POST, verified constant-time, and is ABSENT from the SSE payload.
 
+    /// Build a fresh, isolated lifecycle dispatcher for AppState helpers.
+    fn test_lifecycle_dispatcher() -> Arc<LifecycleDispatcher> {
+        LifecycleDispatcher::new(Uuid::new_v4(), HashSet::new())
+    }
+
     /// Build a minimal AppState carrying real `requests`/`permissions`/`events`
     /// registries for direct handler-level tests. No runtime turn is run.
     fn permission_test_state() -> AppState {
@@ -13007,6 +13434,8 @@ mod tests {
             runtime,
             roles: Arc::new(std::collections::HashMap::new()),
             events: EventBus::new(64),
+            extension_lifecycle: test_lifecycle_dispatcher(),
+            extension_supervisor: None,
             agent_events: AgentEventBus::new(64),
             requests: Arc::new(RwLock::new(HashMap::new())),
             permissions: Arc::new(RwLock::new(HashMap::new())),
@@ -13278,6 +13707,10 @@ mod tests {
             .unwrap_or_default()
             .contains("active operation"));
         assert!(state.requests.read().await.is_empty());
+        assert!(
+            state.extension_lifecycle.attach().retained.is_empty(),
+            "busy admission must publish neither session_started nor turn_started"
+        );
         let (events, _) = state.agent_events.subscribe_with_full_replay();
         assert!(
             events.iter().all(|envelope| !matches!(
@@ -13287,6 +13720,70 @@ mod tests {
             )),
             "busy rejection must happen before TurnStarted"
         );
+    }
+
+    #[tokio::test]
+    async fn explicit_session_create_publishes_only_the_successful_authoritative_fact() {
+        use ocean_agent_sdk::extension_lifecycle::LifecycleEventKind;
+
+        let state = capped_turn_state(1);
+        let workspace = tempfile::tempdir().expect("workspace");
+        let (status, created) = agent_sessions_create(
+            State(state.clone()),
+            Json(AgentSessionCreateRequest {
+                workspace_root: workspace.path().to_string_lossy().into_owned(),
+                project_id: None,
+                client_type: Some("cli".to_owned()),
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let retained = state.extension_lifecycle.attach().retained;
+        assert_eq!(retained.len(), 1);
+        assert_eq!(retained[0].kind, LifecycleEventKind::SessionStarted);
+        assert_eq!(
+            retained[0].scope.session_id,
+            Some(created.session_id.inner())
+        );
+        assert_eq!(retained[0].scope.turn_id, None);
+    }
+
+    #[tokio::test]
+    async fn extension_lifecycle_follows_admission_and_terminal_order_without_changing_ack() {
+        use ocean_agent_sdk::extension_lifecycle::LifecycleEventKind;
+        use std::time::Duration;
+
+        let state = capped_turn_state(1);
+        let (status, ack) = agent_turn(State(state.clone()), Json(sample_agent_turn())).await;
+        assert_eq!(status, StatusCode::ACCEPTED);
+        assert!(ack.ok);
+
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let retained = state.extension_lifecycle.attach().retained;
+                if retained
+                    .iter()
+                    .any(|event| event.kind == LifecycleEventKind::TurnFinished)
+                {
+                    let kinds: Vec<_> = retained.iter().map(|event| event.kind).collect();
+                    assert_eq!(
+                        &kinds[..2],
+                        &[
+                            LifecycleEventKind::SessionStarted,
+                            LifecycleEventKind::TurnStarted,
+                        ]
+                    );
+                    assert_eq!(kinds.last(), Some(&LifecycleEventKind::TurnFinished));
+                    assert!(retained
+                        .windows(2)
+                        .all(|pair| pair[0].sequence.0 < pair[1].sequence.0));
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("turn lifecycle did not converge");
     }
 
     /// A finished turn releases its permit: after a turn runs to completion on the
@@ -14582,6 +15079,8 @@ mod tests {
             runtime,
             roles: Arc::new(std::collections::HashMap::new()),
             events: EventBus::new(1024),
+            extension_lifecycle: test_lifecycle_dispatcher(),
+            extension_supervisor: None,
             agent_events: AgentEventBus::new(1024),
             requests: Arc::new(RwLock::new(HashMap::new())),
             permissions: Arc::new(RwLock::new(HashMap::new())),
@@ -14963,6 +15462,8 @@ mod tests {
             runtime,
             roles: Arc::new(std::collections::HashMap::new()),
             events: EventBus::new(1024),
+            extension_lifecycle: test_lifecycle_dispatcher(),
+            extension_supervisor: None,
             agent_events: AgentEventBus::new(1024),
             requests: Arc::new(RwLock::new(HashMap::new())),
             permissions: Arc::new(RwLock::new(HashMap::new())),
@@ -16710,6 +17211,8 @@ mod tests {
             runtime,
             roles: Arc::new(std::collections::HashMap::new()),
             events: EventBus::new(64),
+            extension_lifecycle: test_lifecycle_dispatcher(),
+            extension_supervisor: None,
             agent_events: AgentEventBus::new(64),
             requests: Arc::new(RwLock::new(HashMap::new())),
             permissions: Arc::new(RwLock::new(HashMap::new())),
