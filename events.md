@@ -5581,3 +5581,16 @@ packages. Removed that stale assertion while retaining frozen/fail-closed graph
 generation, nonempty text/JSON checks, NOTICE checks, and deterministic double
 generation. Local generation now succeeds with pinned cargo-about 0.9.1.
 _________________________________________________________________________________
+_________________________________________________________________________________
+time:      [02:27] [28-07-26]
+agent:     [pi] [gpt-5.4] [thoth]
+worktree:  [fix/tui-clippy-unblock]
+type:      [gh actions]
+area:      [testing]
+
+Aligned the npm smoke test with the repaired dependency inventory contract by
+removing its duplicate stale assertions that publish=false workspace roots must
+appear as third-party packages. Binary-section headers, cargo-about version,
+full NOTICE evidence, exact twelve-file payload, legal-file identity, npm/Bun
+installation, and dependency-free wrapper checks remain unchanged.
+_________________________________________________________________________________
