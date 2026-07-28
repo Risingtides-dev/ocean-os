@@ -108,3 +108,13 @@ http-body-util = "0.1"
 # through `ocean-store`'s API. Already in the workspace lock (transitive via
 # ocean-store), so this pulls no new download.
 rusqlite = { workspace = true }
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { workspace = true, features = [
+    "Wdk_Foundation",
+    "Wdk_Storage_FileSystem",
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_Storage_FileSystem",
+    "Win32_System_IO",
+] }

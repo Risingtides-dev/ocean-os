@@ -206,6 +206,10 @@ pub(crate) struct ExtensionSupervisor {
     cancel: CancellationToken,
     status: RuntimeStatusCache,
     root_task: Mutex<Option<JoinHandle<()>>>,
+    // Exceptional signal or membership-proof failures keep the unreaped child
+    // identity and PGID owner alive for one bounded shutdown retry. A2a never
+    // turns a cleanup uncertainty into permission to signal a reused group.
+    retained_cleanup: Mutex<Vec<CleanupAuthority>>,
 }
 
 impl ExtensionSupervisor {
@@ -215,6 +219,7 @@ impl ExtensionSupervisor {
             cancel: CancellationToken::new(),
             status: RuntimeStatusCache::default(),
             root_task: Mutex::new(None),
+            retained_cleanup: Mutex::new(Vec::new()),
         })
     }
 
@@ -280,29 +285,48 @@ impl ExtensionSupervisor {
             let cancel = self.cancel.clone();
             let status = self.status.clone();
             let boot_id = self.boot_id;
-            services.spawn(async move {
-                run_service(activation, boot_id, cancel, status).await;
-            });
+            services.spawn(async move { run_service(activation, boot_id, cancel, status).await });
         }
-        while services.join_next().await.is_some() {}
+        while let Some(result) = services.join_next().await {
+            match result {
+                Ok(Some(authority)) => self.retained_cleanup.lock().await.push(authority),
+                Ok(None) => {}
+                Err(_) => tracing::warn!(
+                    reason = "service_task_failed",
+                    "extension service task failed"
+                ),
+            }
+        }
     }
 
     pub(crate) async fn shutdown(&self) {
         self.cancel.cancel();
-        let Some(mut task) = self.root_task.lock().await.take() else {
-            return;
+        let deadline = tokio::time::Instant::now() + SUPERVISOR_SHUTDOWN_TIMEOUT;
+        if let Some(mut task) = self.root_task.lock().await.take() {
+            if tokio::time::timeout_at(deadline, &mut task).await.is_err() {
+                task.abort();
+                tracing::warn!(
+                    reason = "supervisor_shutdown_timeout",
+                    "extension supervisor shutdown timed out"
+                );
+                return;
+            }
+        }
+
+        let retained = std::mem::take(&mut *self.retained_cleanup.lock().await);
+        let retry = async move {
+            let mut retries = JoinSet::new();
+            for mut authority in retained {
+                retries.spawn(async move {
+                    terminate_process_group(&mut authority.child, &mut authority.owner).await
+                });
+            }
+            while retries.join_next().await.is_some() {}
         };
-        if tokio::time::timeout(SUPERVISOR_SHUTDOWN_TIMEOUT, &mut task)
-            .await
-            .is_err()
-        {
-            // Every launched service has a shorter internal cleanup bound. A
-            // timeout here can therefore only be stuck pre-spawn registry I/O;
-            // aborting the async waiter cannot launch package code later.
-            task.abort();
+        if tokio::time::timeout_at(deadline, retry).await.is_err() {
             tracing::warn!(
-                reason = "supervisor_shutdown_timeout",
-                "extension supervisor shutdown timed out"
+                reason = "retained_cleanup_timeout",
+                "retained extension cleanup timed out"
             );
         }
     }
@@ -672,7 +696,7 @@ async fn run_service(
     boot_id: Uuid,
     cancel: CancellationToken,
     status: RuntimeStatusCache,
-) {
+) -> Option<CleanupAuthority> {
     let epoch = Uuid::new_v4();
     status.insert_starting(&activation, epoch);
     if !matches!(activation.startup_timeout.as_millis(), 100..=30_000) {
@@ -683,7 +707,7 @@ async fn run_service(
             None,
             Some(RuntimeReason::ProtocolViolation),
         );
-        return;
+        return None;
     }
     if cancel.is_cancelled() {
         status.update(
@@ -693,7 +717,7 @@ async fn run_service(
             None,
             Some(RuntimeReason::Shutdown),
         );
-        return;
+        return None;
     }
 
     let connection_id = Uuid::new_v4();
@@ -712,7 +736,7 @@ async fn run_service(
                 None,
                 Some(RuntimeReason::RootUnavailable),
             );
-            return;
+            return None;
         }
     };
     let environment = match resolve_environment(&activation, |name| std::env::var_os(name)) {
@@ -731,7 +755,7 @@ async fn run_service(
                 Some(reason),
             );
             let _ = cleanup_temp_root(&roots);
-            return;
+            return None;
         }
     };
 
@@ -746,7 +770,7 @@ async fn run_service(
                 Some(RuntimeReason::SpawnFailed),
             );
             let _ = cleanup_temp_root(&roots);
-            return;
+            return None;
         }
     };
     drop(environment);
@@ -759,7 +783,7 @@ async fn run_service(
             Some(RuntimeReason::SpawnFailed),
         );
         let _ = cleanup_temp_root(&roots);
-        return;
+        return None;
     };
     let mut owner = ProcessGroupOwner::new(pid);
     let (Some(stdin), Some(stdout)) = (child.stdin.take(), child.stdout.take()) else {
@@ -778,7 +802,7 @@ async fn run_service(
                 RuntimeReason::CleanupFailed
             }),
         );
-        return;
+        return (!cleaned).then_some(CleanupAuthority { child, owner });
     };
     let mut stdin = stdin;
     let mut stdout = BufReader::new(stdout);
@@ -802,7 +826,7 @@ async fn run_service(
         }
     };
     let Some(handshake) = handshake else {
-        finish_process(
+        let cleaned = finish_process(
             &activation,
             &status,
             &mut child,
@@ -814,7 +838,7 @@ async fn run_service(
             RuntimeReason::Shutdown,
         )
         .await;
-        return;
+        return (!cleaned).then_some(CleanupAuthority { child, owner });
     };
     let subscriptions = match handshake {
         Ok(Ok(subscriptions)) => subscriptions,
@@ -826,7 +850,7 @@ async fn run_service(
                 None,
                 Some(RuntimeReason::ProtocolViolation),
             );
-            finish_process(
+            let cleaned = finish_process(
                 &activation,
                 &status,
                 &mut child,
@@ -838,7 +862,7 @@ async fn run_service(
                 RuntimeReason::ProtocolViolation,
             )
             .await;
-            return;
+            return (!cleaned).then_some(CleanupAuthority { child, owner });
         }
         Err(_) => {
             status.update(
@@ -848,7 +872,7 @@ async fn run_service(
                 None,
                 Some(RuntimeReason::StartupTimeout),
             );
-            finish_process(
+            let cleaned = finish_process(
                 &activation,
                 &status,
                 &mut child,
@@ -860,7 +884,7 @@ async fn run_service(
                 RuntimeReason::StartupTimeout,
             )
             .await;
-            return;
+            return (!cleaned).then_some(CleanupAuthority { child, owner });
         }
     };
     status.update(
@@ -912,13 +936,13 @@ async fn run_service(
                         break (ShutdownReason::Unhealthy, RuntimeReason::ProtocolViolation);
                     }
                     Err(_) => {
-                        break (ShutdownReason::Unhealthy, RuntimeReason::UnexpectedExit);
+                        break (ShutdownReason::Unhealthy, RuntimeReason::ProtocolViolation);
                     }
                 }
             }
         }
     };
-    finish_process(
+    let cleaned = finish_process(
         &activation,
         &status,
         &mut child,
@@ -930,6 +954,7 @@ async fn run_service(
         runtime_reason,
     )
     .await;
+    (!cleaned).then_some(CleanupAuthority { child, owner })
 }
 
 fn spawn_service(
@@ -1137,7 +1162,7 @@ async fn finish_process(
     roots: &AssignedRoots,
     reason: ShutdownReason,
     runtime_reason: RuntimeReason,
-) {
+) -> bool {
     let pid = child.id();
     status.update(
         activation,
@@ -1193,6 +1218,7 @@ async fn finish_process(
         None,
         Some(terminal_reason),
     );
+    group_cleaned
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1201,10 +1227,83 @@ enum SignalError {
     Os,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RetainedLeaderState {
+    Running,
+    Exited,
+}
+
+/// Narrow syscall/identity seam for deterministic generation-safety review.
+/// Production uses retained-child `waitid(WNOWAIT)` before every group signal;
+/// tests can model numeric reuse without asking the kernel PID allocator to wrap.
+trait ProcessGroupSyscalls {
+    fn retained_leader_state(
+        &self,
+        leader: libc::pid_t,
+    ) -> Result<RetainedLeaderState, SignalError>;
+    fn signal_group(&self, pgid: libc::pid_t, signal: libc::c_int) -> io::Result<()>;
+    fn group_has_live_members(&self, pgid: libc::pid_t) -> io::Result<bool>;
+}
+
+struct OsProcessGroupSyscalls;
+
+impl ProcessGroupSyscalls for OsProcessGroupSyscalls {
+    fn retained_leader_state(
+        &self,
+        leader: libc::pid_t,
+    ) -> Result<RetainedLeaderState, SignalError> {
+        let mut info = std::mem::MaybeUninit::<libc::siginfo_t>::zeroed();
+        // SAFETY: info points to writable siginfo storage. WNOWAIT preserves the
+        // child identity and zombie until group cleanup is proven complete.
+        let result = unsafe {
+            libc::waitid(
+                libc::P_PID,
+                leader as libc::id_t,
+                info.as_mut_ptr(),
+                libc::WEXITED | libc::WNOHANG | libc::WNOWAIT,
+            )
+        };
+        if result != 0 {
+            return if io::Error::last_os_error().raw_os_error() == Some(libc::ECHILD) {
+                Err(SignalError::LostOwnership)
+            } else {
+                Err(SignalError::Os)
+            };
+        }
+        // SAFETY: waitid initialized siginfo on success. A zero si_pid means the
+        // retained child is still running; the exact leader pid means zombie.
+        let exited = unsafe { info.assume_init().si_pid() == leader };
+        Ok(if exited {
+            RetainedLeaderState::Exited
+        } else {
+            RetainedLeaderState::Running
+        })
+    }
+
+    fn signal_group(&self, pgid: libc::pid_t, signal: libc::c_int) -> io::Result<()> {
+        // SAFETY: caller proved the exact leader remains an unreaped child, so a
+        // negative PGID cannot name a later unrelated generation.
+        if unsafe { libc::kill(-pgid, signal) } == 0 {
+            Ok(())
+        } else {
+            Err(io::Error::last_os_error())
+        }
+    }
+
+    fn group_has_live_members(&self, pgid: libc::pid_t) -> io::Result<bool> {
+        group_has_live_members(pgid)
+    }
+}
+
 struct ProcessGroupOwner {
     leader: libc::pid_t,
     pgid: libc::pid_t,
     reaped: bool,
+}
+
+struct CleanupAuthority {
+    child: Child,
+    owner: ProcessGroupOwner,
 }
 
 impl ProcessGroupOwner {
@@ -1217,75 +1316,65 @@ impl ProcessGroupOwner {
         }
     }
 
+    fn leader_owned_with(&self, syscalls: &impl ProcessGroupSyscalls) -> bool {
+        !self.reaped && syscalls.retained_leader_state(self.leader).is_ok()
+    }
+
     fn leader_owned(&self) -> bool {
-        if self.reaped {
-            return false;
-        }
-        let mut info = std::mem::MaybeUninit::<libc::siginfo_t>::zeroed();
-        // SAFETY: info points to writable siginfo storage. WNOWAIT explicitly
-        // preserves the child identity and zombie until group cleanup is proven.
-        let result = unsafe {
-            libc::waitid(
-                libc::P_PID,
-                self.leader as libc::id_t,
-                info.as_mut_ptr(),
-                libc::WEXITED | libc::WNOHANG | libc::WNOWAIT,
-            )
-        };
-        result == 0
+        self.leader_owned_with(&OsProcessGroupSyscalls)
     }
 
     fn leader_exited(&self) -> bool {
         if self.reaped {
             return true;
         }
-        let mut info = std::mem::MaybeUninit::<libc::siginfo_t>::zeroed();
-        // SAFETY: same retained-identity wait as leader_owned.
-        let result = unsafe {
-            libc::waitid(
-                libc::P_PID,
-                self.leader as libc::id_t,
-                info.as_mut_ptr(),
-                libc::WEXITED | libc::WNOHANG | libc::WNOWAIT,
-            )
-        };
-        if result != 0 {
-            return true;
-        }
-        // SAFETY: waitid initialized siginfo on success.
-        unsafe { info.assume_init().si_pid() == self.leader }
+        !matches!(
+            OsProcessGroupSyscalls.retained_leader_state(self.leader),
+            Ok(RetainedLeaderState::Running)
+        )
     }
 
-    fn signal(&self, signal: libc::c_int) -> Result<(), SignalError> {
-        if !self.leader_owned() {
+    fn signal_with(
+        &self,
+        signal: libc::c_int,
+        syscalls: &impl ProcessGroupSyscalls,
+    ) -> Result<(), SignalError> {
+        if self.reaped {
             return Err(SignalError::LostOwnership);
         }
-        // SAFETY: a negative owned PGID targets only the retained generation.
-        let result = unsafe { libc::kill(-self.pgid, signal) };
-        if result == 0 {
-            return Ok(());
-        }
-        let error = io::Error::last_os_error();
-        if error.raw_os_error() == Some(libc::ESRCH)
-            || (error.raw_os_error() == Some(libc::EPERM)
-                && matches!(group_has_live_members(self.pgid), Ok(false)))
-        {
-            Ok(())
-        } else {
-            Err(SignalError::Os)
+        syscalls.retained_leader_state(self.leader)?;
+        match syscalls.signal_group(self.pgid, signal) {
+            Ok(()) => Ok(()),
+            Err(error) if error.raw_os_error() == Some(libc::ESRCH) => Ok(()),
+            Err(error) if error.raw_os_error() == Some(libc::EPERM) => {
+                match syscalls.group_has_live_members(self.pgid) {
+                    Ok(false) => Ok(()),
+                    Ok(true) | Err(_) => Err(SignalError::Os),
+                }
+            }
+            Err(_) => Err(SignalError::Os),
         }
     }
 }
 
 async fn terminate_process_group(child: &mut Child, owner: &mut ProcessGroupOwner) -> bool {
-    if owner.signal(libc::SIGTERM).is_err() {
+    terminate_process_group_with(child, owner, &OsProcessGroupSyscalls).await
+}
+
+async fn terminate_process_group_with(
+    child: &mut Child,
+    owner: &mut ProcessGroupOwner,
+    syscalls: &impl ProcessGroupSyscalls,
+) -> bool {
+    let term_deadline = tokio::time::Instant::now() + GROUP_TERM_TIMEOUT;
+    if !signal_until(owner, libc::SIGTERM, term_deadline, syscalls).await {
         return false;
     }
-    if !wait_for_group_exit(owner.pgid, GROUP_TERM_TIMEOUT).await {
-        if owner.signal(libc::SIGKILL).is_err() {
-            return false;
-        }
-        if !wait_for_group_exit(owner.pgid, GROUP_KILL_TIMEOUT).await {
+    if !wait_for_group_exit_until(owner.pgid, term_deadline, syscalls).await {
+        let kill_deadline = tokio::time::Instant::now() + GROUP_KILL_TIMEOUT;
+        if !signal_until(owner, libc::SIGKILL, kill_deadline, syscalls).await
+            || !wait_for_group_exit_until(owner.pgid, kill_deadline, syscalls).await
+        {
             return false;
         }
     }
@@ -1296,13 +1385,33 @@ async fn terminate_process_group(child: &mut Child, owner: &mut ProcessGroupOwne
     true
 }
 
-async fn wait_for_group_exit(pgid: libc::pid_t, timeout: Duration) -> bool {
-    let deadline = tokio::time::Instant::now() + timeout;
+async fn signal_until(
+    owner: &ProcessGroupOwner,
+    signal: libc::c_int,
+    deadline: tokio::time::Instant,
+    syscalls: &impl ProcessGroupSyscalls,
+) -> bool {
     loop {
-        match group_has_live_members(pgid) {
-            Ok(false) => return true,
-            Ok(true) => {}
-            Err(_) => return false,
+        match owner.signal_with(signal, syscalls) {
+            Ok(()) => return true,
+            Err(SignalError::LostOwnership) => return false,
+            Err(SignalError::Os) => {}
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return false;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+}
+
+async fn wait_for_group_exit_until(
+    pgid: libc::pid_t,
+    deadline: tokio::time::Instant,
+    syscalls: &impl ProcessGroupSyscalls,
+) -> bool {
+    loop {
+        if let Ok(false) = syscalls.group_has_live_members(pgid) {
+            return true;
         }
         if tokio::time::Instant::now() >= deadline {
             return false;
@@ -1604,10 +1713,11 @@ printf '%s\n' '{"protocol":"ocean.extension.service","version":1,"frame":"shutdo
         .await
         .unwrap();
         cancel.cancel();
-        tokio::time::timeout(Duration::from_secs(10), task)
+        assert!(tokio::time::timeout(Duration::from_secs(10), task)
             .await
             .unwrap()
-            .unwrap();
+            .unwrap()
+            .is_none());
         let environment =
             fs::read_to_string(config.join("extensions/state/example.noop/data/environment"))
                 .unwrap();
@@ -1687,6 +1797,33 @@ printf '%s\n' '{"protocol":"ocean.extension.service","version":1,"frame":"shutdo
         assert_eq!(lines.lines().count(), 32);
         assert!(lines.lines().all(|line| line == "trusted"));
         assert!(retained.exists());
+    }
+
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn unlinked_verified_executable_fails_closed_without_selecting_replacement() {
+        let (temp, activation) = executable_fixture("#!/bin/sh\nprintf trusted > \"$OUTPUT\"\n");
+        let config = temp.path().join("config");
+        fs::create_dir_all(config.join("extensions")).unwrap();
+        let roots = assigned_roots(
+            &config,
+            &activation.package_id,
+            &activation.service_id,
+            Uuid::new_v4(),
+        )
+        .unwrap();
+        let output = temp.path().join("executed");
+        let environment = vec![(
+            "OUTPUT".to_owned(),
+            SensitiveValue(output.as_os_str().as_bytes().to_vec()),
+        )];
+        let entry = activation.package_path.join("service");
+        fs::remove_file(&entry).unwrap();
+        fs::write(&entry, "#!/bin/sh\nprintf replacement > \"$OUTPUT\"\n").unwrap();
+        fs::set_permissions(&entry, fs::Permissions::from_mode(0o700)).unwrap();
+
+        assert!(spawn_service(&activation, &roots, &environment).is_err());
+        assert!(!output.exists());
     }
 
     #[tokio::test]
@@ -1780,7 +1917,7 @@ printf temp > "$TMPDIR/temp-proof"
         activation.startup_timeout = Duration::from_millis(150);
         let config = activation.config_dir.clone();
         let status = RuntimeStatusCache::default();
-        tokio::time::timeout(
+        let retained = tokio::time::timeout(
             Duration::from_secs(8),
             run_service(
                 activation,
@@ -1791,6 +1928,7 @@ printf temp > "$TMPDIR/temp-proof"
         )
         .await
         .unwrap();
+        assert!(retained.is_none());
         let leader: libc::pid_t =
             fs::read_to_string(config.join("extensions/state/example.noop/data/leader.pid"))
                 .unwrap()
@@ -1874,7 +2012,7 @@ printf '%s\n' '{{"protocol":"ocean.extension.service","version":1,"frame":"shutd
             status.snapshot()
         );
         cancel.cancel();
-        task.await.unwrap();
+        assert!(task.await.unwrap().is_none());
         assert_eq!(
             fs::read_to_string(config.join("extensions/state/example.noop/data/secret-proof"))
                 .unwrap(),
@@ -1909,7 +2047,7 @@ printf '%s\n' '{"protocol":"ocean.extension.service","version":1,"frame":"shutdo
         fs::rename(&activation.package_path, &store).unwrap();
         activation.package_path = store;
         let status = RuntimeStatusCache::default();
-        tokio::time::timeout(
+        let retained = tokio::time::timeout(
             Duration::from_secs(5),
             run_service(
                 activation,
@@ -1920,6 +2058,40 @@ printf '%s\n' '{"protocol":"ocean.extension.service","version":1,"frame":"shutdo
         )
         .await
         .unwrap();
+        assert!(retained.is_none());
+        assert_eq!(status.snapshot()[0].state, RuntimeState::Unhealthy);
+        assert_eq!(
+            status.snapshot()[0].reason,
+            Some(RuntimeReason::ProtocolViolation)
+        );
+    }
+
+    #[tokio::test]
+    async fn malformed_post_ready_frame_is_a_protocol_violation() {
+        let script = r#"#!/bin/sh
+IFS= read -r hello || exit 10
+printf '%s\n' '{"protocol":"ocean.extension.service","version":1,"frame":"service_hello","subscriptions":[],"resume":null}'
+IFS= read -r ready || exit 11
+printf '%s\n' '{malformed'
+IFS= read -r shutdown || exit 12
+printf '%s\n' '{"protocol":"ocean.extension.service","version":1,"frame":"shutdown_complete"}'
+"#;
+        let (temp, mut activation) = executable_fixture(script);
+        install_fixture_store(&temp, &mut activation);
+        activation.events.clear();
+        let status = RuntimeStatusCache::default();
+        let retained = tokio::time::timeout(
+            Duration::from_secs(5),
+            run_service(
+                activation,
+                Uuid::new_v4(),
+                CancellationToken::new(),
+                status.clone(),
+            ),
+        )
+        .await
+        .unwrap();
+        assert!(retained.is_none());
         assert_eq!(status.snapshot()[0].state, RuntimeState::Unhealthy);
         assert_eq!(
             status.snapshot()[0].reason,
@@ -1950,12 +2122,13 @@ exit 0
         fs::rename(&activation.package_path, &store).unwrap();
         activation.package_path = store;
         let status = RuntimeStatusCache::default();
-        tokio::time::timeout(
+        let retained = tokio::time::timeout(
             Duration::from_secs(5),
             run_service(activation, Uuid::new_v4(), CancellationToken::new(), status),
         )
         .await
         .unwrap();
+        assert!(retained.is_none());
         let grandchild: libc::pid_t =
             fs::read_to_string(config.join("extensions/state/example.noop/data/grandchild.pid"))
                 .unwrap()
@@ -1967,16 +2140,106 @@ exit 0
     }
 
     #[tokio::test]
-    async fn reaped_real_leader_loses_authority_while_its_real_group_remains_live() {
-        let temp = tempfile::tempdir().unwrap();
-        let descendant_path = temp.path().join("descendant.pid");
+    async fn exceptional_signal_error_preserves_authority_for_bounded_retry() {
+        use std::cell::Cell;
+
+        struct FailingSignalSyscalls {
+            signal_calls: Cell<usize>,
+        }
+
+        impl ProcessGroupSyscalls for FailingSignalSyscalls {
+            fn retained_leader_state(
+                &self,
+                leader: libc::pid_t,
+            ) -> Result<RetainedLeaderState, SignalError> {
+                OsProcessGroupSyscalls.retained_leader_state(leader)
+            }
+
+            fn signal_group(&self, _pgid: libc::pid_t, _signal: libc::c_int) -> io::Result<()> {
+                self.signal_calls.set(self.signal_calls.get() + 1);
+                Err(io::Error::from_raw_os_error(libc::EPERM))
+            }
+
+            fn group_has_live_members(&self, _pgid: libc::pid_t) -> io::Result<bool> {
+                Err(io::Error::from_raw_os_error(libc::EIO))
+            }
+        }
+
         let mut command = Command::new("/bin/sh");
         command
             .arg("-c")
-            .arg(format!(
-                "sleep 30 & printf '%s' $! > '{}'",
-                descendant_path.display()
-            ))
+            .arg("sleep 30")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        // SAFETY: the child changes only its process group before exec.
+        unsafe {
+            command.pre_exec(|| {
+                if libc::setpgid(0, 0) != 0 {
+                    return Err(io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+        let child = command.spawn().unwrap();
+        let owner = ProcessGroupOwner::new(child.id().unwrap());
+        let mut authority = CleanupAuthority { child, owner };
+        let syscalls = FailingSignalSyscalls {
+            signal_calls: Cell::new(0),
+        };
+        let started = tokio::time::Instant::now();
+        assert!(
+            !terminate_process_group_with(&mut authority.child, &mut authority.owner, &syscalls,)
+                .await
+        );
+        assert!(started.elapsed() >= GROUP_TERM_TIMEOUT);
+        assert!(started.elapsed() < GROUP_TERM_TIMEOUT + Duration::from_secs(1));
+        assert!(syscalls.signal_calls.get() > 1);
+        assert!(authority.owner.leader_owned());
+        assert!(authority.child.try_wait().unwrap().is_none());
+
+        assert!(terminate_process_group(&mut authority.child, &mut authority.owner).await);
+    }
+
+    #[tokio::test]
+    async fn reaped_real_leader_and_simulated_reused_pgid_issue_no_signal_syscall() {
+        use std::cell::Cell;
+
+        struct ReusedPgidSyscalls {
+            pgid: libc::pid_t,
+            signal_calls: Cell<usize>,
+        }
+
+        impl ProcessGroupSyscalls for ReusedPgidSyscalls {
+            fn retained_leader_state(
+                &self,
+                leader: libc::pid_t,
+            ) -> Result<RetainedLeaderState, SignalError> {
+                assert_eq!(leader, self.pgid);
+                // Consult the real kernel identity: the fixture leader was
+                // reaped, so the numeric slot no longer names our child.
+                OsProcessGroupSyscalls.retained_leader_state(leader)
+            }
+
+            fn signal_group(&self, pgid: libc::pid_t, _signal: libc::c_int) -> io::Result<()> {
+                assert_eq!(pgid, self.pgid);
+                self.signal_calls.set(self.signal_calls.get() + 1);
+                Ok(())
+            }
+
+            fn group_has_live_members(&self, pgid: libc::pid_t) -> io::Result<bool> {
+                assert_eq!(pgid, self.pgid);
+                // Deterministically model the same numeric PGID now belonging
+                // to an unrelated generation; forcing kernel PID wrap is not a
+                // reliable or safe test fixture.
+                Ok(true)
+            }
+        }
+
+        let mut command = Command::new("/bin/sh");
+        command
+            .arg("-c")
+            .arg("exit 0")
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null());
@@ -1991,29 +2254,18 @@ exit 0
         }
         let mut leader = command.spawn().unwrap();
         let pid = leader.id().unwrap();
-        let mut owner = ProcessGroupOwner::new(pid);
-        tokio::time::timeout(Duration::from_secs(3), async {
-            while !owner.leader_exited() {
-                tokio::time::sleep(Duration::from_millis(10)).await;
-            }
-        })
-        .await
-        .unwrap();
+        let owner = ProcessGroupOwner::new(pid);
         leader.wait().await.unwrap();
-        owner.reaped = true;
-        let descendant: libc::pid_t = fs::read_to_string(descendant_path)
-            .unwrap()
-            .parse()
-            .unwrap();
-        assert_eq!(owner.signal(libc::SIGKILL), Err(SignalError::LostOwnership));
-        // SAFETY: signal 0 performs an existence check only.
-        assert_eq!(unsafe { libc::kill(descendant, 0) }, 0);
-        // This is the strongest deterministic reuse proof available without
-        // forcing the kernel PID allocator to wrap: a real reaped leader and a
-        // still-live process in its numeric PGID cannot be signaled through the
-        // generation owner. Clean the fixture explicitly, outside that API.
-        // SAFETY: the test owns this fixture process group.
-        unsafe { libc::kill(-owner.pgid, libc::SIGKILL) };
+
+        let syscalls = ReusedPgidSyscalls {
+            pgid: owner.pgid,
+            signal_calls: Cell::new(0),
+        };
+        assert_eq!(
+            owner.signal_with(libc::SIGKILL, &syscalls),
+            Err(SignalError::LostOwnership)
+        );
+        assert_eq!(syscalls.signal_calls.get(), 0);
     }
 
     #[cfg(unix)]

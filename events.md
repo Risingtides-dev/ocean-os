@@ -5619,4 +5619,11 @@ removing its duplicate stale assertions that publish=false workspace roots must
 appear as third-party packages. Binary-section headers, cargo-about version,
 full NOTICE evidence, exact twelve-file payload, legal-file identity, npm/Bun
 installation, and dependency-free wrapper checks remain unchanged.
+time:      [01:08] [28-07-26]
+agent:     [api] [gpt-5.4] [worker]
+worktree:  [feat/extensions-stage-a2a]
+type:      [bug report]: Close final Stage A2a validation and cleanup blockers
+area:      [backend]: Extension registry and native-service security boundary
+
+Consolidated unsupported reconciliation onto the sole descriptor/reparse-safe coherent reader and its exact artifact, service, capability, and secret-binding authority; removed the second pathname parser and added Windows relative-handle traversal primitives. Unsupported startup now projects only common-validated grants and remains no-child/non-probing. Added real supervisor valid/malformed/nonexistent-service/unauthorized-binding tests, the serialized 1,024/1,025 full-reader boundary, post-ready protocol-violation classification, a macOS unlink/fail-closed generation fixture, and a retained cleanup-authority lane for exceptional signal/membership-proof failures. The reviewed syscall/identity seam combines a real reaped leader with deterministic simulated same-number unrelated PGID membership and proves the signal syscall is never reached; forcing the kernel PID allocator to wrap would be nondeterministic and unsafe. A2b+ behavior remains absent.
 _________________________________________________________________________________

@@ -1,8 +1,9 @@
 //! Stage A2a fail-closed supervisor projection for unsupported platforms.
 //!
-//! Exact effective native service grants are read coherently and cached as
-//! `unsupported_platform`. No package artifact, secret, root, or process is
-//! opened by this boundary, and cache reads never probe or start anything.
+//! Exact effective native service grants are read through the sole coherent
+//! descriptor-safe registry/artifact validator and cached as
+//! `unsupported_platform`. Projection opens no secret, assigned root, or
+//! process, and cache reads never probe or start anything.
 
 #![cfg_attr(test, allow(dead_code))]
 
@@ -164,26 +165,205 @@ impl ExtensionSupervisor {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::extension_registry::{
+        read_unsupported_service_activations, test_snapshot_package_digest, StateError,
+    };
+    use serde_json::{json, Value};
+    use std::{fs, path::Path};
 
-    #[test]
-    fn exact_grant_projects_to_non_probing_unsupported_platform_status() {
-        let cache = RuntimeStatusCache::default();
-        cache.insert_unsupported(UnsupportedServiceActivation {
-            package_id: "example.noop".to_owned(),
-            package_version: "1.0.0".to_owned(),
-            package_digest: format!("sha256:{}", "a".repeat(64)),
-            service_id: "lifecycle".to_owned(),
-            activation_revision: 9,
-        });
-        let snapshot = cache.snapshot();
+    const ID: &str = "example.unsupported";
+
+    #[derive(Clone, Copy)]
+    enum FixtureKind {
+        Valid,
+        Malformed,
+        MissingService,
+        UnauthorizedBinding,
+    }
+
+    struct Fixture {
+        config: tempfile::TempDir,
+        marker: PathBuf,
+    }
+
+    fn write_json(path: &Path, value: &Value) {
+        fs::write(path, serde_json::to_vec_pretty(value).unwrap()).unwrap();
+    }
+
+    fn fixture(kind: FixtureKind) -> Fixture {
+        let config = tempfile::tempdir().unwrap();
+        let root = config.path().join("extensions");
+        let staging = root.join("store").join(ID).join("staging");
+        fs::create_dir_all(staging.join("services")).unwrap();
+        let marker = config.path().join("CHILD_STARTED");
+        let capabilities = if matches!(kind, FixtureKind::UnauthorizedBinding) {
+            "[services.capabilities]\nenv = [\"TARGET_TOKEN\"]\nsecrets = [\"env:SOURCE_TOKEN\"]\n"
+        } else {
+            ""
+        };
+        fs::write(
+            staging.join("ocean-extension.toml"),
+            format!(
+                "schema_version = 1\nid = \"{ID}\"\nname = \"Unsupported\"\nversion = \"1.0.0\"\nmin_ocean_version = \"0.1.0\"\n\n[[services]]\nid = \"lifecycle\"\nentry = \"services/lifecycle\"\nevents = []\n{capabilities}"
+            ),
+        )
+        .unwrap();
+        fs::write(
+            staging.join("services/lifecycle"),
+            format!("#!/bin/sh\nprintf started > '{}'\n", marker.display()),
+        )
+        .unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            fs::set_permissions(
+                staging.join("services/lifecycle"),
+                fs::Permissions::from_mode(0o700),
+            )
+            .unwrap();
+        }
+        let digest = test_snapshot_package_digest(&staging).unwrap();
+        fs::rename(
+            &staging,
+            staging
+                .parent()
+                .unwrap()
+                .join(digest.strip_prefix("sha256:").unwrap()),
+        )
+        .unwrap();
+        fs::write(root.join(".state.lock"), "").unwrap();
+        #[cfg(windows)]
+        let source_locator = r"C:\unsupported";
+        #[cfg(not(windows))]
+        let source_locator = "/tmp/unsupported";
+        write_json(
+            &root.join("installs.json"),
+            &json!({
+                "schema_version": 1,
+                "state_revision": 9,
+                "installs": [{
+                    "id": ID,
+                    "version": "1.0.0",
+                    "digest": digest,
+                    "source": {"kind": "local-path", "locator": source_locator}
+                }]
+            }),
+        );
+        write_json(
+            &root.join("trust.json"),
+            &json!({
+                "schema_version": 1,
+                "state_revision": 9,
+                "grants": [{
+                    "id": ID,
+                    "digest": digest,
+                    "capabilities": if matches!(kind, FixtureKind::UnauthorizedBinding) {
+                        json!({"env": ["TARGET_TOKEN"], "secrets": []})
+                    } else {
+                        json!({})
+                    }
+                }]
+            }),
+        );
+        write_json(
+            &root.join("enabled.json"),
+            &json!({
+                "schema_version": 1,
+                "state_revision": 9,
+                "extensions": [{"id": ID, "global": true, "projects": []}]
+            }),
+        );
+        if matches!(kind, FixtureKind::Malformed) {
+            fs::write(root.join("service-grants.json"), b"{not-json").unwrap();
+        } else {
+            let service_id = if matches!(kind, FixtureKind::MissingService) {
+                "missing"
+            } else {
+                "lifecycle"
+            };
+            let bindings = if matches!(kind, FixtureKind::UnauthorizedBinding) {
+                json!([{"target_env": "TARGET_TOKEN", "reference": "env:SOURCE_TOKEN"}])
+            } else {
+                json!([])
+            };
+            write_json(
+                &root.join("service-grants.json"),
+                &json!({
+                    "schema_version": 1,
+                    "state_revision": 9,
+                    "service_grants": [{
+                        "id": ID,
+                        "digest": digest,
+                        "service_id": service_id,
+                        "native_process_ack": true,
+                        "secret_bindings": bindings
+                    }]
+                }),
+            );
+        }
+        Fixture { config, marker }
+    }
+
+    async fn start_and_snapshot(fixture: &Fixture) -> Vec<RuntimeStatus> {
+        let supervisor = ExtensionSupervisor::new();
+        supervisor
+            .start(fixture.config.path().to_path_buf(), HashSet::new())
+            .await;
+        supervisor.shutdown().await;
+        supervisor.status_cache().snapshot()
+    }
+
+    #[tokio::test]
+    async fn real_startup_projects_only_common_validated_state_and_never_starts_a_child() {
+        let valid = fixture(FixtureKind::Valid);
+        let snapshot = start_and_snapshot(&valid).await;
         assert_eq!(snapshot.len(), 1);
         assert_eq!(snapshot[0].state, RuntimeState::UnsupportedPlatform);
         assert_eq!(snapshot[0].reason, Some(RuntimeReason::UnsupportedPlatform));
         assert_eq!(snapshot[0].pid, None);
         assert_eq!(snapshot[0].started_at, None);
+        assert!(!valid.marker.exists());
         let encoded = serde_json::to_string(&snapshot).unwrap();
         assert!(encoded.contains("unsupported_platform"));
         assert!(!encoded.contains("args"));
         assert!(!encoded.contains("secret"));
+
+        let production = include_str!("extension_service_unsupported.rs")
+            .split("#[cfg(test)]")
+            .next()
+            .unwrap();
+        for child_api in ["std::process", "tokio::process", "Command::new"] {
+            assert!(
+                !production.contains(child_api),
+                "unsupported supervisor gained child API {child_api}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn real_startup_rejects_malformed_nonexistent_service_and_unauthorized_binding() {
+        for (kind, expected) in [
+            (
+                FixtureKind::Malformed,
+                StateError::Parse("service-grants.json"),
+            ),
+            (
+                FixtureKind::MissingService,
+                StateError::InvalidRecord("service-grant-service"),
+            ),
+            (
+                FixtureKind::UnauthorizedBinding,
+                StateError::InvalidRecord("secret-binding-authority"),
+            ),
+        ] {
+            let fixture = fixture(kind);
+            assert_eq!(
+                read_unsupported_service_activations(fixture.config.path(), &HashSet::new())
+                    .unwrap_err(),
+                expected
+            );
+            assert!(start_and_snapshot(&fixture).await.is_empty());
+            assert!(!fixture.marker.exists());
+        }
     }
 }

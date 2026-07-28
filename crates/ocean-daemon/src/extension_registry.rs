@@ -8,7 +8,9 @@
 //! activation records consumed by `extension_service`.
 
 use std::collections::{BTreeSet, HashMap, HashSet};
-use std::ffi::{CStr, CString, OsStr};
+use std::ffi::OsStr;
+#[cfg(unix)]
+use std::ffi::{CStr, CString};
 use std::fmt;
 use std::fs::{self, File};
 use std::io::Read;
@@ -16,6 +18,11 @@ use std::io::Read;
 use std::os::fd::{AsRawFd, FromRawFd};
 #[cfg(unix)]
 use std::os::unix::ffi::OsStrExt;
+#[cfg(windows)]
+use std::os::windows::{
+    ffi::OsStrExt as _,
+    io::{AsRawHandle, FromRawHandle},
+};
 use std::path::{Component, Path as FsPath, PathBuf};
 use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
@@ -217,9 +224,20 @@ pub(crate) struct UnsupportedServiceActivation {
     pub(crate) activation_revision: u64,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ValidatedServiceAuthority {
+    package_id: String,
+    package_digest: String,
+    service_id: String,
+}
+
 struct LockedState {
     root: Option<File>,
     snapshot: StateSnapshot,
+    // Derived only by the descriptor-safe artifact/service/capability/binding
+    // validator below. Supported and unsupported supervisors consume this same
+    // authority; neither may recreate effective grants from raw state rows.
+    service_authority: Vec<ValidatedServiceAuthority>,
     // Dropping the file releases the shared advisory lock. It stays live while
     // the artifact is traversed so a compliant Phase 3 writer cannot publish a
     // mixed state/payload generation.
@@ -430,6 +448,7 @@ fn empty_state() -> LockedState {
             enablement: Vec::new(),
             service_grants: Vec::new(),
         },
+        service_authority: Vec::new(),
         _lock: None,
     }
 }
@@ -486,11 +505,12 @@ fn read_locked_state(config_dir: &FsPath) -> Result<LockedState, StateError> {
             .unwrap_or_default(),
     };
     validate_snapshot(&mut snapshot)?;
-    validate_service_grants_against_artifacts(&root, &snapshot)?;
+    let service_authority = validate_service_grants_against_artifacts(&root, &snapshot)?;
 
     Ok(LockedState {
         root: Some(root),
         snapshot,
+        service_authority,
         _lock: Some(lock),
     })
 }
@@ -501,7 +521,7 @@ fn open_extensions_root(config_dir: &FsPath) -> Result<Option<File>, StateError>
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(_) => return Err(StateError::Read("config directory")),
     };
-    let config = File::open(&canonical_config).map_err(|_| StateError::Read("config directory"))?;
+    let config = open_config_directory(&canonical_config)?;
     if !config
         .metadata()
         .map_err(|_| StateError::Read("config directory"))?
@@ -514,6 +534,52 @@ fn open_extensions_root(config_dir: &FsPath) -> Result<Option<File>, StateError>
         Err(StateError::MissingComponent(_)) => Ok(None),
         Err(error) => Err(error),
     }
+}
+
+#[cfg(not(windows))]
+fn open_config_directory(path: &FsPath) -> Result<File, StateError> {
+    File::open(path).map_err(|_| StateError::Read("config directory"))
+}
+
+#[cfg(windows)]
+fn open_config_directory(path: &FsPath) -> Result<File, StateError> {
+    use std::os::windows::fs::MetadataExt as _;
+    use windows_sys::Win32::{
+        Foundation::INVALID_HANDLE_VALUE,
+        Storage::FileSystem::{
+            CreateFileW, FILE_ATTRIBUTE_REPARSE_POINT, FILE_FLAG_BACKUP_SEMANTICS,
+            FILE_FLAG_OPEN_REPARSE_POINT, FILE_GENERIC_READ, FILE_SHARE_DELETE, FILE_SHARE_READ,
+            FILE_SHARE_WRITE, OPEN_EXISTING,
+        },
+    };
+
+    let mut path = path.as_os_str().encode_wide().collect::<Vec<_>>();
+    path.push(0);
+    // SAFETY: path is NUL-terminated and the returned handle is transferred
+    // exactly once to File after validation.
+    let handle = unsafe {
+        CreateFileW(
+            path.as_ptr(),
+            FILE_GENERIC_READ,
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+            std::ptr::null(),
+            OPEN_EXISTING,
+            FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT,
+            std::ptr::null_mut(),
+        )
+    };
+    if handle == INVALID_HANDLE_VALUE {
+        return Err(StateError::Read("config directory"));
+    }
+    // SAFETY: CreateFileW returned a fresh owned handle.
+    let file = unsafe { File::from_raw_handle(handle) };
+    let metadata = file
+        .metadata()
+        .map_err(|_| StateError::Read("config directory"))?;
+    if !metadata.is_dir() || metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+        return Err(StateError::InvalidComponent("config directory"));
+    }
+    Ok(file)
 }
 
 fn acquire_shared_lock(file: &File) -> Result<(), StateError> {
@@ -625,12 +691,123 @@ fn open_at(
     Ok(unsafe { File::from_raw_fd(descriptor) })
 }
 
-#[cfg(not(unix))]
+#[cfg(windows)]
+fn open_dir_at(parent: &File, name: &OsStr, label: &'static str) -> Result<File, StateError> {
+    windows_open_at(parent, name, label, true)
+}
+
+#[cfg(windows)]
+fn open_file_at(parent: &File, name: &OsStr, label: &'static str) -> Result<File, StateError> {
+    windows_open_at(parent, name, label, false)
+}
+
+#[cfg(windows)]
+fn windows_open_at(
+    parent: &File,
+    name: &OsStr,
+    label: &'static str,
+    directory: bool,
+) -> Result<File, StateError> {
+    use windows_sys::{
+        Wdk::{
+            Foundation::OBJECT_ATTRIBUTES,
+            Storage::FileSystem::{
+                NtCreateFile, FILE_DIRECTORY_FILE, FILE_NON_DIRECTORY_FILE, FILE_OPEN,
+                FILE_OPEN_REPARSE_POINT, FILE_SYNCHRONOUS_IO_NONALERT,
+            },
+        },
+        Win32::{
+            Foundation::{
+                HANDLE, OBJ_CASE_INSENSITIVE, OBJ_DONT_REPARSE, STATUS_NOT_A_DIRECTORY,
+                STATUS_OBJECT_NAME_NOT_FOUND, STATUS_OBJECT_PATH_NOT_FOUND,
+                STATUS_REPARSE_POINT_ENCOUNTERED, UNICODE_STRING,
+            },
+            Storage::FileSystem::{
+                FILE_ATTRIBUTE_NORMAL, FILE_GENERIC_READ, FILE_SHARE_DELETE, FILE_SHARE_READ,
+                FILE_SHARE_WRITE,
+            },
+            System::IO::IO_STATUS_BLOCK,
+        },
+    };
+
+    let name_units = name.encode_wide().collect::<Vec<_>>();
+    if name_units.is_empty()
+        || name_units
+            .iter()
+            .any(|unit| *unit == 0 || *unit == u16::from(b'/') || *unit == u16::from(b'\\'))
+        || name == OsStr::new(".")
+        || name == OsStr::new("..")
+    {
+        return Err(StateError::InvalidComponent(label));
+    }
+    let byte_length = name_units
+        .len()
+        .checked_mul(std::mem::size_of::<u16>())
+        .and_then(|length| u16::try_from(length).ok())
+        .ok_or(StateError::InvalidComponent(label))?;
+    let name = UNICODE_STRING {
+        Length: byte_length,
+        MaximumLength: byte_length,
+        Buffer: name_units.as_ptr().cast_mut(),
+    };
+    let attributes = OBJECT_ATTRIBUTES {
+        Length: u32::try_from(std::mem::size_of::<OBJECT_ATTRIBUTES>())
+            .map_err(|_| StateError::Read(label))?,
+        RootDirectory: parent.as_raw_handle() as HANDLE,
+        ObjectName: &name,
+        Attributes: OBJ_CASE_INSENSITIVE | OBJ_DONT_REPARSE,
+        SecurityDescriptor: std::ptr::null(),
+        SecurityQualityOfService: std::ptr::null(),
+    };
+    let mut handle: HANDLE = std::ptr::null_mut();
+    let mut io_status = IO_STATUS_BLOCK::default();
+    let kind = if directory {
+        FILE_DIRECTORY_FILE
+    } else {
+        FILE_NON_DIRECTORY_FILE
+    };
+    // SAFETY: every pointer names initialized storage for the duration of the
+    // synchronous call. RootDirectory is the live parent File handle, and the
+    // returned handle transfers exactly once into File on success.
+    let status = unsafe {
+        NtCreateFile(
+            &mut handle,
+            FILE_GENERIC_READ,
+            &attributes,
+            &mut io_status,
+            std::ptr::null(),
+            FILE_ATTRIBUTE_NORMAL,
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+            FILE_OPEN,
+            kind | FILE_OPEN_REPARSE_POINT | FILE_SYNCHRONOUS_IO_NONALERT,
+            std::ptr::null(),
+            0,
+        )
+    };
+    if status < 0 {
+        return match status {
+            STATUS_OBJECT_NAME_NOT_FOUND | STATUS_OBJECT_PATH_NOT_FOUND => {
+                Err(StateError::MissingComponent(label))
+            }
+            STATUS_REPARSE_POINT_ENCOUNTERED | STATUS_NOT_A_DIRECTORY => {
+                Err(StateError::InvalidComponent(label))
+            }
+            _ => Err(StateError::Read(label)),
+        };
+    }
+    if handle.is_null() {
+        return Err(StateError::Read(label));
+    }
+    // SAFETY: NtCreateFile returned a fresh owned handle.
+    Ok(unsafe { File::from_raw_handle(handle) })
+}
+
+#[cfg(not(any(unix, windows)))]
 fn open_dir_at(_parent: &File, _name: &OsStr, label: &'static str) -> Result<File, StateError> {
     Err(StateError::InvalidComponent(label))
 }
 
-#[cfg(not(unix))]
+#[cfg(not(any(unix, windows)))]
 fn open_file_at(_parent: &File, _name: &OsStr, label: &'static str) -> Result<File, StateError> {
     Err(StateError::InvalidComponent(label))
 }
@@ -716,7 +893,106 @@ fn directory_names(directory: &File, remaining: usize) -> Result<Vec<String>, St
     Ok(names)
 }
 
-#[cfg(not(unix))]
+#[cfg(windows)]
+fn directory_names(directory: &File, remaining: usize) -> Result<Vec<String>, StateError> {
+    use std::os::windows::ffi::OsStringExt as _;
+    use windows_sys::{
+        Wdk::Storage::FileSystem::{
+            FileIdFullDirectoryInformation, NtQueryDirectoryFile, FILE_ID_FULL_DIR_INFORMATION,
+        },
+        Win32::{
+            Foundation::{STATUS_NO_MORE_FILES, STATUS_SUCCESS},
+            Storage::FileSystem::FILE_ATTRIBUTE_REPARSE_POINT,
+            System::IO::IO_STATUS_BLOCK,
+        },
+    };
+
+    let mut buffer = vec![0_u8; 64 * 1024];
+    let mut names = Vec::new();
+    let mut restart = true;
+    loop {
+        let mut io_status = IO_STATUS_BLOCK::default();
+        // SAFETY: directory is a live directory handle, buffer is writable for
+        // its declared length, and the information class matches the parser.
+        let status = unsafe {
+            NtQueryDirectoryFile(
+                directory.as_raw_handle(),
+                std::ptr::null_mut(),
+                None,
+                std::ptr::null(),
+                &mut io_status,
+                buffer.as_mut_ptr().cast(),
+                u32::try_from(buffer.len()).map_err(|_| StateError::Read("extension payload"))?,
+                FileIdFullDirectoryInformation,
+                false,
+                std::ptr::null(),
+                restart,
+            )
+        };
+        restart = false;
+        if status == STATUS_NO_MORE_FILES {
+            break;
+        }
+        if status != STATUS_SUCCESS {
+            return Err(StateError::Read("extension payload"));
+        }
+
+        let mut offset = 0usize;
+        loop {
+            if offset + std::mem::size_of::<FILE_ID_FULL_DIR_INFORMATION>() > buffer.len() {
+                return Err(StateError::Read("extension payload"));
+            }
+            // SAFETY: the bounds above cover this byte-packed, potentially
+            // unaligned directory record.
+            let info = unsafe {
+                std::ptr::read_unaligned(
+                    buffer[offset..]
+                        .as_ptr()
+                        .cast::<FILE_ID_FULL_DIR_INFORMATION>(),
+                )
+            };
+            let name_offset = offset + std::mem::offset_of!(FILE_ID_FULL_DIR_INFORMATION, FileName);
+            let name_length = usize::try_from(info.FileNameLength)
+                .map_err(|_| StateError::Read("extension payload"))?;
+            if name_length % 2 != 0 || name_offset + name_length > buffer.len() {
+                return Err(StateError::Read("extension payload"));
+            }
+            let units = buffer[name_offset..name_offset + name_length]
+                .chunks_exact(2)
+                .map(|chunk| u16::from_ne_bytes([chunk[0], chunk[1]]))
+                .collect::<Vec<_>>();
+            let name = std::ffi::OsString::from_wide(&units);
+            if name != OsStr::new(".") && name != OsStr::new("..") {
+                if info.FileAttributes & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+                    return Err(StateError::InvalidComponent("extension payload"));
+                }
+                let name = name
+                    .into_string()
+                    .map_err(|_| StateError::InvalidComponent("extension payload"))?;
+                if name.is_empty() || name.chars().any(char::is_control) {
+                    return Err(StateError::InvalidComponent("extension payload"));
+                }
+                names.push(name);
+                if names.len() > remaining {
+                    return Err(StateError::Oversized("extension payload"));
+                }
+            }
+            if info.NextEntryOffset == 0 {
+                break;
+            }
+            offset = offset
+                .checked_add(
+                    usize::try_from(info.NextEntryOffset)
+                        .map_err(|_| StateError::Read("extension payload"))?,
+                )
+                .ok_or(StateError::Read("extension payload"))?;
+        }
+    }
+    names.sort();
+    Ok(names)
+}
+
+#[cfg(not(any(unix, windows)))]
 fn directory_names(_directory: &File, _remaining: usize) -> Result<Vec<String>, StateError> {
     Err(StateError::InvalidComponent("extension payload"))
 }
@@ -861,11 +1137,20 @@ pub(crate) fn env_secret_source(reference: &str) -> Option<&str> {
     valid_child_environment_name(key).then_some(key)
 }
 
+struct ValidatedArtifactMetadata {
+    metadata: OceanExtensionMetadata,
+    host_compatible: bool,
+    package_authorized: bool,
+}
+
 fn validate_service_grants_against_artifacts(
     root: &File,
     snapshot: &StateSnapshot,
-) -> Result<(), StateError> {
+) -> Result<Vec<ValidatedServiceAuthority>, StateError> {
     let mut metadata_by_artifact = HashMap::new();
+    let mut service_authority = Vec::with_capacity(snapshot.service_grants.len());
+    let host_version =
+        Version::parse(env!("CARGO_PKG_VERSION")).expect("daemon package version is valid SemVer");
     for grant in &snapshot.service_grants {
         let install = snapshot
             .installs
@@ -886,6 +1171,11 @@ fn validate_service_grants_against_artifacts(
             }
             let raw = RawOceanExtensionManifest::parse(&package.manifest)
                 .map_err(|_| StateError::InvalidRecord("manifest"))?;
+            let host_compatible = match raw.clone().validate_metadata(&host_version) {
+                Ok(_) => true,
+                Err(ExtensionManifestError::IncompatibleHost { .. }) => false,
+                Err(_) => return Err(StateError::InvalidRecord("manifest")),
+            };
             let metadata = raw
                 .validate_metadata(&Version::new(u64::MAX, u64::MAX, u64::MAX))
                 .map_err(|_| StateError::InvalidRecord("manifest"))?;
@@ -895,19 +1185,43 @@ fn validate_service_grants_against_artifacts(
             {
                 return Err(StateError::InvalidRecord("manifest-identity"));
             }
-            metadata_by_artifact.insert(key.clone(), metadata);
+            let requested = requested_capabilities(&metadata);
+            let package_authorized = grants_are_subset(&trust.capabilities, &requested)
+                && metadata.services.iter().all(|service| {
+                    service.capabilities.network.is_empty()
+                        && service.capabilities.filesystem.is_empty()
+                });
+            metadata_by_artifact.insert(
+                key.clone(),
+                ValidatedArtifactMetadata {
+                    metadata,
+                    host_compatible,
+                    package_authorized,
+                },
+            );
         }
-        let metadata = metadata_by_artifact
+        let artifact = metadata_by_artifact
             .get(&key)
             .ok_or(StateError::InvalidRecord("manifest"))?;
-        let service = metadata
+        let service = artifact
+            .metadata
             .services
             .iter()
             .find(|service| service.id == grant.service_id)
             .ok_or(StateError::InvalidRecord("service-grant-service"))?;
         validate_binding_authority(grant, trust, service)?;
+        if artifact.host_compatible
+            && artifact.package_authorized
+            && service_is_fully_authorized(service, trust, grant)
+        {
+            service_authority.push(ValidatedServiceAuthority {
+                package_id: grant.id.clone(),
+                package_digest: grant.digest.clone(),
+                service_id: grant.service_id.clone(),
+            });
+        }
     }
-    Ok(())
+    Ok(service_authority)
 }
 
 fn validate_binding_authority(
@@ -1095,6 +1409,12 @@ struct PackageWalk {
     manifest: Option<Vec<u8>>,
     total_bytes: u64,
     total_entries: usize,
+}
+
+#[cfg(test)]
+pub(crate) fn test_snapshot_package_digest(path: &FsPath) -> Result<String, StateError> {
+    let package = File::open(path).map_err(|_| StateError::Read("extension payload"))?;
+    snapshot_package(&package).map(|snapshot| snapshot.digest)
 }
 
 fn snapshot_package(package: &File) -> Result<PackageSnapshot, StateError> {
@@ -1513,23 +1833,21 @@ fn grants_are_subset(granted: &CapabilitySet, requested: &CapabilitySet) -> bool
 
 #[cfg(any(test, not(any(target_os = "macos", target_os = "linux"))))]
 fn derive_unsupported_service_activations(
-    snapshot: &StateSnapshot,
+    state: &LockedState,
     registered_projects: &HashSet<Uuid>,
 ) -> Vec<UnsupportedServiceActivation> {
-    snapshot
-        .service_grants
+    state
+        .service_authority
         .iter()
-        .filter_map(|service_grant| {
-            let install = snapshot.installs.iter().find(|install| {
-                install.id == service_grant.id && install.digest == service_grant.digest
+        .filter_map(|authority| {
+            let install = state.snapshot.installs.iter().find(|install| {
+                install.id == authority.package_id && install.digest == authority.package_digest
             })?;
-            snapshot.grants.iter().find(|grant| {
-                grant.id == service_grant.id && grant.digest == service_grant.digest
-            })?;
-            let enablement = snapshot
+            let enablement = state
+                .snapshot
                 .enablement
                 .iter()
-                .find(|entry| entry.id == service_grant.id)?;
+                .find(|entry| entry.id == authority.package_id)?;
             if !enablement.global
                 && !enablement.projects.iter().any(|project| {
                     project.enabled && registered_projects.contains(&project.project_id)
@@ -1541,8 +1859,8 @@ fn derive_unsupported_service_activations(
                 package_id: install.id.clone(),
                 package_version: install.version.clone(),
                 package_digest: install.digest.clone(),
-                service_id: service_grant.service_id.clone(),
-                activation_revision: snapshot.revision,
+                service_id: authority.service_id.clone(),
+                activation_revision: state.snapshot.revision,
             })
         })
         .collect()
@@ -1553,83 +1871,9 @@ pub(crate) fn read_unsupported_service_activations(
     config_dir: &FsPath,
     registered_projects: &HashSet<Uuid>,
 ) -> Result<Vec<UnsupportedServiceActivation>, StateError> {
-    fn direct_json<T: for<'de> Deserialize<'de>>(
-        root: &FsPath,
-        name: &'static str,
-    ) -> Result<T, StateError> {
-        let path = root.join(name);
-        let metadata = fs::symlink_metadata(&path).map_err(|error| {
-            if error.kind() == std::io::ErrorKind::NotFound {
-                StateError::MissingComponent(name)
-            } else {
-                StateError::Read(name)
-            }
-        })?;
-        if !metadata.is_file() || metadata.file_type().is_symlink() {
-            return Err(StateError::InvalidComponent(name));
-        }
-        let mut file = File::open(path).map_err(|_| StateError::Read(name))?;
-        let bytes = read_capped(&mut file, STATE_FILE_LIMIT, name)?;
-        serde_json::from_slice(&bytes).map_err(|_| StateError::Parse(name))
-    }
-
-    let root = match fs::canonicalize(config_dir.join("extensions")) {
-        Ok(root) => root,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
-        Err(_) => return Err(StateError::Read("extensions/")),
-    };
-    let lock_path = root.join(".state.lock");
-    let lock_metadata =
-        fs::symlink_metadata(&lock_path).map_err(|_| StateError::Read(".state.lock"))?;
-    if !lock_metadata.is_file() || lock_metadata.file_type().is_symlink() {
-        return Err(StateError::InvalidComponent(".state.lock"));
-    }
-    let lock = File::open(lock_path).map_err(|_| StateError::Read(".state.lock"))?;
-    acquire_shared_lock(&lock)?;
-    let installs: InstallsFile = direct_json(&root, "installs.json")?;
-    let trust: TrustFile = direct_json(&root, "trust.json")?;
-    let enabled: EnabledFile = direct_json(&root, "enabled.json")?;
-    let service_grants = match direct_json::<ServiceGrantsFile>(&root, "service-grants.json") {
-        Ok(grants) => Some(grants),
-        Err(StateError::MissingComponent("service-grants.json")) => None,
-        Err(error) => return Err(error),
-    };
-    for (file, schema) in [
-        ("installs.json", installs.schema_version),
-        ("trust.json", trust.schema_version),
-        ("enabled.json", enabled.schema_version),
-    ] {
-        if schema != STATE_SCHEMA_VERSION {
-            return Err(StateError::UnsupportedSchema(file));
-        }
-    }
-    if service_grants
-        .as_ref()
-        .is_some_and(|grants| grants.schema_version != STATE_SCHEMA_VERSION)
-    {
-        return Err(StateError::UnsupportedSchema("service-grants.json"));
-    }
-    if installs.state_revision == 0
-        || installs.state_revision != trust.state_revision
-        || installs.state_revision != enabled.state_revision
-        || service_grants
-            .as_ref()
-            .is_some_and(|grants| grants.state_revision != installs.state_revision)
-    {
-        return Err(StateError::RevisionMismatch);
-    }
-    let mut snapshot = StateSnapshot {
-        revision: installs.state_revision,
-        installs: installs.installs,
-        grants: trust.grants,
-        enablement: enabled.extensions,
-        service_grants: service_grants
-            .map(|grants| grants.service_grants)
-            .unwrap_or_default(),
-    };
-    validate_snapshot(&mut snapshot)?;
+    let state = read_locked_state(config_dir)?;
     Ok(derive_unsupported_service_activations(
-        &snapshot,
+        &state,
         registered_projects,
     ))
 }
@@ -1721,16 +1965,20 @@ pub(crate) fn read_service_activations(
             verify_open_directory_path(&package_directory, &package_path)?;
 
             for service in &metadata.services {
-                let Some(service_grant) = state.snapshot.service_grants.iter().find(|grant| {
-                    grant.id == install.id
-                        && grant.digest == install.digest
-                        && grant.service_id == service.id
+                let Some(authority) = state.service_authority.iter().find(|authority| {
+                    authority.package_id == install.id
+                        && authority.package_digest == install.digest
+                        && authority.service_id == service.id
                 }) else {
                     continue;
                 };
-                if !service_is_fully_authorized(service, trust, service_grant) {
-                    continue;
-                }
+                let Some(service_grant) = state.snapshot.service_grants.iter().find(|grant| {
+                    grant.id == authority.package_id
+                        && grant.digest == authority.package_digest
+                        && grant.service_id == authority.service_id
+                }) else {
+                    return Err(StateError::InvalidRecord("service-grant-authority"));
+                };
                 let executable = open_relative_entry(&package_directory, &service.entry)?;
                 validate_service_executable(&executable)?;
                 let executable_path = package_path.join(
@@ -2491,14 +2739,9 @@ env = ["EXAMPLE_ENV"]
         );
         let upgraded = read_locked_state(fixture.config.path()).unwrap();
         assert_eq!(upgraded.snapshot.service_grants.len(), 1);
-        let unsupported =
-            derive_unsupported_service_activations(&upgraded.snapshot, &HashSet::new());
-        assert_eq!(unsupported.len(), 1);
-        assert_eq!(unsupported[0].package_id, ID);
-        assert_eq!(unsupported[0].package_version, "0.1.0");
-        assert_eq!(unsupported[0].package_digest, fixture.digest);
-        assert_eq!(unsupported[0].service_id, "bridge");
-        assert_eq!(unsupported[0].activation_revision, 7);
+        // This fixture declares native network authority, so the coherent
+        // reader validates its row but derives no A2a activation authority.
+        assert!(upgraded.service_authority.is_empty());
 
         fs::write(
             root.join("service-grants.json"),
@@ -2640,43 +2883,97 @@ env = ["EXAMPLE_ENV"]
     }
 
     #[test]
-    fn service_grant_count_accepts_exactly_1024_rows_and_rejects_1025() {
-        let digest = format!("sha256:{}", "a".repeat(64));
+    fn serialized_coherent_reader_accepts_1024_service_grants_and_rejects_1025() {
+        let fixture = fixture(true, true);
+        let root = fixture.config.path().join("extensions");
+        let package = root
+            .join("store")
+            .join(ID)
+            .join(digest_hex(&fixture.digest).unwrap());
+        let mut manifest = String::from(
+            "schema_version = 1\nid = \"example.phase-one\"\nname = \"Boundary\"\nversion = \"0.1.0\"\nmin_ocean_version = \"0.1.0\"\n",
+        );
+        for index in 0..MAX_SERVICE_GRANTS {
+            use std::fmt::Write as _;
+            write!(
+                manifest,
+                "\n[[services]]\nid = \"service{index:04}\"\nentry = \"services/bridge\"\nevents = []\n"
+            )
+            .unwrap();
+        }
+        fs::write(package.join("ocean-extension.toml"), manifest).unwrap();
+        let package_file = File::open(&package).unwrap();
+        let digest = snapshot_package(&package_file).unwrap().digest;
+        drop(package_file);
+        fs::rename(
+            &package,
+            package.parent().unwrap().join(digest_hex(&digest).unwrap()),
+        )
+        .unwrap();
+        write_json(
+            &root.join("installs.json"),
+            &json!({
+                "schema_version": 1,
+                "state_revision": 7,
+                "installs": [{
+                    "id": ID,
+                    "version": VERSION,
+                    "digest": digest,
+                    "source": {"kind": "local-path", "locator": "/tmp/example"}
+                }]
+            }),
+        );
+        write_json(
+            &root.join("trust.json"),
+            &json!({
+                "schema_version": 1,
+                "state_revision": 7,
+                "grants": [{"id": ID, "digest": digest, "capabilities": {}}]
+            }),
+        );
         let rows = (0..MAX_SERVICE_GRANTS)
-            .map(|index| ServiceGrant {
-                id: ID.to_owned(),
-                digest: digest.clone(),
-                service_id: format!("service{index:04}"),
-                native_process_ack: true,
-                secret_bindings: Vec::new(),
+            .map(|index| {
+                json!({
+                    "id": ID,
+                    "digest": digest,
+                    "service_id": format!("service{index:04}"),
+                    "native_process_ack": true,
+                    "secret_bindings": []
+                })
             })
             .collect::<Vec<_>>();
-        let mut boundary = StateSnapshot {
-            revision: 7,
-            installs: Vec::new(),
-            grants: Vec::new(),
-            enablement: Vec::new(),
-            service_grants: rows.clone(),
-        };
-        assert!(validate_snapshot(&mut boundary).is_ok());
+        write_json(
+            &root.join("service-grants.json"),
+            &json!({
+                "schema_version": 1,
+                "state_revision": 7,
+                "service_grants": rows.clone()
+            }),
+        );
+        let boundary = read_locked_state(fixture.config.path()).unwrap();
+        assert_eq!(boundary.snapshot.service_grants.len(), MAX_SERVICE_GRANTS);
+        assert_eq!(boundary.service_authority.len(), MAX_SERVICE_GRANTS);
+        drop(boundary);
 
-        let mut oversized = StateSnapshot {
-            revision: 7,
-            installs: Vec::new(),
-            grants: Vec::new(),
-            enablement: Vec::new(),
-            service_grants: rows,
-        };
-        oversized.service_grants.push(ServiceGrant {
-            id: ID.to_owned(),
-            digest,
-            service_id: "service1024".to_owned(),
-            native_process_ack: true,
-            secret_bindings: Vec::new(),
-        });
+        let mut oversized = rows;
+        oversized.push(json!({
+            "id": ID,
+            "digest": digest,
+            "service_id": "service1024",
+            "native_process_ack": true,
+            "secret_bindings": []
+        }));
+        write_json(
+            &root.join("service-grants.json"),
+            &json!({
+                "schema_version": 1,
+                "state_revision": 7,
+                "service_grants": oversized
+            }),
+        );
         assert_eq!(
-            validate_snapshot(&mut oversized),
-            Err(StateError::InvalidRecord("service-grant-count"))
+            read_locked_state(fixture.config.path()).err(),
+            Some(StateError::InvalidRecord("service-grant-count"))
         );
     }
 
