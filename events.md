@@ -5566,3 +5566,18 @@ initialize its busy field in the Default struct expression, satisfying Rust
 changed. This failure was already present on origin/main and blocked both macOS
 and Ubuntu validation for the independently accepted Stage A2a PR #357.
 _________________________________________________________________________________
+_________________________________________________________________________________
+time:      [02:13] [28-07-26]
+agent:     [pi] [gpt-5.4] [thoth]
+worktree:  [fix/tui-clippy-unblock]
+type:      [gh actions]
+area:      [testing]
+
+Repaired the second origin/main validation blocker exposed after strict CI
+passed: license inventory generation still required cargo-about to list the
+workspace root package, but community publication hardening made every workspace
+package publish=false and cargo-about now correctly emits only third-party graph
+packages. Removed that stale assertion while retaining frozen/fail-closed graph
+generation, nonempty text/JSON checks, NOTICE checks, and deterministic double
+generation. Local generation now succeeds with pinned cargo-about 0.9.1.
+_________________________________________________________________________________
