@@ -211,10 +211,17 @@ fn workspace_publish_is_disabled(manifest: &str) -> bool {
 fn package_publish_is_safe(manifest: &str) -> bool {
     let package = toml_section(manifest, "[package]");
     package.lines().any(|raw| {
-        let line = raw.split('#').next().unwrap_or("").trim();
-        line == "publish = false"
-            || line == "publish.workspace = true"
-            || (line.starts_with("publish") && line.contains("workspace") && line.contains("true"))
+        let compact: String = raw
+            .split('#')
+            .next()
+            .unwrap_or("")
+            .chars()
+            .filter(|ch| !ch.is_whitespace())
+            .collect();
+        matches!(
+            compact.as_str(),
+            "publish=false" | "publish.workspace=true" | "publish={workspace=true}"
+        )
     })
 }
 
@@ -424,6 +431,9 @@ rust-version = "1.88"
         ));
         assert!(!package_publish_is_safe(
             "[package]\nname = \"unsafe-default\"\n\n[dependencies]\n"
+        ));
+        assert!(!package_publish_is_safe(
+            "[package]\nname = \"unsafe-registry\"\npublish = [\"crates-io\", \"workspace-true\"]\n"
         ));
     }
 
