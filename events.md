@@ -5530,6 +5530,25 @@ type:  [bug report]: Keep LiveKit server SDK on rustls
 area:  [backend]: Call dependency transport
 
 Recovered the focused LiveKit feature correction from the divergent Mini main. `livekit-api` now uses rustls native roots, removing `native-tls`, `hyper-tls`, and `openssl-sys` from the supported workspace graph. All 160 ocean-call tests, workspace test compilation, compatibility feature Clippy lanes, release all-target compilation, docs-check, and dependency-tree assertions pass.
+time:      [23:50] [27-07-26]
+agent:     [pi] [gpt-5.4] [worker]
+worktree:  [feat/extensions-stage-a2a]
+type:      [feature-request]
+area:      [backend]
+
+Implemented the ratified Stage A2a boundary from base 63a62b87: renamed the
+accepted Phase 1 reader into the sole read-only extension registry authority,
+added strict equal-generation service grants with the A0 absence exception, and
+added fail-soft startup reconciliation into the minimum native stdio supervisor.
+The supervisor enforces exact native acknowledgement, descriptor-bound package
+identity, assigned private roots, env_clear plus explicit env:/ordinary grants,
+strict bounded hello/ready framing and ACK posture, a non-probing cache, and
+retained-leader generation-safe process-group cleanup on macOS/Linux. Added
+hand-authored registry fixtures and schema, no-execution, environment, secret,
+framing, handshake, shutdown, grandchild, and PGID-reuse tests. A1 remains
+unwired; no lifecycle replay/producer wiring, health/restart policy, mutation,
+route, CLI, Crew, UI, or integration behavior was added. A2a remains pending
+independent acceptance; A2b is not authorized to start before that gate.
 _________________________________________________________________________________
 
 _________________________________________________________________________________
@@ -5552,6 +5571,13 @@ type:  [workflow]: Recover dated harness-footprint social assets
 area:  [design]: Public evidence and measurement graphics
 
 Recovered the 2026-07-18 local harness-footprint measurement as two editable SVG/PNG social graphics with AI-generated text-free backplates. Review prep verified all arithmetic, dimensions, visible text, and absence of personal/local identifiers. The daemon-accounting graphic now names its OpenCode 1.17.15 baseline instead of making an unsupported standalone comparison, and the README binds the assets to the public-evidence policy and reproducible Chrome SVG rendering.
+time:      [00:40] [28-07-26]
+agent:     [pi], [gpt-5.4], [worker]
+worktree:  [feat/extensions-stage-a2a]
+type:      [bug report]: Repair Stage A2a exact-generation supervision blockers
+area:      [backend]: Extension native-service security boundary
+
+Corrected the independent A2a review blockers without widening into A2b: macOS now launches the retained executable by stable volfs device/file identity instead of reopening the registry pathname; macOS/Linux assigned data, cache, and temp paths name retained descriptor/file-id generations; temp cleanup is descriptor-relative and refuses replacement generations; terminal status preserves protocol/startup causes; and unsupported platforms project coherent exact grants as non-probing `unsupported_platform` rows without opening package artifacts, secrets, roots, or processes. Added adversarial executable and assigned-root replacement tests, descriptor-relative cleanup refusal, blocked-write deadline, startup-timeout cleanup/cause retention, spawned-secret target/source/redaction coverage, exact 1,024-row boundary, unsupported projection, and a real reaped-leader/live-group ownership fixture. The A0 missing-companion exception remains unchanged because only A3a may add its durable first-publication marker. Focused A2a tests (71), the serial full daemon suite (614), SDK tests (63), workspace test-target check, denied-warning daemon Clippy, formatting, docs, and diff checks pass. The unrelated upstream `ocean-tui/src/chat.rs` `field_reassign_with_default` full-CI warning remains outside this slice and was not edited.
 _________________________________________________________________________________
 _________________________________________________________________________________
 time:      [01:52] [28-07-26]
@@ -5593,4 +5619,61 @@ removing its duplicate stale assertions that publish=false workspace roots must
 appear as third-party packages. Binary-section headers, cargo-about version,
 full NOTICE evidence, exact twelve-file payload, legal-file identity, npm/Bun
 installation, and dependency-free wrapper checks remain unchanged.
+time:      [01:08] [28-07-26]
+agent:     [api] [gpt-5.4] [worker]
+worktree:  [feat/extensions-stage-a2a]
+type:      [bug report]: Close final Stage A2a validation and cleanup blockers
+area:      [backend]: Extension registry and native-service security boundary
+
+Consolidated unsupported reconciliation onto the sole descriptor/reparse-safe coherent reader and its exact artifact, service, capability, and secret-binding authority; removed the second pathname parser and added Windows relative-handle traversal primitives. Unsupported startup now projects only common-validated grants and remains no-child/non-probing. Added real supervisor valid/malformed/nonexistent-service/unauthorized-binding tests, the serialized 1,024/1,025 full-reader boundary, post-ready protocol-violation classification, a macOS unlink/fail-closed generation fixture, and a retained cleanup-authority lane for exceptional signal/membership-proof failures. The reviewed syscall/identity seam combines a real reaped leader with deterministic simulated same-number unrelated PGID membership and proves the signal syscall is never reached; forcing the kernel PID allocator to wrap would be nondeterministic and unsafe. A2b+ behavior remains absent.
+_________________________________________________________________________________
+_________________________________________________________________________________
+time:      [01:36] [28-07-26]
+agent:     [api] [gpt-5.4] [worker]
+worktree:  [feat/extensions-stage-a2a]
+type:      [bug report]: Close final Stage A2a acceptance blockers
+area:      [backend]: Extension transport classification and Windows portability
+
+Separated clean EOF, read I/O, and protocol frame failures in the native-service transport. Post-ready EOF/read failures and the leader-poll race now deterministically retain `unexpected_exit`, while malformed, truncated, unknown, and oversized frames retain `protocol_violation`; repeated real early-exit and injected I/O fixtures cover the boundary. Added an isolated repository-owned Windows cross-build package that includes the actual registry and unsupported-supervisor source modules, compiles the real NtCreateFile/NtQueryDirectoryFile reader and no-child supervisor path, and documents the separate pre-existing full-daemon ocean-observatory Windows blockers. Focused extension tests (77), all daemon tests (620), SDK tests (63), workspace/MSRV checks, denied-warning daemon/SDK Clippy, Linux musl and isolated Windows GNU cross-builds, formatting, docs, and diff checks pass.
+_________________________________________________________________________________
+_________________________________________________________________________________
+time:      [01:45] [28-07-26]
+agent:     [pi] [gpt-5.4] [thoth]
+worktree:  [feat/extensions-stage-a2a]
+type:      [review]
+area:      [testing]
+
+Accepted Stage A2a after four independent review/correction rounds. Final PASS
+confirms the sole coherent exact-grant registry authority, strict hello/ready
+transport, descriptor/file-id-bound executable and assigned-root generations,
+minimal secret-safe child environment, typed transport failure causes, bounded
+generation-safe process cleanup, validated unsupported-platform no-child status,
+and actual-source Linux/Windows cross-build evidence. A2a adds no live lifecycle
+delivery, replay, health/restart policy, registry mutation surface, Crew, UI, or
+integration behavior. A2b is the next authorized slice.
+_________________________________________________________________________________
+_________________________________________________________________________________
+time:      [02:53] [28-07-26]
+agent:     [pi] [gpt-5.4] [thoth]
+worktree:  [feat/extensions-stage-a2a]
+type:      [gh actions]
+area:      [testing]
+
+Repaired the sole hosted A2a failure after macOS, MSRV, cargo-deny, and package
+validation passed: Linux defines stat.st_dev as u64, so two portable generation
+identity checks now use checked conversion instead of a platform-redundant cast.
+The security comparison and behavior are unchanged. This was found only by the
+Ubuntu Rust 1.97 denied-warning Clippy lane.
+_________________________________________________________________________________
+_________________________________________________________________________________
+time:      [03:04] [28-07-26]
+agent:     [pi] [gpt-5.4] [thoth]
+worktree:  [feat/extensions-stage-a2a]
+type:      [gh actions]
+area:      [testing]
+
+Made the retained file-device identity comparison target-specific after Ubuntu
+Clippy correctly rejected a generic checked conversion that is a no-op for
+Linux dev_t. Linux compares native u64 directly; macOS performs its required
+signed-to-u64 cast. The security predicate and generation binding are unchanged.
 _________________________________________________________________________________

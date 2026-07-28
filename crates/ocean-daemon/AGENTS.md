@@ -47,7 +47,9 @@ This crate owns the long-running Ocean HTTP service on `:4780`, including API ro
 
 - `POST /v1/ocean-buddy/events` is the deliberately narrow first Buddy ingress: it accepts only a typed mocked `attached` lifecycle event, carries attachment metadata but no image bytes, performs no camera/session/tool work, and returns a typed Watch result card. Watch approval remains in the Watch-to-iPhone adapter flow.
 - Session behavior lives in `ocean-agent`; route changes must not create a separate session model.
-- `extension_lifecycle.rs` is the Stage A1 pure, metadata-only lifecycle boundary: it owns deterministic source adaptation, bounded per-request runtime-tool-id to host-UUID correlation, permission pairing, validate-before-commit publication, lifecycle-bounded cloneable request-scoped atomic terminal authority with fail-closed active registration, terminal cleanup of abandoned request state, publication-time project classification, and bounded boot-local event retention. It is intentionally unwired until A2b and must not gain process launch, service transport, registry mutation, routes, Observatory coupling, or producer call sites in A1.
+- `extension_lifecycle.rs` is the accepted Stage A1 pure, metadata-only lifecycle boundary: it owns deterministic source adaptation, bounded correlation, request-scoped terminal authority, cleanup, and boot-local retention. It remains intentionally unwired until A2b and must not gain process launch, transport, registry mutation, routes, Observatory coupling, or live producer call sites.
+- `extension_registry.rs` is the sole coherent read-only extension registry authority. It preserves the three accepted A0 schemas, treats absent `service-grants.json` as the one empty A0 upgrade form, and derives supported and unsupported activation authority only after the same shared-lock, descriptor/reparse-safe four-file plus artifact/service/capability/binding validation. A2a has no mutation or durable first-publication marker, so A3a must atomically introduce that marker and make marked companion absence fail closed; A2a must not preempt it. Inspect/doctor remain Phase 1-compatible and execute/probe nothing. The internal `registry-portability-check` feature may remove only daemon AppState/Axum route coupling so the isolated Windows harness can include this actual source; it must not weaken reader or platform validation.
+- `extension_service.rs` is only the Stage A2a minimum macOS/Linux supervisor: exact acknowledged native services, strict hello/ready stdio with typed EOF/read-I/O versus protocol frame failures, Linux descriptor paths and macOS retained volfs device/file-id paths for executable/root generations, descriptor-bound cwd, daemon-assigned private roots, `env_clear` plus explicit ordinary/`env:` secret bindings, cause-preserving read-only status cache, descriptor-relative temp cleanup, and retained-leader generation-safe process-group cleanup. Post-ready clean EOF/read I/O and early exit are always `unexpected_exit`; malformed, unknown, truncated, or oversized frames are `protocol_violation`. Exceptional signal/membership-proof errors retain the unreaped Child/owner for one bounded shutdown retry. The injected syscall/identity seam proves deterministic PGID-reuse safety: after a real leader is reaped, simulated same-number unrelated-group membership cannot reach the signal syscall; forcing kernel PID wrap is neither deterministic nor safe. `extension_service_unsupported.rs` uses the common validated authority, projects non-probing `unsupported_platform` rows, and opens no secret, assigned root, or process. Neither owns events/replay/queues, ping health, restart/backoff/circuit breaking, stderr retention, mutation, or route.
 - Product turns and legacy/call turns (legacy requests pin a session id before
   admission) take the shared non-blocking session operation lease before
   `TurnStarted`, invalidation, or request registration and retain it through
@@ -119,7 +121,8 @@ This crate owns the long-running Ocean HTTP service on `:4780`, including API ro
 - `cargo test -p ocean-daemon cors::tests:: -- --nocapture`
 - `cargo test -p ocean-daemon component_event_ -- --nocapture`
 - `cargo test -p ocean-daemon event_adapter::tests:: -- --nocapture`
-- `cargo test -p ocean-daemon extension_lifecycle -- --nocapture`
+- `cargo test -p ocean-daemon extension_ -- --nocapture --test-threads=1`
+- `cargo zigbuild --manifest-path crates/ocean-daemon/tests/windows-portability/Cargo.toml --features registry-portability-check --target x86_64-pc-windows-gnu`
 - `cargo test -p ocean-daemon fs_ -- --nocapture`
 - `cargo test -p ocean-daemon metrics::tests:: -- --nocapture`
 - `cargo test -p ocean-daemon model_catalog_ -- --nocapture`
@@ -155,4 +158,4 @@ This crate owns the long-running Ocean HTTP service on `:4780`, including API ro
 
 ## Child devlog Index
 
-No child boundaries defined within `ocean-daemon/` at this time.
+- `tests/windows-portability/` — isolated source-inclusion cross-build for the actual Windows registry reader and unsupported supervisor → `tests/windows-portability/AGENTS.md`

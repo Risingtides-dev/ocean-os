@@ -101,8 +101,18 @@ mod event_adapter;
 /// Pure, unwired Stage A lifecycle adaptation and boot-local retention.
 #[allow(dead_code)]
 mod extension_lifecycle;
-/// Read-only installed/trusted/enabled extension state inspection and diagnostics.
-mod extension_state;
+/// Sole coherent read-only install/trust/enable/service-grant registry authority.
+mod extension_registry;
+/// Stage A2a minimum native-service transport and process-group supervisor.
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+mod extension_service;
+/// Fail-closed exact-grant status projection where native supervision is unsupported.
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+#[path = "extension_service_unsupported.rs"]
+mod extension_service;
+#[cfg(all(test, any(target_os = "macos", target_os = "linux")))]
+#[path = "extension_service_unsupported.rs"]
+mod extension_service_unsupported_test;
 /// Home-sandboxed directory listing and capped file-read HTTP policy.
 mod filesystem;
 /// Public, read-only GitHub projection for registered project origins.
@@ -646,8 +656,14 @@ fn app_router(cors: CorsLayer) -> Router<AppState> {
         .route("/v1/observatory/snapshot", get(observatory::snapshot))
         .route("/v1/observatory/events", get(observatory::events))
         .route("/v1/observatory/replay", get(observatory::replay))
-        .route("/v1/extensions/{id}/inspect", get(extension_state::inspect))
-        .route("/v1/extensions/{id}/doctor", get(extension_state::doctor))
+        .route(
+            "/v1/extensions/{id}/inspect",
+            get(extension_registry::inspect),
+        )
+        .route(
+            "/v1/extensions/{id}/doctor",
+            get(extension_registry::doctor),
+        )
         // OCEAN-262: the Slack canvas bridge (`ocean-agents`) POSTs a fulfilled
         // awareness result here after round-tripping a `read`/`list`/`create` to
         // the live Slack Canvas API; a `GET` queries the stored fulfillment per
@@ -910,6 +926,24 @@ async fn main() -> anyhow::Result<()> {
 
     let config_dir = ocean_agent::config_dir_from_env();
     let roles = load_model_roles(&config_dir);
+
+    // A2a startup reconciliation is fail-soft and asynchronous. It consumes the
+    // sole coherent registry reader and owns no lifecycle producer wiring.
+    let extension_supervisor = {
+        let registered_extension_projects = runtime
+            .list_projects()
+            .map(|projects| projects.into_iter().map(|project| project.id).collect())
+            .unwrap_or_default();
+        let supervisor = extension_service::ExtensionSupervisor::new();
+        supervisor
+            .start(config_dir.clone(), registered_extension_projects)
+            .await;
+        // Keep the read-only projection alive for future A3b route composition;
+        // A2a exposes no new route and performs no probe on cache reads.
+        let extension_status_cache = supervisor.status_cache();
+        let _ = extension_status_cache.snapshot();
+        supervisor
+    };
 
     // Hoist the event bus so the Observatory durability pump subscribes before
     // any turn can emit a fact. One boot id scopes auth and all read models.
@@ -1182,6 +1216,10 @@ async fn main() -> anyhow::Result<()> {
                 .await?;
         }
     }
+
+    // Native extension groups are drained before other daemon task trees and
+    // before the Tokio runtime can drop their direct-child handles.
+    extension_supervisor.shutdown().await;
 
     // All room task trees share the daemon shutdown token, but retain and join
     // their handles explicitly so no sender/receiver is runtime-aborted mid-

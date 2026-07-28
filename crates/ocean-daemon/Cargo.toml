@@ -13,6 +13,10 @@ path = "src/main.rs"
 
 [features]
 default = []
+# Internal source-inclusion mode for the isolated Windows registry portability
+# harness. It removes only daemon AppState/Axum route coupling so the harness
+# compiles the actual common reader and unsupported supervisor modules.
+registry-portability-check = []
 # Activates the live call-session audio loop (OCEAN-CALL): joins the LiveKit
 # room, taps remote PCM, and publishes Ocean's voice back. Pulls native
 # libwebrtc via ocean-call's own `livekit-tap` feature, so it is OPT-IN — the
@@ -108,3 +112,13 @@ http-body-util = "0.1"
 # through `ocean-store`'s API. Already in the workspace lock (transitive via
 # ocean-store), so this pulls no new download.
 rusqlite = { workspace = true }
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { workspace = true, features = [
+    "Wdk_Foundation",
+    "Wdk_Storage_FileSystem",
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_Storage_FileSystem",
+    "Win32_System_IO",
+] }

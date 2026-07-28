@@ -1,0 +1,33 @@
+[package]
+name = "ocean-daemon-windows-portability"
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+publish = false
+
+[workspace]
+
+[features]
+default = []
+registry-portability-check = []
+
+[dependencies]
+chrono = "0.4"
+fs2 = "0.4"
+ocean-agent-sdk = { path = "../../../ocean-agent-sdk" }
+ocean-extension = { path = "../../../ocean-extension" }
+semver = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync"] }
+tracing = "0.1"
+uuid = { version = "1", features = ["v4", "serde"] }
+windows-sys = { version = "0.61", features = [
+    "Wdk_Foundation",
+    "Wdk_Storage_FileSystem",
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_Storage_FileSystem",
+    "Win32_System_IO",
+] }

@@ -1,0 +1,18 @@
+{
+  "schema_version": 1,
+  "state_revision": 7,
+  "service_grants": [
+    {
+      "id": "example.phase-one",
+      "digest": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "service_id": "bridge",
+      "native_process_ack": true,
+      "secret_bindings": [
+        {
+          "target_env": "EXAMPLE_ENV",
+          "reference": "env:OCEAN_EXAMPLE_SECRET"
+        }
+      ]
+    }
+  ]
+}
