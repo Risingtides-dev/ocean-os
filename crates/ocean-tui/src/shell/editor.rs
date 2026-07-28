@@ -19,6 +19,9 @@ pub struct EditorTab {
     /// Pretty, read-only Markdown projection for this tab. The source buffer
     /// remains authoritative and is never rewritten by preview rendering.
     pub markdown_preview: bool,
+    /// Read-only image file tab. Binary bytes are never loaded into or saved from
+    /// the text buffer.
+    pub image_preview: bool,
     /// Top wrapped row in Markdown preview mode; independent from source scroll.
     pub preview_scroll: usize,
     pub highlighted: Vec<StyledLine>,
@@ -56,8 +59,38 @@ impl EditorTab {
             visual_scroll: 0,
             horizontal_scroll: 0,
             markdown_preview: false,
+            image_preview: false,
             preview_scroll: 0,
             highlighted,
+            git_lines: HashMap::new(),
+            needs_full_hl: false,
+            last_edit: None,
+        })
+    }
+
+    /// Construct a read-only image tab without ever decoding binary bytes as
+    /// editable UTF-8. Kitty normalization/placement happens at draw time.
+    pub fn open_image(path: PathBuf) -> std::io::Result<Self> {
+        let metadata = std::fs::metadata(&path)?;
+        if !metadata.is_file() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "image path is not a file",
+            ));
+        }
+        Ok(Self {
+            path,
+            lines: vec![String::new()],
+            cursor_row: 0,
+            cursor_col: 0,
+            scroll: 0,
+            dirty: false,
+            visual_scroll: 0,
+            horizontal_scroll: 0,
+            markdown_preview: false,
+            image_preview: true,
+            preview_scroll: 0,
+            highlighted: vec![Vec::new()],
             git_lines: HashMap::new(),
             needs_full_hl: false,
             last_edit: None,

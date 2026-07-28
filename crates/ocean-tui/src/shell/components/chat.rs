@@ -31,6 +31,7 @@ use crate::shell::{
     diff::{self, DiffKind, DiffRow},
     errfmt,
     history::PromptHistory,
+    kitty::{self, LogicalImage, Placement},
     markdown::Markdown,
     panel, slash,
     theme::{self, g},
@@ -412,6 +413,9 @@ pub struct ChatComponent {
     drawer_hits: Vec<DrawerHit>,
     /// Exact visible cells for safe repo-local Markdown links.
     link_hits: Vec<LinkHit>,
+    /// Out-of-band kitty graphics requested by the last transcript draw. App
+    /// diffs and emits these only after Ratatui has painted the frame.
+    image_placements: Vec<Placement>,
     /// Last rendered transcript viewport and its first wrapped logical row.
     /// App-level text selection uses these to survive scrollback movement.
     transcript_rect: Rect,
@@ -937,6 +941,62 @@ fn component_lines(kind: &str, props: &serde_json::Value, width: usize) -> Vec<L
     lines
 }
 
+/// Transcript projection for components that can own image pixels. Pinned
+/// components intentionally keep the compact `component_lines` projection;
+/// only scrollable transcript galleries reserve graphics rows.
+fn component_projection(
+    kind: &str,
+    props: &serde_json::Value,
+    width: usize,
+    image_base: &Path,
+) -> (Vec<Line<'static>>, Vec<LogicalImage>) {
+    let base = component_lines(kind, props, width);
+    if kind != "gallery" {
+        return (base, Vec::new());
+    }
+    let images = props
+        .get("images")
+        .and_then(|value| value.as_array())
+        .map(Vec::as_slice)
+        .unwrap_or_default();
+    if images.is_empty() {
+        return (base, Vec::new());
+    }
+
+    // `component_lines` emits header, one row per first four images, optional
+    // overflow row, footer. Rebuild that narrow section while preserving its
+    // established terminal styling and reserve rows only for resolvable images.
+    let shown = images.len().min(4);
+    let mut lines = Vec::with_capacity(base.len() + shown * 8);
+    let mut logical = Vec::new();
+    if let Some(header) = base.first() {
+        lines.push(header.clone());
+    }
+    for (index, image) in images.iter().take(shown).enumerate() {
+        if let Some(card) = base.get(index + 1) {
+            lines.push(card.clone());
+        }
+        let source = image
+            .get("src")
+            .and_then(|value| value.as_str())
+            .unwrap_or("");
+        let Some(path) = kitty::resolve_local_png(image_base, image_base, source) else {
+            continue;
+        };
+        let line = lines.len();
+        for _ in 0..crate::shell::markdown::INLINE_IMAGE_ROWS {
+            lines.push(Line::from(""));
+        }
+        logical.push(LogicalImage {
+            path,
+            line,
+            rows: crate::shell::markdown::INLINE_IMAGE_ROWS,
+        });
+    }
+    lines.extend(base.into_iter().skip(shown + 1));
+    (lines, logical)
+}
+
 /// Render one diff-card row: a coloured gutter sigil + the (possibly word-diffed)
 /// body on the dark bed. Changed word runs carry `Modifier::REVERSED` (SGR
 /// inverse), matching OMP's intra-line diff highlight.
@@ -1129,6 +1189,12 @@ impl ChatComponent {
             pinned_visible: true,
             ..Default::default()
         }
+    }
+
+    /// Visible inline images from the most recent draw. Pixels are emitted by
+    /// App after Ratatui completes the frame so its cell diff stays authoritative.
+    pub fn image_placements(&self) -> &[Placement] {
+        &self.image_placements
     }
 
     /// Plain-Space hold may arm only when composer overlays are absent and no
@@ -3741,6 +3807,9 @@ impl Component for ChatComponent {
     }
 
     fn draw(&mut self, frame: &mut Frame, area: Rect) {
+        // Never leak placements from an earlier viewport when this frame exits
+        // early or switches to an empty transcript.
+        self.image_placements.clear();
         // Composer grows with its content — explicit ⌃J lines AND soft-wrapped
         // rows of long lines (typing past the right edge used to just clip:
         // the words kept landing but never showed). Capped so the transcript
@@ -3863,6 +3932,13 @@ impl Component for ChatComponent {
         // Safe documentation links are recorded by logical line/span while the
         // transcript is assembled, then projected through Ratatui's exact wrap.
         let mut logical_links: Vec<LogicalLink> = Vec::new();
+        // Local image refs reserve bounded rows in the same logical transcript;
+        // their pixels are placed out of band after the frame is painted.
+        let mut logical_images: Vec<LogicalImage> = Vec::new();
+        let image_base = self
+            .mention_root
+            .as_deref()
+            .unwrap_or_else(|| Path::new("."));
         // ── welcome empty-state: blank except a terse configuration condition
         // (set by the app only when no provider is configured). No branding,
         // no printed instructions — the `/` palette and /help carry discovery.
@@ -3972,9 +4048,18 @@ impl Component for ChatComponent {
                     // Streaming markdown with prefix-freeze: frozen head blocks
                     // are served from cache, only the growing tail re-renders.
                     let rendered = md.render(s);
+                    let mut block_lines = rendered.lines;
+                    let mut block_links = rendered.links;
+                    let mut block_images = kitty::reserve_markdown_images(
+                        &mut block_lines,
+                        &mut block_links,
+                        &rendered.images,
+                        image_base,
+                        image_base,
+                    );
                     let line_base = lines.len();
                     if let Some(root) = self.mention_root.as_deref() {
-                        logical_links.extend(rendered.links.iter().filter_map(|link| {
+                        logical_links.extend(block_links.iter().filter_map(|link| {
                             Some(LogicalLink {
                                 path: resolve_doc_link(root, &link.target)?,
                                 line: line_base + link.line,
@@ -3982,7 +4067,11 @@ impl Component for ChatComponent {
                             })
                         }));
                     }
-                    lines.extend(rendered.lines);
+                    for image in &mut block_images {
+                        image.line += line_base;
+                    }
+                    logical_images.extend(block_images);
+                    lines.extend(block_lines);
                 }
                 Turn::Component {
                     kind,
@@ -4027,7 +4116,14 @@ impl Component for ChatComponent {
                             Style::default().fg(theme::EDGE),
                         )));
                     } else {
-                        lines.extend(component_lines(kind, props, body.width as usize));
+                        let (component_lines, mut component_images) =
+                            component_projection(kind, props, body.width as usize, image_base);
+                        let line_base = lines.len();
+                        for image in &mut component_images {
+                            image.line += line_base;
+                        }
+                        logical_images.extend(component_images);
+                        lines.extend(component_lines);
                     }
                 }
                 Turn::Permission {
@@ -4443,6 +4539,15 @@ impl Component for ChatComponent {
             })
             .collect();
         self.link_hits = project_link_hits(&lines, &logical_links, body, scroll);
+        self.image_placements = kitty::project_visible(
+            &lines,
+            &logical_images,
+            body,
+            scroll,
+            body.width,
+            body.x.saturating_add(1),
+            body.width.saturating_sub(2),
+        );
         frame.render_widget(para.scroll((scroll, 0)), body);
         // Footer: always blank. No key legends, no counters; activity lives on
         // the bottom status row (derived from this component's state), never

@@ -49,12 +49,24 @@ pub(crate) struct MarkdownLink {
     pub span: usize,
     pub target: String,
 }
+/// One rendered image reference, addressed by its caption line. Clients decide
+/// whether the source resolves to a displayable local image before reserving
+/// any graphics rows, so remote/missing images keep the compact text fallback.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct MarkdownImage {
+    pub line: usize,
+    pub path: String,
+}
 
-/// Styled Markdown plus link metadata. Keeping metadata beside the rendered
-/// spans lets clients add interaction without changing the visible text.
+/// Height of an inline image preview in terminal cells.
+pub(crate) const INLINE_IMAGE_ROWS: u16 = 8;
+
+/// Styled Markdown plus interaction metadata. Keeping metadata beside the
+/// rendered spans lets clients add links and graphics without changing source.
 pub(crate) struct MarkdownRender {
     pub lines: Vec<Line<'static>>,
     pub links: Vec<MarkdownLink>,
+    pub images: Vec<MarkdownImage>,
 }
 
 impl Deref for MarkdownRender {
@@ -78,6 +90,7 @@ impl<'a> IntoIterator for &'a MarkdownRender {
 struct RenderedBlock {
     lines: Vec<Line<'static>>,
     links: Vec<MarkdownLink>,
+    images: Vec<MarkdownImage>,
 }
 
 /// Streaming markdown renderer. Owns a lazily-constructed [`Highlighter`] (the
@@ -118,6 +131,7 @@ impl Markdown {
         let mut rendered = MarkdownRender {
             lines: Vec::new(),
             links: Vec::new(),
+            images: Vec::new(),
         };
         let mut first = true;
         for block in &frozen {
@@ -152,8 +166,12 @@ fn append_block(rendered: &mut MarkdownRender, mut block: RenderedBlock) {
     for link in &mut block.links {
         link.line += line_base;
     }
+    for image in &mut block.images {
+        image.line += line_base;
+    }
     rendered.lines.append(&mut block.lines);
     rendered.links.append(&mut block.links);
+    rendered.images.append(&mut block.images);
 }
 
 fn hash_block(s: &str) -> u64 {
@@ -191,6 +209,7 @@ fn split_blocks(src: &str) -> (Vec<String>, String) {
 fn render_block(src: &str, hl: &Highlighter) -> RenderedBlock {
     let lines: Vec<&str> = src.split('\n').collect();
     let mut out: Vec<Line<'static>> = Vec::new();
+    let mut images: Vec<MarkdownImage> = Vec::new();
     let mut i = 0;
     while i < lines.len() {
         let line = lines[i];
@@ -246,13 +265,14 @@ fn render_block(src: &str, hl: &Highlighter) -> RenderedBlock {
         }
 
         if let Some((alt, path)) = parse_image_ref(trimmed) {
-            // Image reference → a distinct card line (the pixels render via the
-            // kitty viewer; see `/image`). Always visible text, scrolls fine.
+            // The visible caption always survives. Chat/editor clients may add a
+            // bounded kitty pixel bed after it when this resolves to a local PNG.
             let label = if alt.is_empty() {
                 path.clone()
             } else {
                 format!("{alt}  ·  {path}")
             };
+            let image_line = out.len();
             out.push(Line::from(vec![
                 Span::styled("  [img] ", Style::default().fg(theme::CYAN)),
                 Span::styled(
@@ -261,8 +281,11 @@ fn render_block(src: &str, hl: &Highlighter) -> RenderedBlock {
                         .fg(theme::CYAN)
                         .add_modifier(Modifier::BOLD),
                 ),
-                Span::styled("   /image to view", Style::default().fg(theme::COMMENT)),
             ]));
+            images.push(MarkdownImage {
+                line: image_line,
+                path,
+            });
         } else if let Some(h) = heading(line) {
             out.push(h);
         } else if is_horizontal_rule(trimmed) {
@@ -302,7 +325,11 @@ fn render_block(src: &str, hl: &Highlighter) -> RenderedBlock {
             });
         }
     }
-    RenderedBlock { lines: out, links }
+    RenderedBlock {
+        lines: out,
+        links,
+        images,
+    }
 }
 
 /// Parse an image reference `![alt](path)` occupying (most of) a line, into
@@ -807,6 +834,43 @@ mod tests {
         let text: String = lines[0].spans.iter().map(|s| s.content.as_ref()).collect();
         assert!(text.contains("diagram") && text.contains("/tmp/d.png"));
         assert!(!text.contains("!["), "raw markdown consumed");
+    }
+
+    #[test]
+    fn image_refs_expose_caption_line_and_path_metadata() {
+        let mut md = Markdown::new();
+        let rendered = md.render("intro\n\n![diagram](/tmp/d.png)\n\ntail");
+
+        assert_eq!(rendered.images.len(), 1, "one image ref recorded");
+        let image = &rendered.images[0];
+        assert_eq!(image.path, "/tmp/d.png");
+        // The recorded line is the caption row itself — a graphics-capable
+        // client reserves its pixel bed directly beneath this index.
+        let caption: String = rendered.lines[image.line]
+            .spans
+            .iter()
+            .map(|s| s.content.as_ref())
+            .collect();
+        assert!(
+            caption.contains("diagram") && caption.contains("/tmp/d.png"),
+            "images[].line points at the caption, got {caption:?}"
+        );
+    }
+
+    #[test]
+    fn image_metadata_survives_prefix_freeze() {
+        let mut md = Markdown::new();
+        md.render("![a](/tmp/a.png)\n\nbody");
+        // Growing the tail serves the frozen image block from cache; its
+        // metadata must still be reported with correct absolute line offsets.
+        let rendered = md.render("![a](/tmp/a.png)\n\nbody more");
+        assert_eq!(rendered.images.len(), 1, "cached block keeps its image");
+        let caption: String = rendered.lines[rendered.images[0].line]
+            .spans
+            .iter()
+            .map(|s| s.content.as_ref())
+            .collect();
+        assert!(caption.contains("/tmp/a.png"), "got {caption:?}");
     }
 
     #[test]

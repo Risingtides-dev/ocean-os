@@ -153,6 +153,22 @@ enum Center {
     WorkflowGraph,
 }
 
+fn visible_image_placements(
+    center: Center,
+    area: Rect,
+    chat: &[kitty::Placement],
+    editor: &[kitty::Placement],
+) -> Vec<kitty::Placement> {
+    if area.width == 0 || area.height == 0 {
+        return Vec::new();
+    }
+    match center {
+        Center::Chat => chat.to_vec(),
+        Center::Editor => editor.to_vec(),
+        Center::Graph | Center::WorkflowGraph => Vec::new(),
+    }
+}
+
 /// The right rail is a mutable work-surface slot. Files is an explicit operator
 /// destination; live projections may select Usage or Workflow only while the
 /// rail is hidden and auto-reveal remains permitted.
@@ -569,6 +585,12 @@ pub struct App {
     image_view: Option<PathBuf>,
     image_body: Rect,
     image_placed: bool,
+    /// Inline image placements from the last frame's chat + editor. Diffed
+    /// after every Ratatui draw so static images aren't retransmitted.
+    previous_placements: Vec<kitty::Placement>,
+    /// True when the image viewer was open in the previous frame — used to
+    /// trigger one CLEAR_ALL when it closes.
+    image_view_was_open: bool,
     /// Mouse text selection. Chat and editor selections use stable content rows;
     /// other panes use terminal screen rows. `sel_rect` keeps the sweep bounded
     /// to the pane where it began. Releasing auto-copies the swept text.
@@ -746,6 +768,8 @@ impl App {
             image_view: None,
             image_body: Rect::default(),
             image_placed: false,
+            previous_placements: Vec::new(),
+            image_view_was_open: false,
             sel_press: None,
             sel_rect: None,
             selection: None,
@@ -1008,14 +1032,29 @@ impl App {
                 self.dispatch(action);
                 dirty = true;
             }
-            // The image viewer closed (or switched images): delete the placed
-            // kitty image and force a full repaint so the workbench comes back
-            // clean underneath where the pixels were.
+            // Close / switch the full-screen image viewer: clear its pixels and
+            // force a repaint so the workbench comes back clean.
             if self.image_placed && self.image_view.is_none() {
-                kitty::emit(kitty::CLEAR_ALL);
+                kitty::clear_all();
                 self.image_placed = false;
+                self.previous_placements.clear();
                 let _ = terminal.clear();
                 dirty = true;
+            }
+            // Any modal overlay open clears inline images so they don't bleed
+            // through. Same for the image viewer itself (it owns the layer).
+            let overlay_open = self.launch_open
+                || self.resume_open
+                || self.settings_open
+                || self.permissions_open
+                || self.models_open
+                || self.advisor_open
+                || self.memory_open
+                || self.lsp_open
+                || self.providers_open;
+            if (overlay_open || self.image_view.is_some()) && !self.previous_placements.is_empty() {
+                kitty::clear_all();
+                self.previous_placements.clear();
             }
             // While the viewer is open and its pixels are already placed, it's a
             // STATIC takeover — skip redraws (a redraw would need to re-place the
@@ -1026,22 +1065,74 @@ impl App {
             if !viewer_static && (immediate || (is_render && dirty)) {
                 terminal.draw(|f| self.draw(f))?;
                 dirty = false;
-                // Just painted the viewer frame: now lay the pixels into the
-                // reserved body rect, once (kitty images float above ratatui's
-                // cells — see `kitty`).
+                // --- full-screen viewer: place pixels once ---
                 if self.image_view.is_some() && !self.image_placed {
                     if let Some(path) = self.image_view.clone() {
                         let b = self.image_body;
                         if let Some(seq) = kitty::place_png_at(&path, b.x, b.y, b.width, b.height) {
                             kitty::emit(&seq);
                         }
-                        // Mark placed even when kitty declined (non-kitty /
-                        // non-PNG): the frame's note is the render, and this
-                        // keeps the static-takeover gate from redrawing.
                         self.image_placed = true;
                     }
                 }
+                // --- inline images: collect, diff, emit ---
+                //
+                // kitty images float ABOVE ratatui's cell buffer, so ratatui
+                // repainting a row does not erase pixels sitting on it. Any
+                // placement that disappears or moves must therefore be cleared
+                // explicitly, or scrolling smears stale images down the pane.
+                //
+                // Retransmitting every frame would re-upload the PNG at the
+                // render cadence, so: unchanged set → emit nothing; pure
+                // additions (nothing removed/moved) → place only the new ones;
+                // anything removed or moved → one CLEAR_ALL, then re-place the
+                // whole visible set.
+                if self.image_view.is_none() && !overlay_open {
+                    // Only the painted center owns graphics. Hidden component
+                    // placement lists are historical draw output and must not
+                    // bleed over Graph/Workflow or the opposite center. A
+                    // too-small frame clears `r_center`, producing an empty set.
+                    let current = visible_image_placements(
+                        self.center,
+                        self.r_center,
+                        self.chat.image_placements(),
+                        self.editor.image_placements(),
+                    );
+                    if current != self.previous_placements {
+                        let purely_additive = self
+                            .previous_placements
+                            .iter()
+                            .all(|old| current.contains(old));
+                        if !purely_additive && !self.previous_placements.is_empty() {
+                            kitty::clear_all();
+                        }
+                        for placement in &current {
+                            let already_on_screen =
+                                purely_additive && self.previous_placements.contains(placement);
+                            if already_on_screen {
+                                continue;
+                            }
+                            let rect = placement.rect;
+                            if let Some(seq) = kitty::place_png_at(
+                                &placement.path,
+                                rect.x,
+                                rect.y,
+                                rect.width,
+                                rect.height,
+                            ) {
+                                kitty::emit(&seq);
+                            }
+                        }
+                        self.previous_placements = current;
+                    }
+                }
+            } else if self.image_view.is_none() && !overlay_open && self.image_view_was_open {
+                // No redraw this iteration, but the viewer just closed: drop
+                // stale placements so the next real draw starts clean.
+                kitty::clear_all();
+                self.previous_placements.clear();
             }
+            self.image_view_was_open = self.image_view.is_some();
         }
         Ok(())
     }
@@ -1104,6 +1195,16 @@ impl App {
                     if matches!(m.kind, MouseEventKind::Down(MouseButton::Left)) =>
                 {
                     self.image_view = None;
+                    return;
+                }
+                CrosstermEvent::Resize(_, _) => {
+                    // The static viewer owns its cell geometry. Clear and
+                    // re-place it after the outer loop's immediate redraw.
+                    if kitty::supported() {
+                        kitty::clear_all();
+                    }
+                    self.image_body = Rect::default();
+                    self.image_placed = false;
                     return;
                 }
                 _ => return,
@@ -2489,6 +2590,9 @@ impl App {
                 }
             }
             Action::ResumeSession { id, path, cwd } => {
+                if !self.set_active_project(cwd.clone()) {
+                    return;
+                }
                 self.chat
                     .load_history(crate::shell::sessions::load_transcript(path));
                 self.bind_session_with(*id, false); // transcript came from disk
@@ -2505,14 +2609,14 @@ impl App {
                         false,
                     );
                 }
-                // Re-root the workbench to the dir this session ran in, so the
-                // file tree, graph, and future turns follow the session.
-                self.set_active_project(cwd.clone());
                 self.center = Center::Chat;
                 self.focus_to(Focus::Center);
             }
             // `+ new` on a project header: fresh session, re-rooted to `cwd`.
             Action::NewSessionInProject { cwd } => {
+                if !self.set_active_project(cwd.clone()) {
+                    return;
+                }
                 if let Some(task) = self.stream_task.take() {
                     task.abort();
                 }
@@ -2526,7 +2630,6 @@ impl App {
                 self.clear_compact_hold();
                 self.chat.load_history(Vec::new()); // clear the transcript
                 self.rail.live_id = None;
-                self.set_active_project(cwd.clone());
                 self.center = Center::Chat;
                 self.focus_to(Focus::Center);
             }
@@ -2754,15 +2857,27 @@ impl App {
             // status line instead of a blank viewer.
             Action::ViewImage(raw) => {
                 let p = PathBuf::from(raw);
-                let abs = if p.is_absolute() {
+                let root = std::fs::canonicalize(&self.workspace_root).ok();
+                let candidate = std::fs::canonicalize(if p.is_absolute() {
                     p
                 } else {
                     PathBuf::from(&self.workspace_root).join(p)
-                };
-                if abs.exists() {
-                    self.image_view = Some(abs);
+                })
+                .ok();
+                let preview = root
+                    .as_ref()
+                    .zip(candidate.as_ref())
+                    .and_then(|(root, path)| {
+                        path.starts_with(root)
+                            .then(|| kitty::normalize_to_png(path, root))
+                            .flatten()
+                    });
+                if let Some(preview) = preview {
+                    self.image_view = Some(preview);
                 } else {
-                    self.set_notice(format!("image not found: {}", abs.display()));
+                    self.set_notice(
+                        "image preview requires a bounded PNG inside the workspace".to_string(),
+                    );
                 }
             }
             // `/cd [path]`: switch the workspace at runtime instead of
@@ -3165,10 +3280,14 @@ impl App {
     /// or `+`-create a session in another worktree. The session rail stays (it
     /// lists the launch project's worktrees); the PTY is left alone (it may have
     /// a live shell). No-ops if already there.
-    fn set_active_project(&mut self, cwd: PathBuf) {
+    fn set_active_project(&mut self, cwd: PathBuf) -> bool {
         let s = cwd.to_string_lossy().into_owned();
         if s == self.workspace_root {
-            return;
+            return true;
+        }
+        if !self.editor.set_root(cwd.clone()) {
+            self.set_notice("save or close modified editor tabs before switching projects".into());
+            return false;
         }
         self.workspace_root = s;
         self.tree.set_root(cwd.clone());
@@ -3177,6 +3296,7 @@ impl App {
                                          // Force the file tree to re-read on the next tick rather than waiting
                                          // out the throttle window.
         self.last_tree_scan = Instant::now() - Duration::from_secs(2);
+        true
     }
 
     /// Startup chooser rows: new session, saved-session picker, blank editor,
@@ -3870,6 +3990,7 @@ impl App {
             .file_name()
             .map(|n| n.to_string_lossy().into_owned())
             .unwrap_or_else(|| path.display().to_string());
+        let name = truncate_cells(&name, full.width.saturating_sub(2) as usize);
         // Title bar.
         frame.render_widget(
             Paragraph::new(Line::from(vec![Span::styled(
@@ -6927,6 +7048,46 @@ mod tests {
             mtime: index as u64,
             path: root.join("session.json"),
         }
+    }
+
+    #[test]
+    fn image_view_resize_clears_static_geometry_for_immediate_replace() {
+        let mut app = offline_app();
+        app.image_view = Some(PathBuf::from("preview.png"));
+        app.image_placed = true;
+
+        app.on_crossterm(CrosstermEvent::Resize(120, 40));
+
+        assert!(app.image_view.is_some(), "resize keeps viewer open");
+        assert!(
+            !app.image_placed,
+            "next immediate draw must place new geometry"
+        );
+    }
+
+    #[test]
+    fn only_the_painted_center_contributes_image_placements() {
+        let chat = vec![kitty::Placement {
+            path: PathBuf::from("chat.png"),
+            rect: Rect::new(1, 1, 10, 10),
+        }];
+        let editor = vec![kitty::Placement {
+            path: PathBuf::from("editor.png"),
+            rect: Rect::new(2, 2, 10, 10),
+        }];
+        let area = Rect::new(0, 0, 80, 24);
+
+        assert_eq!(
+            visible_image_placements(Center::Chat, area, &chat, &editor),
+            chat
+        );
+        assert_eq!(
+            visible_image_placements(Center::Editor, area, &chat, &editor),
+            editor
+        );
+        assert!(visible_image_placements(Center::Graph, area, &chat, &editor).is_empty());
+        assert!(visible_image_placements(Center::WorkflowGraph, area, &chat, &editor).is_empty());
+        assert!(visible_image_placements(Center::Chat, Rect::default(), &chat, &editor).is_empty());
     }
 
     #[test]

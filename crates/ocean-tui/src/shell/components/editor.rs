@@ -21,6 +21,7 @@ use crate::shell::{
     editor::EditorTab,
     git::Mark,
     highlight::Highlighter,
+    kitty::{self, Placement},
     markdown::Markdown,
     panel,
     theme::{self, g},
@@ -42,6 +43,8 @@ pub struct EditorComponent {
     follow_cursor: bool,
     selection_body: Rect,
     selection_top: usize,
+    /// Out-of-band kitty graphics requested by the latest editor draw.
+    image_placements: Vec<Placement>,
 }
 
 impl EditorComponent {
@@ -58,11 +61,37 @@ impl EditorComponent {
             follow_cursor: true,
             selection_body: Rect::default(),
             selection_top: 0,
+            image_placements: Vec::new(),
         }
     }
 
     pub fn has_tabs(&self) -> bool {
         !self.tabs.is_empty()
+    }
+
+    /// Re-root editor authority with the active project. Tabs belong to their
+    /// workspace, so a project switch closes them rather than retaining stale
+    /// edit or image-preview paths across the boundary.
+    pub fn set_root(&mut self, root: PathBuf) -> bool {
+        if self.root == root {
+            return true;
+        }
+        if self.tabs.iter().any(|tab| tab.dirty) {
+            return false;
+        }
+        self.root = root;
+        self.tabs.clear();
+        self.active = 0;
+        self.markdown.clear();
+        self.image_placements.clear();
+        self.selection_body = Rect::default();
+        self.selection_top = 0;
+        true
+    }
+
+    /// Visible inline/direct image previews from the most recent draw.
+    pub fn image_placements(&self) -> &[Placement] {
+        &self.image_placements
     }
 
     /// Breadcrumb text: the open file's path relative to the project root.
@@ -80,6 +109,20 @@ impl EditorComponent {
 
     /// Open `path`, focusing an existing tab if already open.
     pub fn open(&mut self, path: PathBuf) {
+        let path = if kitty::is_image_path(&path) {
+            let Some(root) = std::fs::canonicalize(&self.root).ok() else {
+                return;
+            };
+            let Some(path) = std::fs::canonicalize(path).ok() else {
+                return;
+            };
+            if !path.starts_with(root) {
+                return;
+            }
+            path
+        } else {
+            path
+        };
         if let Some(i) = self.tabs.iter().position(|t| t.path == path) {
             self.active = i;
             if self.tabs[i].markdown_preview {
@@ -87,8 +130,13 @@ impl EditorComponent {
             }
             return;
         }
-        if let Ok(mut tab) = EditorTab::open(path, &self.hl) {
-            tab.markdown_preview = is_markdown(&tab.ext());
+        let opened = if kitty::is_image_path(&path) {
+            EditorTab::open_image(path)
+        } else {
+            EditorTab::open(path, &self.hl)
+        };
+        if let Ok(mut tab) = opened {
+            tab.markdown_preview = !tab.image_preview && is_markdown(&tab.ext());
             if tab.markdown_preview {
                 self.markdown.clear();
             }
@@ -148,7 +196,7 @@ impl Component for EditorComponent {
         }
         let hl = &self.hl;
         let t = self.tabs.get_mut(self.active)?;
-        if t.markdown_preview && is_markdown(&t.ext()) {
+        if t.image_preview || (t.markdown_preview && is_markdown(&t.ext())) {
             return None;
         }
         for c in text.chars() {
@@ -177,6 +225,15 @@ impl Component for EditorComponent {
                 self.follow_cursor = !t.markdown_preview;
                 return Some(Action::Render);
             }
+            return None;
+        }
+        if self
+            .tabs
+            .get(self.active)
+            .is_some_and(|tab| tab.image_preview)
+        {
+            // Image tabs are immutable previews. In particular, Ctrl-S must
+            // never write the placeholder text buffer over the binary.
             return None;
         }
         if ctrl && key.code == KeyCode::Char('s') {
@@ -230,6 +287,13 @@ impl Component for EditorComponent {
                 )
             })
             .unwrap_or_default();
+        if self
+            .tabs
+            .get(self.active)
+            .is_some_and(|tab| tab.image_preview)
+        {
+            return None;
+        }
         let height = self.last_body_h;
         self.follow_cursor = false;
         let t = self.tabs.get_mut(self.active)?;
@@ -267,19 +331,22 @@ impl Component for EditorComponent {
     }
 
     fn draw(&mut self, frame: &mut Frame, area: Rect) {
-        let (title, dirty, preview) = match self.tabs.get(self.active) {
+        self.image_placements.clear();
+        let (title, dirty, preview, is_image) = match self.tabs.get(self.active) {
             Some(t) => (
                 t.name().to_uppercase(),
                 t.dirty,
                 t.markdown_preview && is_markdown(&t.ext()),
+                t.image_preview,
             ),
-            None => ("EDITOR".to_string(), false, false),
+            None => ("EDITOR".to_string(), false, false, false),
         };
-        let state = match (preview, dirty) {
-            (true, true) => Some("preview · unsaved"),
-            (true, false) => Some("preview"),
-            (false, true) => Some("unsaved"),
-            (false, false) => None,
+        let state = match (preview, dirty, is_image) {
+            (_, _, true) => Some("image"),
+            (true, true, false) => Some("preview · unsaved"),
+            (true, false, false) => Some("preview"),
+            (false, true, false) => Some("unsaved"),
+            _ => None,
         };
         let body = panel::draw(frame, area, &title, state, self.focused);
         self.selection_body = body;
@@ -296,6 +363,58 @@ impl Component for EditorComponent {
             return;
         };
 
+        // ── image-file tab: reserve the body for a single full-size pixel preview ──
+        if is_image {
+            let note = if !kitty::supported() {
+                "image preview needs a kitty-graphics terminal".to_string()
+            } else {
+                let size = std::fs::metadata(&t.path)
+                    .map(|m| {
+                        let bytes = m.len();
+                        if bytes < 1024 {
+                            format!("{bytes} B")
+                        } else if bytes < 1024 * 1024 {
+                            format!("{} KiB", bytes / 1024)
+                        } else {
+                            format!("{:.1} MiB", bytes as f64 / (1024.0 * 1024.0))
+                        }
+                    })
+                    .unwrap_or_else(|_| "?".into());
+                format!("{} · {}", t.path.display(), size)
+            };
+            let note =
+                panel::fit_cells(&sanitize_line(&note), body.width.saturating_sub(2) as usize);
+            let note_width = UnicodeWidthStr::width(note.as_str()).min(u16::MAX as usize) as u16;
+            let pad_x = body.width.saturating_sub(note_width + 2).min(4);
+            frame.render_widget(
+                Paragraph::new(Span::styled(
+                    format!("  {}{note}", " ".repeat(pad_x as usize)),
+                    Style::default().fg(theme::COMMENT),
+                ))
+                .style(Style::default().bg(theme::BG)),
+                Rect::new(body.x, body.y, body.width, 1),
+            );
+            if kitty::supported() {
+                if let Some(png) = kitty::normalize_to_png(&t.path, &self.root) {
+                    let image_body = Rect::new(
+                        body.x + 1,
+                        body.y + 1,
+                        body.width.saturating_sub(2),
+                        body.height.saturating_sub(2),
+                    );
+                    if image_body.width > 0 && image_body.height > 0 {
+                        self.image_placements.push(kitty::Placement {
+                            path: png,
+                            rect: image_body,
+                        });
+                    }
+                }
+            }
+            self.selection_top = 0;
+            panel::footer(frame, area, " image preview · read-only");
+            return;
+        }
+
         if preview {
             self.last_text_w = body.width as usize;
             let source = t
@@ -305,7 +424,16 @@ impl Component for EditorComponent {
                 .collect::<Vec<_>>()
                 .join("\n");
             let rendered = self.markdown.render(&source);
-            let paragraph = Paragraph::new(rendered.lines)
+            let mut block_lines = rendered.lines;
+            let mut block_links = rendered.links;
+            let logical_images = kitty::reserve_markdown_images(
+                &mut block_lines,
+                &mut block_links,
+                &rendered.images,
+                t.path.parent().unwrap_or(&self.root),
+                &self.root,
+            );
+            let paragraph = Paragraph::new(block_lines.clone())
                 .style(Style::default().bg(theme::BG))
                 .block(Block::default().padding(Padding::horizontal(PREVIEW_PAD_X)))
                 .wrap(Wrap { trim: false });
@@ -316,7 +444,26 @@ impl Component for EditorComponent {
                 .min(u16::MAX as usize);
             t.preview_scroll = t.preview_scroll.min(max_scroll);
             self.selection_top = t.preview_scroll;
-            frame.render_widget(paragraph.scroll((t.preview_scroll as u16, 0)), body);
+            let scroll = t.preview_scroll as u16;
+            frame.render_widget(paragraph.scroll((scroll, 0)), body);
+            // Project visible images after wrap+scroll so they track the viewport.
+            if !logical_images.is_empty() && content_width > 0 && body.height > 0 {
+                let scroll_area = Rect::new(
+                    body.x.saturating_add(PREVIEW_PAD_X),
+                    body.y,
+                    content_width,
+                    body.height,
+                );
+                self.image_placements = kitty::project_visible(
+                    &block_lines,
+                    &logical_images,
+                    scroll_area,
+                    scroll,
+                    content_width,
+                    scroll_area.x,
+                    scroll_area.width,
+                );
+            }
             panel::footer(frame, area, " preview · ^P source · ↑↓ scroll");
             return;
         }
@@ -693,6 +840,90 @@ mod tests {
         assert!(!editor.tabs[0].markdown_preview);
         editor.handle_key(press(KeyCode::Char('x'), KeyModifiers::NONE));
         assert_eq!(editor.tabs[0].lines[1], "bodyx");
+    }
+
+    #[test]
+    fn image_tab_ignores_paste_edits_and_save_without_touching_binary() {
+        let path =
+            std::env::temp_dir().join(format!("ocean-editor-readonly-{}.png", std::process::id()));
+        let original = b"\x89PNG\r\n\x1a\nbinary fixture";
+        std::fs::write(&path, original).unwrap();
+        let mut editor = EditorComponent::new(std::env::temp_dir());
+        editor.focused = true;
+        editor.open(path.clone());
+        assert!(editor.tabs[0].image_preview);
+
+        editor.handle_paste("overwrite");
+        editor.handle_key(press(KeyCode::Char('x'), KeyModifiers::NONE));
+        editor.handle_key(press(KeyCode::Char('s'), KeyModifiers::CONTROL));
+
+        assert_eq!(std::fs::read(&path).unwrap(), original);
+        assert!(!editor.tabs[0].dirty);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn reroot_closes_workspace_owned_tabs_and_updates_image_boundary() {
+        let base = std::env::temp_dir().join(format!("ocean-editor-reroot-{}", std::process::id()));
+        let first = base.join("first");
+        let second = base.join("second");
+        std::fs::create_dir_all(&first).unwrap();
+        std::fs::create_dir_all(&second).unwrap();
+        let file = first.join("note.md");
+        std::fs::write(&file, "# first").unwrap();
+
+        let mut editor = EditorComponent::new(first);
+        editor.open(file);
+        assert!(editor.has_tabs());
+        assert!(editor.set_root(second.clone()));
+        assert!(!editor.has_tabs());
+        assert_eq!(editor.root, second);
+        let _ = std::fs::remove_dir_all(base);
+    }
+
+    #[test]
+    fn reroot_refuses_to_discard_a_modified_buffer() {
+        let base =
+            std::env::temp_dir().join(format!("ocean-editor-dirty-reroot-{}", std::process::id()));
+        let first = base.join("first");
+        let second = base.join("second");
+        std::fs::create_dir_all(&first).unwrap();
+        std::fs::create_dir_all(&second).unwrap();
+        let file = first.join("note.md");
+        std::fs::write(&file, "original").unwrap();
+
+        let mut editor = EditorComponent::new(first.clone());
+        editor.open(file);
+        editor.tabs[0].dirty = true;
+        assert!(editor.tabs[0].dirty);
+        assert!(!editor.set_root(second));
+        assert_eq!(editor.root, first);
+        assert!(editor.has_tabs());
+        assert!(editor.tabs[0].dirty);
+        let _ = std::fs::remove_dir_all(base);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn image_tab_rejects_a_workspace_symlink_to_an_outside_file() {
+        use std::os::unix::fs::symlink;
+        let base =
+            std::env::temp_dir().join(format!("ocean-editor-image-root-{}", std::process::id()));
+        std::fs::create_dir_all(&base).unwrap();
+        let outside = std::env::temp_dir().join(format!(
+            "ocean-editor-image-outside-{}.png",
+            std::process::id()
+        ));
+        std::fs::write(&outside, b"\x89PNG\r\n\x1a\noutside").unwrap();
+        let link = base.join("escape.png");
+        symlink(&outside, &link).unwrap();
+
+        let mut editor = EditorComponent::new(base.clone());
+        editor.open(link);
+        assert!(!editor.has_tabs());
+
+        let _ = std::fs::remove_dir_all(base);
+        let _ = std::fs::remove_file(outside);
     }
 
     #[test]

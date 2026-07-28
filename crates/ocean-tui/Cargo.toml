@@ -43,6 +43,9 @@ open = "5"
 qrcode = { version = "0.14", default-features = false }
 # Kitty graphics protocol payload encoding (inline image display).
 base64.workspace = true
+crc32fast = "1"
+libc.workspace = true
+png = "0.17.16"
 ocean-oauth.workspace = true
 ocean-observatory.workspace = true
 ocean-providers.workspace = true

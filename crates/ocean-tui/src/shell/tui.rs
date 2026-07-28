@@ -111,6 +111,12 @@ pub fn init() -> io::Result<Guard> {
 }
 
 pub fn restore() -> io::Result<()> {
+    // Clear any kitty graphics images before leaving the alternate screen
+    // so pixels don't linger after the TUI exits.
+    if crate::shell::kitty::supported() {
+        crate::shell::kitty::clear_all();
+    }
+    crate::shell::kitty::cleanup_cache();
     // Pop is a no-op where enhancement was never pushed.
     let _ = execute!(io::stdout(), PopKeyboardEnhancementFlags);
     disable_raw_mode()?;
