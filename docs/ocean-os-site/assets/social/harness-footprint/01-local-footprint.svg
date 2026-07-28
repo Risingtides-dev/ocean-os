@@ -1,0 +1,76 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1600" height="900" viewBox="0 0 1600 900" role="img" aria-labelledby="title description">
+  <title id="title">Ocean local runtime footprint compared with five agent harnesses</title>
+  <desc id="description">Ocean CLI and daemon total 45.1 MiB. Local comparison installs range from 128.9 to 297.3 MiB.</desc>
+  <defs>
+    <linearGradient id="leftShade" x1="0" x2="1">
+      <stop offset="0" stop-color="#030611" stop-opacity="0.98"/>
+      <stop offset="0.31" stop-color="#030611" stop-opacity="0.83"/>
+      <stop offset="0.58" stop-color="#030611" stop-opacity="0.16"/>
+      <stop offset="1" stop-color="#030611" stop-opacity="0"/>
+    </linearGradient>
+    <linearGradient id="bottomShade" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0.56" stop-color="#030611" stop-opacity="0"/>
+      <stop offset="1" stop-color="#030611" stop-opacity="0.9"/>
+    </linearGradient>
+    <filter id="cyanGlow" x="-100%" y="-100%" width="300%" height="300%">
+      <feGaussianBlur stdDeviation="7" result="blur"/>
+      <feMerge><feMergeNode in="blur"/><feMergeNode in="SourceGraphic"/></feMerge>
+    </filter>
+  </defs>
+
+  <image href="backplate-comparison.png" width="1600" height="900" preserveAspectRatio="xMidYMid slice"/>
+  <rect width="1600" height="900" fill="url(#leftShade)"/>
+  <rect width="1600" height="900" fill="url(#bottomShade)"/>
+
+  <g font-family="-apple-system, BlinkMacSystemFont, 'Inter', 'Helvetica Neue', Arial, sans-serif">
+    <g transform="translate(72 58)">
+      <circle cx="20" cy="20" r="20" fill="#0b1529" stroke="#67e8f9" stroke-opacity="0.65"/>
+      <text x="20" y="28" text-anchor="middle" fill="#67e8f9" font-size="25" font-weight="800">≈</text>
+      <text x="56" y="27" fill="#edf8ff" font-size="21" font-weight="800" letter-spacing="2.6">OCEAN</text>
+    </g>
+
+    <text x="76" y="145" fill="#67e8f9" font-size="18" font-weight="750" letter-spacing="3.2">LOCAL ON-DISK FOOTPRINT / APPLE SILICON</text>
+    <text x="68" y="264" fill="#edf8ff" font-size="118" font-weight="760" letter-spacing="-6.5">45.1 MiB</text>
+    <text x="76" y="327" fill="#edf8ff" font-size="48" font-weight="680" letter-spacing="-2.2">Ocean, end to end.</text>
+    <text x="78" y="369" fill="#9fb4d0" font-size="23" font-weight="520">TUI + daemon. Both runtime binaries counted.</text>
+
+    <g font-family="SFMono-Regular, Menlo, Consolas, monospace">
+      <g transform="translate(78 649)">
+        <text x="0" y="0" fill="#67e8f9" font-size="17" font-weight="800" letter-spacing="2.3">OCEAN</text>
+        <text x="0" y="31" fill="#edf8ff" font-size="27" font-weight="760">45.1 MiB</text>
+        <path d="M122 19 L160 19 L181 64" fill="none" stroke="#67e8f9" stroke-width="2"/>
+        <circle cx="181" cy="64" r="4" fill="#67e8f9" filter="url(#cyanGlow)"/>
+      </g>
+
+      <g transform="translate(414 416)">
+        <text x="0" y="0" fill="#edf8ff" font-size="16" font-weight="700">OPENCODE</text>
+        <text x="0" y="25" fill="#9fb4d0" font-size="16">128.9 MiB</text>
+        <path d="M18 37 L18 69" stroke="#64748b" stroke-width="1.5"/>
+      </g>
+      <g transform="translate(563 268)">
+        <text x="0" y="0" fill="#edf8ff" font-size="16" font-weight="700">PI</text>
+        <text x="0" y="25" fill="#9fb4d0" font-size="16">172.9 MiB</text>
+        <path d="M16 37 L16 65" stroke="#64748b" stroke-width="1.5"/>
+      </g>
+      <g transform="translate(720 190)">
+        <text x="0" y="0" fill="#edf8ff" font-size="16" font-weight="700">GOOSE</text>
+        <text x="0" y="25" fill="#9fb4d0" font-size="16">231.4 MiB</text>
+        <path d="M18 37 L18 68" stroke="#64748b" stroke-width="1.5"/>
+      </g>
+      <g transform="translate(933 95)">
+        <text x="0" y="0" fill="#edf8ff" font-size="16" font-weight="700">CLAUDE CODE</text>
+        <text x="0" y="25" fill="#9fb4d0" font-size="16">235.6 MiB</text>
+        <path d="M24 37 L24 68" stroke="#64748b" stroke-width="1.5"/>
+      </g>
+      <g transform="translate(1260 121)">
+        <text x="0" y="0" fill="#edf8ff" font-size="16" font-weight="700">CODEX</text>
+        <text x="0" y="25" fill="#9fb4d0" font-size="16">297.3 MiB</text>
+        <path d="M18 37 L18 65" stroke="#64748b" stroke-width="1.5"/>
+      </g>
+    </g>
+
+    <line x1="76" y1="825" x2="1524" y2="825" stroke="#8fd2ff" stroke-opacity="0.2"/>
+    <text x="76" y="859" fill="#9fb4d0" font-size="15" font-weight="520">Measured locally 18 Jul 2026 · active install artifacts · MiB (2²⁰ bytes)</text>
+    <text x="1524" y="859" text-anchor="end" fill="#64748b" font-size="15" font-family="SFMono-Regular, Menlo, Consolas, monospace">ocean-os</text>
+  </g>
+</svg>

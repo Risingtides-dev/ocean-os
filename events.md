@@ -5542,3 +5542,14 @@ area:  [writing]: Client and voice boundaries
 
 Recovered the Surface-site honesty pass while preserving the new public-evidence policy. The page now identifies the shared Leptos bundle across PWA/Tauri/extension, treats GPUI as legacy, records proxy-forwarded daemon-owned STT/TTS, and distinguishes the transcript-only `/v1/agent/voice` seam from complete voice UX. Retained images are controlled demonstrations and the runtime observation remains dated point-in-time evidence.
 _________________________________________________________________________________
+
+_________________________________________________________________________________
+
+time:  [00:36] [28-07-26]
+agent: [pi] [gpt-5.4] [Thoth]
+worktree: [detached origin/main integration at /private/tmp/ocean-consolidate]
+type:  [workflow]: Recover dated harness-footprint social assets
+area:  [design]: Public evidence and measurement graphics
+
+Recovered the 2026-07-18 local harness-footprint measurement as two editable SVG/PNG social graphics with AI-generated text-free backplates. Review prep verified all arithmetic, dimensions, visible text, and absence of personal/local identifiers. The daemon-accounting graphic now names its OpenCode 1.17.15 baseline instead of making an unsupported standalone comparison, and the README binds the assets to the public-evidence policy and reproducible Chrome SVG rendering.
+_________________________________________________________________________________

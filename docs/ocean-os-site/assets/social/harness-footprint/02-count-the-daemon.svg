@@ -1,0 +1,68 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1600" height="900" viewBox="0 0 1600 900" role="img" aria-labelledby="title description">
+  <title id="title">The full Ocean runtime is 45.1 MiB</title>
+  <desc id="description">Measured locally on Apple Silicon on 18 July 2026: Ocean TUI and daemon are 11.3 MiB and 33.8 MiB, totaling 45.1 MiB, which is 65 percent smaller than the OpenCode 1.17.15 comparison install at 128.9 MiB.</desc>
+  <defs>
+    <linearGradient id="leftShade" x1="0" x2="1">
+      <stop offset="0" stop-color="#030611" stop-opacity="0.99"/>
+      <stop offset="0.46" stop-color="#030611" stop-opacity="0.94"/>
+      <stop offset="0.68" stop-color="#030611" stop-opacity="0.12"/>
+      <stop offset="1" stop-color="#030611" stop-opacity="0"/>
+    </linearGradient>
+    <linearGradient id="bottomShade" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0.65" stop-color="#030611" stop-opacity="0"/>
+      <stop offset="1" stop-color="#030611" stop-opacity="0.88"/>
+    </linearGradient>
+    <linearGradient id="runtimeBar" x1="0" x2="1">
+      <stop offset="0" stop-color="#67e8f9"/>
+      <stop offset="0.25" stop-color="#67e8f9"/>
+      <stop offset="0.251" stop-color="#60a5fa"/>
+      <stop offset="1" stop-color="#60a5fa"/>
+    </linearGradient>
+  </defs>
+
+  <image href="backplate-runtime.png" width="1600" height="900" preserveAspectRatio="xMidYMid slice"/>
+  <rect width="1600" height="900" fill="url(#leftShade)"/>
+  <rect width="1600" height="900" fill="url(#bottomShade)"/>
+
+  <g font-family="-apple-system, BlinkMacSystemFont, 'Inter', 'Helvetica Neue', Arial, sans-serif">
+    <g transform="translate(72 58)">
+      <circle cx="20" cy="20" r="20" fill="#0b1529" stroke="#67e8f9" stroke-opacity="0.65"/>
+      <text x="20" y="28" text-anchor="middle" fill="#67e8f9" font-size="25" font-weight="800">≈</text>
+      <text x="56" y="27" fill="#edf8ff" font-size="21" font-weight="800" letter-spacing="2.6">OCEAN</text>
+    </g>
+
+    <text x="76" y="146" fill="#67e8f9" font-size="18" font-weight="750" letter-spacing="3.2">HONEST TOTAL</text>
+    <text x="70" y="253" fill="#edf8ff" font-size="92" font-weight="760" letter-spacing="-5.5">COUNT THE</text>
+    <text x="70" y="343" fill="#edf8ff" font-size="92" font-weight="760" letter-spacing="-5.5">DAEMON TOO.</text>
+    <text x="76" y="454" fill="#67e8f9" font-size="90" font-weight="760" letter-spacing="-4.5">45.1 MiB</text>
+    <text x="80" y="496" fill="#9fb4d0" font-size="22" font-weight="520">Full local runtime.</text>
+
+    <rect x="78" y="560" width="550" height="12" rx="6" fill="url(#runtimeBar)"/>
+    <line x1="216" y1="548" x2="216" y2="584" stroke="#030611" stroke-width="3"/>
+    <g font-family="SFMono-Regular, Menlo, Consolas, monospace">
+      <text x="78" y="618" fill="#edf8ff" font-size="20" font-weight="740">11.3 MiB</text>
+      <text x="78" y="648" fill="#9fb4d0" font-size="16">OCEAN TUI</text>
+      <text x="290" y="618" fill="#edf8ff" font-size="20" font-weight="740">33.8 MiB</text>
+      <text x="290" y="648" fill="#9fb4d0" font-size="16">OCEAN DAEMON</text>
+    </g>
+
+    <text x="78" y="723" fill="#edf8ff" font-size="31" font-weight="700" letter-spacing="-0.8">65% smaller</text>
+    <text x="276" y="723" fill="#9fb4d0" font-size="25" font-weight="520">than OpenCode 1.17.15 (128.9 MiB).</text>
+
+    <g font-family="SFMono-Regular, Menlo, Consolas, monospace" font-size="15" letter-spacing="1.7">
+      <text x="78" y="781" fill="#67e8f9">TUI</text>
+      <text x="141" y="781" fill="#64748b">/</text>
+      <text x="169" y="781" fill="#67e8f9">DAEMON</text>
+      <text x="263" y="781" fill="#64748b">/</text>
+      <text x="291" y="781" fill="#67e8f9">SESSIONS</text>
+      <text x="404" y="781" fill="#64748b">/</text>
+      <text x="432" y="781" fill="#67e8f9">PROVIDERS</text>
+      <text x="560" y="781" fill="#64748b">/</text>
+      <text x="588" y="781" fill="#67e8f9">TOOLS</text>
+    </g>
+
+    <line x1="76" y1="825" x2="1524" y2="825" stroke="#8fd2ff" stroke-opacity="0.2"/>
+    <text x="76" y="859" fill="#9fb4d0" font-size="15" font-weight="520">Measured locally 18 Jul 2026 · Apple Silicon · both runtime binaries counted.</text>
+    <text x="1524" y="859" text-anchor="end" fill="#64748b" font-size="15" font-family="SFMono-Regular, Menlo, Consolas, monospace">ocean-os</text>
+  </g>
+</svg>
