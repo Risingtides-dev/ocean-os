@@ -46,6 +46,14 @@ Use `crates/AGENTS.md` for all current workspace packages, ownership exclusions,
 - Behavior-neutral extraction requires a written extraction manifest and must not bundle redesign, protocol changes, renames, or opportunistic fixes.
 - Subagent definitions, dispatch, lifecycle, and orchestration policy are extension-owned. Do not add a core daemon/runtime `task`, `spawn_worker`, fleet scheduler, or named-subagent runtime; core may expose only generic permission-gated execution, cancellation, capability-provider, and extension event/tool seams. Existing core subagent-shaped metadata/spec routes are compatibility surfaces pending a separately approved extension migration.
 - Once the operator explicitly authorizes an ongoing program, continue through safe approved checkpoints without repeated approval prompts. Close each bounded change with verification, review, commit, upstream reconciliation, and a clean tree; pause only for a concrete blocker or required design decision.
+- A feature is not delivered while it exists only in a stash, detached worktree,
+  local commit, or unmerged branch. Build and test feature branches normally;
+  do not interpret production-deploy provenance rules as permission to skip
+  compilation. Close authorized work by reconciling current `origin/main`,
+  obtaining fresh review, landing the commit upstream, fast-forwarding the
+  canonical checkout, and rebuilding/installing every affected operator-facing
+  binary. If an external-action gate blocks landing, report the exact branch,
+  commit, remaining command, and blocker; never describe the feature as shipped.
 - The Chromium browser backend is quarantined behind the default-off `legacy-chromium` feature (details and validation in `crates/AGENTS.md`) pending the OceanWebKit browser host; default builds must compile no chromiumoxide and must never launch or probe a browser.
 - Minimum supported Rust is 1.88, enforced by the MSRV lane; do not lower it without pinning the resolved dependency graph and proving every supported feature.
 - Build: `cargo build --workspace --release`.

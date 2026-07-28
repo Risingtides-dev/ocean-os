@@ -23,7 +23,7 @@ on crash (`KeepAlive`) and starts it at login/reboot (`RunAtLoad`).
 | Version-controlled plist | `deploy/dev.risingtides.ocean-daemon.plist` |
 | Launcher it execs | `deploy/ocean-daemon.sh` |
 | Installed plist path | `~/Library/LaunchAgents/dev.risingtides.ocean-daemon.plist` |
-| Binary run | `target/release/ocean-daemon` (prebuilt, from **main**) |
+| Binary run | `~/.local/libexec/ocean-daemon/current` (immutable artifact from reviewed **main**) |
 | Working directory | neutral directory outside any git repo (`$HOME` by default; override with `OCEAN_DAEMON_CWD`) |
 | Bind address | `127.0.0.1:4780` (binary default; env `OCEAN_BIND` to override) |
 | Env | `OCEAN_YOLO=1` (matches the prior hand-launch) |
@@ -34,19 +34,19 @@ on crash (`KeepAlive`) and starts it at login/reboot (`RunAtLoad`).
 > cannot silently bind to ocean-os. The launcher resolves the binary by absolute
 > path, then runs from `$HOME` or `OCEAN_DAEMON_CWD`.
 >
-> ### Build from MAIN — always
-> Per operator rule, **never build/deploy/run the daemon from a feature branch.**
-> The LaunchAgent runs a **prebuilt** `target/release/ocean-daemon` — it does
-> **not** recompile on respawn. So the binary on disk *is* the deployment. Before
-> installing, be on `main` and build:
-> ```bash
-> git checkout main && git pull
-> cargo build -p ocean-daemon --release
-> ```
-> `ops/install-ocean-daemon.sh` does the build for you and fails immediately if
-> the checkout is not on `main`. **To ship new daemon code:** merge to main → rebuild from main →
-> `launchctl kickstart -k` (see "Restart" below). A rebuild alone does nothing
-> until the running process is restarted.
+> ### Build and test everywhere; deploy reviewed MAIN
+> Feature branches and worktrees **must** compile and run their focused tests.
+> The provenance gate applies only to the supervised live daemon deployment; it
+> must never be used as a reason to skip feature verification or leave work
+> unmerged. The LaunchAgent runs a prebuilt immutable artifact and does not
+> recompile on respawn, so shipping requires: review and merge → update
+> `origin/main` → run `ops/install-ocean-daemon.sh` → verify `/health` reports
+> the merged revision. A rebuild alone does nothing until the running process is
+> restarted.
+
+> For the TUI, use `ops/install-ocean-tui.sh` after merge. It atomically updates
+> the `~/.local/bin/ocean` command to a revision-named artifact; a feature branch
+> build proves the code, but an uninstalled build does not change operator UX.
 
 > ### On KeepAlive and health
 > launchd's `KeepAlive` can't natively curl `/health`, so we use the right

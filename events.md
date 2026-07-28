@@ -5426,3 +5426,14 @@ area:  [backend]: Native Messages boundary and daemon client
 
 Consolidated the signed local iMessage adapter source with the exact 571-to-703 inbound and 571-only outbound policy. Review repairs moved exact pair and participant checks into the SQL prefilter, require the operator-enrolled Messages account, constrain delivery to the loopback Ocean daemon, make SSE gaps fatal, serialize and deduplicate cross-process state, and remove an incompatible extension service declaration pending a separately ratified privileged-service contract. Eleven Swift tests, release build, docs-check, shell syntax, patch checks, and final security review pass.
 _________________________________________________________________________________
+
+_________________________________________________________________________________
+
+time:  [23:22] [27-07-26]
+agent: [pi] [gpt-5.4] [Thoth]
+worktree: [detached origin/main integration at /private/tmp/ocean-consolidate]
+type:  [bug report]: Restore TUI acknowledgement, cancellation, and interaction continuity
+area:  [frontend]: Chat lifecycle, queueing, scrollback, and installed artifact workflow
+
+Consolidated unknown-ack reconciliation, exact-request Esc cancellation, tool-local failure color, FIFO follow-up queueing, quiet interrupted turns, and detached scroll anchoring. Review repairs fence queues across session history, handle finish-before-ack, preserve FIFO through 409 and fenced recovery, retain cancellation across transient reconnects, clear stale targets on authoritative sync, and make the revisioned installer truly immutable. The TUI suite passes 432 tests with 4 ignored; release/check/docs/format/shell/patch gates and final review pass.
+_________________________________________________________________________________

@@ -129,24 +129,22 @@ installer and `ops/README.md` are authoritative.
 
 ## Install the TUI
 
-Build from reviewed `main`, then replace the user binary using remove+copy or an
-atomic rename. Do not overwrite an existing executable in place because macOS
-code-signing metadata can be retained incorrectly.
+Feature branches must build and test the TUI normally. Installation is a
+separate delivery gate: after review and merge, update a clean checkout whose
+HEAD is contained in `origin/main`, then run:
 
 ```bash
-cargo build -p ocean-tui --release
-install_dir="$HOME/.local/bin"
-mkdir -p "$install_dir"
-tmp="$install_dir/.ocean.$$"
-cp target/release/ocean-tui "$tmp"
-chmod 755 "$tmp"
-codesign --force --sign - "$tmp"
-mv -f "$tmp" "$install_dir/ocean"
-codesign --verify --deep --strict "$install_dir/ocean"
+./ops/install-ocean-tui.sh
 ```
 
+The installer runs the locked release build, publishes an immutable
+revision-named artifact under `~/.local/libexec/ocean-tui/`, verifies its ad-hoc
+code signature, and atomically updates `~/.local/bin/ocean`. This avoids stale
+or untraceable binaries and avoids overwriting a running Mach-O in place.
+
 After installation, run a real multi-second PTY/TUI smoke rather than treating
-`--help` as a launch proof.
+`--help` as launch proof. A TUI change is not shipped merely because a release
+binary exists under a worktree's `target/` directory.
 
 ## Verification
 

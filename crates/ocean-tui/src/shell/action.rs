@@ -131,6 +131,12 @@ pub enum Action {
         operation_generation: u64,
         result: Result<ocean_core::SessionSyncResponse, CompactFailure>,
     },
+    /// Esc while a turn is active — cancel the daemon request identified by
+    /// the bound stream's authoritative `TurnStarted.turn_id`.
+    InterruptTurn,
+    /// Async completion of an interrupt request. Busy remains authoritative
+    /// until the daemon emits `TurnFinished`.
+    InterruptFinished(Result<String, String>),
     /// A non-fatal error to surface in the status line.
     Error(String),
     /// A turn (or its session mint) could not be sent even after the daemon-blip
@@ -162,6 +168,9 @@ pub enum Action {
     /// offer an automatic retry that could duplicate side effects.
     TurnOutcomeUnknown {
         submission_id: u64,
+        /// Originating session identity survives a UI rebind while the POST
+        /// future is still pending, so uncertainty cannot be dropped on A→B.
+        session_id: AgentSessionId,
         err: String,
     },
     /// Best-effort activity probe used on resume and after a busy rejection.

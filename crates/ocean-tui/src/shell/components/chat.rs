@@ -49,6 +49,9 @@ const KILL_RING_CAP: usize = 10;
 enum Turn {
     /// Operator's prompt.
     User(String),
+    /// A prompt accepted locally while another turn is active. It is promoted
+    /// to `User` and submitted in FIFO order after the active turn finishes.
+    Queued(String),
     /// Assistant visible text (accumulates deltas).
     Assistant(String),
     /// Extended-thinking text (accumulates deltas).
@@ -80,6 +83,8 @@ enum Turn {
     /// Rendered as a plain notice line ("✗ turn failed — …"), NOT as an advisor
     /// card — no severity label, no model attribution.
     ErrorNotice { note: String },
+    /// Operator-requested cancellation is control flow, not a turn failure.
+    Interrupted,
     /// A gated tool waiting on the operator (OCEAN-185). `resolved` is `None`
     /// while waiting, then Some(allowed).
     Permission {
@@ -382,6 +387,13 @@ pub struct ChatComponent {
     cursor: Option<usize>,
     /// Scrollback offset in lines from the bottom (0 = stick to live tail).
     scroll_back: usize,
+    /// Wrapped transcript and viewport heights from the prior frame. While
+    /// detached from the live tail, their combined delta keeps the same top row
+    /// visible across streaming growth, composer resize, and pinned cards.
+    last_wrapped_rows: Option<u16>,
+    last_viewport_rows: Option<u16>,
+    /// Prompts entered while a turn is active, submitted FIFO after each finish.
+    queued_prompts: VecDeque<String>,
     /// Highlighted row in the `/` command palette (see `slash_matches`).
     menu_sel: usize,
     /// Streaming markdown renderer + frozen-block cache for assistant text.
@@ -1785,7 +1797,48 @@ impl ChatComponent {
         self.accepted_submission_id = None;
         self.accepted_turn_id = None;
         self.finished_while_awaiting_ack.clear();
+        self.queued_prompts.clear();
+        self.last_wrapped_rows = None;
+        self.last_viewport_rows = None;
+        self.scroll_back = 0;
         self.busy = false;
+    }
+
+    /// Replace same-session history from a fenced authoritative snapshot while
+    /// retaining follow-ups that never belonged to that snapshot. Session
+    /// switches use `load_history` directly and intentionally drop this queue.
+    pub fn load_synchronized_history(&mut self, msgs: Vec<crate::shell::sessions::HistoryMsg>) {
+        let queued = std::mem::take(&mut self.queued_prompts);
+        self.load_history(msgs);
+        self.queued_prompts = queued;
+        self.turns
+            .extend(self.queued_prompts.iter().cloned().map(Turn::Queued));
+    }
+
+    pub fn release_queued_prompt(&mut self) -> Option<Action> {
+        self.submit_next_queued_prompt()
+    }
+
+    fn submit_next_queued_prompt(&mut self) -> Option<Action> {
+        if self.busy {
+            return None;
+        }
+        let prompt = self.queued_prompts.pop_front()?;
+        if let Some(queued) = self
+            .turns
+            .iter_mut()
+            .find(|turn| matches!(turn, Turn::Queued(text) if text == &prompt))
+        {
+            *queued = Turn::User(prompt.clone());
+        }
+        self.next_submission_id = self.next_submission_id.wrapping_add(1);
+        let submission_id = self.next_submission_id;
+        self.pending_submission_id = Some(submission_id);
+        self.busy = true;
+        Some(Action::SubmitPrompt {
+            submission_id,
+            prompt,
+        })
     }
 
     fn rollback_optimistic_user(&mut self, submission_id: u64, prompt: &str) -> bool {
@@ -2282,6 +2335,9 @@ impl ChatComponent {
                 self.turns.clear();
                 self.md.clear();
                 self.clear_tool_ui_state();
+                self.queued_prompts.clear();
+                self.last_wrapped_rows = None;
+                self.last_viewport_rows = None;
                 self.scroll_back = 0;
                 self.busy = false;
                 None
@@ -2325,6 +2381,9 @@ impl ChatComponent {
                 self.clear_tool_ui_state();
                 self.pinned = None;
                 self.pinned_visible = true;
+                self.queued_prompts.clear();
+                self.last_wrapped_rows = None;
+                self.last_viewport_rows = None;
                 self.scroll_back = 0;
                 self.busy = false;
                 Some(Action::NewSession)
@@ -2951,6 +3010,9 @@ impl Component for ChatComponent {
                         self.turns.clear();
                         self.md.clear();
                         self.clear_tool_ui_state();
+                        self.queued_prompts.clear();
+                        self.last_wrapped_rows = None;
+                        self.last_viewport_rows = None;
                         self.scroll_back = 0;
                     }
                     return None;
@@ -3056,7 +3118,11 @@ impl Component for ChatComponent {
                 _ => {}
             }
         }
+        if matches!(key.code, KeyCode::Esc) && self.busy {
+            return Some(Action::InterruptTurn);
+        }
         match (key.code, key.modifiers) {
+            (KeyCode::Esc, _) if self.busy => Some(Action::InterruptTurn),
             (KeyCode::PageUp, _) => {
                 self.scroll_back += 10;
                 None
@@ -3132,9 +3198,17 @@ impl Component for ChatComponent {
                     }
                 }
                 if self.busy {
-                    return Some(Action::Status(
-                        "session is still working — prompt kept in composer".into(),
-                    ));
+                    self.history.push(&text);
+                    self.reset_history_nav();
+                    self.input.clear();
+                    self.cursor = None;
+                    self.scroll_back = 0;
+                    self.turns.push(Turn::Queued(text.clone()));
+                    self.queued_prompts.push_back(text);
+                    return Some(Action::Status(format!(
+                        "message queued · {} waiting",
+                        self.queued_prompts.len()
+                    )));
                 }
                 self.history.push(&text);
                 self.reset_history_nav();
@@ -3409,12 +3483,19 @@ impl Component for ChatComponent {
             if !self.rollback_optimistic_user(*submission_id, prompt) {
                 return None;
             }
-            // The prior operation still owns this session. Keep Enter blocked;
-            // TurnFinished or an authoritative synchronized snapshot clears it.
+            // The prior operation still owns this session. Preserve the rejected
+            // root prompt ahead of follow-ups so the authoritative finish drains
+            // the operator's original FIFO order without another Enter.
             self.busy = true;
-            if self.input.is_empty() {
-                self.input = prompt.clone();
-            }
+            self.input.clear();
+            self.cursor = None;
+            self.queued_prompts.push_front(prompt.clone());
+            let insert_at = self
+                .turns
+                .iter()
+                .position(|turn| matches!(turn, Turn::Queued(_)))
+                .unwrap_or(self.turns.len());
+            self.turns.insert(insert_at, Turn::Queued(prompt.clone()));
             // App owns the single replace-in-place status notice. Do not add a
             // transcript error/advisor row for this expected admission race.
             self.scroll_back = 0;
@@ -3426,7 +3507,8 @@ impl Component for ChatComponent {
         } = action
         {
             if self.pending_submission_id == Some(*submission_id) {
-                if self.finished_while_awaiting_ack.contains(turn_id) {
+                let finished_before_ack = self.finished_while_awaiting_ack.contains(turn_id);
+                if finished_before_ack {
                     self.pending_submission_id = None;
                     self.accepted_submission_id = None;
                     self.accepted_turn_id = None;
@@ -3439,13 +3521,19 @@ impl Component for ChatComponent {
                     self.accepted_turn_id = Some(*turn_id);
                 }
                 self.finished_while_awaiting_ack.clear();
+                if finished_before_ack {
+                    return self.submit_next_queued_prompt();
+                }
             }
             return None;
         }
         // The request connected, but the final HTTP outcome was lost. The
         // daemon may already have accepted/executed it, so restoring the prompt
         // would invite a duplicate browser action, write, or purchase.
-        if let Action::TurnOutcomeUnknown { submission_id, err } = action {
+        if let Action::TurnOutcomeUnknown {
+            submission_id, err, ..
+        } = action
+        {
             if self.pending_submission_id != Some(*submission_id) {
                 return None;
             }
@@ -3453,9 +3541,14 @@ impl Component for ChatComponent {
             self.accepted_submission_id = None;
             self.accepted_turn_id = None;
             self.finished_while_awaiting_ack.clear();
-            self.busy = false;
+            // HTTP acknowledgement and the authoritative session stream are
+            // independent. A TurnStarted may already have arrived, or the
+            // daemon may still be executing even though the ACK socket closed.
+            // Keep the composer latched until TurnFinished or App's fenced
+            // session probe proves the operation is idle.
+            self.busy = true;
             self.turns.push(Turn::Assistant(format!(
-                "{} turn connection ended before confirmation — {}\n\nThe prompt was not restored because the turn may already be running. Watch the session stream before resubmitting.",
+                "{} turn acknowledgement was interrupted — {}\n\nOcean is checking the session before allowing another submission.",
                 g("⚠", "!"),
                 errfmt::humanize(err)
             )));
@@ -3473,7 +3566,6 @@ impl Component for ChatComponent {
                             reason: reason.clone(),
                             resolved: None,
                         });
-                        self.scroll_back = 0; // surface the prompt immediately
                     }
                 }
                 OceanEvent::PermissionDecision { allowed, .. } => {
@@ -3588,7 +3680,6 @@ impl Component for ChatComponent {
                             resolved: None,
                         });
                     }
-                    self.scroll_back = 0;
                 }
                 AgentTurnEvent::ComponentUnmount { component_id, .. } => {
                     if self.pinned.as_ref().is_some_and(
@@ -3624,18 +3715,20 @@ impl Component for ChatComponent {
                         self.busy = false;
                     }
                     self.last_tok_per_s = *tokens_per_second;
-                    let is_failure = matches!(
-                        status,
-                        ocean_agent_sdk::AgentTurnStatus::Failed
-                            | ocean_agent_sdk::AgentTurnStatus::Cancelled
-                    );
-                    if is_failure || error.is_some() {
+                    if matches!(status, ocean_agent_sdk::AgentTurnStatus::Cancelled) {
+                        self.turns.push(Turn::Interrupted);
+                    } else if matches!(status, ocean_agent_sdk::AgentTurnStatus::Failed)
+                        || error.is_some()
+                    {
                         let note = if let Some(e) = error {
                             format!("{} turn failed — {}", g("✗", "X"), errfmt::humanize(e))
                         } else {
                             format!("{} turn failed — no error detail", g("✗", "X"))
                         };
                         self.turns.push(Turn::ErrorNotice { note });
+                    }
+                    if let Some(next) = self.submit_next_queued_prompt() {
+                        return Some(next);
                     }
                 }
                 AgentTurnEvent::Extension {
@@ -3797,29 +3890,53 @@ impl Component for ChatComponent {
                     } else {
                         g("▸", ">")
                     };
-                    let mut summary = format!("  {disc} tools · {}", group.tool_indices.len());
-                    if done > 0 {
-                        summary.push_str(&format!(" · {done} done"));
+                    // Keep the parent summary quiet: a single failed call must
+                    // not paint the whole historical burst red forever. Status
+                    // segments carry their own text + color, and confirmed tool
+                    // failures use warning-orange while turn-level failures keep
+                    // the stronger red semantic.
+                    let mut summary = vec![
+                        Span::styled(format!("  {disc} "), Style::default().fg(theme::EDGE)),
+                        Span::styled(
+                            format!("tools · {}", group.tool_indices.len()),
+                            Style::default().fg(theme::FG),
+                        ),
+                    ];
+                    // Severity order is deliberate: narrow panes retain the
+                    // failed/running truth before lower-priority done counts.
+                    if failed > 0 {
+                        summary.push(Span::styled(
+                            format!(" · {failed} failed"),
+                            Style::default().fg(theme::ORANGE),
+                        ));
                     }
                     if running > 0 {
-                        summary.push_str(&format!(" · {running} running"));
+                        summary.push(Span::styled(
+                            format!(" · {running} running"),
+                            Style::default().fg(theme::YELLOW),
+                        ));
                     }
-                    if failed > 0 {
-                        summary.push_str(&format!(" · {failed} failed"));
+                    if done > 0 {
+                        summary.push(Span::styled(
+                            format!(" · {done} done"),
+                            Style::default().fg(theme::GREEN),
+                        ));
                     }
-                    let color = if failed > 0 {
-                        theme::RED
-                    } else if running > 0 {
-                        theme::YELLOW
-                    } else {
-                        theme::GREEN
-                    };
+                    let mut cells_left = body.width as usize;
+                    for span in &mut summary {
+                        let width = UnicodeWidthStr::width(span.content.as_ref());
+                        if width <= cells_left {
+                            cells_left -= width;
+                        } else {
+                            span.content =
+                                truncate_to_width(span.content.as_ref(), cells_left).into();
+                            cells_left = 0;
+                        }
+                    }
+                    summary.retain(|span| !span.content.is_empty());
                     drawer_header_lines
                         .push((DrawerTarget::Group(group.root.clone()), lines.len()));
-                    lines.push(Line::from(Span::styled(
-                        truncate_to_width(&summary, body.width as usize),
-                        Style::default().fg(color).add_modifier(Modifier::BOLD),
-                    )));
+                    lines.push(Line::from(summary));
                     if !group_open {
                         lines.push(Line::from(""));
                     }
@@ -3837,6 +3954,17 @@ impl Component for ChatComponent {
                             Style::default()
                                 .fg(theme::CYAN)
                                 .add_modifier(Modifier::BOLD),
+                        ),
+                    ]));
+                }
+                Turn::Queued(s) => {
+                    lines.push(Line::from(vec![
+                        Span::styled(g("◌ ", "~ "), Style::default().fg(theme::COMMENT)),
+                        Span::styled(
+                            format!("{}  · queued", sanitize_line(s)),
+                            Style::default()
+                                .fg(theme::COMMENT)
+                                .add_modifier(Modifier::DIM),
                         ),
                     ]));
                 }
@@ -3980,7 +4108,10 @@ impl Component for ChatComponent {
                     let (status_word, status_color) = match status {
                         ToolStatus::Running => ("running", theme::YELLOW),
                         ToolStatus::Ok => ("done", theme::GREEN),
-                        ToolStatus::Err => ("error", theme::RED),
+                        // Tool-local failures are actionable warnings, not a
+                        // fatal session state. Keep the explicit word while
+                        // reserving persistent red for turn-level failures.
+                        ToolStatus::Err => ("failed", theme::ORANGE),
                     };
                     // One NON-wrapping header row:
                     //   "  {disc} {name}[ · {preview}][ · {status}]"
@@ -4194,6 +4325,12 @@ impl Component for ChatComponent {
                         )));
                     }
                 }
+                Turn::Interrupted => lines.push(Line::from(Span::styled(
+                    "  interrupted",
+                    Style::default()
+                        .fg(theme::COMMENT)
+                        .add_modifier(Modifier::DIM),
+                ))),
             }
             // Grouped tool bursts own their spacing: a closed burst already
             // emitted one parent row + separator; an open burst keeps its nested
@@ -4267,6 +4404,19 @@ impl Component for ChatComponent {
             .style(Style::default().bg(theme::SLATE))
             .wrap(Wrap { trim: false });
         let wrapped = para.line_count(body.width) as u16;
+        if self.scroll_back > 0 {
+            if let (Some(previous_wrapped), Some(previous_viewport)) =
+                (self.last_wrapped_rows, self.last_viewport_rows)
+            {
+                let previous_max_back = previous_wrapped.saturating_sub(previous_viewport);
+                let previous_top = previous_max_back
+                    .saturating_sub(self.scroll_back.min(u16::MAX as usize) as u16);
+                let next_max_back = wrapped.saturating_sub(body.height);
+                self.scroll_back = usize::from(next_max_back.saturating_sub(previous_top));
+            }
+        }
+        self.last_wrapped_rows = Some(wrapped);
+        self.last_viewport_rows = Some(body.height);
         let max_back = wrapped.saturating_sub(body.height) as usize;
         self.scroll_back = self.scroll_back.min(max_back);
         let scroll = wrapped
@@ -4452,6 +4602,33 @@ mod tests {
             out.push('\n');
         }
         out
+    }
+
+    fn render_chat_row_colors(
+        chat: &mut ChatComponent,
+        width: u16,
+        height: u16,
+        needle: &str,
+    ) -> Vec<ratatui::style::Color> {
+        let backend = ratatui::backend::TestBackend::new(width, height);
+        let mut terminal = ratatui::Terminal::new(backend).expect("test terminal");
+        terminal
+            .draw(|frame| chat.draw(frame, frame.area()))
+            .expect("draw chat");
+        let buf = terminal.backend().buffer();
+        for y in buf.area.top()..buf.area.bottom() {
+            let row = (buf.area.left()..buf.area.right())
+                .filter_map(|x| buf.cell((x, y)))
+                .map(|cell| cell.symbol())
+                .collect::<String>();
+            if row.contains(needle) {
+                return (buf.area.left()..buf.area.right())
+                    .filter_map(|x| buf.cell((x, y)))
+                    .map(|cell| cell.fg)
+                    .collect();
+            }
+        }
+        panic!("rendered row did not contain {needle:?}");
     }
 
     fn extension(extension: &str, payload: serde_json::Value) -> Action {
@@ -5052,6 +5229,20 @@ mod tests {
             chat.run_slash("/compact", ""),
             Some(Action::CompactSession)
         ));
+    }
+
+    #[test]
+    fn escape_while_busy_requests_interrupt() {
+        let mut chat = ChatComponent::default();
+        chat.busy = true;
+        assert!(matches!(
+            chat.handle_key(key(KeyCode::Esc)),
+            Some(Action::InterruptTurn)
+        ));
+        assert!(
+            chat.busy,
+            "only TurnFinished may clear the authoritative lifecycle"
+        );
     }
 
     #[test]
@@ -5954,21 +6145,26 @@ mod tests {
     }
 
     #[test]
-    fn turn_finished_cancelled_pushes_error_notice() {
+    fn turn_finished_cancelled_pushes_quiet_interrupted_marker() {
         let mut chat = ChatComponent {
             busy: true,
             ..Default::default()
         };
         chat.update(&turn_finished(
             ocean_agent_sdk::AgentTurnStatus::Cancelled,
-            None,
+            Some("agent canceled"),
         ));
         assert!(!chat.busy);
+        assert!(chat
+            .turns
+            .iter()
+            .any(|turn| matches!(turn, Turn::Interrupted)));
         assert!(
-            chat.turns
+            !chat
+                .turns
                 .iter()
-                .any(|t| matches!(t, Turn::ErrorNotice { note } if note.contains("turn failed"))),
-            "cancelled turn should push an ErrorNotice"
+                .any(|turn| matches!(turn, Turn::ErrorNotice { .. })),
+            "operator cancellation is control flow, not a failure"
         );
     }
 
@@ -6337,9 +6533,47 @@ mod tests {
 
         let screen = render_chat_to_string(&mut chat, 90, 18);
         assert!(
-            screen.contains("tools · 3 · 1 done · 1 running · 1 failed"),
+            screen.contains("tools · 3 · 1 failed · 1 running · 1 done"),
             "{screen:?}"
         );
+        let colors = render_chat_row_colors(&mut chat, 90, 18, "tools · 3");
+        assert!(
+            colors.contains(&theme::GREEN),
+            "done segment stays semantic"
+        );
+        assert!(
+            colors.contains(&theme::YELLOW),
+            "running segment stays semantic"
+        );
+        assert!(
+            colors.contains(&theme::ORANGE),
+            "failed segment uses quieter warning-orange"
+        );
+        assert!(
+            !colors.contains(&theme::RED),
+            "one failed tool must not leave the entire group red"
+        );
+
+        let narrow = render_chat_to_string(&mut chat, 30, 18);
+        assert!(
+            narrow.contains("tools · 3 · 1 failed"),
+            "narrow summaries must preserve failure truth first: {narrow:?}"
+        );
+    }
+
+    #[test]
+    fn failed_tool_indicator_is_orange_not_persistent_red() {
+        let mut chat = ChatComponent::default();
+        let failed = add_tool(&mut chat, "bash", "bad");
+        if let Some(Turn::Tool { status, .. }) = chat.tool_by_id(&failed) {
+            *status = ToolStatus::Err;
+        }
+
+        let screen = render_chat_to_string(&mut chat, 80, 12);
+        assert!(screen.contains("bash · failed"), "{screen:?}");
+        let colors = render_chat_row_colors(&mut chat, 80, 12, "bash · failed");
+        assert!(colors.contains(&theme::ORANGE));
+        assert!(!colors.contains(&theme::RED));
     }
 
     #[test]
@@ -6603,7 +6837,7 @@ mod tests {
         });
 
         assert!(chat.is_busy(), "busy rejection must keep Enter latched");
-        assert_eq!(chat.input, "do not duplicate me");
+        assert!(chat.input.is_empty(), "the preserved root moved into FIFO");
         assert_eq!(
             chat.turns
                 .iter()
@@ -6624,37 +6858,229 @@ mod tests {
         assert_eq!(rendered, "older turn kept streaming");
         assert!(!rendered.contains("409"));
         assert!(!rendered.contains("http://"));
-        let retry = chat.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
-        assert!(
-            matches!(retry, Some(Action::Status(message)) if message.contains("still working"))
-        );
         assert_eq!(
-            chat.turns
-                .iter()
-                .filter(|turn| matches!(turn, Turn::User(text) if text == "do not duplicate me"))
-                .count(),
-            0,
-            "Enter while latched must not create another optimistic echo"
+            chat.queued_prompts.front().map(String::as_str),
+            Some("do not duplicate me")
+        );
+        assert!(chat
+            .turns
+            .iter()
+            .any(|turn| matches!(turn, Turn::Queued(text) if text == "do not duplicate me")));
+    }
+
+    #[test]
+    fn enter_while_busy_queues_fifo_and_finish_submits_next() {
+        let mut chat = ChatComponent {
+            input: "first follow-up".into(),
+            busy: true,
+            ..Default::default()
+        };
+        let first = chat.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(matches!(first, Some(Action::Status(message)) if message.contains("1 waiting")));
+        chat.input = "second follow-up".into();
+        let second = chat.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(matches!(second, Some(Action::Status(message)) if message.contains("2 waiting")));
+        assert!(chat.input.is_empty());
+        assert_eq!(chat.queued_prompts.len(), 2);
+
+        let next = chat.update(&turn_finished(AgentTurnStatus::Completed, None));
+        assert!(matches!(
+            next,
+            Some(Action::SubmitPrompt { prompt, .. }) if prompt == "first follow-up"
+        ));
+        assert!(chat.is_busy());
+        assert_eq!(
+            chat.queued_prompts.front().map(String::as_str),
+            Some("second follow-up")
+        );
+        assert!(matches!(chat.turns.first(), Some(Turn::User(text)) if text == "first follow-up"));
+        assert!(
+            matches!(chat.turns.get(1), Some(Turn::Queued(text)) if text == "second follow-up")
         );
     }
 
     #[test]
-    fn repeated_enter_while_busy_never_posts_or_stacks_rows() {
+    fn queued_finish_before_ack_releases_fifo_after_acceptance() {
         let mut chat = ChatComponent {
-            input: "hammer".into(),
+            input: "root".into(),
+            ..Default::default()
+        };
+        let Some(Action::SubmitPrompt { submission_id, .. }) =
+            chat.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+        else {
+            panic!("expected root submission");
+        };
+        chat.input = "follow-up".into();
+        let queued = chat.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(matches!(queued, Some(Action::Status(_))));
+
+        let turn_id = AgentTurnId(Uuid::from_u128(9901));
+        assert!(chat
+            .update(&turn_finished_for(
+                turn_id,
+                AgentTurnStatus::Completed,
+                None
+            ))
+            .is_none());
+        assert!(chat.is_busy(), "ack is still unresolved");
+
+        let next = chat.update(&Action::TurnAccepted {
+            submission_id,
+            turn_id,
+        });
+        assert!(matches!(
+            next,
+            Some(Action::SubmitPrompt { prompt, .. }) if prompt == "follow-up"
+        ));
+        assert!(chat.is_busy());
+    }
+
+    #[test]
+    fn definite_failures_and_busy_rejections_preserve_follow_up_fifo() {
+        let mut failed = ChatComponent {
+            input: "root".into(),
+            ..Default::default()
+        };
+        let Some(Action::SubmitPrompt { submission_id, .. }) =
+            failed.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+        else {
+            panic!("expected root submission");
+        };
+        failed.input = "follow-up".into();
+        let _ = failed.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        failed.update(&Action::TurnSendFailed {
+            submission_id,
+            prompt: "root".into(),
+            err: "connect failed".into(),
+        });
+        assert_eq!(
+            failed.queued_prompts.front().map(String::as_str),
+            Some("follow-up")
+        );
+        assert!(failed
+            .turns
+            .iter()
+            .any(|turn| matches!(turn, Turn::Queued(text) if text == "follow-up")));
+
+        let mut busy = ChatComponent {
+            input: "root".into(),
+            ..Default::default()
+        };
+        let Some(Action::SubmitPrompt { submission_id, .. }) =
+            busy.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+        else {
+            panic!("expected root submission");
+        };
+        busy.input = "follow-up".into();
+        let _ = busy.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        busy.update(&Action::TurnSessionBusy {
+            submission_id,
+            session_id: AgentSessionId(Uuid::from_u128(9902)),
+            binding_generation: 1,
+            prompt: "root".into(),
+        });
+        assert_eq!(
+            busy.queued_prompts
+                .iter()
+                .map(String::as_str)
+                .collect::<Vec<_>>(),
+            vec!["root", "follow-up"]
+        );
+        let next = busy.update(&turn_finished(AgentTurnStatus::Completed, None));
+        assert!(matches!(
+            next,
+            Some(Action::SubmitPrompt { prompt, .. }) if prompt == "root"
+        ));
+    }
+
+    #[test]
+    fn fenced_same_session_history_preserves_busy_rejection_fifo() {
+        let mut chat = ChatComponent {
+            input: "root".into(),
+            ..Default::default()
+        };
+        let Some(Action::SubmitPrompt { submission_id, .. }) =
+            chat.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+        else {
+            panic!("expected root submission");
+        };
+        chat.input = "follow-up".into();
+        let _ = chat.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        chat.update(&Action::TurnSessionBusy {
+            submission_id,
+            session_id: AgentSessionId(Uuid::from_u128(9903)),
+            binding_generation: 1,
+            prompt: "root".into(),
+        });
+
+        chat.load_synchronized_history(Vec::new());
+        assert_eq!(
+            chat.queued_prompts
+                .iter()
+                .map(String::as_str)
+                .collect::<Vec<_>>(),
+            vec!["root", "follow-up"]
+        );
+        let next = chat.release_queued_prompt();
+        assert!(matches!(
+            next,
+            Some(Action::SubmitPrompt { prompt, .. }) if prompt == "root"
+        ));
+    }
+
+    #[test]
+    fn history_replacement_drops_session_local_queue_and_anchor() {
+        let mut chat = ChatComponent {
+            input: "follow-up".into(),
             busy: true,
             ..Default::default()
         };
-        for _ in 0..5 {
-            let action = chat.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
-            assert!(matches!(
-                action,
-                Some(Action::Status(message)) if message.contains("still working")
-            ));
+        let _ = chat.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        let _ = render_chat_to_string(&mut chat, 50, 12);
+        assert!(!chat.queued_prompts.is_empty());
+        assert!(chat.last_wrapped_rows.is_some());
+
+        chat.load_history(Vec::new());
+        assert!(chat.queued_prompts.is_empty());
+        assert!(chat.last_wrapped_rows.is_none());
+        assert!(chat.last_viewport_rows.is_none());
+        assert!(!chat
+            .turns
+            .iter()
+            .any(|turn| matches!(turn, Turn::Queued(_))));
+    }
+
+    #[test]
+    fn detached_scrollback_stays_on_same_wrapped_row_during_growth() {
+        let mut chat = ChatComponent::default();
+        for index in 0..40 {
+            chat.turns
+                .push(Turn::User(format!("historical row {index}")));
         }
-        assert!(chat.turns.is_empty());
-        assert_eq!(chat.input, "hammer");
-        assert!(!chat.has_pending_turn_submission());
+        let _ = render_chat_to_string(&mut chat, 50, 12);
+        chat.scroll_back = 12;
+        let _ = render_chat_to_string(&mut chat, 50, 12);
+        let top_before = chat.transcript_top;
+
+        chat.turns.push(Turn::Assistant(
+            "new streamed output that wraps across several terminal rows without stealing focus"
+                .into(),
+        ));
+        let _ = render_chat_to_string(&mut chat, 50, 12);
+
+        assert_eq!(chat.transcript_top, top_before);
+        assert!(
+            chat.scroll_back > 12,
+            "growth is absorbed below the viewport"
+        );
+
+        chat.input = "composer\ngrows\nwithout\nmoving\nscrollback".into();
+        let top_before_resize = chat.transcript_top;
+        let _ = render_chat_to_string(&mut chat, 50, 12);
+        assert_eq!(
+            chat.transcript_top, top_before_resize,
+            "viewport-height changes are absorbed below the anchored top row"
+        );
     }
 
     #[test]
@@ -6713,6 +7139,7 @@ mod tests {
 
         chat.update(&Action::TurnOutcomeUnknown {
             submission_id,
+            session_id: AgentSessionId(Uuid::from_u128(71)),
             err: "response body ended unexpectedly".into(),
         });
 
@@ -6722,6 +7149,10 @@ mod tests {
             .iter()
             .any(|turn| matches!(turn, Turn::User(text) if text == "side effecting prompt")));
         assert!(!chat.has_pending_turn_submission());
+        assert!(
+            chat.is_busy(),
+            "unknown acknowledgement must keep input locked until synchronized"
+        );
     }
 
     #[test]

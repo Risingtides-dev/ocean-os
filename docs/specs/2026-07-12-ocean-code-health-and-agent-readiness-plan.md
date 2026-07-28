@@ -58,7 +58,7 @@ The baseline was collected on `main` at commit `b5d564169f3f7034c2794007ed9795be
 | File | Total lines | Primary issue |
 |---|---:|---|
 | `crates/ocean-daemon/src/main.rs` | 21,636 | About 11.8k production lines plus a large inline test module; many route and domain responsibilities share one compilation unit. |
-| `crates/ocean-tui/src/main.rs` | 9,304 | Binary routing, active mesh support, and retained legacy UI coexist; the current `shell/` is already modular and should not be rebuilt. |
+| `crates/ocean-tui/src/main.rs` | 9,304 | Binary routing, active mesh support, and retained legacy UI coexist; the current `shell/` is already modular and should be refactored in place rather than replaced wholesale. |
 | `crates/ocean-agent/src/lib.rs` | 7,354 | Runtime facade, turn pipeline, session store, compatibility logic, prompt shaping, and large tests share one root. |
 
 File size is a navigation and review signal. It is not evidence of runtime slowness by itself.

@@ -12,14 +12,16 @@ This crate owns the full-screen terminal steering cockpit (`ocean` binary) for i
 
 ## Local Contracts
 
-- After any TUI change, build the release binary: `cargo build -p ocean-tui --release`.
-- Installing a fresh build over `~/.cargo/bin/ocean-tui` MUST use remove+copy
-  (`rm dest && cp src dest`) or a temp-file + atomic rename — NEVER an
-  in-place overwrite of the existing Mach-O: on this host the next `ocean`
-  exec dies with an instant SIGKILL (observed 2026-07-11; stale kernel
-  code-signature cache is the leading explanation). After installing, verify
-  with `codesign --verify --deep --strict` AND a real PTY launch that stays
-  alive several seconds — `--help` exits before terminal setup and proves
+- Every TUI behavior change must compile and test on its feature branch; the
+  production-install provenance rule is never a reason to defer a build.
+  Before finishing, run `cargo check -p ocean-tui`, focused tests, and
+  `cargo build -p ocean-tui --release`.
+- The operator command is `~/.local/bin/ocean` (not the obsolete
+  `~/.cargo/bin/ocean-tui`). After a reviewed change lands on `origin/main`,
+  install it with `ops/install-ocean-tui.sh`. The installer publishes an
+  immutable revision-named artifact and atomically flips the symlink; never
+  overwrite a running Mach-O in place. Verify code signing and perform a real
+  multi-second PTY launch—`--help` exits before terminal setup and proves
   nothing.
 - Keep TUI behavior aligned with daemon API contracts; clients do not own sessions.
 - `/web` and `/desk` hand the bound session to sibling surfaces owned by the
@@ -59,12 +61,18 @@ This crate owns the full-screen terminal steering cockpit (`ocean` binary) for i
 3. **Concurrent lanes are real.** Multiple agents edit this crate at once.
    Re-read a file immediately before editing it; keep each edit surgical; stage
    only the files you changed. Never `git add -A`.
-4. **Rendering is terminal-safe or it smears.** Any text that reaches a ratatui
+4. **Do not bury product behavior.** A TUI feature is not shipped from a stash,
+   worktree, local commit, or unmerged branch. Preserve unfamiliar behavior
+   until repository-wide history/reference review proves removal is intended;
+   do not replace expected interaction with an error/no-op merely because it is
+   simpler. After review and merge, update the canonical checkout, run the TUI
+   installer, and smoke the command the operator actually invokes.
+5. **Rendering is terminal-safe or it smears.** Any text that reaches a ratatui
    `Span` from tool output, file content, or provider errors goes through
    `sanitize_line` (chat.rs) — raw tabs/control chars desync the terminal from
    ratatui's cell math and leave permanent bleed. Long lines clamp
    (`clamp_line`) or wrap explicitly; never assume one logical line = one row.
-5. **The Elm loop is the only mutation channel.** Components emit `Action`s;
+6. **The Elm loop is the only mutation channel.** Components emit `Action`s;
    `App::dispatch` and component `update`s consume them. No state mutation
    outside that path, no components reaching into `App` internals.
 
@@ -139,12 +147,15 @@ This crate owns the full-screen terminal steering cockpit (`ocean` binary) for i
   short layouts return the full rail to its selected representation; tray
   selection and mouse routing remain pane-bounded.
 - Consecutive tool bursts (`shell/components/chat.rs`) collapse under one
-  non-wrapping parent summary with truthful running/done/failed counts. Hidden
-  Thinking turns do not split a burst; visible prose/cards/errors do. Opening a
-  parent reveals the existing independently expandable per-call drawers;
-  keyboard focus reveals a nested drawer's parent, and `Ctrl+O` remains the
-  global open-all override. Mouse routing uses the exact wrapped + scrolled
-  geometry and preserves drag-to-select precedence.
+  non-wrapping parent summary with truthful running/done/failed counts. Keep the
+  parent label neutral and color only each status segment; tool-local failures
+  use explicit `failed` copy plus warning-orange, while persistent red is
+  reserved for turn/session-level failure. Hidden Thinking turns do not split a
+  burst; visible prose/cards/errors do. Opening a parent reveals the existing
+  independently expandable per-call drawers; keyboard focus reveals a nested
+  drawer's parent, and `Ctrl+O` remains the global open-all override. Mouse
+  routing uses the exact wrapped + scrolled geometry and preserves
+  drag-to-select precedence.
 - Assistant Markdown links to existing workspace-local `.md`, `.markdown`, and
   `.mdx` files open in the native editor on a clean mouse click. Resolve and
   canonicalize against the active workspace, reject symlink/`..` escapes and
@@ -156,7 +167,13 @@ This crate owns the full-screen terminal steering cockpit (`ocean` binary) for i
   remains permission-first, `Ctrl+L` clears only an idle transcript, and
   `Up`/`Down` remain history/picker navigation. Composer sizing, caret paint,
   and scroll use Unicode cell width and follow the cursor row, never the final
-  input row. `/compact` is an idle, bound-session action over the daemon-owned
+  input row. Enter during an active turn appends a FIFO follow-up prompt; only
+  authoritative `TurnFinished` releases the next queued submission. While a
+  turn is active, `Esc` posts cancellation for the exact bound
+  `TurnStarted.turn_id` request and leaves `busy` set until the authoritative
+  `TurnFinished` arrives; cancelled turns render a quiet interrupted marker.
+  Overlays and dictation retain first claim on `Esc`. Detached scrollback keeps
+  its viewport anchored when live content grows. `/compact` is an idle, bound-session action over the daemon-owned
   atomic compaction route. Replace chat only from the response's bounded public
   `SessionSyncSnapshot`, then restart the scoped SSE stream strictly after its
   `SessionEventFence`; never bridge compact with an independent raw-session GET.
@@ -248,12 +265,16 @@ This crate owns the full-screen terminal steering cockpit (`ocean` binary) for i
   "couldn't reach the daemon" vs "turn could not start" transcript prefix.
   A request timeout or generic post-connect transport failure is outcome-unknown,
   never proof that the daemon was unavailable.
-- Turn submission uses its dedicated no-whole-request-timeout HTTP client;
-  provider rounds own their runtime timeout. Retry/restore only definitely-unsent
+- Turn submission uses a dedicated HTTP client with a 30-minute deadman timeout
+  and opens a fresh connection for each non-idempotent POST; do not reuse idle
+  keep-alive sockets whose server-side close can race the next acknowledgement.
+  Provider rounds own their runtime timeout. Retry/restore only definitely-unsent
   connect failures or pre-execution 4xx rejection. HTTP 408 is a known executed
   runtime failure in Ocean and must decode its normal response. On
-  `TurnOutcomeUnknown`, unwind
-  `busy` but never restore or replay the prompt because tools may have run.
+  `TurnOutcomeUnknown`, never restore or replay the prompt because tools may
+  have run; keep input latched and reconcile through the generation-scoped
+  fenced session activity probe until `TurnFinished` or an idle snapshot is
+  authoritative.
 - Turn lifecycle: only `TurnFinished`/`TurnSendFailed`/`TurnOutcomeUnknown` (or
   explicit new/clear/history reset) may clear `busy` — never generic SSE
   reconnect statuses; failed turns render `Turn::ErrorNotice`, not advisor

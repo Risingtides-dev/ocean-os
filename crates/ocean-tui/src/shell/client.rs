@@ -20,7 +20,7 @@ use ocean_agent_sdk::{
 };
 use ocean_core::{
     CompactResponse, EventEnvelope, HealthResponse, PermissionDecision, PermissionDecisionRequest,
-    PermissionId, PermissionMode, PermissionSettingsRequest, PermissionSettingsResponse,
+    PermissionId, PermissionMode, PermissionSettingsRequest, PermissionSettingsResponse, RequestId,
     SessionSyncResponse,
 };
 use ocean_observatory::{
@@ -70,9 +70,16 @@ impl DaemonClient {
             .connect_timeout(Duration::from_secs(10))
             .timeout(Duration::from_secs(1800))
             .build()?;
+        // Turn submission is infrequent and non-idempotent. Reusing an idle
+        // HTTP/1 connection lets a server-side keep-alive close race the next
+        // POST: the daemon can accept the turn while reqwest reports that the
+        // acknowledgement connection closed. A fresh localhost connection per
+        // submission removes that false outcome-unknown path without retrying
+        // any request that may have reached the daemon.
         let turn_http = reqwest::Client::builder()
             .connect_timeout(Duration::from_secs(10))
             .timeout(Duration::from_secs(1800))
+            .pool_max_idle_per_host(0)
             .build()?;
         Ok(Self {
             http,
@@ -680,6 +687,37 @@ impl DaemonClient {
         Ok(compact)
     }
 
+    /// Cancel the daemon request backing the active turn. This mirrors the
+    /// working MacBook TUI path from `5f3fddd6`: the agent turn id is also the
+    /// daemon request id.
+    pub async fn cancel_request(&self, request_id: RequestId) -> Result<String, String> {
+        let response = self
+            .http
+            .post(format!("{}/v1/requests/{request_id}/cancel", self.base))
+            .send()
+            .await
+            .map_err(|error| error.to_string())?;
+        let status = response.status();
+        let value = response
+            .json::<serde_json::Value>()
+            .await
+            .map_err(|error| error.to_string())?;
+        let ok = value
+            .get("ok")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false);
+        let message = value
+            .get("message")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("cancel request failed")
+            .to_string();
+        if status.is_success() && ok {
+            Ok(message)
+        } else {
+            Err(message)
+        }
+    }
+
     /// `POST /v1/permissions/{id}/decision`, replaying the turn's decision
     /// token (OCEAN-185) so the daemon accepts the approval.
     pub async fn permission_decision(
@@ -1090,6 +1128,79 @@ mod tests {
 
         assert!(matches!(error, TurnSubmitError::SessionBusy));
         assert_eq!(error.to_string(), "session is still working");
+        server.await.expect("mock server completed");
+    }
+
+    #[tokio::test]
+    async fn turn_posts_do_not_reuse_idle_connections() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind mock turn server");
+        let address = listener.local_addr().expect("mock address");
+        let session_id = AgentSessionId(uuid::Uuid::from_u128(51));
+        let server = tokio::spawn(async move {
+            // Keep the first socket open after its response. A pooled client
+            // would reuse it for the second POST and hang here waiting for a
+            // new accept; the turn client must instead open a fresh socket.
+            let mut open_sockets = Vec::new();
+            for turn in 0..2u128 {
+                let (mut socket, _) =
+                    tokio::time::timeout(Duration::from_secs(2), listener.accept())
+                        .await
+                        .expect("turn client opened a fresh connection")
+                        .expect("accept turn request");
+                let mut request = [0u8; 8192];
+                let _ = socket.read(&mut request).await.expect("read turn request");
+                let turn_id = uuid::Uuid::from_u128(52 + turn);
+                let body = serde_json::json!({
+                    "ok": true,
+                    "turn_id": turn_id,
+                    "session_id": session_id,
+                    "status": "running",
+                    "event_id_prefix": turn_id.to_string()[..8].to_string()
+                })
+                .to_string();
+                let response = format!(
+                    "HTTP/1.1 202 Accepted\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: keep-alive\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                socket
+                    .write_all(response.as_bytes())
+                    .await
+                    .expect("write turn acknowledgement");
+                open_sockets.push(socket);
+            }
+        });
+
+        let client = DaemonClient::new(&format!("http://{address}")).expect("client");
+        let request = AgentTurnRequest {
+            session_id: Some(session_id),
+            prompt: "ack test".into(),
+            cwd: "/tmp".into(),
+            guidance: None,
+            project_id: None,
+            client_type: Some("tui".into()),
+            agent: None,
+            role: None,
+            thinking_level: None,
+            model_id: None,
+            images: None,
+            decision_token: None,
+            client_context: None,
+            advisor: None,
+        };
+        for _ in 0..2 {
+            tokio::time::timeout(
+                Duration::from_secs(2),
+                client.agent_turn_retrying(&request, |_, _| {}),
+            )
+            .await
+            .expect("turn acknowledgement arrived")
+            .expect("turn accepted");
+        }
         server.await.expect("mock server completed");
     }
 
