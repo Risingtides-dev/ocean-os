@@ -1,0 +1,43 @@
+name = "ocean-subagents"
+version = "0.1.0"
+entry = "ocean-subagents.py"
+
+[[tool]]
+name = "spawn"
+description = "Start a bounded Ocean subagent in a new durable child session. Returns immediately with run_id, turn_id, and session_id. Use status or wait to collect its result."
+input_schema = { type = "object", properties = { task = { type = "string", description = "The complete task for the subagent." }, role = { type = "string", description = "Short specialist role, for example reviewer or researcher." }, cwd = { type = "string", description = "Absolute working directory. Defaults to the configured subagent working directory." }, model = { type = "string", description = "Optional Ocean model alias for this child turn." }, timeout_seconds = { type = "integer", minimum = 30, maximum = 1800, description = "Elapsed-time ceiling; default 600 seconds." } }, required = ["task"] }
+
+[[tool]]
+name = "status"
+description = "Refresh one Ocean subagent from daemon request/session truth and return its status and result when complete."
+input_schema = { type = "object", properties = { run_id = { type = "string" } }, required = ["run_id"] }
+
+[[tool]]
+name = "wait"
+description = "Wait up to 20 seconds for one Ocean subagent, then return its current status and result. Call again when still running or waiting for permission."
+input_schema = { type = "object", properties = { run_id = { type = "string" }, timeout_seconds = { type = "number", minimum = 0, maximum = 20 } }, required = ["run_id"] }
+
+[[tool]]
+name = "send"
+description = "Send a follow-up task to a completed Ocean subagent's existing durable session. Returns immediately with the new turn id."
+input_schema = { type = "object", properties = { run_id = { type = "string" }, message = { type = "string" } }, required = ["run_id", "message"] }
+
+[[tool]]
+name = "permissions"
+description = "List pending permission requests for one Ocean subagent. Inspect these before calling decide."
+input_schema = { type = "object", properties = { run_id = { type = "string" } }, required = ["run_id"] }
+
+[[tool]]
+name = "decide"
+description = "Resolve one pending child permission after operator review. The permission must belong to this run and expected_tool must match daemon truth."
+input_schema = { type = "object", properties = { run_id = { type = "string" }, permission_id = { type = "string" }, expected_tool = { type = "string" }, decision = { type = "string", enum = ["allow", "allow_session", "deny"] }, reason = { type = "string" } }, required = ["run_id", "permission_id", "expected_tool", "decision"] }
+
+[[tool]]
+name = "cancel"
+description = "Cancel the active turn for an Ocean subagent run."
+input_schema = { type = "object", properties = { run_id = { type = "string" } }, required = ["run_id"] }
+
+[[tool]]
+name = "list"
+description = "List Ocean subagent runs persisted by this plugin, newest first."
+input_schema = { type = "object", properties = { active_only = { type = "boolean" } } }

@@ -28,6 +28,16 @@
 Everything below is the detail behind those four steps, ending with a copy-paste
 walkthrough using the bundled example.
 
+## Shipped plugin: Ocean Subagents
+
+`plugins/ocean-subagents/` is a working first-party plugin that exposes
+permission-gated `spawn`, `status`, `wait`, `send`, `permissions`, `decide`,
+`cancel`, and `list` tools to Ocean itself. It starts ordinary daemon-owned child sessions through
+`POST /v1/agent/turns`, persists bounded lifecycle metadata outside daemon
+session files, and binds every child to a fixed folder-agent profile that omits
+the subagent plugin to prevent recursive fan-out. Install and validation commands
+are in [`../plugins/ocean-subagents/README.md`](../plugins/ocean-subagents/README.md).
+
 ---
 
 ## 1. The `plugin.toml` manifest

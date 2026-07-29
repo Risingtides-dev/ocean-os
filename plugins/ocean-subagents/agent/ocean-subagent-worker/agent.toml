@@ -1,0 +1,2 @@
+description = "Bounded child worker launched by the ocean-subagents plugin"
+tools = ["read", "ls", "grep", "glob", "lsp", "web_fetch", "bash", "edit", "write", "hashline_edit"]
