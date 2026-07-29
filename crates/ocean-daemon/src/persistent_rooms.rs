@@ -2353,6 +2353,8 @@ mod tests {
                 author_id: "browser-forgery".into(),
                 author_kind: RoomParticipantKind::Agent,
                 body: "federated intent".into(),
+                thread_parent_seq: None,
+                session_id: None,
             }),
         )
         .await;
@@ -2386,6 +2388,8 @@ mod tests {
             author_id: "human".into(),
             author_kind: RoomParticipantKind::Human,
             body: "intent".into(),
+            thread_parent_seq: None,
+            session_id: None,
         };
 
         let (status, Json(body)) = room_post_message(
@@ -2462,6 +2466,8 @@ mod tests {
                         author_id: "claimed-human".into(),
                         author_kind: RoomParticipantKind::Human,
                         body: "conversion race".into(),
+                        thread_parent_seq: None,
+                        session_id: None,
                     }),
                 )
                 .await
@@ -2906,6 +2912,8 @@ mod tests {
                 author_id: "human".into(),
                 author_kind: RoomParticipantKind::Human,
                 body: "first".into(),
+                thread_parent_seq: None,
+                session_id: None,
             }),
         )
         .await;
@@ -2924,6 +2932,8 @@ mod tests {
                 author_id: "human".into(),
                 author_kind: RoomParticipantKind::Human,
                 body: "second".into(),
+                thread_parent_seq: None,
+                session_id: None,
             }),
         )
         .await;
@@ -3077,6 +3087,8 @@ mod tests {
                 author_id: "human".into(),
                 author_kind: RoomParticipantKind::Human,
                 body: "@helper report".into(),
+                thread_parent_seq: None,
+                session_id: None,
             }),
         )
         .await;
@@ -3394,6 +3406,8 @@ mod tests {
                 author_id: "human".into(),
                 author_kind: RoomParticipantKind::Human,
                 body: "@phantom report".into(),
+                thread_parent_seq: None,
+                session_id: None,
             }),
         )
         .await;
@@ -3467,6 +3481,8 @@ env = { FIXTURE = "1" }
                 author_id: "human".into(),
                 author_kind: RoomParticipantKind::Human,
                 body: "@bound-agent report".into(),
+                thread_parent_seq: None,
+                session_id: None,
             }),
         )
         .await;
@@ -3536,6 +3552,8 @@ env = { FIXTURE = "1" }
                 author_id: "human".into(),
                 author_kind: RoomParticipantKind::Human,
                 body: "@data-only report".into(),
+                thread_parent_seq: None,
+                session_id: None,
             }),
         )
         .await;

@@ -16033,6 +16033,8 @@ mod tests {
                 author_id: "john".into(),
                 author_kind: RoomParticipantKind::Human,
                 body: "@helper can you summarize the plan?".into(),
+                thread_parent_seq: None,
+                session_id: None,
             }),
         )
         .await;
@@ -16239,6 +16241,8 @@ mod tests {
                 author_id: "john".into(),
                 author_kind: RoomParticipantKind::Human,
                 body: "@helper status?".into(),
+                thread_parent_seq: None,
+                session_id: None,
             }),
         )
         .await;
@@ -16334,6 +16338,8 @@ mod tests {
                 author_id: "john".into(),
                 author_kind: RoomParticipantKind::Human,
                 body: "@helper status?".into(),
+                thread_parent_seq: None,
+                session_id: None,
             }),
         )
         .await;
@@ -16417,6 +16423,8 @@ mod tests {
                 author_id: "helper".into(),
                 author_kind: RoomParticipantKind::Agent,
                 body: "done — cc @helper @other".into(),
+                thread_parent_seq: None,
+                session_id: None,
             }),
         )
         .await;
@@ -19914,6 +19922,8 @@ mod tests {
                 author_id: "john".into(),
                 author_kind: RoomParticipantKind::Human,
                 body: "@dana what did you think?".into(),
+                thread_parent_seq: None,
+                session_id: None,
             }),
         )
         .await;
