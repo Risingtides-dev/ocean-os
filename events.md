@@ -5824,3 +5824,24 @@ metadata peek, Enter promotes the tab to normal editing, Esc closes it without
 mutation, image behavior remains separate, and paste/mouse editing is blocked while
 peeking. Added direct Enter/Esc lifecycle coverage and retained the existing editor
 viewport, Markdown preview, reroot, and image safety tests.
+_________________________________________________________________________________
+time:      [14:09] [29-07-26]
+agent:     [api] [thoth]
+worktree:  [feat/crew-demo]
+type:      [feature]
+area:      [automations] [testing]
+
+Built and ran a tangible local Ocean Crew demo without spawning auxiliary agents.
+The standard-library adapter dispatches existing daemon `/v1/prompt` agent loops
+from an acyclic dependency graph, persists every transition through atomic JSON
+replacement, runs ready workers concurrently, retries bounded failures, resumes
+interrupted tasks without exceeding attempt limits, hands bounded dependency
+outputs to downstream tasks, and prints live terminal progress. It is explicitly
+an at-least-once external demo rather than the production extension-owned Crew
+engine. A real three-turn run on the supervised `deepseek-v4-pro` daemon completed
+two workers in parallel and one dependent Crew lead in 19 seconds. Durable run
+`a2af0818-fea2-4925-bd42-6caa0e9570cd` and its three Ocean session ids are stored
+at `/Users/risingtidesdev/tmp/ocean-crew-demo-live-20260729-140726.json`. Five
+standard-library integration tests cover parallel dispatch, dependency handoff,
+retry, resume, attempt exhaustion/blocking, and graph-cycle rejection.
+_________________________________________________________________________________
