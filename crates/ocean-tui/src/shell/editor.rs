@@ -22,6 +22,9 @@ pub struct EditorTab {
     /// Read-only image file tab. Binary bytes are never loaded into or saved from
     /// the text buffer.
     pub image_preview: bool,
+    /// Peek mode: file-summary header + read-only preview on first open. Enter
+    /// commits to full edit; Esc closes the tab. Always false for image tabs.
+    pub peek: bool,
     /// Top wrapped row in Markdown preview mode; independent from source scroll.
     pub preview_scroll: usize,
     pub highlighted: Vec<StyledLine>,
@@ -60,6 +63,7 @@ impl EditorTab {
             horizontal_scroll: 0,
             markdown_preview: false,
             image_preview: false,
+            peek: true,
             preview_scroll: 0,
             highlighted,
             git_lines: HashMap::new(),
@@ -89,6 +93,7 @@ impl EditorTab {
             horizontal_scroll: 0,
             markdown_preview: false,
             image_preview: true,
+            peek: false,
             preview_scroll: 0,
             highlighted: vec![Vec::new()],
             git_lines: HashMap::new(),
@@ -110,6 +115,85 @@ impl EditorTab {
             .and_then(|e| e.to_str())
             .unwrap_or("")
             .to_string()
+    }
+
+    /// Human-readable language name from the file extension.
+    pub fn language(&self) -> &'static str {
+        match self.ext().as_str() {
+            "rs" => "Rust",
+            "ts" | "tsx" => "TypeScript",
+            "js" | "jsx" | "mjs" | "cjs" => "JavaScript",
+            "py" | "pyi" | "pyx" => "Python",
+            "md" | "mdx" | "markdown" => "Markdown",
+            "json" | "jsonc" => "JSON",
+            "toml" => "TOML",
+            "yaml" | "yml" => "YAML",
+            "html" | "htm" => "HTML",
+            "css" | "scss" | "less" => "CSS",
+            "sh" | "bash" | "zsh" => "Shell",
+            "sql" => "SQL",
+            "go" => "Go",
+            "c" | "h" => "C",
+            "cpp" | "hpp" | "cc" | "hh" | "cxx" | "hxx" => "C++",
+            "java" => "Java",
+            "rb" => "Ruby",
+            "swift" => "Swift",
+            "kt" | "kts" => "Kotlin",
+            "lua" => "Lua",
+            "zig" => "Zig",
+            "nix" => "Nix",
+            "tf" | "tfvars" => "Terraform",
+            "dockerfile" => "Docker",
+            "txt" | "text" => "Plain Text",
+            "svg" => "SVG",
+            "png" | "jpg" | "jpeg" | "gif" | "webp" | "ico" | "bmp" => "Image",
+            _ => "Text",
+        }
+    }
+
+    /// Formatted file size string.
+    pub fn file_size(&self) -> Option<String> {
+        std::fs::metadata(&self.path).ok().map(|m| {
+            let bytes = m.len();
+            if bytes < 1024 {
+                format!("{bytes} B")
+            } else if bytes < 1024 * 1024 {
+                format!("{:.1} KiB", bytes as f64 / 1024.0)
+            } else {
+                format!("{:.1} MiB", bytes as f64 / (1024.0 * 1024.0))
+            }
+        })
+    }
+
+    /// Human-readable relative time since last modification.
+    pub fn modified_ago(&self) -> Option<String> {
+        std::fs::metadata(&self.path)
+            .ok()
+            .and_then(|m| m.modified().ok())
+            .map(|t| {
+                let elapsed = std::time::SystemTime::now()
+                    .duration_since(t)
+                    .unwrap_or_default();
+                if elapsed.as_secs() < 60 {
+                    "just now".into()
+                } else if elapsed.as_secs() < 3600 {
+                    format!("{}m ago", elapsed.as_secs() / 60)
+                } else if elapsed.as_secs() < 86400 {
+                    format!("{}h ago", elapsed.as_secs() / 3600)
+                } else {
+                    format!("{}d ago", elapsed.as_secs() / 86400)
+                }
+            })
+    }
+
+    /// Commit peek mode: start editing. Returns true if the tab transitioned.
+    pub fn commit_peek(&mut self) -> bool {
+        if !self.peek {
+            return false;
+        }
+        self.peek = false;
+        self.markdown_preview = false;
+        true
     }
 
     fn rehighlight(&mut self, hl: &Highlighter) {

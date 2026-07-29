@@ -196,7 +196,7 @@ impl Component for EditorComponent {
         }
         let hl = &self.hl;
         let t = self.tabs.get_mut(self.active)?;
-        if t.image_preview || (t.markdown_preview && is_markdown(&t.ext())) {
+        if t.image_preview || t.peek || (t.markdown_preview && is_markdown(&t.ext())) {
             return None;
         }
         for c in text.chars() {
@@ -217,6 +217,30 @@ impl Component for EditorComponent {
         }
         let vp = self.last_body_h.max(1);
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+        // ── peek-mode: Enter commits, Esc closes ──
+        if self.tabs.get(self.active).is_some_and(|t| t.peek) {
+            match key.code {
+                KeyCode::Enter => {
+                    if let Some(t) = self.tabs.get_mut(self.active) {
+                        t.commit_peek();
+                        self.follow_cursor = true;
+                        if is_markdown(&t.ext()) {
+                            t.markdown_preview = true;
+                        }
+                    }
+                    return Some(Action::Render);
+                }
+                KeyCode::Esc => {
+                    self.tabs.remove(self.active);
+                    self.markdown.clear();
+                    self.image_placements.clear();
+                    self.active = self.active.min(self.tabs.len().saturating_sub(1));
+                    self.follow_cursor = true;
+                    return Some(Action::Render);
+                }
+                _ => return None,
+            }
+        }
         if ctrl && key.code == KeyCode::Char('p') {
             let t = self.tabs.get_mut(self.active)?;
             if is_markdown(&t.ext()) {
@@ -290,7 +314,7 @@ impl Component for EditorComponent {
         if self
             .tabs
             .get(self.active)
-            .is_some_and(|tab| tab.image_preview)
+            .is_some_and(|tab| tab.image_preview || tab.peek)
         {
             return None;
         }
@@ -332,20 +356,22 @@ impl Component for EditorComponent {
 
     fn draw(&mut self, frame: &mut Frame, area: Rect) {
         self.image_placements.clear();
-        let (title, dirty, preview, is_image) = match self.tabs.get(self.active) {
+        let (title, dirty, preview, is_image, peek) = match self.tabs.get(self.active) {
             Some(t) => (
                 t.name().to_uppercase(),
                 t.dirty,
                 t.markdown_preview && is_markdown(&t.ext()),
                 t.image_preview,
+                t.peek,
             ),
-            None => ("EDITOR".to_string(), false, false, false),
+            None => ("EDITOR".to_string(), false, false, false, false),
         };
-        let state = match (preview, dirty, is_image) {
-            (_, _, true) => Some("image"),
-            (true, true, false) => Some("preview · unsaved"),
-            (true, false, false) => Some("preview"),
-            (false, true, false) => Some("unsaved"),
+        let state = match (preview, dirty, is_image, peek) {
+            (_, _, true, _) => Some("image"),
+            (_, _, _, true) => Some("peek"),
+            (true, true, false, _) => Some("preview · unsaved"),
+            (true, false, false, _) => Some("preview"),
+            (false, true, false, _) => Some("unsaved"),
             _ => None,
         };
         let body = panel::draw(frame, area, &title, state, self.focused);
@@ -412,6 +438,95 @@ impl Component for EditorComponent {
             }
             self.selection_top = 0;
             panel::footer(frame, area, " image preview · read-only");
+            return;
+        }
+
+        // ── peek mode: file-summary header + read-only content preview ──
+        if peek {
+            draw_peek_header(frame, body, t);
+            let peek_body = Rect::new(
+                body.x,
+                body.y + 1,
+                body.width,
+                body.height.saturating_sub(1),
+            );
+            if preview {
+                // Markdown: render preview below the peek header.
+                let source = t
+                    .lines
+                    .iter()
+                    .map(|line| sanitize_line(line))
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                let rendered = self.markdown.render(&source);
+                let mut block_lines = rendered.lines;
+                let mut block_links = rendered.links;
+                let logical_images = kitty::reserve_markdown_images(
+                    &mut block_lines,
+                    &mut block_links,
+                    &rendered.images,
+                    t.path.parent().unwrap_or(&self.root),
+                    &self.root,
+                );
+                let paragraph = Paragraph::new(block_lines.clone())
+                    .style(Style::default().bg(theme::BG))
+                    .block(Block::default().padding(Padding::horizontal(PREVIEW_PAD_X)))
+                    .wrap(Wrap { trim: false });
+                let content_width = peek_body
+                    .width
+                    .saturating_sub(PREVIEW_PAD_X.saturating_mul(2));
+                frame.render_widget(paragraph, peek_body);
+                if !logical_images.is_empty() && content_width > 0 && peek_body.height > 0 {
+                    let scroll_area = Rect::new(
+                        peek_body.x.saturating_add(PREVIEW_PAD_X),
+                        peek_body.y,
+                        content_width,
+                        peek_body.height,
+                    );
+                    self.image_placements = kitty::project_visible(
+                        &block_lines,
+                        &logical_images,
+                        scroll_area,
+                        0,
+                        content_width,
+                        scroll_area.x,
+                        scroll_area.width,
+                    );
+                }
+                self.selection_top = 0;
+            } else {
+                // Code: syntax-highlighted first N lines, read-only.
+                let max_lines = (peek_body.height as usize).min(20);
+                let mut lines = Vec::new();
+                for row in 0..max_lines.min(t.lines.len()) {
+                    let mut spans = gutter(t, row, false);
+                    if let Some(styled) = t.highlighted.get(row).filter(|s| !s.is_empty()) {
+                        for (color, text) in styled {
+                            let clean = sanitize_line(text);
+                            spans.push(Span::styled(clean, Style::default().fg(*color)));
+                        }
+                    } else {
+                        spans.push(Span::styled(
+                            sanitize_line(&t.lines[row]),
+                            Style::default().fg(theme::FG),
+                        ));
+                    }
+                    lines.push(Line::from(spans));
+                }
+                if (t.lines.len() as u16) > max_lines as u16 {
+                    let more = format!("… {} more lines", t.lines.len() - max_lines);
+                    lines.push(Line::from(Span::styled(
+                        more,
+                        Style::default().fg(theme::COMMENT),
+                    )));
+                }
+                frame.render_widget(
+                    Paragraph::new(lines).style(Style::default().bg(theme::BG)),
+                    peek_body,
+                );
+                self.selection_top = 0;
+            }
+            panel::footer(frame, area, " ↵ edit  esc close");
             return;
         }
 
@@ -734,6 +849,58 @@ fn cell_slice(s: &str, offset: usize, width: usize) -> String {
     out
 }
 
+/// File peek header: an extension badge (`.rs`) and file stats row.
+fn draw_peek_header(frame: &mut Frame, body: Rect, t: &EditorTab) {
+    let ext = t.ext();
+    let lang = t.language();
+    let lines_str = format!(
+        "{} line{}",
+        t.lines.len(),
+        if t.lines.len() == 1 { "" } else { "s" }
+    );
+    let size_str = t.file_size().unwrap_or_else(|| "?".into());
+    let ago_str = t.modified_ago().unwrap_or_else(|| "?".into());
+
+    let ext_pill = if ext.is_empty() {
+        "".into()
+    } else {
+        format!(".{ext}")
+    };
+    let sep = g(" · ", " | ");
+    let info = format!("{lang}{sep}{lines_str}{sep}{size_str}{sep}{ago_str}");
+
+    let ext_style = Style::default()
+        .fg(theme::CYAN)
+        .add_modifier(Modifier::BOLD);
+    let dim = Style::default().fg(theme::COMMENT);
+
+    let ext_w = UnicodeWidthStr::width(ext_pill.as_str());
+    let info_w = UnicodeWidthStr::width(info.as_str());
+    let gap = if ext_w > 0 && info_w > 0 { 1 } else { 0 };
+    let total_w = ext_w + gap + info_w;
+
+    let line = if total_w <= body.width as usize {
+        Line::from(vec![
+            Span::styled(ext_pill, ext_style),
+            Span::raw(" "),
+            Span::styled(info, dim),
+        ])
+    } else {
+        // Tight: show just lang + lines.
+        let short = format!("{lang}{sep}{lines_str}");
+        Line::from(vec![
+            Span::styled(ext_pill, ext_style),
+            Span::raw(" "),
+            Span::styled(short, dim),
+        ])
+    };
+
+    frame.render_widget(
+        Paragraph::new(line).style(Style::default().bg(theme::BG_DARK)),
+        Rect::new(body.x, body.y, body.width, 1),
+    );
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -819,6 +986,8 @@ mod tests {
     #[test]
     fn markdown_preview_is_read_only_and_preserves_source_state() {
         let mut editor = focused_editor("missing.md");
+        // Press Enter to commit peek mode (markdown stays in preview).
+        editor.handle_key(press(KeyCode::Enter, KeyModifiers::NONE));
         let tab = &mut editor.tabs[0];
         tab.lines = vec!["# Draft".into(), "body".into()];
         tab.cursor_row = 1;
@@ -927,6 +1096,22 @@ mod tests {
     }
 
     #[test]
+    fn first_open_peeks_then_enter_commits_or_escape_closes() {
+        let mut committed = focused_editor("missing.rs");
+        assert!(committed.tabs[0].peek, "text files open as previews");
+        assert!(committed
+            .handle_key(press(KeyCode::Enter, KeyModifiers::NONE))
+            .is_some());
+        assert!(!committed.tabs[0].peek, "Enter promotes the tab to editing");
+
+        let mut closed = focused_editor("missing.rs");
+        assert!(closed
+            .handle_key(press(KeyCode::Esc, KeyModifiers::NONE))
+            .is_some());
+        assert!(!closed.has_tabs(), "Esc closes an uncommitted preview");
+    }
+
+    #[test]
     fn preview_toggle_is_markdown_only() {
         let mut editor = focused_editor("missing.rs");
         assert!(editor
@@ -940,6 +1125,8 @@ mod tests {
         use ratatui::{backend::TestBackend, Terminal};
 
         let mut editor = focused_editor("missing.md");
+        // Press Enter to commit peek mode (markdown stays in preview).
+        editor.handle_key(press(KeyCode::Enter, KeyModifiers::NONE));
         editor.tabs[0].lines = vec![
             "# Ocean Preview".into(),
             String::new(),

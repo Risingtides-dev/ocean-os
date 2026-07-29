@@ -5810,3 +5810,17 @@ rejects late GET/PATCH completions across rapid picks and A→B→A switches ins
 of snapping back to the daemon-wide DeepSeek default. Added mock HTTP route/body
 coverage and reducer coverage for stale-load rejection. Focused tests, TUI check,
 format, and release build pass in the isolated worktree.
+
+_________________________________________________________________________________
+time:      [23:39] [28-07-26]
+agent:     [ocean-api] [gpt-5.4] [pm]
+worktree:  [main]
+type:      [feature-request]: Preserve and finish editor peek mode
+area:      [frontend]: TUI native editor
+
+Recovered a concurrent agent's disappearing uncommitted editor patch from a captured
+diff and took ownership of it on current main. Text files now open in a read-only
+metadata peek, Enter promotes the tab to normal editing, Esc closes it without
+mutation, image behavior remains separate, and paste/mouse editing is blocked while
+peeking. Added direct Enter/Esc lifecycle coverage and retained the existing editor
+viewport, Markdown preview, reroot, and image safety tests.

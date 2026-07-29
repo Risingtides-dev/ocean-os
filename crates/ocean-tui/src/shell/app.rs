@@ -6374,6 +6374,7 @@ mod tests {
         app.editor.open(path.clone());
         app.center = Center::Editor;
         app.focus_to(Focus::Center);
+        app.on_crossterm(key_event(KeyCode::Enter)); // promote peek to editable source
         render_app_to_string(&mut app, 80, 20);
 
         let center = app.r_center;

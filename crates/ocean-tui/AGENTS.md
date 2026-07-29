@@ -242,15 +242,18 @@ This crate owns the full-screen terminal steering cockpit (`ocean` binary) for i
   accent bars, Unicode-cell fitting, visible hierarchy guides, selected-only
   row actions, and extension identity at narrow widths; do not fork the visual
   grammar between rails.
-- Editor viewport behavior is content-aware: Markdown files open in terminal-safe
-  read-only preview mode and `Ctrl-P` flips per-tab between that live unsaved-buffer
-  projection and raw source without rewriting source, cursor, dirty, or source-scroll
-  state. Preview uses the existing Ocean Markdown renderer for text and a conservative
-  Kitty-protocol overlay only for resolved local images; it owns independent wrapped-row
-  keyboard/mouse scroll and keeps raw paste/edit disabled. Other prose extensions
-  soft-wrap vertically, source code scrolls horizontally, mouse-wheel scrolling stays
-  independent until the next keyboard edit/navigation, and rendered text/cursor geometry
-  share terminal sanitization plus Unicode cell widths.
+- Editor viewport behavior is content-aware: every text file first opens as a
+  read-only peek with a bounded file-summary header; `Enter` commits that tab to
+  normal editing and `Esc` closes it without mutation. Markdown peeks render the
+  terminal-safe preview, and `Ctrl-P` flips a committed Markdown tab between that
+  live unsaved-buffer projection and raw source without rewriting source, cursor,
+  dirty, or source-scroll state. Preview uses the existing Ocean Markdown renderer
+  for text and a conservative Kitty-protocol overlay only for resolved local images;
+  it owns independent wrapped-row keyboard/mouse scroll and keeps raw paste/edit
+  disabled. Other prose extensions soft-wrap vertically, source code scrolls
+  horizontally, mouse-wheel scrolling stays independent until the next keyboard
+  edit/navigation, and rendered text/cursor geometry share terminal sanitization
+  plus Unicode cell widths.
 - Inline image rendering is local-only and PNG-native at the terminal boundary: descriptor-confine regular-file sources to the active Markdown/workspace base on Unix and fail closed on platforms without exact descriptor identity, accept only complete CRC- and decoder-validated byte/dimension-bounded local PNGs, snapshot them read-only into a private per-process 64-entry/64-MiB cache removed on exit, bound negative resolution attempts, and never decode data URIs, invoke converters, or fetch remote/embedded resources. Reserve stable logical rows, place only fully visible beds from the currently painted center, clear out-of-band Kitty pixels across scrolling/resize/overlay/viewer transitions, and preserve ratatui's real cursor around every placement. Unknown terminals, multiplexers, other formats, and remote/escaping paths keep a text fallback.
 - Coordinate API/event changes with `ocean-daemon` and `ocean-core`.
 - The model registry lives in `ocean-providers` (`known_models` + resolver
