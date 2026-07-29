@@ -903,7 +903,17 @@ impl SqliteRoomStore {
         })?;
         let mut out = Vec::new();
         for r in rows {
-            let (seq, author_id, author_kind, kind, body, created_at, federated, thread_parent_seq, session_id) = r?;
+            let (
+                seq,
+                author_id,
+                author_kind,
+                kind,
+                body,
+                created_at,
+                federated,
+                thread_parent_seq,
+                session_id,
+            ) = r?;
             let federated_meta: Option<FederatedMessageMeta> =
                 match federated {
                     Some(json) => Some(serde_json::from_str(&json).map_err(|e| {
@@ -1474,14 +1484,24 @@ impl SqliteRoomStore {
         })?;
         let mut out = Vec::new();
         for r in rows {
-            let (seq, author_id, author_kind, kind, body, created_at, federated, thread_parent_seq, session_id) = r?;
-            let federated_meta: Option<FederatedMessageMeta> = match federated {
-                Some(json) => Some(
-                    serde_json::from_str(&json)
-                        .map_err(|e| RoomStoreError::Encode(format!("invalid federated JSON: {e}")))?,
-                ),
-                None => None,
-            };
+            let (
+                seq,
+                author_id,
+                author_kind,
+                kind,
+                body,
+                created_at,
+                federated,
+                thread_parent_seq,
+                session_id,
+            ) = r?;
+            let federated_meta: Option<FederatedMessageMeta> =
+                match federated {
+                    Some(json) => Some(serde_json::from_str(&json).map_err(|e| {
+                        RoomStoreError::Encode(format!("invalid federated JSON: {e}"))
+                    })?),
+                    None => None,
+                };
             out.push(RoomMessage {
                 seq: seq as u64,
                 author_id,
