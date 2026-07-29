@@ -1,0 +1,29 @@
+{
+  "name": "ocean-crew-tangible-demo",
+  "tasks": [
+    {
+      "id": "workflow-designer",
+      "role": "workflow designer",
+      "objective": "Give exactly three concrete design rules for a durable multi-agent task workflow. Keep the entire answer under 120 words.",
+      "depends_on": [],
+      "max_attempts": 2
+    },
+    {
+      "id": "failure-reviewer",
+      "role": "failure reviewer",
+      "objective": "Give exactly three concrete failure modes a durable multi-agent workflow must handle. Keep the entire answer under 120 words.",
+      "depends_on": [],
+      "max_attempts": 2
+    },
+    {
+      "id": "crew-lead",
+      "role": "crew lead",
+      "objective": "Using both completed worker reports, produce a six-item implementation checklist. Label each item with the worker report that supports it. Keep the entire answer under 220 words.",
+      "depends_on": [
+        "workflow-designer",
+        "failure-reviewer"
+      ],
+      "max_attempts": 2
+    }
+  ]
+}
