@@ -5845,3 +5845,28 @@ at `/Users/risingtidesdev/tmp/ocean-crew-demo-live-20260729-140726.json`. Five
 standard-library integration tests cover parallel dispatch, dependency handoff,
 retry, resume, attempt exhaustion/blocking, and graph-cycle rejection.
 _________________________________________________________________________________
+_________________________________________________________________________________
+time:      [17:01] [29-07-26]
+agent:     [api] [thoth]
+worktree:  [feat/ocean-subagents]
+type:      [feature]
+area:      [skill/mcp] [testing]
+
+Shipped Ocean subagents as a first-party `ocean-plugin` subprocess package,
+without adding subagent or scheduling vocabulary to daemon/runtime core. The
+permission-gated model tools spawn, inspect, wait for, continue, inspect and
+resolve token-bound child permissions, cancel, and list ordinary daemon-owned
+child sessions. A fixed folder-agent profile removes the subagent plugin from
+child tool visibility to prevent recursive fan-out while retaining normal Ocean
+read/write/bash tooling and permission gates. Run metadata is mode-0600 atomic
+JSON with a four-child concurrency ceiling, 30–1800s watchdog, bounded results,
+and daemon request/session reconciliation. Installed the package under
+`~/.config/ocean-rs/plugins/ocean-subagents`, installed the fixed worker under
+`~/.config/ocean-rs/agents/ocean-subagent-worker`, and restarted the supervised
+daemon. Two real parent Ocean turns independently called the plugin's spawn and
+wait tools; the final proof run `92959ed7-274e-42ac-99eb-54fb0b1325e9` created
+child session `e9f77c15-12bf-427f-a526-479a0f66ea44`, which completed with exact
+output `CHILD_OK`. Six unit/integration tests, real stdio JSON-RPC smoke, Python
+compile, shell syntax, installer install/uninstall round-trip, and docs checks
+passed.
+_________________________________________________________________________________

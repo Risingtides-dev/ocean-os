@@ -95,3 +95,4 @@ CI consumes the repository and compatibility manifests on macOS and Ubuntu, runs
 - `docs/` — architecture, operator documentation, active plans, and historical archive policy → `docs/AGENTS.md`
 - `integrations/` — distributable adapters for external host extension surfaces → `integrations/AGENTS.md`
 - `packaging/` — team distribution: npm wrapper package publishing prebuilt `ocean` + `ocean-daemon` binaries via the tag-triggered release workflow → `packaging/AGENTS.md`
+- `plugins/` — distributable permission-gated Ocean subprocess tool plugins → `plugins/AGENTS.md`
