@@ -5740,3 +5740,25 @@ passed while fresh workspace check and strict Clippy compilation ran concurrentl
 the complete local repository CI gate also passed. Production protocol and
 cleanup deadlines are unchanged, and no A3 scope was added.
 _________________________________________________________________________________
+_________________________________________________________________________________
+time:      [22:05] [28-07-26]
+agent:     [api] [gpt-5.4] [worker]
+worktree:  [feat/extensions-stage-a2b]
+type:      [bug report]: Close final Stage A2b cleanup and attach ACK blockers
+area:      [backend]: Extension supervisor ownership, protocol ordering, and temp-root retry
+
+Moved completed-service exceptional cleanup into the managed production owner: it
+immediately performs the promised bounded retry and transfers any still-failed
+process/temp-root authority to supervisor retention before the task completes.
+`finish_process` now reports full process-group plus descriptor-relative temp-root
+cleanup, so failed roots remain retryable without weakening generation identity.
+Attach replay records an event as ACK-eligible only after its complete write
+succeeds; an exact racing ACK is bounded and non-authoritative until that point.
+Added gated-write and adversarial real-child ACK proofs plus supervisor-path
+startup, health, protocol, circuit, shutdown, retained-root, and replacement-
+generation tests. Focused 102-test extension coverage, three repeated parallel
+41-test supervisor runs, ten adversarial-child repeats, all 654 daemon tests, the
+full workspace suite, canonical repository CI, compatibility, Rust 1.88 MSRV,
+Windows actual-source portability, and Linux musl cross-builds pass. Scope remains
+strictly A2b with no registry mutation, route, CLI, durable replay, or A3 behavior.
+_________________________________________________________________________________

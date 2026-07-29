@@ -363,7 +363,7 @@ struct ManagedService {
     cancel: CancellationToken,
     stop_reason: Arc<std::sync::Mutex<ShutdownReason>>,
     history: Arc<std::sync::Mutex<RestartHistory>>,
-    task: JoinHandle<Option<CleanupAuthority>>,
+    task: JoinHandle<bool>,
 }
 
 fn requested_stop_reason(reason: &std::sync::Mutex<ShutdownReason>) -> ShutdownReason {
@@ -402,7 +402,7 @@ pub(crate) struct ExtensionSupervisor {
     root_task: Mutex<Option<JoinHandle<()>>>,
     project_tx: mpsc::Sender<ProjectSnapshotCommand>,
     project_rx: Mutex<Option<mpsc::Receiver<ProjectSnapshotCommand>>>,
-    retained_cleanup: Mutex<Vec<CleanupAuthority>>,
+    retained_cleanup: Arc<Mutex<Vec<CleanupAuthority>>>,
 }
 
 impl ExtensionSupervisor {
@@ -415,7 +415,7 @@ impl ExtensionSupervisor {
             root_task: Mutex::new(None),
             project_tx,
             project_rx: Mutex::new(Some(project_rx)),
-            retained_cleanup: Mutex::new(Vec::new()),
+            retained_cleanup: Arc::new(Mutex::new(Vec::new())),
         })
     }
 
@@ -499,15 +499,8 @@ impl ExtensionSupervisor {
     ) -> Result<(), ProjectSnapshotError> {
         request_service_stop(&managed, reason);
         match managed.task.await {
-            Ok(Some(mut authority)) => {
-                if authority.cleanup().await {
-                    Ok(())
-                } else {
-                    self.retained_cleanup.lock().await.push(authority);
-                    Err(ProjectSnapshotError::CleanupIncomplete)
-                }
-            }
-            Ok(None) => Ok(()),
+            Ok(true) => Ok(()),
+            Ok(false) => Err(ProjectSnapshotError::CleanupIncomplete),
             Err(_) => {
                 tracing::warn!(
                     reason = "service_task_failed",
@@ -534,6 +527,60 @@ impl ExtensionSupervisor {
         } else {
             self.retained_cleanup.lock().await.extend(failed);
             Err(ProjectSnapshotError::CleanupIncomplete)
+        }
+    }
+
+    fn spawn_managed(
+        &self,
+        activation: ServiceActivation,
+        history: Arc<std::sync::Mutex<RestartHistory>>,
+    ) -> ManagedService {
+        let descriptor = ServiceDescriptor::from_activation(&activation);
+        let cancel = CancellationToken::new();
+        let task_cancel = cancel.clone();
+        let stop_reason = Arc::new(std::sync::Mutex::new(ShutdownReason::DaemonStopping));
+        let task_stop_reason = Arc::clone(&stop_reason);
+        let lifecycle = Arc::clone(&self.lifecycle);
+        let status = self.status.clone();
+        let epoch = Uuid::new_v4();
+        let replay_floor = lifecycle.current_sequence();
+        let scope = activation_scope(&activation);
+        let task_history = Arc::clone(&history);
+        let retained_cleanup = Arc::clone(&self.retained_cleanup);
+        let task = tokio::spawn(async move {
+            let Some(mut authority) = run_service_with_epoch(
+                activation,
+                lifecycle,
+                task_cancel,
+                status,
+                epoch,
+                replay_floor,
+                scope,
+                task_stop_reason,
+                task_history,
+            )
+            .await
+            else {
+                return true;
+            };
+
+            // The task that owns the completed service immediately consumes
+            // the one promised exceptional retry. A still-failed authority is
+            // transferred into supervisor-owned retention before this task can
+            // complete, so no JoinHandle can hide a surviving process group.
+            if authority.cleanup().await {
+                true
+            } else {
+                retained_cleanup.lock().await.push(authority);
+                false
+            }
+        });
+        ManagedService {
+            descriptor,
+            cancel,
+            stop_reason,
+            history,
+            task,
         }
     }
 
@@ -588,44 +635,11 @@ impl ExtensionSupervisor {
             if services.contains_key(&key) {
                 continue;
             }
-            let descriptor = ServiceDescriptor::from_activation(&activation);
             let history = preserved_histories.remove(&key).unwrap_or_default();
-            let cancel = CancellationToken::new();
-            let task_cancel = cancel.clone();
-            let stop_reason = Arc::new(std::sync::Mutex::new(ShutdownReason::DaemonStopping));
-            let task_stop_reason = Arc::clone(&stop_reason);
-            let lifecycle = Arc::clone(&self.lifecycle);
-            let status = self.status.clone();
-            // Mint the immutable epoch and floor before reconciliation
-            // acknowledges a project-snapshot change.
-            let epoch = Uuid::new_v4();
-            let replay_floor = lifecycle.current_sequence();
-            let scope = activation_scope(&activation);
-            let task_history = Arc::clone(&history);
-            let task = tokio::spawn(async move {
-                run_service_with_epoch(
-                    activation,
-                    lifecycle,
-                    task_cancel,
-                    status,
-                    epoch,
-                    replay_floor,
-                    scope,
-                    task_stop_reason,
-                    task_history,
-                )
-                .await
-            });
-            services.insert(
-                key,
-                ManagedService {
-                    descriptor,
-                    cancel,
-                    stop_reason,
-                    history,
-                    task,
-                },
-            );
+            // Minting the immutable epoch and floor happens in this exact
+            // production spawn path before reconciliation acknowledges a
+            // project-snapshot change.
+            services.insert(key, self.spawn_managed(activation, history));
         }
         Ok(())
     }
@@ -1438,7 +1452,7 @@ where
     R: AsyncBufRead + Unpin,
     T: Serialize,
 {
-    if let Some(sequence) = sent_sequence {
+    if sent_sequence.is_some() {
         while ledger.is_full() {
             wait_attach_child_frame(
                 stdout,
@@ -1451,22 +1465,56 @@ where
             )
             .await?;
         }
-        // Record before polling the write. Once the complete frame reaches the
-        // pipe, a fast child may ACK before Tokio next polls the write future.
-        ledger
-            .record_sent(sequence)
-            .map_err(|_| AttachError::ProtocolViolation)?;
     }
     let write = write_frame(stdin, frame);
     tokio::pin!(write);
+    let mut deferred_ack = None;
     loop {
         tokio::select! {
             _ = cancel.cancelled() => return Err(AttachError::Cancelled),
             _ = tokio::time::sleep_until(deadline) => return Err(AttachError::Timeout),
-            result = &mut write => return result.map_err(|_| AttachError::ProtocolViolation),
+            result = &mut write => {
+                result.map_err(|_| AttachError::ProtocolViolation)?;
+                if let Some(sequence) = sent_sequence {
+                    // A sequence becomes authoritative only after the complete
+                    // event frame write succeeds. A child ACK that raced that
+                    // completion remains non-authoritative until this point.
+                    ledger
+                        .record_sent(sequence)
+                        .map_err(|_| AttachError::ProtocolViolation)?;
+                    if let Some(acknowledged) = deferred_ack {
+                        ledger
+                            .acknowledge(acknowledged)
+                            .map_err(|_| AttachError::ProtocolViolation)?;
+                        status.update_ack(activation, acknowledged);
+                    }
+                }
+                return Ok(());
+            },
             child = read_frame::<ChildFrame, _>(stdout) => {
                 let child = child.map_err(|_| AttachError::ProtocolViolation)?;
-                validate_attach_child_frame(child, ledger, child_status, status, activation)?;
+                match child {
+                    ChildFrame::Ack(ack)
+                        if sent_sequence == Some(ack.sequence)
+                            && deferred_ack.is_none()
+                            && ledger
+                                .last_ack
+                                .is_none_or(|last| ack.sequence.0 > last) =>
+                    {
+                        // The child may have read the pipe before Tokio polls a
+                        // now-complete write. Buffer only the exact in-flight
+                        // sequence, never publish it, and validate it through
+                        // the sent ledger after successful write completion.
+                        deferred_ack = Some(ack.sequence);
+                    }
+                    child => validate_attach_child_frame(
+                        child,
+                        ledger,
+                        child_status,
+                        status,
+                        activation,
+                    )?,
+                }
             }
         }
     }
@@ -2971,7 +3019,7 @@ async fn finish_process(
         None,
         Some(terminal_reason),
     );
-    group_cleaned
+    fully_cleaned
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -3362,6 +3410,40 @@ mod tests {
             .expect("fixture service task panicked")
     }
 
+    async fn wait_for_managed_completion(managed: &ManagedService) {
+        tokio::time::timeout(Duration::from_secs(20), async {
+            while !managed.task.is_finished() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("managed service did not complete within its cleanup bound");
+    }
+
+    fn replace_active_temp_generation(config_dir: &Path) -> (PathBuf, PathBuf) {
+        let parent = config_dir.join("extensions/state/example.noop/tmp/lifecycle");
+        let mut active = fs::read_dir(&parent)
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .collect::<Vec<_>>();
+        assert_eq!(active.len(), 1, "expected one active connection root");
+        let named = active.pop().unwrap();
+        let retained = named.with_extension("retained");
+        fs::rename(&named, &retained).unwrap();
+        fs::create_dir(&named).unwrap();
+        fs::write(named.join("replacement-generation"), b"untouched").unwrap();
+        (named, retained)
+    }
+
+    fn restore_active_temp_generation(named: &Path, retained: &Path) {
+        assert_eq!(
+            fs::read(named.join("replacement-generation")).unwrap(),
+            b"untouched"
+        );
+        fs::remove_dir_all(named).unwrap();
+        fs::rename(retained, named).unwrap();
+    }
+
     #[test]
     fn prioritized_control_lane_coalesces_without_an_unbounded_control_queue() {
         let controls = ControlLane::default();
@@ -3418,6 +3500,159 @@ mod tests {
         assert!(!ledger.is_full());
         assert!(ledger.acknowledge(Sequence(17)).is_err());
         assert!(ledger.acknowledge(Sequence(999_999)).is_err());
+    }
+
+    #[tokio::test]
+    async fn racing_attach_ack_is_not_authoritative_until_event_write_succeeds() {
+        use std::{
+            future::Future,
+            pin::Pin,
+            sync::atomic::AtomicBool,
+            task::{Context, Poll},
+        };
+
+        struct GatedWriter {
+            release: oneshot::Receiver<()>,
+            write_polled: Arc<AtomicBool>,
+        }
+
+        impl AsyncWrite for GatedWriter {
+            fn poll_write(
+                mut self: Pin<&mut Self>,
+                context: &mut Context<'_>,
+                bytes: &[u8],
+            ) -> Poll<io::Result<usize>> {
+                self.write_polled.store(true, Ordering::Release);
+                match Pin::new(&mut self.release).poll(context) {
+                    Poll::Ready(_) => Poll::Ready(Ok(bytes.len())),
+                    Poll::Pending => Poll::Pending,
+                }
+            }
+
+            fn poll_flush(
+                self: Pin<&mut Self>,
+                _context: &mut Context<'_>,
+            ) -> Poll<io::Result<()>> {
+                Poll::Ready(Ok(()))
+            }
+
+            fn poll_shutdown(
+                self: Pin<&mut Self>,
+                _context: &mut Context<'_>,
+            ) -> Poll<io::Result<()>> {
+                Poll::Ready(Ok(()))
+            }
+        }
+
+        let (_temp, activation) = executable_fixture("#!/bin/sh\nexit 0\n");
+        let status = RuntimeStatusCache::default();
+        status.insert_starting(&activation, Uuid::new_v4(), Sequence(0), 0);
+        let (release, released) = oneshot::channel();
+        let write_polled = Arc::new(AtomicBool::new(false));
+        let (mut child, host) = tokio::io::duplex(MAX_FRAME_BYTES);
+        let writer_polled = Arc::clone(&write_polled);
+        let host_status = status.clone();
+        let task = tokio::spawn(async move {
+            let mut writer = GatedWriter {
+                release: released,
+                write_polled: writer_polled,
+            };
+            let mut stdout = BufReader::new(host);
+            let mut ledger = AckLedger::default();
+            let mut child_status = None;
+            let event = serde_json::json!({"frame": "event"});
+            let result = write_attach_frame(
+                &mut writer,
+                &mut stdout,
+                &event,
+                Some(Sequence(1)),
+                &mut ledger,
+                &mut child_status,
+                &host_status,
+                &activation,
+                &CancellationToken::new(),
+                tokio::time::Instant::now() + Duration::from_secs(5),
+            )
+            .await;
+            (result, ledger)
+        });
+
+        while !write_polled.load(Ordering::Acquire) {
+            tokio::task::yield_now().await;
+        }
+        let ack = Ack {
+            protocol: ProtocolName,
+            version: ProtocolV1,
+            frame: ocean_agent_sdk::extension_lifecycle::AckFrame,
+            sequence: Sequence(1),
+        };
+        child.write_all(&encode_frame(&ack).unwrap()).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(25)).await;
+        assert_eq!(status.snapshot()[0].last_acknowledged_sequence, None);
+        assert!(!task.is_finished());
+
+        release.send(()).unwrap();
+        let (result, ledger) = task.await.unwrap();
+        assert_eq!(result, Ok(()));
+        assert_eq!(ledger.last_ack, Some(1));
+        assert_eq!(
+            status.snapshot()[0].last_acknowledged_sequence,
+            Some(Sequence(1))
+        );
+    }
+
+    #[tokio::test]
+    async fn real_child_guessed_ack_before_reading_replay_is_validated_only_after_send() {
+        let script = r#"#!/bin/sh
+IFS= read -r hello || exit 10
+printf waiting > "$HOME/host-hello-read"
+while [ ! -f "$HOME/release-hello" ]; do sleep 0.01; done
+printf '%s\n' '{"protocol":"ocean.extension.service","version":1,"frame":"service_hello","subscriptions":["session_started"],"resume":null}'
+IFS= read -r ready || exit 11
+printf '%s\n' '{"protocol":"ocean.extension.service","version":1,"frame":"ack","sequence":"1"}'
+printf guessed > "$HOME/guessed-ack-sent"
+sleep 1
+IFS= read -r event || exit 12
+IFS= read -r shutdown || exit 13
+printf '%s\n' '{"protocol":"ocean.extension.service","version":1,"frame":"shutdown_complete"}'
+"#;
+        let (temp, mut activation) = executable_fixture(script);
+        install_fixture_store(&temp, &mut activation);
+        activation.events = vec![LifecycleEventKind::SessionStarted];
+        let data = activation
+            .config_dir
+            .join("extensions/state/example.noop/data");
+        let marker = data.join("guessed-ack-sent");
+        let lifecycle = LifecycleDispatcher::new(Uuid::new_v4(), HashSet::new());
+        let cancel = CancellationToken::new();
+        let status = RuntimeStatusCache::default();
+        let task = tokio::spawn(run_service_a2b(
+            activation,
+            Arc::clone(&lifecycle),
+            cancel.clone(),
+            status.clone(),
+        ));
+
+        wait_for_fixture_marker(&data.join("host-hello-read")).await;
+        lifecycle.publish(LifecycleSource::ExplicitSessionCreated {
+            succeeded: true,
+            scope: lifecycle.source_scope(None, Some(Uuid::new_v4()), None, None, None),
+            stamp: super::super::extension_lifecycle::event_stamp(),
+            title: "discarded".into(),
+            cwd: "/discarded".into(),
+        });
+        fs::write(data.join("release-hello"), b"release").unwrap();
+        wait_for_fixture_marker(&marker).await;
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while status.snapshot()[0].last_acknowledged_sequence != Some(Sequence(1)) {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("guessed ACK was not validated after the replay event was sent");
+        assert_eq!(status.snapshot()[0].state, RuntimeState::Healthy);
+        cancel.cancel();
+        assert!(await_fixture_service(task).await.is_none());
     }
 
     #[tokio::test(start_paused = true)]
@@ -4388,6 +4623,209 @@ printf temp > "$TMPDIR/temp-proof"
         let elapsed = started.elapsed();
         assert!(elapsed >= Duration::from_millis(1_900));
         assert!(elapsed < Duration::from_secs(3));
+    }
+
+    #[tokio::test]
+    async fn supervisor_immediately_retries_and_retains_exceptional_startup_cleanup() {
+        let script = r#"#!/bin/sh
+printf '%s' $$ > "$HOME/leader.pid"
+printf started > "$HOME/startup-entered"
+sleep 30
+"#;
+        let (temp, mut activation) = executable_fixture(script);
+        install_fixture_store(&temp, &mut activation);
+        activation.events.clear();
+        activation.startup_timeout = Duration::from_secs(1);
+        let config = activation.config_dir.clone();
+        let data = config.join("extensions/state/example.noop/data");
+        let supervisor = ExtensionSupervisor::new_with_lifecycle(LifecycleDispatcher::new(
+            Uuid::new_v4(),
+            HashSet::new(),
+        ));
+        let managed = supervisor.spawn_managed(
+            activation,
+            Arc::new(std::sync::Mutex::new(RestartHistory::default())),
+        );
+
+        wait_for_fixture_marker(&data.join("startup-entered")).await;
+        let (named, retained) = replace_active_temp_generation(&config);
+        wait_for_managed_completion(&managed).await;
+
+        // The completed service task itself performed the bounded exceptional
+        // retry and transferred the still-failed descriptor authority to the
+        // supervisor. No later reconfigure/shutdown poll was needed.
+        assert_eq!(supervisor.retained_cleanup.lock().await.len(), 1);
+        assert_eq!(
+            supervisor
+                .stop_managed(managed, ShutdownReason::Reconfigure)
+                .await,
+            Err(ProjectSnapshotError::CleanupIncomplete)
+        );
+        let leader: libc::pid_t = fs::read_to_string(data.join("leader.pid"))
+            .unwrap()
+            .parse()
+            .unwrap();
+        assert!(!group_has_live_members(leader).unwrap());
+        assert_eq!(
+            supervisor.status.snapshot()[0].reason,
+            Some(RuntimeReason::StartupTimeout)
+        );
+
+        restore_active_temp_generation(&named, &retained);
+        assert_eq!(supervisor.retry_retained_cleanup().await, Ok(()));
+        assert!(supervisor.retained_cleanup.lock().await.is_empty());
+        assert!(!named.exists());
+    }
+
+    #[tokio::test]
+    async fn supervisor_production_path_cleans_protocol_circuit_and_shutdown() {
+        let protocol_script = r#"#!/bin/sh
+IFS= read -r hello || exit 10
+printf '%s\n' '{"protocol":"ocean.extension.service","version":1,"frame":"service_hello","subscriptions":[],"resume":null}'
+IFS= read -r ready || exit 11
+printf '%s\n' '{malformed'
+IFS= read -r shutdown || exit 12
+printf '%s\n' '{"protocol":"ocean.extension.service","version":1,"frame":"shutdown_complete"}'
+"#;
+        let (protocol_temp, mut protocol) = executable_fixture(protocol_script);
+        install_fixture_store(&protocol_temp, &mut protocol);
+        protocol.events.clear();
+        let protocol_supervisor = ExtensionSupervisor::new_with_lifecycle(
+            LifecycleDispatcher::new(Uuid::new_v4(), HashSet::new()),
+        );
+        let protocol_managed = protocol_supervisor.spawn_managed(
+            protocol,
+            Arc::new(std::sync::Mutex::new(RestartHistory::default())),
+        );
+        wait_for_managed_completion(&protocol_managed).await;
+        assert_eq!(
+            protocol_supervisor
+                .stop_managed(protocol_managed, ShutdownReason::Reconfigure)
+                .await,
+            Ok(())
+        );
+        let protocol_status = protocol_supervisor.status.snapshot();
+        assert_eq!(
+            protocol_status[0].reason,
+            Some(RuntimeReason::ProtocolViolation)
+        );
+        assert_eq!(protocol_status[0].pid, None);
+
+        let circuit_script = r#"#!/bin/sh
+IFS= read -r hello || exit 10
+printf '%s\n' '{"protocol":"ocean.extension.service","version":1,"frame":"service_hello","subscriptions":[],"resume":null}'
+IFS= read -r ready || exit 11
+exit 17
+"#;
+        let (circuit_temp, mut circuit) = executable_fixture(circuit_script);
+        install_fixture_store(&circuit_temp, &mut circuit);
+        circuit.events.clear();
+        circuit.restart_on_failure = true;
+        let circuit_supervisor = ExtensionSupervisor::new_with_lifecycle(LifecycleDispatcher::new(
+            Uuid::new_v4(),
+            HashSet::new(),
+        ));
+        let circuit_managed = circuit_supervisor.spawn_managed(
+            circuit,
+            Arc::new(std::sync::Mutex::new(RestartHistory::default())),
+        );
+        wait_for_managed_completion(&circuit_managed).await;
+        assert_eq!(
+            circuit_supervisor
+                .stop_managed(circuit_managed, ShutdownReason::Reconfigure)
+                .await,
+            Ok(())
+        );
+        let circuit_status = circuit_supervisor.status.snapshot();
+        assert_eq!(circuit_status[0].state, RuntimeState::CircuitOpen);
+        assert_eq!(circuit_status[0].restart_count, 4);
+        assert_eq!(circuit_status[0].pid, None);
+
+        let shutdown_script = r#"#!/bin/sh
+IFS= read -r hello || exit 10
+printf '%s\n' '{"protocol":"ocean.extension.service","version":1,"frame":"service_hello","subscriptions":[],"resume":null}'
+IFS= read -r ready || exit 11
+while IFS= read -r frame; do
+ case "$frame" in
+  *'"frame":"ping"'*) nonce=${frame#*\"nonce\":\"}; nonce=${nonce%%\"*}; printf '{"protocol":"ocean.extension.service","version":1,"frame":"pong","nonce":"%s"}\n' "$nonce" ;;
+  *'"frame":"shutdown"'*'"reason":"daemon_stopping"'*) printf stopped > "$HOME/shutdown-received"; printf '%s\n' '{"protocol":"ocean.extension.service","version":1,"frame":"shutdown_complete"}'; exit 0 ;;
+ esac
+done
+"#;
+        let (shutdown_temp, mut shutdown) = executable_fixture(shutdown_script);
+        install_fixture_store(&shutdown_temp, &mut shutdown);
+        shutdown.events.clear();
+        let shutdown_marker = shutdown
+            .config_dir
+            .join("extensions/state/example.noop/data/shutdown-received");
+        let shutdown_supervisor = ExtensionSupervisor::new_with_lifecycle(
+            LifecycleDispatcher::new(Uuid::new_v4(), HashSet::new()),
+        );
+        let shutdown_managed = shutdown_supervisor.spawn_managed(
+            shutdown,
+            Arc::new(std::sync::Mutex::new(RestartHistory::default())),
+        );
+        let _ = wait_for_runtime_state(&shutdown_supervisor.status, RuntimeState::Healthy).await;
+        assert_eq!(
+            shutdown_supervisor
+                .stop_managed(shutdown_managed, ShutdownReason::DaemonStopping)
+                .await,
+            Ok(())
+        );
+        assert!(shutdown_marker.exists());
+        let shutdown_status = shutdown_supervisor.status.snapshot();
+        assert_eq!(shutdown_status[0].state, RuntimeState::Inactive);
+        assert_eq!(shutdown_status[0].pid, None);
+    }
+
+    #[tokio::test]
+    async fn supervisor_health_failure_cleans_through_managed_owner() {
+        let script = r#"#!/bin/sh
+IFS= read -r hello || exit 10
+printf '%s\n' '{"protocol":"ocean.extension.service","version":1,"frame":"service_hello","subscriptions":[],"resume":null}'
+IFS= read -r ready || exit 11
+while IFS= read -r frame; do
+ case "$frame" in
+  *'"frame":"shutdown"'*) printf '%s\n' '{"protocol":"ocean.extension.service","version":1,"frame":"shutdown_complete"}'; exit 0 ;;
+ esac
+done
+"#;
+        let (temp, mut activation) = executable_fixture(script);
+        install_fixture_store(&temp, &mut activation);
+        activation.events.clear();
+        let supervisor = ExtensionSupervisor::new_with_lifecycle(LifecycleDispatcher::new(
+            Uuid::new_v4(),
+            HashSet::new(),
+        ));
+        let managed = supervisor.spawn_managed(
+            activation,
+            Arc::new(std::sync::Mutex::new(RestartHistory::default())),
+        );
+        let _ = wait_for_runtime_state(&supervisor.status, RuntimeState::Healthy).await;
+
+        tokio::time::pause();
+        for delta in [10_u64, 5, 5, 5, 5, 5] {
+            tokio::time::advance(Duration::from_secs(delta)).await;
+            tokio::task::yield_now().await;
+        }
+        for _ in 0..500 {
+            if managed.task.is_finished() {
+                break;
+            }
+            tokio::time::advance(Duration::from_millis(100)).await;
+            std::thread::sleep(Duration::from_millis(1));
+            tokio::task::yield_now().await;
+        }
+        assert!(managed.task.is_finished());
+        assert_eq!(
+            supervisor
+                .stop_managed(managed, ShutdownReason::Reconfigure)
+                .await,
+            Ok(())
+        );
+        let status = supervisor.status.snapshot();
+        assert_eq!(status[0].reason, Some(RuntimeReason::PingTimeout));
+        assert_eq!(status[0].pid, None);
     }
 
     #[tokio::test]
