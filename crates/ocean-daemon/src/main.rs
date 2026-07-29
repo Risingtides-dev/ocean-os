@@ -461,15 +461,30 @@ type TurnLimiter = Arc<tokio::sync::Semaphore>;
 /// unbounded number of simultaneous provider calls.
 const DEFAULT_MAX_CONCURRENT_TURNS: usize = 24;
 
+/// Leave one terminal-authority slot outside the turn permit pool so lifecycle
+/// admission cannot exhaust its exactly-once completion bookkeeping. The permit
+/// remains owned until the background turn task drops its terminal guard.
+const MAX_CONCURRENT_TURNS: usize =
+    extension_lifecycle::MAX_ACTIVE_TERMINAL_AUTHORITIES.saturating_sub(1);
+
 /// Resolve the concurrent-turn ceiling: `OCEAN_MAX_CONCURRENT_TURNS` if set to a
-/// parseable, non-zero `usize`, else [`DEFAULT_MAX_CONCURRENT_TURNS`]. A `0` or
-/// garbage value falls back to the default rather than wedging intake shut
-/// (Semaphore with 0 permits would reject every turn), matching how the other
-/// numeric env knobs (`OCEAN_SHUTDOWN_*`) degrade to a sane default.
+/// parseable, non-zero `usize`, else [`DEFAULT_MAX_CONCURRENT_TURNS`]. Values
+/// above [`MAX_CONCURRENT_TURNS`] are clamped below lifecycle bookkeeping
+/// capacity; a `0` or garbage value falls back to the default rather than
+/// wedging intake shut (Semaphore with 0 permits would reject every turn).
 fn max_concurrent_turns() -> usize {
     match env::var("OCEAN_MAX_CONCURRENT_TURNS") {
         Ok(raw) => match raw.trim().parse::<usize>() {
-            Ok(n) if n > 0 => n,
+            Ok(n) if n > 0 => {
+                if n > MAX_CONCURRENT_TURNS {
+                    tracing::warn!(
+                        value = n,
+                        maximum = MAX_CONCURRENT_TURNS,
+                        "OCEAN_MAX_CONCURRENT_TURNS clamped below lifecycle bookkeeping capacity"
+                    );
+                }
+                n.min(MAX_CONCURRENT_TURNS)
+            }
             _ => {
                 tracing::warn!(
                     value = %raw,
@@ -6203,17 +6218,49 @@ async fn agent_turn(
     .await;
     // Mint one request-scoped atomic terminal authority and distribute clones
     // to normal completion and the orphan/panic guard. No terminal lifecycle
-    // API exists without this exact authority.
-    let lifecycle_terminal_authority = state.extension_lifecycle.register_request(lifecycle_scope);
-    let lifecycle_terminal =
-        lifecycle_terminal_authority.map(|authority| LifecycleTerminalContext {
-            dispatcher: Arc::clone(&state.extension_lifecycle),
-            authority,
-            project_id: lifecycle_project_id,
-            session_id: session_id.inner(),
-            turn_id: turn_id.inner(),
+    // API exists without this exact authority. Capacity is normally impossible
+    // because the turn limiter is clamped below the authority cap; still reject
+    // fail-closed if bookkeeping cannot be minted rather than admitting a turn
+    // that can never publish its required terminal lifecycle fact.
+    let Some(lifecycle_terminal_authority) =
+        state.extension_lifecycle.register_request(lifecycle_scope)
+    else {
+        let message = "lifecycle terminal bookkeeping unavailable; turn was not admitted";
+        let _ = update_request_finished(
+            &state.requests,
             request_id,
-        });
+            Some(core_sid(session_id)),
+            RequestState::Errored,
+            message.into(),
+            |_| {},
+        )
+        .await;
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(AgentTurnResponse {
+                ok: false,
+                turn_id,
+                session_id,
+                status: AgentTurnStatus::Failed,
+                event_id_prefix: event_prefix,
+                error: Some(message.into()),
+                output_tokens: None,
+                input_tokens: None,
+                cache_read_tokens: None,
+                tokens_per_second: None,
+                context_usage: None,
+                wall_ms: None,
+            }),
+        );
+    };
+    let lifecycle_terminal = Some(LifecycleTerminalContext {
+        dispatcher: Arc::clone(&state.extension_lifecycle),
+        authority: lifecycle_terminal_authority,
+        project_id: lifecycle_project_id,
+        session_id: session_id.inner(),
+        turn_id: turn_id.inner(),
+        request_id,
+    });
     // Construct the terminal guard before publishing admission. From this point
     // onward, handler drop, panic, or spawned-task abort-before-first-poll owns a
     // terminal authority; no admitted turn can be orphaned in an await gap.
@@ -13876,6 +13923,13 @@ mod tests {
 
         std::env::set_var("OCEAN_MAX_CONCURRENT_TURNS", "5");
         assert_eq!(max_concurrent_turns(), 5);
+
+        std::env::set_var(
+            "OCEAN_MAX_CONCURRENT_TURNS",
+            (MAX_CONCURRENT_TURNS + 1).to_string(),
+        );
+        assert_eq!(max_concurrent_turns(), MAX_CONCURRENT_TURNS);
+        assert!(max_concurrent_turns() < extension_lifecycle::MAX_ACTIVE_TERMINAL_AUTHORITIES);
 
         // Zero would wedge intake shut (a 0-permit Semaphore rejects every turn);
         // it must degrade to the default instead.

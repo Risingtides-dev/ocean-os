@@ -29,7 +29,7 @@ pub(crate) const BOOT_RING_MAX_EVENTS: usize = 2_048;
 pub(crate) const BOOT_RING_MAX_BYTES: usize = 8 * 1024 * 1024;
 const MAX_ACTIVE_TOOL_CORRELATIONS: usize = BOOT_RING_MAX_EVENTS;
 const MAX_OPEN_PERMISSIONS: usize = BOOT_RING_MAX_EVENTS;
-const MAX_ACTIVE_TERMINAL_AUTHORITIES: usize = BOOT_RING_MAX_EVENTS;
+pub(crate) const MAX_ACTIVE_TERMINAL_AUTHORITIES: usize = BOOT_RING_MAX_EVENTS;
 const MAX_RUNTIME_TOOL_CALL_ID_BYTES: usize = 1_024;
 
 /// Deterministic host inputs used for one emitted envelope.

@@ -5778,3 +5778,20 @@ tests, repeated loaded supervisor runs, the full workspace and canonical CI,
 compatibility, Rust 1.88 MSRV, Linux musl, and actual-source Windows portability.
 A3a is the next authorized slice; no A3+ behavior is included here.
 _________________________________________________________________________________
+_________________________________________________________________________________
+time:  [23:31] [28-07-26]
+agent: [pi] [gpt-5.4] [Thoth]
+worktree: [feat/extensions-stage-a2b]
+type:  [bug report]: Close final Stage A2b review findings
+area:  [backend]: ACK-window delivery and lifecycle admission
+
+Closed both final independent-review findings without widening beyond A2b. Live
+service delivery now pauses event dequeue at the fixed ACK window, gives legal
+child frames a bounded prioritized drain opportunity, and retains fragmented
+frame prefixes across select cancellation through attach, live operation, and
+shutdown. Turn concurrency is clamped below terminal-authority capacity, with a
+fail-closed admission fallback if authority minting is ever unavailable. Added
+fragmented full-window and oversized concurrency regression coverage. The full
+655-test daemon suite passed after one isolated startup-cleanup fixture retry and
+then passed cleanly in full; focused checks and formatting also pass.
+_________________________________________________________________________________

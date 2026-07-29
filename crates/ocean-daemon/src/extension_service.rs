@@ -55,6 +55,7 @@ const WRITE_TIMEOUT: Duration = Duration::from_secs(2);
 const GRACEFUL_RESPONSE_TIMEOUT: Duration = Duration::from_secs(2);
 const DIAGNOSTIC_JOIN_TIMEOUT: Duration = Duration::from_millis(250);
 const ACK_WINDOW_MAX: usize = OUTBOUND_MAX_MESSAGES;
+const ACK_WINDOW_DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
 const GROUP_TERM_TIMEOUT: Duration = Duration::from_secs(2);
 const GROUP_KILL_TIMEOUT: Duration = Duration::from_secs(2);
 const REGISTRY_LOAD_TIMEOUT: Duration = Duration::from_secs(5);
@@ -1417,6 +1418,7 @@ fn validate_attach_child_frame(
 #[allow(clippy::too_many_arguments)]
 async fn wait_attach_child_frame<R: AsyncBufRead + Unpin>(
     stdout: &mut R,
+    frame_buffer: &mut Vec<u8>,
     ledger: &mut AckLedger,
     child_status: &mut Option<ChildStatusProjection>,
     status: &RuntimeStatusCache,
@@ -1427,7 +1429,7 @@ async fn wait_attach_child_frame<R: AsyncBufRead + Unpin>(
     tokio::select! {
         _ = cancel.cancelled() => Err(AttachError::Cancelled),
         _ = tokio::time::sleep_until(deadline) => Err(AttachError::Timeout),
-        frame = read_frame::<ChildFrame, _>(stdout) => {
+        frame = read_frame_buffered::<ChildFrame, _>(stdout, frame_buffer) => {
             let frame = frame.map_err(|_| AttachError::ProtocolViolation)?;
             validate_attach_child_frame(frame, ledger, child_status, status, activation)
         }
@@ -1438,6 +1440,7 @@ async fn wait_attach_child_frame<R: AsyncBufRead + Unpin>(
 async fn write_attach_frame<W, R, T>(
     stdin: &mut W,
     stdout: &mut R,
+    frame_buffer: &mut Vec<u8>,
     frame: &T,
     sent_sequence: Option<Sequence>,
     ledger: &mut AckLedger,
@@ -1456,6 +1459,7 @@ where
         while ledger.is_full() {
             wait_attach_child_frame(
                 stdout,
+                frame_buffer,
                 ledger,
                 child_status,
                 status,
@@ -1491,7 +1495,7 @@ where
                 }
                 return Ok(());
             },
-            child = read_frame::<ChildFrame, _>(stdout) => {
+            child = read_frame_buffered::<ChildFrame, _>(stdout, frame_buffer) => {
                 let child = child.map_err(|_| AttachError::ProtocolViolation)?;
                 match child {
                     ChildFrame::Ack(ack)
@@ -2075,6 +2079,7 @@ async fn run_service_once(
     ));
     let mut stdin = stdin;
     let mut stdout = BufReader::new(stdout);
+    let mut frame_buffer = Vec::with_capacity(1024);
 
     let service_hello = {
         let handshake = tokio::time::timeout(
@@ -2141,6 +2146,7 @@ async fn run_service_once(
                 write_attach_frame(
                     &mut stdin,
                     &mut stdout,
+                    &mut frame_buffer,
                     &ready,
                     None,
                     &mut ledger,
@@ -2157,6 +2163,7 @@ async fn run_service_once(
                     write_attach_frame(
                         &mut stdin,
                         &mut stdout,
+                        &mut frame_buffer,
                         reset,
                         None,
                         &mut ledger,
@@ -2172,6 +2179,7 @@ async fn run_service_once(
                     write_attach_frame(
                         &mut stdin,
                         &mut stdout,
+                        &mut frame_buffer,
                         event,
                         Some(event.sequence),
                         &mut ledger,
@@ -2242,6 +2250,7 @@ async fn run_service_once(
             feeder_cancel.clone(),
         ));
         let mut pending_ping = None::<(Uuid, tokio::time::Instant)>;
+        let mut ack_window_deadline = None::<tokio::time::Instant>;
         let mut next_ping = tokio::time::Instant::now() + HEARTBEAT_INTERVAL;
         let mut misses = 0_u8;
         let mut leader_poll = tokio::time::interval(LEADER_POLL_INTERVAL);
@@ -2299,7 +2308,12 @@ async fn run_service_once(
                         break RuntimeReason::UnexpectedExit;
                     }
                 }
-                frame = read_frame::<ChildFrame, _>(&mut stdout) => {
+                _ = tokio::time::sleep_until(ack_window_deadline.unwrap_or(next_ping)), if ack_window_deadline.is_some() => {
+                    // The window stayed full after giving a concurrently-readable
+                    // legal ACK a bounded chance to drain it.
+                    break RuntimeReason::ProtocolViolation;
+                }
+                frame = read_frame_buffered::<ChildFrame, _>(&mut stdout, &mut frame_buffer) => {
                     match frame {
                         Ok(ChildFrame::Status(child_status)) => {
                             let state = match child_status.state {
@@ -2318,6 +2332,9 @@ async fn run_service_once(
                             if ack_ledger.acknowledge(ack.sequence).is_err() {
                                 break RuntimeReason::ProtocolViolation;
                             }
+                            if !ack_ledger.is_full() {
+                                ack_window_deadline = None;
+                            }
                             status.update_ack(activation, ack.sequence);
                         }
                         Ok(ChildFrame::Pong(pong)) => {
@@ -2332,19 +2349,23 @@ async fn run_service_once(
                         Err(error) => break post_ready_frame_failure_reason(error),
                     }
                 }
-                event = data_rx.recv() => {
+                event = data_rx.recv(), if !ack_ledger.is_full() => {
                     let Some(event) = event else {
                         break RuntimeReason::UnexpectedExit;
                     };
                     queued_bytes.fetch_sub(event.encoded_bytes, Ordering::AcqRel);
-                    if ack_ledger.is_full()
-                        || write_frame(&mut stdin, &event.event).await.is_err()
+                    if write_frame(&mut stdin, &event.event).await.is_err()
                         || ack_ledger.record_sent(event.event.sequence).is_err()
                     {
-                        // A child may choose not to ACK, but it cannot make
-                        // daemon bookkeeping unbounded. Reconnect/reset starts
-                        // a fresh connection ledger.
                         break RuntimeReason::ProtocolViolation;
+                    }
+                    if ack_ledger.is_full() {
+                        // Stop polling queued events at the fixed window. Child
+                        // frames remain prioritized, so an ACK already readable
+                        // under the same burst drains before failure is decided.
+                        ack_window_deadline = Some(
+                            tokio::time::Instant::now() + ACK_WINDOW_DRAIN_TIMEOUT,
+                        );
                     }
                 }
             }
@@ -2369,6 +2390,7 @@ async fn run_service_once(
         &mut owner,
         stdin,
         stdout,
+        frame_buffer,
         &roots,
         effective_shutdown_reason,
         runtime_reason,
@@ -2508,6 +2530,7 @@ async fn run_service(
     };
     let mut stdin = stdin;
     let mut stdout = BufReader::new(stdout);
+    let mut frame_buffer = Vec::with_capacity(1024);
 
     let handshake = {
         let handshake = tokio::time::timeout(
@@ -2535,6 +2558,7 @@ async fn run_service(
             &mut owner,
             stdin,
             stdout,
+            frame_buffer,
             &roots,
             ShutdownReason::DaemonStopping,
             RuntimeReason::Shutdown,
@@ -2564,6 +2588,7 @@ async fn run_service(
                 &mut owner,
                 stdin,
                 stdout,
+                frame_buffer,
                 &roots,
                 ShutdownReason::Unhealthy,
                 RuntimeReason::ProtocolViolation,
@@ -2591,6 +2616,7 @@ async fn run_service(
                 &mut owner,
                 stdin,
                 stdout,
+                frame_buffer,
                 &roots,
                 ShutdownReason::Unhealthy,
                 RuntimeReason::StartupTimeout,
@@ -2624,7 +2650,7 @@ async fn run_service(
                     break (ShutdownReason::Unhealthy, RuntimeReason::UnexpectedExit);
                 }
             }
-            frame = read_frame::<ChildFrame, _>(&mut stdout) => {
+            frame = read_frame_buffered::<ChildFrame, _>(&mut stdout, &mut frame_buffer) => {
                 match frame {
                     Ok(ChildFrame::Status(child_status)) => {
                         let state = match child_status.state {
@@ -2669,6 +2695,7 @@ async fn run_service(
         &mut owner,
         stdin,
         stdout,
+        frame_buffer,
         &roots,
         shutdown_reason,
         runtime_reason,
@@ -2915,6 +2942,17 @@ async fn read_frame<T: for<'de> Deserialize<'de>, R: AsyncBufRead + Unpin>(
     reader: &mut R,
 ) -> Result<T, FrameReadError> {
     let mut encoded = Vec::with_capacity(1024);
+    read_frame_buffered(reader, &mut encoded).await
+}
+
+/// Read one bounded newline-delimited child frame while retaining any consumed
+/// prefix in caller-owned storage. The live loop repeatedly recreates this
+/// future inside `select!`; keeping the prefix outside the future makes branch
+/// cancellation lossless even when a child fragments one legal frame.
+async fn read_frame_buffered<T: for<'de> Deserialize<'de>, R: AsyncBufRead + Unpin>(
+    reader: &mut R,
+    encoded: &mut Vec<u8>,
+) -> Result<T, FrameReadError> {
     loop {
         let available = reader.fill_buf().await.map_err(|_| FrameReadError::Io)?;
         if available.is_empty() {
@@ -2938,7 +2976,9 @@ async fn read_frame<T: for<'de> Deserialize<'de>, R: AsyncBufRead + Unpin>(
         encoded.extend_from_slice(&available[..count]);
         reader.consume(count);
         if encoded.last() == Some(&b'\n') {
-            return decode_frame(&encoded).map_err(|_| FrameReadError::ProtocolViolation);
+            let decoded = decode_frame(encoded).map_err(|_| FrameReadError::ProtocolViolation);
+            encoded.clear();
+            return decoded;
         }
     }
 }
@@ -2951,6 +2991,7 @@ async fn finish_process(
     owner: &mut ProcessGroupOwner,
     mut stdin: ChildStdin,
     mut stdout: BufReader<ChildStdout>,
+    mut frame_buffer: Vec<u8>,
     roots: &AssignedRoots,
     reason: ShutdownReason,
     runtime_reason: RuntimeReason,
@@ -2975,7 +3016,7 @@ async fn finish_process(
     }
     let response = async {
         loop {
-            match read_frame::<ChildFrame, _>(&mut stdout)
+            match read_frame_buffered::<ChildFrame, _>(&mut stdout, &mut frame_buffer)
                 .await
                 .map_err(|_| ())?
             {
@@ -3558,12 +3599,14 @@ mod tests {
                 write_polled: writer_polled,
             };
             let mut stdout = BufReader::new(host);
+            let mut frame_buffer = Vec::new();
             let mut ledger = AckLedger::default();
             let mut child_status = None;
             let event = serde_json::json!({"frame": "event"});
             let result = write_attach_frame(
                 &mut writer,
                 &mut stdout,
+                &mut frame_buffer,
                 &event,
                 Some(Sequence(1)),
                 &mut ledger,
@@ -3836,6 +3879,74 @@ done
         })
         .await
         .expect("maximum replay did not drain ACK-every-event traffic");
+        cancel.cancel();
+        assert!(task.await.expect("service task").is_none());
+    }
+
+    #[tokio::test]
+    async fn live_full_window_drains_a_fragmented_ready_ack_before_polling_more_events() {
+        let script = r#"#!/bin/sh
+IFS= read -r hello || exit 10
+printf '%s\n' '{"protocol":"ocean.extension.service","version":1,"frame":"service_hello","subscriptions":["session_started"],"resume":null}'
+IFS= read -r ready || exit 11
+count=0
+while IFS= read -r frame; do
+ case "$frame" in
+  *'"frame":"event"'*)
+   seq=${frame#*\"sequence\":\"}; seq=${seq%%\"*}
+   count=$((count + 1))
+   if [ "$count" -eq __WINDOW__ ]; then
+    printf '{"protocol":"ocean.extension.service","version":1,"frame":"ack","sequence":"%s"' "$seq"
+    sleep 0.1
+    printf '}\n'
+   elif [ "$count" -gt __WINDOW__ ]; then
+    printf '{"protocol":"ocean.extension.service","version":1,"frame":"ack","sequence":"%s"}\n' "$seq"
+   fi ;;
+  *'"frame":"ping"'*) nonce=${frame#*\"nonce\":\"}; nonce=${nonce%%\"*}; printf '{"protocol":"ocean.extension.service","version":1,"frame":"pong","nonce":"%s"}\n' "$nonce" ;;
+  *'"frame":"shutdown"'*) printf '%s\n' '{"protocol":"ocean.extension.service","version":1,"frame":"shutdown_complete"}'; exit 0 ;;
+ esac
+done
+"#
+        .replace("__WINDOW__", &ACK_WINDOW_MAX.to_string());
+        let (temp, mut activation) = executable_fixture(&script);
+        install_fixture_store(&temp, &mut activation);
+        activation.events = vec![LifecycleEventKind::SessionStarted];
+        let lifecycle = LifecycleDispatcher::new(Uuid::new_v4(), HashSet::new());
+        let cancel = CancellationToken::new();
+        let status = RuntimeStatusCache::default();
+        let task = tokio::spawn(run_service_a2b(
+            activation,
+            Arc::clone(&lifecycle),
+            cancel.clone(),
+            status.clone(),
+        ));
+        wait_for_runtime_state(&status, RuntimeState::Healthy).await;
+
+        for _ in 0..=ACK_WINDOW_MAX {
+            lifecycle.publish(LifecycleSource::ExplicitSessionCreated {
+                succeeded: true,
+                scope: lifecycle.source_scope(None, Some(Uuid::new_v4()), None, None, None),
+                stamp: super::super::extension_lifecycle::event_stamp(),
+                title: "discarded".into(),
+                cwd: "/discarded".into(),
+            });
+            // Keep the bounded feeder below its independent lag threshold while
+            // the child intentionally withholds only transport ACKs.
+            tokio::time::sleep(Duration::from_millis(2)).await;
+        }
+        let expected = lifecycle.current_sequence();
+        let drained = tokio::time::timeout(Duration::from_secs(20), async {
+            while status.snapshot()[0].last_acknowledged_sequence != Some(expected) {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await;
+        assert!(
+            drained.is_ok(),
+            "fragmented ACK at the live window was not drained: {:?}",
+            status.snapshot()
+        );
+
         cancel.cancel();
         assert!(task.await.expect("service task").is_none());
     }
