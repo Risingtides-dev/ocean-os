@@ -3189,7 +3189,7 @@ fn model_from_provider_config(config: &ProviderConfig) -> anyhow::Result<Model> 
         ProviderId::ClaudeCode => Ok(match selection.model.as_str() {
             // The claude-code alias maps to the REAL Anthropic API model id on
             // the wire — "claude-code-sonnet-5" is never sent to the API.
-            "claude-code-fable-5" => Model::anthropic_claude_fable_5(),
+            "claude-code-fable-5" | "claude-fable-5" => Model::anthropic_claude_fable_5(),
             "claude-code-opus-5" | "claude-opus-5" => Model::anthropic_claude_opus_5(),
             "claude-code-sonnet-5" | "claude-sonnet-5" => Model::anthropic_claude_sonnet_5(),
             "claude-code-haiku-4-5" | "claude-haiku-4-5" => Model::anthropic_claude_haiku_4_5(),

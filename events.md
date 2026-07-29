@@ -5870,3 +5870,22 @@ output `CHILD_OK`. Six unit/integration tests, real stdio JSON-RPC smoke, Python
 compile, shell syntax, installer install/uninstall round-trip, and docs checks
 passed.
 _________________________________________________________________________________
+time:      [17:43] [07-29-26]
+agent:     [claude] [fable 5]
+worktree:  fix/fable-5-wire-alias
+type:      [bug-report]
+area:      [backend]
+
+Diagnosed and fixed tonight's "agents don't respond" outage. Two overlapping
+causes: a transient outbound-network window (20:20–21:16 UTC; Anthropic, Codex,
+and DeepSeek all unreachable at the transport layer, self-healed) and a hard
+regression from today's deploy — the TUI now persists a session's model and
+replays the session record's `Model.id` on later turns, but `claude-fable-5`
+(the wire id) was the only Claude id with no resolver alias, so every
+fable-pinned session instant-failed with "unknown model 'claude-fable-5'".
+Reproduced live via POST /v1/agent/turns (ok=false, wall_ms=0) with the error
+captured on /v1/events SSE. Fix: route `claude-fable-5` through the existing
+`claude-code-fable-5` arm in ocean-providers, mirror the wire id in
+ocean-agent's ClaudeCode match, and add a round-trip regression test covering
+every fable spelling. cargo test -p ocean-providers green (46 passed).
+_________________________________________________________________________________
