@@ -704,8 +704,9 @@ pub fn known_models() -> Vec<KnownModel> {
         // arms so pinned sessions keep resolving). The plain ids route through
         // `ProviderId::ClaudeCode` — they assume the Claude Code OAuth login,
         // not a direct Anthropic API key. `claude-code-*` aliases are dropped
-        // from the menu (they resolved to the same models); `fable` has no
-        // plain alias so it keeps its `claude-code-fable-5` id.
+        // from the menu (they resolved to the same models); `fable` keeps its
+        // `claude-code-fable-5` MENU id, though its wire id `claude-fable-5`
+        // stays routable in the resolver (persisted session models replay it).
         m("claude-opus-5", "claude-code", "Claude Opus 5"),
         m("claude-sonnet-5", "claude-code", "Claude Sonnet 5"),
         m("claude-haiku-4-5", "claude-code", "Claude Haiku 4.5"),
@@ -949,8 +950,12 @@ pub fn resolve_model_selection(env: &ProviderEnv) -> Result<ModelSelection, Prov
         )),
         // Claude Code (Anthropic Messages wire protocol, OAuth bearer auth).
         // selection.model preserves the public alias id; ocean-agent maps it to
-        // the real Anthropic API model id.
-        "claude-code-fable-5" | "claude-code-fable" | "cc-fable" | "fable" => Ok(model_selection(
+        // the real Anthropic API model id. `claude-fable-5` (the wire id) must
+        // stay routable: session records persist `Model.id`, and clients that
+        // pin a session's model replay that id verbatim on later turns — every
+        // other Claude arm already accepts its wire id, and fable missing it
+        // instant-failed all fable-pinned sessions (2026-07-29 outage).
+        "claude-code-fable-5" | "claude-code-fable" | "cc-fable" | "fable" | "claude-fable-5" => Ok(model_selection(
             ProviderId::ClaudeCode,
             "claude-code-fable-5",
             ANTHROPIC_BASE_URL,
@@ -1795,6 +1800,26 @@ mod tests {
         let legacy_cc =
             resolve_model_selection(&env(&[("OCEAN_MODEL", "claude-code-opus-4-8")])).unwrap();
         assert_eq!(legacy_cc.model, "claude-code-opus-4-8");
+    }
+
+    #[test]
+    fn fable_wire_id_round_trips_through_the_resolver() {
+        // Session records persist `Model.id` ("claude-fable-5"), and clients
+        // that pin a session's model replay that id as the next turn's model
+        // spec. Every fable spelling — menu id, shorthands, AND the wire id —
+        // must therefore resolve; the wire id missing here bricked every
+        // fable-pinned session on 2026-07-29.
+        for alias in [
+            "claude-code-fable-5",
+            "claude-code-fable",
+            "cc-fable",
+            "fable",
+            "claude-fable-5",
+        ] {
+            let s = resolve_model_selection(&env(&[("OCEAN_MODEL", alias)])).unwrap();
+            assert_eq!(s.provider, ProviderId::ClaudeCode, "{alias}");
+            assert_eq!(s.model, "claude-code-fable-5", "{alias}");
+        }
     }
 
     #[test]
