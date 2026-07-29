@@ -592,6 +592,14 @@ pub(super) struct RoomMessageRequest {
     pub(super) author_kind: RoomParticipantKind,
     /// Message body. `@id` mentions in the body drive trigger evaluation.
     pub(super) body: String,
+    /// When this is a reply, the `seq` of the parent message (G1-B real
+    /// threads). `None` for top-level messages.
+    #[serde(default)]
+    pub(super) thread_parent_seq: Option<u64>,
+    /// The Ocean session id producing this message, for session-backed
+    /// attribution (G1-B imported agents).
+    #[serde(default)]
+    pub(super) session_id: Option<String>,
 }
 
 /// `POST /v1/rooms/persistent/{key}/messages` — append a chat message to the
@@ -621,13 +629,15 @@ pub(super) async fn room_post_message(
                 "missing credential for non-local room".into(),
             ));
         }
-        let msg = reg.append_message(
+        let msg = reg.append_message_threaded(
             &key,
             &req.author_id,
             req.author_kind,
             RoomMessageKind::Message,
             &req.body,
             Utc::now(),
+            req.thread_parent_seq,
+            req.session_id.as_deref(),
         )?;
         let policy = reg.trigger_policy(&key)?;
         let roster = reg
