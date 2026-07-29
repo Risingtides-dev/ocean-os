@@ -105,7 +105,10 @@ This crate owns the full-screen terminal steering cockpit (`ocean` binary) for i
   `TurnStarted`; context also clears on stream gaps or adoption after a missing
   start). Context occupancy uses the provider-reported final request,
   never cumulative multi-round usage; unknown values remain absent. The model
-  row falls back to the startup `/v1/models` fetch before the first turn.
+  row falls back to the startup `/v1/models` fetch only before a session is bound.
+  A bound session's model is daemon-owned config: `/model` and the picker persist
+  through `PATCH /v1/agent/sessions/{id}/config`, binding reloads `GET .../config`,
+  and generation guards reject late load/save responses across session switches.
 - The upper right rail is a mutable Work Surface slot, not a Files-owned pane.
   Its typed representations currently include explicit `Files`, session-scoped
   `Usage`, and daemon-wide `Workflow`; domain projections keep their real schemas

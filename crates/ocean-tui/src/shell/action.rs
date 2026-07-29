@@ -223,8 +223,17 @@ pub enum Action {
     },
     /// `/copy` — put the given text (the last reply) on the system clipboard.
     CopyToClipboard(String),
-    /// `/model <id>` — override the model for subsequent turns this session.
+    /// `/model <id>` — optimistically select a model, then persist it through
+    /// the daemon's session-config authority when a session is bound.
     SetModel(String),
+    /// Authoritative completion of a session model GET/PATCH. Generation guards
+    /// prevent a late load or save from overwriting a newer selection/session.
+    SessionModelResolved {
+        session_id: AgentSessionId,
+        generation: u64,
+        requested: Option<String>,
+        result: Result<crate::shell::client::SessionConfigResponse, String>,
+    },
     /// `/thinking <level>` — override the thinking level for subsequent turns
     /// this session (`None` = daemon default; rides `AgentTurnRequest`).
     SetThinking(Option<ThinkingLevel>),

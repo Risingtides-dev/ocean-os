@@ -455,8 +455,12 @@ pub struct App {
     /// Best-effort projection of the authoritative TUI lifecycle into a
     /// surrounding Herdr pane. Disabled automatically outside Herdr.
     herdr: HerdrReporter,
-    /// `/model <id>` override applied to subsequent turns (None → daemon default).
+    /// Model selected for the current or next session. For a bound session this
+    /// mirrors the daemon's persisted session-config value, not a UI-only guess.
     model_override: Option<String>,
+    /// Invalidates late session-model GET/PATCH completions across rapid model
+    /// picks and A→B→A session switches.
+    model_config_generation: u64,
     /// The live SSE subscription for `session_id`. Held so a session switch
     /// aborts the superseded stream instead of leaking it (a leaked stream
     /// kept pumping a stale session's events into the chat).
@@ -701,6 +705,7 @@ impl App {
             session_activity_probe_generation: 0,
             herdr: HerdrReporter::from_env(),
             model_override: None,
+            model_config_generation: 0,
             stream_task: None,
             health_task: None,
             status: String::new(),
@@ -2723,8 +2728,54 @@ impl App {
                 }
                 None => self.set_notice("no session yet — send a message first".into()),
             },
-            // `/model <id>`: remember the override for subsequent turns.
-            Action::SetModel(id) => self.model_override = Some(id.clone()),
+            // `/model <id>`: update immediately, then pin the selection through
+            // daemon session-config authority. An unbound choice seeds the next
+            // session; its first turn persists the same model server-side.
+            Action::SetModel(id) => {
+                self.model_override = Some(id.clone());
+                self.model_config_generation = self.model_config_generation.wrapping_add(1);
+                if let Some(session_id) = self.session_id {
+                    let generation = self.model_config_generation;
+                    let requested = id.clone();
+                    let client = self.client.clone();
+                    let tx = self.actions_tx.clone();
+                    tokio::spawn(async move {
+                        let result = client.set_session_model(session_id, &requested).await;
+                        let _ = tx.send(Action::SessionModelResolved {
+                            session_id,
+                            generation,
+                            requested: Some(requested),
+                            result,
+                        });
+                    });
+                }
+            }
+            Action::SessionModelResolved {
+                session_id,
+                generation,
+                requested,
+                result,
+            } => {
+                if self.session_id == Some(*session_id)
+                    && self.model_config_generation == *generation
+                {
+                    match result {
+                        Ok(config) if config.session_id == *session_id => {
+                            self.model_override = Some(config.model.clone());
+                            if requested.is_some() {
+                                self.set_notice(format!("model pinned · {}", config.model));
+                            }
+                        }
+                        Ok(_) => {
+                            self.set_notice("model save returned the wrong session".into());
+                        }
+                        Err(error) => {
+                            self.set_notice(format!("model save failed · {error}"));
+                            self.load_session_model(*session_id);
+                        }
+                    }
+                }
+            }
             // `/thinking <level>`: remember the override for subsequent turns.
             // `default` clears the per-turn override so the daemon's global
             // setting is in force again.
@@ -3186,6 +3237,24 @@ impl App {
         self.apply_focus();
     }
 
+    /// Refresh the model from the daemon-owned session record. The generation
+    /// makes this safe across rapid session switches and model selections.
+    fn load_session_model(&mut self, session_id: AgentSessionId) {
+        self.model_config_generation = self.model_config_generation.wrapping_add(1);
+        let generation = self.model_config_generation;
+        let client = self.client.clone();
+        let tx = self.actions_tx.clone();
+        tokio::spawn(async move {
+            let result = client.session_config(session_id).await;
+            let _ = tx.send(Action::SessionModelResolved {
+                session_id,
+                generation,
+                requested: None,
+                result,
+            });
+        });
+    }
+
     /// Bind the chat to `id`: abort any superseded stream and subscribe a fresh
     /// self-healing one. Idempotent for the already-bound session.
     fn bind_session_with(&mut self, id: AgentSessionId, replay_first: bool) {
@@ -3211,6 +3280,7 @@ impl App {
         // subscription below — start it from a neutral SSE source.
         self.health.recover(HealthSource::Sse);
         self.session_id = Some(id);
+        self.load_session_model(id);
         self.stream_generation = self.stream_generation.wrapping_add(1);
         self.stream_task = Some(self.client.spawn_event_stream(
             id,
@@ -7931,6 +8001,43 @@ mod tests {
         app.models_sel = 0;
         app.models_apply();
         assert_eq!(app.status_data().model, Some("deepseek-v4-pro"));
+    }
+
+    #[test]
+    fn session_model_resolution_installs_only_current_authority() {
+        use crate::shell::client::SessionConfigResponse;
+
+        let mut app = offline_app();
+        let current = AgentSessionId(uuid::Uuid::from_u128(501));
+        app.session_id = Some(current);
+        app.model_config_generation = 7;
+        app.model_override = Some("deepseek-v4-pro".into());
+
+        app.dispatch(Action::SessionModelResolved {
+            session_id: current,
+            generation: 7,
+            requested: None,
+            result: Ok(SessionConfigResponse {
+                session_id: current,
+                model: "claude-opus-4-6".into(),
+            }),
+        });
+        assert_eq!(app.model_override.as_deref(), Some("claude-opus-4-6"));
+
+        app.dispatch(Action::SessionModelResolved {
+            session_id: current,
+            generation: 6,
+            requested: None,
+            result: Ok(SessionConfigResponse {
+                session_id: current,
+                model: "deepseek-v4-pro".into(),
+            }),
+        });
+        assert_eq!(
+            app.model_override.as_deref(),
+            Some("claude-opus-4-6"),
+            "a late config load cannot snap the picker back"
+        );
     }
 
     #[test]

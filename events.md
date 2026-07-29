@@ -5795,3 +5795,18 @@ fragmented full-window and oversized concurrency regression coverage. The full
 655-test daemon suite passed after one isolated startup-cleanup fixture retry and
 then passed cleanly in full; focused checks and formatting also pass.
 _________________________________________________________________________________
+
+_________________________________________________________________________________
+time:      [23:24] [28-07-26]
+agent:     [ocean-api] [gpt-5.4] [pm]
+worktree:  [fix/tui-session-model-persistence]
+type:      [bug report]: Persist TUI model selection on daemon sessions
+area:      [frontend]: TUI model authority and session binding
+
+Replaced the TUI model picker's UI-only override with the daemon's existing
+session-config authority. Bound selections now PATCH the session model, every
+session bind reloads its authoritative config, and a dedicated generation guard
+rejects late GET/PATCH completions across rapid picks and A→B→A switches instead
+of snapping back to the daemon-wide DeepSeek default. Added mock HTTP route/body
+coverage and reducer coverage for stale-load rejection. Focused tests, TUI check,
+format, and release build pass in the isolated worktree.

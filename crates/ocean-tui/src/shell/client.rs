@@ -827,6 +827,17 @@ pub struct ModelsResponse {
     #[serde(default)]
     pub models: Vec<ModelEntry>,
 }
+/// Authoritative model pin for one daemon-owned session.
+#[derive(Debug, Clone, serde::Deserialize)]
+pub struct SessionConfigResponse {
+    pub session_id: AgentSessionId,
+    pub model: String,
+}
+
+#[derive(serde::Serialize)]
+struct SessionModelPatch<'a> {
+    model: &'a str,
+}
 
 /// One retained memory from `GET /v1/memory`, for the `/memory` browser.
 #[derive(Debug, Clone, serde::Deserialize)]
@@ -855,6 +866,59 @@ impl DaemonClient {
             .json::<ModelsResponse>()
             .await
             .map_err(|e| e.to_string())
+    }
+
+    /// Read the model actually pinned to a session. The TUI never infers this
+    /// from the daemon-wide `/v1/models.current` fallback.
+    pub async fn session_config(
+        &self,
+        session_id: AgentSessionId,
+    ) -> Result<SessionConfigResponse, String> {
+        self.http
+            .get(format!(
+                "{}/v1/agent/sessions/{session_id}/config",
+                self.base
+            ))
+            .send()
+            .await
+            .and_then(|response| response.error_for_status())
+            .map_err(|error| error.to_string())?
+            .json::<SessionConfigResponse>()
+            .await
+            .map_err(|error| error.to_string())
+    }
+
+    /// Persist a model selection on the daemon-owned session and return the
+    /// authoritative catalog-resolved model/provider pair.
+    pub async fn set_session_model(
+        &self,
+        session_id: AgentSessionId,
+        model: &str,
+    ) -> Result<SessionConfigResponse, String> {
+        let response = self
+            .http
+            .patch(format!(
+                "{}/v1/agent/sessions/{session_id}/config",
+                self.base
+            ))
+            .json(&SessionModelPatch { model })
+            .send()
+            .await
+            .map_err(|error| error.to_string())?;
+        let status = response.status();
+        let payload = response
+            .json::<serde_json::Value>()
+            .await
+            .map_err(|error| format!("invalid session model response: {error}"))?;
+        if !status.is_success() {
+            return Err(payload
+                .get("error")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("daemon rejected session model")
+                .to_string());
+        }
+        serde_json::from_value(payload)
+            .map_err(|error| format!("invalid session model response: {error}"))
     }
 
     /// `GET /v1/memory` — the operator's retained memories, for `/memory`.
@@ -1068,6 +1132,68 @@ mod tests {
             parse_observatory_frame("event: message\ndata: {\"schema_version\":1}"),
             ObservatoryFrame::Rebaseline
         ));
+    }
+
+    #[tokio::test]
+    async fn session_model_round_trip_uses_authoritative_config_routes() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind session config server");
+        let address = listener.local_addr().expect("mock address");
+        let session_id = AgentSessionId(uuid::Uuid::from_u128(31));
+        let server = tokio::spawn(async move {
+            let mut requests = Vec::new();
+            for model in ["claude-opus-4-6", "kimi-k3"] {
+                let (mut socket, _) = listener.accept().await.expect("accept config request");
+                let mut request = vec![0u8; 8192];
+                let read = socket
+                    .read(&mut request)
+                    .await
+                    .expect("read config request");
+                requests.push(String::from_utf8_lossy(&request[..read]).to_string());
+                let body = serde_json::json!({
+                    "session_id": session_id,
+                    "model": model,
+                    "provider": if model == "kimi-k3" { "kimi" } else { "anthropic" },
+                    "model_source": "session"
+                })
+                .to_string();
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(), body
+                );
+                socket
+                    .write_all(response.as_bytes())
+                    .await
+                    .expect("write config response");
+            }
+            requests
+        });
+
+        let client = DaemonClient::new(&format!("http://{address}")).expect("client");
+        let loaded = client
+            .session_config(session_id)
+            .await
+            .expect("load config");
+        assert_eq!(loaded.session_id, session_id);
+        assert_eq!(loaded.model, "claude-opus-4-6");
+        let saved = client
+            .set_session_model(session_id, "kimi-k3")
+            .await
+            .expect("save config");
+        assert_eq!(saved.session_id, session_id);
+        assert_eq!(saved.model, "kimi-k3");
+
+        let requests = server.await.expect("mock server completed");
+        assert!(requests[0].starts_with(&format!(
+            "GET /v1/agent/sessions/{session_id}/config HTTP/1.1"
+        )));
+        assert!(requests[1].starts_with(&format!(
+            "PATCH /v1/agent/sessions/{session_id}/config HTTP/1.1"
+        )));
+        assert!(requests[1].contains(r#"{"model":"kimi-k3"}"#));
     }
 
     #[tokio::test]
