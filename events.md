@@ -5762,3 +5762,19 @@ full workspace suite, canonical repository CI, compatibility, Rust 1.88 MSRV,
 Windows actual-source portability, and Linux musl cross-builds pass. Scope remains
 strictly A2b with no registry mutation, route, CLI, durable replay, or A3 behavior.
 _________________________________________________________________________________
+_________________________________________________________________________________
+time:      [22:27] [28-07-26]
+agent:     [pi] [gpt-5.4] [thoth]
+worktree:  [feat/extensions-stage-a2b]
+type:      [review]
+area:      [backend] [testing]
+
+Accepted Stage A2b after independent final review PASS at `b1ed181c`. The final
+delta closes post-write-only replay ACK authority and immediately consumes,
+retries, and retains exceptional process/temp-root cleanup authority in the
+production managed owner. Focused adversarial review passed 14 tests; the
+implementation gate previously passed 102 focused extension tests, 654 daemon
+tests, repeated loaded supervisor runs, the full workspace and canonical CI,
+compatibility, Rust 1.88 MSRV, Linux musl, and actual-source Windows portability.
+A3a is the next authorized slice; no A3+ behavior is included here.
+_________________________________________________________________________________
