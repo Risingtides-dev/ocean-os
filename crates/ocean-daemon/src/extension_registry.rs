@@ -225,6 +225,9 @@ pub(crate) struct ServiceActivation {
     pub(crate) environment: Vec<String>,
     pub(crate) secret_bindings: Vec<SecretBinding>,
     pub(crate) startup_timeout: Duration,
+    pub(crate) restart_on_failure: bool,
+    pub(crate) effective_global: bool,
+    pub(crate) effective_projects: HashSet<Uuid>,
 }
 
 #[cfg(any(test, not(any(target_os = "macos", target_os = "linux"))))]
@@ -1926,11 +1929,18 @@ pub(crate) fn read_service_activations(
             else {
                 continue;
             };
-            if !enablement.global
-                && !enablement.projects.iter().any(|project| {
-                    project.enabled && registered_projects.contains(&project.project_id)
+            let effective_projects: HashSet<Uuid> = registered_projects
+                .iter()
+                .copied()
+                .filter(|project_id| {
+                    enablement
+                        .projects
+                        .iter()
+                        .find(|project| project.project_id == *project_id)
+                        .map_or(enablement.global, |project| project.enabled)
                 })
-            {
+                .collect();
+            if !enablement.global && effective_projects.is_empty() {
                 continue;
             }
             let Some(trust) = state
@@ -2043,6 +2053,9 @@ pub(crate) fn read_service_activations(
                     environment,
                     secret_bindings: service_grant.secret_bindings.clone(),
                     startup_timeout,
+                    restart_on_failure: matches!(service.restart, Some(RestartPolicy::OnFailure)),
+                    effective_global: enablement.global,
+                    effective_projects: effective_projects.clone(),
                 });
             }
         }

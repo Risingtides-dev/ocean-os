@@ -96,6 +96,7 @@ tracing-subscriber.workspace = true
 uuid.workspace = true
 
 [dev-dependencies]
+tokio = { workspace = true, features = ["test-util"] }
 tempfile = "3"
 # OCEAN-130: the fake-tool block→decide→proceed test scripts a provider stream
 # via `futures::stream::iter`. Test-only; the production daemon never builds one.

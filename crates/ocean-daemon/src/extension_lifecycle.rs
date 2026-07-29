@@ -1,16 +1,18 @@
-//! Pure Stage A lifecycle adaptation and boot-local retention.
+//! Stage A lifecycle adaptation, publication, and boot-local retention.
 //!
-//! This module deliberately has no process, transport, registry, route, or live
-//! producer wiring. It converts explicit authoritative-source facts into the
-//! closed metadata-only SDK envelope and retains only encoded-safe frames.
+//! Authoritative daemon producers call this metadata-only boundary synchronously.
+//! Publication is bounded and non-blocking; native services attach through the
+//! dedicated replay/live API rather than observing either client event bus.
 
 use std::{
     collections::{HashMap, HashSet, VecDeque},
     sync::{
         atomic::{AtomicBool, Ordering},
-        Arc, Weak,
+        Arc, Mutex, RwLock, Weak,
     },
 };
+
+use chrono::Utc;
 
 use ocean_agent_sdk::extension_lifecycle::{
     encode_frame, DaemonStartedMetadata, DaemonStopReason, DaemonStoppingMetadata, DaemonVersion,
@@ -20,6 +22,7 @@ use ocean_agent_sdk::extension_lifecycle::{
     ToolOutcome, ToolStartedMetadata, TurnFinishedMetadata, TurnOutcome,
 };
 use serde_json::Value;
+use tokio::sync::{broadcast, watch};
 use uuid::Uuid;
 
 pub(crate) const BOOT_RING_MAX_EVENTS: usize = 2_048;
@@ -60,6 +63,15 @@ impl SourceScope {
     }
 }
 
+/// One fresh production timestamp/id pair. Keeping allocation here prevents
+/// producer call sites from accidentally supplying payload-derived identifiers.
+pub(crate) fn event_stamp() -> EventStamp {
+    EventStamp {
+        event_id: Uuid::new_v4(),
+        occurred_at: MillisecondTimestamp::new(Utc::now()),
+    }
+}
+
 /// Terminal input authority for a turn.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum TerminalSource {
@@ -96,6 +108,9 @@ pub(crate) struct ToolEndDetails {
 }
 
 /// Exhaustive pure input vocabulary for current Stage A source authorities.
+/// Content-bearing fields are intentionally accepted only so exhaustive
+/// adaptation can prove they are structurally discarded.
+#[allow(dead_code)]
 #[derive(Clone)]
 pub(crate) enum LifecycleSource {
     DaemonStarted {
@@ -193,6 +208,7 @@ pub(crate) enum DiagnosticCode {
 }
 
 impl DiagnosticCode {
+    #[cfg(test)]
     const fn as_str(self) -> &'static str {
         match self {
             Self::UnmatchedToolEnd => "unmatched_tool_end",
@@ -860,10 +876,22 @@ impl LifecycleAdapter {
     fn retained(&self) -> impl Iterator<Item = &LifecycleEvent> {
         self.ring.events.iter().map(|retained| &retained.event)
     }
+
+    fn retained_snapshot(&self) -> Vec<LifecycleEvent> {
+        self.ring
+            .events
+            .iter()
+            .map(|retained| retained.event.clone())
+            .collect()
+    }
+
+    fn current_sequence(&self) -> Sequence {
+        Sequence(self.next_sequence.unwrap_or(u64::MAX).saturating_sub(1))
+    }
 }
 
 /// Immutable effective activation scope used for pure delivery tests.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(crate) struct ActivationScope {
     pub(crate) global: bool,
     pub(crate) projects: HashSet<Uuid>,
@@ -880,6 +908,217 @@ impl ActivationScope {
                 None => self.global,
             },
         }
+    }
+}
+
+/// Atomic replay snapshot and live receiver for one immutable activation epoch.
+pub(crate) struct LifecycleAttach {
+    pub(crate) retained: Vec<LifecycleEvent>,
+    pub(crate) boundary: Sequence,
+    pub(crate) live: broadcast::Receiver<LifecycleEvent>,
+}
+
+/// Cloneable daemon-wide lifecycle authority.
+///
+/// Its mutex is held only for pure adaptation/ring publication and never across
+/// I/O or `.await`. Broadcast send is best-effort and cannot backpressure a
+/// daemon request; each service applies its own stricter outbound bounds.
+#[derive(Default)]
+struct RegisteredProjectSnapshot {
+    ids: HashSet<Uuid>,
+    workspace_ids: HashMap<String, Uuid>,
+}
+
+pub(crate) struct LifecycleDispatcher {
+    daemon_boot_id: Uuid,
+    adapter: Mutex<LifecycleAdapter>,
+    registered_projects: RwLock<RegisteredProjectSnapshot>,
+    live: broadcast::Sender<LifecycleEvent>,
+    project_updates: watch::Sender<HashSet<Uuid>>,
+    accepting: AtomicBool,
+}
+
+impl LifecycleDispatcher {
+    pub(crate) fn new(daemon_boot_id: Uuid, registered_projects: HashSet<Uuid>) -> Arc<Self> {
+        let (live, _) = broadcast::channel(BOOT_RING_MAX_EVENTS);
+        let (project_updates, _) = watch::channel(registered_projects.clone());
+        Arc::new(Self {
+            daemon_boot_id,
+            adapter: Mutex::new(LifecycleAdapter::new(daemon_boot_id)),
+            registered_projects: RwLock::new(RegisteredProjectSnapshot {
+                ids: registered_projects,
+                workspace_ids: HashMap::new(),
+            }),
+            live,
+            project_updates,
+            accepting: AtomicBool::new(true),
+        })
+    }
+
+    pub(crate) fn daemon_boot_id(&self) -> Uuid {
+        self.daemon_boot_id
+    }
+
+    pub(crate) fn current_sequence(&self) -> Sequence {
+        self.adapter
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .current_sequence()
+    }
+
+    pub(crate) fn source_scope(
+        &self,
+        project_id: Option<Uuid>,
+        session_id: Option<Uuid>,
+        turn_id: Option<Uuid>,
+        request_id: Option<Uuid>,
+        permission_id: Option<Uuid>,
+    ) -> SourceScope {
+        let project_registered = project_id.is_some_and(|project_id| {
+            self.registered_projects
+                .read()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .ids
+                .contains(&project_id)
+        });
+        SourceScope {
+            project_id,
+            project_registered,
+            session_id,
+            turn_id,
+            request_id,
+            permission_id,
+        }
+    }
+
+    /// Replace the committed project snapshot before the corresponding project
+    /// mutation returns. Event publication thereafter captures this exact
+    /// registered/unregistered classification without filesystem access.
+    pub(crate) fn update_registered_projects(&self, projects: HashSet<Uuid>) {
+        let mut snapshot = self
+            .registered_projects
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        snapshot
+            .workspace_ids
+            .retain(|_, project_id| projects.contains(project_id));
+        snapshot.ids.clone_from(&projects);
+        drop(snapshot);
+        self.project_updates.send_replace(projects);
+    }
+
+    /// Replace ids and canonical workspace bindings as one committed snapshot.
+    /// Hot lifecycle call sites use this map instead of re-reading projects.json.
+    pub(crate) fn update_registered_project_snapshot(&self, workspace_ids: HashMap<String, Uuid>) {
+        let projects = workspace_ids.values().copied().collect::<HashSet<_>>();
+        *self
+            .registered_projects
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = RegisteredProjectSnapshot {
+            ids: projects.clone(),
+            workspace_ids,
+        };
+        self.project_updates.send_replace(projects);
+    }
+
+    pub(crate) fn project_id_for_workspace(&self, workspace: &str) -> Option<Uuid> {
+        self.registered_projects
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .workspace_ids
+            .get(workspace)
+            .copied()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn subscribe_registered_projects(&self) -> watch::Receiver<HashSet<Uuid>> {
+        self.project_updates.subscribe()
+    }
+
+    pub(crate) fn register_request(&self, scope: SourceScope) -> Option<TerminalAuthority> {
+        self.adapter
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .register_request(scope)
+    }
+
+    pub(crate) fn publish(&self, source: LifecycleSource) -> Vec<LifecycleEvent> {
+        let mut adapter = self
+            .adapter
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if !self.accepting.load(Ordering::Acquire) {
+            return Vec::new();
+        }
+        let events = adapter.adapt(source);
+        // Broadcast while the sequence allocator is still locked. Sending is
+        // synchronous/non-blocking, and retaining the lock here prevents two
+        // concurrent publishers from committing N,N+1 but broadcasting N+1,N.
+        for event in &events {
+            let _ = self.live.send(event.clone());
+        }
+        events
+    }
+
+    /// Publish the final graceful fact and close producer admission. The state
+    /// change and adaptation share the publication mutex, so a producer that
+    /// raced shutdown is ordered wholly before this fact or rejected wholly
+    /// after it; `daemon_stopping` is therefore the last accepted sequence.
+    pub(crate) fn stop_publication(&self) {
+        let mut adapter = self
+            .adapter
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if self
+            .accepting
+            .compare_exchange(true, false, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            return;
+        }
+        let events = adapter.adapt(LifecycleSource::DaemonStopping {
+            stamp: event_stamp(),
+        });
+        for event in &events {
+            let _ = self.live.send(event.clone());
+        }
+    }
+
+    /// Snapshot retained history, its live boundary, and a receiver under the
+    /// same publication mutex. This removes the replay/live attach race.
+    pub(crate) fn attach(&self) -> LifecycleAttach {
+        let adapter = self
+            .adapter
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let live = self.live.subscribe();
+        LifecycleAttach {
+            retained: adapter.retained_snapshot(),
+            boundary: adapter.current_sequence(),
+            live,
+        }
+    }
+
+    pub(crate) fn replay_available(
+        &self,
+        scope: &ActivationScope,
+        subscriptions: &[LifecycleEventKind],
+        first: Sequence,
+        last: Sequence,
+    ) -> bool {
+        self.adapter
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .ring
+            .events
+            .iter()
+            .map(|retained| &retained.event)
+            .any(|event| {
+                event.sequence.0 >= first.0
+                    && event.sequence.0 <= last.0
+                    && scope.eligible(event)
+                    && subscriptions.contains(&event.kind)
+            })
     }
 }
 
@@ -2105,6 +2344,98 @@ mod tests {
         }
         assert!(ring.encoded_bytes <= BOOT_RING_MAX_BYTES);
         assert_eq!(ring.events.len(), 128);
+    }
+
+    #[test]
+    fn concurrent_publishers_broadcast_in_the_same_order_as_allocated_sequences() {
+        let dispatcher = LifecycleDispatcher::new(id(89_000), HashSet::new());
+        let mut attach = dispatcher.attach();
+        std::thread::scope(|scope| {
+            for worker in 0..8_u128 {
+                let dispatcher = Arc::clone(&dispatcher);
+                scope.spawn(move || {
+                    for event in 0..16_u128 {
+                        dispatcher.publish(LifecycleSource::ExplicitSessionCreated {
+                            succeeded: true,
+                            scope: dispatcher.source_scope(
+                                None,
+                                Some(id(89_100 + worker * 16 + event)),
+                                None,
+                                None,
+                                None,
+                            ),
+                            stamp: event_stamp(),
+                            title: String::new(),
+                            cwd: String::new(),
+                        });
+                    }
+                });
+            }
+        });
+        let sequences = std::iter::from_fn(|| attach.live.try_recv().ok())
+            .map(|event| event.sequence.0)
+            .collect::<Vec<_>>();
+        assert_eq!(sequences, (1..=128).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn graceful_stop_is_exactly_once_and_rejects_every_later_producer() {
+        let dispatcher = LifecycleDispatcher::new(id(90_000), HashSet::new());
+        dispatcher.publish(LifecycleSource::DaemonStarted {
+            daemon_version: "0.1.0".to_owned(),
+            stamp: stamp(90_001, 0),
+        });
+        dispatcher.stop_publication();
+        dispatcher.stop_publication();
+        assert!(dispatcher
+            .publish(LifecycleSource::ExplicitSessionCreated {
+                succeeded: true,
+                scope: SourceScope {
+                    project_id: None,
+                    project_registered: false,
+                    session_id: Some(id(90_002)),
+                    turn_id: None,
+                    request_id: None,
+                    permission_id: None,
+                },
+                stamp: stamp(90_003, 1),
+                title: "must-not-publish".to_owned(),
+                cwd: "/must-not-publish".to_owned(),
+            })
+            .is_empty());
+        let retained = dispatcher.attach().retained;
+        assert_eq!(retained.len(), 2);
+        assert_eq!(retained[0].kind, LifecycleEventKind::DaemonStarted);
+        assert_eq!(retained[1].kind, LifecycleEventKind::DaemonStopping);
+    }
+
+    #[test]
+    fn committed_project_snapshot_changes_publication_classification_synchronously() {
+        let project = id(90_001);
+        let dispatcher = LifecycleDispatcher::new(id(90_002), HashSet::new());
+        let before = dispatcher.source_scope(Some(project), Some(id(90_003)), None, None, None);
+        assert!(!before.project_registered);
+
+        dispatcher.update_registered_project_snapshot(HashMap::from([(
+            "/registered/workspace".to_owned(),
+            project,
+        )]));
+        let after = dispatcher.source_scope(Some(project), Some(id(90_004)), None, None, None);
+        assert!(after.project_registered);
+        assert_eq!(
+            dispatcher.project_id_for_workspace("/registered/workspace"),
+            Some(project)
+        );
+        let mut updates = dispatcher.subscribe_registered_projects();
+        assert!(updates.borrow_and_update().contains(&project));
+
+        dispatcher.update_registered_projects(HashSet::new());
+        let removed = dispatcher.source_scope(Some(project), Some(id(90_005)), None, None, None);
+        assert!(!removed.project_registered);
+        assert_eq!(
+            dispatcher.project_id_for_workspace("/registered/workspace"),
+            None
+        );
     }
 
     #[test]

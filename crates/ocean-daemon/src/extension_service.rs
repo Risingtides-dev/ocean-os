@@ -1,13 +1,13 @@
-//! Stage A2a minimum native extension-service supervisor.
+//! Stage A native extension-service supervisor.
 //!
-//! This boundary consumes only coherent activation records from
-//! `extension_registry`, launches one exact trusted executable with assigned
-//! roots and a cleared environment, performs the strict v1 hello/ready exchange,
-//! and owns generation-safe Unix process-group cleanup. It deliberately has no
-//! lifecycle delivery/replay, ping health, restart/backoff, mutation, or route.
+//! This boundary consumes coherent activation records, owns strict stdio
+//! transport, bounded lifecycle replay/live delivery, heartbeat health,
+//! deterministic restart policy, sanitized stderr diagnostics, and
+//! generation-safe Unix process-group cleanup. It has no registry mutation,
+//! route, package acquisition, or extension-originated command authority.
 
 use std::{
-    collections::{BTreeMap, HashSet},
+    collections::{BTreeMap, HashSet, VecDeque},
     ffi::{CStr, CString, OsStr, OsString},
     fs::{self, File},
     io,
@@ -18,40 +18,72 @@ use std::{
     },
     path::{Path, PathBuf},
     process::Stdio,
-    sync::{Arc, RwLock},
+    sync::{
+        atomic::{AtomicU64, AtomicUsize, Ordering},
+        Arc, RwLock,
+    },
     time::Duration,
 };
 
 use chrono::{SecondsFormat, Utc};
 use ocean_agent_sdk::extension_lifecycle::{
-    decode_frame, encode_frame, Ack, HostHello, HostHelloFrame, LifecycleEventKind, Pong,
-    ProtocolName, ProtocolV1, Ready, ReadyFrame, ReplayMode, Sequence, ServiceHello,
+    decode_frame, encode_frame, Ack, HostHello, HostHelloFrame, Lag, LagFrame, LifecycleEvent,
+    LifecycleEventKind, Ping, PingFrame, Pong, ProtocolName, ProtocolV1, Ready, ReadyFrame,
+    ReplayMode, Reset, ResetFrame, ResetReason, ResumeCursor, Sequence, ServiceHello,
     ServiceIdentity, ServiceLimits, ServiceStatus, ServiceStatusCode, ServiceStatusState, Shutdown,
     ShutdownComplete, ShutdownFrame, ShutdownReason,
 };
 use serde::{Deserialize, Serialize};
 use tokio::{
-    io::{AsyncBufRead, AsyncBufReadExt, AsyncWrite, AsyncWriteExt, BufReader},
-    process::{Child, ChildStdin, ChildStdout, Command},
-    sync::Mutex,
+    io::{AsyncBufRead, AsyncBufReadExt, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader},
+    process::{Child, ChildStderr, ChildStdin, ChildStdout, Command},
+    sync::{broadcast, mpsc, oneshot, Mutex, Notify},
     task::{JoinHandle, JoinSet},
 };
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
-use super::extension_registry::{
-    env_secret_source, read_service_activations, reserved_child_environment_name,
-    valid_child_environment_name, SecretBinding, ServiceActivation,
+use super::{
+    extension_lifecycle::{ActivationScope, LifecycleAttach, LifecycleDispatcher},
+    extension_registry::{
+        env_secret_source, read_service_activations, reserved_child_environment_name,
+        valid_child_environment_name, SecretBinding, ServiceActivation,
+    },
 };
 
 const WRITE_TIMEOUT: Duration = Duration::from_secs(2);
 const GRACEFUL_RESPONSE_TIMEOUT: Duration = Duration::from_secs(2);
+const DIAGNOSTIC_JOIN_TIMEOUT: Duration = Duration::from_millis(250);
+const ACK_WINDOW_MAX: usize = OUTBOUND_MAX_MESSAGES;
 const GROUP_TERM_TIMEOUT: Duration = Duration::from_secs(2);
 const GROUP_KILL_TIMEOUT: Duration = Duration::from_secs(2);
 const REGISTRY_LOAD_TIMEOUT: Duration = Duration::from_secs(5);
+const PROJECT_RECONCILE_TIMEOUT: Duration = Duration::from_secs(15);
 const SUPERVISOR_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(15);
 const LEADER_POLL_INTERVAL: Duration = Duration::from_millis(50);
 const MAX_FRAME_BYTES: usize = ocean_agent_sdk::extension_lifecycle::MAX_FRAME_BYTES;
+const OUTBOUND_MAX_MESSAGES: usize = 256;
+const OUTBOUND_MAX_BYTES: usize = 1024 * 1024;
+const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(10);
+const HEARTBEAT_TIMEOUT: Duration = Duration::from_secs(5);
+const HEARTBEAT_MAX_MISSES: u8 = 3;
+const FAILURE_WINDOW: Duration = Duration::from_secs(60);
+const CIRCUIT_FAILURES: usize = 5;
+const STABLE_RESET: Duration = Duration::from_secs(5 * 60);
+const BACKOFF: [Duration; 8] = [
+    Duration::from_millis(250),
+    Duration::from_millis(500),
+    Duration::from_secs(1),
+    Duration::from_secs(2),
+    Duration::from_secs(4),
+    Duration::from_secs(8),
+    Duration::from_secs(16),
+    Duration::from_secs(30),
+];
+const STDERR_MAX_LINE: usize = 8 * 1024;
+const STDERR_RING_BYTES: usize = 64 * 1024;
+const STDERR_RATE_PER_SECOND: u32 = 20;
+const STDERR_BURST: u32 = 40;
 
 #[allow(dead_code)] // A2b owns transitions for the already-ratified full state vocabulary.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -79,6 +111,7 @@ pub(crate) enum RuntimeReason {
     SpawnFailed,
     StartupTimeout,
     ProtocolViolation,
+    PingTimeout,
     UnexpectedExit,
     Shutdown,
     CleanupFailed,
@@ -89,7 +122,7 @@ pub(crate) enum RuntimeReason {
     UnsupportedPlatform,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 struct ServiceKey {
     package_id: String,
     service_id: String,
@@ -115,6 +148,12 @@ pub(crate) struct RuntimeStatus {
     negotiated_subscriptions: Vec<LifecycleEventKind>,
     last_acknowledged_sequence: Option<Sequence>,
     lag_count: u64,
+    stderr_bytes: u64,
+    stderr_lines: u64,
+    stderr_discarded_bytes: u64,
+    stderr_truncated_lines: u64,
+    stderr_redactions: u64,
+    temp_cleanup_failures: u64,
     reason: Option<RuntimeReason>,
 }
 
@@ -140,32 +179,118 @@ impl RuntimeStatusCache {
             .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 
-    fn insert_starting(&self, activation: &ServiceActivation, epoch: Uuid) {
-        let status = RuntimeStatus {
+    fn insert_starting(
+        &self,
+        activation: &ServiceActivation,
+        epoch: Uuid,
+        replay_floor: Sequence,
+        restart_count: u64,
+    ) {
+        let mut status = RuntimeStatus {
             package_id: activation.package_id.clone(),
             package_version: activation.package_version.clone(),
             package_digest: activation.package_digest.clone(),
             service_id: activation.service_id.clone(),
             activation_revision: activation.activation_revision,
             activation_epoch: epoch,
-            replay_floor: Sequence(0),
+            replay_floor,
             state: RuntimeState::Starting,
             pid: None,
             started_at: None,
             observed_at: now_string(),
-            restart_count: 0,
+            restart_count,
             negotiated_subscriptions: Vec::new(),
             last_acknowledged_sequence: None,
             lag_count: 0,
+            stderr_bytes: 0,
+            stderr_lines: 0,
+            stderr_discarded_bytes: 0,
+            stderr_truncated_lines: 0,
+            stderr_redactions: 0,
+            temp_cleanup_failures: 0,
             reason: None,
         };
-        self.write().insert(
-            ServiceKey {
-                package_id: activation.package_id.clone(),
-                service_id: activation.service_id.clone(),
-            },
-            status,
-        );
+        let key = ServiceKey {
+            package_id: activation.package_id.clone(),
+            service_id: activation.service_id.clone(),
+        };
+        let mut statuses = self.write();
+        if let Some(previous) = statuses
+            .get(&key)
+            .filter(|previous| previous.activation_epoch == epoch)
+        {
+            // Process-failure restarts retain the activation epoch and its
+            // connection-independent progress projection. A scope/grant/digest
+            // change mints a new epoch and must not carry an old ACK or lag
+            // posture across that replay boundary.
+            status.last_acknowledged_sequence = previous.last_acknowledged_sequence;
+            status.lag_count = previous.lag_count;
+            status.stderr_bytes = previous.stderr_bytes;
+            status.stderr_lines = previous.stderr_lines;
+            status.stderr_discarded_bytes = previous.stderr_discarded_bytes;
+            status.stderr_truncated_lines = previous.stderr_truncated_lines;
+            status.stderr_redactions = previous.stderr_redactions;
+            status.temp_cleanup_failures = previous.temp_cleanup_failures;
+        }
+        statuses.insert(key, status);
+    }
+
+    fn key(activation: &ServiceActivation) -> ServiceKey {
+        ServiceKey {
+            package_id: activation.package_id.clone(),
+            service_id: activation.service_id.clone(),
+        }
+    }
+
+    fn clear_ack(&self, activation: &ServiceActivation) {
+        if let Some(status) = self.write().get_mut(&Self::key(activation)) {
+            status.last_acknowledged_sequence = None;
+            status.observed_at = now_string();
+        }
+    }
+
+    fn update_ack(&self, activation: &ServiceActivation, sequence: Sequence) {
+        if let Some(status) = self.write().get_mut(&Self::key(activation)) {
+            status.last_acknowledged_sequence = Some(sequence);
+            status.observed_at = now_string();
+        }
+    }
+
+    fn add_lag(&self, activation: &ServiceActivation, count: u64) {
+        if let Some(status) = self.write().get_mut(&Self::key(activation)) {
+            status.lag_count = status.lag_count.saturating_add(count);
+            status.observed_at = now_string();
+        }
+    }
+
+    fn retain_only(&self, desired: &HashSet<ServiceKey>) {
+        self.write().retain(|key, _| desired.contains(key));
+    }
+
+    fn record_temp_cleanup_failure(&self, activation: &ServiceActivation) {
+        if let Some(status) = self.write().get_mut(&Self::key(activation)) {
+            status.temp_cleanup_failures = status.temp_cleanup_failures.saturating_add(1);
+            status.observed_at = now_string();
+        }
+    }
+
+    fn update_diagnostics(&self, activation: &ServiceActivation, diagnostics: &DiagnosticStats) {
+        if let Some(status) = self.write().get_mut(&Self::key(activation)) {
+            status.stderr_bytes = status.stderr_bytes.saturating_add(diagnostics.input_bytes);
+            status.stderr_lines = status
+                .stderr_lines
+                .saturating_add(diagnostics.retained_lines);
+            status.stderr_discarded_bytes = status
+                .stderr_discarded_bytes
+                .saturating_add(diagnostics.discarded_bytes);
+            status.stderr_truncated_lines = status
+                .stderr_truncated_lines
+                .saturating_add(diagnostics.truncated_lines);
+            status.stderr_redactions = status
+                .stderr_redactions
+                .saturating_add(diagnostics.redactions);
+            status.observed_at = now_string();
+        }
     }
 
     fn update(
@@ -176,11 +301,7 @@ impl RuntimeStatusCache {
         subscriptions: Option<&[LifecycleEventKind]>,
         reason: Option<RuntimeReason>,
     ) {
-        let key = ServiceKey {
-            package_id: activation.package_id.clone(),
-            service_id: activation.service_id.clone(),
-        };
-        if let Some(status) = self.write().get_mut(&key) {
+        if let Some(status) = self.write().get_mut(&Self::key(activation)) {
             status.state = state;
             status.pid = pid;
             if status.started_at.is_none() && pid.is_some() {
@@ -199,27 +320,102 @@ fn now_string() -> String {
     Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true)
 }
 
-/// One boot-local supervisor. Startup is fail-soft and asynchronous; shutdown
-/// is explicitly joined under a hard wall-clock bound.
+#[derive(Clone, PartialEq, Eq)]
+struct ServiceDescriptor {
+    package_digest: String,
+    activation_revision: u64,
+    args: Vec<String>,
+    events: Vec<LifecycleEventKind>,
+    environment: Vec<String>,
+    secret_bindings: Vec<SecretBinding>,
+    restart_on_failure: bool,
+    effective_global: bool,
+    effective_projects: HashSet<Uuid>,
+}
+
+impl ServiceDescriptor {
+    fn from_activation(activation: &ServiceActivation) -> Self {
+        Self {
+            package_digest: activation.package_digest.clone(),
+            activation_revision: activation.activation_revision,
+            args: activation.args.clone(),
+            events: activation.events.clone(),
+            environment: activation.environment.clone(),
+            secret_bindings: activation.secret_bindings.clone(),
+            restart_on_failure: activation.restart_on_failure,
+            effective_global: activation.effective_global,
+            effective_projects: activation.effective_projects.clone(),
+        }
+    }
+}
+
+#[derive(Default)]
+struct RestartHistory {
+    failures: VecDeque<tokio::time::Instant>,
+    backoff_index: usize,
+    restart_count: u64,
+    circuit_open: bool,
+    blocked_reason: Option<RuntimeReason>,
+}
+
+struct ManagedService {
+    descriptor: ServiceDescriptor,
+    cancel: CancellationToken,
+    stop_reason: Arc<std::sync::Mutex<ShutdownReason>>,
+    history: Arc<std::sync::Mutex<RestartHistory>>,
+    task: JoinHandle<bool>,
+}
+
+fn requested_stop_reason(reason: &std::sync::Mutex<ShutdownReason>) -> ShutdownReason {
+    *reason
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+fn request_service_stop(managed: &ManagedService, reason: ShutdownReason) {
+    *managed
+        .stop_reason
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner()) = reason;
+    managed.cancel.cancel();
+}
+
+struct ProjectSnapshotCommand {
+    projects: HashSet<Uuid>,
+    completed: oneshot::Sender<Result<(), ProjectSnapshotError>>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ProjectSnapshotError {
+    SupervisorUnavailable,
+    RegistryUnavailable,
+    CleanupIncomplete,
+}
+
+/// One boot-local supervisor. Startup is fail-soft and asynchronous; project
+/// reconciliation is serialized, and shutdown explicitly joins every process
+/// owner under a hard wall-clock bound.
 pub(crate) struct ExtensionSupervisor {
-    boot_id: Uuid,
+    lifecycle: Arc<LifecycleDispatcher>,
     cancel: CancellationToken,
     status: RuntimeStatusCache,
     root_task: Mutex<Option<JoinHandle<()>>>,
-    // Exceptional signal or membership-proof failures keep the unreaped child
-    // identity and PGID owner alive for one bounded shutdown retry. A2a never
-    // turns a cleanup uncertainty into permission to signal a reused group.
-    retained_cleanup: Mutex<Vec<CleanupAuthority>>,
+    project_tx: mpsc::Sender<ProjectSnapshotCommand>,
+    project_rx: Mutex<Option<mpsc::Receiver<ProjectSnapshotCommand>>>,
+    retained_cleanup: Arc<Mutex<Vec<CleanupAuthority>>>,
 }
 
 impl ExtensionSupervisor {
-    pub(crate) fn new() -> Arc<Self> {
+    pub(crate) fn new_with_lifecycle(lifecycle: Arc<LifecycleDispatcher>) -> Arc<Self> {
+        let (project_tx, project_rx) = mpsc::channel(8);
         Arc::new(Self {
-            boot_id: Uuid::new_v4(),
+            lifecycle,
             cancel: CancellationToken::new(),
             status: RuntimeStatusCache::default(),
             root_task: Mutex::new(None),
-            retained_cleanup: Mutex::new(Vec::new()),
+            project_tx,
+            project_rx: Mutex::new(Some(project_rx)),
+            retained_cleanup: Arc::new(Mutex::new(Vec::new())),
         })
     }
 
@@ -227,75 +423,257 @@ impl ExtensionSupervisor {
         self.status.clone()
     }
 
+    pub(crate) async fn update_project_snapshot(
+        &self,
+        projects: HashSet<Uuid>,
+    ) -> Result<(), ProjectSnapshotError> {
+        let update = async {
+            let (completed, wait) = oneshot::channel();
+            self.project_tx
+                .send(ProjectSnapshotCommand {
+                    projects,
+                    completed,
+                })
+                .await
+                .map_err(|_| ProjectSnapshotError::SupervisorUnavailable)?;
+            wait.await
+                .map_err(|_| ProjectSnapshotError::SupervisorUnavailable)?
+        };
+        tokio::time::timeout(PROJECT_RECONCILE_TIMEOUT, update)
+            .await
+            .map_err(|_| ProjectSnapshotError::SupervisorUnavailable)?
+    }
+
     pub(crate) async fn start(
         self: &Arc<Self>,
         config_dir: PathBuf,
         registered_projects: HashSet<Uuid>,
     ) {
+        self.lifecycle
+            .update_registered_projects(registered_projects.clone());
+        let Some(project_rx) = self.project_rx.lock().await.take() else {
+            return;
+        };
         let supervisor = Arc::clone(self);
         let task = tokio::spawn(async move {
             supervisor
-                .run_reconciliation(config_dir, registered_projects)
+                .run_reconciliation(config_dir, registered_projects, project_rx)
                 .await;
         });
         *self.root_task.lock().await = Some(task);
     }
 
-    async fn run_reconciliation(
-        self: Arc<Self>,
+    async fn load_activations(
         config_dir: PathBuf,
-        registered_projects: HashSet<Uuid>,
-    ) {
-        let load = tokio::task::spawn_blocking(move || {
-            read_service_activations(&config_dir, &registered_projects)
-        });
-        let activations = match tokio::time::timeout(REGISTRY_LOAD_TIMEOUT, load).await {
-            Ok(Ok(Ok(activations))) => activations,
+        projects: HashSet<Uuid>,
+    ) -> Result<Vec<ServiceActivation>, ProjectSnapshotError> {
+        let load =
+            tokio::task::spawn_blocking(move || read_service_activations(&config_dir, &projects));
+        match tokio::time::timeout(REGISTRY_LOAD_TIMEOUT, load).await {
+            Ok(Ok(Ok(activations))) => Ok(activations),
             Ok(Ok(Err(error))) => {
-                tracing::warn!(
-                    reason = error.code(),
-                    "extension startup reconciliation blocked"
-                );
-                return;
+                tracing::warn!(reason = error.code(), "extension reconciliation blocked");
+                Err(ProjectSnapshotError::RegistryUnavailable)
             }
             Ok(Err(_)) => {
                 tracing::warn!(
                     reason = "registry_reader_failed",
-                    "extension startup reconciliation blocked"
+                    "extension reconciliation blocked"
                 );
-                return;
+                Err(ProjectSnapshotError::RegistryUnavailable)
             }
             Err(_) => {
                 tracing::warn!(
                     reason = "registry_reader_timeout",
-                    "extension startup reconciliation blocked"
+                    "extension reconciliation blocked"
                 );
-                return;
+                Err(ProjectSnapshotError::RegistryUnavailable)
             }
-        };
-        if self.cancel.is_cancelled() {
-            return;
         }
+    }
 
-        let mut services = JoinSet::new();
-        for activation in activations {
-            if self.cancel.is_cancelled() {
-                break;
-            }
-            let cancel = self.cancel.clone();
-            let status = self.status.clone();
-            let boot_id = self.boot_id;
-            services.spawn(async move { run_service(activation, boot_id, cancel, status).await });
-        }
-        while let Some(result) = services.join_next().await {
-            match result {
-                Ok(Some(authority)) => self.retained_cleanup.lock().await.push(authority),
-                Ok(None) => {}
-                Err(_) => tracing::warn!(
+    async fn stop_managed(
+        &self,
+        managed: ManagedService,
+        reason: ShutdownReason,
+    ) -> Result<(), ProjectSnapshotError> {
+        request_service_stop(&managed, reason);
+        match managed.task.await {
+            Ok(true) => Ok(()),
+            Ok(false) => Err(ProjectSnapshotError::CleanupIncomplete),
+            Err(_) => {
+                tracing::warn!(
                     reason = "service_task_failed",
                     "extension service task failed"
-                ),
+                );
+                Err(ProjectSnapshotError::CleanupIncomplete)
             }
+        }
+    }
+
+    async fn retry_retained_cleanup(&self) -> Result<(), ProjectSnapshotError> {
+        let retained = std::mem::take(&mut *self.retained_cleanup.lock().await);
+        if retained.is_empty() {
+            return Ok(());
+        }
+        let mut failed = Vec::new();
+        for mut authority in retained {
+            if !authority.cleanup().await {
+                failed.push(authority);
+            }
+        }
+        if failed.is_empty() {
+            Ok(())
+        } else {
+            self.retained_cleanup.lock().await.extend(failed);
+            Err(ProjectSnapshotError::CleanupIncomplete)
+        }
+    }
+
+    fn spawn_managed(
+        &self,
+        activation: ServiceActivation,
+        history: Arc<std::sync::Mutex<RestartHistory>>,
+    ) -> ManagedService {
+        let descriptor = ServiceDescriptor::from_activation(&activation);
+        let cancel = CancellationToken::new();
+        let task_cancel = cancel.clone();
+        let stop_reason = Arc::new(std::sync::Mutex::new(ShutdownReason::DaemonStopping));
+        let task_stop_reason = Arc::clone(&stop_reason);
+        let lifecycle = Arc::clone(&self.lifecycle);
+        let status = self.status.clone();
+        let epoch = Uuid::new_v4();
+        let replay_floor = lifecycle.current_sequence();
+        let scope = activation_scope(&activation);
+        let task_history = Arc::clone(&history);
+        let retained_cleanup = Arc::clone(&self.retained_cleanup);
+        let task = tokio::spawn(async move {
+            let Some(mut authority) = run_service_with_epoch(
+                activation,
+                lifecycle,
+                task_cancel,
+                status,
+                epoch,
+                replay_floor,
+                scope,
+                task_stop_reason,
+                task_history,
+            )
+            .await
+            else {
+                return true;
+            };
+
+            // The task that owns the completed service immediately consumes
+            // the one promised exceptional retry. A still-failed authority is
+            // transferred into supervisor-owned retention before this task can
+            // complete, so no JoinHandle can hide a surviving process group.
+            if authority.cleanup().await {
+                true
+            } else {
+                retained_cleanup.lock().await.push(authority);
+                false
+            }
+        });
+        ManagedService {
+            descriptor,
+            cancel,
+            stop_reason,
+            history,
+            task,
+        }
+    }
+
+    async fn reconcile(
+        &self,
+        config_dir: &Path,
+        projects: &HashSet<Uuid>,
+        services: &mut BTreeMap<ServiceKey, ManagedService>,
+    ) -> Result<(), ProjectSnapshotError> {
+        // Never activate a replacement generation while an obsolete process
+        // group still has retained cleanup authority.
+        self.retry_retained_cleanup().await?;
+        let activations =
+            Self::load_activations(config_dir.to_path_buf(), projects.clone()).await?;
+        let mut desired = BTreeMap::new();
+        for activation in activations {
+            let key = ServiceKey {
+                package_id: activation.package_id.clone(),
+                service_id: activation.service_id.clone(),
+            };
+            desired.insert(key, activation);
+        }
+
+        let stale: Vec<ServiceKey> = services
+            .iter()
+            .filter_map(|(key, managed)| {
+                desired
+                    .get(key)
+                    .is_none_or(|activation| {
+                        managed.descriptor != ServiceDescriptor::from_activation(activation)
+                    })
+                    .then_some(key.clone())
+            })
+            .collect();
+        let mut preserved_histories = BTreeMap::new();
+        for key in stale {
+            if let Some(managed) = services.remove(&key) {
+                if desired.get(&key).is_some_and(|activation| {
+                    managed.descriptor.package_digest == activation.package_digest
+                }) {
+                    preserved_histories.insert(key.clone(), Arc::clone(&managed.history));
+                }
+                self.stop_managed(managed, ShutdownReason::Reconfigure)
+                    .await?;
+            }
+        }
+
+        let desired_keys = desired.keys().cloned().collect::<HashSet<_>>();
+        self.status.retain_only(&desired_keys);
+
+        for (key, activation) in desired {
+            if services.contains_key(&key) {
+                continue;
+            }
+            let history = preserved_histories.remove(&key).unwrap_or_default();
+            // Minting the immutable epoch and floor happens in this exact
+            // production spawn path before reconciliation acknowledges a
+            // project-snapshot change.
+            services.insert(key, self.spawn_managed(activation, history));
+        }
+        Ok(())
+    }
+
+    async fn run_reconciliation(
+        self: Arc<Self>,
+        config_dir: PathBuf,
+        mut projects: HashSet<Uuid>,
+        mut project_rx: mpsc::Receiver<ProjectSnapshotCommand>,
+    ) {
+        let mut services = BTreeMap::new();
+        let _ = self.reconcile(&config_dir, &projects, &mut services).await;
+        loop {
+            tokio::select! {
+                _ = self.cancel.cancelled() => break,
+                command = project_rx.recv() => {
+                    let Some(command) = command else { break };
+                    projects = command.projects;
+                    let result = self.reconcile(&config_dir, &projects, &mut services).await;
+                    let _ = command.completed.send(result);
+                }
+            }
+        }
+        // Broadcast cancellation to every owner before awaiting any one group.
+        // Each bounded cleanup then progresses concurrently; a slow first
+        // service cannot consume the whole daemon shutdown budget while later
+        // services remain running.
+        for managed in services.values() {
+            request_service_stop(managed, ShutdownReason::DaemonStopping);
+        }
+        for (_, managed) in services {
+            let _ = self
+                .stop_managed(managed, ShutdownReason::DaemonStopping)
+                .await;
         }
     }
 
@@ -304,31 +682,26 @@ impl ExtensionSupervisor {
         let deadline = tokio::time::Instant::now() + SUPERVISOR_SHUTDOWN_TIMEOUT;
         if let Some(mut task) = self.root_task.lock().await.take() {
             if tokio::time::timeout_at(deadline, &mut task).await.is_err() {
-                task.abort();
                 tracing::warn!(
                     reason = "supervisor_shutdown_timeout",
-                    "extension supervisor shutdown timed out"
+                    "extension supervisor shutdown exceeded its deadline; retaining cleanup ownership"
                 );
-                return;
+                // Never abort the owner task: dropping its nested JoinHandles
+                // would detach native processes. Attach and cleanup paths are
+                // independently bounded, so retain and join authority here.
+                let _ = task.await;
             }
         }
 
         let retained = std::mem::take(&mut *self.retained_cleanup.lock().await);
-        let retry = async move {
-            let mut retries = JoinSet::new();
-            for mut authority in retained {
-                retries.spawn(async move {
-                    terminate_process_group(&mut authority.child, &mut authority.owner).await
-                });
-            }
-            while retries.join_next().await.is_some() {}
-        };
-        if tokio::time::timeout_at(deadline, retry).await.is_err() {
-            tracing::warn!(
-                reason = "retained_cleanup_timeout",
-                "retained extension cleanup timed out"
-            );
+        let mut retries = JoinSet::new();
+        for mut authority in retained {
+            retries.spawn(async move { authority.cleanup().await });
         }
+        while retries.join_next().await.is_some() {}
+        // Each authority performs one independently bounded group retry. Never
+        // wrap this owner set in a timeout whose cancellation would drop and
+        // detach the remaining native children.
     }
 }
 
@@ -343,6 +716,10 @@ impl std::fmt::Debug for SensitiveValue {
 impl SensitiveValue {
     fn as_os_str(&self) -> &OsStr {
         OsStr::from_bytes(&self.0)
+    }
+
+    fn duplicate_for_redaction(&self) -> Self {
+        Self(self.0.clone())
     }
 }
 
@@ -701,6 +1078,1317 @@ fn cleanup_temp_root(roots: &AssignedRoots) -> bool {
     }
 }
 
+fn cleanup_temp_root_accounted(
+    roots: &AssignedRoots,
+    status: &RuntimeStatusCache,
+    activation: &ServiceActivation,
+) -> bool {
+    let cleaned = cleanup_temp_root(roots);
+    if !cleaned {
+        status.record_temp_cleanup_failure(activation);
+    }
+    cleaned
+}
+
+#[derive(Debug, Clone, Default)]
+struct DiagnosticStats {
+    input_bytes: u64,
+    retained_lines: u64,
+    discarded_bytes: u64,
+    truncated_lines: u64,
+    redactions: u64,
+}
+
+#[derive(Default)]
+struct DiagnosticState {
+    lines: VecDeque<Vec<u8>>,
+    retained_bytes: usize,
+    stats: DiagnosticStats,
+}
+
+type SharedDiagnostics = Arc<std::sync::Mutex<DiagnosticState>>;
+
+#[derive(Debug)]
+struct QueuedEvent {
+    event: LifecycleEvent,
+    encoded_bytes: usize,
+}
+
+#[derive(Debug)]
+enum HostControl {
+    Shutdown(Shutdown),
+    Reset(Reset),
+    Lag(Lag),
+    Ping(Ping),
+}
+
+#[derive(Default)]
+struct PendingControls {
+    shutdown: Option<Shutdown>,
+    reset: Option<Reset>,
+    lag: Option<Lag>,
+    ping: Option<Ping>,
+}
+
+#[derive(Default)]
+struct ControlLane {
+    pending: std::sync::Mutex<PendingControls>,
+    notify: Notify,
+    lag_total: AtomicU64,
+}
+
+impl ControlLane {
+    fn lag(&self, first: Sequence, last: Sequence, count: u64, replay_available: bool) {
+        self.lag_total.fetch_add(count, Ordering::Relaxed);
+        let mut pending = self
+            .pending
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if pending.shutdown.is_some() || pending.reset.is_some() {
+            return;
+        }
+        match pending.lag.as_mut() {
+            Some(lag) => {
+                lag.first_lost = Sequence(lag.first_lost.0.min(first.0));
+                lag.last_lost = Sequence(lag.last_lost.0.max(last.0));
+                lag.lost_count = lag.lost_count.saturating_add(count);
+                lag.replay_available |= replay_available;
+            }
+            None => {
+                pending.lag = Some(Lag {
+                    protocol: ProtocolName,
+                    version: ProtocolV1,
+                    frame: LagFrame,
+                    first_lost: first,
+                    last_lost: last,
+                    lost_count: count,
+                    replay_available,
+                });
+            }
+        }
+        drop(pending);
+        self.notify.notify_one();
+    }
+
+    #[allow(dead_code)]
+    fn reset(&self, reset: Reset) {
+        let mut pending = self
+            .pending
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if pending.shutdown.is_none() {
+            pending.reset = Some(reset);
+            pending.lag = None;
+        }
+        drop(pending);
+        self.notify.notify_one();
+    }
+
+    fn ping(&self, nonce: Uuid) {
+        let mut pending = self
+            .pending
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if pending.shutdown.is_none() {
+            pending.ping = Some(Ping {
+                protocol: ProtocolName,
+                version: ProtocolV1,
+                frame: PingFrame,
+                nonce,
+            });
+        }
+        drop(pending);
+        self.notify.notify_one();
+    }
+
+    fn shutdown(&self, reason: ShutdownReason) {
+        let mut pending = self
+            .pending
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        pending.shutdown = Some(Shutdown {
+            protocol: ProtocolName,
+            version: ProtocolV1,
+            frame: ShutdownFrame,
+            reason,
+        });
+        pending.reset = None;
+        pending.lag = None;
+        pending.ping = None;
+        drop(pending);
+        self.notify.notify_one();
+    }
+
+    fn pop(&self) -> Option<HostControl> {
+        let mut pending = self
+            .pending
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        pending
+            .shutdown
+            .take()
+            .map(HostControl::Shutdown)
+            .or_else(|| pending.reset.take().map(HostControl::Reset))
+            .or_else(|| pending.lag.take().map(HostControl::Lag))
+            .or_else(|| pending.ping.take().map(HostControl::Ping))
+    }
+}
+
+fn pong_deadline_after_ping_write() -> tokio::time::Instant {
+    tokio::time::Instant::now() + HEARTBEAT_TIMEOUT
+}
+
+fn activation_scope(activation: &ServiceActivation) -> ActivationScope {
+    ActivationScope {
+        global: activation.effective_global,
+        projects: activation.effective_projects.clone(),
+    }
+}
+
+fn eligible_events(
+    attach: &LifecycleAttach,
+    scope: &ActivationScope,
+    subscriptions: &[LifecycleEventKind],
+    replay_floor: Sequence,
+) -> Vec<LifecycleEvent> {
+    attach
+        .retained
+        .iter()
+        .filter(|event| {
+            scope.eligible(event)
+                && subscriptions.contains(&event.kind)
+                && (event.sequence.0 > replay_floor.0
+                    || event.kind == LifecycleEventKind::DaemonStarted)
+        })
+        .cloned()
+        .collect()
+}
+
+fn reset_frame(reason: ResetReason, eligible: &[LifecycleEvent]) -> Reset {
+    Reset {
+        protocol: ProtocolName,
+        version: ProtocolV1,
+        frame: ResetFrame,
+        reason,
+        oldest_available: eligible.first().map(|event| event.sequence),
+        latest_available: eligible.last().map(|event| event.sequence),
+    }
+}
+
+fn replay_plan(
+    resume: Option<&ResumeCursor>,
+    boot_id: Uuid,
+    epoch: Uuid,
+    replay_floor: Sequence,
+    eligible: &[LifecycleEvent],
+) -> (Option<Reset>, Vec<LifecycleEvent>) {
+    let Some(resume) = resume else {
+        return (None, eligible.to_vec());
+    };
+    let reason = if resume.daemon_boot_id != boot_id {
+        Some(ResetReason::BootChanged)
+    } else if resume.activation_epoch != epoch || resume.after_sequence.0 < replay_floor.0 {
+        Some(ResetReason::ActivationChanged)
+    } else if !eligible
+        .iter()
+        .any(|event| event.sequence == resume.after_sequence)
+    {
+        let oldest = eligible
+            .first()
+            .map_or(attach_floor(replay_floor), |event| event.sequence.0);
+        Some(if resume.after_sequence.0 < oldest {
+            ResetReason::RetentionExceeded
+        } else {
+            ResetReason::InvalidCursor
+        })
+    } else {
+        None
+    };
+    match reason {
+        Some(reason) => (Some(reset_frame(reason, eligible)), Vec::new()),
+        None => (
+            None,
+            eligible
+                .iter()
+                .filter(|event| event.sequence.0 > resume.after_sequence.0)
+                .cloned()
+                .collect(),
+        ),
+    }
+}
+
+const fn attach_floor(floor: Sequence) -> u64 {
+    floor.0.saturating_add(1)
+}
+
+#[derive(Default)]
+struct AckLedger {
+    pending: VecDeque<u64>,
+    last_ack: Option<u64>,
+}
+
+impl AckLedger {
+    fn record_sent(&mut self, sequence: Sequence) -> Result<(), ()> {
+        if self.pending.len() >= ACK_WINDOW_MAX
+            || self
+                .pending
+                .back()
+                .is_some_and(|previous| *previous >= sequence.0)
+        {
+            return Err(());
+        }
+        self.pending.push_back(sequence.0);
+        Ok(())
+    }
+
+    fn acknowledge(&mut self, sequence: Sequence) -> Result<(), ()> {
+        if self.last_ack.is_some_and(|last| sequence.0 <= last)
+            || !self.pending.contains(&sequence.0)
+        {
+            return Err(());
+        }
+        self.last_ack = Some(sequence.0);
+        while self
+            .pending
+            .front()
+            .is_some_and(|pending| *pending <= sequence.0)
+        {
+            self.pending.pop_front();
+        }
+        Ok(())
+    }
+
+    fn is_full(&self) -> bool {
+        self.pending.len() >= ACK_WINDOW_MAX
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AttachError {
+    Cancelled,
+    Timeout,
+    ProtocolViolation,
+}
+
+type ChildStatusProjection = (RuntimeState, Option<RuntimeReason>);
+
+fn child_status_projection(child_status: &ServiceStatus) -> ChildStatusProjection {
+    let state = match child_status.state {
+        ServiceStatusState::Ready => RuntimeState::Healthy,
+        ServiceStatusState::Degraded => RuntimeState::Degraded,
+    };
+    let reason = (state == RuntimeState::Degraded).then_some(match child_status.code {
+        ServiceStatusCode::ExternalUnavailable => RuntimeReason::ExternalUnavailable,
+        ServiceStatusCode::ConfigurationMissing => RuntimeReason::ConfigurationMissing,
+        ServiceStatusCode::RateLimited => RuntimeReason::RateLimited,
+        ServiceStatusCode::Unknown => RuntimeReason::ChildUnknown,
+    });
+    (state, reason)
+}
+
+fn validate_attach_child_frame(
+    frame: ChildFrame,
+    ledger: &mut AckLedger,
+    child_status: &mut Option<ChildStatusProjection>,
+    status: &RuntimeStatusCache,
+    activation: &ServiceActivation,
+) -> Result<(), AttachError> {
+    match frame {
+        ChildFrame::Ack(ack) => {
+            ledger
+                .acknowledge(ack.sequence)
+                .map_err(|_| AttachError::ProtocolViolation)?;
+            status.update_ack(activation, ack.sequence);
+            Ok(())
+        }
+        // Status is legal immediately after ready. Keep only the newest closed
+        // projection and publish it once replay/live attach is complete, so a
+        // long replay neither lies about readiness nor loses degraded state.
+        ChildFrame::Status(frame) => {
+            *child_status = Some(child_status_projection(&frame));
+            Ok(())
+        }
+        ChildFrame::Pong(_) | ChildFrame::ShutdownComplete(_) => {
+            Err(AttachError::ProtocolViolation)
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn wait_attach_child_frame<R: AsyncBufRead + Unpin>(
+    stdout: &mut R,
+    ledger: &mut AckLedger,
+    child_status: &mut Option<ChildStatusProjection>,
+    status: &RuntimeStatusCache,
+    activation: &ServiceActivation,
+    cancel: &CancellationToken,
+    deadline: tokio::time::Instant,
+) -> Result<(), AttachError> {
+    tokio::select! {
+        _ = cancel.cancelled() => Err(AttachError::Cancelled),
+        _ = tokio::time::sleep_until(deadline) => Err(AttachError::Timeout),
+        frame = read_frame::<ChildFrame, _>(stdout) => {
+            let frame = frame.map_err(|_| AttachError::ProtocolViolation)?;
+            validate_attach_child_frame(frame, ledger, child_status, status, activation)
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn write_attach_frame<W, R, T>(
+    stdin: &mut W,
+    stdout: &mut R,
+    frame: &T,
+    sent_sequence: Option<Sequence>,
+    ledger: &mut AckLedger,
+    child_status: &mut Option<ChildStatusProjection>,
+    status: &RuntimeStatusCache,
+    activation: &ServiceActivation,
+    cancel: &CancellationToken,
+    deadline: tokio::time::Instant,
+) -> Result<(), AttachError>
+where
+    W: AsyncWrite + Unpin,
+    R: AsyncBufRead + Unpin,
+    T: Serialize,
+{
+    if sent_sequence.is_some() {
+        while ledger.is_full() {
+            wait_attach_child_frame(
+                stdout,
+                ledger,
+                child_status,
+                status,
+                activation,
+                cancel,
+                deadline,
+            )
+            .await?;
+        }
+    }
+    let write = write_frame(stdin, frame);
+    tokio::pin!(write);
+    let mut deferred_ack = None;
+    loop {
+        tokio::select! {
+            _ = cancel.cancelled() => return Err(AttachError::Cancelled),
+            _ = tokio::time::sleep_until(deadline) => return Err(AttachError::Timeout),
+            result = &mut write => {
+                result.map_err(|_| AttachError::ProtocolViolation)?;
+                if let Some(sequence) = sent_sequence {
+                    // A sequence becomes authoritative only after the complete
+                    // event frame write succeeds. A child ACK that raced that
+                    // completion remains non-authoritative until this point.
+                    ledger
+                        .record_sent(sequence)
+                        .map_err(|_| AttachError::ProtocolViolation)?;
+                    if let Some(acknowledged) = deferred_ack {
+                        ledger
+                            .acknowledge(acknowledged)
+                            .map_err(|_| AttachError::ProtocolViolation)?;
+                        status.update_ack(activation, acknowledged);
+                    }
+                }
+                return Ok(());
+            },
+            child = read_frame::<ChildFrame, _>(stdout) => {
+                let child = child.map_err(|_| AttachError::ProtocolViolation)?;
+                match child {
+                    ChildFrame::Ack(ack)
+                        if sent_sequence == Some(ack.sequence)
+                            && deferred_ack.is_none()
+                            && ledger
+                                .last_ack
+                                .is_none_or(|last| ack.sequence.0 > last) =>
+                    {
+                        // The child may have read the pipe before Tokio polls a
+                        // now-complete write. Buffer only the exact in-flight
+                        // sequence, never publish it, and validate it through
+                        // the sent ledger after successful write completion.
+                        deferred_ack = Some(ack.sequence);
+                    }
+                    child => validate_attach_child_frame(
+                        child,
+                        ledger,
+                        child_status,
+                        status,
+                        activation,
+                    )?,
+                }
+            }
+        }
+    }
+}
+
+fn try_reserve_bytes(bytes: &AtomicUsize, amount: usize) -> bool {
+    let mut current = bytes.load(Ordering::Acquire);
+    loop {
+        let Some(next) = current.checked_add(amount) else {
+            return false;
+        };
+        if next > OUTBOUND_MAX_BYTES {
+            return false;
+        }
+        match bytes.compare_exchange_weak(current, next, Ordering::AcqRel, Ordering::Acquire) {
+            Ok(_) => return true,
+            Err(observed) => current = observed,
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn feed_live_events(
+    dispatcher: Arc<LifecycleDispatcher>,
+    mut live: broadcast::Receiver<LifecycleEvent>,
+    boundary: Sequence,
+    scope: ActivationScope,
+    subscriptions: Vec<LifecycleEventKind>,
+    tx: mpsc::Sender<QueuedEvent>,
+    queued_bytes: Arc<AtomicUsize>,
+    controls: Arc<ControlLane>,
+    cancel: CancellationToken,
+) {
+    let mut last_seen = boundary.0;
+    loop {
+        let event = tokio::select! {
+            _ = cancel.cancelled() => break,
+            event = live.recv() => event,
+        };
+        match event {
+            Ok(event) => {
+                last_seen = event.sequence.0;
+                if event.sequence.0 <= boundary.0
+                    || !scope.eligible(&event)
+                    || !subscriptions.contains(&event.kind)
+                {
+                    continue;
+                }
+                let Ok(encoded) = encode_frame(&event) else {
+                    continue;
+                };
+                let encoded_bytes = encoded.len();
+                if !try_reserve_bytes(&queued_bytes, encoded_bytes) {
+                    let replay_available = dispatcher.replay_available(
+                        &scope,
+                        &subscriptions,
+                        event.sequence,
+                        event.sequence,
+                    );
+                    controls.lag(event.sequence, event.sequence, 1, replay_available);
+                    continue;
+                }
+                match tx.try_send(QueuedEvent {
+                    event,
+                    encoded_bytes,
+                }) {
+                    Ok(()) => {}
+                    Err(error) => {
+                        queued_bytes.fetch_sub(encoded_bytes, Ordering::AcqRel);
+                        let event = error.into_inner().event;
+                        let replay_available = dispatcher.replay_available(
+                            &scope,
+                            &subscriptions,
+                            event.sequence,
+                            event.sequence,
+                        );
+                        controls.lag(event.sequence, event.sequence, 1, replay_available);
+                    }
+                }
+            }
+            Err(broadcast::error::RecvError::Lagged(skipped)) => {
+                let first = Sequence(last_seen.saturating_add(1));
+                let last = Sequence(last_seen.saturating_add(skipped));
+                last_seen = last.0;
+                let replay_available =
+                    dispatcher.replay_available(&scope, &subscriptions, first, last);
+                controls.lag(first, last, skipped, replay_available);
+            }
+            Err(broadcast::error::RecvError::Closed) => break,
+        }
+    }
+}
+
+async fn write_control(
+    writer: &mut (impl AsyncWrite + Unpin),
+    control: &HostControl,
+) -> Result<(), ()> {
+    match control {
+        HostControl::Shutdown(frame) => write_frame(writer, frame).await,
+        HostControl::Reset(frame) => write_frame(writer, frame).await,
+        HostControl::Lag(frame) => write_frame(writer, frame).await,
+        HostControl::Ping(frame) => write_frame(writer, frame).await,
+    }
+}
+
+fn redact_exact(mut input: Vec<u8>, values: &[SensitiveValue]) -> (Vec<u8>, u64) {
+    let mut redactions = 0_u64;
+    for value in values.iter().filter(|value| !value.0.is_empty()) {
+        let mut cursor = 0;
+        while cursor + value.0.len() <= input.len() {
+            let Some(relative) = input[cursor..]
+                .windows(value.0.len())
+                .position(|window| window == value.0)
+            else {
+                break;
+            };
+            let start = cursor + relative;
+            input.splice(start..start + value.0.len(), b"<redacted>".iter().copied());
+            redactions = redactions.saturating_add(1);
+            cursor = start + b"<redacted>".len();
+        }
+    }
+    (input, redactions)
+}
+
+fn retain_diagnostic_line(state: &mut DiagnosticState, line: Vec<u8>, values: &[SensitiveValue]) {
+    let (line, redactions) = redact_exact(line, values);
+    state.stats.redactions = state.stats.redactions.saturating_add(redactions);
+    let sanitized: Vec<u8> = String::from_utf8_lossy(&line)
+        .bytes()
+        .filter(|byte| !byte.is_ascii_control())
+        .collect();
+    while state.retained_bytes.saturating_add(sanitized.len()) > STDERR_RING_BYTES {
+        let Some(evicted) = state.lines.pop_front() else {
+            break;
+        };
+        state.retained_bytes = state.retained_bytes.saturating_sub(evicted.len());
+        state.stats.discarded_bytes = state
+            .stats
+            .discarded_bytes
+            .saturating_add(u64::try_from(evicted.len()).unwrap_or(u64::MAX));
+    }
+    if sanitized.len() > STDERR_RING_BYTES {
+        state.stats.discarded_bytes = state
+            .stats
+            .discarded_bytes
+            .saturating_add(u64::try_from(sanitized.len()).unwrap_or(u64::MAX));
+        return;
+    }
+    state.retained_bytes = state.retained_bytes.saturating_add(sanitized.len());
+    state.stats.retained_lines = state.stats.retained_lines.saturating_add(1);
+    state.lines.push_back(sanitized);
+}
+
+async fn capture_stderr(
+    mut stderr: ChildStderr,
+    values: Vec<SensitiveValue>,
+    shared: SharedDiagnostics,
+) {
+    let mut buffer = [0_u8; 4096];
+    let mut line = Vec::with_capacity(STDERR_MAX_LINE);
+    let mut dropping_line = false;
+    let mut tokens_milli = u64::from(STDERR_BURST) * 1000;
+    let mut replenished_at = tokio::time::Instant::now();
+    loop {
+        let read = match stderr.read(&mut buffer).await {
+            Ok(0) => break,
+            Ok(read) => read,
+            Err(_) => break,
+        };
+        {
+            let mut state = shared
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            state.stats.input_bytes = state
+                .stats
+                .input_bytes
+                .saturating_add(u64::try_from(read).unwrap_or(u64::MAX));
+        }
+        for byte in &buffer[..read] {
+            if *byte == b'\n' {
+                let now = tokio::time::Instant::now();
+                let elapsed_ms = u64::try_from(now.duration_since(replenished_at).as_millis())
+                    .unwrap_or(u64::MAX);
+                tokens_milli = tokens_milli
+                    .saturating_add(elapsed_ms.saturating_mul(u64::from(STDERR_RATE_PER_SECOND)))
+                    .min(u64::from(STDERR_BURST) * 1000);
+                replenished_at = now;
+                let mut state = shared
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                if dropping_line {
+                    state.stats.truncated_lines = state.stats.truncated_lines.saturating_add(1);
+                    dropping_line = false;
+                    line.clear();
+                } else if tokens_milli >= 1000 {
+                    tokens_milli -= 1000;
+                    retain_diagnostic_line(&mut state, std::mem::take(&mut line), &values);
+                } else {
+                    state.stats.discarded_bytes = state
+                        .stats
+                        .discarded_bytes
+                        .saturating_add(u64::try_from(line.len()).unwrap_or(u64::MAX));
+                    line.clear();
+                }
+            } else if dropping_line {
+                let mut state = shared
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                state.stats.discarded_bytes = state.stats.discarded_bytes.saturating_add(1);
+            } else if line.len() == STDERR_MAX_LINE {
+                let mut state = shared
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                state.stats.discarded_bytes = state.stats.discarded_bytes.saturating_add(
+                    u64::try_from(line.len())
+                        .unwrap_or(u64::MAX)
+                        .saturating_add(1),
+                );
+                dropping_line = true;
+                line.clear();
+            } else {
+                line.push(*byte);
+            }
+        }
+    }
+    let mut state = shared
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if dropping_line {
+        state.stats.truncated_lines = state.stats.truncated_lines.saturating_add(1);
+    } else if !line.is_empty() {
+        retain_diagnostic_line(&mut state, line, &values);
+    }
+}
+
+async fn finish_diagnostics(
+    mut task: JoinHandle<()>,
+    diagnostics: &SharedDiagnostics,
+) -> DiagnosticStats {
+    if tokio::time::timeout(DIAGNOSTIC_JOIN_TIMEOUT, &mut task)
+        .await
+        .is_err()
+    {
+        task.abort();
+        let _ = task.await;
+    }
+    diagnostics
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .stats
+        .clone()
+}
+
+struct AttemptResult {
+    reason: RuntimeReason,
+    retained: Option<CleanupAuthority>,
+    healthy_for: Duration,
+}
+
+#[cfg(test)]
+async fn run_service_a2b(
+    activation: ServiceActivation,
+    lifecycle: Arc<LifecycleDispatcher>,
+    cancel: CancellationToken,
+    status: RuntimeStatusCache,
+) -> Option<CleanupAuthority> {
+    let epoch = Uuid::new_v4();
+    let replay_floor = lifecycle.current_sequence();
+    let scope = activation_scope(&activation);
+    run_service_with_epoch(
+        activation,
+        lifecycle,
+        cancel,
+        status,
+        epoch,
+        replay_floor,
+        scope,
+        Arc::new(std::sync::Mutex::new(ShutdownReason::DaemonStopping)),
+        Arc::new(std::sync::Mutex::new(RestartHistory::default())),
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn run_service_with_epoch(
+    activation: ServiceActivation,
+    lifecycle: Arc<LifecycleDispatcher>,
+    cancel: CancellationToken,
+    status: RuntimeStatusCache,
+    epoch: Uuid,
+    replay_floor: Sequence,
+    scope: ActivationScope,
+    stop_reason: Arc<std::sync::Mutex<ShutdownReason>>,
+    history: Arc<std::sync::Mutex<RestartHistory>>,
+) -> Option<CleanupAuthority> {
+    loop {
+        let (restart_count, circuit_open, blocked_reason) = {
+            let history = history
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            (
+                history.restart_count,
+                history.circuit_open,
+                history.blocked_reason,
+            )
+        };
+        status.insert_starting(&activation, epoch, replay_floor, restart_count);
+        if let Some(reason) = blocked_reason {
+            status.update(
+                &activation,
+                if circuit_open {
+                    RuntimeState::CircuitOpen
+                } else {
+                    RuntimeState::Unhealthy
+                },
+                None,
+                None,
+                Some(reason),
+            );
+            return None;
+        }
+        let attempt = run_service_once(
+            &activation,
+            Arc::clone(&lifecycle),
+            epoch,
+            replay_floor,
+            scope.clone(),
+            cancel.clone(),
+            Arc::clone(&stop_reason),
+            &status,
+        )
+        .await;
+        if let Some(authority) = attempt.retained {
+            return Some(authority);
+        }
+        if cancel.is_cancelled() || attempt.reason == RuntimeReason::Shutdown {
+            return None;
+        }
+        if !activation.restart_on_failure {
+            history
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .blocked_reason = Some(attempt.reason);
+            status.update(
+                &activation,
+                RuntimeState::Unhealthy,
+                None,
+                None,
+                Some(attempt.reason),
+            );
+            return None;
+        }
+
+        let now = tokio::time::Instant::now();
+        let (delay, circuit_open) = {
+            let mut history = history
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            if attempt.healthy_for >= STABLE_RESET {
+                history.failures.clear();
+                history.backoff_index = 0;
+                history.circuit_open = false;
+                history.blocked_reason = None;
+            }
+            history.failures.push_back(now);
+            while history
+                .failures
+                .front()
+                .is_some_and(|failure| now.duration_since(*failure) > FAILURE_WINDOW)
+            {
+                history.failures.pop_front();
+            }
+            if history.failures.len() >= CIRCUIT_FAILURES {
+                history.circuit_open = true;
+                history.blocked_reason = Some(attempt.reason);
+            }
+            let delay = BACKOFF[history.backoff_index.min(BACKOFF.len() - 1)];
+            history.backoff_index = history.backoff_index.saturating_add(1);
+            history.restart_count = history.restart_count.saturating_add(1);
+            (delay, history.circuit_open)
+        };
+        if circuit_open {
+            status.update(
+                &activation,
+                RuntimeState::CircuitOpen,
+                None,
+                None,
+                Some(attempt.reason),
+            );
+            return None;
+        }
+        status.update(
+            &activation,
+            RuntimeState::Backoff,
+            None,
+            None,
+            Some(attempt.reason),
+        );
+        tokio::select! {
+            _ = cancel.cancelled() => return None,
+            _ = tokio::time::sleep(delay) => {}
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn run_service_once(
+    activation: &ServiceActivation,
+    lifecycle: Arc<LifecycleDispatcher>,
+    epoch: Uuid,
+    replay_floor: Sequence,
+    scope: ActivationScope,
+    cancel: CancellationToken,
+    stop_reason: Arc<std::sync::Mutex<ShutdownReason>>,
+    status: &RuntimeStatusCache,
+) -> AttemptResult {
+    let immediate = |reason| AttemptResult {
+        reason,
+        retained: None,
+        healthy_for: Duration::ZERO,
+    };
+    if !matches!(activation.startup_timeout.as_millis(), 100..=30_000) {
+        status.update(
+            activation,
+            RuntimeState::Unhealthy,
+            None,
+            None,
+            Some(RuntimeReason::ProtocolViolation),
+        );
+        return immediate(RuntimeReason::ProtocolViolation);
+    }
+    if cancel.is_cancelled() {
+        status.update(
+            activation,
+            RuntimeState::Inactive,
+            None,
+            None,
+            Some(RuntimeReason::Shutdown),
+        );
+        return immediate(RuntimeReason::Shutdown);
+    }
+
+    let connection_id = Uuid::new_v4();
+    let roots = match assigned_roots(
+        &activation.config_dir,
+        &activation.package_id,
+        &activation.service_id,
+        connection_id,
+    ) {
+        Ok(roots) => roots,
+        Err(_) => {
+            status.update(
+                activation,
+                RuntimeState::Unhealthy,
+                None,
+                None,
+                Some(RuntimeReason::RootUnavailable),
+            );
+            return immediate(RuntimeReason::RootUnavailable);
+        }
+    };
+    let environment = match resolve_environment(activation, |name| std::env::var_os(name)) {
+        Ok(environment) => environment,
+        Err(error) => {
+            let reason = match error {
+                EnvironmentError::MissingOrdinary => RuntimeReason::EnvironmentMissing,
+                EnvironmentError::MissingSecret => RuntimeReason::SecretMissing,
+                EnvironmentError::InvalidName => RuntimeReason::InvalidEnvironment,
+            };
+            status.update(
+                activation,
+                RuntimeState::Unhealthy,
+                None,
+                None,
+                Some(reason),
+            );
+            cleanup_temp_root_accounted(&roots, status, activation);
+            return immediate(reason);
+        }
+    };
+    let mut redaction_values: Vec<SensitiveValue> = environment
+        .iter()
+        .map(|(_, value)| value.duplicate_for_redaction())
+        .collect();
+    redaction_values.extend(
+        [
+            OsStr::new("/usr/bin:/bin"),
+            activation.package_path.as_os_str(),
+            roots.data.as_os_str(),
+            roots.cache.as_os_str(),
+            roots.temp.as_os_str(),
+        ]
+        .into_iter()
+        .map(|value| SensitiveValue(value.as_bytes().to_vec())),
+    );
+    let mut child = match spawn_service(activation, &roots, &environment) {
+        Ok(child) => child,
+        Err(_) => {
+            status.update(
+                activation,
+                RuntimeState::Unhealthy,
+                None,
+                None,
+                Some(RuntimeReason::SpawnFailed),
+            );
+            cleanup_temp_root_accounted(&roots, status, activation);
+            return immediate(RuntimeReason::SpawnFailed);
+        }
+    };
+    drop(environment);
+    let Some(pid) = child.id() else {
+        status.update(
+            activation,
+            RuntimeState::Unhealthy,
+            None,
+            None,
+            Some(RuntimeReason::SpawnFailed),
+        );
+        cleanup_temp_root_accounted(&roots, status, activation);
+        return immediate(RuntimeReason::SpawnFailed);
+    };
+    let mut owner = ProcessGroupOwner::new(pid);
+    let (Some(stdin), Some(stdout), Some(stderr)) =
+        (child.stdin.take(), child.stdout.take(), child.stderr.take())
+    else {
+        let cleaned = terminate_process_group(&mut child, &mut owner).await;
+        if cleaned {
+            cleanup_temp_root_accounted(&roots, status, activation);
+        }
+        let reason = if cleaned {
+            RuntimeReason::SpawnFailed
+        } else {
+            RuntimeReason::CleanupFailed
+        };
+        status.update(
+            activation,
+            RuntimeState::Unhealthy,
+            None,
+            None,
+            Some(reason),
+        );
+        return AttemptResult {
+            reason,
+            retained: (!cleaned).then_some(CleanupAuthority {
+                child,
+                owner,
+                roots: Some(roots),
+            }),
+            healthy_for: Duration::ZERO,
+        };
+    };
+    let diagnostics = Arc::new(std::sync::Mutex::new(DiagnosticState::default()));
+    let diagnostics_task = tokio::spawn(capture_stderr(
+        stderr,
+        redaction_values,
+        Arc::clone(&diagnostics),
+    ));
+    let mut stdin = stdin;
+    let mut stdout = BufReader::new(stdout);
+
+    let service_hello = {
+        let handshake = tokio::time::timeout(
+            activation.startup_timeout,
+            perform_handshake_a2b(
+                activation,
+                lifecycle.daemon_boot_id(),
+                connection_id,
+                epoch,
+                replay_floor,
+                &mut stdin,
+                &mut stdout,
+            ),
+        );
+        tokio::pin!(handshake);
+        tokio::select! {
+            _ = cancel.cancelled() => None,
+            result = &mut handshake => Some(result),
+        }
+    };
+    let (shutdown_reason, runtime_reason, subscriptions, attach) = match service_hello {
+        None => (
+            requested_stop_reason(&stop_reason),
+            RuntimeReason::Shutdown,
+            None,
+            None,
+        ),
+        Some(Err(_)) => (
+            ShutdownReason::Unhealthy,
+            RuntimeReason::StartupTimeout,
+            None,
+            None,
+        ),
+        Some(Ok(Err(_))) => (
+            ShutdownReason::Unhealthy,
+            RuntimeReason::ProtocolViolation,
+            None,
+            None,
+        ),
+        Some(Ok(Ok(service_hello))) => {
+            let subscriptions = service_hello.subscriptions.clone();
+            let attach = lifecycle.attach();
+            let ready = Ready {
+                protocol: ProtocolName,
+                version: ProtocolV1,
+                frame: ReadyFrame,
+                subscriptions: subscriptions.clone(),
+                replay: ReplayMode::BootLocal,
+                activation_epoch: epoch,
+                replay_floor,
+            };
+            let eligible = eligible_events(&attach, &scope, &subscriptions, replay_floor);
+            let (reset, replay) = replay_plan(
+                service_hello.resume.as_ref(),
+                lifecycle.daemon_boot_id(),
+                epoch,
+                replay_floor,
+                &eligible,
+            );
+            let attach_deadline = tokio::time::Instant::now() + activation.startup_timeout;
+            let mut ledger = AckLedger::default();
+            let mut child_status = None;
+            let attach_result = async {
+                write_attach_frame(
+                    &mut stdin,
+                    &mut stdout,
+                    &ready,
+                    None,
+                    &mut ledger,
+                    &mut child_status,
+                    status,
+                    activation,
+                    &cancel,
+                    attach_deadline,
+                )
+                .await?;
+                if let Some(reset) = reset.as_ref() {
+                    status.clear_ack(activation);
+                    ledger = AckLedger::default();
+                    write_attach_frame(
+                        &mut stdin,
+                        &mut stdout,
+                        reset,
+                        None,
+                        &mut ledger,
+                        &mut child_status,
+                        status,
+                        activation,
+                        &cancel,
+                        attach_deadline,
+                    )
+                    .await?;
+                }
+                for event in &replay {
+                    write_attach_frame(
+                        &mut stdin,
+                        &mut stdout,
+                        event,
+                        Some(event.sequence),
+                        &mut ledger,
+                        &mut child_status,
+                        status,
+                        activation,
+                        &cancel,
+                        attach_deadline,
+                    )
+                    .await?;
+                }
+                Ok::<(), AttachError>(())
+            }
+            .await;
+            match attach_result {
+                Ok(()) => (
+                    ShutdownReason::Unhealthy,
+                    RuntimeReason::ChildUnknown,
+                    Some((subscriptions, ledger, child_status)),
+                    Some(attach),
+                ),
+                Err(AttachError::Cancelled) => (
+                    requested_stop_reason(&stop_reason),
+                    RuntimeReason::Shutdown,
+                    None,
+                    None,
+                ),
+                Err(AttachError::Timeout | AttachError::ProtocolViolation) => (
+                    ShutdownReason::Unhealthy,
+                    RuntimeReason::ProtocolViolation,
+                    None,
+                    None,
+                ),
+            }
+        }
+    };
+
+    let started_healthy = tokio::time::Instant::now();
+    let mut shutdown_already_sent = false;
+    let runtime_reason = if let (
+        Some((subscriptions, mut ack_ledger, child_status)),
+        Some(attach),
+    ) = (subscriptions, attach)
+    {
+        status.update(
+            activation,
+            RuntimeState::Healthy,
+            Some(pid),
+            Some(&subscriptions),
+            None,
+        );
+        if let Some((state, reason)) = child_status {
+            status.update(activation, state, Some(pid), None, reason);
+        }
+        let controls = Arc::new(ControlLane::default());
+        let queued_bytes = Arc::new(AtomicUsize::new(0));
+        let (data_tx, mut data_rx) = mpsc::channel(OUTBOUND_MAX_MESSAGES);
+        let feeder_cancel = CancellationToken::new();
+        let feeder = tokio::spawn(feed_live_events(
+            Arc::clone(&lifecycle),
+            attach.live,
+            attach.boundary,
+            scope,
+            subscriptions,
+            data_tx,
+            Arc::clone(&queued_bytes),
+            Arc::clone(&controls),
+            feeder_cancel.clone(),
+        ));
+        let mut pending_ping = None::<(Uuid, tokio::time::Instant)>;
+        let mut next_ping = tokio::time::Instant::now() + HEARTBEAT_INTERVAL;
+        let mut misses = 0_u8;
+        let mut leader_poll = tokio::time::interval(LEADER_POLL_INTERVAL);
+        leader_poll.tick().await;
+
+        let reason = loop {
+            if cancel.is_cancelled() {
+                controls.shutdown(requested_stop_reason(&stop_reason));
+            }
+            if let Some(control) = controls.pop() {
+                let is_shutdown = matches!(control, HostControl::Shutdown(_));
+                let ping_nonce = match &control {
+                    HostControl::Ping(ping) => Some(ping.nonce),
+                    _ => None,
+                };
+                if write_control(&mut stdin, &control).await.is_err() {
+                    break RuntimeReason::ProtocolViolation;
+                }
+                if let Some(nonce) = ping_nonce {
+                    // The child receives the full contracted timeout. Queueing
+                    // or a slow-but-successful pipe write consumes none of it.
+                    pending_ping = Some((nonce, pong_deadline_after_ping_write()));
+                }
+                if is_shutdown {
+                    shutdown_already_sent = true;
+                    break RuntimeReason::Shutdown;
+                }
+                continue;
+            }
+
+            let health_deadline =
+                pending_ping.map_or(next_ping, |(_, deadline)| deadline.min(next_ping));
+            tokio::select! {
+                biased;
+                _ = cancel.cancelled() => {
+                    controls.shutdown(requested_stop_reason(&stop_reason));
+                }
+                _ = controls.notify.notified() => {}
+                _ = tokio::time::sleep_until(health_deadline) => {
+                    let now = tokio::time::Instant::now();
+                    if pending_ping.is_some_and(|(_, deadline)| now >= deadline) {
+                        pending_ping = None;
+                        misses = misses.saturating_add(1);
+                        if misses >= HEARTBEAT_MAX_MISSES {
+                            break RuntimeReason::PingTimeout;
+                        }
+                    }
+                    if pending_ping.is_none() && now >= next_ping {
+                        controls.ping(Uuid::new_v4());
+                        next_ping = now + HEARTBEAT_INTERVAL;
+                    }
+                }
+                _ = leader_poll.tick() => {
+                    if owner.leader_exited() {
+                        break RuntimeReason::UnexpectedExit;
+                    }
+                }
+                frame = read_frame::<ChildFrame, _>(&mut stdout) => {
+                    match frame {
+                        Ok(ChildFrame::Status(child_status)) => {
+                            let state = match child_status.state {
+                                ServiceStatusState::Ready => RuntimeState::Healthy,
+                                ServiceStatusState::Degraded => RuntimeState::Degraded,
+                            };
+                            let reason = (state == RuntimeState::Degraded).then_some(match child_status.code {
+                                ServiceStatusCode::ExternalUnavailable => RuntimeReason::ExternalUnavailable,
+                                ServiceStatusCode::ConfigurationMissing => RuntimeReason::ConfigurationMissing,
+                                ServiceStatusCode::RateLimited => RuntimeReason::RateLimited,
+                                ServiceStatusCode::Unknown => RuntimeReason::ChildUnknown,
+                            });
+                            status.update(activation, state, Some(pid), None, reason);
+                        }
+                        Ok(ChildFrame::Ack(ack)) => {
+                            if ack_ledger.acknowledge(ack.sequence).is_err() {
+                                break RuntimeReason::ProtocolViolation;
+                            }
+                            status.update_ack(activation, ack.sequence);
+                        }
+                        Ok(ChildFrame::Pong(pong)) => {
+                            if pending_ping.is_some_and(|(nonce, _)| nonce == pong.nonce) {
+                                pending_ping = None;
+                                misses = 0;
+                            } else {
+                                break RuntimeReason::ProtocolViolation;
+                            }
+                        }
+                        Ok(ChildFrame::ShutdownComplete(_)) => break RuntimeReason::ProtocolViolation,
+                        Err(error) => break post_ready_frame_failure_reason(error),
+                    }
+                }
+                event = data_rx.recv() => {
+                    let Some(event) = event else {
+                        break RuntimeReason::UnexpectedExit;
+                    };
+                    queued_bytes.fetch_sub(event.encoded_bytes, Ordering::AcqRel);
+                    if ack_ledger.is_full()
+                        || write_frame(&mut stdin, &event.event).await.is_err()
+                        || ack_ledger.record_sent(event.event.sequence).is_err()
+                    {
+                        // A child may choose not to ACK, but it cannot make
+                        // daemon bookkeeping unbounded. Reconnect/reset starts
+                        // a fresh connection ledger.
+                        break RuntimeReason::ProtocolViolation;
+                    }
+                }
+            }
+        };
+        feeder_cancel.cancel();
+        let _ = feeder.await;
+        status.add_lag(activation, controls.lag_total.swap(0, Ordering::AcqRel));
+        reason
+    } else {
+        runtime_reason
+    };
+
+    let effective_shutdown_reason = if runtime_reason == RuntimeReason::Shutdown {
+        requested_stop_reason(&stop_reason)
+    } else {
+        shutdown_reason
+    };
+    let cleaned = finish_process(
+        activation,
+        status,
+        &mut child,
+        &mut owner,
+        stdin,
+        stdout,
+        &roots,
+        effective_shutdown_reason,
+        runtime_reason,
+        shutdown_already_sent,
+    )
+    .await;
+    let diagnostic_stats = finish_diagnostics(diagnostics_task, &diagnostics).await;
+    status.update_diagnostics(activation, &diagnostic_stats);
+    AttemptResult {
+        reason: runtime_reason,
+        retained: (!cleaned).then_some(CleanupAuthority {
+            child,
+            owner,
+            roots: Some(roots),
+        }),
+        healthy_for: started_healthy.elapsed(),
+    }
+}
+
+#[cfg(test)]
 async fn run_service(
     activation: ServiceActivation,
     boot_id: Uuid,
@@ -708,7 +2396,7 @@ async fn run_service(
     status: RuntimeStatusCache,
 ) -> Option<CleanupAuthority> {
     let epoch = Uuid::new_v4();
-    status.insert_starting(&activation, epoch);
+    status.insert_starting(&activation, epoch, Sequence(0), 0);
     if !matches!(activation.startup_timeout.as_millis(), 100..=30_000) {
         status.update(
             &activation,
@@ -812,7 +2500,11 @@ async fn run_service(
                 RuntimeReason::CleanupFailed
             }),
         );
-        return (!cleaned).then_some(CleanupAuthority { child, owner });
+        return (!cleaned).then_some(CleanupAuthority {
+            child,
+            owner,
+            roots: Some(roots),
+        });
     };
     let mut stdin = stdin;
     let mut stdout = BufReader::new(stdout);
@@ -846,9 +2538,14 @@ async fn run_service(
             &roots,
             ShutdownReason::DaemonStopping,
             RuntimeReason::Shutdown,
+            false,
         )
         .await;
-        return (!cleaned).then_some(CleanupAuthority { child, owner });
+        return (!cleaned).then_some(CleanupAuthority {
+            child,
+            owner,
+            roots: Some(roots),
+        });
     };
     let subscriptions = match handshake {
         Ok(Ok(subscriptions)) => subscriptions,
@@ -870,9 +2567,14 @@ async fn run_service(
                 &roots,
                 ShutdownReason::Unhealthy,
                 RuntimeReason::ProtocolViolation,
+                false,
             )
             .await;
-            return (!cleaned).then_some(CleanupAuthority { child, owner });
+            return (!cleaned).then_some(CleanupAuthority {
+                child,
+                owner,
+                roots: Some(roots),
+            });
         }
         Err(_) => {
             status.update(
@@ -892,9 +2594,14 @@ async fn run_service(
                 &roots,
                 ShutdownReason::Unhealthy,
                 RuntimeReason::StartupTimeout,
+                false,
             )
             .await;
-            return (!cleaned).then_some(CleanupAuthority { child, owner });
+            return (!cleaned).then_some(CleanupAuthority {
+                child,
+                owner,
+                roots: Some(roots),
+            });
         }
     };
     status.update(
@@ -965,9 +2672,14 @@ async fn run_service(
         &roots,
         shutdown_reason,
         runtime_reason,
+        false,
     )
     .await;
-    (!cleaned).then_some(CleanupAuthority { child, owner })
+    (!cleaned).then_some(CleanupAuthority {
+        child,
+        owner,
+        roots: Some(roots),
+    })
 }
 
 fn spawn_service(
@@ -1000,9 +2712,9 @@ fn spawn_service(
         .env("TMPDIR", &roots.temp)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
-        // Detailed bounded diagnostic capture belongs to A2b. A2a discards
-        // stderr structurally, so secret bytes cannot reach logs or status.
-        .stderr(Stdio::null());
+        // Stderr is diagnostics only and is consumed by the bounded structural
+        // redactor; it is never interpreted as protocol or logged raw.
+        .stderr(Stdio::piped());
     for (name, value) in environment {
         command.env(name, value.as_os_str());
     }
@@ -1070,6 +2782,52 @@ enum ChildFrame {
     ShutdownComplete(ShutdownComplete),
 }
 
+async fn perform_handshake_a2b<W, R>(
+    activation: &ServiceActivation,
+    boot_id: Uuid,
+    connection_id: Uuid,
+    epoch: Uuid,
+    replay_floor: Sequence,
+    stdin: &mut W,
+    stdout: &mut R,
+) -> Result<ServiceHello, ()>
+where
+    W: AsyncWrite + Unpin,
+    R: AsyncBufRead + Unpin,
+{
+    let hello = HostHello {
+        protocol: ProtocolName,
+        version: ProtocolV1,
+        frame: HostHelloFrame,
+        connection_id,
+        daemon_boot_id: boot_id,
+        identity: ServiceIdentity {
+            package_id: activation.package_id.clone(),
+            package_version: activation.package_version.clone(),
+            package_digest: activation.package_digest.clone(),
+            service_id: activation.service_id.clone(),
+            activation_revision: activation.activation_revision,
+            activation_epoch: epoch,
+            replay_floor,
+        },
+        limits: ServiceLimits {
+            max_frame_bytes: 65_536,
+            outbound_messages: u64::try_from(OUTBOUND_MAX_MESSAGES).unwrap_or(u64::MAX),
+            outbound_bytes: u64::try_from(OUTBOUND_MAX_BYTES).unwrap_or(u64::MAX),
+            heartbeat_interval_ms: u64::try_from(HEARTBEAT_INTERVAL.as_millis())
+                .unwrap_or(u64::MAX),
+            heartbeat_timeout_ms: u64::try_from(HEARTBEAT_TIMEOUT.as_millis()).unwrap_or(u64::MAX),
+        },
+    };
+    write_frame(stdin, &hello).await?;
+    let service_hello: ServiceHello = read_frame(stdout).await.map_err(|_| ())?;
+    service_hello
+        .validate_subscriptions(&activation.events)
+        .map_err(|_| ())?;
+    Ok(service_hello)
+}
+
+#[allow(dead_code)]
 async fn perform_handshake<W, R>(
     activation: &ServiceActivation,
     boot_id: Uuid,
@@ -1196,6 +2954,7 @@ async fn finish_process(
     roots: &AssignedRoots,
     reason: ShutdownReason,
     runtime_reason: RuntimeReason,
+    shutdown_already_sent: bool,
 ) -> bool {
     let pid = child.id();
     status.update(
@@ -1205,13 +2964,15 @@ async fn finish_process(
         None,
         Some(runtime_reason),
     );
-    let shutdown = Shutdown {
-        protocol: ProtocolName,
-        version: ProtocolV1,
-        frame: ShutdownFrame,
-        reason,
-    };
-    let _ = write_frame(&mut stdin, &shutdown).await;
+    if !shutdown_already_sent {
+        let shutdown = Shutdown {
+            protocol: ProtocolName,
+            version: ProtocolV1,
+            frame: ShutdownFrame,
+            reason,
+        };
+        let _ = write_frame(&mut stdin, &shutdown).await;
+    }
     let response = async {
         loop {
             match read_frame::<ChildFrame, _>(&mut stdout)
@@ -1220,14 +2981,10 @@ async fn finish_process(
             {
                 ChildFrame::ShutdownComplete(_) => return Ok::<(), ()>(()),
                 ChildFrame::Status(_) => {}
-                ChildFrame::Ack(ack) => {
-                    let _invalid_sequence = ack.sequence;
-                    return Err(());
-                }
-                ChildFrame::Pong(pong) => {
-                    let _unexpected_nonce = pong.nonce;
-                    return Err(());
-                }
+                // A previously delivered event or ping can race the prioritized
+                // shutdown write. Both frames are valid but irrelevant once
+                // shutdown begins; continue waiting for shutdown_complete.
+                ChildFrame::Ack(_) | ChildFrame::Pong(_) => {}
             }
         }
     };
@@ -1236,6 +2993,9 @@ async fn finish_process(
 
     let group_cleaned = terminate_process_group(child, owner).await;
     let roots_cleaned = group_cleaned && cleanup_temp_root(roots);
+    if group_cleaned && !roots_cleaned {
+        status.record_temp_cleanup_failure(activation);
+    }
     let fully_cleaned = group_cleaned && roots_cleaned;
     let terminal_reason = if !fully_cleaned && runtime_reason == RuntimeReason::Shutdown {
         RuntimeReason::CleanupFailed
@@ -1246,7 +3006,11 @@ async fn finish_process(
     };
     status.update(
         activation,
-        if reason == ShutdownReason::DaemonStopping && fully_cleaned {
+        if matches!(
+            reason,
+            ShutdownReason::Disabled | ShutdownReason::DaemonStopping | ShutdownReason::Reconfigure
+        ) && fully_cleaned
+        {
             RuntimeState::Inactive
         } else {
             RuntimeState::Unhealthy
@@ -1255,7 +3019,7 @@ async fn finish_process(
         None,
         Some(terminal_reason),
     );
-    group_cleaned
+    fully_cleaned
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1341,6 +3105,20 @@ struct ProcessGroupOwner {
 struct CleanupAuthority {
     child: Child,
     owner: ProcessGroupOwner,
+    roots: Option<AssignedRoots>,
+}
+
+impl CleanupAuthority {
+    async fn cleanup(&mut self) -> bool {
+        if !self.owner.reaped && !terminate_process_group(&mut self.child, &mut self.owner).await {
+            return false;
+        }
+        let roots_cleaned = self.roots.as_ref().is_none_or(cleanup_temp_root);
+        if roots_cleaned {
+            self.roots = None;
+        }
+        roots_cleaned
+    }
 }
 
 impl ProcessGroupOwner {
@@ -1541,6 +3319,7 @@ fn group_has_live_members(pgid: libc::pid_t) -> io::Result<bool> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::extension_lifecycle::LifecycleSource;
     use ocean_agent_sdk::extension_lifecycle::LifecycleEventKind;
     use std::os::unix::fs::PermissionsExt;
 
@@ -1570,7 +3349,10 @@ mod tests {
                 events: vec![LifecycleEventKind::DaemonStarted],
                 environment: Vec::new(),
                 secret_bindings: Vec::new(),
-                startup_timeout: Duration::from_secs(2),
+                startup_timeout: Duration::from_secs(10),
+                restart_on_failure: false,
+                effective_global: true,
+                effective_projects: HashSet::new(),
             },
         )
     }
@@ -1586,6 +3368,801 @@ mod tests {
         fs::create_dir_all(store.parent().unwrap()).unwrap();
         fs::rename(&activation.package_path, &store).unwrap();
         activation.package_path = store;
+    }
+
+    async fn wait_for_runtime_state(
+        status: &RuntimeStatusCache,
+        wanted: RuntimeState,
+    ) -> RuntimeStatus {
+        for _ in 0..1_000 {
+            if let Some(found) = status
+                .snapshot()
+                .into_iter()
+                .find(|entry| entry.state == wanted)
+            {
+                return found;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        panic!("runtime state {wanted:?} was not observed")
+    }
+
+    async fn wait_for_fixture_marker(marker: &Path) {
+        tokio::time::timeout(Duration::from_secs(20), async {
+            while !marker.exists() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap_or_else(|_| panic!("fixture marker was not created: {}", marker.display()));
+    }
+
+    async fn await_fixture_service(
+        task: JoinHandle<Option<CleanupAuthority>>,
+    ) -> Option<CleanupAuthority> {
+        // A cleanup attempt may legitimately consume the 2s shutdown write,
+        // 2s graceful response, 2s TERM, and 2s KILL bounds. Keep this
+        // fixture-only watchdog above that contracted total plus loaded-host
+        // scheduling margin; changing production deadlines would weaken proof.
+        tokio::time::timeout(Duration::from_secs(15), task)
+            .await
+            .expect("fixture service exceeded bounded protocol/cleanup time")
+            .expect("fixture service task panicked")
+    }
+
+    async fn wait_for_managed_completion(managed: &ManagedService) {
+        tokio::time::timeout(Duration::from_secs(20), async {
+            while !managed.task.is_finished() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("managed service did not complete within its cleanup bound");
+    }
+
+    fn replace_active_temp_generation(config_dir: &Path) -> (PathBuf, PathBuf) {
+        let parent = config_dir.join("extensions/state/example.noop/tmp/lifecycle");
+        let mut active = fs::read_dir(&parent)
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .collect::<Vec<_>>();
+        assert_eq!(active.len(), 1, "expected one active connection root");
+        let named = active.pop().unwrap();
+        let retained = named.with_extension("retained");
+        fs::rename(&named, &retained).unwrap();
+        fs::create_dir(&named).unwrap();
+        fs::write(named.join("replacement-generation"), b"untouched").unwrap();
+        (named, retained)
+    }
+
+    fn restore_active_temp_generation(named: &Path, retained: &Path) {
+        assert_eq!(
+            fs::read(named.join("replacement-generation")).unwrap(),
+            b"untouched"
+        );
+        fs::remove_dir_all(named).unwrap();
+        fs::rename(retained, named).unwrap();
+    }
+
+    #[test]
+    fn prioritized_control_lane_coalesces_without_an_unbounded_control_queue() {
+        let controls = ControlLane::default();
+        controls.ping(Uuid::new_v4());
+        controls.lag(Sequence(10), Sequence(12), 3, true);
+        controls.lag(Sequence(8), Sequence(20), 5, false);
+        controls.reset(reset_frame(ResetReason::InvalidCursor, &[]));
+        assert!(matches!(controls.pop(), Some(HostControl::Reset(_))));
+        assert!(matches!(controls.pop(), Some(HostControl::Ping(_))));
+        assert!(controls.pop().is_none());
+
+        controls.ping(Uuid::new_v4());
+        controls.lag(Sequence(21), Sequence(21), 1, true);
+        controls.shutdown(ShutdownReason::DaemonStopping);
+        assert!(matches!(controls.pop(), Some(HostControl::Shutdown(_))));
+        assert!(controls.pop().is_none());
+        assert_eq!(controls.lag_total.load(Ordering::Relaxed), 9);
+    }
+
+    #[test]
+    fn replay_floor_cursor_requires_an_actual_retained_epoch_eligible_event() {
+        let boot = Uuid::new_v4();
+        let epoch = Uuid::new_v4();
+        let floor = Sequence(41);
+        let (reset, replay) = replay_plan(
+            Some(&ResumeCursor {
+                daemon_boot_id: boot,
+                activation_epoch: epoch,
+                after_sequence: floor,
+            }),
+            boot,
+            epoch,
+            floor,
+            &[],
+        );
+        assert!(matches!(
+            reset.map(|frame| frame.reason),
+            Some(ResetReason::RetentionExceeded | ResetReason::InvalidCursor)
+        ));
+        assert!(replay.is_empty());
+    }
+
+    #[test]
+    fn ack_ledger_is_strictly_bounded_and_releases_only_delivered_order() {
+        let mut ledger = AckLedger::default();
+        for sequence in 1..=ACK_WINDOW_MAX {
+            ledger.record_sent(Sequence(sequence as u64)).unwrap();
+        }
+        assert!(ledger.is_full());
+        assert!(ledger
+            .record_sent(Sequence(ACK_WINDOW_MAX as u64 + 1))
+            .is_err());
+        assert!(ledger.acknowledge(Sequence(17)).is_ok());
+        assert!(!ledger.is_full());
+        assert!(ledger.acknowledge(Sequence(17)).is_err());
+        assert!(ledger.acknowledge(Sequence(999_999)).is_err());
+    }
+
+    #[tokio::test]
+    async fn racing_attach_ack_is_not_authoritative_until_event_write_succeeds() {
+        use std::{
+            future::Future,
+            pin::Pin,
+            sync::atomic::AtomicBool,
+            task::{Context, Poll},
+        };
+
+        struct GatedWriter {
+            release: oneshot::Receiver<()>,
+            write_polled: Arc<AtomicBool>,
+        }
+
+        impl AsyncWrite for GatedWriter {
+            fn poll_write(
+                mut self: Pin<&mut Self>,
+                context: &mut Context<'_>,
+                bytes: &[u8],
+            ) -> Poll<io::Result<usize>> {
+                self.write_polled.store(true, Ordering::Release);
+                match Pin::new(&mut self.release).poll(context) {
+                    Poll::Ready(_) => Poll::Ready(Ok(bytes.len())),
+                    Poll::Pending => Poll::Pending,
+                }
+            }
+
+            fn poll_flush(
+                self: Pin<&mut Self>,
+                _context: &mut Context<'_>,
+            ) -> Poll<io::Result<()>> {
+                Poll::Ready(Ok(()))
+            }
+
+            fn poll_shutdown(
+                self: Pin<&mut Self>,
+                _context: &mut Context<'_>,
+            ) -> Poll<io::Result<()>> {
+                Poll::Ready(Ok(()))
+            }
+        }
+
+        let (_temp, activation) = executable_fixture("#!/bin/sh\nexit 0\n");
+        let status = RuntimeStatusCache::default();
+        status.insert_starting(&activation, Uuid::new_v4(), Sequence(0), 0);
+        let (release, released) = oneshot::channel();
+        let write_polled = Arc::new(AtomicBool::new(false));
+        let (mut child, host) = tokio::io::duplex(MAX_FRAME_BYTES);
+        let writer_polled = Arc::clone(&write_polled);
+        let host_status = status.clone();
+        let task = tokio::spawn(async move {
+            let mut writer = GatedWriter {
+                release: released,
+                write_polled: writer_polled,
+            };
+            let mut stdout = BufReader::new(host);
+            let mut ledger = AckLedger::default();
+            let mut child_status = None;
+            let event = serde_json::json!({"frame": "event"});
+            let result = write_attach_frame(
+                &mut writer,
+                &mut stdout,
+                &event,
+                Some(Sequence(1)),
+                &mut ledger,
+                &mut child_status,
+                &host_status,
+                &activation,
+                &CancellationToken::new(),
+                tokio::time::Instant::now() + Duration::from_secs(5),
+            )
+            .await;
+            (result, ledger)
+        });
+
+        while !write_polled.load(Ordering::Acquire) {
+            tokio::task::yield_now().await;
+        }
+        let ack = Ack {
+            protocol: ProtocolName,
+            version: ProtocolV1,
+            frame: ocean_agent_sdk::extension_lifecycle::AckFrame,
+            sequence: Sequence(1),
+        };
+        child.write_all(&encode_frame(&ack).unwrap()).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(25)).await;
+        assert_eq!(status.snapshot()[0].last_acknowledged_sequence, None);
+        assert!(!task.is_finished());
+
+        release.send(()).unwrap();
+        let (result, ledger) = task.await.unwrap();
+        assert_eq!(result, Ok(()));
+        assert_eq!(ledger.last_ack, Some(1));
+        assert_eq!(
+            status.snapshot()[0].last_acknowledged_sequence,
+            Some(Sequence(1))
+        );
+    }
+
+    #[tokio::test]
+    async fn real_child_guessed_ack_before_reading_replay_is_validated_only_after_send() {
+        let script = r#"#!/bin/sh
+IFS= read -r hello || exit 10
+printf waiting > "$HOME/host-hello-read"
+while [ ! -f "$HOME/release-hello" ]; do sleep 0.01; done
+printf '%s\n' '{"protocol":"ocean.extension.service","version":1,"frame":"service_hello","subscriptions":["session_started"],"resume":null}'
+IFS= read -r ready || exit 11
+printf '%s\n' '{"protocol":"ocean.extension.service","version":1,"frame":"ack","sequence":"1"}'
+printf guessed > "$HOME/guessed-ack-sent"
+sleep 1
+IFS= read -r event || exit 12
+IFS= read -r shutdown || exit 13
+printf '%s\n' '{"protocol":"ocean.extension.service","version":1,"frame":"shutdown_complete"}'
+"#;
+        let (temp, mut activation) = executable_fixture(script);
+        install_fixture_store(&temp, &mut activation);
+        activation.events = vec![LifecycleEventKind::SessionStarted];
+        let data = activation
+            .config_dir
+            .join("extensions/state/example.noop/data");
+        let marker = data.join("guessed-ack-sent");
+        let lifecycle = LifecycleDispatcher::new(Uuid::new_v4(), HashSet::new());
+        let cancel = CancellationToken::new();
+        let status = RuntimeStatusCache::default();
+        let task = tokio::spawn(run_service_a2b(
+            activation,
+            Arc::clone(&lifecycle),
+            cancel.clone(),
+            status.clone(),
+        ));
+
+        wait_for_fixture_marker(&data.join("host-hello-read")).await;
+        lifecycle.publish(LifecycleSource::ExplicitSessionCreated {
+            succeeded: true,
+            scope: lifecycle.source_scope(None, Some(Uuid::new_v4()), None, None, None),
+            stamp: super::super::extension_lifecycle::event_stamp(),
+            title: "discarded".into(),
+            cwd: "/discarded".into(),
+        });
+        fs::write(data.join("release-hello"), b"release").unwrap();
+        wait_for_fixture_marker(&marker).await;
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while status.snapshot()[0].last_acknowledged_sequence != Some(Sequence(1)) {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("guessed ACK was not validated after the replay event was sent");
+        assert_eq!(status.snapshot()[0].state, RuntimeState::Healthy);
+        cancel.cancel();
+        assert!(await_fixture_service(task).await.is_none());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn pong_deadline_starts_only_after_a_slow_successful_ping_write() {
+        let (mut writer, mut reader) = tokio::io::duplex(1);
+        let ping = HostControl::Ping(Ping {
+            protocol: ProtocolName,
+            version: ProtocolV1,
+            frame: PingFrame,
+            nonce: Uuid::new_v4(),
+        });
+        let started = tokio::time::Instant::now();
+        let drain = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_secs(1)).await;
+            let mut bytes = Vec::new();
+            loop {
+                let mut byte = [0_u8; 1];
+                if reader.read_exact(&mut byte).await.is_err() || byte[0] == b'\n' {
+                    break;
+                }
+                bytes.push(byte[0]);
+            }
+            bytes
+        });
+        write_control(&mut writer, &ping).await.unwrap();
+        let deadline = pong_deadline_after_ping_write();
+        assert!(deadline.duration_since(started) >= Duration::from_secs(6));
+        drop(writer);
+        let _ = drain.await.unwrap();
+    }
+
+    #[test]
+    fn activation_epoch_replay_rejects_widening_old_boot_and_ineligible_cursors() {
+        let boot = Uuid::new_v4();
+        let project_a = Uuid::new_v4();
+        let project_b = Uuid::new_v4();
+        let dispatcher = LifecycleDispatcher::new(boot, HashSet::from([project_a, project_b]));
+        dispatcher.publish(LifecycleSource::DaemonStarted {
+            daemon_version: "0.1.0".to_owned(),
+            stamp: super::super::extension_lifecycle::event_stamp(),
+        });
+        let floor = dispatcher.current_sequence();
+        for (project, session) in [(project_a, Uuid::new_v4()), (project_b, Uuid::new_v4())] {
+            dispatcher.publish(LifecycleSource::ExplicitSessionCreated {
+                succeeded: true,
+                scope: dispatcher.source_scope(Some(project), Some(session), None, None, None),
+                stamp: super::super::extension_lifecycle::event_stamp(),
+                title: "forbidden-title".to_owned(),
+                cwd: "/forbidden/path".to_owned(),
+            });
+        }
+        let attach = dispatcher.attach();
+        let scope_a = ActivationScope {
+            global: false,
+            projects: HashSet::from([project_a]),
+        };
+        let subscriptions = vec![
+            LifecycleEventKind::DaemonStarted,
+            LifecycleEventKind::SessionStarted,
+        ];
+        let eligible = eligible_events(&attach, &scope_a, &subscriptions, floor);
+        assert_eq!(
+            eligible
+                .iter()
+                .filter(|event| event.kind == LifecycleEventKind::SessionStarted)
+                .count(),
+            1
+        );
+        let epoch = Uuid::new_v4();
+        let (reset, replay) = replay_plan(
+            Some(&ResumeCursor {
+                daemon_boot_id: boot,
+                activation_epoch: epoch,
+                after_sequence: floor,
+            }),
+            boot,
+            epoch,
+            floor,
+            &eligible,
+        );
+        assert!(reset.is_none());
+        assert_eq!(replay.len(), 1);
+
+        let (reset, replay) = replay_plan(
+            Some(&ResumeCursor {
+                daemon_boot_id: Uuid::new_v4(),
+                activation_epoch: epoch,
+                after_sequence: floor,
+            }),
+            boot,
+            epoch,
+            floor,
+            &eligible,
+        );
+        assert!(matches!(
+            reset.map(|frame| frame.reason),
+            Some(ResetReason::BootChanged)
+        ));
+        assert!(replay.is_empty());
+
+        // Widening creates a floor at the current sequence. The older project-B
+        // event is therefore ineligible even though the new scope contains B.
+        let widened_floor = dispatcher.current_sequence();
+        let widened = eligible_events(
+            &dispatcher.attach(),
+            &ActivationScope {
+                global: false,
+                projects: HashSet::from([project_a, project_b]),
+            },
+            &subscriptions,
+            widened_floor,
+        );
+        assert!(widened
+            .iter()
+            .all(|event| event.kind == LifecycleEventKind::DaemonStarted));
+    }
+
+    #[tokio::test]
+    async fn maximum_replay_concurrently_drains_an_ack_for_every_event() {
+        let script = r#"#!/bin/sh
+IFS= read -r hello || exit 10
+printf ready > "$HOME/host-hello-read"
+while [ ! -f "$HOME/release-hello" ]; do sleep 0.01; done
+printf '%s\n' '{"protocol":"ocean.extension.service","version":1,"frame":"service_hello","subscriptions":["session_started"],"resume":null}'
+IFS= read -r ready || exit 11
+while IFS= read -r frame; do
+ case "$frame" in
+  *'"frame":"event"'*) seq=${frame#*\"sequence\":\"}; seq=${seq%%\"*}; printf '{"protocol":"ocean.extension.service","version":1,"frame":"ack","sequence":"%s"}\n' "$seq" ;;
+  *'"frame":"ping"'*) nonce=${frame#*\"nonce\":\"}; nonce=${nonce%%\"*}; printf '{"protocol":"ocean.extension.service","version":1,"frame":"pong","nonce":"%s"}\n' "$nonce" ;;
+  *'"frame":"shutdown"'*) printf '%s\n' '{"protocol":"ocean.extension.service","version":1,"frame":"shutdown_complete"}'; exit 0 ;;
+ esac
+done
+"#;
+        let (temp, mut activation) = executable_fixture(script);
+        install_fixture_store(&temp, &mut activation);
+        activation.events = vec![LifecycleEventKind::SessionStarted];
+        activation.startup_timeout = Duration::from_secs(30);
+        let marker = activation
+            .config_dir
+            .join("extensions/state/example.noop/data/host-hello-read");
+        let release = activation
+            .config_dir
+            .join("extensions/state/example.noop/data/release-hello");
+        let lifecycle = LifecycleDispatcher::new(Uuid::new_v4(), HashSet::new());
+        let cancel = CancellationToken::new();
+        let status = RuntimeStatusCache::default();
+        let task = tokio::spawn(run_service_a2b(
+            activation,
+            Arc::clone(&lifecycle),
+            cancel.clone(),
+            status.clone(),
+        ));
+        tokio::time::timeout(Duration::from_secs(20), async {
+            while !marker.exists() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("child did not enter delayed hello");
+        for _ in 0..super::super::extension_lifecycle::BOOT_RING_MAX_EVENTS {
+            lifecycle.publish(LifecycleSource::ExplicitSessionCreated {
+                succeeded: true,
+                scope: lifecycle.source_scope(None, Some(Uuid::new_v4()), None, None, None),
+                stamp: super::super::extension_lifecycle::event_stamp(),
+                title: "discarded".into(),
+                cwd: "/discarded".into(),
+            });
+        }
+        let expected = lifecycle.current_sequence();
+        std::fs::write(release, b"release").unwrap();
+        tokio::time::timeout(Duration::from_secs(30), async {
+            loop {
+                if status.snapshot().first().is_some_and(|row| {
+                    row.state == RuntimeState::Healthy
+                        && row.last_acknowledged_sequence == Some(expected)
+                }) {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("maximum replay did not drain ACK-every-event traffic");
+        cancel.cancel();
+        assert!(task.await.expect("service task").is_none());
+    }
+
+    #[tokio::test]
+    async fn sustained_replay_without_acks_fails_at_the_bounded_ack_window() {
+        let script = r#"#!/bin/sh
+IFS= read -r hello || exit 10
+printf ready > "$HOME/host-hello-read"
+while [ ! -f "$HOME/release-hello" ]; do sleep 0.01; done
+printf '%s\n' '{"protocol":"ocean.extension.service","version":1,"frame":"service_hello","subscriptions":["session_started"],"resume":null}'
+IFS= read -r ready || exit 11
+while IFS= read -r frame; do
+ case "$frame" in
+  *'"frame":"shutdown"'*) printf '%s\n' '{"protocol":"ocean.extension.service","version":1,"frame":"shutdown_complete"}'; exit 0 ;;
+ esac
+done
+"#;
+        let (temp, mut activation) = executable_fixture(script);
+        install_fixture_store(&temp, &mut activation);
+        activation.events = vec![LifecycleEventKind::SessionStarted];
+        activation.startup_timeout = Duration::from_secs(15);
+        let marker = activation
+            .config_dir
+            .join("extensions/state/example.noop/data/host-hello-read");
+        let release = activation
+            .config_dir
+            .join("extensions/state/example.noop/data/release-hello");
+        let lifecycle = LifecycleDispatcher::new(Uuid::new_v4(), HashSet::new());
+        let status = RuntimeStatusCache::default();
+        let task = tokio::spawn(run_service_a2b(
+            activation,
+            Arc::clone(&lifecycle),
+            CancellationToken::new(),
+            status.clone(),
+        ));
+        tokio::time::timeout(Duration::from_secs(20), async {
+            while !marker.exists() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("child did not enter delayed hello");
+        for _ in 0..ACK_WINDOW_MAX + 32 {
+            lifecycle.publish(LifecycleSource::ExplicitSessionCreated {
+                succeeded: true,
+                scope: lifecycle.source_scope(None, Some(Uuid::new_v4()), None, None, None),
+                stamp: super::super::extension_lifecycle::event_stamp(),
+                title: "discarded".into(),
+                cwd: "/discarded".into(),
+            });
+        }
+        std::fs::write(release, b"release").unwrap();
+        assert!(tokio::time::timeout(Duration::from_secs(25), task)
+            .await
+            .expect("bounded ACK policy did not terminate")
+            .expect("service task")
+            .is_none());
+        assert_eq!(
+            status.snapshot()[0].reason,
+            Some(RuntimeReason::ProtocolViolation)
+        );
+    }
+
+    #[tokio::test]
+    async fn live_a2b_process_replays_acks_redacts_stderr_and_cleans_on_cancel() {
+        const SENTINEL: &str = "stage-a2b-secret-sentinel";
+        #[allow(clippy::useless_format)]
+        let script = format!(
+            "#!/bin/sh\nIFS= read -r hello\nprintf '%s\\n' '{{\"protocol\":\"ocean.extension.service\",\"version\":1,\"frame\":\"service_hello\",\"subscriptions\":[\"daemon_started\"],\"resume\":null}}'\nIFS= read -r ready\nprintf '%s\\n' \"$A2B_SENTINEL\" >&2\nwhile IFS= read -r frame; do\n case \"$frame\" in\n  *'\"frame\":\"event\"'*) seq=$(printf '%s' \"$frame\" | sed -n 's/.*\"sequence\":\"\\([^\"]*\\)\".*/\\1/p'); printf '{{\"protocol\":\"ocean.extension.service\",\"version\":1,\"frame\":\"ack\",\"sequence\":\"%s\"}}\\n' \"$seq\" ;;\n  *'\"frame\":\"ping\"'*) nonce=$(printf '%s' \"$frame\" | sed -n 's/.*\"nonce\":\"\\([^\"]*\\)\".*/\\1/p'); printf '{{\"protocol\":\"ocean.extension.service\",\"version\":1,\"frame\":\"pong\",\"nonce\":\"%s\"}}\\n' \"$nonce\" ;;\n  *'\"frame\":\"shutdown\"'*) printf '%s\\n' '{{\"protocol\":\"ocean.extension.service\",\"version\":1,\"frame\":\"shutdown_complete\"}}'; exit 0 ;;\n esac\ndone\n",
+        );
+        let (temp, mut activation) = executable_fixture(&script);
+        install_fixture_store(&temp, &mut activation);
+        activation.environment = vec!["A2B_SENTINEL".to_owned()];
+        let previous = std::env::var_os("A2B_SENTINEL");
+        std::env::set_var("A2B_SENTINEL", SENTINEL);
+
+        let boot = Uuid::new_v4();
+        let lifecycle = LifecycleDispatcher::new(boot, HashSet::new());
+        lifecycle.publish(LifecycleSource::DaemonStarted {
+            daemon_version: "0.1.0".to_owned(),
+            stamp: super::super::extension_lifecycle::event_stamp(),
+        });
+        let cancel = CancellationToken::new();
+        let status = RuntimeStatusCache::default();
+        let task = tokio::spawn(run_service_a2b(
+            activation,
+            Arc::clone(&lifecycle),
+            cancel.clone(),
+            status.clone(),
+        ));
+        let healthy = wait_for_runtime_state(&status, RuntimeState::Healthy).await;
+        assert!(healthy.pid.is_some());
+        for _ in 0..100 {
+            if status.snapshot()[0].last_acknowledged_sequence == Some(Sequence(1)) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert_eq!(
+            status.snapshot()[0].last_acknowledged_sequence,
+            Some(Sequence(1))
+        );
+        cancel.cancel();
+        assert!(tokio::time::timeout(Duration::from_secs(8), task)
+            .await
+            .expect("service cleanup timeout")
+            .expect("service task")
+            .is_none());
+        let final_status = status.snapshot().pop().expect("status");
+        assert_eq!(final_status.state, RuntimeState::Inactive);
+        assert!(final_status.stderr_redactions >= 1);
+        assert!(!serde_json::to_string(&final_status)
+            .unwrap()
+            .contains(SENTINEL));
+        match previous {
+            Some(value) => std::env::set_var("A2B_SENTINEL", value),
+            None => std::env::remove_var("A2B_SENTINEL"),
+        }
+    }
+
+    #[tokio::test]
+    async fn three_missed_pongs_trigger_ping_timeout_and_full_cleanup() {
+        let script = "#!/bin/sh\nIFS= read -r hello\nprintf '%s\\n' '{\"protocol\":\"ocean.extension.service\",\"version\":1,\"frame\":\"service_hello\",\"subscriptions\":[],\"resume\":null}'\nIFS= read -r ready\nwhile IFS= read -r frame; do\n case \"$frame\" in\n  *'\"frame\":\"shutdown\"'*) printf '%s\\n' '{\"protocol\":\"ocean.extension.service\",\"version\":1,\"frame\":\"shutdown_complete\"}'; exit 0 ;;\n esac\ndone\n";
+        let (temp, mut activation) = executable_fixture(script);
+        install_fixture_store(&temp, &mut activation);
+        activation.events.clear();
+        let lifecycle = LifecycleDispatcher::new(Uuid::new_v4(), HashSet::new());
+        let status = RuntimeStatusCache::default();
+        let task = tokio::spawn(run_service_a2b(
+            activation,
+            lifecycle,
+            CancellationToken::new(),
+            status.clone(),
+        ));
+        let healthy = wait_for_runtime_state(&status, RuntimeState::Healthy).await;
+        assert_eq!(healthy.state, RuntimeState::Healthy);
+        // Freeze time only after the real child has completed startup. Pausing
+        // from test entry lets Tokio auto-advance the startup deadline while an
+        // OS process is merely waiting for scheduler time under workspace load.
+        tokio::time::pause();
+        for delta in [10_u64, 5, 5, 5, 5, 5] {
+            tokio::time::advance(Duration::from_secs(delta)).await;
+            tokio::task::yield_now().await;
+        }
+        // The child is a real OS process while Tokio's clock is paused. Keep
+        // advancing bounded cleanup timers and yielding real scheduler time so
+        // the shell can consume shutdown and close its pipes; a paused Tokio
+        // timeout alone can otherwise remain pending on external process I/O.
+        for _ in 0..500 {
+            if task.is_finished() {
+                break;
+            }
+            tokio::time::advance(Duration::from_millis(100)).await;
+            std::thread::sleep(Duration::from_millis(1));
+            tokio::task::yield_now().await;
+        }
+        assert!(task.is_finished(), "health cleanup did not finish");
+        assert!(task.await.expect("service task").is_none());
+        let final_status = status.snapshot().pop().expect("status");
+        assert_eq!(final_status.reason, Some(RuntimeReason::PingTimeout));
+        assert_eq!(final_status.pid, None);
+    }
+
+    #[tokio::test]
+    async fn stderr_binary_newline_free_and_rate_flood_stay_bounded_and_redacted() {
+        const SENTINEL: &str = "stderr-secret-sentinel";
+        let script = "#!/bin/sh\nIFS= read -r hello\nprintf '%s\\n' '{\"protocol\":\"ocean.extension.service\",\"version\":1,\"frame\":\"service_hello\",\"subscriptions\":[],\"resume\":null}'\nIFS= read -r ready\nhead -c 10000 /dev/zero >&2\ni=0; while [ $i -lt 100 ]; do printf '%s\\n' \"$STDERR_SENTINEL\" >&2; i=$((i+1)); done\nprintf done > \"$HOME/stderr-done\"\nwhile IFS= read -r frame; do\n case \"$frame\" in\n  *'\"frame\":\"ping\"'*) nonce=$(printf '%s' \"$frame\" | sed -n 's/.*\"nonce\":\"\\([^\"]*\\)\".*/\\1/p'); printf '{\"protocol\":\"ocean.extension.service\",\"version\":1,\"frame\":\"pong\",\"nonce\":\"%s\"}\\n' \"$nonce\" ;;\n  *'\"frame\":\"shutdown\"'*) printf '%s\\n' '{\"protocol\":\"ocean.extension.service\",\"version\":1,\"frame\":\"shutdown_complete\"}'; exit 0 ;;\n esac\ndone\n";
+        let (temp, mut activation) = executable_fixture(script);
+        install_fixture_store(&temp, &mut activation);
+        activation.events.clear();
+        activation.environment = vec!["STDERR_SENTINEL".to_owned()];
+        let stderr_done = activation
+            .config_dir
+            .join("extensions/state/example.noop/data/stderr-done");
+        let previous = std::env::var_os("STDERR_SENTINEL");
+        std::env::set_var("STDERR_SENTINEL", SENTINEL);
+        let lifecycle = LifecycleDispatcher::new(Uuid::new_v4(), HashSet::new());
+        let cancel = CancellationToken::new();
+        let status = RuntimeStatusCache::default();
+        let task = tokio::spawn(run_service_a2b(
+            activation,
+            lifecycle,
+            cancel.clone(),
+            status.clone(),
+        ));
+        let _ = wait_for_runtime_state(&status, RuntimeState::Healthy).await;
+        tokio::time::timeout(Duration::from_secs(15), async {
+            while !stderr_done.exists() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("stderr fixture did not finish under load");
+        cancel.cancel();
+        assert!(task.await.expect("service task").is_none());
+        let final_status = status.snapshot().pop().expect("status");
+        assert!(final_status.stderr_bytes >= 10_000);
+        assert!(final_status.stderr_truncated_lines >= 1);
+        assert!(final_status.stderr_discarded_bytes > 0);
+        assert!(final_status.stderr_lines <= u64::from(STDERR_BURST));
+        assert!(final_status.stderr_redactions > 0);
+        assert!(!serde_json::to_string(&final_status)
+            .expect("status json")
+            .contains(SENTINEL));
+        match previous {
+            Some(value) => std::env::set_var("STDERR_SENTINEL", value),
+            None => std::env::remove_var("STDERR_SENTINEL"),
+        }
+    }
+
+    #[tokio::test]
+    async fn slow_reader_hits_bounded_data_queue_and_records_coalesced_lag() {
+        let script = "#!/bin/sh\nIFS= read -r hello\nprintf '%s\\n' '{\"protocol\":\"ocean.extension.service\",\"version\":1,\"frame\":\"service_hello\",\"subscriptions\":[\"session_started\"],\"resume\":null}'\nIFS= read -r ready\nsleep 10\n";
+        let (temp, mut activation) = executable_fixture(script);
+        install_fixture_store(&temp, &mut activation);
+        activation.events = vec![LifecycleEventKind::SessionStarted];
+        let lifecycle = LifecycleDispatcher::new(Uuid::new_v4(), HashSet::new());
+        let status = RuntimeStatusCache::default();
+        let task = tokio::spawn(run_service_a2b(
+            activation,
+            Arc::clone(&lifecycle),
+            CancellationToken::new(),
+            status.clone(),
+        ));
+        let _ = wait_for_runtime_state(&status, RuntimeState::Healthy).await;
+        for _ in 0..1_000 {
+            lifecycle.publish(LifecycleSource::ExplicitSessionCreated {
+                succeeded: true,
+                scope: lifecycle.source_scope(None, Some(Uuid::new_v4()), None, None, None),
+                stamp: super::super::extension_lifecycle::event_stamp(),
+                title: "never serialized".to_owned(),
+                cwd: "/never/serialized".to_owned(),
+            });
+        }
+        assert!(tokio::time::timeout(Duration::from_secs(8), task)
+            .await
+            .expect("blocked writer did not fail within its deadline")
+            .expect("service task")
+            .is_none());
+        let final_status = status.snapshot().pop().expect("status");
+        assert!(final_status.lag_count > 0);
+        assert_eq!(final_status.reason, Some(RuntimeReason::ProtocolViolation));
+    }
+
+    #[test]
+    fn restart_backoff_schedule_and_circuit_threshold_match_the_ratified_policy() {
+        assert_eq!(
+            BACKOFF,
+            [
+                Duration::from_millis(250),
+                Duration::from_millis(500),
+                Duration::from_secs(1),
+                Duration::from_secs(2),
+                Duration::from_secs(4),
+                Duration::from_secs(8),
+                Duration::from_secs(16),
+                Duration::from_secs(30),
+            ]
+        );
+        assert_eq!(FAILURE_WINDOW, Duration::from_secs(60));
+        assert_eq!(CIRCUIT_FAILURES, 5);
+        assert_eq!(STABLE_RESET, Duration::from_secs(5 * 60));
+    }
+
+    #[tokio::test]
+    async fn on_failure_crash_loop_opens_circuit_after_exact_threshold() {
+        let script = "#!/bin/sh\nIFS= read -r hello\nprintf '%s\\n' '{\"protocol\":\"ocean.extension.service\",\"version\":1,\"frame\":\"service_hello\",\"subscriptions\":[],\"resume\":null}'\nIFS= read -r ready\nexit 17\n";
+        let (temp, mut activation) = executable_fixture(script);
+        install_fixture_store(&temp, &mut activation);
+        activation.events.clear();
+        activation.restart_on_failure = true;
+        let lifecycle = LifecycleDispatcher::new(Uuid::new_v4(), HashSet::new());
+        let status = RuntimeStatusCache::default();
+        let result = tokio::time::timeout(
+            Duration::from_secs(10),
+            run_service_a2b(
+                activation,
+                lifecycle,
+                CancellationToken::new(),
+                status.clone(),
+            ),
+        )
+        .await
+        .expect("circuit did not open");
+        assert!(result.is_none());
+        let circuit = wait_for_runtime_state(&status, RuntimeState::CircuitOpen).await;
+        assert_eq!(circuit.restart_count, 4);
+        assert_eq!(circuit.reason, Some(RuntimeReason::UnexpectedExit));
+    }
+
+    #[tokio::test]
+    async fn scope_only_epoch_change_preserves_open_circuit_and_does_not_respawn() {
+        let (temp, mut activation) =
+            executable_fixture("#!/bin/sh\nprintf spawned > \"$HOME/should-not-exist\"\n");
+        install_fixture_store(&temp, &mut activation);
+        activation.restart_on_failure = true;
+        activation.effective_global = false;
+        activation.effective_projects = HashSet::from([Uuid::new_v4()]);
+        let marker = activation
+            .config_dir
+            .join("extensions/state/example.noop/data/should-not-exist");
+        let history = Arc::new(std::sync::Mutex::new(RestartHistory {
+            circuit_open: true,
+            blocked_reason: Some(RuntimeReason::UnexpectedExit),
+            ..RestartHistory::default()
+        }));
+        let lifecycle = LifecycleDispatcher::new(Uuid::new_v4(), HashSet::new());
+        let status = RuntimeStatusCache::default();
+        let result = run_service_with_epoch(
+            activation,
+            lifecycle,
+            CancellationToken::new(),
+            status.clone(),
+            Uuid::new_v4(),
+            Sequence(99),
+            ActivationScope {
+                global: false,
+                projects: HashSet::from([Uuid::new_v4()]),
+            },
+            Arc::new(std::sync::Mutex::new(ShutdownReason::Reconfigure)),
+            history,
+        )
+        .await;
+        assert!(result.is_none());
+        assert!(!marker.exists());
+        assert_eq!(status.snapshot()[0].state, RuntimeState::CircuitOpen);
     }
 
     #[test]
@@ -1636,14 +4213,52 @@ mod tests {
     }
 
     #[test]
+    fn runtime_status_retains_ack_only_for_process_restart_in_the_same_epoch() {
+        let (_temp, activation) = executable_fixture("#!/bin/sh\nexit 0\n");
+        let cache = RuntimeStatusCache::default();
+        let first_epoch = Uuid::new_v4();
+        cache.insert_starting(&activation, first_epoch, Sequence(7), 0);
+        cache.update_ack(&activation, Sequence(11));
+        cache.add_lag(&activation, 3);
+
+        cache.insert_starting(&activation, first_epoch, Sequence(7), 1);
+        let same_epoch = cache.snapshot().pop().expect("same epoch status");
+        assert_eq!(same_epoch.last_acknowledged_sequence, Some(Sequence(11)));
+        assert_eq!(same_epoch.lag_count, 3);
+
+        cache.insert_starting(&activation, Uuid::new_v4(), Sequence(20), 0);
+        let new_epoch = cache.snapshot().pop().expect("new epoch status");
+        assert_eq!(new_epoch.last_acknowledged_sequence, None);
+        assert_eq!(new_epoch.lag_count, 0);
+        assert_eq!(new_epoch.replay_floor, Sequence(20));
+    }
+
+    #[test]
+    fn runtime_status_cache_prunes_removed_service_keys() {
+        let (_temp_a, activation_a) = executable_fixture("#!/bin/sh\nexit 0\n");
+        let (_temp_b, mut activation_b) = executable_fixture("#!/bin/sh\nexit 0\n");
+        activation_b.package_id = "example.other".into();
+        let cache = RuntimeStatusCache::default();
+        cache.insert_starting(&activation_a, Uuid::new_v4(), Sequence(0), 0);
+        cache.insert_starting(&activation_b, Uuid::new_v4(), Sequence(0), 0);
+        cache.retain_only(&HashSet::from([RuntimeStatusCache::key(&activation_a)]));
+        let rows = cache.snapshot();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].package_id, activation_a.package_id);
+    }
+
+    #[test]
     fn runtime_status_has_no_argv_environment_secret_or_diagnostic_text_fields() {
         let (_temp, activation) = executable_fixture("#!/bin/sh\nexit 0\n");
         let cache = RuntimeStatusCache::default();
-        cache.insert_starting(&activation, Uuid::nil());
+        cache.insert_starting(&activation, Uuid::nil(), Sequence(0), 0);
+        cache.record_temp_cleanup_failure(&activation);
         let encoded = serde_json::to_string(&cache.snapshot()).unwrap();
-        for forbidden in ["args", "environment", "secret", "stderr", "diagnostic"] {
+        for forbidden in ["args", "environment", "secret-sentinel", "diagnostic_text"] {
             assert!(!encoded.contains(forbidden));
         }
+        assert!(encoded.contains("stderr_bytes"));
+        assert!(encoded.contains("\"temp_cleanup_failures\":1"));
         assert_eq!(cache.snapshot()[0].state, RuntimeState::Starting);
     }
 
@@ -1800,7 +4415,7 @@ printf '%s\n' '{"protocol":"ocean.extension.service","version":1,"frame":"shutdo
             cancel.clone(),
             status.clone(),
         ));
-        tokio::time::timeout(Duration::from_secs(3), async {
+        tokio::time::timeout(Duration::from_secs(15), async {
             loop {
                 if status
                     .snapshot()
@@ -2011,16 +4626,219 @@ printf temp > "$TMPDIR/temp-proof"
     }
 
     #[tokio::test]
+    async fn supervisor_immediately_retries_and_retains_exceptional_startup_cleanup() {
+        let script = r#"#!/bin/sh
+printf '%s' $$ > "$HOME/leader.pid"
+printf started > "$HOME/startup-entered"
+sleep 30
+"#;
+        let (temp, mut activation) = executable_fixture(script);
+        install_fixture_store(&temp, &mut activation);
+        activation.events.clear();
+        activation.startup_timeout = Duration::from_secs(1);
+        let config = activation.config_dir.clone();
+        let data = config.join("extensions/state/example.noop/data");
+        let supervisor = ExtensionSupervisor::new_with_lifecycle(LifecycleDispatcher::new(
+            Uuid::new_v4(),
+            HashSet::new(),
+        ));
+        let managed = supervisor.spawn_managed(
+            activation,
+            Arc::new(std::sync::Mutex::new(RestartHistory::default())),
+        );
+
+        wait_for_fixture_marker(&data.join("startup-entered")).await;
+        let (named, retained) = replace_active_temp_generation(&config);
+        wait_for_managed_completion(&managed).await;
+
+        // The completed service task itself performed the bounded exceptional
+        // retry and transferred the still-failed descriptor authority to the
+        // supervisor. No later reconfigure/shutdown poll was needed.
+        assert_eq!(supervisor.retained_cleanup.lock().await.len(), 1);
+        assert_eq!(
+            supervisor
+                .stop_managed(managed, ShutdownReason::Reconfigure)
+                .await,
+            Err(ProjectSnapshotError::CleanupIncomplete)
+        );
+        let leader: libc::pid_t = fs::read_to_string(data.join("leader.pid"))
+            .unwrap()
+            .parse()
+            .unwrap();
+        assert!(!group_has_live_members(leader).unwrap());
+        assert_eq!(
+            supervisor.status.snapshot()[0].reason,
+            Some(RuntimeReason::StartupTimeout)
+        );
+
+        restore_active_temp_generation(&named, &retained);
+        assert_eq!(supervisor.retry_retained_cleanup().await, Ok(()));
+        assert!(supervisor.retained_cleanup.lock().await.is_empty());
+        assert!(!named.exists());
+    }
+
+    #[tokio::test]
+    async fn supervisor_production_path_cleans_protocol_circuit_and_shutdown() {
+        let protocol_script = r#"#!/bin/sh
+IFS= read -r hello || exit 10
+printf '%s\n' '{"protocol":"ocean.extension.service","version":1,"frame":"service_hello","subscriptions":[],"resume":null}'
+IFS= read -r ready || exit 11
+printf '%s\n' '{malformed'
+IFS= read -r shutdown || exit 12
+printf '%s\n' '{"protocol":"ocean.extension.service","version":1,"frame":"shutdown_complete"}'
+"#;
+        let (protocol_temp, mut protocol) = executable_fixture(protocol_script);
+        install_fixture_store(&protocol_temp, &mut protocol);
+        protocol.events.clear();
+        let protocol_supervisor = ExtensionSupervisor::new_with_lifecycle(
+            LifecycleDispatcher::new(Uuid::new_v4(), HashSet::new()),
+        );
+        let protocol_managed = protocol_supervisor.spawn_managed(
+            protocol,
+            Arc::new(std::sync::Mutex::new(RestartHistory::default())),
+        );
+        wait_for_managed_completion(&protocol_managed).await;
+        assert_eq!(
+            protocol_supervisor
+                .stop_managed(protocol_managed, ShutdownReason::Reconfigure)
+                .await,
+            Ok(())
+        );
+        let protocol_status = protocol_supervisor.status.snapshot();
+        assert_eq!(
+            protocol_status[0].reason,
+            Some(RuntimeReason::ProtocolViolation)
+        );
+        assert_eq!(protocol_status[0].pid, None);
+
+        let circuit_script = r#"#!/bin/sh
+IFS= read -r hello || exit 10
+printf '%s\n' '{"protocol":"ocean.extension.service","version":1,"frame":"service_hello","subscriptions":[],"resume":null}'
+IFS= read -r ready || exit 11
+exit 17
+"#;
+        let (circuit_temp, mut circuit) = executable_fixture(circuit_script);
+        install_fixture_store(&circuit_temp, &mut circuit);
+        circuit.events.clear();
+        circuit.restart_on_failure = true;
+        let circuit_supervisor = ExtensionSupervisor::new_with_lifecycle(LifecycleDispatcher::new(
+            Uuid::new_v4(),
+            HashSet::new(),
+        ));
+        let circuit_managed = circuit_supervisor.spawn_managed(
+            circuit,
+            Arc::new(std::sync::Mutex::new(RestartHistory::default())),
+        );
+        wait_for_managed_completion(&circuit_managed).await;
+        assert_eq!(
+            circuit_supervisor
+                .stop_managed(circuit_managed, ShutdownReason::Reconfigure)
+                .await,
+            Ok(())
+        );
+        let circuit_status = circuit_supervisor.status.snapshot();
+        assert_eq!(circuit_status[0].state, RuntimeState::CircuitOpen);
+        assert_eq!(circuit_status[0].restart_count, 4);
+        assert_eq!(circuit_status[0].pid, None);
+
+        let shutdown_script = r#"#!/bin/sh
+IFS= read -r hello || exit 10
+printf '%s\n' '{"protocol":"ocean.extension.service","version":1,"frame":"service_hello","subscriptions":[],"resume":null}'
+IFS= read -r ready || exit 11
+while IFS= read -r frame; do
+ case "$frame" in
+  *'"frame":"ping"'*) nonce=${frame#*\"nonce\":\"}; nonce=${nonce%%\"*}; printf '{"protocol":"ocean.extension.service","version":1,"frame":"pong","nonce":"%s"}\n' "$nonce" ;;
+  *'"frame":"shutdown"'*'"reason":"daemon_stopping"'*) printf stopped > "$HOME/shutdown-received"; printf '%s\n' '{"protocol":"ocean.extension.service","version":1,"frame":"shutdown_complete"}'; exit 0 ;;
+ esac
+done
+"#;
+        let (shutdown_temp, mut shutdown) = executable_fixture(shutdown_script);
+        install_fixture_store(&shutdown_temp, &mut shutdown);
+        shutdown.events.clear();
+        let shutdown_marker = shutdown
+            .config_dir
+            .join("extensions/state/example.noop/data/shutdown-received");
+        let shutdown_supervisor = ExtensionSupervisor::new_with_lifecycle(
+            LifecycleDispatcher::new(Uuid::new_v4(), HashSet::new()),
+        );
+        let shutdown_managed = shutdown_supervisor.spawn_managed(
+            shutdown,
+            Arc::new(std::sync::Mutex::new(RestartHistory::default())),
+        );
+        let _ = wait_for_runtime_state(&shutdown_supervisor.status, RuntimeState::Healthy).await;
+        assert_eq!(
+            shutdown_supervisor
+                .stop_managed(shutdown_managed, ShutdownReason::DaemonStopping)
+                .await,
+            Ok(())
+        );
+        assert!(shutdown_marker.exists());
+        let shutdown_status = shutdown_supervisor.status.snapshot();
+        assert_eq!(shutdown_status[0].state, RuntimeState::Inactive);
+        assert_eq!(shutdown_status[0].pid, None);
+    }
+
+    #[tokio::test]
+    async fn supervisor_health_failure_cleans_through_managed_owner() {
+        let script = r#"#!/bin/sh
+IFS= read -r hello || exit 10
+printf '%s\n' '{"protocol":"ocean.extension.service","version":1,"frame":"service_hello","subscriptions":[],"resume":null}'
+IFS= read -r ready || exit 11
+while IFS= read -r frame; do
+ case "$frame" in
+  *'"frame":"shutdown"'*) printf '%s\n' '{"protocol":"ocean.extension.service","version":1,"frame":"shutdown_complete"}'; exit 0 ;;
+ esac
+done
+"#;
+        let (temp, mut activation) = executable_fixture(script);
+        install_fixture_store(&temp, &mut activation);
+        activation.events.clear();
+        let supervisor = ExtensionSupervisor::new_with_lifecycle(LifecycleDispatcher::new(
+            Uuid::new_v4(),
+            HashSet::new(),
+        ));
+        let managed = supervisor.spawn_managed(
+            activation,
+            Arc::new(std::sync::Mutex::new(RestartHistory::default())),
+        );
+        let _ = wait_for_runtime_state(&supervisor.status, RuntimeState::Healthy).await;
+
+        tokio::time::pause();
+        for delta in [10_u64, 5, 5, 5, 5, 5] {
+            tokio::time::advance(Duration::from_secs(delta)).await;
+            tokio::task::yield_now().await;
+        }
+        for _ in 0..500 {
+            if managed.task.is_finished() {
+                break;
+            }
+            tokio::time::advance(Duration::from_millis(100)).await;
+            std::thread::sleep(Duration::from_millis(1));
+            tokio::task::yield_now().await;
+        }
+        assert!(managed.task.is_finished());
+        assert_eq!(
+            supervisor
+                .stop_managed(managed, ShutdownReason::Reconfigure)
+                .await,
+            Ok(())
+        );
+        let status = supervisor.status.snapshot();
+        assert_eq!(status[0].reason, Some(RuntimeReason::PingTimeout));
+        assert_eq!(status[0].pid, None);
+    }
+
+    #[tokio::test]
     async fn startup_timeout_cleans_process_group_and_preserves_reason() {
         let (temp, mut activation) =
             executable_fixture("#!/bin/sh\nprintf '%s' $$ > \"$HOME/leader.pid\"\nsleep 30\n");
         install_fixture_store(&temp, &mut activation);
         activation.events.clear();
-        activation.startup_timeout = Duration::from_millis(150);
+        activation.startup_timeout = Duration::from_secs(10);
         let config = activation.config_dir.clone();
         let status = RuntimeStatusCache::default();
         let retained = tokio::time::timeout(
-            Duration::from_secs(8),
+            Duration::from_secs(20),
             run_service(
                 activation,
                 Uuid::new_v4(),
@@ -2095,7 +4913,7 @@ printf '%s\n' '{{"protocol":"ocean.extension.service","version":1,"frame":"shutd
             cancel.clone(),
             status.clone(),
         ));
-        tokio::time::timeout(Duration::from_secs(3), async {
+        tokio::time::timeout(Duration::from_secs(20), async {
             loop {
                 if status.snapshot().first().is_some_and(|row| {
                     matches!(row.state, RuntimeState::Healthy | RuntimeState::Unhealthy)
@@ -2133,33 +4951,28 @@ IFS= read -r hello || exit 10
 printf '%s\n' '{"protocol":"ocean.extension.service","version":1,"frame":"service_hello","subscriptions":[],"resume":null}'
 IFS= read -r ready || exit 11
 printf '%s\n' '{"protocol":"ocean.extension.service","version":1,"frame":"ack","sequence":"1"}'
+printf ready > "$HOME/invalid-ack-sent"
 IFS= read -r shutdown || exit 12
 printf '%s\n' '{"protocol":"ocean.extension.service","version":1,"frame":"shutdown_complete"}'
 "#;
         let (temp, mut activation) = executable_fixture(script);
+        install_fixture_store(&temp, &mut activation);
         activation.events.clear();
-        let config = temp.path().join("config");
-        fs::create_dir(&config).unwrap();
-        activation.config_dir = config.clone();
-        fs::create_dir(config.join("extensions")).unwrap();
-        let store = config
-            .join("extensions/store/example.noop")
-            .join("a".repeat(64));
-        fs::create_dir_all(store.parent().unwrap()).unwrap();
-        fs::rename(&activation.package_path, &store).unwrap();
-        activation.package_path = store;
+        let marker = activation
+            .config_dir
+            .join("extensions/state/example.noop/data/invalid-ack-sent");
         let status = RuntimeStatusCache::default();
-        let retained = tokio::time::timeout(
-            Duration::from_secs(5),
-            run_service(
-                activation,
-                Uuid::new_v4(),
-                CancellationToken::new(),
-                status.clone(),
-            ),
-        )
-        .await
-        .unwrap();
+        let task = tokio::spawn(run_service(
+            activation,
+            Uuid::new_v4(),
+            CancellationToken::new(),
+            status.clone(),
+        ));
+
+        // Synchronize on the invalid frame reaching the host pipe so startup
+        // scheduling is not charged to the cleanup watchdog.
+        wait_for_fixture_marker(&marker).await;
+        let retained = await_fixture_service(task).await;
         assert!(retained.is_none());
         assert_eq!(status.snapshot()[0].state, RuntimeState::Unhealthy);
         assert_eq!(
@@ -2210,15 +5023,16 @@ IFS= read -r ready || exit 11
 exit 0
 "#;
 
-        // Repeat the fixture so both stdout EOF and the 50 ms leader poll can
-        // win scheduling without changing the fixed operator-visible cause.
-        for _ in 0..8 {
+        // Repeat under the same multi-threaded process load used by the
+        // workspace gate so EOF and the leader poll may race without relying on
+        // a narrow cleanup wall clock.
+        for _ in 0..16 {
             let (temp, mut activation) = executable_fixture(script);
             install_fixture_store(&temp, &mut activation);
             activation.events.clear();
             let status = RuntimeStatusCache::default();
             let retained = tokio::time::timeout(
-                Duration::from_secs(5),
+                Duration::from_secs(15),
                 run_service(
                     activation,
                     Uuid::new_v4(),
@@ -2243,38 +5057,54 @@ exit 0
 IFS= read -r hello || exit 10
 printf '%s\n' '{"protocol":"ocean.extension.service","version":1,"frame":"service_hello","subscriptions":[],"resume":null}'
 IFS= read -r ready || exit 11
-sleep 30 &
+(
+  printf ready > "$HOME/grandchild-ready"
+  exec sleep 30
+) &
 printf '%s' "$!" > "$HOME/grandchild.pid"
+while [ ! -f "$HOME/grandchild-ready" ]; do sleep 0.01; done
+printf '%s' "$$" > "$HOME/leader.pid"
+printf ready > "$HOME/leader-ready"
+while [ ! -f "$HOME/release-leader" ]; do sleep 0.01; done
 exit 0
 "#;
         let (temp, mut activation) = executable_fixture(script);
+        install_fixture_store(&temp, &mut activation);
         activation.events.clear();
-        let config = temp.path().join("config");
-        fs::create_dir(&config).unwrap();
-        activation.config_dir = config.clone();
-        fs::create_dir(config.join("extensions")).unwrap();
-        let store = config
-            .join("extensions/store/example.noop")
-            .join("a".repeat(64));
-        fs::create_dir_all(store.parent().unwrap()).unwrap();
-        fs::rename(&activation.package_path, &store).unwrap();
-        activation.package_path = store;
+        let data = activation
+            .config_dir
+            .join("extensions/state/example.noop/data");
         let status = RuntimeStatusCache::default();
-        let retained = tokio::time::timeout(
-            Duration::from_secs(5),
-            run_service(activation, Uuid::new_v4(), CancellationToken::new(), status),
-        )
-        .await
-        .unwrap();
-        assert!(retained.is_none());
-        let grandchild: libc::pid_t =
-            fs::read_to_string(config.join("extensions/state/example.noop/data/grandchild.pid"))
-                .unwrap()
-                .parse()
-                .unwrap();
+        let task = tokio::spawn(run_service(
+            activation,
+            Uuid::new_v4(),
+            CancellationToken::new(),
+            status,
+        ));
+
+        // The child-originated marker proves the descendant is running before
+        // the test releases the leader to exit; this removes the fork/exit race
+        // without changing the inherited-pipe cleanup case under test.
+        wait_for_fixture_marker(&data.join("leader-ready")).await;
+        let leader: libc::pid_t = fs::read_to_string(data.join("leader.pid"))
+            .unwrap()
+            .parse()
+            .unwrap();
+        let grandchild: libc::pid_t = fs::read_to_string(data.join("grandchild.pid"))
+            .unwrap()
+            .parse()
+            .unwrap();
         // SAFETY: signal 0 performs an existence check only.
-        let exists = unsafe { libc::kill(grandchild, 0) } == 0;
-        assert!(!exists, "surviving grandchild was not cleaned");
+        assert_eq!(unsafe { libc::kill(grandchild, 0) }, 0);
+        assert!(group_has_live_members(leader).unwrap());
+        fs::write(data.join("release-leader"), b"release").unwrap();
+
+        let retained = await_fixture_service(task).await;
+        assert!(retained.is_none());
+        assert!(
+            !group_has_live_members(leader).unwrap(),
+            "surviving grandchild remained live after group cleanup"
+        );
     }
 
     #[tokio::test]
@@ -2321,7 +5151,11 @@ exit 0
         }
         let child = command.spawn().unwrap();
         let owner = ProcessGroupOwner::new(child.id().unwrap());
-        let mut authority = CleanupAuthority { child, owner };
+        let mut authority = CleanupAuthority {
+            child,
+            owner,
+            roots: None,
+        };
         let syscalls = FailingSignalSyscalls {
             signal_calls: Cell::new(0),
         };
@@ -2336,7 +5170,15 @@ exit 0
         assert!(authority.owner.leader_owned());
         assert!(authority.child.try_wait().unwrap().is_none());
 
-        assert!(terminate_process_group(&mut authority.child, &mut authority.owner).await);
+        // Model a surviving descendant that inherited stderr: diagnostics must
+        // be aborted/bounded before retained process authority is retried.
+        let diagnostics = Arc::new(std::sync::Mutex::new(DiagnosticState::default()));
+        let diagnostics_task = tokio::spawn(std::future::pending::<()>());
+        let diagnostics_started = tokio::time::Instant::now();
+        let _ = finish_diagnostics(diagnostics_task, &diagnostics).await;
+        assert!(diagnostics_started.elapsed() < Duration::from_secs(1));
+
+        assert!(authority.cleanup().await);
     }
 
     #[tokio::test]

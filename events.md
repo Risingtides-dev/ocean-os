@@ -5677,3 +5677,104 @@ Clippy correctly rejected a generic checked conversion that is a no-op for
 Linux dev_t. Linux compares native u64 directly; macOS performs its required
 signed-to-u64 cast. The security predicate and generation binding are unchanged.
 _________________________________________________________________________________
+_________________________________________________________________________________
+time:      [04:33] [28-07-26]
+agent:     [api] [gpt-5.4] [worker]
+worktree:  [feat/extensions-stage-a2b]
+type:      [feature-request]
+area:      [backend]
+
+Completed the bounded Stage A2b implementation without registry mutation or A3
+scope. Wired the nine authoritative metadata-only lifecycle producers with
+request-scoped terminal and host tool correlation; added synchronous in-memory
+project snapshots, immutable activation epochs, replay/ACK/lag/reset and
+prioritized controls; and completed heartbeat, restart/backoff/circuit, redacted
+stderr, unsupported-platform reprojection, and generation-safe startup,
+reconfigure, and shutdown cleanup. Focused/fanout/full workspace gates, strict
+Clippy, formatting/docs, compatibility, Rust 1.88 MSRV, Linux musl, and the
+actual-source Windows portability cross-build pass. A2b remains pending
+independent review and authorizes no A3 work.
+_________________________________________________________________________________
+_________________________________________________________________________________
+time:      [05:33] [28-07-26]
+agent:     [api] [gpt-5.4] [worker]
+worktree:  [feat/extensions-stage-a2b]
+type:      [bug report]: Repair Stage A2b independent-review findings
+area:      [backend]: Extension lifecycle scope, replay, reconciliation, and cleanup
+
+Corrected the reviewed A2b lifecycle host without widening into A3: authoritative project identity now rejects explicit workspace/session scope mismatch; terminal authority and the captured orphan guard precede admission; cancellation deterministically resolves permission lifecycle as cancelled. Replay concurrently drains legal child frames under one cancellation-aware attach deadline, uses a fixed delivered-sequence ACK ledger with fail-closed exhaustion, requires a real retained floor cursor, and starts pong time only after ping write success. Project mutations now return success only after checked snapshot/epoch/reap reconciliation and otherwise expose a committed recovery error. Scope-only epochs preserve failure/circuit history, status rows prune removed services, temp cleanup failures are counted, and exceptional stderr/supervisor shutdown paths retain cleanup ownership instead of detaching it. Added mismatch, cancellation, pre-poll guard, project-recovery, maximum ACK-every-replay, no-ACK, cursor-floor, circuit-scope, slow-ping, cleanup-failure, status-bound, and repeated process-load coverage.
+_________________________________________________________________________________
+_________________________________________________________________________________
+time:      [18:18] [28-07-26]
+agent:     [api] [gpt-5.4] [worker]
+worktree:  [feat/extensions-stage-a2b]
+type:      [bug report]: Complete Stage A2b review-fix validation
+area:      [testing]: Extension process stability and portability gates
+
+Finished the uncommitted A2b review repairs and made their process fixtures
+stable under real parallel workspace load without changing production timeout
+policy. The attach path now preserves legal child status received during replay;
+replay fixtures use an explicit release barrier, heartbeat time pauses only after
+the real child is healthy, descendant cleanup tolerates bounded zombie reaping,
+and the common daemon test state injects its config root directly instead of
+racing process-global policy tests. Five consecutive parallel 36-test extension
+process runs, all 649 daemon tests, all workspace tests, strict workspace Clippy,
+format/docs/diff checks, compatibility, Rust 1.88 MSRV, full repository CI,
+Linux musl, and actual-source Windows GNU portability cross-builds pass.
+_________________________________________________________________________________
+_________________________________________________________________________________
+time:      [19:19] [28-07-26]
+agent:     [api] [gpt-5.4] [worker]
+worktree:  [feat/extensions-stage-a2b]
+type:      [bug report]: Stabilize final Stage A2b loaded-host process proofs
+area:      [testing]: Extension protocol rejection and descendant cleanup
+
+Replaced two undersized five-second aggregate fixture deadlines with explicit
+child-to-test phase barriers and a fixture-only watchdog sized above the intact
+production shutdown/write/TERM/KILL budget. The invalid-ACK proof now begins its
+cleanup bound only after the child has written the illegal frame. The abrupt-exit
+proof establishes a live inherited-pipe grandchild before releasing the leader,
+then checks the process group has no live member without depending on unrelated
+OS zombie reaping. Ten focused repeats and three full 97-test extension repeats
+passed while fresh workspace check and strict Clippy compilation ran concurrently;
+the complete local repository CI gate also passed. Production protocol and
+cleanup deadlines are unchanged, and no A3 scope was added.
+_________________________________________________________________________________
+_________________________________________________________________________________
+time:      [22:05] [28-07-26]
+agent:     [api] [gpt-5.4] [worker]
+worktree:  [feat/extensions-stage-a2b]
+type:      [bug report]: Close final Stage A2b cleanup and attach ACK blockers
+area:      [backend]: Extension supervisor ownership, protocol ordering, and temp-root retry
+
+Moved completed-service exceptional cleanup into the managed production owner: it
+immediately performs the promised bounded retry and transfers any still-failed
+process/temp-root authority to supervisor retention before the task completes.
+`finish_process` now reports full process-group plus descriptor-relative temp-root
+cleanup, so failed roots remain retryable without weakening generation identity.
+Attach replay records an event as ACK-eligible only after its complete write
+succeeds; an exact racing ACK is bounded and non-authoritative until that point.
+Added gated-write and adversarial real-child ACK proofs plus supervisor-path
+startup, health, protocol, circuit, shutdown, retained-root, and replacement-
+generation tests. Focused 102-test extension coverage, three repeated parallel
+41-test supervisor runs, ten adversarial-child repeats, all 654 daemon tests, the
+full workspace suite, canonical repository CI, compatibility, Rust 1.88 MSRV,
+Windows actual-source portability, and Linux musl cross-builds pass. Scope remains
+strictly A2b with no registry mutation, route, CLI, durable replay, or A3 behavior.
+_________________________________________________________________________________
+_________________________________________________________________________________
+time:      [22:27] [28-07-26]
+agent:     [pi] [gpt-5.4] [thoth]
+worktree:  [feat/extensions-stage-a2b]
+type:      [review]
+area:      [backend] [testing]
+
+Accepted Stage A2b after independent final review PASS at `b1ed181c`. The final
+delta closes post-write-only replay ACK authority and immediately consumes,
+retries, and retains exceptional process/temp-root cleanup authority in the
+production managed owner. Focused adversarial review passed 14 tests; the
+implementation gate previously passed 102 focused extension tests, 654 daemon
+tests, repeated loaded supervisor runs, the full workspace and canonical CI,
+compatibility, Rust 1.88 MSRV, Linux musl, and actual-source Windows portability.
+A3a is the next authorized slice; no A3+ behavior is included here.
+_________________________________________________________________________________

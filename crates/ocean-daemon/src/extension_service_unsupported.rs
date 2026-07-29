@@ -19,6 +19,8 @@ use serde::Serialize;
 use tokio::sync::Mutex;
 use uuid::Uuid;
 
+#[cfg(not(feature = "registry-portability-check"))]
+use super::extension_lifecycle::LifecycleDispatcher;
 use super::extension_registry::{
     read_unsupported_service_activations, UnsupportedServiceActivation,
 };
@@ -76,17 +78,15 @@ impl RuntimeStatusCache {
             .collect()
     }
 
-    fn insert_unsupported(&self, activation: UnsupportedServiceActivation) {
-        let key = ServiceKey {
-            package_id: activation.package_id.clone(),
-            service_id: activation.service_id.clone(),
-        };
-        self.inner
-            .write()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .insert(
-                key,
-                RuntimeStatus {
+    fn replace_unsupported(&self, activations: Vec<UnsupportedServiceActivation>) {
+        let statuses = activations
+            .into_iter()
+            .map(|activation| {
+                let key = ServiceKey {
+                    package_id: activation.package_id.clone(),
+                    service_id: activation.service_id.clone(),
+                };
+                let status = RuntimeStatus {
                     package_id: activation.package_id,
                     package_version: activation.package_version,
                     package_digest: activation.package_digest,
@@ -103,14 +103,22 @@ impl RuntimeStatusCache {
                     last_acknowledged_sequence: None,
                     lag_count: 0,
                     reason: Some(RuntimeReason::UnsupportedPlatform),
-                },
-            );
+                };
+                (key, status)
+            })
+            .collect();
+        *self
+            .inner
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = statuses;
     }
 }
 
 pub(crate) struct ExtensionSupervisor {
     status: RuntimeStatusCache,
     root_task: Mutex<Option<tokio::task::JoinHandle<()>>>,
+    config_dir: RwLock<Option<PathBuf>>,
+    reconciliation: Mutex<()>,
 }
 
 impl ExtensionSupervisor {
@@ -118,7 +126,60 @@ impl ExtensionSupervisor {
         Arc::new(Self {
             status: RuntimeStatusCache::default(),
             root_task: Mutex::new(None),
+            config_dir: RwLock::new(None),
+            reconciliation: Mutex::new(()),
         })
+    }
+
+    #[cfg(not(feature = "registry-portability-check"))]
+    pub(crate) fn new_with_lifecycle(_lifecycle: Arc<LifecycleDispatcher>) -> Arc<Self> {
+        Self::new()
+    }
+
+    #[cfg(not(feature = "registry-portability-check"))]
+    pub(crate) async fn update_project_snapshot(&self, projects: HashSet<Uuid>) -> Result<(), ()> {
+        let config_dir = self
+            .config_dir
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone();
+        if let Some(config_dir) = config_dir {
+            self.reconcile(config_dir, projects).await
+        } else {
+            Err(())
+        }
+    }
+
+    async fn reconcile(
+        &self,
+        config_dir: PathBuf,
+        registered_projects: HashSet<Uuid>,
+    ) -> Result<(), ()> {
+        let _serial = self.reconciliation.lock().await;
+        let result = tokio::task::spawn_blocking(move || {
+            read_unsupported_service_activations(&config_dir, &registered_projects)
+        })
+        .await;
+        match result {
+            Ok(Ok(activations)) => {
+                self.status.replace_unsupported(activations);
+                Ok(())
+            }
+            Ok(Err(error)) => {
+                tracing::warn!(
+                    reason = error.code(),
+                    "unsupported extension reconciliation blocked"
+                );
+                Err(())
+            }
+            Err(_) => {
+                tracing::warn!(
+                    reason = "registry_reader_failed",
+                    "unsupported extension reconciliation blocked"
+                );
+                Err(())
+            }
+        }
     }
 
     pub(crate) fn status_cache(&self) -> RuntimeStatusCache {
@@ -130,27 +191,13 @@ impl ExtensionSupervisor {
         config_dir: PathBuf,
         registered_projects: HashSet<Uuid>,
     ) {
-        let status = self.status.clone();
+        *self
+            .config_dir
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(config_dir.clone());
+        let supervisor = Arc::clone(self);
         let task = tokio::spawn(async move {
-            let result = tokio::task::spawn_blocking(move || {
-                read_unsupported_service_activations(&config_dir, &registered_projects)
-            })
-            .await;
-            match result {
-                Ok(Ok(activations)) => {
-                    for activation in activations {
-                        status.insert_unsupported(activation);
-                    }
-                }
-                Ok(Err(error)) => tracing::warn!(
-                    reason = error.code(),
-                    "unsupported extension startup reconciliation blocked"
-                ),
-                Err(_) => tracing::warn!(
-                    reason = "registry_reader_failed",
-                    "unsupported extension startup reconciliation blocked"
-                ),
-            }
+            let _ = supervisor.reconcile(config_dir, registered_projects).await;
         });
         *self.root_task.lock().await = Some(task);
     }
