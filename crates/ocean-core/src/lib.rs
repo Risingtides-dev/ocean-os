@@ -652,6 +652,15 @@ pub struct RoomMessage {
     /// messages. Present only after Bedrock confirms.
     #[serde(default)]
     pub federated: Option<FederatedMessageMeta>,
+    /// When this message is a reply, the `seq` of the parent message in the
+    /// same room. `None` for top-level messages. (G1-B: real threads).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub thread_parent_seq: Option<u64>,
+    /// The Ocean session id that produced this message, if any. Set when a
+    /// human or imported agent posts through a session — enables per-session
+    /// attribution and read-state tracking. (G1-B).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_id: Option<String>,
 }
 
 /// A room-level event that the [`RoomTriggerPolicy`] is evaluated against
@@ -1727,6 +1736,8 @@ mod tests {
             body: "@ocean fix the markers".into(),
             created_at: Utc::now(),
             federated: None,
+            thread_parent_seq: None,
+            session_id: None,
         };
         let json = serde_json::to_value(&msg).unwrap();
         assert_eq!(json["seq"], 3);
@@ -1823,6 +1834,8 @@ mod tests {
             body: "hello".into(),
             created_at: Utc::now(),
             federated: None,
+            thread_parent_seq: None,
+            session_id: None,
         };
         let json = serde_json::to_value(&msg).unwrap();
         assert_eq!(json["federated"], serde_json::Value::Null);
@@ -1864,6 +1877,8 @@ mod tests {
             body: "hello".into(),
             created_at: Utc::now(),
             federated: Some(meta),
+            thread_parent_seq: None,
+            session_id: None,
         };
         let json = serde_json::to_value(&msg).unwrap();
         assert_eq!(

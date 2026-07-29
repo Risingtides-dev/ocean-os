@@ -556,9 +556,32 @@ impl SqliteRoomStore {
                 body        TEXT NOT NULL,
                 created_at  TEXT NOT NULL,           -- RFC3339
                 federated   TEXT,                    -- JSON FederatedMessageMeta, NULL = local
+                thread_parent_seq INTEGER,           -- NULL = top-level; G1-B threads
+                session_id  TEXT,                    -- NULL = unattributed; G1-B agent import
                 PRIMARY KEY (room_id, seq)
             );
 
+            -- G1-B: add thread_parent_seq and session_id columns to existing
+            -- databases without rewriting. SQLite ALTER TABLE ADD COLUMN is
+            -- cheap (no table copy) and NULL defaults are implicit.
+            -- These are safe to run on new databases too: we catch "duplicate
+            -- column" errors silently below rather than failing the batch.
+            "#,
+        )?;
+        // G1-B migrations: safe on both fresh and existing databases.
+        for col in &["thread_parent_seq INTEGER", "session_id TEXT"] {
+            let sql = format!("ALTER TABLE messages ADD COLUMN {col}");
+            if let Err(e) = self.conn.execute(&sql, []) {
+                // SQLite error: "duplicate column name" means the column already
+                // exists (e.g. CREATE TABLE IF NOT EXISTS just created it).
+                // Any other error is a real problem.
+                if !e.to_string().contains("duplicate column") {
+                    return Err(e.into());
+                }
+            }
+        }
+        self.conn.execute_batch(
+            r#"
             CREATE INDEX IF NOT EXISTS idx_messages_room_seq ON messages(room_id, seq);
             CREATE INDEX IF NOT EXISTS idx_participants_room ON participants(room_id, position);
 
@@ -853,7 +876,7 @@ impl SqliteRoomStore {
         // but stay total) and bind as i64 for SQLite.
         let fetch = effective_limit.saturating_add(1) as i64;
         let mut stmt = self.conn.prepare(
-            "SELECT seq, author_id, author_kind, kind, body, created_at, federated
+            "SELECT seq, author_id, author_kind, kind, body, created_at, federated, thread_parent_seq, session_id
              FROM messages WHERE room_id = ?1 AND seq > ?2 ORDER BY seq LIMIT ?3",
         )?;
         let rows = stmt.query_map(params![key.as_str(), after, fetch], |row| {
@@ -864,6 +887,8 @@ impl SqliteRoomStore {
             let body: String = row.get(4)?;
             let created_at: String = row.get(5)?;
             let federated: Option<String> = row.get(6)?;
+            let thread_parent_seq: Option<i64> = row.get(7)?;
+            let session_id: Option<String> = row.get(8)?;
             Ok((
                 seq,
                 author_id,
@@ -872,11 +897,13 @@ impl SqliteRoomStore {
                 body,
                 created_at,
                 federated,
+                thread_parent_seq,
+                session_id,
             ))
         })?;
         let mut out = Vec::new();
         for r in rows {
-            let (seq, author_id, author_kind, kind, body, created_at, federated) = r?;
+            let (seq, author_id, author_kind, kind, body, created_at, federated, thread_parent_seq, session_id) = r?;
             let federated_meta: Option<FederatedMessageMeta> =
                 match federated {
                     Some(json) => Some(serde_json::from_str(&json).map_err(|e| {
@@ -892,6 +919,8 @@ impl SqliteRoomStore {
                 body,
                 created_at: parse_ts(&created_at)?,
                 federated: federated_meta,
+                thread_parent_seq: thread_parent_seq.map(|s| s as u64),
+                session_id,
             });
         }
         // If we got the sentinel row back, there is at least one more page. Drop
@@ -931,6 +960,8 @@ impl SqliteRoomStore {
         kind: RoomMessageKind,
         body: &str,
         now: DateTime<Utc>,
+        thread_parent_seq: Option<u64>,
+        session_id: Option<&str>,
     ) -> Result<RoomMessage> {
         // MAX(seq)+1, recomputed from stored rows so it survives restarts.
         let next_seq: i64 = conn.query_row(
@@ -938,9 +969,10 @@ impl SqliteRoomStore {
             params![key.as_str()],
             |r| r.get(0),
         )?;
+        let tps: Option<i64> = thread_parent_seq.map(|s| s as i64);
         conn.execute(
-            "INSERT INTO messages (room_id, seq, author_id, author_kind, kind, body, created_at, federated)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, NULL)",
+            "INSERT INTO messages (room_id, seq, author_id, author_kind, kind, body, created_at, federated, thread_parent_seq, session_id)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, NULL, ?8, ?9)",
             params![
                 key.as_str(),
                 next_seq,
@@ -949,6 +981,8 @@ impl SqliteRoomStore {
                 encode_message_kind(kind),
                 body,
                 fmt_ts(now),
+                tps,
+                session_id,
             ],
         )?;
         Ok(RoomMessage {
@@ -959,6 +993,8 @@ impl SqliteRoomStore {
             body: body.to_string(),
             created_at: now,
             federated: None,
+            thread_parent_seq,
+            session_id: session_id.map(|s| s.to_string()),
         })
     }
 
@@ -1223,6 +1259,8 @@ impl RoomStore for SqliteRoomStore {
             RoomMessageKind::ParticipantJoined,
             &format!("{} joined", participant.display_name),
             now,
+            None,
+            None,
         )?;
         Self::touch_on(&tx, key, now)?;
         tx.commit()?;
@@ -1283,6 +1321,8 @@ impl RoomStore for SqliteRoomStore {
             RoomMessageKind::ParticipantLeft,
             &format!("{display_name} left"),
             now,
+            None,
+            None,
         )?;
         Self::touch_on(&tx, key, now)?;
         tx.commit()?;
@@ -1299,21 +1339,7 @@ impl RoomStore for SqliteRoomStore {
         body: &str,
         now: DateTime<Utc>,
     ) -> Result<RoomMessage> {
-        if !self.room_is_open(key)? {
-            return Err(RoomStoreError::UnknownRoom(key.clone()));
-        }
-        // SELECT MAX(seq)+1, the message INSERT, and the updated_at touch are
-        // dependent statements. Wrap them in an IMMEDIATE transaction so a
-        // concurrent writer can't interleave a commit at the same seq and tear the
-        // transcript (OCEAN-201). On a PK collision the `?` rolls the whole thing
-        // back rather than leaving a half-written row.
-        let tx = self
-            .conn
-            .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let msg = Self::insert_message_on(&tx, key, author_id, author_kind, kind, body, now)?;
-        Self::touch_on(&tx, key, now)?;
-        tx.commit()?;
-        Ok(msg)
+        self.append_message_threaded(key, author_id, author_kind, kind, body, now, None, None)
     }
 
     fn transcript(&self, key: &RoomKey, after_seq: Option<u64>) -> Result<Vec<RoomMessage>> {
@@ -1350,6 +1376,125 @@ impl RoomStore for SqliteRoomStore {
             Some(json) => decode_policy(json.as_deref()),
             None => Ok(None),
         }
+    }
+}
+
+// ── G1-B: real threads + session attribution (not on RoomStore trait) ─────
+
+impl SqliteRoomStore {
+    /// Append a chat/system message with optional thread and session
+    /// attribution (G1-B). `thread_parent_seq`, when `Some`, marks this as a
+    /// reply to an existing message's `seq` in the same room — a real,
+    /// durable parent/child relationship, not a CSS-only visual grouping.
+    /// `session_id`, when `Some`, records the Ocean session that produced
+    /// this message, so imported user-owned agents and humans posting
+    /// through a session are attributable. The plain
+    /// [`RoomStore::append_message`] delegates here with both `None`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn append_message_threaded(
+        &mut self,
+        key: &RoomKey,
+        author_id: &str,
+        author_kind: RoomParticipantKind,
+        kind: RoomMessageKind,
+        body: &str,
+        now: DateTime<Utc>,
+        thread_parent_seq: Option<u64>,
+        session_id: Option<&str>,
+    ) -> Result<RoomMessage> {
+        if !self.room_is_open(key)? {
+            return Err(RoomStoreError::UnknownRoom(key.clone()));
+        }
+        // SELECT MAX(seq)+1, the message INSERT, and the updated_at touch are
+        // dependent statements. Wrap them in an IMMEDIATE transaction so a
+        // concurrent writer can't interleave a commit at the same seq and tear the
+        // transcript (OCEAN-201). On a PK collision the `?` rolls the whole thing
+        // back rather than leaving a half-written row.
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let msg = Self::insert_message_on(
+            &tx,
+            key,
+            author_id,
+            author_kind,
+            kind,
+            body,
+            now,
+            thread_parent_seq,
+            session_id,
+        )?;
+        Self::touch_on(&tx, key, now)?;
+        tx.commit()?;
+        Ok(msg)
+    }
+
+    /// Count direct replies (`thread_parent_seq = root_seq`) to a message
+    /// (G1-B). Used to materialize a root's reply count without loading the
+    /// whole transcript, mirroring Buzz's root `reply_count` pattern.
+    pub fn thread_reply_count(&self, key: &RoomKey, root_seq: u64) -> Result<u64> {
+        let count: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM messages WHERE room_id = ?1 AND thread_parent_seq = ?2",
+            params![key.as_str(), root_seq as i64],
+            |r| r.get(0),
+        )?;
+        Ok(count as u64)
+    }
+
+    /// Read every reply to a root message (`thread_parent_seq = root_seq`),
+    /// in ascending `seq` order (G1-B). Independently addressable, mirroring
+    /// Buzz's thread-panel read path rather than deriving replies from
+    /// in-memory transcript scanning on every render.
+    pub fn thread_replies(&self, key: &RoomKey, root_seq: u64) -> Result<Vec<RoomMessage>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT seq, author_id, author_kind, kind, body, created_at, federated, thread_parent_seq, session_id
+             FROM messages WHERE room_id = ?1 AND thread_parent_seq = ?2 ORDER BY seq",
+        )?;
+        let rows = stmt.query_map(params![key.as_str(), root_seq as i64], |row| {
+            let seq: i64 = row.get(0)?;
+            let author_id: String = row.get(1)?;
+            let author_kind: String = row.get(2)?;
+            let kind: String = row.get(3)?;
+            let body: String = row.get(4)?;
+            let created_at: String = row.get(5)?;
+            let federated: Option<String> = row.get(6)?;
+            let thread_parent_seq: Option<i64> = row.get(7)?;
+            let session_id: Option<String> = row.get(8)?;
+            Ok((
+                seq,
+                author_id,
+                author_kind,
+                kind,
+                body,
+                created_at,
+                federated,
+                thread_parent_seq,
+                session_id,
+            ))
+        })?;
+        let mut out = Vec::new();
+        for r in rows {
+            let (seq, author_id, author_kind, kind, body, created_at, federated, thread_parent_seq, session_id) = r?;
+            let federated_meta: Option<FederatedMessageMeta> = match federated {
+                Some(json) => Some(
+                    serde_json::from_str(&json)
+                        .map_err(|e| RoomStoreError::Encode(format!("invalid federated JSON: {e}")))?,
+                ),
+                None => None,
+            };
+            out.push(RoomMessage {
+                seq: seq as u64,
+                author_id,
+                author_kind: decode_participant_kind(&author_kind)?,
+                kind: decode_message_kind(&kind)?,
+                body,
+                created_at: parse_ts(&created_at)?,
+                federated: federated_meta,
+                thread_parent_seq: thread_parent_seq.map(|s| s as u64),
+                session_id,
+            });
+        }
+        Ok(out)
     }
 }
 
@@ -1496,8 +1641,8 @@ impl SqliteRoomStore {
         let federated_json = serde_json::to_string(meta)
             .map_err(|e| RoomStoreError::Encode(format!("federated serialize: {e}")))?;
         tx.execute(
-            "INSERT INTO messages (room_id, seq, author_id, author_kind, kind, body, created_at, federated)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            "INSERT INTO messages (room_id, seq, author_id, author_kind, kind, body, created_at, federated, thread_parent_seq, session_id)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, NULL, NULL)",
             params![
                 key.as_str(),
                 next_seq,
@@ -1519,6 +1664,8 @@ impl SqliteRoomStore {
             body: body.to_string(),
             created_at: now,
             federated: Some(meta.clone()),
+            thread_parent_seq: None,
+            session_id: None,
         })
     }
 
@@ -2717,6 +2864,8 @@ impl SqliteRoomStore {
             body: event.body.clone(),
             created_at: now,
             federated: Some(meta),
+            thread_parent_seq: None,
+            session_id: None,
         };
         Ok(IngestOutcome::Ingested(Box::new(IngestedCommit {
             message,

@@ -312,6 +312,8 @@ impl RoomRegistry {
             body,
             created_at: now,
             federated: None,
+            thread_parent_seq: None,
+            session_id: None,
         };
         let record = self
             .rooms
