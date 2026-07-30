@@ -16455,9 +16455,9 @@ mod tests {
             "helper",
             "done — cc @helper @other",
             None,
-            Some(&sid),
         )
         .expect("agent reply append");
+        assert_eq!(message.session_id.as_deref(), Some(sid.as_str()));
         assert_eq!(message.seq, 1);
         assert_eq!(message.author_id, "helper");
         assert_eq!(message.author_kind, RoomParticipantKind::Agent);

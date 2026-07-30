@@ -183,12 +183,12 @@ fn append_room_message(
 
 /// Post a convened agent's answer back into a room (G3).
 ///
-/// Two invariants live here, and neither is client-controllable:
+/// Two invariants live here, and neither is client- or caller-controllable:
 ///
-/// 1. **Session attribution is daemon-derived.** `session_id` is the id the
-///    daemon itself minted for this (room, agent) pair via
-///    [`room_agent_session_id`] — it is never read off a request body, so a
-///    caller can never attribute a row to a session it does not own.
+/// 1. **Session attribution is daemon-derived, structurally.** The persisted
+///    `session_id` is minted HERE via [`room_agent_session_id`] from the
+///    (room, agent) pair — it is not a parameter, so no caller (and certainly
+///    no request body) can attribute a row to a session it does not own.
 /// 2. **Threading degrades, it never drops.** The agent answers *after* its
 ///    turn ran, so the parent row it should hang under may have been closed,
 ///    re-parented, or otherwise invalidated in the meantime. A typed
@@ -201,8 +201,9 @@ pub(super) fn append_room_agent_reply(
     agent_id: &str,
     body: &str,
     thread_parent_seq: Option<u64>,
-    session_id: Option<&str>,
 ) -> Result<RoomMessage, ocean_store::RoomStoreError> {
+    let session_id = room_agent_session_id(room, agent_id).to_string();
+    let session_id = Some(session_id.as_str());
     let message = with_rooms(state, |store| {
         let first = store.append_message_threaded(
             room,
@@ -242,6 +243,11 @@ pub(super) fn append_room_agent_reply(
             }
         }
     })?;
+    debug_assert_eq!(
+        message.session_id.as_deref(),
+        session_id,
+        "agent reply must persist the daemon-derived session id"
+    );
     publish_room_wake(state, room, &message);
     Ok(message)
 }
@@ -1537,14 +1543,8 @@ fn spawn_room_agent_turn(
                     .and_then(|rows| rows.into_iter().find(|m| m.seq == triggered_by_seq))
                     .and_then(|m| m.thread_parent_seq)
                     .unwrap_or(triggered_by_seq);
-                    let _ = append_room_agent_reply(
-                        &state,
-                        &room,
-                        &agent.id,
-                        body,
-                        Some(thread_root),
-                        Some(&session_id.to_string()),
-                    );
+                    let _ =
+                        append_room_agent_reply(&state, &room, &agent.id, body, Some(thread_root));
                 }
             }
         } else if federated_member_id.is_none() {
@@ -2485,6 +2485,63 @@ mod tests {
             before_invalid_parent,
             "invalid thread parent must not write"
         );
+
+        // One-level policy, exercised for real (not a nonexistent seq): a reply
+        // to a REPLY row is exactly what live QA found silently accepted-or-lost.
+        // Build root -> reply, then post against the reply and require the same
+        // typed 400 with no write.
+        let (status, body) = room_post_message(
+            State(state.clone()),
+            Path(key.as_str().to_string()),
+            Json(RoomMessageRequest {
+                author_id: "john".into(),
+                author_kind: RoomParticipantKind::Human,
+                body: "thread root".into(),
+                thread_parent_seq: None,
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED);
+        let root_seq = body.0["message"]["seq"].as_u64().unwrap();
+        let (status, body) = room_post_message(
+            State(state.clone()),
+            Path(key.as_str().to_string()),
+            Json(RoomMessageRequest {
+                author_id: "john".into(),
+                author_kind: RoomParticipantKind::Human,
+                body: "first reply".into(),
+                thread_parent_seq: Some(root_seq),
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED);
+        let reply_seq = body.0["message"]["seq"].as_u64().unwrap();
+        let before_nested = with_rooms(&state, |store| store.transcript(&key, None))
+            .unwrap()
+            .len();
+        let (status, body) = room_post_message(
+            State(state.clone()),
+            Path(key.as_str().to_string()),
+            Json(RoomMessageRequest {
+                author_id: "john".into(),
+                author_kind: RoomParticipantKind::Human,
+                body: "nested reply".into(),
+                thread_parent_seq: Some(reply_seq),
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(
+            body.0,
+            json!({"ok": false, "error": "invalid_thread_parent"})
+        );
+        assert_eq!(
+            with_rooms(&state, |store| store.transcript(&key, None))
+                .unwrap()
+                .len(),
+            before_nested,
+            "reply-to-a-reply must not write"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -2532,7 +2589,7 @@ mod tests {
             Ok::<_, ocean_store::RoomStoreError>(())
         })
         .unwrap();
-        let root = append_room_agent_reply(&state, &key, "helper", "agent root", None, None)
+        let root = append_room_agent_reply(&state, &key, "helper", "agent root", None)
             .expect("agent root append");
 
         // Both the explicit mention and the thread-root author resolve to helper.
@@ -2572,7 +2629,8 @@ mod tests {
                 .unwrap()
                 .into_iter()
                 .find(|message| {
-                    message.author_id == "helper"
+                    message.seq > trigger_seq
+                        && message.author_id == "helper"
                         && message.session_id.as_deref() == Some(expected_session.as_str())
                 });
             if generated_reply.is_some() {
@@ -2597,7 +2655,6 @@ mod tests {
             "helper",
             "fallback reply",
             Some(generated_reply.seq),
-            Some(&expected_session),
         )
         .expect("invalid agent parent must fall back");
         assert_eq!(fallback.thread_parent_seq, None);

@@ -5913,4 +5913,25 @@ outcome-unknown copy. Added focused lifecycle regression coverage and restored
 the pre-existing rustfmt drift in ocean-providers so the repository formatting
 gate can pass. The full 459-test TUI suite, TUI check/release build, workspace
 check, docs-check, and independent review all passed.
+time:      [19:25] [07-30-26]
+agent:     [claude] [pm]
+worktree:  feat/rooms-g1-integrity
+type:      [feature]
+area:      [backend]
+
+Rooms G3 integrity successor (supersedes blocked 6c084289). Local room posts
+now classify authors exact-roster and fail closed: whitespace variants,
+non-roster ids, and client-claimed Agent/System author kinds return typed 403s
+with no transcript write. The message wire rejects client-supplied session
+attribution via deny_unknown_fields. append_room_agent_reply now mints session
+attribution internally from the (room, agent) pair — structural authority, no
+caller parameter. Convened agent answers thread under the resolved thread ROOT:
+a trigger that is itself a reply resolves its own parent, fixing the silent
+top-level demotion under one-level threading that live QA exposed; stale
+parents still degrade to top-level rather than dropping the reply. Five G3
+production-path tests cover forged/non-roster rejection without writes,
+wire-level session rejection, reply-to-a-reply exact 400 with no write,
+mention+thread-reply dispatch dedup on one row, and agent reply root/session
+attribution with fallback. Verified: 53/53 persistent_rooms, fmt, clippy -D
+warnings (daemon), cargo check --workspace.
 _________________________________________________________________________________
