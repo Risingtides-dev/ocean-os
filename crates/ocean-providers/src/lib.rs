@@ -955,13 +955,15 @@ pub fn resolve_model_selection(env: &ProviderEnv) -> Result<ModelSelection, Prov
         // pin a session's model replay that id verbatim on later turns — every
         // other Claude arm already accepts its wire id, and fable missing it
         // instant-failed all fable-pinned sessions (2026-07-29 outage).
-        "claude-code-fable-5" | "claude-code-fable" | "cc-fable" | "fable" | "claude-fable-5" => Ok(model_selection(
-            ProviderId::ClaudeCode,
-            "claude-code-fable-5",
-            ANTHROPIC_BASE_URL,
-            200_000,
-            16_384,
-        )),
+        "claude-code-fable-5" | "claude-code-fable" | "cc-fable" | "fable" | "claude-fable-5" => {
+            Ok(model_selection(
+                ProviderId::ClaudeCode,
+                "claude-code-fable-5",
+                ANTHROPIC_BASE_URL,
+                200_000,
+                16_384,
+            ))
+        }
         "claude-code-opus-5" | "claude-code-opus" | "cc-opus" => Ok(model_selection(
             ProviderId::ClaudeCode,
             "claude-code-opus-5",

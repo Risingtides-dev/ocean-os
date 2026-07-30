@@ -271,11 +271,13 @@ This crate owns the full-screen terminal steering cockpit (`ocean` binary) for i
   `OCEAN_TUI_AUTOSTART=0` disables, `OCEAN_DAEMON_BIN` overrides discovery.
   Blocking work stays in `spawn_blocking`; never on an async worker.
 - Error copy (`shell/errfmt.rs`): daemon/provider error text reaching the user
-  goes through `errfmt::humanize` (no raw reqwest blobs); credential-shaped
-  errors carry `/login` recovery hints; `is_connect_shaped` picks the
-  "couldn't reach the daemon" vs "turn could not start" transcript prefix.
-  A request timeout or generic post-connect transport failure is outcome-unknown,
-  never proof that the daemon was unavailable.
+  goes through the context-appropriate humanizer (no raw reqwest blobs);
+  credential-shaped errors carry `/login` recovery hints; `is_connect_shaped`
+  picks the "couldn't reach the daemon" vs "turn could not start" transcript
+  prefix. A request timeout or generic post-connect transport failure is
+  outcome-unknown only while the TUI lacks acknowledgement. An authoritative
+  failed `TurnFinished` is definitive, must never claim an unknown outcome, and
+  must state that any completed tool checkpoints remain saved.
 - Turn submission uses a dedicated HTTP client with a 30-minute deadman timeout
   and opens a fresh connection for each non-idempotent POST; do not reuse idle
   keep-alive sockets whose server-side close can race the next acknowledgement.
