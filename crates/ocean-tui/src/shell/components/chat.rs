@@ -3787,7 +3787,11 @@ impl Component for ChatComponent {
                         || error.is_some()
                     {
                         let note = if let Some(e) = error {
-                            format!("{} turn failed — {}", g("✗", "X"), errfmt::humanize(e))
+                            format!(
+                                "{} turn failed — {}",
+                                g("✗", "X"),
+                                errfmt::humanize_confirmed_turn_failure(e)
+                            )
                         } else {
                             format!("{} turn failed — no error detail", g("✗", "X"))
                         };
@@ -6202,6 +6206,35 @@ mod tests {
                 .iter()
                 .any(|t| matches!(t, Turn::ErrorNotice { note } if note.contains("turn failed"))),
             "failed turn with error should push an ErrorNotice"
+        );
+    }
+
+    #[test]
+    fn turn_finished_provider_transport_error_is_definitive_and_preserves_progress() {
+        let mut chat = ChatComponent {
+            busy: true,
+            ..Default::default()
+        };
+
+        chat.update(&turn_finished(
+            ocean_agent_sdk::AgentTurnStatus::Failed,
+            Some(
+                "provider error: error sending request for url (https://api.anthropic.com/v1/messages)",
+            ),
+        ));
+
+        assert!(!chat.busy, "terminal failed event must clear busy");
+        let notice = chat.turns.iter().find_map(|t| match t {
+            Turn::ErrorNotice { note } => Some(note.as_str()),
+            _ => None,
+        });
+        assert!(
+            matches!(notice, Some(note) if note.contains("provider connection failed") && note.contains("completed tool results remain saved")),
+            "authoritative provider failure should be definitive and preserve progress, got {notice:?}"
+        );
+        assert!(
+            matches!(notice, Some(note) if !note.contains("unknown") && !note.contains("before confirmation")),
+            "authoritative TurnFinished must never claim an unknown outcome, got {notice:?}"
         );
     }
 

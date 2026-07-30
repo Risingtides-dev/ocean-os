@@ -47,6 +47,9 @@ pub(crate) fn is_connect_shaped(err: &str) -> bool {
 
 /// Convert a raw error string into a human-readable message suitable for the
 /// transcript or status line. Already-human strings pass through unchanged.
+///
+/// This generic path is also used when the turn POST acknowledgement is lost,
+/// so uncertain transport errors deliberately preserve outcome-unknown copy.
 pub fn humanize(err: &str) -> String {
     // ── turn: / session: prefix added by app.rs ───────────────────────────
     let body = err
@@ -97,6 +100,32 @@ pub fn humanize(err: &str) -> String {
     } else {
         body.chars().take(117).collect::<String>() + "..."
     }
+}
+
+/// Humanize an error carried by authoritative `TurnFinished(Failed)`.
+///
+/// Unlike a lost HTTP acknowledgement, this event proves that the daemon
+/// accepted and finished the turn. Provider transport failures and timeouts are
+/// therefore definitive failures, while completed tool checkpoints remain
+/// durable and must not be described as having an unknown outcome.
+pub fn humanize_confirmed_turn_failure(err: &str) -> String {
+    let body = err
+        .strip_prefix("turn: ")
+        .or_else(|| err.strip_prefix("session: "))
+        .unwrap_or(err);
+    let lower = body.to_lowercase();
+
+    if lower.contains("cancelled") || lower.contains("canceled") {
+        return "request was cancelled; completed tool results remain saved".into();
+    }
+    if is_timeout_pattern(body) {
+        return "provider request timed out; completed tool results remain saved".into();
+    }
+    if is_uncertain_transport_pattern(body) {
+        return "provider connection failed; completed tool results remain saved".into();
+    }
+
+    humanize(err)
 }
 
 /// Check whether `s` matches a known credential-related pattern.
@@ -173,6 +202,37 @@ mod tests {
         assert_eq!(
             got,
             "connection closed before confirmation; turn outcome is unknown"
+        );
+    }
+
+    #[test]
+    fn confirmed_provider_transport_failure_is_not_unknown() {
+        let got = humanize_confirmed_turn_failure(
+            "provider error: error sending request for url (https://api.anthropic.com/v1/messages)",
+        );
+        assert_eq!(
+            got,
+            "provider connection failed; completed tool results remain saved"
+        );
+        assert!(!got.contains("unknown"));
+    }
+
+    #[test]
+    fn confirmed_timeout_is_not_unknown() {
+        let got = humanize_confirmed_turn_failure("provider error: request timed out");
+        assert_eq!(
+            got,
+            "provider request timed out; completed tool results remain saved"
+        );
+        assert!(!got.contains("unknown"));
+    }
+
+    #[test]
+    fn confirmed_cancellation_is_definitive() {
+        let got = humanize_confirmed_turn_failure("provider error: request cancelled");
+        assert_eq!(
+            got,
+            "request was cancelled; completed tool results remain saved"
         );
     }
 

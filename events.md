@@ -5897,3 +5897,20 @@ type:      [bug report]
 area:      [frontend]
 
 Audited unexpected DeepSeek spend and found the installed TUI's `/models` picker violated daemon-owned model authority: it changed only `model_override`, so the footer showed the selected model and manual TUI turns carried it per request, while Herdr/on-push turns against the same session continued using the persisted DeepSeek pin. Routed picker application through `Action::SetModel`, the existing generation-guarded session config PATCH path; strengthened the regression test and local TUI contract. Focused test, `cargo check -p ocean-tui`, and docs-check pass.
+
+_________________________________________________________________________________
+time:  [18:55] [30-07-26]
+agent: [pi] [Thoth]
+worktree: [fix/incident-turn-failure-ux]
+type:  [bug report]: Make authoritative TUI turn failures explicit
+area:  [frontend]: TUI turn lifecycle error copy
+
+Separated uncertain turn-POST acknowledgement failures from authoritative failed
+TurnFinished events. Confirmed provider transport failures, timeouts, and
+cancellations now report a definitive failure and state that completed tool
+results remain saved; only a genuinely lost acknowledgement retains
+outcome-unknown copy. Added focused lifecycle regression coverage and restored
+the pre-existing rustfmt drift in ocean-providers so the repository formatting
+gate can pass. The full 459-test TUI suite, TUI check/release build, workspace
+check, docs-check, and independent review all passed.
+_________________________________________________________________________________
