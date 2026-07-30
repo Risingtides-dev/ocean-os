@@ -5889,3 +5889,11 @@ captured on /v1/events SSE. Fix: route `claude-fable-5` through the existing
 ocean-agent's ClaudeCode match, and add a round-trip regression test covering
 every fable spelling. cargo test -p ocean-providers green (46 passed).
 _________________________________________________________________________________
+
+time:      13:44 30-07-26
+agent:     [ocean], [gpt-5.6-sol], [@pm]
+worktree:  [fix/tui-picker-session-authority]
+type:      [bug report]
+area:      [frontend]
+
+Audited unexpected DeepSeek spend and found the installed TUI's `/models` picker violated daemon-owned model authority: it changed only `model_override`, so the footer showed the selected model and manual TUI turns carried it per request, while Herdr/on-push turns against the same session continued using the persisted DeepSeek pin. Routed picker application through `Action::SetModel`, the existing generation-guarded session config PATCH path; strengthened the regression test and local TUI contract. Focused test, `cargo check -p ocean-tui`, and docs-check pass.

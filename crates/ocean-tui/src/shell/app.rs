@@ -3660,9 +3660,10 @@ impl App {
         }
     }
 
-    /// Apply the picker selection: pin the model for subsequent turns and keep
-    /// the thinking level shown in the footer. Not-ready models don't apply —
-    /// the status line says what's missing instead.
+    /// Apply the picker selection through the same authoritative action as
+    /// `/model`: update immediately and persist a bound session through the
+    /// daemon config PATCH. Not-ready models don't apply — the status line says
+    /// what's missing instead.
     fn models_apply(&mut self) {
         let Some(entry) = self.models_entries.get(self.models_sel) else {
             return;
@@ -3674,8 +3675,9 @@ impl App {
             ));
             return;
         }
-        self.model_override = Some(entry.id.clone());
+        let id = entry.id.clone();
         self.models_open = false;
+        self.dispatch(Action::SetModel(id));
     }
 
     // ── /advisor picker ──────────────────────────────────────────────────────
@@ -7992,16 +7994,19 @@ mod tests {
     }
 
     #[test]
-    fn model_selection_updates_status_row_immediately() {
+    fn model_selection_updates_status_and_authority_immediately() {
         let mut app = offline_app();
         // `/model <id>` — before any TurnStarted names a model.
         app.dispatch(Action::SetModel("glm-5".into()));
         assert_eq!(app.status_data().model, Some("glm-5"));
-        // The `/models` picker apply path must show just as instantly.
+        assert_eq!(app.model_config_generation, 1);
+        // The `/models` picker must use that same authoritative action path,
+        // rather than only changing the footer's local projection.
         app.models_entries = vec![entry("deepseek-v4-pro", "deepseek", true)];
         app.models_sel = 0;
         app.models_apply();
         assert_eq!(app.status_data().model, Some("deepseek-v4-pro"));
+        assert_eq!(app.model_config_generation, 2);
     }
 
     #[test]
