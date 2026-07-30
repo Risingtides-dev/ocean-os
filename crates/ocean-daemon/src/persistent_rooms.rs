@@ -649,6 +649,7 @@ pub(super) async fn room_leave(
 }
 
 #[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub(super) struct RoomMessageRequest {
     /// Author participant id (or a synthetic id like `"system"`).
     pub(super) author_id: String,
@@ -728,28 +729,27 @@ pub(super) fn post_rejection_response(
 /// 2. The `(id, kind)` pair must already be on the roster. Membership — not
 ///    the request body — is the authority on who may speak in a room, so an
 ///    unknown id, or a known id claiming the wrong kind, is refused.
-pub(super) fn classify_local_author(
-    roster: &[RoomParticipant],
+pub(super) fn classify_local_author<'a>(
+    roster: &'a [RoomParticipant],
     author_id: &str,
     author_kind: RoomParticipantKind,
-) -> Result<(), PostRejection> {
+) -> Result<&'a str, PostRejection> {
     if matches!(
         author_kind,
         RoomParticipantKind::Agent | RoomParticipantKind::System
     ) {
         return Err(PostRejection::ForgedAuthorKind);
     }
-    let author_id = author_id.trim();
-    if author_id.is_empty() {
+    // Roster ids are canonical authority. Do not admit a trimmed spelling and
+    // then persist the caller's non-canonical bytes (for example `" john "`).
+    if author_id.is_empty() || author_id != author_id.trim() {
         return Err(PostRejection::AuthorNotInRoster);
     }
-    let admitted = roster
+    roster
         .iter()
-        .any(|p| p.id == author_id && p.kind == author_kind);
-    if !admitted {
-        return Err(PostRejection::AuthorNotInRoster);
-    }
-    Ok(())
+        .find(|participant| participant.id == author_id && participant.kind == author_kind)
+        .map(|participant| participant.id.as_str())
+        .ok_or(PostRejection::AuthorNotInRoster)
 }
 
 /// Read just the author of one thread root, as a bounded single-row query.
@@ -809,8 +809,9 @@ pub(super) async fn room_post_message(
             .unwrap_or_default();
         // G3 author authority: decide who may speak BEFORE anything is
         // written, under the same guard as the append, so a roster change
-        // cannot land between the decision and the row.
-        classify_local_author(&roster, &req.author_id, req.author_kind)
+        // cannot land between the decision and the row. The returned id is the
+        // exact roster-owned canonical spelling used for persistence.
+        let canonical_author_id = classify_local_author(&roster, &req.author_id, req.author_kind)
             .map_err(LocalPostError::Rejected)?;
         // Read the thread root's author before appending: the reply itself is
         // not a valid trigger source, and after the append the root is one row
@@ -821,7 +822,7 @@ pub(super) async fn room_post_message(
         };
         let msg = match reg.append_message_threaded(
             &key,
-            &req.author_id,
+            canonical_author_id,
             req.author_kind,
             RoomMessageKind::Message,
             &req.body,
@@ -1522,15 +1523,26 @@ fn spawn_room_agent_turn(
                         tracing::warn!(room = %room, outcome = "agent_reply_enqueue_failed", "federated agent reply suppressed");
                     }
                 } else {
-                    // G3: thread the answer under the line that convened it and
-                    // stamp the daemon-derived session. A stale/invalid parent
-                    // degrades to a top-level post inside the helper.
+                    // G3: thread the answer under the ROOT of the line that
+                    // convened it. When the trigger row is itself a thread
+                    // reply, its own `thread_parent_seq` is the root — parenting
+                    // under the reply row would violate one-level threading and
+                    // demote the answer to top-level. A top-level trigger is its
+                    // own root. Stamp the daemon-derived session either way; a
+                    // stale/invalid parent still degrades inside the helper.
+                    let thread_root = with_rooms(&state, |store| {
+                        store.transcript(&room, Some(triggered_by_seq.saturating_sub(1)))
+                    })
+                    .ok()
+                    .and_then(|rows| rows.into_iter().find(|m| m.seq == triggered_by_seq))
+                    .and_then(|m| m.thread_parent_seq)
+                    .unwrap_or(triggered_by_seq);
                     let _ = append_room_agent_reply(
                         &state,
                         &room,
                         &agent.id,
                         body,
-                        Some(triggered_by_seq),
+                        Some(thread_root),
                         Some(&session_id.to_string()),
                     );
                 }
@@ -2314,6 +2326,285 @@ mod tests {
             derived_presence: Some(ocean_core::MemberPresence::Unavailable),
             local_binding_available: None,
         }
+    }
+
+    #[test]
+    fn g3_author_classification_is_exact_and_fail_closed() {
+        let roster = vec![
+            RoomParticipant {
+                id: "john".into(),
+                kind: RoomParticipantKind::Human,
+                display_name: "John".into(),
+            },
+            RoomParticipant {
+                id: "helper".into(),
+                kind: RoomParticipantKind::Agent,
+                display_name: "Helper".into(),
+            },
+        ];
+
+        assert_eq!(
+            classify_local_author(&roster, "john", RoomParticipantKind::Human),
+            Ok("john")
+        );
+        assert_eq!(
+            classify_local_author(&roster, " john ", RoomParticipantKind::Human),
+            Err(PostRejection::AuthorNotInRoster)
+        );
+        assert_eq!(
+            classify_local_author(&roster, "unknown", RoomParticipantKind::Human),
+            Err(PostRejection::AuthorNotInRoster)
+        );
+        assert_eq!(
+            classify_local_author(&roster, "john", RoomParticipantKind::Bot),
+            Err(PostRejection::AuthorNotInRoster)
+        );
+        assert_eq!(
+            classify_local_author(&roster, "helper", RoomParticipantKind::Agent),
+            Err(PostRejection::ForgedAuthorKind)
+        );
+        assert_eq!(
+            classify_local_author(&roster, "system", RoomParticipantKind::System),
+            Err(PostRejection::ForgedAuthorKind)
+        );
+    }
+
+    #[test]
+    fn g3_message_wire_rejects_client_session_attribution() {
+        assert!(serde_json::from_value::<RoomMessageRequest>(json!({
+            "author_id": "john",
+            "author_kind": "human",
+            "body": "hello",
+            "session_id": "00000000-0000-0000-0000-000000000000"
+        }))
+        .is_err());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn g3_local_post_enforces_author_and_thread_authority_without_writes() {
+        let tmp = tempfile::tempdir().unwrap();
+        let state = fake_convene_state(&tmp);
+        let key = RoomKey::new("g3-authority");
+        with_rooms(&state, |store| {
+            store.create(key.clone(), "G3 Authority", None, Utc::now())?;
+            store.add_participant(
+                &key,
+                RoomParticipant {
+                    id: "john".into(),
+                    kind: RoomParticipantKind::Human,
+                    display_name: "John".into(),
+                },
+                Utc::now(),
+            )?;
+            store.add_participant(
+                &key,
+                RoomParticipant {
+                    id: "helper".into(),
+                    kind: RoomParticipantKind::Agent,
+                    display_name: "Helper".into(),
+                },
+                Utc::now(),
+            )?;
+            Ok::<_, ocean_store::RoomStoreError>(())
+        })
+        .unwrap();
+
+        let initial_len = with_rooms(&state, |store| store.transcript(&key, None))
+            .unwrap()
+            .len();
+        for (author_id, author_kind, expected_error) in [
+            ("helper", RoomParticipantKind::Agent, "forged_author_kind"),
+            ("system", RoomParticipantKind::System, "forged_author_kind"),
+            (
+                "unknown",
+                RoomParticipantKind::Human,
+                "author_not_in_roster",
+            ),
+            (" john ", RoomParticipantKind::Human, "author_not_in_roster"),
+        ] {
+            let (status, body) = room_post_message(
+                State(state.clone()),
+                Path(key.as_str().to_string()),
+                Json(RoomMessageRequest {
+                    author_id: author_id.into(),
+                    author_kind,
+                    body: "must not persist".into(),
+                    thread_parent_seq: None,
+                }),
+            )
+            .await;
+            assert_eq!(status, StatusCode::FORBIDDEN);
+            assert_eq!(body.0, json!({"ok": false, "error": expected_error}));
+            assert_eq!(
+                with_rooms(&state, |store| store.transcript(&key, None))
+                    .unwrap()
+                    .len(),
+                initial_len,
+                "rejected author {author_id:?} must not write"
+            );
+        }
+
+        let (status, body) = room_post_message(
+            State(state.clone()),
+            Path(key.as_str().to_string()),
+            Json(RoomMessageRequest {
+                author_id: "john".into(),
+                author_kind: RoomParticipantKind::Human,
+                body: "valid post".into(),
+                thread_parent_seq: None,
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED);
+        assert_eq!(body.0["message"]["author_id"], "john");
+        assert_eq!(body.0["message"]["session_id"], serde_json::Value::Null);
+
+        let before_invalid_parent = with_rooms(&state, |store| store.transcript(&key, None))
+            .unwrap()
+            .len();
+        let (status, body) = room_post_message(
+            State(state.clone()),
+            Path(key.as_str().to_string()),
+            Json(RoomMessageRequest {
+                author_id: "john".into(),
+                author_kind: RoomParticipantKind::Human,
+                body: "orphan reply".into(),
+                thread_parent_seq: Some(u64::MAX),
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(
+            body.0,
+            json!({"ok": false, "error": "invalid_thread_parent"})
+        );
+        assert_eq!(
+            with_rooms(&state, |store| store.transcript(&key, None))
+                .unwrap()
+                .len(),
+            before_invalid_parent,
+            "invalid thread parent must not write"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn g3_thread_reply_deduplicates_dispatch_and_attributes_agent_reply() {
+        let _guard = AUTO_CONVENE_ENV_LOCK.lock().await;
+        let _env = TestEnvRestore::capture(&[
+            "OCEAN_CONFIG_DIR",
+            "OCEAN_MODEL",
+            "OCEAN_YOLO",
+            "OCEAN_AGENTS_DIR",
+        ]);
+        let tmp = tempfile::tempdir().unwrap();
+        let state = fake_convene_state(&tmp);
+        let agents_root = tmp.path().join("agents");
+        write_agent_fixture(&agents_root, "helper", "", None);
+        std::env::set_var("OCEAN_AGENTS_DIR", &agents_root);
+        let (_replay, mut trigger_rx) = state.agent_events.subscribe_with_replay(None);
+
+        let key = RoomKey::new("g3-thread-dispatch");
+        with_rooms(&state, |store| {
+            store.create(
+                key.clone(),
+                "G3 Thread Dispatch",
+                Some(RoomTriggerPolicy {
+                    on_mention: true,
+                    on_thread_reply: true,
+                    ..Default::default()
+                }),
+                Utc::now(),
+            )?;
+            for participant in [
+                RoomParticipant {
+                    id: "helper".into(),
+                    kind: RoomParticipantKind::Agent,
+                    display_name: "Helper".into(),
+                },
+                RoomParticipant {
+                    id: "john".into(),
+                    kind: RoomParticipantKind::Human,
+                    display_name: "John".into(),
+                },
+            ] {
+                store.add_participant(&key, participant, Utc::now())?;
+            }
+            Ok::<_, ocean_store::RoomStoreError>(())
+        })
+        .unwrap();
+        let root = append_room_agent_reply(&state, &key, "helper", "agent root", None, None)
+            .expect("agent root append");
+
+        // Both the explicit mention and the thread-root author resolve to helper.
+        // Policy evaluation reports both, but dispatch must queue helper once.
+        let (status, body) = room_post_message(
+            State(state.clone()),
+            Path(key.as_str().to_string()),
+            Json(RoomMessageRequest {
+                author_id: "john".into(),
+                author_kind: RoomParticipantKind::Human,
+                body: "@helper following up".into(),
+                thread_parent_seq: Some(root.seq),
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED);
+        let trigger_seq = body.0["message"]["seq"].as_u64().unwrap();
+        assert!(trigger_seq > root.seq, "trigger must be a later reply row");
+        assert_eq!(body.0["message"]["thread_parent_seq"], root.seq);
+        assert_eq!(body.0["triggers_fired"].as_array().unwrap().len(), 2);
+
+        let mut room_trigger_count = 0;
+        while let Ok(event) = trigger_rx.try_recv() {
+            if matches!(
+                event.event,
+                AgentTurnEvent::Extension { ref extension, .. } if extension == "room_trigger"
+            ) {
+                room_trigger_count += 1;
+            }
+        }
+        assert_eq!(room_trigger_count, 1, "one agent gets one dispatch per row");
+
+        let expected_session = room_agent_session_id(&key, "helper").to_string();
+        let mut generated_reply = None;
+        for _ in 0..100 {
+            generated_reply = with_rooms(&state, |store| store.transcript(&key, None))
+                .unwrap()
+                .into_iter()
+                .find(|message| {
+                    message.author_id == "helper"
+                        && message.session_id.as_deref() == Some(expected_session.as_str())
+                });
+            if generated_reply.is_some() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        let generated_reply = generated_reply.expect("convened agent reply must persist");
+        // The convened answer hangs under the thread ROOT — not the reply row
+        // that mentioned the agent, which one-level threading would reject.
+        assert_eq!(generated_reply.thread_parent_seq, Some(root.seq));
+        assert_eq!(
+            generated_reply.session_id.as_deref(),
+            Some(expected_session.as_str())
+        );
+
+        // A reply cannot parent another reply. Agent output degrades to top-level
+        // rather than disappearing, while retaining daemon-derived attribution.
+        let fallback = append_room_agent_reply(
+            &state,
+            &key,
+            "helper",
+            "fallback reply",
+            Some(generated_reply.seq),
+            Some(&expected_session),
+        )
+        .expect("invalid agent parent must fall back");
+        assert_eq!(fallback.thread_parent_seq, None);
+        assert_eq!(
+            fallback.session_id.as_deref(),
+            Some(expected_session.as_str())
+        );
     }
 
     #[test]

@@ -16461,8 +16461,6 @@ mod tests {
         assert_eq!(message.seq, 1);
         assert_eq!(message.author_id, "helper");
         assert_eq!(message.author_kind, RoomParticipantKind::Agent);
-        // triggers_fired: none — agent-authored rows never evaluate triggers
-        let fired: Vec<serde_json::Value> = vec![];
         assert!(
             matches!(
                 trigger_rx.try_recv(),
