@@ -331,6 +331,123 @@ impl From<RoomStoreError> for RetryOutboxError {
     }
 }
 
+// ── G1 thread-integrity error (inherent API, never widened on RoomStore) ───
+
+/// Which one-level thread rule a rejected `thread_parent_seq` broke (G1).
+///
+/// Every variant is a *client* mistake about an opaque `seq`, never a store
+/// fault, and never carries body text or secret material — only the room key
+/// and the offending sequence number travel with it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ThreadParentRejection {
+    /// No message with that `seq` exists in this room. This is also how a
+    /// self-reply and a forward reference are rejected: the appended row's
+    /// `seq` is `MAX(seq) + 1`, so its own seq — and every larger one — is
+    /// unwritten at validation time and therefore cannot be found.
+    NotFound,
+    /// The row exists but is not a chat [`RoomMessageKind::Message`]. Join,
+    /// leave, and system markers are transcript structure, not thread roots.
+    NotAMessage,
+    /// The row exists and is a chat message, but it is itself a reply.
+    /// Threads are exactly one level deep, so a reply is never a parent.
+    NotTopLevel,
+    /// The value cannot be represented as a stored SQLite signed integer
+    /// (`> i64::MAX`, e.g. `u64::MAX`), so no row can ever match it. Rejected
+    /// by checked conversion instead of wrapping to a negative `seq`.
+    OutOfRange,
+}
+
+impl std::fmt::Display for ThreadParentRejection {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NotFound => write!(f, "no message with that seq in this room"),
+            Self::NotAMessage => write!(f, "parent is not a chat message"),
+            Self::NotTopLevel => write!(f, "parent is itself a reply (threads are one level)"),
+            Self::OutOfRange => write!(f, "seq is not representable as a stored sequence"),
+        }
+    }
+}
+
+/// Errors specific to [`SqliteRoomStore::append_message_threaded`] (G1).
+///
+/// Like [`RetryOutboxError`] this is a separate type — deliberately NOT a new
+/// [`RoomStoreError`] variant — so the daemon's exhaustive `RoomStoreError`
+/// match keeps compiling while the thread rejection stays typed and
+/// inspectable at the store boundary. A caller that only speaks
+/// `RoomStoreError` still gets a fail-closed error through
+/// `From<ThreadAppendError>`; a caller that wants the precise reason (and a
+/// 4xx instead of a 5xx) matches this type directly.
+#[derive(Debug)]
+pub enum ThreadAppendError {
+    /// The requested `thread_parent_seq` violated the one-level thread policy.
+    /// Nothing was written: the check runs inside the append transaction.
+    InvalidThreadParent {
+        /// Room the append targeted.
+        room: RoomKey,
+        /// The rejected parent sequence exactly as the caller supplied it.
+        parent_seq: u64,
+        /// Which rule was broken.
+        reason: ThreadParentRejection,
+    },
+    /// An underlying store error (unknown room, SQLite, decode, I/O).
+    Store(RoomStoreError),
+}
+
+impl std::fmt::Display for ThreadAppendError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::InvalidThreadParent {
+                room,
+                parent_seq,
+                reason,
+            } => write!(
+                f,
+                "invalid thread parent {parent_seq} in room '{room}': {reason}"
+            ),
+            Self::Store(e) => write!(f, "store error: {e}"),
+        }
+    }
+}
+
+impl std::error::Error for ThreadAppendError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Store(e) => Some(e),
+            _ => None,
+        }
+    }
+}
+
+impl From<RoomStoreError> for ThreadAppendError {
+    fn from(e: RoomStoreError) -> Self {
+        Self::Store(e)
+    }
+}
+
+impl From<rusqlite::Error> for ThreadAppendError {
+    fn from(e: rusqlite::Error) -> Self {
+        Self::Store(RoomStoreError::Db(e))
+    }
+}
+
+impl From<ThreadAppendError> for RoomStoreError {
+    /// Collapse onto [`RoomStoreError`] for callers (today: the daemon's
+    /// `room_post_message`) that propagate with `?` into a `RoomStoreError`
+    /// result. `Store` passes through unchanged; a policy violation degrades
+    /// to [`RoomStoreError::Encode`], which is this crate's existing carrier
+    /// for "this value cannot be represented/accepted" (see
+    /// `parse_canonical_u64_text`). The full typed reason is preserved in the
+    /// message. Callers that need a 4xx status must match
+    /// [`ThreadAppendError`] directly rather than reading it back out of the
+    /// string.
+    fn from(e: ThreadAppendError) -> Self {
+        match e {
+            ThreadAppendError::Store(inner) => inner,
+            other => RoomStoreError::Encode(other.to_string()),
+        }
+    }
+}
+
 type Result<T> = std::result::Result<T, RoomStoreError>;
 
 /// The common room-store operations, shared by the in-memory `RoomRegistry`
@@ -487,6 +604,155 @@ pub trait RoomStore {
     fn trigger_policy(&self, key: &RoomKey) -> Result<Option<RoomTriggerPolicy>>;
 }
 
+/// Additive `messages` columns introduced by G1, as `(name, declaration)`.
+/// Fresh databases get them from `CREATE TABLE`; pre-G1 databases get them
+/// through introspection-driven `ALTER TABLE ADD COLUMN` in
+/// [`SqliteRoomStore::migrate`]. Both are nullable with an implicit NULL
+/// default, so existing rows stay valid and read back as top-level and
+/// unattributed.
+const G1_MESSAGE_COLUMNS: [(&str, &str); 2] =
+    [("thread_parent_seq", "INTEGER"), ("session_id", "TEXT")];
+
+/// Everything an appended transcript row carries besides its room key and
+/// timestamp (G1 internal value object).
+///
+/// Grouping these keeps [`SqliteRoomStore::insert_message_on`] — and every
+/// future insert path — inside Clippy's argument budget without an
+/// `#[allow(clippy::too_many_arguments)]`, and makes the thread/session pair
+/// travel together with the row it describes instead of as two trailing
+/// positional `Option`s.
+#[derive(Debug, Clone, Copy)]
+struct MessageDraft<'a> {
+    author_id: &'a str,
+    author_kind: RoomParticipantKind,
+    kind: RoomMessageKind,
+    body: &'a str,
+    /// `Some(parent_seq)` marks a reply. Validated against the one-level
+    /// thread policy inside the appending transaction before any insert.
+    thread_parent_seq: Option<u64>,
+    session_id: Option<&'a str>,
+}
+
+impl<'a> MessageDraft<'a> {
+    /// A structural, top-level, unattributed row (join/leave markers).
+    ///
+    /// Markers are transcript *structure*, never thread roots or replies, so
+    /// this constructor pins `thread_parent_seq` and `session_id` to `None`
+    /// rather than letting a caller thread a parent through a join/leave row.
+    fn marker(
+        author_id: &'a str,
+        author_kind: RoomParticipantKind,
+        kind: RoomMessageKind,
+        body: &'a str,
+    ) -> Self {
+        Self {
+            author_id,
+            author_kind,
+            kind,
+            body,
+            thread_parent_seq: None,
+            session_id: None,
+        }
+    }
+}
+
+/// The `messages` column list every transcript read selects, in exactly the
+/// order [`RawMessageRow::read`] expects.
+///
+/// One constant so the paged transcript read, the thread-reply read, and any
+/// future read path cannot drift apart in column order — a drift that would
+/// silently swap `body` for `created_at` or read `session_id` as a thread
+/// parent.
+const MESSAGE_ROW_COLUMNS: &str =
+    "seq, author_id, author_kind, kind, body, created_at, federated, thread_parent_seq, session_id";
+
+/// One raw `messages` row, still in stored form.
+///
+/// Reading (a `rusqlite::Error` domain) is deliberately separated from decoding
+/// (a [`RoomStoreError`] domain) so `query_map`'s closure stays infallible in
+/// our own error type and every stored-value rejection surfaces at one place.
+struct RawMessageRow {
+    seq: i64,
+    author_id: String,
+    author_kind: String,
+    kind: String,
+    body: String,
+    created_at: String,
+    federated: Option<String>,
+    thread_parent_seq: Option<i64>,
+    session_id: Option<String>,
+}
+
+impl RawMessageRow {
+    /// Read the [`MESSAGE_ROW_COLUMNS`] tuple positionally.
+    fn read(row: &rusqlite::Row<'_>) -> rusqlite::Result<Self> {
+        Ok(Self {
+            seq: row.get(0)?,
+            author_id: row.get(1)?,
+            author_kind: row.get(2)?,
+            kind: row.get(3)?,
+            body: row.get(4)?,
+            created_at: row.get(5)?,
+            federated: row.get(6)?,
+            thread_parent_seq: row.get(7)?,
+            session_id: row.get(8)?,
+        })
+    }
+
+    /// Decode into the public [`RoomMessage`], failing closed on any stored
+    /// value that cannot be represented (bad kind, bad timestamp, bad
+    /// federated JSON, negative sequence) instead of coercing with `as`.
+    fn decode(self) -> Result<RoomMessage> {
+        let federated = match self.federated {
+            Some(json) => Some(
+                serde_json::from_str(&json)
+                    .map_err(|e| RoomStoreError::Encode(format!("invalid federated JSON: {e}")))?,
+            ),
+            None => None,
+        };
+        Ok(RoomMessage {
+            seq: u64::try_from(self.seq).map_err(|_| {
+                RoomStoreError::Encode(format!("negative message seq: {}", self.seq))
+            })?,
+            author_id: self.author_id,
+            author_kind: decode_participant_kind(&self.author_kind)?,
+            kind: decode_message_kind(&self.kind)?,
+            body: self.body,
+            created_at: parse_ts(&self.created_at)?,
+            federated,
+            thread_parent_seq: decode_thread_parent_seq(self.thread_parent_seq)?,
+            session_id: self.session_id,
+        })
+    }
+}
+
+/// Convert a caller-supplied `thread_parent_seq` to the stored SQLite signed
+/// integer, failing closed instead of wrapping.
+///
+/// `seq` columns are SQLite `INTEGER` (signed 64-bit), so a `u64` above
+/// `i64::MAX` has no representation. The old `as i64` cast turned `u64::MAX`
+/// into `-1` and would have written a row pointing at a parent that can never
+/// exist; this rejects it.
+fn encode_thread_parent_seq(seq: u64) -> Result<i64> {
+    i64::try_from(seq).map_err(|_| {
+        RoomStoreError::Encode(format!(
+            "thread_parent_seq {seq} exceeds the storable sequence range"
+        ))
+    })
+}
+
+/// Convert a stored `thread_parent_seq` back to `u64`, failing closed on a
+/// negative value (only reachable through external tampering or a legacy
+/// wrapped cast) instead of wrapping it into a huge bogus sequence.
+fn decode_thread_parent_seq(stored: Option<i64>) -> Result<Option<u64>> {
+    match stored {
+        None => Ok(None),
+        Some(raw) => u64::try_from(raw)
+            .map(Some)
+            .map_err(|_| RoomStoreError::Encode(format!("negative thread_parent_seq: {raw}"))),
+    }
+}
+
 /// SQLite-backed durable room store.
 pub struct SqliteRoomStore {
     conn: Connection,
@@ -556,33 +822,41 @@ impl SqliteRoomStore {
                 body        TEXT NOT NULL,
                 created_at  TEXT NOT NULL,           -- RFC3339
                 federated   TEXT,                    -- JSON FederatedMessageMeta, NULL = local
-                thread_parent_seq INTEGER,           -- NULL = top-level; G1-B threads
-                session_id  TEXT,                    -- NULL = unattributed; G1-B agent import
+                thread_parent_seq INTEGER,           -- NULL = top-level; G1 threads
+                session_id  TEXT,                    -- NULL = unattributed; G1 agent import
                 PRIMARY KEY (room_id, seq)
             );
-
-            -- G1-B: add thread_parent_seq and session_id columns to existing
-            -- databases without rewriting. SQLite ALTER TABLE ADD COLUMN is
-            -- cheap (no table copy) and NULL defaults are implicit.
-            -- These are safe to run on new databases too: we catch "duplicate
-            -- column" errors silently below rather than failing the batch.
             "#,
         )?;
-        // G1-B migrations: safe on both fresh and existing databases.
-        for col in &["thread_parent_seq INTEGER", "session_id TEXT"] {
-            let sql = format!("ALTER TABLE messages ADD COLUMN {col}");
-            if let Err(e) = self.conn.execute(&sql, []) {
-                // SQLite error: "duplicate column name" means the column already
-                // exists (e.g. CREATE TABLE IF NOT EXISTS just created it).
-                // Any other error is a real problem.
-                if !e.to_string().contains("duplicate column") {
-                    return Err(e.into());
+        // G1 additive columns on `messages`. Fresh databases already have both
+        // from the CREATE TABLE above; databases created before G1 get them
+        // here. The decision is made by schema INTROSPECTION
+        // (`PRAGMA table_info`), not by matching SQLite's "duplicate column
+        // name" error text — error strings are not a stable contract, and a
+        // substring test would also silently swallow an unrelated failure that
+        // happened to mention those words. Any real ALTER failure now
+        // propagates.
+        {
+            let existing = self.message_column_names()?;
+            for (name, decl) in G1_MESSAGE_COLUMNS {
+                if !existing.contains(name) {
+                    self.conn.execute(
+                        &format!("ALTER TABLE messages ADD COLUMN {name} {decl}"),
+                        [],
+                    )?;
                 }
             }
         }
         self.conn.execute_batch(
             r#"
             CREATE INDEX IF NOT EXISTS idx_messages_room_seq ON messages(room_id, seq);
+            -- G1 thread reads: bounded per-root reply lookups
+            -- (`thread_reply_count`, `thread_replies`) and the in-transaction
+            -- parent check all filter on (room_id, thread_parent_seq) and order
+            -- by seq. Created AFTER the additive ALTERs above so a pre-G1
+            -- database has the columns by the time the index is built.
+            CREATE INDEX IF NOT EXISTS idx_messages_room_thread
+                ON messages(room_id, thread_parent_seq, seq);
             CREATE INDEX IF NOT EXISTS idx_participants_room ON participants(room_id, position);
 
             CREATE TABLE IF NOT EXISTS room_access (
@@ -745,6 +1019,21 @@ impl SqliteRoomStore {
         Ok(())
     }
 
+    /// Column names currently present on the `messages` table, read straight
+    /// from SQLite's own schema introspection. Used by [`migrate`](Self::migrate)
+    /// to decide additive `ALTER TABLE ADD COLUMN` steps instead of inferring
+    /// schema state from an error string.
+    fn message_column_names(&self) -> Result<std::collections::HashSet<String>> {
+        let mut stmt = self.conn.prepare("PRAGMA table_info(messages)")?;
+        // PRAGMA table_info columns: (cid, name, type, notnull, dflt_value, pk).
+        let rows = stmt.query_map([], |row| row.get::<_, String>(1))?;
+        let mut out = std::collections::HashSet::new();
+        for r in rows {
+            out.insert(r?);
+        }
+        Ok(out)
+    }
+
     /// Like [`get`](Self::get) but also returns soft-closed rooms (audit view).
     pub fn get_including_closed(&self, key: &RoomKey) -> Result<Option<RoomRecord>> {
         self.load_record(key, true)
@@ -870,68 +1159,39 @@ impl SqliteRoomStore {
         after_seq: Option<u64>,
         effective_limit: usize,
     ) -> Result<TranscriptPage> {
-        let after = after_seq.map(|s| s as i64).unwrap_or(-1);
+        // Cursor conversion is checked, never `as`. A `u64` cursor above
+        // `i64::MAX` has no stored representation; the old cast wrapped it to a
+        // negative value, which read as "before the beginning" and replayed the
+        // ENTIRE transcript for a caller asking for rows after the end. Such a
+        // cursor is after every storable row, so the truthful answer is a
+        // terminal empty page.
+        let after = match after_seq {
+            None => -1,
+            Some(s) => match i64::try_from(s) {
+                Ok(v) => v,
+                Err(_) => {
+                    return Ok(TranscriptPage {
+                        messages: Vec::new(),
+                        next_seq: None,
+                        has_more: false,
+                    })
+                }
+            },
+        };
         // Fetch one extra row as the "is there a next page?" sentinel. Guard the
         // `+ 1` against overflow on a pathological usize::MAX (clamp prevents it,
         // but stay total) and bind as i64 for SQLite.
         let fetch = effective_limit.saturating_add(1) as i64;
-        let mut stmt = self.conn.prepare(
-            "SELECT seq, author_id, author_kind, kind, body, created_at, federated, thread_parent_seq, session_id
-             FROM messages WHERE room_id = ?1 AND seq > ?2 ORDER BY seq LIMIT ?3",
-        )?;
+        let mut stmt = self.conn.prepare(&format!(
+            "SELECT {MESSAGE_ROW_COLUMNS}
+             FROM messages WHERE room_id = ?1 AND seq > ?2 ORDER BY seq LIMIT ?3"
+        ))?;
         let rows = stmt.query_map(params![key.as_str(), after, fetch], |row| {
-            let seq: i64 = row.get(0)?;
-            let author_id: String = row.get(1)?;
-            let author_kind: String = row.get(2)?;
-            let kind: String = row.get(3)?;
-            let body: String = row.get(4)?;
-            let created_at: String = row.get(5)?;
-            let federated: Option<String> = row.get(6)?;
-            let thread_parent_seq: Option<i64> = row.get(7)?;
-            let session_id: Option<String> = row.get(8)?;
-            Ok((
-                seq,
-                author_id,
-                author_kind,
-                kind,
-                body,
-                created_at,
-                federated,
-                thread_parent_seq,
-                session_id,
-            ))
+            RawMessageRow::read(row)
         })?;
         let mut out = Vec::new();
         for r in rows {
-            let (
-                seq,
-                author_id,
-                author_kind,
-                kind,
-                body,
-                created_at,
-                federated,
-                thread_parent_seq,
-                session_id,
-            ) = r?;
-            let federated_meta: Option<FederatedMessageMeta> =
-                match federated {
-                    Some(json) => Some(serde_json::from_str(&json).map_err(|e| {
-                        RoomStoreError::Encode(format!("invalid federated JSON: {e}"))
-                    })?),
-                    None => None,
-                };
-            out.push(RoomMessage {
-                seq: seq as u64,
-                author_id,
-                author_kind: decode_participant_kind(&author_kind)?,
-                kind: decode_message_kind(&kind)?,
-                body,
-                created_at: parse_ts(&created_at)?,
-                federated: federated_meta,
-                thread_parent_seq: thread_parent_seq.map(|s| s as u64),
-                session_id,
-            });
+            out.push(r?.decode()?);
         }
         // If we got the sentinel row back, there is at least one more page. Drop
         // it so the page holds exactly `effective_limit` rows, then expose the
@@ -965,21 +1225,32 @@ impl SqliteRoomStore {
     fn insert_message_on(
         conn: &Connection,
         key: &RoomKey,
-        author_id: &str,
-        author_kind: RoomParticipantKind,
-        kind: RoomMessageKind,
-        body: &str,
+        draft: MessageDraft<'_>,
         now: DateTime<Utc>,
-        thread_parent_seq: Option<u64>,
-        session_id: Option<&str>,
     ) -> Result<RoomMessage> {
+        let MessageDraft {
+            author_id,
+            author_kind,
+            kind,
+            body,
+            thread_parent_seq,
+            session_id,
+        } = draft;
         // MAX(seq)+1, recomputed from stored rows so it survives restarts.
         let next_seq: i64 = conn.query_row(
             "SELECT COALESCE(MAX(seq) + 1, 0) FROM messages WHERE room_id = ?1",
             params![key.as_str()],
             |r| r.get(0),
         )?;
-        let tps: Option<i64> = thread_parent_seq.map(|s| s as i64);
+        // Checked, never `as`: an unrepresentable parent seq must fail closed
+        // rather than wrap to a negative row reference. Callers that can
+        // surface a typed rejection validate first (see
+        // `validate_thread_parent_on`); this is the last-line guard for every
+        // insert path.
+        let tps: Option<i64> = match thread_parent_seq {
+            Some(s) => Some(encode_thread_parent_seq(s)?),
+            None => None,
+        };
         conn.execute(
             "INSERT INTO messages (room_id, seq, author_id, author_kind, kind, body, created_at, federated, thread_parent_seq, session_id)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, NULL, ?8, ?9)",
@@ -1264,13 +1535,13 @@ impl RoomStore for SqliteRoomStore {
         let message = Self::insert_message_on(
             &tx,
             key,
-            &participant.id,
-            participant.kind,
-            RoomMessageKind::ParticipantJoined,
-            &format!("{} joined", participant.display_name),
+            MessageDraft::marker(
+                &participant.id,
+                participant.kind,
+                RoomMessageKind::ParticipantJoined,
+                &format!("{} joined", participant.display_name),
+            ),
             now,
-            None,
-            None,
         )?;
         Self::touch_on(&tx, key, now)?;
         tx.commit()?;
@@ -1326,13 +1597,13 @@ impl RoomStore for SqliteRoomStore {
         let message = Self::insert_message_on(
             &tx,
             key,
-            participant_id,
-            decode_participant_kind(&kind)?,
-            RoomMessageKind::ParticipantLeft,
-            &format!("{display_name} left"),
+            MessageDraft::marker(
+                participant_id,
+                decode_participant_kind(&kind)?,
+                RoomMessageKind::ParticipantLeft,
+                &format!("{display_name} left"),
+            ),
             now,
-            None,
-            None,
         )?;
         Self::touch_on(&tx, key, now)?;
         tx.commit()?;
@@ -1349,7 +1620,14 @@ impl RoomStore for SqliteRoomStore {
         body: &str,
         now: DateTime<Utc>,
     ) -> Result<RoomMessage> {
+        // A plain append is always top-level (`thread_parent_seq: None`), so the
+        // thread-parent validation inside `append_message_threaded` can never
+        // fire on this path. Collapsing onto `RoomStoreError` therefore
+        // preserves this trait method's exact pre-G1 error surface: every error
+        // reachable here is a `ThreadAppendError::Store` passing through
+        // unchanged.
         self.append_message_threaded(key, author_id, author_kind, kind, body, now, None, None)
+            .map_err(RoomStoreError::from)
     }
 
     fn transcript(&self, key: &RoomKey, after_seq: Option<u64>) -> Result<Vec<RoomMessage>> {
@@ -1389,17 +1667,37 @@ impl RoomStore for SqliteRoomStore {
     }
 }
 
-// ── G1-B: real threads + session attribution (not on RoomStore trait) ─────
+// ── G1: real threads + session attribution (not on RoomStore trait) ───────
 
 impl SqliteRoomStore {
     /// Append a chat/system message with optional thread and session
-    /// attribution (G1-B). `thread_parent_seq`, when `Some`, marks this as a
+    /// attribution (G1). `thread_parent_seq`, when `Some`, marks this as a
     /// reply to an existing message's `seq` in the same room — a real,
     /// durable parent/child relationship, not a CSS-only visual grouping.
     /// `session_id`, when `Some`, records the Ocean session that produced
     /// this message, so imported user-owned agents and humans posting
     /// through a session are attributable. The plain
     /// [`RoomStore::append_message`] delegates here with both `None`.
+    ///
+    /// # Thread integrity (G1)
+    ///
+    /// A `Some(parent_seq)` is validated INSIDE the same IMMEDIATE transaction
+    /// that allocates the new `seq` and inserts the row, so the parent cannot
+    /// be added, removed, or re-parented between the check and the write. All
+    /// four rules must hold or nothing is written and a typed
+    /// [`ThreadAppendError::InvalidThreadParent`] comes back:
+    ///
+    /// 1. the parent row exists **in this room** (room scoping comes from the
+    ///    query, not from trusting the caller);
+    /// 2. it is a chat [`RoomMessageKind::Message`], not a join/leave/system
+    ///    structural marker;
+    /// 3. it is itself top-level — threads are exactly one level deep, so a
+    ///    reply can never be a parent;
+    /// 4. `parent_seq` is representable as a stored sequence.
+    ///
+    /// Self-replies and forward references need no separate rule: the row being
+    /// appended takes `MAX(seq) + 1`, so its own sequence and every larger one
+    /// are unwritten at validation time and fail rule 1 as `NotFound`.
     #[allow(clippy::too_many_arguments)]
     pub fn append_message_threaded(
         &mut self,
@@ -1411,108 +1709,132 @@ impl SqliteRoomStore {
         now: DateTime<Utc>,
         thread_parent_seq: Option<u64>,
         session_id: Option<&str>,
-    ) -> Result<RoomMessage> {
+    ) -> std::result::Result<RoomMessage, ThreadAppendError> {
         if !self.room_is_open(key)? {
-            return Err(RoomStoreError::UnknownRoom(key.clone()));
+            return Err(RoomStoreError::UnknownRoom(key.clone()).into());
         }
-        // SELECT MAX(seq)+1, the message INSERT, and the updated_at touch are
-        // dependent statements. Wrap them in an IMMEDIATE transaction so a
-        // concurrent writer can't interleave a commit at the same seq and tear the
-        // transcript (OCEAN-201). On a PK collision the `?` rolls the whole thing
-        // back rather than leaving a half-written row.
+        // The parent validation, SELECT MAX(seq)+1, the message INSERT, and the
+        // updated_at touch are dependent statements. Wrap them in an IMMEDIATE
+        // transaction so a concurrent writer can't interleave a commit at the same
+        // seq and tear the transcript (OCEAN-201), and so the validated parent is
+        // still exactly as validated at insert time. On a PK collision or a
+        // rejected parent the `?` rolls the whole thing back rather than leaving a
+        // half-written row.
         let tx = self
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        if let Some(parent_seq) = thread_parent_seq {
+            Self::validate_thread_parent_on(&tx, key, parent_seq)?;
+        }
         let msg = Self::insert_message_on(
             &tx,
             key,
-            author_id,
-            author_kind,
-            kind,
-            body,
+            MessageDraft {
+                author_id,
+                author_kind,
+                kind,
+                body,
+                thread_parent_seq,
+                session_id,
+            },
             now,
-            thread_parent_seq,
-            session_id,
         )?;
         Self::touch_on(&tx, key, now)?;
         tx.commit()?;
         Ok(msg)
     }
 
+    /// Enforce the G1 one-level thread policy for `parent_seq` in `key`.
+    ///
+    /// Runs on the caller's transaction (`&Connection`, which a
+    /// `rusqlite::Transaction` derefs to) so the decision and the dependent
+    /// insert are atomic. Reads only `kind` and `thread_parent_seq` — never the
+    /// body — so a rejection can never leak message content.
+    fn validate_thread_parent_on(
+        conn: &Connection,
+        key: &RoomKey,
+        parent_seq: u64,
+    ) -> std::result::Result<(), ThreadAppendError> {
+        let reject = |reason| ThreadAppendError::InvalidThreadParent {
+            room: key.clone(),
+            parent_seq,
+            reason,
+        };
+        // Checked conversion, never `as`: `u64::MAX` would wrap to `-1` and
+        // could in principle match a tampered row. Above the storable range no
+        // legitimate row can exist, so reject before querying.
+        let Ok(stored_seq) = i64::try_from(parent_seq) else {
+            return Err(reject(ThreadParentRejection::OutOfRange));
+        };
+        // `room_id = ?1` is what scopes the parent to THIS room: a real message
+        // in another room does not match and is reported as `NotFound`, so a
+        // thread can never straddle rooms.
+        let found: Option<(String, Option<i64>)> = conn
+            .query_row(
+                "SELECT kind, thread_parent_seq FROM messages WHERE room_id = ?1 AND seq = ?2",
+                params![key.as_str(), stored_seq],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .optional()?;
+        // Also the self-reply and forward-reference rejection: the row being
+        // appended is not written yet, so its own seq and everything above it
+        // are absent here.
+        let Some((parent_kind, parent_of_parent)) = found else {
+            return Err(reject(ThreadParentRejection::NotFound));
+        };
+        if decode_message_kind(&parent_kind)? != RoomMessageKind::Message {
+            return Err(reject(ThreadParentRejection::NotAMessage));
+        }
+        // Any non-NULL parent pointer on the parent — including a tampered
+        // negative one — means it is itself a reply.
+        if parent_of_parent.is_some() {
+            return Err(reject(ThreadParentRejection::NotTopLevel));
+        }
+        Ok(())
+    }
+
     /// Count direct replies (`thread_parent_seq = root_seq`) to a message
-    /// (G1-B). Used to materialize a root's reply count without loading the
+    /// (G1). Used to materialize a root's reply count without loading the
     /// whole transcript, mirroring Buzz's root `reply_count` pattern.
+    ///
+    /// A `root_seq` above the storable range cannot be any row's parent, so
+    /// this reports `0` rather than wrapping the cast or erroring: the read is
+    /// total and truthful. Writes still reject such a parent outright (see
+    /// [`Self::append_message_threaded`]).
     pub fn thread_reply_count(&self, key: &RoomKey, root_seq: u64) -> Result<u64> {
+        let Ok(stored_root) = i64::try_from(root_seq) else {
+            return Ok(0);
+        };
         let count: i64 = self.conn.query_row(
             "SELECT COUNT(*) FROM messages WHERE room_id = ?1 AND thread_parent_seq = ?2",
-            params![key.as_str(), root_seq as i64],
+            params![key.as_str(), stored_root],
             |r| r.get(0),
         )?;
-        Ok(count as u64)
+        // COUNT(*) is non-negative by construction; stay total anyway.
+        Ok(u64::try_from(count).unwrap_or(0))
     }
 
     /// Read every reply to a root message (`thread_parent_seq = root_seq`),
-    /// in ascending `seq` order (G1-B). Independently addressable, mirroring
+    /// in ascending `seq` order (G1). Independently addressable, mirroring
     /// Buzz's thread-panel read path rather than deriving replies from
     /// in-memory transcript scanning on every render.
+    ///
+    /// Same total-read contract as [`Self::thread_reply_count`]: an
+    /// unstorable `root_seq` yields an empty list, not a wrapped lookup.
     pub fn thread_replies(&self, key: &RoomKey, root_seq: u64) -> Result<Vec<RoomMessage>> {
-        let mut stmt = self.conn.prepare(
-            "SELECT seq, author_id, author_kind, kind, body, created_at, federated, thread_parent_seq, session_id
-             FROM messages WHERE room_id = ?1 AND thread_parent_seq = ?2 ORDER BY seq",
-        )?;
-        let rows = stmt.query_map(params![key.as_str(), root_seq as i64], |row| {
-            let seq: i64 = row.get(0)?;
-            let author_id: String = row.get(1)?;
-            let author_kind: String = row.get(2)?;
-            let kind: String = row.get(3)?;
-            let body: String = row.get(4)?;
-            let created_at: String = row.get(5)?;
-            let federated: Option<String> = row.get(6)?;
-            let thread_parent_seq: Option<i64> = row.get(7)?;
-            let session_id: Option<String> = row.get(8)?;
-            Ok((
-                seq,
-                author_id,
-                author_kind,
-                kind,
-                body,
-                created_at,
-                federated,
-                thread_parent_seq,
-                session_id,
-            ))
+        let Ok(stored_root) = i64::try_from(root_seq) else {
+            return Ok(Vec::new());
+        };
+        let mut stmt = self.conn.prepare(&format!(
+            "SELECT {MESSAGE_ROW_COLUMNS}
+             FROM messages WHERE room_id = ?1 AND thread_parent_seq = ?2 ORDER BY seq"
+        ))?;
+        let rows = stmt.query_map(params![key.as_str(), stored_root], |row| {
+            RawMessageRow::read(row)
         })?;
         let mut out = Vec::new();
         for r in rows {
-            let (
-                seq,
-                author_id,
-                author_kind,
-                kind,
-                body,
-                created_at,
-                federated,
-                thread_parent_seq,
-                session_id,
-            ) = r?;
-            let federated_meta: Option<FederatedMessageMeta> =
-                match federated {
-                    Some(json) => Some(serde_json::from_str(&json).map_err(|e| {
-                        RoomStoreError::Encode(format!("invalid federated JSON: {e}"))
-                    })?),
-                    None => None,
-                };
-            out.push(RoomMessage {
-                seq: seq as u64,
-                author_id,
-                author_kind: decode_participant_kind(&author_kind)?,
-                kind: decode_message_kind(&kind)?,
-                body,
-                created_at: parse_ts(&created_at)?,
-                federated: federated_meta,
-                thread_parent_seq: thread_parent_seq.map(|s| s as u64),
-                session_id,
-            });
+            out.push(r?.decode()?);
         }
         Ok(out)
     }
@@ -6326,5 +6648,643 @@ mod tests {
         // The room credential is untouched.
         let cred = s.room_credential(&key).unwrap().unwrap();
         assert_eq!(cred.bearer_token, "bearer-keep");
+    }
+
+    // ── G1 thread integrity ────────────────────────────────────────────────
+
+    /// A store with one open room, ready for thread appends.
+    fn thread_store(key: &str) -> (SqliteRoomStore, RoomKey) {
+        let mut s = store();
+        let key = RoomKey::new(key);
+        s.create(key.clone(), "Threads", None, now()).unwrap();
+        (s, key)
+    }
+
+    /// Append a top-level chat message and return its `seq`.
+    fn post_root(s: &mut SqliteRoomStore, key: &RoomKey, body: &str) -> u64 {
+        s.append_message_threaded(
+            key,
+            "john",
+            RoomParticipantKind::Human,
+            RoomMessageKind::Message,
+            body,
+            now(),
+            None,
+            None,
+        )
+        .unwrap()
+        .seq
+    }
+
+    /// The [`ThreadParentRejection`] an append produced, or a panic describing
+    /// what came back instead. Keeps every adversarial case a one-liner.
+    fn rejection(
+        result: std::result::Result<RoomMessage, ThreadAppendError>,
+    ) -> ThreadParentRejection {
+        match result {
+            Err(ThreadAppendError::InvalidThreadParent { reason, .. }) => reason,
+            Err(other) => panic!("expected InvalidThreadParent, got {other}"),
+            Ok(msg) => panic!("expected rejection, but wrote seq {}", msg.seq),
+        }
+    }
+
+    #[test]
+    fn threaded_append_round_trips_parent_session_and_counts() {
+        // The positive path: a reply carries its parent and session through the
+        // insert, the transcript read, and the dedicated thread reads.
+        let (mut s, key) = thread_store("t-round-trip");
+        let root = post_root(&mut s, &key, "root question");
+        let reply = s
+            .append_message_threaded(
+                &key,
+                "agent-1",
+                RoomParticipantKind::Agent,
+                RoomMessageKind::Message,
+                "an answer",
+                now(),
+                Some(root),
+                Some("sess-abc"),
+            )
+            .unwrap();
+        // Returned value is already correct (no re-read needed to learn it).
+        assert_eq!(reply.thread_parent_seq, Some(root));
+        assert_eq!(reply.session_id.as_deref(), Some("sess-abc"));
+
+        // Durable: the transcript read decodes the same pair.
+        let transcript = s.transcript(&key, None).unwrap();
+        assert_eq!(transcript.len(), 2);
+        assert_eq!(
+            transcript[0].thread_parent_seq, None,
+            "root stays top-level"
+        );
+        assert_eq!(transcript[0].session_id, None, "root stays unattributed");
+        assert_eq!(transcript[1].thread_parent_seq, Some(root));
+        assert_eq!(transcript[1].session_id.as_deref(), Some("sess-abc"));
+
+        // Count and the reply list agree with the transcript.
+        assert_eq!(s.thread_reply_count(&key, root).unwrap(), 1);
+        let replies = s.thread_replies(&key, root).unwrap();
+        assert_eq!(replies.len(), 1);
+        assert_eq!(replies[0].seq, reply.seq);
+        assert_eq!(replies[0].body, "an answer");
+        assert_eq!(replies[0].session_id.as_deref(), Some("sess-abc"));
+    }
+
+    #[test]
+    fn thread_replies_are_seq_ordered_and_root_scoped() {
+        // Two roots in one room: each reply list holds only its own replies, in
+        // ascending seq order, and the counts match.
+        let (mut s, key) = thread_store("t-order");
+        let root_a = post_root(&mut s, &key, "root A");
+        let root_b = post_root(&mut s, &key, "root B");
+        for body in ["a1", "a2", "a3"] {
+            s.append_message_threaded(
+                &key,
+                "john",
+                RoomParticipantKind::Human,
+                RoomMessageKind::Message,
+                body,
+                now(),
+                Some(root_a),
+                None,
+            )
+            .unwrap();
+        }
+        s.append_message_threaded(
+            &key,
+            "john",
+            RoomParticipantKind::Human,
+            RoomMessageKind::Message,
+            "b1",
+            now(),
+            Some(root_b),
+            None,
+        )
+        .unwrap();
+
+        assert_eq!(s.thread_reply_count(&key, root_a).unwrap(), 3);
+        assert_eq!(s.thread_reply_count(&key, root_b).unwrap(), 1);
+        let a_bodies: Vec<String> = s
+            .thread_replies(&key, root_a)
+            .unwrap()
+            .into_iter()
+            .map(|m| m.body)
+            .collect();
+        assert_eq!(a_bodies, vec!["a1", "a2", "a3"], "ascending seq order");
+        let a_seqs: Vec<u64> = s
+            .thread_replies(&key, root_a)
+            .unwrap()
+            .iter()
+            .map(|m| m.seq)
+            .collect();
+        assert!(a_seqs.windows(2).all(|w| w[0] < w[1]));
+        // A root with no replies is an empty list, not an error.
+        let leaf = post_root(&mut s, &key, "lonely");
+        assert_eq!(s.thread_reply_count(&key, leaf).unwrap(), 0);
+        assert!(s.thread_replies(&key, leaf).unwrap().is_empty());
+    }
+
+    #[test]
+    fn threaded_append_survives_reopen() {
+        // Thread edges and session attribution are durable across a close/open
+        // cycle, and re-running migrate() on the populated DB preserves them.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("threads.db");
+        let key = RoomKey::new("t-durable");
+        let (root, reply_seq) = {
+            let mut s = SqliteRoomStore::open(&path).unwrap();
+            s.create(key.clone(), "Durable", None, now()).unwrap();
+            let root = post_root(&mut s, &key, "root");
+            let reply = s
+                .append_message_threaded(
+                    &key,
+                    "agent-1",
+                    RoomParticipantKind::Agent,
+                    RoomMessageKind::Message,
+                    "reply",
+                    now(),
+                    Some(root),
+                    Some("sess-durable"),
+                )
+                .unwrap();
+            (root, reply.seq)
+        };
+        let s = SqliteRoomStore::open(&path).unwrap();
+        let replies = s.thread_replies(&key, root).unwrap();
+        assert_eq!(replies.len(), 1);
+        assert_eq!(replies[0].seq, reply_seq);
+        assert_eq!(replies[0].thread_parent_seq, Some(root));
+        assert_eq!(replies[0].session_id.as_deref(), Some("sess-durable"));
+        assert_eq!(s.thread_reply_count(&key, root).unwrap(), 1);
+    }
+
+    #[test]
+    fn reply_to_missing_parent_is_rejected_and_writes_nothing() {
+        // Rule 1: no such seq in this room. Nothing may be written — the check
+        // runs inside the append transaction.
+        let (mut s, key) = thread_store("t-missing");
+        let root = post_root(&mut s, &key, "root");
+        let before = s.transcript(&key, None).unwrap().len();
+        let err = s.append_message_threaded(
+            &key,
+            "john",
+            RoomParticipantKind::Human,
+            RoomMessageKind::Message,
+            "orphan",
+            now(),
+            Some(root + 99),
+            None,
+        );
+        assert_eq!(rejection(err), ThreadParentRejection::NotFound);
+        assert_eq!(
+            s.transcript(&key, None).unwrap().len(),
+            before,
+            "rejected append must roll back"
+        );
+    }
+
+    #[test]
+    fn reply_to_future_or_self_seq_is_rejected() {
+        // A forward reference and a self-reply are the same rejection: the row
+        // being appended takes MAX(seq)+1, so its own seq and every larger one
+        // are unwritten at validation time.
+        let (mut s, key) = thread_store("t-future");
+        let root = post_root(&mut s, &key, "root");
+        // `root` is seq 0, so the next append would be seq 1 — a self-reply.
+        let self_reply = s.append_message_threaded(
+            &key,
+            "john",
+            RoomParticipantKind::Human,
+            RoomMessageKind::Message,
+            "self",
+            now(),
+            Some(root + 1),
+            None,
+        );
+        assert_eq!(rejection(self_reply), ThreadParentRejection::NotFound);
+        // Far-future reference: same outcome.
+        let future = s.append_message_threaded(
+            &key,
+            "john",
+            RoomParticipantKind::Human,
+            RoomMessageKind::Message,
+            "future",
+            now(),
+            Some(10_000),
+            None,
+        );
+        assert_eq!(rejection(future), ThreadParentRejection::NotFound);
+        assert_eq!(s.transcript(&key, None).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn reply_to_parent_in_another_room_is_rejected() {
+        // Room scoping comes from the validation query, not caller trust: a
+        // real message in a different room is not a usable parent.
+        let (mut s, key_a) = thread_store("t-room-a");
+        let key_b = RoomKey::new("t-room-b");
+        s.create(key_b.clone(), "Room B", None, now()).unwrap();
+        let root_b = post_root(&mut s, &key_b, "root in B");
+        let err = s.append_message_threaded(
+            &key_a,
+            "john",
+            RoomParticipantKind::Human,
+            RoomMessageKind::Message,
+            "cross-room reply",
+            now(),
+            Some(root_b),
+            None,
+        );
+        assert_eq!(rejection(err), ThreadParentRejection::NotFound);
+        assert!(s.transcript(&key_a, None).unwrap().is_empty());
+    }
+
+    #[test]
+    fn reply_to_a_reply_is_rejected_one_level_only() {
+        // Rule 3: threads are exactly one level deep.
+        let (mut s, key) = thread_store("t-one-level");
+        let root = post_root(&mut s, &key, "root");
+        let reply = s
+            .append_message_threaded(
+                &key,
+                "john",
+                RoomParticipantKind::Human,
+                RoomMessageKind::Message,
+                "reply",
+                now(),
+                Some(root),
+                None,
+            )
+            .unwrap();
+        let err = s.append_message_threaded(
+            &key,
+            "john",
+            RoomParticipantKind::Human,
+            RoomMessageKind::Message,
+            "nested",
+            now(),
+            Some(reply.seq),
+            None,
+        );
+        assert_eq!(rejection(err), ThreadParentRejection::NotTopLevel);
+        // The valid reply is still there and still the only one.
+        assert_eq!(s.thread_reply_count(&key, root).unwrap(), 1);
+        assert_eq!(s.thread_reply_count(&key, reply.seq).unwrap(), 0);
+        assert_eq!(s.transcript(&key, None).unwrap().len(), 2);
+    }
+
+    #[test]
+    fn reply_to_structural_marker_is_rejected() {
+        // Rule 2: join/leave/system rows are transcript structure, never
+        // thread roots.
+        let (mut s, key) = thread_store("t-marker");
+        let (_, joined) = s
+            .add_participant_with_message(&key, human("john", "John"), now())
+            .unwrap();
+        assert_eq!(joined.kind, RoomMessageKind::ParticipantJoined);
+        let err = s.append_message_threaded(
+            &key,
+            "john",
+            RoomParticipantKind::Human,
+            RoomMessageKind::Message,
+            "reply to a join marker",
+            now(),
+            Some(joined.seq),
+            None,
+        );
+        assert_eq!(rejection(err), ThreadParentRejection::NotAMessage);
+
+        // Same for a system line.
+        let sys = s
+            .append_message_threaded(
+                &key,
+                "system",
+                RoomParticipantKind::Human,
+                RoomMessageKind::System,
+                "convened",
+                now(),
+                None,
+                None,
+            )
+            .unwrap();
+        let err = s.append_message_threaded(
+            &key,
+            "john",
+            RoomParticipantKind::Human,
+            RoomMessageKind::Message,
+            "reply to a system line",
+            now(),
+            Some(sys.seq),
+            None,
+        );
+        assert_eq!(rejection(err), ThreadParentRejection::NotAMessage);
+        // And for a leave marker.
+        let (_, left) = s
+            .remove_participant_with_message(&key, "john", now())
+            .unwrap();
+        let err = s.append_message_threaded(
+            &key,
+            "john",
+            RoomParticipantKind::Human,
+            RoomMessageKind::Message,
+            "reply to a leave marker",
+            now(),
+            Some(left.seq),
+            None,
+        );
+        assert_eq!(rejection(err), ThreadParentRejection::NotAMessage);
+        // Markers themselves are always top-level and unattributed.
+        for m in s.transcript(&key, None).unwrap() {
+            assert_eq!(m.thread_parent_seq, None);
+            assert_eq!(m.session_id, None);
+        }
+    }
+
+    #[test]
+    fn out_of_range_parent_seq_is_rejected_not_wrapped() {
+        // `u64::MAX` has no signed representation. The old `as i64` cast turned
+        // it into `-1` and wrote a row pointing at a parent that can never
+        // exist; checked conversion rejects it before any query.
+        let (mut s, key) = thread_store("t-range");
+        post_root(&mut s, &key, "root");
+        for bogus in [u64::MAX, (i64::MAX as u64) + 1] {
+            let err = s.append_message_threaded(
+                &key,
+                "john",
+                RoomParticipantKind::Human,
+                RoomMessageKind::Message,
+                "wrapped",
+                now(),
+                Some(bogus),
+                None,
+            );
+            assert_eq!(rejection(err), ThreadParentRejection::OutOfRange);
+        }
+        // Nothing written, and no row acquired a negative parent pointer.
+        assert_eq!(s.transcript(&key, None).unwrap().len(), 1);
+        let negative: i64 = s
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM messages WHERE thread_parent_seq < 0",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(negative, 0);
+        // The reads stay total for the same value: nothing can be its child.
+        assert_eq!(s.thread_reply_count(&key, u64::MAX).unwrap(), 0);
+        assert!(s.thread_replies(&key, u64::MAX).unwrap().is_empty());
+    }
+
+    #[test]
+    fn out_of_range_transcript_cursor_returns_empty_not_everything() {
+        // An `after_seq` above i64::MAX used to wrap to -1 and replay the whole
+        // transcript for a caller asking for rows after the end.
+        let (mut s, key) = thread_store("t-cursor");
+        post_root(&mut s, &key, "one");
+        post_root(&mut s, &key, "two");
+        assert_eq!(s.transcript(&key, None).unwrap().len(), 2);
+        let page = s.transcript_page(&key, Some(u64::MAX), None).unwrap();
+        assert!(page.messages.is_empty());
+        assert!(!page.has_more);
+        assert_eq!(page.next_seq, None);
+        assert!(s.transcript(&key, Some(u64::MAX)).unwrap().is_empty());
+    }
+
+    #[test]
+    fn threaded_append_rejects_unknown_and_closed_rooms() {
+        // Room existence is still checked first, and still reported as
+        // `UnknownRoom` through the collapse to `RoomStoreError`.
+        let (mut s, key) = thread_store("t-closed");
+        let missing = RoomKey::new("nope");
+        let err = s.append_message_threaded(
+            &missing,
+            "john",
+            RoomParticipantKind::Human,
+            RoomMessageKind::Message,
+            "hi",
+            now(),
+            None,
+            None,
+        );
+        assert!(matches!(
+            err,
+            Err(ThreadAppendError::Store(RoomStoreError::UnknownRoom(_)))
+        ));
+        // The collapse used by `RoomStore::append_message` preserves the variant.
+        assert!(matches!(
+            s.append_message(
+                &missing,
+                "john",
+                RoomParticipantKind::Human,
+                RoomMessageKind::Message,
+                "hi",
+                now()
+            ),
+            Err(RoomStoreError::UnknownRoom(_))
+        ));
+        // A policy rejection collapses to a non-UnknownRoom error rather than
+        // being mistaken for a missing room.
+        post_root(&mut s, &key, "root");
+        let collapsed: RoomStoreError = s
+            .append_message_threaded(
+                &key,
+                "john",
+                RoomParticipantKind::Human,
+                RoomMessageKind::Message,
+                "orphan",
+                now(),
+                Some(777),
+                None,
+            )
+            .unwrap_err()
+            .into();
+        assert!(matches!(collapsed, RoomStoreError::Encode(_)));
+        assert!(
+            !collapsed.to_string().contains("orphan"),
+            "a thread rejection must not leak message body text: {collapsed}"
+        );
+    }
+
+    #[test]
+    fn plain_append_message_still_writes_top_level_rows() {
+        // The pre-G1 trait path is untouched: no parent, no session, and it
+        // remains a valid thread root.
+        let (mut s, key) = thread_store("t-plain");
+        let msg = s
+            .append_message(
+                &key,
+                "john",
+                RoomParticipantKind::Human,
+                RoomMessageKind::Message,
+                "plain",
+                now(),
+            )
+            .unwrap();
+        assert_eq!(msg.thread_parent_seq, None);
+        assert_eq!(msg.session_id, None);
+        s.append_message_threaded(
+            &key,
+            "john",
+            RoomParticipantKind::Human,
+            RoomMessageKind::Message,
+            "reply to a plain root",
+            now(),
+            Some(msg.seq),
+            None,
+        )
+        .unwrap();
+        assert_eq!(s.thread_reply_count(&key, msg.seq).unwrap(), 1);
+    }
+
+    #[test]
+    fn migrate_adds_g1_columns_to_pre_g1_db_and_preserves_rows() {
+        // A database whose `messages` table predates G1 must gain both columns
+        // by schema introspection on the next open, with existing rows reading
+        // back as top-level and unattributed — not a hard error, and not a
+        // rewrite that loses transcript history.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("pre-g1.db");
+        let key = RoomKey::new("legacy-threads");
+        {
+            // Hand-build the pre-G1 schema: no thread_parent_seq, no
+            // session_id, and a `rooms` table without workspace_root.
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch(
+                r#"
+                CREATE TABLE rooms (
+                    id             TEXT PRIMARY KEY,
+                    name           TEXT NOT NULL,
+                    trigger_policy TEXT,
+                    created_at     TEXT NOT NULL,
+                    updated_at     TEXT NOT NULL,
+                    closed_at      TEXT
+                );
+                CREATE TABLE messages (
+                    room_id     TEXT NOT NULL,
+                    seq         INTEGER NOT NULL,
+                    author_id   TEXT NOT NULL,
+                    author_kind TEXT NOT NULL,
+                    kind        TEXT NOT NULL,
+                    body        TEXT NOT NULL,
+                    created_at  TEXT NOT NULL,
+                    federated   TEXT,
+                    PRIMARY KEY (room_id, seq)
+                );
+                "#,
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO rooms (id, name, trigger_policy, created_at, updated_at, closed_at)
+                 VALUES (?1, ?2, NULL, ?3, ?3, NULL)",
+                params![key.as_str(), "Legacy Threads", fmt_ts(now())],
+            )
+            .unwrap();
+            for (seq, body) in [(0i64, "old one"), (1i64, "old two")] {
+                conn.execute(
+                    "INSERT INTO messages (room_id, seq, author_id, author_kind, kind, body, created_at, federated)
+                     VALUES (?1, ?2, 'john', 'human', 'message', ?3, ?4, NULL)",
+                    params![key.as_str(), seq, body, fmt_ts(now())],
+                )
+                .unwrap();
+            }
+        }
+
+        // Opening runs migrate(), which introspects and ALTERs in both columns.
+        let mut s = SqliteRoomStore::open(&path).unwrap();
+        assert!(s
+            .message_column_names()
+            .unwrap()
+            .contains("thread_parent_seq"));
+        assert!(s.message_column_names().unwrap().contains("session_id"));
+        let transcript = s.transcript(&key, None).unwrap();
+        assert_eq!(transcript.len(), 2, "legacy rows preserved");
+        assert_eq!(transcript[0].body, "old one");
+        assert_eq!(transcript[1].body, "old two");
+        for m in &transcript {
+            assert_eq!(m.thread_parent_seq, None, "legacy rows read as top-level");
+            assert_eq!(m.session_id, None, "legacy rows read as unattributed");
+        }
+        // The migrated DB is fully functional: a legacy row is a valid thread
+        // root, and seq allocation continues from the legacy MAX.
+        let reply = s
+            .append_message_threaded(
+                &key,
+                "agent-1",
+                RoomParticipantKind::Agent,
+                RoomMessageKind::Message,
+                "reply to a legacy root",
+                now(),
+                Some(0),
+                Some("sess-legacy"),
+            )
+            .unwrap();
+        assert_eq!(reply.seq, 2);
+        assert_eq!(s.thread_reply_count(&key, 0).unwrap(), 1);
+
+        // Idempotent: migrate() again in-process, and a fresh open, both no-op
+        // and keep every row.
+        s.migrate().unwrap();
+        s.migrate().unwrap();
+        drop(s);
+        let s = SqliteRoomStore::open(&path).unwrap();
+        assert_eq!(s.transcript(&key, None).unwrap().len(), 3);
+        assert_eq!(s.thread_reply_count(&key, 0).unwrap(), 1);
+        assert_eq!(
+            s.thread_replies(&key, 0).unwrap()[0].session_id.as_deref(),
+            Some("sess-legacy")
+        );
+    }
+
+    #[test]
+    fn migrate_creates_composite_thread_index() {
+        // The per-root reply reads and the in-transaction parent check all
+        // filter on (room_id, thread_parent_seq) and order by seq; the index
+        // must exist so a long-lived room never full-scans.
+        let s = store();
+        let names: Vec<String> = {
+            let mut stmt = s
+                .conn
+                .prepare(
+                    "SELECT name FROM sqlite_master WHERE type = 'index' AND tbl_name = 'messages'",
+                )
+                .unwrap();
+            let rows = stmt.query_map([], |r| r.get::<_, String>(0)).unwrap();
+            rows.map(|r| r.unwrap()).collect()
+        };
+        assert!(
+            names.iter().any(|n| n == "idx_messages_room_thread"),
+            "missing composite thread index, got {names:?}"
+        );
+    }
+
+    #[test]
+    fn negative_stored_thread_parent_fails_closed_on_read() {
+        // Only reachable by external tampering (or a pre-fix wrapped cast). A
+        // negative parent pointer must NOT decode into a huge bogus u64.
+        let (mut s, key) = thread_store("t-tampered");
+        post_root(&mut s, &key, "root");
+        s.conn
+            .execute(
+                "UPDATE messages SET thread_parent_seq = -1 WHERE room_id = ?1 AND seq = 0",
+                params![key.as_str()],
+            )
+            .unwrap();
+        assert!(matches!(
+            s.transcript(&key, None),
+            Err(RoomStoreError::Encode(_))
+        ));
+        // And such a row is never a usable parent.
+        let err = s.append_message_threaded(
+            &key,
+            "john",
+            RoomParticipantKind::Human,
+            RoomMessageKind::Message,
+            "reply",
+            now(),
+            Some(0),
+            None,
+        );
+        assert_eq!(rejection(err), ThreadParentRejection::NotTopLevel);
     }
 }
