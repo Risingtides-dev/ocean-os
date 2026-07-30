@@ -19,7 +19,7 @@ use ocean_core::{
 };
 #[cfg(test)]
 use ocean_core::{OutboxItemState, RoomOutboxItem};
-use ocean_store::RoomStore;
+use ocean_store::{RoomStore, ThreadAppendError};
 use serde::Deserialize;
 use serde_json::json;
 use sha2::{Digest, Sha256};
@@ -176,6 +176,71 @@ fn append_room_message(
 ) -> Result<RoomMessage, ocean_store::RoomStoreError> {
     let message = with_rooms(state, |store| {
         store.append_message(room, author_id, author_kind, kind, body, Utc::now())
+    })?;
+    publish_room_wake(state, room, &message);
+    Ok(message)
+}
+
+/// Post a convened agent's answer back into a room (G3).
+///
+/// Two invariants live here, and neither is client-controllable:
+///
+/// 1. **Session attribution is daemon-derived.** `session_id` is the id the
+///    daemon itself minted for this (room, agent) pair via
+///    [`room_agent_session_id`] — it is never read off a request body, so a
+///    caller can never attribute a row to a session it does not own.
+/// 2. **Threading degrades, it never drops.** The agent answers *after* its
+///    turn ran, so the parent row it should hang under may have been closed,
+///    re-parented, or otherwise invalidated in the meantime. A typed
+///    [`ThreadAppendError::InvalidThreadParent`] therefore does not fail the
+///    reply: it is re-appended top-level (the pre-thread behaviour) and the
+///    stale parent is logged. Only a real store error propagates.
+pub(super) fn append_room_agent_reply(
+    state: &AppState,
+    room: &RoomKey,
+    agent_id: &str,
+    body: &str,
+    thread_parent_seq: Option<u64>,
+    session_id: Option<&str>,
+) -> Result<RoomMessage, ocean_store::RoomStoreError> {
+    let message = with_rooms(state, |store| {
+        let first = store.append_message_threaded(
+            room,
+            agent_id,
+            RoomParticipantKind::Agent,
+            RoomMessageKind::Message,
+            body,
+            Utc::now(),
+            thread_parent_seq,
+            session_id,
+        );
+        match first {
+            Ok(message) => Ok(message),
+            Err(ThreadAppendError::Store(e)) => Err(e),
+            Err(ThreadAppendError::InvalidThreadParent {
+                parent_seq, reason, ..
+            }) => {
+                tracing::warn!(
+                    room = %room,
+                    agent = %agent_id,
+                    parent_seq,
+                    reason = %reason,
+                    "stale thread parent for agent reply; posting top-level"
+                );
+                store
+                    .append_message_threaded(
+                        room,
+                        agent_id,
+                        RoomParticipantKind::Agent,
+                        RoomMessageKind::Message,
+                        body,
+                        Utc::now(),
+                        None,
+                        session_id,
+                    )
+                    .map_err(ocean_store::RoomStoreError::from)
+            }
+        }
     })?;
     publish_room_wake(state, room, &message);
     Ok(message)
@@ -596,10 +661,118 @@ pub(super) struct RoomMessageRequest {
     /// threads). `None` for top-level messages.
     #[serde(default)]
     pub(super) thread_parent_seq: Option<u64>,
-    /// The Ocean session id producing this message, for session-backed
-    /// attribution (G1-B imported agents).
-    #[serde(default)]
-    pub(super) session_id: Option<String>,
+    // NOTE (G3): there is deliberately NO `session_id` field. Session
+    // attribution is derived by the daemon from the path that produced the row
+    // — `room_agent_session_id` for a convened agent reply (see
+    // [`append_room_agent_reply`]) — so a client can never attribute its post
+    // to a session it does not own. A locally posted HTTP message has no
+    // owning daemon session and is stored with `session_id = NULL`.
+}
+
+/// Why the daemon refused a locally authored post *before* it could reach the
+/// transcript (G3 author authority + thread integrity).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum PostRejection {
+    /// The caller claimed an `agent`/`system` author kind. Those rows are
+    /// daemon-authored only (convened replies and audit lines); accepting a
+    /// client-supplied one would let a browser forge an agent utterance *and*
+    /// bypass the anti-loop guard, which skips trigger evaluation for
+    /// agent-authored messages.
+    ForgedAuthorKind,
+    /// The `(author_id, author_kind)` pair is not on the room's roster, so the
+    /// caller is claiming an identity this room never admitted.
+    AuthorNotInRoster,
+    /// `thread_parent_seq` violated the store's one-level thread policy. The
+    /// store rejected it inside the append transaction; nothing was written.
+    InvalidThreadParent,
+}
+
+/// The local post path's error: either the durable store failed, or the daemon
+/// itself refused the post. Keeping them apart is what lets a refusal answer
+/// with a fixed 4xx while a store fault keeps its existing mapping.
+#[derive(Debug)]
+pub(super) enum LocalPostError {
+    /// An underlying store error (unknown room, federation corruption, SQLite).
+    Store(ocean_store::RoomStoreError),
+    /// A daemon-side refusal with a fixed, body-free reason.
+    Rejected(PostRejection),
+}
+
+impl From<ocean_store::RoomStoreError> for LocalPostError {
+    fn from(e: ocean_store::RoomStoreError) -> Self {
+        Self::Store(e)
+    }
+}
+
+/// Map a [`PostRejection`] onto its frozen `(status, body)` pair. The body
+/// carries a stable machine code and never echoes the rejected author id,
+/// claimed kind, or message body.
+pub(super) fn post_rejection_response(
+    rejection: PostRejection,
+) -> (StatusCode, Json<serde_json::Value>) {
+    let (status, code) = match rejection {
+        PostRejection::ForgedAuthorKind => (StatusCode::FORBIDDEN, "forged_author_kind"),
+        PostRejection::AuthorNotInRoster => (StatusCode::FORBIDDEN, "author_not_in_roster"),
+        PostRejection::InvalidThreadParent => (StatusCode::BAD_REQUEST, "invalid_thread_parent"),
+    };
+    (status, Json(json!({ "ok": false, "error": code })))
+}
+
+/// Decide whether a client may author this local post (G3).
+///
+/// Two rules, both fail-closed:
+///
+/// 1. `agent` and `system` are daemon-only author kinds. The daemon writes
+///    those rows itself ([`append_room_agent_reply`] and the audit appends);
+///    a request that claims one is a forgery regardless of its id.
+/// 2. The `(id, kind)` pair must already be on the roster. Membership — not
+///    the request body — is the authority on who may speak in a room, so an
+///    unknown id, or a known id claiming the wrong kind, is refused.
+pub(super) fn classify_local_author(
+    roster: &[RoomParticipant],
+    author_id: &str,
+    author_kind: RoomParticipantKind,
+) -> Result<(), PostRejection> {
+    if matches!(
+        author_kind,
+        RoomParticipantKind::Agent | RoomParticipantKind::System
+    ) {
+        return Err(PostRejection::ForgedAuthorKind);
+    }
+    let author_id = author_id.trim();
+    if author_id.is_empty() {
+        return Err(PostRejection::AuthorNotInRoster);
+    }
+    let admitted = roster
+        .iter()
+        .any(|p| p.id == author_id && p.kind == author_kind);
+    if !admitted {
+        return Err(PostRejection::AuthorNotInRoster);
+    }
+    Ok(())
+}
+
+/// Read just the author of one thread root, as a bounded single-row query.
+///
+/// Uses the `LIMIT`ed [`RoomStore::transcript_page`] with `after_seq =
+/// root_seq - 1` and `limit = 1`, so this never loads a transcript to answer a
+/// one-row question. Returns `None` when no row with exactly `root_seq` exists
+/// in this room; a caller treats that as "no thread-reply trigger", never as an
+/// error.
+fn thread_root_author(
+    reg: &ocean_store::SqliteRoomStore,
+    key: &RoomKey,
+    root_seq: u64,
+) -> Result<Option<String>, ocean_store::RoomStoreError> {
+    // `seq` is 0-based, and `transcript_page` is exclusive on `after_seq`, so
+    // seq 0 must page from the start rather than from `-1`.
+    let after_seq = root_seq.checked_sub(1);
+    let page = reg.transcript_page(key, after_seq, Some(1))?;
+    Ok(page
+        .messages
+        .into_iter()
+        .find(|m| m.seq == root_seq)
+        .map(|m| m.author_id))
 }
 
 /// `POST /v1/rooms/persistent/{key}/messages` — append a chat message to the
@@ -619,7 +792,7 @@ pub(super) async fn room_post_message(
     // never between a Local check and a later append.
     let append = with_rooms(&state, |reg| {
         if reg.get(&key)?.is_none() {
-            return Err(ocean_store::RoomStoreError::UnknownRoom(key.clone()));
+            return Err(ocean_store::RoomStoreError::UnknownRoom(key.clone()).into());
         }
         if reg.room_credential(&key)?.is_some() {
             return Ok(None);
@@ -627,9 +800,26 @@ pub(super) async fn room_post_message(
         if reg.room_access(&key)?.state != RoomAccessState::Local {
             return Err(ocean_store::RoomStoreError::FederationCorruption(
                 "missing credential for non-local room".into(),
-            ));
+            )
+            .into());
         }
-        let msg = reg.append_message_threaded(
+        let roster = reg
+            .get(&key)?
+            .map(|rec| rec.room.participants)
+            .unwrap_or_default();
+        // G3 author authority: decide who may speak BEFORE anything is
+        // written, under the same guard as the append, so a roster change
+        // cannot land between the decision and the row.
+        classify_local_author(&roster, &req.author_id, req.author_kind)
+            .map_err(LocalPostError::Rejected)?;
+        // Read the thread root's author before appending: the reply itself is
+        // not a valid trigger source, and after the append the root is one row
+        // further back. `None` for a top-level post or a vanished root.
+        let root_author = match req.thread_parent_seq {
+            Some(parent_seq) => thread_root_author(reg, &key, parent_seq)?,
+            None => None,
+        };
+        let msg = match reg.append_message_threaded(
             &key,
             &req.author_id,
             req.author_kind,
@@ -637,17 +827,23 @@ pub(super) async fn room_post_message(
             &req.body,
             Utc::now(),
             req.thread_parent_seq,
-            req.session_id.as_deref(),
-        )?;
+            // G3: session attribution is daemon-derived, never client-supplied.
+            // An HTTP post has no owning daemon session.
+            None,
+        ) {
+            Ok(msg) => msg,
+            // A bad parent is a client mistake, not a server fault: keep it a
+            // typed 400 instead of collapsing onto `RoomStoreError::Encode`.
+            Err(ThreadAppendError::InvalidThreadParent { .. }) => {
+                return Err(LocalPostError::Rejected(PostRejection::InvalidThreadParent))
+            }
+            Err(ThreadAppendError::Store(e)) => return Err(LocalPostError::Store(e)),
+        };
         let policy = reg.trigger_policy(&key)?;
-        let roster = reg
-            .get(&key)?
-            .map(|rec| rec.room.participants)
-            .unwrap_or_default();
-        Ok::<_, ocean_store::RoomStoreError>(Some((msg, policy, roster)))
+        Ok::<_, LocalPostError>(Some((msg, policy, roster, root_author)))
     });
 
-    let (msg, policy, roster) = match append {
+    let (msg, policy, roster, root_author) = match append {
         Ok(Some(local)) => local,
         Ok(None) => {
             return match state
@@ -662,13 +858,14 @@ pub(super) async fn room_post_message(
                 Err(error) => intent_error_response(error),
             };
         }
-        Err(ocean_store::RoomStoreError::UnknownRoom(_)) => {
+        Err(LocalPostError::Rejected(rejection)) => return post_rejection_response(rejection),
+        Err(LocalPostError::Store(ocean_store::RoomStoreError::UnknownRoom(_))) => {
             return intent_error_response(IntentError::NotFound)
         }
-        Err(ocean_store::RoomStoreError::FederationCorruption(_)) => {
+        Err(LocalPostError::Store(ocean_store::RoomStoreError::FederationCorruption(_))) => {
             return intent_error_response(IntentError::Store)
         }
-        Err(e) => return room_store_error_response(e),
+        Err(LocalPostError::Store(e)) => return room_store_error_response(e),
     };
     publish_room_wake(&state, &key, &msg);
 
@@ -687,14 +884,21 @@ pub(super) async fn room_post_message(
     // agent (or itself) in its reply can never ping-pong the room. Only
     // human/bot/system-authored lines can convene an agent.
     let mut fired = Vec::new();
+    let mut convened = std::collections::HashSet::new();
     if !matches!(req.author_kind, RoomParticipantKind::Agent) {
-        for participant_id in parse_mentions(&req.body) {
-            let decision = evaluate_trigger_policy(
-                policy.as_ref(),
-                &RoomTriggerEvent::Mention {
-                    participant_id: participant_id.clone(),
-                },
+        // Every trigger source for THIS row, in a fixed order: each @-mention in
+        // body order, then (G3) the thread-root author when this post is a reply.
+        // A single evaluation loop keeps one convene footprint per agent.
+        let events = parse_mentions(&req.body)
+            .into_iter()
+            .map(|participant_id| RoomTriggerEvent::Mention { participant_id })
+            .chain(
+                root_author
+                    .into_iter()
+                    .map(|participant_id| RoomTriggerEvent::ThreadReply { participant_id }),
             );
+        for event in events {
+            let decision = evaluate_trigger_policy(policy.as_ref(), &event);
             if !decision.should_convene {
                 continue;
             }
@@ -721,6 +925,13 @@ pub(super) async fn room_post_message(
             let Some(agent) = resolved_agent else {
                 continue;
             };
+
+            // One convene footprint per agent per posted row. Mentioning an
+            // agent twice — or mentioning the same agent that owns the thread
+            // root — must not queue two turns for one message.
+            if !convened.insert(agent.id.clone()) {
+                continue;
+            }
 
             // Named-agent binding gate (TASK-9): a roster Agent participant must
             // ALSO resolve to a real folder-as-agent definition before any
@@ -1311,13 +1522,16 @@ fn spawn_room_agent_turn(
                         tracing::warn!(room = %room, outcome = "agent_reply_enqueue_failed", "federated agent reply suppressed");
                     }
                 } else {
-                    let _ = append_room_message(
+                    // G3: thread the answer under the line that convened it and
+                    // stamp the daemon-derived session. A stale/invalid parent
+                    // degrades to a top-level post inside the helper.
+                    let _ = append_room_agent_reply(
                         &state,
                         &room,
                         &agent.id,
-                        RoomParticipantKind::Agent,
-                        RoomMessageKind::Message,
                         body,
+                        Some(triggered_by_seq),
+                        Some(&session_id.to_string()),
                     );
                 }
             }
@@ -2354,7 +2568,6 @@ mod tests {
                 author_kind: RoomParticipantKind::Agent,
                 body: "federated intent".into(),
                 thread_parent_seq: None,
-                session_id: None,
             }),
         )
         .await;
@@ -2389,7 +2602,6 @@ mod tests {
             author_kind: RoomParticipantKind::Human,
             body: "intent".into(),
             thread_parent_seq: None,
-            session_id: None,
         };
 
         let (status, Json(body)) = room_post_message(
@@ -2452,6 +2664,15 @@ mod tests {
             store.create(key.clone(), "Conversion Race", None, Utc::now())
         })
         .unwrap();
+        // G3: the local branch only accepts an admitted author, so the race is
+        // still a race between a local commit and a federated hand-off.
+        join_participant(
+            &state,
+            &key,
+            "claimed-human",
+            RoomParticipantKind::Human,
+            "Claimed Human",
+        );
         let barrier = Arc::new(tokio::sync::Barrier::new(3));
         let post = tokio::spawn({
             let state = state.clone();
@@ -2467,7 +2688,6 @@ mod tests {
                         author_kind: RoomParticipantKind::Human,
                         body: "conversion race".into(),
                         thread_parent_seq: None,
-                        session_id: None,
                     }),
                 )
                 .await
@@ -2497,14 +2717,20 @@ mod tests {
         let (status, _) = post.unwrap();
         install.unwrap();
         let transcript = with_rooms(&state, |store| store.transcript(&key, None)).unwrap();
+        // Only chat rows are the race's output; the roster join above is fixture
+        // setup and is always present.
+        let chat: Vec<_> = transcript
+            .iter()
+            .filter(|m| m.kind == RoomMessageKind::Message)
+            .collect();
         let pending = with_rooms(&state, |store| store.pending_outbox(&key)).unwrap();
         match status {
             StatusCode::CREATED => {
-                assert_eq!(transcript.len(), 1);
+                assert_eq!(chat.len(), 1);
                 assert!(pending.is_empty());
             }
             StatusCode::ACCEPTED => {
-                assert!(transcript.is_empty());
+                assert!(chat.is_empty());
                 assert_eq!(pending.len(), 1);
             }
             other => panic!("unexpected conversion-race status {other}"),
@@ -2823,6 +3049,36 @@ mod tests {
         });
     }
 
+    /// Admit a `human` Human participant (G3 author authority): a locally posted
+    /// message is refused with 403 unless its `(id, kind)` pair is already on the
+    /// roster. The join itself commits a `ParticipantJoined` row, so fixtures that
+    /// assert on `seq` or on tail ordering account for it explicitly.
+    fn join_human(state: &AppState, key: &RoomKey) {
+        join_participant(state, key, "human", RoomParticipantKind::Human, "Human");
+    }
+
+    fn join_participant(
+        state: &AppState,
+        key: &RoomKey,
+        id: &str,
+        kind: RoomParticipantKind,
+        display_name: &str,
+    ) {
+        with_rooms(state, |store| {
+            store
+                .add_participant(
+                    key,
+                    RoomParticipant {
+                        id: id.into(),
+                        kind,
+                        display_name: display_name.into(),
+                    },
+                    Utc::now(),
+                )
+                .expect("roster fixture");
+        });
+    }
+
     async fn paused_tail(
         state: &AppState,
         key: &RoomKey,
@@ -2899,9 +3155,12 @@ mod tests {
         let state = fake_convene_state(&tmp);
         let key = RoomKey::new("fanout");
         create_plain_room(&state, &key);
+        // The author must be admitted before it may post (G3). Its join row is
+        // seq 0, so both tails resume after it and the posts are seq 1 and 2.
+        join_human(&state, &key);
 
-        let (mut first, release_first) = paused_tail(&state, &key, None).await;
-        let (mut second, release_second) = paused_tail(&state, &key, None).await;
+        let (mut first, release_first) = paused_tail(&state, &key, Some(0)).await;
+        let (mut second, release_second) = paused_tail(&state, &key, Some(0)).await;
         release_first.send(()).unwrap();
         release_second.send(()).unwrap();
 
@@ -2913,7 +3172,6 @@ mod tests {
                 author_kind: RoomParticipantKind::Human,
                 body: "first".into(),
                 thread_parent_seq: None,
-                session_id: None,
             }),
         )
         .await;
@@ -2923,7 +3181,7 @@ mod tests {
         let first_b = next_message(&mut second).await;
         assert!(returned_at.elapsed() < std::time::Duration::from_millis(250));
         assert_eq!(first_a, first_b);
-        assert_eq!(first_a.seq, 0);
+        assert_eq!(first_a.seq, 1);
 
         let (status, _) = room_post_message(
             State(state),
@@ -2933,13 +3191,12 @@ mod tests {
                 author_kind: RoomParticipantKind::Human,
                 body: "second".into(),
                 thread_parent_seq: None,
-                session_id: None,
             }),
         )
         .await;
         assert_eq!(status, StatusCode::CREATED);
-        assert_eq!(next_message(&mut first).await.seq, 1);
-        assert_eq!(next_message(&mut second).await.seq, 1);
+        assert_eq!(next_message(&mut first).await.seq, 2);
+        assert_eq!(next_message(&mut second).await.seq, 2);
         assert!(
             tokio::time::timeout(std::time::Duration::from_millis(30), first.next())
                 .await
@@ -3067,6 +3324,9 @@ mod tests {
         std::env::set_var("OCEAN_AGENTS_DIR", &agents_root);
         let convene = RoomKey::new("convene-live");
         create_mention_room(&state, &convene);
+        // Author admission (G3) is seq 0 and the agent join is seq 1, so the
+        // tail resumes after both and sees only the post + audit rows.
+        join_human(&state, &convene);
         let (join_status, _) = room_join(
             State(state.clone()),
             Path(convene.as_str().to_string()),
@@ -3078,7 +3338,7 @@ mod tests {
         )
         .await;
         assert_eq!(join_status, StatusCode::OK);
-        let (mut convene_tail, release) = paused_tail(&state, &convene, Some(0)).await;
+        let (mut convene_tail, release) = paused_tail(&state, &convene, Some(1)).await;
         release.send(()).unwrap();
         let (post_status, _) = room_post_message(
             State(state),
@@ -3088,7 +3348,6 @@ mod tests {
                 author_kind: RoomParticipantKind::Human,
                 body: "@helper report".into(),
                 thread_parent_seq: None,
-                session_id: None,
             }),
         )
         .await;
@@ -3385,6 +3644,7 @@ mod tests {
         let (_replay, mut trigger_rx) = state.agent_events.subscribe_with_replay(None);
         let key = RoomKey::new("legacy-phantom");
         create_mention_room(&state, &key);
+        join_human(&state, &key);
         with_rooms(&state, |store| {
             store
                 .add_participant(
@@ -3407,7 +3667,6 @@ mod tests {
                 author_kind: RoomParticipantKind::Human,
                 body: "@phantom report".into(),
                 thread_parent_seq: None,
-                session_id: None,
             }),
         )
         .await;
@@ -3461,6 +3720,7 @@ env = { FIXTURE = "1" }
         clear_turn_captures();
         let key = RoomKey::new("bound-agent-profile");
         create_mention_room(&state, &key);
+        join_human(&state, &key);
 
         let (join_status, _) = room_join(
             State(state.clone()),
@@ -3482,7 +3742,6 @@ env = { FIXTURE = "1" }
                 author_kind: RoomParticipantKind::Human,
                 body: "@bound-agent report".into(),
                 thread_parent_seq: None,
-                session_id: None,
             }),
         )
         .await;
@@ -3532,6 +3791,7 @@ env = { FIXTURE = "1" }
         let (_replay, mut trigger_rx) = state.agent_events.subscribe_with_replay(None);
         let key = RoomKey::new("data-only-profile");
         create_mention_room(&state, &key);
+        join_human(&state, &key);
 
         let (join_status, _) = room_join(
             State(state.clone()),
@@ -3553,7 +3813,6 @@ env = { FIXTURE = "1" }
                 author_kind: RoomParticipantKind::Human,
                 body: "@data-only report".into(),
                 thread_parent_seq: None,
-                session_id: None,
             }),
         )
         .await;

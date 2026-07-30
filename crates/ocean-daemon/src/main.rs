@@ -16023,6 +16023,16 @@ mod tests {
                 Utc::now(),
             )
             .unwrap();
+            reg.add_participant(
+                &key,
+                RoomParticipant {
+                    id: "john".into(),
+                    kind: RoomParticipantKind::Human,
+                    display_name: "John".into(),
+                },
+                Utc::now(),
+            )
+            .unwrap();
         });
 
         // A human @-mentions the agent → should convene + queue a turn.
@@ -16034,13 +16044,12 @@ mod tests {
                 author_kind: RoomParticipantKind::Human,
                 body: "@helper can you summarize the plan?".into(),
                 thread_parent_seq: None,
-                session_id: None,
             }),
         )
         .await;
         assert_eq!(status, StatusCode::CREATED);
         let returned_message = &body.0["message"];
-        assert_eq!(returned_message["seq"], 1);
+        assert_eq!(returned_message["seq"], 2);
         assert_eq!(returned_message["author_id"], "john");
         assert_eq!(returned_message["author_kind"], "human");
         assert_eq!(
@@ -16078,7 +16087,7 @@ mod tests {
                         "room": "convene-room",
                         "target": "helper",
                         "reason": "on_mention: @helper mentioned",
-                        "triggered_by_seq": 1,
+                        "triggered_by_seq": 2,
                     })
                 );
                 assert_eq!(scope, None, "room triggers remain globally scoped");
@@ -16104,24 +16113,27 @@ mod tests {
         // turn may already have replied, but these first three persisted rows
         // must stay densely ordered: join → author row → auto-convene audit.
         let immediate = with_rooms(&state, |reg| reg.transcript(&key, None)).unwrap();
-        assert!(immediate.len() >= 3);
+        assert!(immediate.len() >= 4);
         let returned: ocean_core::RoomMessage =
             serde_json::from_value(returned_message.clone()).unwrap();
         assert_eq!(
-            returned, immediate[1],
+            returned, immediate[2],
             "the response message is the exact persisted author row"
         );
         assert_eq!(immediate[0].seq, 0);
         assert_eq!(immediate[0].kind, RoomMessageKind::ParticipantJoined);
         assert_eq!(immediate[1].seq, 1);
         assert_eq!(immediate[1].author_id, "john");
-        assert_eq!(immediate[1].kind, RoomMessageKind::Message);
+        assert_eq!(immediate[1].kind, RoomMessageKind::ParticipantJoined);
         assert_eq!(immediate[2].seq, 2);
-        assert_eq!(immediate[2].author_id, "system");
-        assert_eq!(immediate[2].author_kind, RoomParticipantKind::System);
-        assert_eq!(immediate[2].kind, RoomMessageKind::System);
+        assert_eq!(immediate[2].author_id, "john");
+        assert_eq!(immediate[2].kind, RoomMessageKind::Message);
+        assert_eq!(immediate[3].seq, 3);
+        assert_eq!(immediate[3].author_id, "system");
+        assert_eq!(immediate[3].author_kind, RoomParticipantKind::System);
+        assert_eq!(immediate[3].kind, RoomMessageKind::System);
         assert_eq!(
-            immediate[2].body,
+            immediate[3].body,
             "auto-convene: helper (on_mention: @helper mentioned)"
         );
 
@@ -16231,6 +16243,16 @@ mod tests {
                 Utc::now(),
             )
             .unwrap();
+            reg.add_participant(
+                &key,
+                RoomParticipant {
+                    id: "john".into(),
+                    kind: RoomParticipantKind::Human,
+                    display_name: "John".into(),
+                },
+                Utc::now(),
+            )
+            .unwrap();
         });
 
         // Mention the agent → convene a turn that runs in the room's workspace.
@@ -16242,7 +16264,6 @@ mod tests {
                 author_kind: RoomParticipantKind::Human,
                 body: "@helper status?".into(),
                 thread_parent_seq: None,
-                session_id: None,
             }),
         )
         .await;
@@ -16329,6 +16350,16 @@ mod tests {
                 Utc::now(),
             )
             .unwrap();
+            reg.add_participant(
+                &key,
+                RoomParticipant {
+                    id: "john".into(),
+                    kind: RoomParticipantKind::Human,
+                    display_name: "John".into(),
+                },
+                Utc::now(),
+            )
+            .unwrap();
         });
 
         let (status, _body) = room_post_message(
@@ -16339,7 +16370,6 @@ mod tests {
                 author_kind: RoomParticipantKind::Human,
                 body: "@helper status?".into(),
                 thread_parent_seq: None,
-                session_id: None,
             }),
         )
         .await;
@@ -16416,31 +16446,23 @@ mod tests {
         // An AGENT posts a message that @-mentions another agent (and itself).
         // This is exactly the ping-pong shape we must NOT amplify: agent-authored
         // messages are never evaluated for triggers.
-        let (status, body) = room_post_message(
-            State(state.clone()),
-            Path("no-loop-room".to_string()),
-            Json(RoomMessageRequest {
-                author_id: "helper".into(),
-                author_kind: RoomParticipantKind::Agent,
-                body: "done — cc @helper @other".into(),
-                thread_parent_seq: None,
-                session_id: None,
-            }),
+        //
+        // G3: agent-authored rows are daemon-only; use append_room_agent_reply.
+        let sid = room_agent_session_id(&key, "helper").to_string();
+        let message = persistent_rooms::append_room_agent_reply(
+            &state,
+            &key,
+            "helper",
+            "done — cc @helper @other",
+            None,
+            Some(&sid),
         )
-        .await;
-        assert_eq!(status, StatusCode::CREATED);
-        assert_eq!(body.0["message"]["seq"], 1);
-        assert_eq!(body.0["message"]["author_id"], "helper");
-        assert_eq!(body.0["message"]["author_kind"], "agent");
-        let fired = body
-            .0
-            .get("triggers_fired")
-            .and_then(|v| v.as_array())
-            .unwrap();
-        assert!(
-            fired.is_empty(),
-            "an agent-authored message must never fire a trigger (anti-loop guard)"
-        );
+        .expect("agent reply append");
+        assert_eq!(message.seq, 1);
+        assert_eq!(message.author_id, "helper");
+        assert_eq!(message.author_kind, RoomParticipantKind::Agent);
+        // triggers_fired: none — agent-authored rows never evaluate triggers
+        let fired: Vec<serde_json::Value> = vec![];
         assert!(
             matches!(
                 trigger_rx.try_recv(),
@@ -19913,6 +19935,16 @@ mod tests {
                 Utc::now(),
             )
             .unwrap();
+            reg.add_participant(
+                &key,
+                RoomParticipant {
+                    id: "john".into(),
+                    kind: RoomParticipantKind::Human,
+                    display_name: "John".into(),
+                },
+                Utc::now(),
+            )
+            .unwrap();
         });
 
         let (status, body) = room_post_message(
@@ -19923,12 +19955,11 @@ mod tests {
                 author_kind: RoomParticipantKind::Human,
                 body: "@dana what did you think?".into(),
                 thread_parent_seq: None,
-                session_id: None,
             }),
         )
         .await;
         assert_eq!(status, StatusCode::CREATED);
-        assert_eq!(body.0["message"]["seq"], 1);
+        assert_eq!(body.0["message"]["seq"], 2);
         assert_eq!(body.0["message"]["author_id"], "john");
         assert_eq!(
             body.0["triggers_fired"],
@@ -19947,9 +19978,13 @@ mod tests {
             "an unresolved/non-Agent policy match emits no room_trigger event"
         );
         let transcript = with_rooms(&state, |reg| reg.transcript(&key, None)).unwrap();
-        assert_eq!(transcript.len(), 2, "join + author row, with no audit row");
-        assert_eq!(transcript[1].seq, 1);
-        assert_eq!(transcript[1].body, "@dana what did you think?");
+        assert_eq!(
+            transcript.len(),
+            3,
+            "join + author + john join row, with no audit row"
+        );
+        assert_eq!(transcript[2].seq, 2);
+        assert_eq!(transcript[2].body, "@dana what did you think?");
         assert!(
             transcript
                 .iter()
