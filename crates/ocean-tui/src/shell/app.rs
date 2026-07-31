@@ -7374,7 +7374,13 @@ mod tests {
         app.launch_apply();
         assert!(app.resume_open && app.resume_loading);
 
-        let action = tokio::time::timeout(Duration::from_secs(2), app.actions_rx.recv())
+        // Discovery scans the operator's real `~/.config/ocean-rs/sessions`
+        // archive (spawn_blocking + serde over every record; 700+ files / 55MB
+        // on a long-lived box). The assertion is about the action-channel
+        // plumbing — discovery RETURNS through the channel — not its latency,
+        // so the bound is generous to stay honest on large archives and busy
+        // machines.
+        let action = tokio::time::timeout(Duration::from_secs(60), app.actions_rx.recv())
             .await
             .expect("bounded discovery")
             .expect("discovery action");
