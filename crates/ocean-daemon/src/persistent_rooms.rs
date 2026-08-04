@@ -334,6 +334,8 @@ pub(super) fn room_store_error_response(
         // sees. Before this it tripped the PK constraint and surfaced as a 500 —
         // a client mistake reported as a server fault.
         ArtifactAlreadyExists { .. } => StatusCode::CONFLICT,
+        // Nothing to change is a client mistake, not a conflict to retry.
+        ArtifactUnchanged { .. } => StatusCode::BAD_REQUEST,
         ParticipantRecordImmutable { .. } => StatusCode::CONFLICT,
         // An artifact attributed to someone not in the room is a lie, not a
         // server fault.

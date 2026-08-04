@@ -230,6 +230,10 @@ pub enum RoomStoreError {
         participant: String,
         field: &'static str,
     },
+    /// An amend that would change nothing. Bumping the version on a no-op both
+    /// records an update that did not happen and invalidates every other
+    /// writer's `expected_version`, which is a denial-of-honest-writes lever.
+    ArtifactUnchanged { room: RoomKey, artifact: String },
     /// An artifact with that id already exists in this room. A client naming
     /// collision is the most ordinary error this endpoint sees; it must not
     /// surface as a server fault.
@@ -295,6 +299,10 @@ impl std::fmt::Display for RoomStoreError {
                 f,
                 "room '{room}': participant '{participant}' already exists; \
                  '{field}' cannot be changed by re-joining"
+            ),
+            Self::ArtifactUnchanged { room, artifact } => write!(
+                f,
+                "room '{room}': amend of '{artifact}' would change nothing"
             ),
             Self::ArtifactAlreadyExists { room, artifact } => {
                 write!(f, "room '{room}' already has an artifact '{artifact}'")
@@ -1410,6 +1418,19 @@ impl SqliteRoomStore {
             .map(encode_artifact_state)
             .unwrap_or(cur_state.as_str())
             .to_string();
+        // An amend that changes NOTHING must not pretend it did. Bumping the
+        // version on a no-op writes a transcript line saying somebody updated
+        // the artifact when they did not — the room's own history telling a lie
+        // — and, worse, it invalidates every other writer's `expected_version`.
+        // Any roster member could then issue content-free amends in a loop and
+        // starve honest writers out of the CAS forever. Refuse it: nothing
+        // changed, so there is nothing to record.
+        if next_title == cur_title && next_body == cur_body && next_state == cur_state {
+            return Err(RoomStoreError::ArtifactUnchanged {
+                room: key.clone(),
+                artifact: artifact_id.to_string(),
+            });
+        }
         let ts = now.to_rfc3339();
         tx.execute(
             "UPDATE room_artifacts
@@ -4808,6 +4829,68 @@ mod tests {
             Some("alice"),
             "the artifact was created for alice; that is history, not live state"
         );
+    }
+
+    /// F3 (kimi-verify): an amend that changes nothing must not bump the
+    /// version or write a transcript line. Beyond the lie, a content-free amend
+    /// invalidates every other writer's expected_version — a roster member could
+    /// loop it and starve honest writers out of the CAS.
+    /// Mutation: delete the unchanged check -> version burns, transcript grows,
+    /// and the room claims an update that never happened -> RED.
+    #[test]
+    fn a_no_op_amend_is_refused_and_does_not_burn_the_version() {
+        let (mut s, key) = artifact_room();
+        let (a, _) = s
+            .create_artifact(
+                &key,
+                "t1",
+                RoomArtifactKind::Task,
+                "Ship it",
+                "b",
+                "alice",
+                now(),
+            )
+            .unwrap();
+        let before = s.get(&key).unwrap().unwrap().transcript.len();
+
+        // Explicit all-None amend.
+        let err = s
+            .amend_artifact(&key, "t1", a.version, None, None, None, "bob", now())
+            .unwrap_err();
+        assert!(matches!(err, RoomStoreError::ArtifactUnchanged { .. }));
+
+        // Same-value amend is equally a no-op.
+        let err = s
+            .amend_artifact(
+                &key,
+                "t1",
+                a.version,
+                Some("Ship it"),
+                Some("b"),
+                Some(RoomArtifactState::Open),
+                "bob",
+                now(),
+            )
+            .unwrap_err();
+        assert!(matches!(err, RoomStoreError::ArtifactUnchanged { .. }));
+
+        let after = s.artifact(&key, "t1").unwrap().unwrap();
+        assert_eq!(after.version, 1, "a no-op must not burn the CAS version");
+        assert_eq!(
+            after.updated_by, "alice",
+            "no-op must not reassign updated_by"
+        );
+        assert_eq!(
+            s.get(&key).unwrap().unwrap().transcript.len(),
+            before,
+            "a no-op must not claim an update in the transcript"
+        );
+
+        // A real change still works at the unchanged version.
+        let (a2, _) = s
+            .amend_artifact(&key, "t1", 1, Some("Ship it now"), None, None, "bob", now())
+            .unwrap();
+        assert_eq!(a2.version, 2);
     }
 
     /// A duplicate id is a client naming collision (409), never a server fault
