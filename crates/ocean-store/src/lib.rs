@@ -86,7 +86,8 @@ use chrono::{DateTime, Utc};
 use ocean_core::{
     FederatedMessageMeta, FederatedRoomMemberProjection, OutboxItemState, Room,
     RoomAccessProjection, RoomAccessState, RoomKey, RoomMessage, RoomMessageKind, RoomOutboxItem,
-    RoomParticipant, RoomParticipantKind, RoomTriggerPolicy,
+    RoomParticipant, RoomParticipantKind, RoomReadCursorProjection, RoomReadCursorUpdateRequest,
+    RoomTriggerPolicy,
 };
 use rusqlite::{params, Connection, OptionalExtension, TransactionBehavior};
 
@@ -880,7 +881,14 @@ impl SqliteRoomStore {
                 PRIMARY KEY (room_id, client_event_id)
             );
 
-            CREATE INDEX IF NOT EXISTS idx_outbox_room_state ON outbox(room_id, state);
+            CREATE TABLE IF NOT EXISTS room_read_cursors (
+                room_id       TEXT NOT NULL REFERENCES rooms(id) ON DELETE CASCADE,
+                principal_id  TEXT NOT NULL,
+                read_seq      TEXT NOT NULL,
+                PRIMARY KEY (room_id, principal_id)
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_room_read_cursors_room ON room_read_cursors(room_id);
 
             -- ── P2-A federation durability (private tables) ──────────────
             -- Bearer tokens and registration keys below are PRIVATE: they are
@@ -2666,6 +2674,79 @@ impl SqliteRoomStore {
             params![redemption_id],
         )?;
         Ok(n > 0)
+    }
+
+    pub fn room_read_cursor(
+        &self,
+        key: &RoomKey,
+        principal_id: &str,
+    ) -> Result<RoomReadCursorProjection> {
+        if !self.room_exists(key)? {
+            return Err(RoomStoreError::UnknownRoom(key.clone()));
+        }
+        let read_seq = self
+            .conn
+            .query_row(
+                "SELECT read_seq FROM room_read_cursors WHERE room_id = ?1 AND principal_id = ?2",
+                params![key.as_str(), principal_id],
+                |r| r.get::<_, String>(0),
+            )
+            .optional()?
+            .map(|t| parse_canonical_u64_text(&t))
+            .transpose()?;
+        Ok(RoomReadCursorProjection { read_seq })
+    }
+
+    pub fn update_room_read_cursor(
+        &mut self,
+        key: &RoomKey,
+        principal_id: &str,
+        requested: RoomReadCursorUpdateRequest,
+    ) -> Result<RoomReadCursorProjection> {
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let room_exists: Option<i64> = tx
+            .query_row(
+                "SELECT 1 FROM rooms WHERE id = ?1",
+                params![key.as_str()],
+                |r| r.get(0),
+            )
+            .optional()?;
+        if room_exists.is_none() {
+            return Err(RoomStoreError::UnknownRoom(key.clone()));
+        }
+        let high_water: Option<u64> = tx.query_row(
+            "SELECT MAX(seq) FROM messages WHERE room_id = ?1",
+            params![key.as_str()],
+            |r| r.get(0),
+        )?;
+        let clamped = high_water.map(|high_water| requested.read_seq.min(high_water));
+        let current = tx
+            .query_row(
+                "SELECT read_seq FROM room_read_cursors WHERE room_id = ?1 AND principal_id = ?2",
+                params![key.as_str(), principal_id],
+                |r| r.get::<_, String>(0),
+            )
+            .optional()?
+            .map(|t| parse_canonical_u64_text(&t))
+            .transpose()?;
+        let next = match (current, clamped) {
+            (Some(current), Some(clamped)) => Some(current.max(clamped)),
+            (Some(current), None) => Some(current),
+            (None, Some(clamped)) => Some(clamped),
+            (None, None) => None,
+        };
+        if let Some(next) = next {
+            tx.execute(
+                "INSERT INTO room_read_cursors (room_id, principal_id, read_seq)
+                 VALUES (?1, ?2, ?3)
+                 ON CONFLICT(room_id, principal_id) DO UPDATE SET read_seq = excluded.read_seq",
+                params![key.as_str(), principal_id, write_u64_text(next)],
+            )?;
+        }
+        tx.commit()?;
+        Ok(RoomReadCursorProjection { read_seq: next })
     }
 
     /// Replace the room's SAFE projection fields — state, member roster,
@@ -5144,6 +5225,171 @@ mod tests {
     }
 
     // ── exact {"state":"local"} open + closed ──────────────────────────────
+
+    #[test]
+    fn room_read_cursor_defaults_to_none_for_absent_row() {
+        let mut s = store();
+        let key = RoomKey::new("cursor-none");
+        s.create(key.clone(), "Cursor None", None, now()).unwrap();
+
+        let cursor = s.room_read_cursor(&key, "principal").unwrap();
+        assert_eq!(cursor.read_seq, None);
+    }
+
+    #[test]
+    fn room_read_cursor_unknown_room_errors() {
+        let s = store();
+        let err = s
+            .room_read_cursor(&RoomKey::new("missing-cursor"), "principal")
+            .unwrap_err();
+        assert!(matches!(err, RoomStoreError::UnknownRoom(_)));
+    }
+
+    #[test]
+    fn room_read_cursor_update_is_monotonic_and_clamped() {
+        let mut s = store();
+        let key = RoomKey::new("cursor-clamp");
+        s.create(key.clone(), "Cursor Clamp", None, now()).unwrap();
+        s.append_message(
+            &key,
+            "u1",
+            RoomParticipantKind::Human,
+            RoomMessageKind::Message,
+            "one",
+            now(),
+        )
+        .unwrap();
+        s.append_message(
+            &key,
+            "u1",
+            RoomParticipantKind::Human,
+            RoomMessageKind::Message,
+            "two",
+            now(),
+        )
+        .unwrap();
+
+        let updated = s
+            .update_room_read_cursor(
+                &key,
+                "principal",
+                RoomReadCursorUpdateRequest { read_seq: 99 },
+            )
+            .unwrap();
+        assert_eq!(updated.read_seq, Some(1));
+
+        let non_regressed = s
+            .update_room_read_cursor(
+                &key,
+                "principal",
+                RoomReadCursorUpdateRequest { read_seq: 0 },
+            )
+            .unwrap();
+        assert_eq!(non_regressed.read_seq, Some(1));
+    }
+
+    #[test]
+    fn room_read_cursor_survives_reopen() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("rooms.db");
+        let key = RoomKey::new("cursor-reopen");
+        {
+            let mut s = SqliteRoomStore::open(&path).unwrap();
+            s.create(key.clone(), "Cursor Reopen", None, now()).unwrap();
+            s.append_message(
+                &key,
+                "u1",
+                RoomParticipantKind::Human,
+                RoomMessageKind::Message,
+                "one",
+                now(),
+            )
+            .unwrap();
+            s.update_room_read_cursor(
+                &key,
+                "principal",
+                RoomReadCursorUpdateRequest { read_seq: 0 },
+            )
+            .unwrap();
+        }
+        let s = SqliteRoomStore::open(&path).unwrap();
+        assert_eq!(
+            s.room_read_cursor(&key, "principal").unwrap().read_seq,
+            Some(0)
+        );
+    }
+
+    #[test]
+    fn room_read_cursor_update_without_messages_keeps_absent_projection() {
+        let mut s = store();
+        let key = RoomKey::new("cursor-no-messages");
+        s.create(key.clone(), "Cursor No Messages", None, now())
+            .unwrap();
+
+        let updated = s
+            .update_room_read_cursor(
+                &key,
+                "principal",
+                RoomReadCursorUpdateRequest { read_seq: 99 },
+            )
+            .unwrap();
+        assert_eq!(updated.read_seq, None);
+        assert_eq!(
+            s.room_read_cursor(&key, "principal").unwrap().read_seq,
+            None
+        );
+    }
+
+    #[test]
+    fn corrupt_room_read_cursor_text_is_store_error() {
+        let mut s = store();
+        let key = RoomKey::new("cursor-corrupt");
+        s.create(key.clone(), "Cursor Corrupt", None, now())
+            .unwrap();
+        s.conn
+            .execute(
+                "INSERT INTO room_read_cursors (room_id, principal_id, read_seq) VALUES (?1, 'principal', 'bad')",
+                params![key.as_str()],
+            )
+            .unwrap();
+        let err = s.room_read_cursor(&key, "principal").unwrap_err();
+        assert!(
+            matches!(&err, RoomStoreError::Encode(msg) if msg.contains("invalid") || msg.contains("u64"))
+        );
+    }
+
+    #[test]
+    fn room_read_cursor_update_is_idempotent_for_same_value() {
+        let mut s = store();
+        let key = RoomKey::new("cursor-idempotent");
+        s.create(key.clone(), "Cursor Idempotent", None, now())
+            .unwrap();
+        s.append_message(
+            &key,
+            "u1",
+            RoomParticipantKind::Human,
+            RoomMessageKind::Message,
+            "one",
+            now(),
+        )
+        .unwrap();
+        let first = s
+            .update_room_read_cursor(
+                &key,
+                "principal",
+                RoomReadCursorUpdateRequest { read_seq: 0 },
+            )
+            .unwrap();
+        let second = s
+            .update_room_read_cursor(
+                &key,
+                "principal",
+                RoomReadCursorUpdateRequest { read_seq: 0 },
+            )
+            .unwrap();
+        assert_eq!(first, second);
+        assert_eq!(second.read_seq, Some(0));
+    }
 
     #[test]
     fn local_access_state_open_and_closed() {
