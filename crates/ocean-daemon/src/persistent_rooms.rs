@@ -564,13 +564,26 @@ pub(super) async fn room_get(
             return Ok(None);
         };
         let access = reg.room_access(&key)?;
-        Ok(Some((record, access)))
+        // Which worker owns which agent in THIS room. Adjacent to the roster,
+        // never a field on RoomParticipant (the federated design reserves
+        // owner/sovereignty for Bedrock's authenticated principal mapping).
+        // Absent key == no local ownership recorded, which is what every
+        // pre-existing room reports.
+        let owners = reg.agent_owners(&key)?;
+        Ok(Some((record, access, owners)))
     }) {
-        Ok(Some((rec, access))) => (
+        Ok(Some((rec, access, owners))) => (
             StatusCode::OK,
-            Json(
-                json!({ "ok": true, "room": rec.room, "transcript": rec.transcript, "access": access }),
-            ),
+            Json(json!({
+                "ok": true,
+                "room": rec.room,
+                "transcript": rec.transcript,
+                "access": access,
+                "agent_owners": owners
+                    .into_iter()
+                    .map(|(agent, owner)| json!({ "agent_id": agent, "owner_id": owner }))
+                    .collect::<Vec<_>>(),
+            })),
         ),
         Ok(None) => (
             StatusCode::NOT_FOUND,
@@ -589,6 +602,12 @@ pub(super) struct RoomJoinRequest {
     /// What kind of actor is joining. Defaults to `human`.
     #[serde(default = "default_participant_kind")]
     pub(super) kind: RoomParticipantKind,
+    /// The WORKER who owns this agent. Only meaningful for `kind: Agent`, and
+    /// the owner must already be a Human on this room's roster. This is the
+    /// local half of "a worker persists alongside their agents": it makes
+    /// "my agent" a real relationship in a room with no federation.
+    #[serde(default)]
+    pub(super) owner_id: Option<String>,
 }
 
 fn default_participant_kind() -> RoomParticipantKind {
@@ -664,13 +683,31 @@ pub(super) async fn room_join(
             );
         }
     }
+    // An owner is only meaningful for an Agent. Refuse it elsewhere rather than
+    // silently dropping it — a caller that believed it recorded ownership and
+    // did not is the false-success class this work exists to remove.
+    if req.owner_id.is_some() && !matches!(req.kind, RoomParticipantKind::Agent) {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({
+                "ok": false,
+                "code": "owner_requires_agent",
+                "error": "owner_id is only valid for a participant of kind 'agent'",
+            })),
+        );
+    }
+    let owner_id = req.owner_id.clone();
     let participant = RoomParticipant {
         id: req.id,
         kind: req.kind,
         display_name: req.display_name,
     };
-    let result = with_rooms(&state, |reg| {
-        reg.add_participant_with_message(&key, participant, Utc::now())
+    let result = with_rooms(&state, |reg| match owner_id.as_deref() {
+        // The store validates the owner against the live roster INSIDE the same
+        // transaction as the insert, so a concurrent leave cannot strand an
+        // agent owned by someone who is gone.
+        Some(owner) => reg.add_agent_participant_with_owner(&key, participant, owner, Utc::now()),
+        None => reg.add_participant_with_message(&key, participant, Utc::now()),
     });
     match result {
         Ok((rec, message)) => {
@@ -3700,6 +3737,7 @@ mod tests {
                 id: "amy".into(),
                 display_name: "Amy".into(),
                 kind: RoomParticipantKind::Human,
+                owner_id: None,
             }),
         )
         .await;
@@ -3734,6 +3772,7 @@ mod tests {
                 id: "helper".into(),
                 display_name: "Helper".into(),
                 kind: RoomParticipantKind::Agent,
+                owner_id: None,
             }),
         )
         .await;
@@ -3989,6 +4028,145 @@ mod tests {
         }
     }
 
+    /// END TO END: a worker adds their agent over HTTP, and the room reports
+    /// that the agent is THEIRS. This is the whole point of the feature — the
+    /// store gates prove the write, this proves it is reachable and projected.
+    /// Mutation: make `room_join` ignore `owner_id` (always take the
+    /// non-owner store path) -> agent_owners comes back empty -> RED.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn join_records_agent_ownership_and_room_get_projects_it() {
+        let _guard = AUTO_CONVENE_ENV_LOCK.lock().await;
+        let _env = TestEnvRestore::capture(&[
+            "OCEAN_CONFIG_DIR",
+            "OCEAN_MODEL",
+            "OCEAN_YOLO",
+            "OCEAN_AGENTS_DIR",
+        ]);
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = fake_convene_state(&tmp);
+        let agents_root = tmp.path().join("agents");
+        write_agent_fixture(&agents_root, "researcher", "model = \"fake-ok\"\n", None);
+        std::env::set_var("OCEAN_AGENTS_DIR", &agents_root);
+        let key = RoomKey::new("owned-room");
+        create_mention_room(&state, &key);
+
+        // The worker joins first — an agent cannot be owned by someone absent.
+        let (status, _) = room_join(
+            State(state.clone()),
+            Path(key.as_str().to_string()),
+            Json(RoomJoinRequest {
+                id: "alice".into(),
+                display_name: "Alice".into(),
+                kind: RoomParticipantKind::Human,
+                owner_id: None,
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+
+        // Then adds THEIR agent.
+        let (status, _) = room_join(
+            State(state.clone()),
+            Path(key.as_str().to_string()),
+            Json(RoomJoinRequest {
+                id: "researcher".into(),
+                display_name: "Researcher".into(),
+                kind: RoomParticipantKind::Agent,
+                owner_id: Some("alice".into()),
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+
+        let (status, Json(body)) =
+            room_get(State(state.clone()), Path(key.as_str().to_string())).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            body["agent_owners"],
+            json!([{ "agent_id": "researcher", "owner_id": "alice" }]),
+            "the room must report whose agent this is"
+        );
+    }
+
+    /// An owner named for a participant who is not on the roster is refused,
+    /// and the refusal writes nothing — no roster row, no join marker.
+    /// Mutation: delete the store's `None =>` owner arm -> RED.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn join_with_an_absent_owner_is_refused_and_writes_nothing() {
+        let _guard = AUTO_CONVENE_ENV_LOCK.lock().await;
+        let _env = TestEnvRestore::capture(&[
+            "OCEAN_CONFIG_DIR",
+            "OCEAN_MODEL",
+            "OCEAN_YOLO",
+            "OCEAN_AGENTS_DIR",
+        ]);
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = fake_convene_state(&tmp);
+        let agents_root = tmp.path().join("agents");
+        write_agent_fixture(&agents_root, "researcher", "model = \"fake-ok\"\n", None);
+        std::env::set_var("OCEAN_AGENTS_DIR", &agents_root);
+        let key = RoomKey::new("absent-owner");
+        create_mention_room(&state, &key);
+
+        let (status, _body) = room_join(
+            State(state.clone()),
+            Path(key.as_str().to_string()),
+            Json(RoomJoinRequest {
+                id: "researcher".into(),
+                display_name: "Researcher".into(),
+                kind: RoomParticipantKind::Agent,
+                owner_id: Some("nobody".into()),
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+
+        let room = with_rooms(&state, |store| store.get(&key))
+            .expect("room lookup")
+            .expect("room exists");
+        assert!(
+            room.room.participants.is_empty(),
+            "a refused owner must leave no roster row"
+        );
+        assert!(
+            room.transcript.is_empty(),
+            "a refused owner must forge no join marker"
+        );
+    }
+
+    /// Only an Agent may carry an owner; anything else is refused rather than
+    /// silently dropped. A caller that believed it recorded ownership and did
+    /// not is the false-success class.
+    /// Mutation: delete the `owner_requires_agent` arm -> RED.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn owner_id_on_a_non_agent_is_refused() {
+        let _guard = AUTO_CONVENE_ENV_LOCK.lock().await;
+        let _env = TestEnvRestore::capture(&[
+            "OCEAN_CONFIG_DIR",
+            "OCEAN_MODEL",
+            "OCEAN_YOLO",
+            "OCEAN_AGENTS_DIR",
+        ]);
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = fake_convene_state(&tmp);
+        let key = RoomKey::new("owner-on-human");
+        create_mention_room(&state, &key);
+
+        let (status, Json(body)) = room_join(
+            State(state.clone()),
+            Path(key.as_str().to_string()),
+            Json(RoomJoinRequest {
+                id: "bob".into(),
+                display_name: "Bob".into(),
+                kind: RoomParticipantKind::Human,
+                owner_id: Some("alice".into()),
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(body["code"], json!("owner_requires_agent"));
+    }
+
     /// The daemon authors every audit row as ("system", System). If a client can
     /// join as System, its ParticipantJoined marker is a System-authored
     /// transcript row indistinguishable from a genuine daemon audit line.
@@ -4014,6 +4192,7 @@ mod tests {
                 id: "system".into(),
                 display_name: "Ocean System".into(),
                 kind: RoomParticipantKind::System,
+                owner_id: None,
             }),
         )
         .await;
@@ -4059,6 +4238,7 @@ mod tests {
                     id: bad.into(),
                     display_name: "John".into(),
                     kind: RoomParticipantKind::Human,
+                    owner_id: None,
                 }),
             )
             .await;
@@ -4074,6 +4254,7 @@ mod tests {
                 id: "john".into(),
                 display_name: "John".into(),
                 kind: RoomParticipantKind::Human,
+                owner_id: None,
             }),
         )
         .await;
@@ -4108,6 +4289,7 @@ mod tests {
                 id: "ghost".into(),
                 display_name: "   ".into(),
                 kind: RoomParticipantKind::Human,
+                owner_id: None,
             }),
         )
         .await;
@@ -4139,6 +4321,7 @@ mod tests {
                 id: "phantom".into(),
                 display_name: "Phantom".into(),
                 kind: RoomParticipantKind::Agent,
+                owner_id: None,
             }),
         )
         .await;
@@ -4255,6 +4438,7 @@ env = { FIXTURE = "1" }
                 id: "bound-agent".into(),
                 display_name: "Bound Agent".into(),
                 kind: RoomParticipantKind::Agent,
+                owner_id: None,
             }),
         )
         .await;
@@ -4326,6 +4510,7 @@ env = { FIXTURE = "1" }
                 id: "data-only".into(),
                 display_name: "Data Only".into(),
                 kind: RoomParticipantKind::Agent,
+                owner_id: None,
             }),
         )
         .await;

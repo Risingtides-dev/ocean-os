@@ -12637,7 +12637,16 @@ mod tests {
         .await;
         assert_eq!(status, StatusCode::OK);
         let detail = persistent_room_http_json(&raw);
-        assert_json_object_keys(&detail, &["access", "ok", "room", "transcript"]);
+        // DELIBERATE envelope change: `agent_owners` was added so a room can
+        // report which WORKER owns which agent participant — the local half of
+        // "a worker persists alongside their agents". It is additive and always
+        // present (empty for every pre-existing room), and this frozen key-set
+        // is updated on purpose, not worked around. The gate did its job: it
+        // caught the wire change on the first run.
+        assert_json_object_keys(
+            &detail,
+            &["access", "agent_owners", "ok", "room", "transcript"],
+        );
         assert_eq!(detail["ok"], true);
         assert_eq!(detail["room"]["id"], "lifecycle-room");
         assert_eq!(detail["room"]["name"], "  Verbatim Room Name  ");
