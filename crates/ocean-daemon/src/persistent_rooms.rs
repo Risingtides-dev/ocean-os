@@ -318,6 +318,10 @@ pub(super) fn room_store_error_response(
         // The room exists but is not federated: a client-side misuse of a
         // federation-only operation, not a server fault.
         RoomNotFederated(_) => StatusCode::CONFLICT,
+        // The caller named an owner that is not a Human in this room's roster
+        // (or gave an owner to a non-Agent). That is a malformed request, and
+        // the store refused it having written nothing.
+        InvalidAgentOwner { .. } => StatusCode::BAD_REQUEST,
         // A durable backend can fail on I/O or (de)serialization, which the
         // in-memory registry never could. Surface those as 500s, not as a
         // misleading 4xx. Federation corruption is a fail-closed integrity

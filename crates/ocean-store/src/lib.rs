@@ -211,6 +211,14 @@ pub enum RoomStoreError {
     /// with the incoming row. Carries opaque ids/sequences only — never a
     /// bearer, registration key, or any secret material (P2-A).
     FederationCorruption(String),
+    /// An Agent participant was offered with an owner that is not a Human in
+    /// this room's roster (or a non-Agent was given an owner). Fail-closed:
+    /// nothing is written when this is returned.
+    InvalidAgentOwner {
+        agent: String,
+        owner: String,
+        reason: String,
+    },
     /// An underlying SQLite error.
     Db(rusqlite::Error),
     /// A stored value could not be (de)serialized.
@@ -232,6 +240,14 @@ impl std::fmt::Display for RoomStoreError {
                 write!(f, "room '{k}' is not federated (no access projection)")
             }
             Self::FederationCorruption(m) => write!(f, "federation corruption: {m}"),
+            Self::InvalidAgentOwner {
+                agent,
+                owner,
+                reason,
+            } => write!(
+                f,
+                "agent '{agent}' cannot be owned by '{owner}': {reason}"
+            ),
             Self::Db(e) => write!(f, "sqlite error: {e}"),
             Self::Encode(e) => write!(f, "encode error: {e}"),
             Self::Io(e) => write!(f, "io error: {e}"),
@@ -813,6 +829,30 @@ impl SqliteRoomStore {
                 PRIMARY KEY (room_id, id)
             );
 
+            -- Which WORKER owns which agent participant, within one local room.
+            -- This is the local half of "a worker persists alongside their
+            -- agents": it makes "my agent" a real concept in a room that has no
+            -- federation and no authenticated principal.
+            --
+            -- It is deliberately an ADJACENT table, not a column on
+            -- `participants`, because the federated-rooms design forbids growing
+            -- `ocean_core::RoomParticipant` with an owner/sovereignty field —
+            -- federated sovereignty is derived from Bedrock's authenticated
+            -- principal mapping, never from a local participant row. Keeping the
+            -- local binding adjacent means the two models never fight, and the
+            -- 31 existing RoomParticipant construction sites are untouched.
+            --
+            -- ON DELETE CASCADE on room_id drops bindings with the room. The
+            -- owner is stored as a participant id, validated by the caller
+            -- against the live roster inside the SAME transaction as the insert.
+            CREATE TABLE IF NOT EXISTS room_agent_owners (
+                room_id    TEXT NOT NULL REFERENCES rooms(id) ON DELETE CASCADE,
+                agent_id   TEXT NOT NULL,   -- the Agent participant's id
+                owner_id   TEXT NOT NULL,   -- the Human participant who owns it
+                created_at TEXT NOT NULL,
+                PRIMARY KEY (room_id, agent_id)
+            );
+
             CREATE TABLE IF NOT EXISTS messages (
                 room_id     TEXT NOT NULL REFERENCES rooms(id) ON DELETE CASCADE,
                 seq         INTEGER NOT NULL,        -- per-room monotonic
@@ -1119,6 +1159,131 @@ impl SqliteRoomStore {
             workspace_root,
         };
         Ok(Some(RoomRecord { room, transcript }))
+    }
+
+    /// Add an Agent participant AND record the worker who owns it, atomically.
+    ///
+    /// This is the local half of "a worker persists alongside their agents".
+    /// The owner must already be a `Human` in this room's roster; that check
+    /// runs INSIDE the transaction, so a concurrent `remove_participant` cannot
+    /// slip between validation and insert and leave an agent owned by someone
+    /// who is no longer here (the TOCTOU that the remove path still has).
+    ///
+    /// Fail-closed: an unknown or non-Human owner is `InvalidAgentOwner` and
+    /// NOTHING is written — no participant row, no join marker, no binding.
+    /// A partially-applied ownership is exactly the "durable effect claimed but
+    /// not verified" class this campaign exists to kill.
+    pub fn add_agent_participant_with_owner(
+        &mut self,
+        key: &RoomKey,
+        participant: RoomParticipant,
+        owner_id: &str,
+        now: DateTime<Utc>,
+    ) -> Result<(RoomRecord, RoomMessage)> {
+        if !self.room_is_open(key)? {
+            return Err(RoomStoreError::UnknownRoom(key.clone()));
+        }
+        if participant.kind != RoomParticipantKind::Agent {
+            return Err(RoomStoreError::InvalidAgentOwner {
+                agent: participant.id.clone(),
+                owner: owner_id.to_string(),
+                reason: "only an Agent participant can have an owner".into(),
+            });
+        }
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+
+        // Positive proof, inside the write lock: the owner must be a Human that
+        // is in this room right now. We do not trust the caller's roster read.
+        let owner_kind: Option<String> = tx
+            .query_row(
+                "SELECT kind FROM participants WHERE room_id = ?1 AND id = ?2",
+                params![key.as_str(), owner_id],
+                |r| r.get(0),
+            )
+            .optional()?;
+        match owner_kind.as_deref() {
+            Some("human") => {}
+            Some(other) => {
+                return Err(RoomStoreError::InvalidAgentOwner {
+                    agent: participant.id,
+                    owner: owner_id.to_string(),
+                    reason: format!("owner is a '{other}', not a human"),
+                })
+            }
+            None => {
+                return Err(RoomStoreError::InvalidAgentOwner {
+                    agent: participant.id,
+                    owner: owner_id.to_string(),
+                    reason: "owner is not in this room's roster".into(),
+                })
+            }
+        }
+
+        tx.execute(
+            "DELETE FROM participants WHERE room_id = ?1 AND id = ?2",
+            params![key.as_str(), participant.id],
+        )?;
+        let next_pos: i64 = tx.query_row(
+            "SELECT COALESCE(MAX(position) + 1, 0) FROM participants WHERE room_id = ?1",
+            params![key.as_str()],
+            |r| r.get(0),
+        )?;
+        tx.execute(
+            "INSERT INTO participants (room_id, id, kind, display_name, position)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![
+                key.as_str(),
+                participant.id,
+                encode_participant_kind(participant.kind),
+                participant.display_name,
+                next_pos,
+            ],
+        )?;
+        tx.execute(
+            "INSERT INTO room_agent_owners (room_id, agent_id, owner_id, created_at)
+             VALUES (?1, ?2, ?3, ?4)
+             ON CONFLICT(room_id, agent_id) DO UPDATE SET owner_id = excluded.owner_id,
+                                                          created_at = excluded.created_at",
+            params![key.as_str(), participant.id, owner_id, now.to_rfc3339()],
+        )?;
+        let message = Self::insert_message_on(
+            &tx,
+            key,
+            MessageDraft::marker(
+                &participant.id,
+                participant.kind,
+                RoomMessageKind::ParticipantJoined,
+                &format!("{} joined", participant.display_name),
+            ),
+            now,
+        )?;
+        Self::touch_on(&tx, key, now)?;
+        tx.commit()?;
+        let record = self.load_record(key, false)?.expect("room exists");
+        Ok((record, message))
+    }
+
+    /// Every agent->owner binding in this room, as `(agent_id, owner_id)`
+    /// ordered by roster position so the projection is stable.
+    pub fn agent_owners(&self, key: &RoomKey) -> Result<Vec<(String, String)>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT o.agent_id, o.owner_id
+               FROM room_agent_owners o
+               JOIN participants p
+                 ON p.room_id = o.room_id AND p.id = o.agent_id
+              WHERE o.room_id = ?1
+              ORDER BY p.position",
+        )?;
+        let rows = stmt.query_map(params![key.as_str()], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })?;
+        let mut out = Vec::new();
+        for r in rows {
+            out.push(r?);
+        }
+        Ok(out)
     }
 
     fn load_participants(&self, key: &RoomKey) -> Result<Vec<RoomParticipant>> {
@@ -3835,6 +4000,192 @@ mod tests {
             .collect();
         assert_eq!(ids, vec!["room-002".to_string(), "room-000".to_string()]);
         assert!(!page.has_more);
+    }
+
+    fn owned_agent(id: &str, name: &str) -> RoomParticipant {
+        RoomParticipant {
+            id: id.into(),
+            kind: RoomParticipantKind::Agent,
+            display_name: name.into(),
+        }
+    }
+
+    /// THE persistence gate for "a worker persists alongside their agents".
+    /// A worker adds their agent; the process dies; the room comes back. The
+    /// agent must still be THEIRS. Mutation: drop the `room_agent_owners`
+    /// INSERT in `add_agent_participant_with_owner` -> the reopened room reports
+    /// no owner -> RED.
+    #[test]
+    fn agent_owner_survives_store_reopen() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("rooms.db");
+        let key = RoomKey::new("r1");
+        {
+            let mut s = SqliteRoomStore::open(&path).unwrap();
+            s.create(key.clone(), "R1", None, now()).unwrap();
+            s.add_participant(&key, human("alice", "Alice"), now())
+                .unwrap();
+            s.add_agent_participant_with_owner(
+                &key,
+                owned_agent("researcher", "Researcher"),
+                "alice",
+                now(),
+            )
+            .unwrap();
+            assert_eq!(
+                s.agent_owners(&key).unwrap(),
+                vec![("researcher".to_string(), "alice".to_string())]
+            );
+        }
+        // New process, same file: the binding is still there and still Alice's.
+        let s = SqliteRoomStore::open(&path).unwrap();
+        assert_eq!(
+            s.agent_owners(&key).unwrap(),
+            vec![("researcher".to_string(), "alice".to_string())],
+            "an agent must still belong to its worker after a restart"
+        );
+    }
+
+    /// Fail-closed, and NOTHING is written. Mutation: delete the `None =>`
+    /// rejection arm in `add_agent_participant_with_owner` -> the agent lands
+    /// with a dangling owner -> RED.
+    #[test]
+    fn agent_owner_absent_from_roster_is_refused_and_writes_nothing() {
+        let mut s = store();
+        let key = RoomKey::new("r1");
+        s.create(key.clone(), "R1", None, now()).unwrap();
+        let before = s.get(&key).unwrap().unwrap();
+
+        let err = s
+            .add_agent_participant_with_owner(
+                &key,
+                owned_agent("researcher", "Researcher"),
+                "nobody",
+                now(),
+            )
+            .unwrap_err();
+        assert!(
+            matches!(err, RoomStoreError::InvalidAgentOwner { .. }),
+            "expected InvalidAgentOwner, got {err:?}"
+        );
+
+        // The refusal must leave NO partial state: no participant, no join
+        // marker, no binding. A half-applied ownership is the exact
+        // "claimed a durable effect that did not happen" class.
+        let after = s.get(&key).unwrap().unwrap();
+        assert_eq!(after.room.participants.len(), before.room.participants.len());
+        assert_eq!(after.transcript.len(), before.transcript.len());
+        assert!(s.agent_owners(&key).unwrap().is_empty());
+    }
+
+    /// An agent may not be owned by another agent. Mutation: change the
+    /// `Some("human") => {}` guard to accept any kind -> RED.
+    #[test]
+    fn agent_owner_must_be_a_human_not_another_agent() {
+        let mut s = store();
+        let key = RoomKey::new("r1");
+        s.create(key.clone(), "R1", None, now()).unwrap();
+        s.add_participant(&key, human("alice", "Alice"), now())
+            .unwrap();
+        s.add_agent_participant_with_owner(
+            &key,
+            owned_agent("researcher", "Researcher"),
+            "alice",
+            now(),
+        )
+        .unwrap();
+
+        let err = s
+            .add_agent_participant_with_owner(
+                &key,
+                owned_agent("archivist", "Archivist"),
+                "researcher", // an Agent, not a worker
+                now(),
+            )
+            .unwrap_err();
+        match err {
+            RoomStoreError::InvalidAgentOwner { reason, .. } => {
+                assert!(reason.contains("not a human"), "reason was: {reason}")
+            }
+            other => panic!("expected InvalidAgentOwner, got {other:?}"),
+        }
+        assert_eq!(s.agent_owners(&key).unwrap().len(), 1);
+    }
+
+    /// Only an Agent can carry an owner. Mutation: delete the `kind != Agent`
+    /// guard -> a Human gets an owner row -> RED.
+    #[test]
+    fn only_an_agent_participant_can_have_an_owner() {
+        let mut s = store();
+        let key = RoomKey::new("r1");
+        s.create(key.clone(), "R1", None, now()).unwrap();
+        s.add_participant(&key, human("alice", "Alice"), now())
+            .unwrap();
+        let err = s
+            .add_agent_participant_with_owner(&key, human("bob", "Bob"), "alice", now())
+            .unwrap_err();
+        assert!(matches!(err, RoomStoreError::InvalidAgentOwner { .. }));
+        assert!(s.agent_owners(&key).unwrap().is_empty());
+    }
+
+    /// Re-adding the same agent re-points the binding rather than duplicating
+    /// it, and the roster does not grow.
+    #[test]
+    fn re_adding_an_agent_repoints_its_owner_without_duplicating() {
+        let mut s = store();
+        let key = RoomKey::new("r1");
+        s.create(key.clone(), "R1", None, now()).unwrap();
+        s.add_participant(&key, human("alice", "Alice"), now())
+            .unwrap();
+        s.add_participant(&key, human("bob", "Bob"), now()).unwrap();
+        s.add_agent_participant_with_owner(
+            &key,
+            owned_agent("researcher", "Researcher"),
+            "alice",
+            now(),
+        )
+        .unwrap();
+        s.add_agent_participant_with_owner(
+            &key,
+            owned_agent("researcher", "Researcher"),
+            "bob",
+            now(),
+        )
+        .unwrap();
+        assert_eq!(
+            s.agent_owners(&key).unwrap(),
+            vec![("researcher".to_string(), "bob".to_string())]
+        );
+        let rec = s.get(&key).unwrap().unwrap();
+        assert_eq!(rec.room.participants.len(), 3);
+    }
+
+    /// Dropping the room drops its bindings (FK CASCADE), so a deleted room
+    /// cannot leave orphaned ownership behind.
+    #[test]
+    fn agent_owner_bindings_cascade_with_the_room() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("rooms.db");
+        let key = RoomKey::new("r1");
+        let mut s = SqliteRoomStore::open(&path).unwrap();
+        s.create(key.clone(), "R1", None, now()).unwrap();
+        s.add_participant(&key, human("alice", "Alice"), now())
+            .unwrap();
+        s.add_agent_participant_with_owner(
+            &key,
+            owned_agent("researcher", "Researcher"),
+            "alice",
+            now(),
+        )
+        .unwrap();
+        s.conn
+            .execute("DELETE FROM rooms WHERE id = ?1", params![key.as_str()])
+            .unwrap();
+        let n: i64 = s
+            .conn
+            .query_row("SELECT COUNT(*) FROM room_agent_owners", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(n, 0, "bindings must cascade with the room");
     }
 
     #[test]
