@@ -211,6 +211,16 @@ pub enum RoomStoreError {
     /// with the incoming row. Carries opaque ids/sequences only — never a
     /// bearer, registration key, or any secret material (P2-A).
     FederationCorruption(String),
+    /// A join tried to replace an existing participant with one of a DIFFERENT
+    /// kind (e.g. a Bot taking over an Agent's id). Re-joining your own id with
+    /// the same kind stays idempotent; changing the kind is a takeover and is
+    /// refused with nothing written.
+    ParticipantKindConflict {
+        room: RoomKey,
+        participant: String,
+        existing: String,
+        offered: String,
+    },
     /// An Agent participant was offered with an owner that is not a Human in
     /// this room's roster (or a non-Agent was given an owner). Fail-closed:
     /// nothing is written when this is returned.
@@ -240,6 +250,16 @@ impl std::fmt::Display for RoomStoreError {
                 write!(f, "room '{k}' is not federated (no access projection)")
             }
             Self::FederationCorruption(m) => write!(f, "federation corruption: {m}"),
+            Self::ParticipantKindConflict {
+                room,
+                participant,
+                existing,
+                offered,
+            } => write!(
+                f,
+                "room '{room}': participant '{participant}' already exists as a \
+                 '{existing}'; refusing to replace it with a '{offered}'"
+            ),
             Self::InvalidAgentOwner {
                 agent,
                 owner,
@@ -1161,6 +1181,45 @@ impl SqliteRoomStore {
         Ok(Some(RoomRecord { room, transcript }))
     }
 
+    /// Refuse a join that would REPLACE an existing participant with one of a
+    /// different kind.
+    ///
+    /// `add_participant_with_message` is deliberately idempotent-on-id
+    /// (DELETE-then-INSERT), which is correct for a reconnect or a rename. But
+    /// with no authorization on the join route, last-writer-wins on `kind` is a
+    /// working takeover: re-join an Agent's id as a `Bot` and the Agent roster
+    /// row is destroyed, so `@that-agent` stops convening (it no longer resolves
+    /// as an Agent) while the attacker may post under that id — `Bot` is NOT one
+    /// of the kinds the post-time author gate rejects.
+    ///
+    /// Same-kind re-join stays allowed, so reconnects and display-name changes
+    /// keep working. Runs INSIDE the caller's transaction so it cannot be raced.
+    fn guard_participant_kind_on(
+        tx: &rusqlite::Transaction<'_>,
+        key: &RoomKey,
+        participant: &RoomParticipant,
+    ) -> Result<()> {
+        let existing: Option<String> = tx
+            .query_row(
+                "SELECT kind FROM participants WHERE room_id = ?1 AND id = ?2",
+                params![key.as_str(), participant.id],
+                |r| r.get(0),
+            )
+            .optional()?;
+        let offered = encode_participant_kind(participant.kind);
+        if let Some(existing) = existing {
+            if existing != offered {
+                return Err(RoomStoreError::ParticipantKindConflict {
+                    room: key.clone(),
+                    participant: participant.id.clone(),
+                    existing,
+                    offered: offered.to_string(),
+                });
+            }
+        }
+        Ok(())
+    }
+
     /// Add an Agent participant AND record the worker who owns it, atomically.
     ///
     /// This is the local half of "a worker persists alongside their agents".
@@ -1194,6 +1253,7 @@ impl SqliteRoomStore {
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
 
+        Self::guard_participant_kind_on(&tx, key, &participant)?;
         // Positive proof, inside the write lock: the owner must be a Human that
         // is in this room right now. We do not trust the caller's roster read.
         let owner_kind: Option<String> = tx
@@ -1675,6 +1735,7 @@ impl RoomStore for SqliteRoomStore {
         let tx = self
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        Self::guard_participant_kind_on(&tx, key, &participant)?;
         // Idempotent on id: replace any existing entry, appending at the end of
         // the roster ordering (MAX(position)+1) to mirror the Vec push.
         tx.execute(
@@ -4000,6 +4061,132 @@ mod tests {
             .collect();
         assert_eq!(ids, vec!["room-002".to_string(), "room-000".to_string()]);
         assert!(!page.has_more);
+    }
+
+    fn bot(id: &str, name: &str) -> RoomParticipant {
+        RoomParticipant {
+            id: id.into(),
+            kind: RoomParticipantKind::Bot,
+            display_name: name.into(),
+        }
+    }
+
+    /// THE agent-silencing gate. Confirmed live by the flash-identity lane:
+    /// re-joining an Agent's id as a `Bot` destroyed the Agent roster row, so
+    /// `@researcher` stopped convening, and `Bot` is not one of the kinds the
+    /// post-time author gate rejects — so the attacker could also speak in that
+    /// agent's name. Mutation: delete the `guard_participant_kind_on` call in
+    /// `add_participant_with_message` -> the Bot replaces the Agent -> RED.
+    #[test]
+    fn a_bot_cannot_take_over_an_agents_id_and_silence_it() {
+        let mut s = store();
+        let key = RoomKey::new("r1");
+        s.create(key.clone(), "R1", None, now()).unwrap();
+        s.add_participant(&key, human("alice", "Alice"), now())
+            .unwrap();
+        s.add_participant(&key, owned_agent("researcher", "Researcher"), now())
+            .unwrap();
+
+        let err = s
+            .add_participant(&key, bot("researcher", "Not The Researcher"), now())
+            .unwrap_err();
+        match err {
+            RoomStoreError::ParticipantKindConflict {
+                existing, offered, ..
+            } => {
+                assert_eq!(existing, "agent");
+                assert_eq!(offered, "bot");
+            }
+            other => panic!("expected ParticipantKindConflict, got {other:?}"),
+        }
+
+        // The agent must still be an Agent, or @mention convene is dead.
+        let rec = s.get(&key).unwrap().unwrap();
+        let researcher = rec
+            .room
+            .participants
+            .iter()
+            .find(|p| p.id == "researcher")
+            .expect("researcher still on the roster");
+        assert_eq!(researcher.kind, RoomParticipantKind::Agent);
+        assert_eq!(researcher.display_name, "Researcher");
+    }
+
+    /// The identity-takeover half: a human id cannot be re-kinded either, and
+    /// the refusal writes NOTHING (no join marker for the imposter).
+    #[test]
+    fn a_join_cannot_re_kind_an_existing_human_and_writes_nothing() {
+        let mut s = store();
+        let key = RoomKey::new("r1");
+        s.create(key.clone(), "R1", None, now()).unwrap();
+        s.add_participant(&key, human("alice", "Alice"), now())
+            .unwrap();
+        let before = s.get(&key).unwrap().unwrap();
+
+        let err = s
+            .add_participant(&key, bot("alice", "Eve"), now())
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            RoomStoreError::ParticipantKindConflict { .. }
+        ));
+
+        let after = s.get(&key).unwrap().unwrap();
+        assert_eq!(after.transcript.len(), before.transcript.len());
+        let alice = after
+            .room
+            .participants
+            .iter()
+            .find(|p| p.id == "alice")
+            .unwrap();
+        assert_eq!(alice.display_name, "Alice", "display name must not be stolen");
+        assert_eq!(alice.kind, RoomParticipantKind::Human);
+    }
+
+    /// Same-kind re-join MUST stay idempotent — reconnects and renames are the
+    /// legitimate case the DELETE-then-INSERT exists for. Mutation: make the
+    /// guard reject on any existing row -> RED (this is the over-reach gate).
+    #[test]
+    fn same_kind_rejoin_still_works_and_can_rename() {
+        let mut s = store();
+        let key = RoomKey::new("r1");
+        s.create(key.clone(), "R1", None, now()).unwrap();
+        s.add_participant(&key, human("alice", "Alice"), now())
+            .unwrap();
+        s.add_participant(&key, human("alice", "Alice A."), now())
+            .unwrap();
+        let rec = s.get(&key).unwrap().unwrap();
+        assert_eq!(rec.room.participants.len(), 1, "no duplicate roster row");
+        assert_eq!(rec.room.participants[0].display_name, "Alice A.");
+    }
+
+    /// The owner-aware path is guarded too: a Bot cannot displace an owned agent.
+    #[test]
+    fn owned_agent_is_also_protected_from_kind_takeover() {
+        let mut s = store();
+        let key = RoomKey::new("r1");
+        s.create(key.clone(), "R1", None, now()).unwrap();
+        s.add_participant(&key, human("alice", "Alice"), now())
+            .unwrap();
+        s.add_agent_participant_with_owner(
+            &key,
+            owned_agent("researcher", "Researcher"),
+            "alice",
+            now(),
+        )
+        .unwrap();
+        let err = s
+            .add_participant(&key, bot("researcher", "Imposter"), now())
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            RoomStoreError::ParticipantKindConflict { .. }
+        ));
+        assert_eq!(
+            s.agent_owners(&key).unwrap(),
+            vec![("researcher".to_string(), "alice".to_string())],
+            "ownership must survive a refused takeover"
+        );
     }
 
     fn owned_agent(id: &str, name: &str) -> RoomParticipant {
