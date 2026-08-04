@@ -574,6 +574,11 @@ pub struct RoomArtifact {
     /// Participant id of whoever last changed it.
     pub updated_by: String,
     pub updated_at: String,
+    /// The worker an agent author was acting for, snapshotted at write time.
+    /// `None` when a human authored directly. Derived server-side; never
+    /// accepted from a client.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub on_behalf_of: Option<String>,
     /// Monotonic per-artifact. A writer must present the version it read.
     pub version: u64,
 }

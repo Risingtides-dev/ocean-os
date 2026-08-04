@@ -221,6 +221,10 @@ pub enum RoomStoreError {
         expected: u64,
         actual: u64,
     },
+    /// An artifact with that id already exists in this room. A client naming
+    /// collision is the most ordinary error this endpoint sees; it must not
+    /// surface as a server fault.
+    ArtifactAlreadyExists { room: RoomKey, artifact: String },
     /// No artifact with that id in this room.
     UnknownArtifact { room: RoomKey, artifact: String },
     /// The author of an artifact write is not on this room's roster.
@@ -274,6 +278,9 @@ impl std::fmt::Display for RoomStoreError {
                 "room '{room}': artifact '{artifact}' is at version {actual}, \
                  not {expected}; re-read it and retry"
             ),
+            Self::ArtifactAlreadyExists { room, artifact } => {
+                write!(f, "room '{room}' already has an artifact '{artifact}'")
+            }
             Self::UnknownArtifact { room, artifact } => {
                 write!(f, "room '{room}' has no artifact '{artifact}'")
             }
@@ -927,6 +934,17 @@ impl SqliteRoomStore {
                 created_at  TEXT NOT NULL,
                 updated_by  TEXT NOT NULL,
                 updated_at  TEXT NOT NULL,
+                -- The WORKER an agent author was acting for, snapshotted at
+                -- write time. NULL when a human authored it directly.
+                --
+                -- Denormalized on purpose: `room_agent_owners` is live state and
+                -- can be re-pointed or removed, but history must not rewrite. If
+                -- this were a join, deleting a binding would silently orphan
+                -- every artifact that agent ever created. Derived SERVER-SIDE
+                -- inside the write transaction — never accepted from the client,
+                -- because an asserted identity one layer down is exactly what
+                -- the roster check exists to prevent.
+                on_behalf_of TEXT,
                 version     INTEGER NOT NULL,
                 PRIMARY KEY (room_id, artifact_id)
             );
@@ -1265,13 +1283,29 @@ impl SqliteRoomStore {
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
         Self::require_roster_author_on(&tx, key, author)?;
+        // A duplicate id is a client naming collision, not a server fault.
+        // Without this the INSERT trips the PK constraint and surfaces as a 500.
+        let taken: Option<String> = tx
+            .query_row(
+                "SELECT artifact_id FROM room_artifacts WHERE room_id = ?1 AND artifact_id = ?2",
+                params![key.as_str(), artifact_id],
+                |r| r.get(0),
+            )
+            .optional()?;
+        if taken.is_some() {
+            return Err(RoomStoreError::ArtifactAlreadyExists {
+                room: key.clone(),
+                artifact: artifact_id.to_string(),
+            });
+        }
+        let on_behalf_of = Self::acting_for_on(&tx, key, author)?;
         let ts = now.to_rfc3339();
         // Version starts at 1 so "0" can never be mistaken for a valid read.
         tx.execute(
             "INSERT INTO room_artifacts
                 (room_id, artifact_id, kind, title, body, state,
-                 created_by, created_at, updated_by, updated_at, version)
-             VALUES (?1, ?2, ?3, ?4, ?5, 'open', ?6, ?7, ?6, ?7, 1)",
+                 created_by, created_at, updated_by, updated_at, on_behalf_of, version)
+             VALUES (?1, ?2, ?3, ?4, ?5, 'open', ?6, ?7, ?6, ?7, ?8, 1)",
             params![
                 key.as_str(),
                 artifact_id,
@@ -1279,7 +1313,8 @@ impl SqliteRoomStore {
                 title,
                 body,
                 author,
-                ts
+                ts,
+                on_behalf_of
             ],
         )?;
         let message = Self::insert_message_on(
@@ -1399,7 +1434,7 @@ impl SqliteRoomStore {
         self.conn
             .query_row(
                 "SELECT artifact_id, kind, title, body, state, created_by, created_at,
-                        updated_by, updated_at, version
+                        updated_by, updated_at, version, on_behalf_of
                    FROM room_artifacts WHERE room_id = ?1 AND artifact_id = ?2",
                 params![key.as_str(), artifact_id],
                 Self::map_artifact,
@@ -1412,7 +1447,7 @@ impl SqliteRoomStore {
     pub fn artifacts(&self, key: &RoomKey) -> Result<Vec<RoomArtifact>> {
         let mut stmt = self.conn.prepare(
             "SELECT artifact_id, kind, title, body, state, created_by, created_at,
-                    updated_by, updated_at, version
+                    updated_by, updated_at, version, on_behalf_of
                FROM room_artifacts WHERE room_id = ?1
               ORDER BY updated_at DESC, artifact_id",
         )?;
@@ -1441,8 +1476,26 @@ impl SqliteRoomStore {
                 updated_at: row.get(8)?,
                 version: u64::try_from(version)
                     .map_err(|_| RoomStoreError::Encode("negative artifact version".into()))?,
+                on_behalf_of: row.get(10)?,
             })
         })())
+    }
+
+    /// Which WORKER this author is acting for, if the author is an agent with a
+    /// recorded owner. Read inside the caller's transaction and snapshotted by
+    /// the caller, so later changes to the live binding never rewrite history.
+    fn acting_for_on(
+        tx: &rusqlite::Transaction<'_>,
+        key: &RoomKey,
+        author: &str,
+    ) -> Result<Option<String>> {
+        Ok(tx
+            .query_row(
+                "SELECT owner_id FROM room_agent_owners WHERE room_id = ?1 AND agent_id = ?2",
+                params![key.as_str(), author],
+                |r| r.get::<_, String>(0),
+            )
+            .optional()?)
     }
 
     /// An artifact author must be on the roster. Runs inside the caller's
@@ -1612,11 +1665,28 @@ impl SqliteRoomStore {
         Ok((record, message))
     }
 
-    /// Every agent->owner binding in this room, as `(agent_id, owner_id)`
-    /// ordered by roster position so the projection is stable.
-    pub fn agent_owners(&self, key: &RoomKey) -> Result<Vec<(String, String)>> {
+    /// Every agent->owner binding in this room, as
+    /// `(agent_id, owner_id, owner_present)`, ordered by roster position.
+    ///
+    /// `owner_present` is load-bearing and is the reason this does not simply
+    /// join on the owner. A worker can leave — and `room_leave` still takes no
+    /// authorization, so anyone can evict them — which would leave the binding
+    /// pointing at somebody who is gone. Reporting that as a live "researcher
+    /// belongs to alice" is the room asserting something it cannot prove; but
+    /// silently DROPPING the row is its own lie, because the ownership really
+    /// did happen and the agent really is unclaimed now.
+    ///
+    /// So the projection tells the truth twice: who owns it, and whether that
+    /// worker is still here. Same rule as presence — "joined" is not "here now",
+    /// and "owned" is not "owner still in the room".
+    pub fn agent_owners(&self, key: &RoomKey) -> Result<Vec<(String, String, bool)>> {
         let mut stmt = self.conn.prepare(
-            "SELECT o.agent_id, o.owner_id
+            "SELECT o.agent_id,
+                    o.owner_id,
+                    EXISTS (
+                        SELECT 1 FROM participants owner
+                         WHERE owner.room_id = o.room_id AND owner.id = o.owner_id
+                    ) AS owner_present
                FROM room_agent_owners o
                JOIN participants p
                  ON p.room_id = o.room_id AND p.id = o.agent_id
@@ -1624,7 +1694,11 @@ impl SqliteRoomStore {
               ORDER BY p.position",
         )?;
         let rows = stmt.query_map(params![key.as_str()], |row| {
-            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, i64>(2)? != 0,
+            ))
         })?;
         let mut out = Vec::new();
         for r in rows {
@@ -4583,6 +4657,79 @@ mod tests {
         assert!(s.artifacts(&key).unwrap().is_empty());
     }
 
+    /// An agent-authored artifact must record the WORKER it acted for, derived
+    /// server-side and snapshotted, so accountability survives the binding
+    /// changing later. Mutation: make `acting_for_on` return Ok(None) -> RED.
+    #[test]
+    fn an_agent_artifact_records_the_worker_it_acted_for() {
+        let (mut s, key) = artifact_room();
+        s.add_agent_participant_with_owner(
+            &key,
+            owned_agent("scribe", "Scribe"),
+            "alice",
+            now(),
+        )
+        .unwrap();
+        let (a, _) = s
+            .create_artifact(&key, "t1", RoomArtifactKind::Task, "Ship it", "", "scribe", now())
+            .unwrap();
+        assert_eq!(a.created_by, "scribe");
+        assert_eq!(
+            a.on_behalf_of.as_deref(),
+            Some("alice"),
+            "an agent's artifact must name the human behind it"
+        );
+
+        // A human author has no one behind them.
+        let (h, _) = s
+            .create_artifact(&key, "t2", RoomArtifactKind::Task, "Direct", "", "bob", now())
+            .unwrap();
+        assert_eq!(h.on_behalf_of, None);
+    }
+
+    /// History must not rewrite. Re-pointing the live binding AFTER the fact
+    /// must not change who an existing artifact was created on behalf of.
+    /// Mutation: make `artifact()` join room_agent_owners instead of reading the
+    /// snapshotted column -> RED.
+    #[test]
+    fn re_pointing_ownership_does_not_rewrite_existing_artifact_attribution() {
+        let (mut s, key) = artifact_room();
+        s.add_agent_participant_with_owner(&key, owned_agent("scribe", "Scribe"), "alice", now())
+            .unwrap();
+        s.create_artifact(&key, "t1", RoomArtifactKind::Task, "Ship it", "", "scribe", now())
+            .unwrap();
+        // Ownership moves to bob.
+        s.add_agent_participant_with_owner(&key, owned_agent("scribe", "Scribe"), "bob", now())
+            .unwrap();
+        let a = s.artifact(&key, "t1").unwrap().unwrap();
+        assert_eq!(
+            a.on_behalf_of.as_deref(),
+            Some("alice"),
+            "the artifact was created for alice; that is history, not live state"
+        );
+    }
+
+    /// A duplicate id is a client naming collision (409), never a server fault
+    /// (500). Mutation: delete the `taken.is_some()` guard -> the PK constraint
+    /// trips and surfaces as RoomStoreError::Db -> RED.
+    #[test]
+    fn a_duplicate_artifact_id_is_a_client_conflict_not_a_server_fault() {
+        let (mut s, key) = artifact_room();
+        s.create_artifact(&key, "t1", RoomArtifactKind::Task, "First", "", "alice", now())
+            .unwrap();
+        let err = s
+            .create_artifact(&key, "t1", RoomArtifactKind::Task, "Second", "", "bob", now())
+            .unwrap_err();
+        assert!(
+            matches!(err, RoomStoreError::ArtifactAlreadyExists { .. }),
+            "expected ArtifactAlreadyExists, got {err:?}"
+        );
+        // The original is untouched and no second row appeared.
+        let a = s.artifact(&key, "t1").unwrap().unwrap();
+        assert_eq!(a.title, "First");
+        assert_eq!(s.artifacts(&key).unwrap().len(), 1);
+    }
+
     /// A dropped task is a tombstone, not a delete — a retracted decision must
     /// stay explainable.
     #[test]
@@ -4729,7 +4876,7 @@ mod tests {
         ));
         assert_eq!(
             s.agent_owners(&key).unwrap(),
-            vec![("researcher".to_string(), "alice".to_string())],
+            vec![("researcher".to_string(), "alice".to_string(), true)],
             "ownership must survive a refused takeover"
         );
     }
@@ -4766,14 +4913,14 @@ mod tests {
             .unwrap();
             assert_eq!(
                 s.agent_owners(&key).unwrap(),
-                vec![("researcher".to_string(), "alice".to_string())]
+                vec![("researcher".to_string(), "alice".to_string(), true)]
             );
         }
         // New process, same file: the binding is still there and still Alice's.
         let s = SqliteRoomStore::open(&path).unwrap();
         assert_eq!(
             s.agent_owners(&key).unwrap(),
-            vec![("researcher".to_string(), "alice".to_string())],
+            vec![("researcher".to_string(), "alice".to_string(), true)],
             "an agent must still belong to its worker after a restart"
         );
     }
@@ -4886,10 +5033,47 @@ mod tests {
         .unwrap();
         assert_eq!(
             s.agent_owners(&key).unwrap(),
-            vec![("researcher".to_string(), "bob".to_string())]
+            vec![("researcher".to_string(), "bob".to_string(), true)]
         );
         let rec = s.get(&key).unwrap().unwrap();
         assert_eq!(rec.room.participants.len(), 3);
+    }
+
+    /// THE truthfulness gate for ownership. A worker adds their agent, then
+    /// leaves — and `room_leave` takes no authorization, so anyone can make that
+    /// happen. The binding must NOT silently vanish (the ownership really did
+    /// happen and the agent really is unclaimed now), and it must NOT be
+    /// reported as a live claim (the owner is gone). It reports both facts.
+    /// Mutation: replace the EXISTS subquery with a constant 1 -> the room
+    /// claims a departed owner is present -> RED.
+    #[test]
+    fn ownership_survives_the_owner_leaving_but_stops_claiming_they_are_here() {
+        let mut s = store();
+        let key = RoomKey::new("r1");
+        s.create(key.clone(), "R1", None, now()).unwrap();
+        s.add_participant(&key, human("alice", "Alice"), now())
+            .unwrap();
+        s.add_agent_participant_with_owner(
+            &key,
+            owned_agent("researcher", "Researcher"),
+            "alice",
+            now(),
+        )
+        .unwrap();
+        assert_eq!(
+            s.agent_owners(&key).unwrap(),
+            vec![("researcher".to_string(), "alice".to_string(), true)]
+        );
+
+        // Alice leaves. Nothing stops this today.
+        s.remove_participant(&key, "alice", now()).unwrap();
+
+        let owners = s.agent_owners(&key).unwrap();
+        assert_eq!(
+            owners,
+            vec![("researcher".to_string(), "alice".to_string(), false)],
+            "the binding must survive, and must stop claiming alice is here"
+        );
     }
 
     /// Dropping the room drops its bindings (FK CASCADE), so a deleted room

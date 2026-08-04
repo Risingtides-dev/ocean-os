@@ -329,6 +329,10 @@ pub(super) fn room_store_error_response(
         // body is the whole contract: re-read and retry. Never a silent merge.
         ArtifactVersionConflict { .. } => StatusCode::CONFLICT,
         UnknownArtifact { .. } => StatusCode::NOT_FOUND,
+        // A client naming collision is the most ordinary error this endpoint
+        // sees. Before this it tripped the PK constraint and surfaced as a 500 —
+        // a client mistake reported as a server fault.
+        ArtifactAlreadyExists { .. } => StatusCode::CONFLICT,
         // An artifact attributed to someone not in the room is a lie, not a
         // server fault.
         ArtifactAuthorNotInRoster { .. } => StatusCode::FORBIDDEN,
@@ -588,7 +592,14 @@ pub(super) async fn room_get(
                 "access": access,
                 "agent_owners": owners
                     .into_iter()
-                    .map(|(agent, owner)| json!({ "agent_id": agent, "owner_id": owner }))
+                    .map(|(agent, owner, owner_present)| json!({
+                        "agent_id": agent,
+                        "owner_id": owner,
+                        // "owned" is not "owner still in the room". A worker can
+                        // leave and the binding outlives them; the room says so
+                        // rather than asserting a live claim it cannot prove.
+                        "owner_present": owner_present,
+                    }))
                     .collect::<Vec<_>>(),
             })),
         ),
@@ -834,6 +845,35 @@ pub(super) async fn room_amend_artifact(
                 "expected_version": expected,
                 "actual_version": actual,
                 "error": format!("artifact is at version {actual}, not {expected}; re-read and retry"),
+            })),
+        ),
+        Err(e) => room_store_error_response(e),
+    }
+}
+
+/// `GET /v1/rooms/persistent/{key}/artifacts/{artifact_id}` — one artifact.
+///
+/// This is the other half of the compare-and-swap contract. A 409 tells a caller
+/// their version is stale and hands back the actual one, but without a
+/// single-artifact read the only recovery is to re-list the whole room: fine at
+/// five artifacts, absurd at two hundred. With this the conflict->re-read->retry
+/// loop is one round trip.
+pub(super) async fn room_get_artifact(
+    State(state): State<AppState>,
+    Path((key, artifact_id)): Path<(String, String)>,
+) -> (StatusCode, Json<serde_json::Value>) {
+    let key = RoomKey::new(key.trim());
+    match with_rooms(&state, |store| store.artifact(&key, artifact_id.trim())) {
+        Ok(Some(artifact)) => (
+            StatusCode::OK,
+            Json(json!({ "ok": true, "artifact": artifact })),
+        ),
+        Ok(None) => (
+            StatusCode::NOT_FOUND,
+            Json(json!({
+                "ok": false,
+                "code": "unknown_artifact",
+                "error": format!("room '{key}' has no artifact '{}'", artifact_id.trim()),
             })),
         ),
         Err(e) => room_store_error_response(e),
@@ -4217,7 +4257,7 @@ mod tests {
         assert_eq!(status, StatusCode::OK);
         assert_eq!(
             body["agent_owners"],
-            json!([{ "agent_id": "researcher", "owner_id": "alice" }]),
+            json!([{ "agent_id": "researcher", "owner_id": "alice", "owner_present": true }]),
             "the room must report whose agent this is"
         );
     }

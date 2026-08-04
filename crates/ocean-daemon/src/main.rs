@@ -1532,6 +1532,7 @@ fn banner_routes() -> &'static [&'static str] {
         "GET /v1/rooms/persistent/{key}/transcript",
         "POST /v1/rooms/persistent/{key}/artifacts",
         "GET /v1/rooms/persistent/{key}/artifacts",
+        "GET /v1/rooms/persistent/{key}/artifacts/{artifact_id}",
         "POST /v1/rooms/persistent/{key}/artifacts/{artifact_id}/amend",
         "GET /v1/rooms/persistent/{key}/snapshot",
         "GET /v1/rooms/persistent/{key}/events",
@@ -2786,6 +2787,10 @@ fn room_routes() -> Router<AppState> {
         .route(
             "/v1/rooms/persistent/{key}/artifacts",
             post(persistent_rooms::room_create_artifact).get(persistent_rooms::room_list_artifacts),
+        )
+        .route(
+            "/v1/rooms/persistent/{key}/artifacts/{artifact_id}",
+            get(persistent_rooms::room_get_artifact),
         )
         .route(
             "/v1/rooms/persistent/{key}/artifacts/{artifact_id}/amend",
@@ -24606,6 +24611,7 @@ mod tests {
             "GET /v1/rooms/persistent",
             "POST /v1/rooms/persistent/{key}/artifacts",
             "GET /v1/rooms/persistent/{key}/artifacts",
+            "GET /v1/rooms/persistent/{key}/artifacts/{artifact_id}",
             "POST /v1/rooms/persistent/{key}/artifacts/{artifact_id}/amend",
             "GET /v1/rooms/persistent/{key}/snapshot",
             "POST /v1/rooms/{room_id}/livekit-token",
@@ -24775,7 +24781,7 @@ mod tests {
         // human to look when the surface grows.
         assert_eq!(
             banner.len(),
-            98,
+            99,
             "route baseline changed; review the manifest"
         );
 
