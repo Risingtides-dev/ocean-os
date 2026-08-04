@@ -109,8 +109,11 @@ This crate owns the full-screen terminal steering cockpit (`ocean` binary) for i
   A bound session's model is daemon-owned config: `/model` and the picker must
   both dispatch `Action::SetModel` and persist through
   `PATCH /v1/agent/sessions/{id}/config`; the picker must never mutate only its
-  local footer projection. Binding reloads `GET .../config`, and generation
-  guards reject late load/save responses across session switches.
+  local footer projection. A model chosen before the first message must be
+  pinned immediately after the create-session RPC and before `SessionBound`,
+  because session creation starts from the daemon-global model. Binding reloads
+  `GET .../config`, and generation guards reject late load/save responses across
+  session switches.
 - The upper right rail is a mutable Work Surface slot, not a Files-owned pane.
   Its typed representations currently include explicit `Files`, session-scoped
   `Usage`, and daemon-wide `Workflow`; domain projections keep their real schemas

@@ -5951,4 +5951,34 @@ type:      [bug report]: close persistent-room SSE/bootstrap and route-parity re
 area:      [backend]: ocean-daemon persistent rooms + operator route guide
 
 Updated `crates/ocean-daemon/src/persistent_rooms.rs` tests so merged room SSE accepts interleaved no-id `room_read_cursor` bootstrap frames while still requiring each subscriber to receive exactly the intended `room_access` update, preserving Last-Event-ID semantics for message replay. Added the missing GET/PATCH `/v1/rooms/persistent/{key}/read-cursor` entries to `crates/ocean-daemon/src/main.rs` banner discovery and `docs/OCEAN_RUNTIME_OPERATOR_GUIDE.md` quick reference, then re-ran focused daemon regressions, full `cargo test -p ocean-daemon`, strict daemon all-target clippy, and fmt/diff checks.
+
+time:      [15:20] [04-08-26]
+agent:     [ocean], [gpt-5.6-sol]
+worktree:  [main]
+type:      [fix]
+area:      [frontend]
+
+Fixed fresh-session model authority so a model selected before the first prompt
+is persisted through the session-config RPC before SessionBound reloads daemon
+authority. This prevents session creation's global-model seed from snapping the
+TUI back to gpt-5.6-sol while the submitted turn still carries the selected
+override; pin failures now fail closed before turn admission. Independent review
+confirmed the ordering closes the reported normal path. Verified: cargo fmt
+--check; cargo test -p ocean-tui (463 passed, 1 ignored); cargo build -p
+ocean-tui --release; git diff --check.
+_________________________________________________________________________________
+
+time:      [21:04] [08-04-2026]
+agent:     [ocean], [gpt-5.6-sol]
+worktree:  [fix/failure-honesty]
+type:      [fix]
+area:      [runtime]
+
+Made the reserved, tool-free final synthesis round resilient to a clean provider
+failure: it now retries within the existing bounded round-attempt budget without
+replaying tools or retrying cancellation. Exhausted failures now log their exact
+turn/request/session-correlated terminal error instead of leaving only `ok=false`.
+Added an end-to-end regression proving one tool execution across a failed/retried
+final synthesis. Verified full ocean-runtime tests (191 passed across targets),
+`cargo check -p ocean-daemon`, fmt, diff check, and independent review approval.
 _________________________________________________________________________________

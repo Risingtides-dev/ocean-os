@@ -5304,6 +5304,24 @@ impl App {
                         .await
                     {
                         Ok(resp) => {
+                            // A model chosen before the first message must become
+                            // session authority before binding. The create RPC
+                            // seeds a new session from the daemon-global model;
+                            // without this PATCH, SessionBound immediately loaded
+                            // that global model and appeared to "snap back" even
+                            // though the first turn used the requested override.
+                            if let Some(requested) = model_id.as_deref() {
+                                if let Err(e) =
+                                    client.set_session_model(resp.session_id, requested).await
+                                {
+                                    let _ = tx.send(Action::TurnSendFailed {
+                                        submission_id,
+                                        prompt,
+                                        err: format!("model pin: {e}"),
+                                    });
+                                    return;
+                                }
+                            }
                             // SessionBound → App::bind_session spawns the (single,
                             // self-healing) stream and holds its handle.
                             let _ = tx.send(Action::SessionBound(resp.session_id));

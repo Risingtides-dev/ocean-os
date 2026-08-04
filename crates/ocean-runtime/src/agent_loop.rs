@@ -724,10 +724,25 @@ pub async fn run_agent_with_history(
             match result {
                 Ok(()) => break,
                 Err(e) => {
+                    // The reserved final synthesis round is read-only: tools are
+                    // hidden and nothing from a clean failed attempt reached the
+                    // operator. Retry any non-cancellation failure here so a
+                    // one-off provider terminal/error-frame glitch cannot discard
+                    // several already-completed tool rounds and leave no answer.
+                    // Ordinary rounds keep the narrower transient-only policy.
+                    let clean_final_synthesis_failure = final_answer_round
+                        && !attempt_emitted
+                        && !matches!(&e, AgentError::Cancelled);
                     let retryable = attempt < MAX_ROUND_ATTEMPTS
                         && !attempt_emitted
-                        && is_transient_stream_error(&e);
+                        && (is_transient_stream_error(&e) || clean_final_synthesis_failure);
                     if !retryable {
+                        tracing::error!(
+                            error = %e,
+                            attempt,
+                            final_answer_round,
+                            "provider round failed"
+                        );
                         return Err(e);
                     }
                     // Exponential backoff (500ms, 1s, …), racing the cancel token
@@ -737,8 +752,9 @@ pub async fn run_agent_with_history(
                     tracing::warn!(
                         error = %e,
                         attempt,
+                        final_answer_round,
                         delay_ms = delay.as_millis() as u64,
-                        "transient provider stream failure on a clean round; retrying"
+                        "clean provider round failed; retrying"
                     );
                     tokio::select! {
                         biased;
