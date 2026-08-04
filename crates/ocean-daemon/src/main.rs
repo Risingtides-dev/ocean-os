@@ -1530,6 +1530,9 @@ fn banner_routes() -> &'static [&'static str] {
         "POST /v1/rooms/persistent/invites/redeem",
         "POST /v1/rooms/persistent/{key}/members/agents",
         "GET /v1/rooms/persistent/{key}/transcript",
+        "POST /v1/rooms/persistent/{key}/artifacts",
+        "GET /v1/rooms/persistent/{key}/artifacts",
+        "POST /v1/rooms/persistent/{key}/artifacts/{artifact_id}/amend",
         "GET /v1/rooms/persistent/{key}/snapshot",
         "GET /v1/rooms/persistent/{key}/events",
         "POST /v1/rooms/persistent/{key}/outbox/retry",
@@ -2779,6 +2782,14 @@ fn room_routes() -> Router<AppState> {
         .route(
             "/v1/rooms/persistent/{key}/transcript",
             get(room_transcript),
+        )
+        .route(
+            "/v1/rooms/persistent/{key}/artifacts",
+            post(persistent_rooms::room_create_artifact).get(persistent_rooms::room_list_artifacts),
+        )
+        .route(
+            "/v1/rooms/persistent/{key}/artifacts/{artifact_id}/amend",
+            post(persistent_rooms::room_amend_artifact),
         )
         .route("/v1/rooms/persistent/{key}/snapshot", get(room_snapshot))
         // Merged SSE: room_message + room_access frames, with durable replay
@@ -24593,6 +24604,9 @@ mod tests {
         }
         for retained in [
             "GET /v1/rooms/persistent",
+            "POST /v1/rooms/persistent/{key}/artifacts",
+            "GET /v1/rooms/persistent/{key}/artifacts",
+            "POST /v1/rooms/persistent/{key}/artifacts/{artifact_id}/amend",
             "GET /v1/rooms/persistent/{key}/snapshot",
             "POST /v1/rooms/{room_id}/livekit-token",
         ] {
@@ -24754,9 +24768,14 @@ mod tests {
             registered, banner,
             "live Router::route registrations and GET / discovery must match"
         );
+        // 95 -> 98: room artifacts added POST+GET /artifacts and
+        // POST /artifacts/{artifact_id}/amend. Moved DELIBERATELY. The parity
+        // assertion above is the real gate — it proves every advertised route is
+        // actually registered — and this count is the tripwire that forces a
+        // human to look when the surface grows.
         assert_eq!(
             banner.len(),
-            95,
+            98,
             "route baseline changed; review the manifest"
         );
 

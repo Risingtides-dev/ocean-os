@@ -12,7 +12,7 @@ use axum::{
 };
 use chrono::Utc;
 use ocean_agent_sdk::{AgentSessionId, AgentTurnEvent};
-use ocean_core::{
+use ocean_core::{RoomArtifactKind, RoomArtifactState,
     evaluate_trigger_policy, PermissionMode, PromptRequest, PublicAgentDescriptor, RequestState,
     RoomAccessProjection, RoomAccessState, RoomKey, RoomMessage, RoomMessageKind, RoomParticipant,
     RoomParticipantKind, RoomTriggerEvent, RoomTriggerPolicy,
@@ -724,6 +724,133 @@ pub(super) async fn room_join(
                 Json(json!({ "ok": true, "room": rec.room })),
             )
         }
+        Err(e) => room_store_error_response(e),
+    }
+}
+
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct CreateArtifactRequest {
+    pub(super) id: String,
+    pub(super) kind: RoomArtifactKind,
+    pub(super) title: String,
+    #[serde(default)]
+    pub(super) body: String,
+    /// Participant id of the author — human OR agent. Validated against the
+    /// roster inside the store transaction.
+    pub(super) author_id: String,
+}
+
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct AmendArtifactRequest {
+    /// The version the caller READ. Compare-and-swap: if the artifact has moved
+    /// on, the write is refused with the actual version rather than merged.
+    pub(super) expected_version: u64,
+    #[serde(default)]
+    pub(super) title: Option<String>,
+    #[serde(default)]
+    pub(super) body: Option<String>,
+    #[serde(default)]
+    pub(super) state: Option<RoomArtifactState>,
+    pub(super) author_id: String,
+}
+
+/// `POST /v1/rooms/persistent/{key}/artifacts` — record something the room
+/// produced: a task, a decision, or captured knowledge.
+pub(super) async fn room_create_artifact(
+    State(state): State<AppState>,
+    Path(key): Path<String>,
+    Json(req): Json<CreateArtifactRequest>,
+) -> (StatusCode, Json<serde_json::Value>) {
+    let key = RoomKey::new(key.trim());
+    if req.id.trim().is_empty() || req.id != req.id.trim() {
+        return invalid_request_response();
+    }
+    if req.title.trim().is_empty() {
+        return invalid_request_response();
+    }
+    let result = with_rooms(&state, |store| {
+        store.create_artifact(
+            &key,
+            &req.id,
+            req.kind,
+            &req.title,
+            &req.body,
+            &req.author_id,
+            Utc::now(),
+        )
+    });
+    match result {
+        Ok((artifact, message)) => {
+            // The transcript line is live on the room's SSE, so every client
+            // learns the artifact exists without polling.
+            publish_room_wake(&state, &key, &message);
+            (
+                StatusCode::CREATED,
+                Json(json!({ "ok": true, "artifact": artifact })),
+            )
+        }
+        Err(e) => room_store_error_response(e),
+    }
+}
+
+/// `POST /v1/rooms/persistent/{key}/artifacts/{artifact_id}/amend` — rewrite an
+/// artifact in place under compare-and-swap.
+pub(super) async fn room_amend_artifact(
+    State(state): State<AppState>,
+    Path((key, artifact_id)): Path<(String, String)>,
+    Json(req): Json<AmendArtifactRequest>,
+) -> (StatusCode, Json<serde_json::Value>) {
+    let key = RoomKey::new(key.trim());
+    let result = with_rooms(&state, |store| {
+        store.amend_artifact(
+            &key,
+            artifact_id.trim(),
+            req.expected_version,
+            req.title.as_deref(),
+            req.body.as_deref(),
+            req.state,
+            &req.author_id,
+            Utc::now(),
+        )
+    });
+    match result {
+        Ok((artifact, message)) => {
+            publish_room_wake(&state, &key, &message);
+            (
+                StatusCode::OK,
+                Json(json!({ "ok": true, "artifact": artifact })),
+            )
+        }
+        // A stale write must hand back where to re-read from, not just "409".
+        Err(ocean_store::RoomStoreError::ArtifactVersionConflict {
+            expected, actual, ..
+        }) => (
+            StatusCode::CONFLICT,
+            Json(json!({
+                "ok": false,
+                "code": "artifact_version_conflict",
+                "expected_version": expected,
+                "actual_version": actual,
+                "error": format!("artifact is at version {actual}, not {expected}; re-read and retry"),
+            })),
+        ),
+        Err(e) => room_store_error_response(e),
+    }
+}
+
+/// `GET /v1/rooms/persistent/{key}/artifacts` — everything this room produced.
+pub(super) async fn room_list_artifacts(
+    State(state): State<AppState>,
+    Path(key): Path<String>,
+) -> (StatusCode, Json<serde_json::Value>) {
+    let key = RoomKey::new(key.trim());
+    match with_rooms(&state, |store| store.artifacts(&key)) {
+        Ok(artifacts) => (
+            StatusCode::OK,
+            Json(json!({ "ok": true, "artifacts": artifacts })),
+        ),
         Err(e) => room_store_error_response(e),
     }
 }
