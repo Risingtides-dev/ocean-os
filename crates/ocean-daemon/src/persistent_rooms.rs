@@ -5827,31 +5827,35 @@ env = { FIXTURE = "1" }
 
     use crate::tests::fake_convene_file_state;
 
+    fn seed_live_with_failed_projection(client_event_id: &str) -> RoomAccessProjection {
+        RoomAccessProjection {
+            state: RoomAccessState::Live,
+            last_confirmed_global_sequence: Some(1),
+            members: vec![],
+            outbox: vec![RoomOutboxItem {
+                client_event_id: client_event_id.into(),
+                source_id: "src".into(),
+                source_sequence: 10,
+                author_member_id: "auth".into(),
+                event_type: "chat.message".into(),
+                payload: json!({"text": "hi"}),
+                mention_member_ids: vec![],
+                state: OutboxItemState::Failed,
+            }],
+        }
+    }
+
     /// Create a room with Live access and one Failed outbox item.
     fn seed_live_with_failed(state: &AppState, key: &RoomKey, client_event_id: &str) {
         seed_access(
             state,
             key,
-            RoomAccessProjection {
-                state: RoomAccessState::Live,
-                last_confirmed_global_sequence: Some(1),
-                members: vec![],
-                outbox: vec![RoomOutboxItem {
-                    client_event_id: client_event_id.into(),
-                    source_id: "src".into(),
-                    source_sequence: 10,
-                    author_member_id: "auth".into(),
-                    event_type: "chat.message".into(),
-                    payload: json!({"text": "hi"}),
-                    mention_member_ids: vec![],
-                    state: OutboxItemState::Failed,
-                }],
-            },
+            seed_live_with_failed_projection(client_event_id),
         );
     }
 
-    /// Read one SSE event+data from a streaming body.
-    async fn read_sse_frame(body: &mut Body) -> (String, serde_json::Value) {
+    /// Read one SSE event frame from a streaming body.
+    async fn read_sse_frame(body: &mut Body) -> SseFrame {
         use http_body_util::BodyExt as _;
         let frame = tokio::time::timeout(Duration::from_millis(500), body.frame())
             .await
@@ -5859,17 +5863,62 @@ env = { FIXTURE = "1" }
             .expect("SSE body ended")
             .expect("SSE body error");
         let text = String::from_utf8_lossy(&frame.into_data().unwrap_or_default()).to_string();
-        let event_type = text
+        parse_sse_frame(&text)
+    }
+
+    #[derive(Debug)]
+    struct SseFrame {
+        event: String,
+        id: Option<String>,
+        data: serde_json::Value,
+    }
+
+    fn parse_sse_frame(text: &str) -> SseFrame {
+        let event = text
             .lines()
             .find_map(|line| line.strip_prefix("event: "))
             .unwrap_or("")
             .to_string();
-        let data: serde_json::Value = text
+        let id = text
+            .lines()
+            .find_map(|line| line.strip_prefix("id: "))
+            .map(str::to_string);
+        let data = text
             .lines()
             .find_map(|line| line.strip_prefix("data: "))
             .map(|d| serde_json::from_str(d).expect("valid JSON"))
             .unwrap_or(serde_json::Value::Null);
-        (event_type, data)
+        SseFrame { event, id, data }
+    }
+
+    async fn read_until_access_frame(body: &mut Body, dur: Duration) -> SseFrame {
+        use http_body_util::BodyExt as _;
+        let deadline = tokio::time::Instant::now() + dur;
+        loop {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "timed out waiting for room_access SSE frame"
+            );
+            let frame = tokio::time::timeout(Duration::from_millis(50), body.frame())
+                .await
+                .expect("frame timeout")
+                .expect("SSE body ended")
+                .expect("SSE body error");
+            let parsed = parse_sse_frame(&String::from_utf8_lossy(
+                &frame.into_data().unwrap_or_default(),
+            ));
+            if parsed.event == "room_access" {
+                return parsed;
+            }
+            assert_eq!(
+                parsed.event, "room_read_cursor",
+                "unexpected interleaved SSE event before room_access"
+            );
+            assert!(
+                parsed.id.is_none(),
+                "room_read_cursor bootstrap must not consume or alter Last-Event-ID"
+            );
+        }
     }
 
     /// Drain the body for `dur` and report whether any `room_access` frame arrived.
@@ -5916,6 +5965,8 @@ env = { FIXTURE = "1" }
                 state: OutboxItemState::Pending,
             }],
         };
+        let initial_expected =
+            serde_json::to_value(seed_live_with_failed_projection("evt-both")).unwrap();
         let expected = serde_json::to_value(&expected_proj).unwrap();
 
         let app1 = room_routes().with_state(state.clone());
@@ -5942,11 +5993,12 @@ env = { FIXTURE = "1" }
         let mut body1 = resp1.into_body();
         let mut body2 = resp2.into_body();
 
-        // Both start with initial room_access.
-        let (ev1, _) = read_sse_frame(&mut body1).await;
-        assert_eq!(ev1, "room_access");
-        let (ev2, _) = read_sse_frame(&mut body2).await;
-        assert_eq!(ev2, "room_access");
+        // Both subscribers must observe the exact initial access projection, but
+        // a no-id cursor bootstrap may interleave first.
+        let init1 = read_until_access_frame(&mut body1, Duration::from_millis(500)).await;
+        assert_eq!(init1.data, initial_expected);
+        let init2 = read_until_access_frame(&mut body2, Duration::from_millis(500)).await;
+        assert_eq!(init2.data, initial_expected);
 
         // Retry triggers access change + wake.
         let app_retry = room_routes().with_state(state.clone());
@@ -5961,13 +6013,13 @@ env = { FIXTURE = "1" }
             .unwrap();
         assert_eq!(resp.status(), StatusCode::ACCEPTED);
 
-        // Both must receive a follow-up room_access frame.
-        let (ev1b, data1) = read_sse_frame(&mut body1).await;
-        assert_eq!(ev1b, "room_access");
-        assert_eq!(data1, expected, "subscriber 1 mismatched");
-        let (ev2b, data2) = read_sse_frame(&mut body2).await;
-        assert_eq!(ev2b, "room_access");
-        assert_eq!(data2, expected, "subscriber 2 mismatched");
+        // Both must receive exactly one follow-up room_access frame; any
+        // interleaved bootstrap/read-cursor frames must be no-id and not affect
+        // message Last-Event-ID semantics.
+        let sub1 = read_until_access_frame(&mut body1, Duration::from_secs(1)).await;
+        assert_eq!(sub1.data, expected, "subscriber 1 mismatched");
+        let sub2 = read_until_access_frame(&mut body2, Duration::from_secs(1)).await;
+        assert_eq!(sub2.data, expected, "subscriber 2 mismatched");
     }
 
     /// (3) Dedup: same-room unchanged hint produces no access frame. Also proves
@@ -5995,9 +6047,9 @@ env = { FIXTURE = "1" }
         let mut body_a = resp_a.into_body();
 
         // Consume initial access frame.
-        let (ev, data) = read_sse_frame(&mut body_a).await;
-        assert_eq!(ev, "room_access");
-        assert_eq!(data["outbox"][0]["client_event_id"], json!("evt-a"));
+        let frame = read_sse_frame(&mut body_a).await;
+        assert_eq!(frame.event, "room_access");
+        assert_eq!(frame.data["outbox"][0]["client_event_id"], json!("evt-a"));
 
         // 1) Publish same-room unchanged hint → must produce NO access frame.
         publish_room_access_wake(&state, &room_a);

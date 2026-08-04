@@ -5943,3 +5943,12 @@ area:      [backend]
 
 Completed the rooms federated cursor/presence closeout in ocean-daemon. Wired RoomReadCursorWakeBus through FederationSupervisor init/test fixtures and persistent-room fake state, added federated SSE handling for explicit `presence` and `room_read_cursor` events, and published read-cursor wakes after authoritative mirrored cursor commits. Persistent room events SSE now includes Local-room read-cursor bootstrap/live tail support without breaking existing transcript replay semantics; HTTP tests were updated to tolerate the new bootstrap ordering. Verified targeted daemon/store cursor tests, full daemon tests, daemon clippy -D warnings, cargo fmt --check, and diff --check.
 _________________________________________________________________________________
+
+time:      [12:00] [08-08-25]
+agent:     [ocean-subagent], [gpt-5], [daemon-cursor-gate-closer]
+worktree:  feat/rooms-federated-cursor-presence
+type:      [bug report]: close persistent-room SSE/bootstrap and route-parity regressions
+area:      [backend]: ocean-daemon persistent rooms + operator route guide
+
+Updated `crates/ocean-daemon/src/persistent_rooms.rs` tests so merged room SSE accepts interleaved no-id `room_read_cursor` bootstrap frames while still requiring each subscriber to receive exactly the intended `room_access` update, preserving Last-Event-ID semantics for message replay. Added the missing GET/PATCH `/v1/rooms/persistent/{key}/read-cursor` entries to `crates/ocean-daemon/src/main.rs` banner discovery and `docs/OCEAN_RUNTIME_OPERATOR_GUIDE.md` quick reference, then re-ran focused daemon regressions, full `cargo test -p ocean-daemon`, strict daemon all-target clippy, and fmt/diff checks.
+_________________________________________________________________________________

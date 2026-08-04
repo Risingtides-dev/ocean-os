@@ -1539,6 +1539,8 @@ fn banner_routes() -> &'static [&'static str] {
         "POST /v1/rooms/persistent/{key}/artifacts/{artifact_id}/amend",
         "GET /v1/rooms/persistent/{key}/snapshot",
         "GET /v1/rooms/persistent/{key}/events",
+        "GET /v1/rooms/persistent/{key}/read-cursor",
+        "PATCH /v1/rooms/persistent/{key}/read-cursor",
         "POST /v1/rooms/persistent/{key}/outbox/retry",
         "GET /v1/sessions",
         "GET /v1/sessions/{id}",
