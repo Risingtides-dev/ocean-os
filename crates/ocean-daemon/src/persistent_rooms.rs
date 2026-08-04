@@ -325,6 +325,13 @@ pub(super) fn room_store_error_response(
         // A join that would re-kind an existing participant is a takeover, not
         // a reconnect. 409: the id is taken by a different kind of actor.
         ParticipantKindConflict { .. } => StatusCode::CONFLICT,
+        // The caller read a stale artifact. 409 with the actual version in the
+        // body is the whole contract: re-read and retry. Never a silent merge.
+        ArtifactVersionConflict { .. } => StatusCode::CONFLICT,
+        UnknownArtifact { .. } => StatusCode::NOT_FOUND,
+        // An artifact attributed to someone not in the room is a lie, not a
+        // server fault.
+        ArtifactAuthorNotInRoster { .. } => StatusCode::FORBIDDEN,
         // A durable backend can fail on I/O or (de)serialization, which the
         // in-memory registry never could. Surface those as 500s, not as a
         // misleading 4xx. Federation corruption is a fail-closed integrity

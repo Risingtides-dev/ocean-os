@@ -85,8 +85,9 @@ use std::path::Path;
 use chrono::{DateTime, Utc};
 use ocean_core::{
     FederatedMessageMeta, FederatedRoomMemberProjection, OutboxItemState, Room,
-    RoomAccessProjection, RoomAccessState, RoomKey, RoomMessage, RoomMessageKind, RoomOutboxItem,
-    RoomParticipant, RoomParticipantKind, RoomTriggerPolicy,
+    RoomAccessProjection, RoomAccessState, RoomArtifact, RoomArtifactKind, RoomArtifactState,
+    RoomKey, RoomMessage, RoomMessageKind, RoomOutboxItem, RoomParticipant, RoomParticipantKind,
+    RoomTriggerPolicy,
 };
 use rusqlite::{params, Connection, OptionalExtension, TransactionBehavior};
 
@@ -211,6 +212,19 @@ pub enum RoomStoreError {
     /// with the incoming row. Carries opaque ids/sequences only — never a
     /// bearer, registration key, or any secret material (P2-A).
     FederationCorruption(String),
+    /// An artifact write presented a version that is not the current one.
+    /// Compare-and-swap refused it: the caller read stale state, and merging
+    /// would silently discard whatever the other writer just did.
+    ArtifactVersionConflict {
+        room: RoomKey,
+        artifact: String,
+        expected: u64,
+        actual: u64,
+    },
+    /// No artifact with that id in this room.
+    UnknownArtifact { room: RoomKey, artifact: String },
+    /// The author of an artifact write is not on this room's roster.
+    ArtifactAuthorNotInRoster { room: RoomKey, author: String },
     /// A join tried to replace an existing participant with one of a DIFFERENT
     /// kind (e.g. a Bot taking over an Agent's id). Re-joining your own id with
     /// the same kind stays idempotent; changing the kind is a takeover and is
@@ -250,6 +264,22 @@ impl std::fmt::Display for RoomStoreError {
                 write!(f, "room '{k}' is not federated (no access projection)")
             }
             Self::FederationCorruption(m) => write!(f, "federation corruption: {m}"),
+            Self::ArtifactVersionConflict {
+                room,
+                artifact,
+                expected,
+                actual,
+            } => write!(
+                f,
+                "room '{room}': artifact '{artifact}' is at version {actual}, \
+                 not {expected}; re-read it and retry"
+            ),
+            Self::UnknownArtifact { room, artifact } => {
+                write!(f, "room '{room}' has no artifact '{artifact}'")
+            }
+            Self::ArtifactAuthorNotInRoster { room, author } => {
+                write!(f, "room '{room}' has no participant '{author}'")
+            }
             Self::ParticipantKindConflict {
                 room,
                 participant,
@@ -873,6 +903,37 @@ impl SqliteRoomStore {
                 PRIMARY KEY (room_id, agent_id)
             );
 
+            -- Room-scoped ARTIFACTS: the durable thing a conversation produces.
+            -- A transcript is a recording; nobody re-reads 4,000 lines to find
+            -- what they agreed to. An artifact is the agreed thing itself —
+            -- a task, a decision, a note — created by a human OR an agent and
+            -- AMENDED IN PLACE as the conversation moves, so the room shows
+            -- current state instead of requiring an archaeological dig.
+            --
+            -- `version` is a compare-and-swap guard, not decoration. The roster
+            -- clobber (two writers racing on one block, last-writer-wins) ate a
+            -- live roster twice in the prior campaign and reproduced on THIS
+            -- campaign's own pad the day it was created. An artifact that two
+            -- people edit during the same call is the same shape of race, so a
+            -- stale write is REFUSED, never merged and never silently applied.
+            CREATE TABLE IF NOT EXISTS room_artifacts (
+                room_id     TEXT NOT NULL REFERENCES rooms(id) ON DELETE CASCADE,
+                artifact_id TEXT NOT NULL,
+                kind        TEXT NOT NULL,   -- task | decision | note
+                title       TEXT NOT NULL,
+                body        TEXT NOT NULL,
+                state       TEXT NOT NULL,   -- open | done | dropped
+                created_by  TEXT NOT NULL,   -- participant id
+                created_at  TEXT NOT NULL,
+                updated_by  TEXT NOT NULL,
+                updated_at  TEXT NOT NULL,
+                version     INTEGER NOT NULL,
+                PRIMARY KEY (room_id, artifact_id)
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_room_artifacts_room
+                ON room_artifacts(room_id, state, updated_at);
+
             CREATE TABLE IF NOT EXISTS messages (
                 room_id     TEXT NOT NULL REFERENCES rooms(id) ON DELETE CASCADE,
                 seq         INTEGER NOT NULL,        -- per-room monotonic
@@ -1179,6 +1240,232 @@ impl SqliteRoomStore {
             workspace_root,
         };
         Ok(Some(RoomRecord { room, transcript }))
+    }
+
+    /// Create a room artifact and explain it in the transcript, atomically.
+    ///
+    /// The author must be on the roster — an artifact attributed to somebody who
+    /// is not in the room is a lie, and lies are what this campaign removes. The
+    /// System line is written in the SAME transaction, so an artifact can never
+    /// exist that the room's history does not account for.
+    pub fn create_artifact(
+        &mut self,
+        key: &RoomKey,
+        artifact_id: &str,
+        kind: RoomArtifactKind,
+        title: &str,
+        body: &str,
+        author: &str,
+        now: DateTime<Utc>,
+    ) -> Result<(RoomArtifact, RoomMessage)> {
+        if !self.room_is_open(key)? {
+            return Err(RoomStoreError::UnknownRoom(key.clone()));
+        }
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        Self::require_roster_author_on(&tx, key, author)?;
+        let ts = now.to_rfc3339();
+        // Version starts at 1 so "0" can never be mistaken for a valid read.
+        tx.execute(
+            "INSERT INTO room_artifacts
+                (room_id, artifact_id, kind, title, body, state,
+                 created_by, created_at, updated_by, updated_at, version)
+             VALUES (?1, ?2, ?3, ?4, ?5, 'open', ?6, ?7, ?6, ?7, 1)",
+            params![
+                key.as_str(),
+                artifact_id,
+                encode_artifact_kind(kind),
+                title,
+                body,
+                author,
+                ts
+            ],
+        )?;
+        let message = Self::insert_message_on(
+            &tx,
+            key,
+            MessageDraft::marker(
+                "system",
+                RoomParticipantKind::System,
+                RoomMessageKind::System,
+                &format!("{author} created {} '{title}'", encode_artifact_kind(kind)),
+            ),
+            now,
+        )?;
+        Self::touch_on(&tx, key, now)?;
+        tx.commit()?;
+        let artifact = self
+            .artifact(key, artifact_id)?
+            .expect("artifact just inserted");
+        Ok((artifact, message))
+    }
+
+    /// Amend an artifact in place under compare-and-swap.
+    ///
+    /// `expected_version` is what the caller read. If the artifact has moved on,
+    /// this REFUSES with the actual version rather than merging — because the
+    /// alternative is last-writer-wins, which is precisely the bug that ate a
+    /// live roster twice. Nothing is written on refusal.
+    #[allow(clippy::too_many_arguments)]
+    pub fn amend_artifact(
+        &mut self,
+        key: &RoomKey,
+        artifact_id: &str,
+        expected_version: u64,
+        title: Option<&str>,
+        body: Option<&str>,
+        state: Option<RoomArtifactState>,
+        author: &str,
+        now: DateTime<Utc>,
+    ) -> Result<(RoomArtifact, RoomMessage)> {
+        if !self.room_is_open(key)? {
+            return Err(RoomStoreError::UnknownRoom(key.clone()));
+        }
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        Self::require_roster_author_on(&tx, key, author)?;
+
+        let current: Option<(i64, String, String, String)> = tx
+            .query_row(
+                "SELECT version, title, body, state FROM room_artifacts
+                  WHERE room_id = ?1 AND artifact_id = ?2",
+                params![key.as_str(), artifact_id],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+            )
+            .optional()?;
+        let Some((actual, cur_title, cur_body, cur_state)) = current else {
+            return Err(RoomStoreError::UnknownArtifact {
+                room: key.clone(),
+                artifact: artifact_id.to_string(),
+            });
+        };
+        let actual = u64::try_from(actual).map_err(|_| {
+            RoomStoreError::Encode(format!("artifact '{artifact_id}' has a negative version"))
+        })?;
+        if actual != expected_version {
+            return Err(RoomStoreError::ArtifactVersionConflict {
+                room: key.clone(),
+                artifact: artifact_id.to_string(),
+                expected: expected_version,
+                actual,
+            });
+        }
+
+        let next_title = title.unwrap_or(&cur_title).to_string();
+        let next_body = body.unwrap_or(&cur_body).to_string();
+        let next_state = state
+            .map(encode_artifact_state)
+            .unwrap_or(cur_state.as_str())
+            .to_string();
+        let ts = now.to_rfc3339();
+        tx.execute(
+            "UPDATE room_artifacts
+                SET title = ?3, body = ?4, state = ?5,
+                    updated_by = ?6, updated_at = ?7, version = version + 1
+              WHERE room_id = ?1 AND artifact_id = ?2",
+            params![
+                key.as_str(),
+                artifact_id,
+                next_title,
+                next_body,
+                next_state,
+                author,
+                ts
+            ],
+        )?;
+        let message = Self::insert_message_on(
+            &tx,
+            key,
+            MessageDraft::marker(
+                "system",
+                RoomParticipantKind::System,
+                RoomMessageKind::System,
+                &format!("{author} updated '{next_title}' (v{})", actual + 1),
+            ),
+            now,
+        )?;
+        Self::touch_on(&tx, key, now)?;
+        tx.commit()?;
+        let artifact = self
+            .artifact(key, artifact_id)?
+            .expect("artifact just updated");
+        Ok((artifact, message))
+    }
+
+    /// One artifact by id.
+    pub fn artifact(&self, key: &RoomKey, artifact_id: &str) -> Result<Option<RoomArtifact>> {
+        self.conn
+            .query_row(
+                "SELECT artifact_id, kind, title, body, state, created_by, created_at,
+                        updated_by, updated_at, version
+                   FROM room_artifacts WHERE room_id = ?1 AND artifact_id = ?2",
+                params![key.as_str(), artifact_id],
+                Self::map_artifact,
+            )
+            .optional()?
+            .transpose()
+    }
+
+    /// Every artifact in a room, newest change first.
+    pub fn artifacts(&self, key: &RoomKey) -> Result<Vec<RoomArtifact>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT artifact_id, kind, title, body, state, created_by, created_at,
+                    updated_by, updated_at, version
+               FROM room_artifacts WHERE room_id = ?1
+              ORDER BY updated_at DESC, artifact_id",
+        )?;
+        let rows = stmt.query_map(params![key.as_str()], Self::map_artifact)?;
+        let mut out = Vec::new();
+        for r in rows {
+            out.push(r??);
+        }
+        Ok(out)
+    }
+
+    fn map_artifact(row: &rusqlite::Row<'_>) -> rusqlite::Result<Result<RoomArtifact>> {
+        let kind: String = row.get(1)?;
+        let state: String = row.get(4)?;
+        let version: i64 = row.get(9)?;
+        Ok((|| {
+            Ok(RoomArtifact {
+                id: row.get(0)?,
+                kind: decode_artifact_kind(&kind)?,
+                title: row.get(2)?,
+                body: row.get(3)?,
+                state: decode_artifact_state(&state)?,
+                created_by: row.get(5)?,
+                created_at: row.get(6)?,
+                updated_by: row.get(7)?,
+                updated_at: row.get(8)?,
+                version: u64::try_from(version)
+                    .map_err(|_| RoomStoreError::Encode("negative artifact version".into()))?,
+            })
+        })())
+    }
+
+    /// An artifact author must be on the roster. Runs inside the caller's
+    /// transaction so a concurrent leave cannot race it.
+    fn require_roster_author_on(
+        tx: &rusqlite::Transaction<'_>,
+        key: &RoomKey,
+        author: &str,
+    ) -> Result<()> {
+        let found: Option<String> = tx
+            .query_row(
+                "SELECT id FROM participants WHERE room_id = ?1 AND id = ?2",
+                params![key.as_str(), author],
+                |r| r.get(0),
+            )
+            .optional()?;
+        if found.is_none() {
+            return Err(RoomStoreError::ArtifactAuthorNotInRoster {
+                room: key.clone(),
+                author: author.to_string(),
+            });
+        }
+        Ok(())
     }
 
     /// Refuse a join that would REPLACE an existing participant with one of a
@@ -3609,6 +3896,44 @@ fn json_string(s: &str) -> String {
     format!("\"{escaped}\"")
 }
 
+fn encode_artifact_kind(k: RoomArtifactKind) -> &'static str {
+    match k {
+        RoomArtifactKind::Task => "task",
+        RoomArtifactKind::Decision => "decision",
+        RoomArtifactKind::Note => "note",
+    }
+}
+
+fn decode_artifact_kind(s: &str) -> Result<RoomArtifactKind> {
+    match s {
+        "task" => Ok(RoomArtifactKind::Task),
+        "decision" => Ok(RoomArtifactKind::Decision),
+        "note" => Ok(RoomArtifactKind::Note),
+        other => Err(RoomStoreError::Encode(format!(
+            "unknown artifact kind '{other}'"
+        ))),
+    }
+}
+
+fn encode_artifact_state(s: RoomArtifactState) -> &'static str {
+    match s {
+        RoomArtifactState::Open => "open",
+        RoomArtifactState::Done => "done",
+        RoomArtifactState::Dropped => "dropped",
+    }
+}
+
+fn decode_artifact_state(s: &str) -> Result<RoomArtifactState> {
+    match s {
+        "open" => Ok(RoomArtifactState::Open),
+        "done" => Ok(RoomArtifactState::Done),
+        "dropped" => Ok(RoomArtifactState::Dropped),
+        other => Err(RoomStoreError::Encode(format!(
+            "unknown artifact state '{other}'"
+        ))),
+    }
+}
+
 fn encode_participant_kind(k: RoomParticipantKind) -> &'static str {
     match k {
         RoomParticipantKind::Human => "human",
@@ -4061,6 +4386,226 @@ mod tests {
             .collect();
         assert_eq!(ids, vec!["room-002".to_string(), "room-000".to_string()]);
         assert!(!page.has_more);
+    }
+
+    fn artifact_room() -> (SqliteRoomStore, RoomKey) {
+        let mut s = store();
+        let key = RoomKey::new("call");
+        s.create(key.clone(), "Call", None, now()).unwrap();
+        s.add_participant(&key, human("alice", "Alice"), now())
+            .unwrap();
+        s.add_participant(&key, human("bob", "Bob"), now()).unwrap();
+        s.add_participant(&key, owned_agent("scribe", "Scribe"), now())
+            .unwrap();
+        (s, key)
+    }
+
+    /// THE race gate. Two people editing the same task during one call both read
+    /// v1. The first write wins; the second MUST be refused with the actual
+    /// version, not merged and not silently applied. Last-writer-wins here is
+    /// the same bug that ate a live roster twice in the prior campaign.
+    /// Mutation: delete the `actual != expected_version` check -> the second
+    /// write clobbers the first -> RED.
+    #[test]
+    fn a_stale_amend_is_refused_with_the_actual_version_and_writes_nothing() {
+        let (mut s, key) = artifact_room();
+        let (a, _) = s
+            .create_artifact(
+                &key,
+                "t1",
+                RoomArtifactKind::Task,
+                "Ship the thing",
+                "",
+                "alice",
+                now(),
+            )
+            .unwrap();
+        assert_eq!(a.version, 1);
+
+        // Alice amends first and wins.
+        let (a2, _) = s
+            .amend_artifact(&key, "t1", 1, Some("Ship the thing v2"), None, None, "alice", now())
+            .unwrap();
+        assert_eq!(a2.version, 2);
+
+        // Bob still holds the version he read. He must be refused.
+        let before = s.get(&key).unwrap().unwrap().transcript.len();
+        let err = s
+            .amend_artifact(&key, "t1", 1, Some("Bob's clobber"), None, None, "bob", now())
+            .unwrap_err();
+        match err {
+            RoomStoreError::ArtifactVersionConflict {
+                expected, actual, ..
+            } => {
+                assert_eq!(expected, 1);
+                assert_eq!(actual, 2, "the refusal must tell Bob where to re-read from");
+            }
+            other => panic!("expected ArtifactVersionConflict, got {other:?}"),
+        }
+
+        // Alice's work survives, and the refusal wrote NOTHING.
+        let current = s.artifact(&key, "t1").unwrap().unwrap();
+        assert_eq!(current.title, "Ship the thing v2");
+        assert_eq!(current.version, 2);
+        assert_eq!(current.updated_by, "alice");
+        assert_eq!(
+            s.get(&key).unwrap().unwrap().transcript.len(),
+            before,
+            "a refused amend must not write a transcript line"
+        );
+    }
+
+    /// An artifact is the durable thing a call produced. It must outlive the
+    /// process. Mutation: drop the INSERT in create_artifact -> RED.
+    #[test]
+    fn artifacts_survive_a_store_reopen() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("rooms.db");
+        let key = RoomKey::new("call");
+        {
+            let mut s = SqliteRoomStore::open(&path).unwrap();
+            s.create(key.clone(), "Call", None, now()).unwrap();
+            s.add_participant(&key, human("alice", "Alice"), now())
+                .unwrap();
+            s.create_artifact(
+                &key,
+                "d1",
+                RoomArtifactKind::Decision,
+                "Use Bedrock for fanout",
+                "rejected creator-host",
+                "alice",
+                now(),
+            )
+            .unwrap();
+        }
+        let s = SqliteRoomStore::open(&path).unwrap();
+        let a = s.artifact(&key, "d1").unwrap().expect("artifact persisted");
+        assert_eq!(a.title, "Use Bedrock for fanout");
+        assert_eq!(a.kind, RoomArtifactKind::Decision);
+        assert_eq!(a.state, RoomArtifactState::Open);
+        assert_eq!(a.created_by, "alice");
+    }
+
+    /// "Zoom, but the room remembers": an AGENT keeps a live card and rewrites
+    /// it in place as the call moves. Same path as a human, attributed to the
+    /// agent.
+    #[test]
+    fn an_agent_can_keep_a_live_card_and_amend_it_in_place() {
+        let (mut s, key) = artifact_room();
+        let (a, _) = s
+            .create_artifact(
+                &key,
+                "board",
+                RoomArtifactKind::Note,
+                "Action items",
+                "- [ ] nothing yet",
+                "scribe",
+                now(),
+            )
+            .unwrap();
+        assert_eq!(a.created_by, "scribe");
+
+        let (a2, msg) = s
+            .amend_artifact(
+                &key,
+                "board",
+                a.version,
+                None,
+                Some("- [ ] alice: ship the thing\n- [ ] bob: write the gate"),
+                None,
+                "scribe",
+                now(),
+            )
+            .unwrap();
+        assert_eq!(a2.version, 2);
+        assert!(a2.body.contains("alice: ship the thing"));
+        assert_eq!(a2.updated_by, "scribe");
+        // The room's own history explains the change.
+        assert_eq!(msg.kind, RoomMessageKind::System);
+        assert!(msg.body.contains("scribe updated"));
+    }
+
+    /// An artifact attributed to someone not in the room is a lie.
+    /// Mutation: delete `require_roster_author_on` from create -> RED.
+    #[test]
+    fn an_artifact_author_must_be_on_the_roster() {
+        let (mut s, key) = artifact_room();
+        let err = s
+            .create_artifact(
+                &key,
+                "t9",
+                RoomArtifactKind::Task,
+                "ghost task",
+                "",
+                "mallory",
+                now(),
+            )
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            RoomStoreError::ArtifactAuthorNotInRoster { .. }
+        ));
+        assert!(s.artifacts(&key).unwrap().is_empty());
+    }
+
+    /// Every artifact creation is explained in the transcript, in the SAME
+    /// transaction — so an artifact can never exist that the room's history does
+    /// not account for. Mutation: delete the insert_message_on call -> RED.
+    #[test]
+    fn creating_an_artifact_explains_itself_in_the_transcript() {
+        let (mut s, key) = artifact_room();
+        let before = s.get(&key).unwrap().unwrap().transcript.len();
+        let (_, msg) = s
+            .create_artifact(
+                &key,
+                "t1",
+                RoomArtifactKind::Task,
+                "Ship the thing",
+                "",
+                "alice",
+                now(),
+            )
+            .unwrap();
+        let after = s.get(&key).unwrap().unwrap();
+        assert_eq!(after.transcript.len(), before + 1);
+        assert_eq!(msg.author_kind, RoomParticipantKind::System);
+        assert!(msg.body.contains("alice created task 'Ship the thing'"));
+    }
+
+    /// Amending something that does not exist is refused, not silently created.
+    #[test]
+    fn amending_an_unknown_artifact_is_refused() {
+        let (mut s, key) = artifact_room();
+        let err = s
+            .amend_artifact(&key, "nope", 1, Some("x"), None, None, "alice", now())
+            .unwrap_err();
+        assert!(matches!(err, RoomStoreError::UnknownArtifact { .. }));
+        assert!(s.artifacts(&key).unwrap().is_empty());
+    }
+
+    /// A dropped task is a tombstone, not a delete — a retracted decision must
+    /// stay explainable.
+    #[test]
+    fn dropping_an_artifact_keeps_it_readable_as_a_tombstone() {
+        let (mut s, key) = artifact_room();
+        let (a, _) = s
+            .create_artifact(&key, "t1", RoomArtifactKind::Task, "Maybe", "", "alice", now())
+            .unwrap();
+        s.amend_artifact(
+            &key,
+            "t1",
+            a.version,
+            None,
+            None,
+            Some(RoomArtifactState::Dropped),
+            "bob",
+            now(),
+        )
+        .unwrap();
+        let a = s.artifact(&key, "t1").unwrap().unwrap();
+        assert_eq!(a.state, RoomArtifactState::Dropped);
+        assert_eq!(a.title, "Maybe", "a tombstone keeps its content");
+        assert_eq!(a.updated_by, "bob");
     }
 
     fn bot(id: &str, name: &str) -> RoomParticipant {
