@@ -602,6 +602,51 @@ pub(super) async fn room_join(
     Json(req): Json<RoomJoinRequest>,
 ) -> (StatusCode, Json<serde_json::Value>) {
     let key = RoomKey::new(key.trim());
+    // `System` is the DAEMON'S OWN author identity. Every audit row it writes is
+    // authored `("system", System)` — the auto-convene notice, the "not bound"
+    // note, the turn-failure line. If a client may join as System, the
+    // `ParticipantJoined` marker it produces is a System-authored transcript row
+    // that a reader cannot tell apart from a genuine daemon audit line. That is
+    // transcript forgery, so System is refused at JOIN for the same reason
+    // `classify_local_author` refuses it at POST (:743-748) — the two gates now
+    // agree instead of only the second one holding.
+    if matches!(req.kind, RoomParticipantKind::System) {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({
+                "ok": false,
+                "code": "forged_participant_kind",
+                "error": "'system' is the daemon's own author identity and cannot be joined",
+            })),
+        );
+    }
+    // Join and post must agree on what an id IS. `classify_local_author` treats
+    // roster ids as canonical and refuses anything that is empty or not equal to
+    // its own trim (:751-753). Without the same rule here, joining as `" john "`
+    // succeeds and then that participant can NEVER post — a permanent, silent,
+    // self-inflicted denial with no way to discover the cause. Refuse it at the
+    // door instead.
+    let id = req.id.trim();
+    if id.is_empty() || id != req.id {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({
+                "ok": false,
+                "code": "invalid_participant_id",
+                "error": "participant id must be non-empty and carry no leading or trailing whitespace",
+            })),
+        );
+    }
+    if req.display_name.trim().is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({
+                "ok": false,
+                "code": "invalid_display_name",
+                "error": "display_name must not be empty",
+            })),
+        );
+    }
     // Named-agent binding (TASK-9): an Agent participant MUST name a resolvable
     // folder-as-agent. Reject an unresolved name with a typed 4xx so a phantom
     // agent can never enter the roster as an Agent (it would later convene a
@@ -3942,6 +3987,132 @@ mod tests {
             assert_eq!(status, expected_status);
             assert_eq!(body["code"], expected_code);
         }
+    }
+
+    /// The daemon authors every audit row as ("system", System). If a client can
+    /// join as System, its ParticipantJoined marker is a System-authored
+    /// transcript row indistinguishable from a genuine daemon audit line.
+    /// Mutation: delete the System arm in `room_join` -> RED.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn system_kind_cannot_join_over_http() {
+        let _guard = AUTO_CONVENE_ENV_LOCK.lock().await;
+        let _env = TestEnvRestore::capture(&[
+            "OCEAN_CONFIG_DIR",
+            "OCEAN_MODEL",
+            "OCEAN_YOLO",
+            "OCEAN_AGENTS_DIR",
+        ]);
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = fake_convene_state(&tmp);
+        let key = RoomKey::new("system-join");
+        create_mention_room(&state, &key);
+
+        let (status, Json(body)) = room_join(
+            State(state.clone()),
+            Path(key.as_str().to_string()),
+            Json(RoomJoinRequest {
+                id: "system".into(),
+                display_name: "Ocean System".into(),
+                kind: RoomParticipantKind::System,
+            }),
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(body["code"], json!("forged_participant_kind"));
+        let room = with_rooms(&state, |store| store.get(&key))
+            .expect("room lookup")
+            .expect("room exists");
+        assert!(
+            room.room.participants.is_empty(),
+            "a refused System join must leave no roster row"
+        );
+        assert!(
+            room.transcript.is_empty(),
+            "a refused System join must forge no transcript marker"
+        );
+    }
+
+    /// Join and post must agree on what an id is. `classify_local_author`
+    /// refuses an untrimmed id at POST, so accepting one at JOIN strands that
+    /// participant forever with no way to discover why.
+    /// Mutation: delete the id-normalization arm in `room_join` -> RED.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn join_refuses_the_untrimmed_id_that_post_would_strand() {
+        let _guard = AUTO_CONVENE_ENV_LOCK.lock().await;
+        let _env = TestEnvRestore::capture(&[
+            "OCEAN_CONFIG_DIR",
+            "OCEAN_MODEL",
+            "OCEAN_YOLO",
+            "OCEAN_AGENTS_DIR",
+        ]);
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = fake_convene_state(&tmp);
+        let key = RoomKey::new("untrimmed-join");
+        create_mention_room(&state, &key);
+
+        for bad in [" john ", "", "   "] {
+            let (status, Json(body)) = room_join(
+                State(state.clone()),
+                Path(key.as_str().to_string()),
+                Json(RoomJoinRequest {
+                    id: bad.into(),
+                    display_name: "John".into(),
+                    kind: RoomParticipantKind::Human,
+                }),
+            )
+            .await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "id {bad:?} must be refused");
+            assert_eq!(body["code"], json!("invalid_participant_id"));
+        }
+
+        // The canonical spelling still joins, and can therefore post.
+        let (status, _) = room_join(
+            State(state.clone()),
+            Path(key.as_str().to_string()),
+            Json(RoomJoinRequest {
+                id: "john".into(),
+                display_name: "John".into(),
+                kind: RoomParticipantKind::Human,
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let room = with_rooms(&state, |store| store.get(&key))
+            .expect("room lookup")
+            .expect("room exists");
+        assert_eq!(room.room.participants.len(), 1);
+        assert_eq!(room.room.participants[0].id, "john");
+    }
+
+    /// An empty display name produces a " joined" marker with no author to read.
+    /// Mutation: delete the display_name arm -> RED.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn join_refuses_an_empty_display_name() {
+        let _guard = AUTO_CONVENE_ENV_LOCK.lock().await;
+        let _env = TestEnvRestore::capture(&[
+            "OCEAN_CONFIG_DIR",
+            "OCEAN_MODEL",
+            "OCEAN_YOLO",
+            "OCEAN_AGENTS_DIR",
+        ]);
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = fake_convene_state(&tmp);
+        let key = RoomKey::new("blank-name-join");
+        create_mention_room(&state, &key);
+
+        let (status, Json(body)) = room_join(
+            State(state.clone()),
+            Path(key.as_str().to_string()),
+            Json(RoomJoinRequest {
+                id: "ghost".into(),
+                display_name: "   ".into(),
+                kind: RoomParticipantKind::Human,
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(body["code"], json!("invalid_display_name"));
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
