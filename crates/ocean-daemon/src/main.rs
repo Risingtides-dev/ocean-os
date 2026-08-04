@@ -12641,9 +12641,15 @@ mod tests {
         .await;
         assert_eq!(status, StatusCode::OK);
         let list = persistent_room_http_json(&raw);
-        assert_json_object_keys(&list, &["ok", "rooms", "next_cursor", "has_more"]);
+        assert_json_object_keys(&list, &["ok", "rooms", "read_states", "has_more"]);
         assert_eq!(list["ok"], true);
         assert_eq!(list["rooms"].as_array().unwrap().len(), 1);
+        assert_eq!(
+            list["read_states"],
+            json!([{
+                "room_id": "lifecycle-room"
+            }])
+        );
         assert_eq!(list["rooms"][0]["id"], "lifecycle-room");
         assert_eq!(list["rooms"][0]["name"], "  Verbatim Room Name  ");
         assert!(list["rooms"][0].get("workspace_root").is_none());

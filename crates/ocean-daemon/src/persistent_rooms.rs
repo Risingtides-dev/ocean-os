@@ -579,6 +579,25 @@ pub(super) struct RoomsListQuery {
     pub(super) cursor: Option<String>,
 }
 
+#[derive(Debug, Clone, serde::Serialize, PartialEq, Eq)]
+struct PersistentRoomReadState {
+    room_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    latest_seq: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    read_seq: Option<String>,
+}
+
+#[derive(Debug, Clone, serde::Serialize, PartialEq, Eq)]
+struct PersistentRoomsListResponse {
+    ok: bool,
+    rooms: Vec<ocean_core::Room>,
+    read_states: Vec<PersistentRoomReadState>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    next_cursor: Option<String>,
+    has_more: bool,
+}
+
 /// `GET /v1/rooms/persistent?limit=&cursor=` — list open persistent rooms, one
 /// bounded page at a time (OCEAN-250). Rooms are ordered most-recently-updated
 /// first; the `rooms` array shape is unchanged, with additive
@@ -587,15 +606,62 @@ pub(super) async fn rooms_list_persistent(
     State(state): State<AppState>,
     Query(q): Query<RoomsListQuery>,
 ) -> (StatusCode, Json<serde_json::Value>) {
-    match with_rooms(&state, |reg| reg.list_page(q.cursor.as_deref(), q.limit)) {
-        Ok(page) => (
+    match with_rooms(&state, |reg| {
+        let page = reg.list_page(q.cursor.as_deref(), q.limit)?;
+        let read_states = page
+            .rooms
+            .iter()
+            .map(|room| {
+                let key = room.id.clone();
+                let access = reg.room_access(&key)?;
+                let principal: Option<String> = match access.state {
+                    RoomAccessState::Local => Some(local_room_read_cursor_principal().to_string()),
+                    RoomAccessState::Live
+                    | RoomAccessState::Connecting
+                    | RoomAccessState::Recovering
+                    | RoomAccessState::Revoked => reg
+                        .room_credential(&key)?
+                        .map(|credential| credential.local_human_member_id),
+                };
+                let cursor = match principal.as_deref() {
+                    Some(principal) => reg.room_read_cursor(&key, principal)?,
+                    None => RoomReadCursorProjection {
+                        read_seq: None,
+                        mirrored_upstream_read_seq: None,
+                    },
+                };
+                let latest_seq = match access.state {
+                    RoomAccessState::Local => reg.room_latest_durable_seq(&key)?,
+                    RoomAccessState::Live => access.last_confirmed_global_sequence,
+                    RoomAccessState::Connecting
+                    | RoomAccessState::Recovering
+                    | RoomAccessState::Revoked => access.last_confirmed_global_sequence,
+                };
+                let read_seq = match access.state {
+                    RoomAccessState::Local => cursor.read_seq,
+                    RoomAccessState::Live
+                    | RoomAccessState::Connecting
+                    | RoomAccessState::Recovering
+                    | RoomAccessState::Revoked => cursor.mirrored_upstream_read_seq,
+                };
+                Ok::<_, ocean_store::RoomStoreError>(PersistentRoomReadState {
+                    room_id: room.id.to_string(),
+                    latest_seq: latest_seq.map(|seq| seq.to_string()),
+                    read_seq: read_seq.map(|seq| seq.to_string()),
+                })
+            })
+            .collect::<Result<Vec<_>, ocean_store::RoomStoreError>>()?;
+        Ok::<_, ocean_store::RoomStoreError>(PersistentRoomsListResponse {
+            ok: true,
+            rooms: page.rooms,
+            read_states,
+            next_cursor: page.next_cursor,
+            has_more: page.has_more,
+        })
+    }) {
+        Ok(response) => (
             StatusCode::OK,
-            Json(json!({
-                "ok": true,
-                "rooms": page.rooms,
-                "next_cursor": page.next_cursor,
-                "has_more": page.has_more,
-            })),
+            Json(serde_json::to_value(response).unwrap()),
         ),
         Err(e) => room_store_error_response(e),
     }
@@ -2963,6 +3029,122 @@ mod tests {
             derived_presence: Some(ocean_core::MemberPresence::Unavailable),
             local_binding_available: None,
         }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn rooms_list_persistent_includes_ordered_read_states_for_local_and_live() {
+        let tmp = tempfile::tempdir().unwrap();
+        let state = fake_convene_state(&tmp);
+        let local = RoomKey::new("list-read-local");
+        let live = RoomKey::new("list-read-live");
+        with_rooms(&state, |store| {
+            store.create(local.clone(), "Local", None, Utc::now())?;
+            store.append_message(
+                &local,
+                "u1",
+                RoomParticipantKind::Human,
+                RoomMessageKind::Message,
+                "local first",
+                Utc::now(),
+            )?;
+            store.update_room_read_cursor(
+                &local,
+                local_room_read_cursor_principal(),
+                RoomReadCursorUpdateRequest { read_seq: 0 },
+            )?;
+
+            store.create(live.clone(), "Live", None, Utc::now())?;
+            store.update_room_access_safe(
+                &live,
+                Some(RoomAccessState::Live),
+                None,
+                Some(u64::MAX),
+            )?;
+            store.install_room_credential(&live, "bearer-secret", "live-principal")?;
+            store.set_room_read_cursor_mirror(&live, "live-principal", Some((1u64 << 53) + 7))?;
+            Ok::<_, ocean_store::RoomStoreError>(())
+        })
+        .unwrap();
+
+        let (status, body) = rooms_list_persistent(
+            State(state.clone()),
+            Query(RoomsListQuery {
+                limit: Some(10),
+                cursor: None,
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body.0["ok"], json!(true));
+        let rooms = body.0["rooms"].as_array().unwrap();
+        let read_states = body.0["read_states"].as_array().unwrap();
+        assert_eq!(rooms.len(), 2);
+        assert_eq!(read_states.len(), 2);
+        for (room, read_state) in rooms.iter().zip(read_states.iter()) {
+            assert_eq!(read_state["room_id"], room["id"]);
+        }
+        assert_eq!(
+            read_states[0],
+            json!({
+                "room_id": live.as_str(),
+                "latest_seq": u64::MAX.to_string(),
+                "read_seq": ((1u64 << 53) + 7).to_string()
+            })
+        );
+        assert_eq!(
+            read_states[1],
+            json!({
+                "room_id": local.as_str(),
+                "latest_seq": "0",
+                "read_seq": "0"
+            })
+        );
+        let encoded = serde_json::to_string(&body.0).unwrap();
+        assert!(encoded.contains(&format!("\"latest_seq\":\"{}\"", u64::MAX)));
+        assert!(encoded.contains("\"read_seq\":\"9007199254740999\""));
+        assert!(!encoded.contains("bearer-secret"));
+        assert!(!encoded.contains("live-principal"));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn rooms_list_persistent_uses_durable_metadata_for_non_live_federated_states() {
+        let tmp = tempfile::tempdir().unwrap();
+        let state = fake_convene_state(&tmp);
+        let key = RoomKey::new("list-read-connecting");
+        with_rooms(&state, |store| {
+            store.create(key.clone(), "Connecting", None, Utc::now())?;
+            store.update_room_access_safe(
+                &key,
+                Some(RoomAccessState::Connecting),
+                None,
+                Some(42),
+            )?;
+            store.install_room_credential(&key, "bearer-secret", "connecting-principal")?;
+            store.set_room_read_cursor_mirror(&key, "connecting-principal", Some(7))?;
+            Ok::<_, ocean_store::RoomStoreError>(())
+        })
+        .unwrap();
+
+        let (status, body) = rooms_list_persistent(
+            State(state),
+            Query(RoomsListQuery {
+                limit: Some(10),
+                cursor: None,
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            body.0["read_states"],
+            json!([{
+                "room_id": key.as_str(),
+                "latest_seq": "42",
+                "read_seq": "7"
+            }])
+        );
+        let encoded = serde_json::to_string(&body.0).unwrap();
+        assert!(!encoded.contains("bearer-secret"));
+        assert!(!encoded.contains("connecting-principal"));
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

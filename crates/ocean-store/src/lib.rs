@@ -3421,6 +3421,19 @@ impl SqliteRoomStore {
         })
     }
 
+    pub fn room_latest_durable_seq(&self, key: &RoomKey) -> Result<Option<u64>> {
+        if !self.room_exists(key)? {
+            return Err(RoomStoreError::UnknownRoom(key.clone()));
+        }
+        self.conn
+            .query_row(
+                "SELECT MAX(seq) FROM messages WHERE room_id = ?1",
+                params![key.as_str()],
+                |r| r.get(0),
+            )
+            .map_err(Into::into)
+    }
+
     pub fn update_room_read_cursor(
         &mut self,
         key: &RoomKey,
@@ -6889,6 +6902,34 @@ mod tests {
     }
 
     // ── exact {"state":"local"} open + closed ──────────────────────────────
+
+    #[test]
+    fn room_latest_durable_seq_absent_and_zero_round_trip() {
+        let mut s = store();
+        let key = RoomKey::new("latest-seq");
+        s.create(key.clone(), "Latest Seq", None, now()).unwrap();
+        assert_eq!(s.room_latest_durable_seq(&key).unwrap(), None);
+
+        s.append_message(
+            &key,
+            "u1",
+            RoomParticipantKind::Human,
+            RoomMessageKind::Message,
+            "zero",
+            now(),
+        )
+        .unwrap();
+        assert_eq!(s.room_latest_durable_seq(&key).unwrap(), Some(0));
+    }
+
+    #[test]
+    fn room_latest_durable_seq_unknown_room_errors() {
+        let s = store();
+        let err = s
+            .room_latest_durable_seq(&RoomKey::new("missing-latest"))
+            .unwrap_err();
+        assert!(matches!(err, RoomStoreError::UnknownRoom(_)));
+    }
 
     #[test]
     fn room_read_cursor_defaults_to_none_for_absent_row() {
