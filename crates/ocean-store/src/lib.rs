@@ -221,6 +221,15 @@ pub enum RoomStoreError {
         expected: u64,
         actual: u64,
     },
+    /// A re-join tried to MUTATE an existing participant record (display name,
+    /// ownership). The join route is unauthenticated, so "rename" and "steal
+    /// this identity" are indistinguishable requests; an existing record is
+    /// immutable via join and an identical re-join stays idempotent.
+    ParticipantRecordImmutable {
+        room: RoomKey,
+        participant: String,
+        field: &'static str,
+    },
     /// An artifact with that id already exists in this room. A client naming
     /// collision is the most ordinary error this endpoint sees; it must not
     /// surface as a server fault.
@@ -277,6 +286,15 @@ impl std::fmt::Display for RoomStoreError {
                 f,
                 "room '{room}': artifact '{artifact}' is at version {actual}, \
                  not {expected}; re-read it and retry"
+            ),
+            Self::ParticipantRecordImmutable {
+                room,
+                participant,
+                field,
+            } => write!(
+                f,
+                "room '{room}': participant '{participant}' already exists; \
+                 '{field}' cannot be changed by re-joining"
             ),
             Self::ArtifactAlreadyExists { room, artifact } => {
                 write!(f, "room '{room}' already has an artifact '{artifact}'")
@@ -1481,6 +1499,16 @@ impl SqliteRoomStore {
         })())
     }
 
+    /// Drop an agent's ownership binding. The artifacts that agent already
+    /// created keep their snapshotted `on_behalf_of` — history does not rewrite.
+    pub fn remove_agent_owner(&mut self, key: &RoomKey, agent_id: &str) -> Result<bool> {
+        let n = self.conn.execute(
+            "DELETE FROM room_agent_owners WHERE room_id = ?1 AND agent_id = ?2",
+            params![key.as_str(), agent_id],
+        )?;
+        Ok(n > 0)
+    }
+
     /// Which WORKER this author is acting for, if the author is an agent with a
     /// recorded owner. Read inside the caller's transaction and snapshotted by
     /// the caller, so later changes to the live binding never rewrite history.
@@ -1539,21 +1567,37 @@ impl SqliteRoomStore {
         key: &RoomKey,
         participant: &RoomParticipant,
     ) -> Result<()> {
-        let existing: Option<String> = tx
+        let existing: Option<(String, String)> = tx
             .query_row(
-                "SELECT kind FROM participants WHERE room_id = ?1 AND id = ?2",
+                "SELECT kind, display_name FROM participants WHERE room_id = ?1 AND id = ?2",
                 params![key.as_str(), participant.id],
-                |r| r.get(0),
+                |r| Ok((r.get(0)?, r.get(1)?)),
             )
             .optional()?;
         let offered = encode_participant_kind(participant.kind);
-        if let Some(existing) = existing {
+        if let Some((existing, existing_name)) = existing {
             if existing != offered {
                 return Err(RoomStoreError::ParticipantKindConflict {
                     room: key.clone(),
                     participant: participant.id.clone(),
                     existing,
                     offered: offered.to_string(),
+                });
+            }
+            // Same kind, different display name is STILL a takeover. The join
+            // route has no authentication, so "rename" and "steal this person's
+            // name" are the same request — and the transcript's historical lines
+            // stay attributed to the id whose label just changed under them.
+            // An existing participant record is therefore IMMUTABLE via join:
+            // an identical re-join is idempotent (reconnect), anything else is
+            // refused. A genuine rename needs an authenticated path, which does
+            // not exist yet; inventing one here by accident is how the display
+            // name got stealable in the first place.
+            if existing_name != participant.display_name {
+                return Err(RoomStoreError::ParticipantRecordImmutable {
+                    room: key.clone(),
+                    participant: participant.id.clone(),
+                    field: "display_name",
                 });
             }
         }
@@ -1594,6 +1638,26 @@ impl SqliteRoomStore {
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
 
         Self::guard_participant_kind_on(&tx, key, &participant)?;
+        // A3: re-adding an existing agent with a DIFFERENT owner is ownership
+        // theft by the same unauthenticated route. Re-pointing an agent to a new
+        // worker is a real operation, but it needs an authenticated actor, not
+        // an anonymous re-join.
+        let prior_owner: Option<String> = tx
+            .query_row(
+                "SELECT owner_id FROM room_agent_owners WHERE room_id = ?1 AND agent_id = ?2",
+                params![key.as_str(), participant.id],
+                |r| r.get(0),
+            )
+            .optional()?;
+        if let Some(prior) = prior_owner {
+            if prior != owner_id {
+                return Err(RoomStoreError::ParticipantRecordImmutable {
+                    room: key.clone(),
+                    participant: participant.id.clone(),
+                    field: "owner_id",
+                });
+            }
+        }
         // Positive proof, inside the write lock: the owner must be a Human that
         // is in this room right now. We do not trust the caller's roster read.
         let owner_kind: Option<String> = tx
@@ -4698,9 +4762,11 @@ mod tests {
             .unwrap();
         s.create_artifact(&key, "t1", RoomArtifactKind::Task, "Ship it", "", "scribe", now())
             .unwrap();
-        // Ownership moves to bob.
-        s.add_agent_participant_with_owner(&key, owned_agent("scribe", "Scribe"), "bob", now())
-            .unwrap();
+        // The live binding is removed entirely. If `on_behalf_of` were a join
+        // rather than a snapshot, every artifact that agent created would lose
+        // its chain to a human the moment the binding went away.
+        s.remove_agent_owner(&key, "scribe").unwrap();
+        assert!(s.agent_owners(&key).unwrap().is_empty());
         let a = s.artifact(&key, "t1").unwrap().unwrap();
         assert_eq!(
             a.on_behalf_of.as_deref(),
@@ -4838,18 +4904,84 @@ mod tests {
     /// Same-kind re-join MUST stay idempotent — reconnects and renames are the
     /// legitimate case the DELETE-then-INSERT exists for. Mutation: make the
     /// guard reject on any existing row -> RED (this is the over-reach gate).
+    /// An IDENTICAL re-join stays idempotent — that is the reconnect case the
+    /// DELETE-then-INSERT exists for. Mutation: make the guard reject any
+    /// existing row -> RED.
     #[test]
-    fn same_kind_rejoin_still_works_and_can_rename() {
+    fn an_identical_rejoin_is_still_idempotent() {
         let mut s = store();
         let key = RoomKey::new("r1");
         s.create(key.clone(), "R1", None, now()).unwrap();
         s.add_participant(&key, human("alice", "Alice"), now())
             .unwrap();
-        s.add_participant(&key, human("alice", "Alice A."), now())
+        s.add_participant(&key, human("alice", "Alice"), now())
             .unwrap();
         let rec = s.get(&key).unwrap().unwrap();
         assert_eq!(rec.room.participants.len(), 1, "no duplicate roster row");
-        assert_eq!(rec.room.participants[0].display_name, "Alice A.");
+        assert_eq!(rec.room.participants[0].display_name, "Alice");
+    }
+
+    /// A1 (pro-adversary): same kind, different display name is display-name
+    /// THEFT, because the join route has no authentication and the transcript's
+    /// historical lines stay attributed to the id whose label just changed.
+    /// Mutation: delete the display_name arm of guard_participant_kind_on -> RED.
+    #[test]
+    fn a_rejoin_cannot_steal_an_existing_participants_display_name() {
+        let mut s = store();
+        let key = RoomKey::new("r1");
+        s.create(key.clone(), "R1", None, now()).unwrap();
+        s.add_participant(&key, human("alice", "Alice"), now())
+            .unwrap();
+        let err = s
+            .add_participant(&key, human("alice", "Eve"), now())
+            .unwrap_err();
+        match err {
+            RoomStoreError::ParticipantRecordImmutable { field, .. } => {
+                assert_eq!(field, "display_name")
+            }
+            other => panic!("expected ParticipantRecordImmutable, got {other:?}"),
+        }
+        let rec = s.get(&key).unwrap().unwrap();
+        assert_eq!(rec.room.participants[0].display_name, "Alice");
+    }
+
+    /// A3 (pro-adversary): re-adding an existing agent under a DIFFERENT owner
+    /// is ownership theft by the same unauthenticated route.
+    /// Mutation: delete the prior_owner check -> RED.
+    #[test]
+    fn a_rejoin_cannot_re_point_an_agent_to_a_different_owner() {
+        let mut s = store();
+        let key = RoomKey::new("r1");
+        s.create(key.clone(), "R1", None, now()).unwrap();
+        s.add_participant(&key, human("alice", "Alice"), now())
+            .unwrap();
+        s.add_participant(&key, human("bob", "Bob"), now()).unwrap();
+        s.add_agent_participant_with_owner(
+            &key,
+            owned_agent("researcher", "Researcher"),
+            "alice",
+            now(),
+        )
+        .unwrap();
+        let err = s
+            .add_agent_participant_with_owner(
+                &key,
+                owned_agent("researcher", "Researcher"),
+                "bob",
+                now(),
+            )
+            .unwrap_err();
+        match err {
+            RoomStoreError::ParticipantRecordImmutable { field, .. } => {
+                assert_eq!(field, "owner_id")
+            }
+            other => panic!("expected ParticipantRecordImmutable, got {other:?}"),
+        }
+        assert_eq!(
+            s.agent_owners(&key).unwrap(),
+            vec![("researcher".to_string(), "alice".to_string(), true)],
+            "the agent must still belong to alice"
+        );
     }
 
     /// The owner-aware path is guarded too: a Bot cannot displace an owned agent.
@@ -5010,6 +5142,7 @@ mod tests {
     /// Re-adding the same agent re-points the binding rather than duplicating
     /// it, and the roster does not grow.
     #[test]
+    #[should_panic(expected = "ParticipantRecordImmutable")]
     fn re_adding_an_agent_repoints_its_owner_without_duplicating() {
         let mut s = store();
         let key = RoomKey::new("r1");

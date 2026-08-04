@@ -333,6 +333,7 @@ pub(super) fn room_store_error_response(
         // sees. Before this it tripped the PK constraint and surfaced as a 500 —
         // a client mistake reported as a server fault.
         ArtifactAlreadyExists { .. } => StatusCode::CONFLICT,
+        ParticipantRecordImmutable { .. } => StatusCode::CONFLICT,
         // An artifact attributed to someone not in the room is a lie, not a
         // server fault.
         ArtifactAuthorNotInRoster { .. } => StatusCode::FORBIDDEN,
@@ -780,6 +781,35 @@ pub(super) async fn room_create_artifact(
     }
     if req.title.trim().is_empty() {
         return invalid_request_response();
+    }
+    // Finding B: `author_id` is caller-supplied and only roster-checked, so a
+    // hostile local caller could author an artifact AS somebody's agent. An
+    // agent's artifact is produced by the daemon's own convene path, never by a
+    // client claiming an agent's identity over the wire — the same rule
+    // `classify_local_author` already applies to messages (Agent|System are
+    // daemon-only author kinds). Enforce it here too instead of trusting the
+    // client one layer down.
+    let claimed_kind = with_rooms(&state, |store| store.get(&key)).ok().and_then(|rec| {
+        rec.and_then(|rec| {
+            rec.room
+                .participants
+                .iter()
+                .find(|p| p.id == req.author_id)
+                .map(|p| p.kind)
+        })
+    });
+    if matches!(
+        claimed_kind,
+        Some(RoomParticipantKind::Agent) | Some(RoomParticipantKind::System)
+    ) {
+        return (
+            StatusCode::FORBIDDEN,
+            Json(json!({
+                "ok": false,
+                "code": "forged_artifact_author",
+                "error": "an agent's artifact is authored by the daemon, not by a client claiming its identity",
+            })),
+        );
     }
     let result = with_rooms(&state, |store| {
         store.create_artifact(
@@ -4339,6 +4369,85 @@ mod tests {
         .await;
         assert_eq!(status, StatusCode::BAD_REQUEST);
         assert_eq!(body["code"], json!("owner_requires_agent"));
+    }
+
+    /// Finding B (pro-adversary): `author_id` is caller-supplied and only
+    /// roster-checked, so a hostile local caller could author an artifact AS
+    /// somebody's agent. An agent's artifact is produced by the daemon's convene
+    /// path, never by a client claiming its identity over the wire.
+    /// Mutation: delete the forged_artifact_author arm -> RED.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_client_cannot_author_an_artifact_as_an_agent() {
+        let _guard = AUTO_CONVENE_ENV_LOCK.lock().await;
+        let _env = TestEnvRestore::capture(&[
+            "OCEAN_CONFIG_DIR",
+            "OCEAN_MODEL",
+            "OCEAN_YOLO",
+            "OCEAN_AGENTS_DIR",
+        ]);
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = fake_convene_state(&tmp);
+        let agents_root = tmp.path().join("agents");
+        write_agent_fixture(&agents_root, "researcher", "model = \"fake-ok\"\n", None);
+        std::env::set_var("OCEAN_AGENTS_DIR", &agents_root);
+        let key = RoomKey::new("forge-artifact");
+        create_mention_room(&state, &key);
+        for (id, name, kind) in [
+            ("alice", "Alice", RoomParticipantKind::Human),
+            ("researcher", "Researcher", RoomParticipantKind::Agent),
+        ] {
+            let (status, _) = room_join(
+                State(state.clone()),
+                Path(key.as_str().to_string()),
+                Json(RoomJoinRequest {
+                    id: id.into(),
+                    display_name: name.into(),
+                    kind,
+                    owner_id: None,
+                }),
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK);
+        }
+
+        let (status, Json(body)) = room_create_artifact(
+            State(state.clone()),
+            Path(key.as_str().to_string()),
+            Json(CreateArtifactRequest {
+                id: "forged".into(),
+                kind: RoomArtifactKind::Task,
+                title: "I am the agent".into(),
+                body: String::new(),
+                author_id: "researcher".into(),
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        assert_eq!(body["code"], json!("forged_artifact_author"));
+
+        let (status, Json(list)) =
+            room_list_artifacts(State(state.clone()), Path(key.as_str().to_string())).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            list["artifacts"].as_array().map(|a| a.len()),
+            Some(0),
+            "a forged artifact must not exist"
+        );
+
+        // A human author on the same route still works.
+        let (status, _) = room_create_artifact(
+            State(state.clone()),
+            Path(key.as_str().to_string()),
+            Json(CreateArtifactRequest {
+                id: "real".into(),
+                kind: RoomArtifactKind::Task,
+                title: "Real task".into(),
+                body: String::new(),
+                author_id: "alice".into(),
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED);
     }
 
     /// The daemon authors every audit row as ("system", System). If a client can
