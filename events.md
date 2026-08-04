@@ -5951,3 +5951,18 @@ confirmed the ordering closes the reported normal path. Verified: cargo fmt
 --check; cargo test -p ocean-tui (463 passed, 1 ignored); cargo build -p
 ocean-tui --release; git diff --check.
 _________________________________________________________________________________
+
+time:      [21:04] [08-04-2026]
+agent:     [ocean], [gpt-5.6-sol]
+worktree:  [fix/failure-honesty]
+type:      [fix]
+area:      [runtime]
+
+Made the reserved, tool-free final synthesis round resilient to a clean provider
+failure: it now retries within the existing bounded round-attempt budget without
+replaying tools or retrying cancellation. Exhausted failures now log their exact
+turn/request/session-correlated terminal error instead of leaving only `ok=false`.
+Added an end-to-end regression proving one tool execution across a failed/retried
+final synthesis. Verified full ocean-runtime tests (191 passed across targets),
+`cargo check -p ocean-daemon`, fmt, diff check, and independent review approval.
+_________________________________________________________________________________

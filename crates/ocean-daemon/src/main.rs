@@ -6833,6 +6833,20 @@ async fn agent_turn(
         )
         .await;
 
+        // The terminal SSE frame carries this text once, but subscribers can
+        // disconnect and the durable session transcript intentionally excludes
+        // provider failures. Retain the sanitized failure in daemon logs instead
+        // of reducing the only postmortem evidence to `ok=false`.
+        if !res.ok {
+            tracing::error!(
+                turn_id = %turn_id,
+                request_id = %request_id,
+                session_id = %session_id,
+                error = %res.stderr,
+                "agent turn failed"
+            );
+        }
+
         tracing::info!(
             turn_id = %turn_id,
             request_id = %request_id,
