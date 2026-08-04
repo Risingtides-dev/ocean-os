@@ -35,8 +35,8 @@ use tokio_stream::StreamExt;
 use tokio_util::sync::CancellationToken;
 
 use crate::persistent_rooms::{
-    publish_room_access_wake_on, publish_room_wake_on, with_rooms_handle, RoomAccessWakeBus,
-    RoomStoreHandle, RoomWakeBus,
+    publish_room_access_wake_on, publish_room_read_cursor_wake_on, publish_room_wake_on,
+    with_rooms_handle, RoomAccessWakeBus, RoomReadCursorWakeBus, RoomStoreHandle, RoomWakeBus,
 };
 
 const FEDERATION_URL_ENV: &str = "OCEAN_FEDERATION_URL";
@@ -308,6 +308,7 @@ struct SupervisorInit {
     rooms: RoomStoreHandle,
     room_wakes: RoomWakeBus,
     access_wakes: RoomAccessWakeBus,
+    read_cursor_wakes: RoomReadCursorWakeBus,
     trigger_tx: mpsc::UnboundedSender<FederatedTriggerDispatch>,
     shutdown: CancellationToken,
     scan_interval: Duration,
@@ -320,6 +321,7 @@ struct SupervisorInner {
     rooms: RoomStoreHandle,
     room_wakes: RoomWakeBus,
     access_wakes: RoomAccessWakeBus,
+    read_cursor_wakes: RoomReadCursorWakeBus,
     trigger_tx: mpsc::UnboundedSender<FederatedTriggerDispatch>,
     shutdown: CancellationToken,
     slots: Mutex<HashMap<RoomKey, Arc<RoomSlot>>>,
@@ -421,6 +423,7 @@ impl FederationSupervisor {
         rooms: RoomStoreHandle,
         room_wakes: RoomWakeBus,
         access_wakes: RoomAccessWakeBus,
+        read_cursor_wakes: RoomReadCursorWakeBus,
         trigger_tx: mpsc::UnboundedSender<FederatedTriggerDispatch>,
         shutdown: CancellationToken,
     ) -> Self {
@@ -440,6 +443,7 @@ impl FederationSupervisor {
             rooms,
             room_wakes,
             access_wakes,
+            read_cursor_wakes,
             trigger_tx,
             shutdown,
             scan_interval: SENDER_SCAN_INTERVAL,
@@ -452,6 +456,7 @@ impl FederationSupervisor {
         rooms: RoomStoreHandle,
         room_wakes: RoomWakeBus,
         access_wakes: RoomAccessWakeBus,
+        read_cursor_wakes: RoomReadCursorWakeBus,
         shutdown: CancellationToken,
         scan_interval: Duration,
     ) -> Self {
@@ -461,6 +466,7 @@ impl FederationSupervisor {
             rooms,
             room_wakes,
             access_wakes,
+            read_cursor_wakes,
             trigger_tx,
             shutdown,
             scan_interval,
@@ -473,6 +479,7 @@ impl FederationSupervisor {
         rooms: RoomStoreHandle,
         room_wakes: RoomWakeBus,
         access_wakes: RoomAccessWakeBus,
+        read_cursor_wakes: RoomReadCursorWakeBus,
         trigger_tx: mpsc::UnboundedSender<FederatedTriggerDispatch>,
         shutdown: CancellationToken,
         scan_interval: Duration,
@@ -484,6 +491,7 @@ impl FederationSupervisor {
             rooms,
             room_wakes,
             access_wakes,
+            read_cursor_wakes,
             trigger_tx,
             shutdown,
             scan_interval,
@@ -495,6 +503,7 @@ impl FederationSupervisor {
         rooms: RoomStoreHandle,
         room_wakes: RoomWakeBus,
         access_wakes: RoomAccessWakeBus,
+        read_cursor_wakes: RoomReadCursorWakeBus,
         shutdown: CancellationToken,
     ) -> Self {
         let (trigger_tx, _) = mpsc::unbounded_channel();
@@ -505,6 +514,7 @@ impl FederationSupervisor {
             rooms,
             room_wakes,
             access_wakes,
+            read_cursor_wakes,
             trigger_tx,
             shutdown,
             scan_interval: SENDER_SCAN_INTERVAL,
@@ -520,6 +530,7 @@ impl FederationSupervisor {
                 rooms: init.rooms,
                 room_wakes: init.room_wakes,
                 access_wakes: init.access_wakes,
+                read_cursor_wakes: init.read_cursor_wakes,
                 trigger_tx: init.trigger_tx,
                 shutdown: init.shutdown,
                 slots: Mutex::new(HashMap::new()),
@@ -1667,11 +1678,38 @@ async fn run_epoch(
                                 let Ok(current_state) = durable_state(&inner.rooms, &key) else {
                                     break EpochOutcome::Recover;
                                 };
-                                if !commit_access(&inner, &key, current_state, Some(&members), None) {
+                                if !commit_presence_snapshot(&inner, &key, current_state, &members) {
                                     break EpochOutcome::Recover;
                                 }
                             }
                             Err(outcome) => break outcome,
+                        }
+                    }
+                    "presence" => {
+                        let Ok(frame) = parse_sse_json::<PresenceFrame>(&event.data) else {
+                            break EpochOutcome::Recover;
+                        };
+                        if frame.room_id != key.as_str() {
+                            break EpochOutcome::Recover;
+                        }
+                        let Ok(current_state) = durable_state(&inner.rooms, &key) else {
+                            break EpochOutcome::Recover;
+                        };
+                        if !apply_presence_frame(&inner, &key, current_state, &frame.members) {
+                            break EpochOutcome::Recover;
+                        }
+                    }
+                    "room_read_cursor" => {
+                        let Ok(frame) = parse_sse_json::<ReadCursorFrame>(&event.data) else {
+                            break EpochOutcome::Recover;
+                        };
+                        if frame.room_id != key.as_str() {
+                            break EpochOutcome::Recover;
+                        }
+                        match commit_mirrored_read_cursor(&inner, &client, &credential, &key, frame.sequence).await {
+                            Ok(()) => {}
+                            Err(BridgeError::Revoked) => break EpochOutcome::Revoked,
+                            Err(_) => break EpochOutcome::Recover,
                         }
                     }
                     "resync_required" => {
@@ -1725,6 +1763,33 @@ struct HeartbeatFrame {
 #[serde(deny_unknown_fields)]
 struct ResyncFrame {
     after_sequence: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PresenceFrame {
+    room_id: String,
+    members: Vec<PresenceWireMember>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PresenceWireMember {
+    member_id: String,
+    actor_type: FederatedActorType,
+    #[allow(dead_code)]
+    role_in_room: FederatedRoomRole,
+    #[allow(dead_code)]
+    display_name: String,
+    #[allow(dead_code)]
+    joined_at: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ReadCursorFrame {
+    room_id: String,
+    sequence: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -2305,6 +2370,115 @@ fn commit_access(
 
 fn commit_state_only(inner: &Arc<SupervisorInner>, key: &RoomKey, state: RoomAccessState) -> bool {
     commit_access(inner, key, state, None, None)
+}
+
+fn commit_presence_snapshot(
+    inner: &Arc<SupervisorInner>,
+    key: &RoomKey,
+    state: RoomAccessState,
+    members: &[FederatedRoomMemberProjection],
+) -> bool {
+    commit_access(inner, key, state, Some(members), None)
+}
+
+fn apply_presence_frame(
+    inner: &Arc<SupervisorInner>,
+    key: &RoomKey,
+    state: RoomAccessState,
+    incoming: &[PresenceWireMember],
+) -> bool {
+    let projection = match with_rooms_handle(&inner.rooms, |store| store.room_access(key)) {
+        Ok(projection) => projection,
+        Err(_) => return false,
+    };
+    let live_humans: HashSet<&str> = incoming
+        .iter()
+        .filter(|member| member.actor_type == FederatedActorType::User)
+        .map(|member| member.member_id.as_str())
+        .collect();
+    let mut members = projection.members;
+    for member in &mut members {
+        match member.actor_type {
+            FederatedActorType::User => {
+                member.derived_presence =
+                    Some(if live_humans.contains(member.member_id.as_str()) {
+                        MemberPresence::Live
+                    } else {
+                        MemberPresence::Unavailable
+                    });
+            }
+            FederatedActorType::Agent => {
+                member.derived_presence = None;
+            }
+        }
+    }
+    commit_access(inner, key, state, Some(&members), None)
+}
+
+async fn commit_mirrored_read_cursor(
+    inner: &Arc<SupervisorInner>,
+    client: &FederationClient,
+    credential: &RoomCredential,
+    key: &RoomKey,
+    sequence: Option<String>,
+) -> Result<(), BridgeError> {
+    let read_seq = match sequence {
+        Some(sequence) => Some(parse_canonical_u64(&sequence)?),
+        None => None,
+    };
+    let url = client
+        .room_endpoint(key, "read-cursor")
+        .map_err(|_| BridgeError::Protocol)?;
+    let response = client
+        .http
+        .patch(url)
+        .timeout(REQUEST_TIMEOUT)
+        .bearer_auth(&credential.bearer_token)
+        .json(&serde_json::json!({ "read_seq": read_seq }))
+        .send()
+        .await
+        .map_err(|_| BridgeError::Transport)?;
+    match response.status() {
+        StatusCode::OK => {}
+        StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN => return Err(BridgeError::Revoked),
+        StatusCode::BAD_REQUEST | StatusCode::CONFLICT => return Err(BridgeError::Protocol),
+        _ => return Err(BridgeError::Transport),
+    }
+    #[derive(Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct ReadCursorPatchBody {
+        read_seq: Option<u64>,
+    }
+    #[derive(Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct ReadCursorPatchEnvelope {
+        read_cursor: ReadCursorPatchBody,
+    }
+    let body = response
+        .json::<ReadCursorPatchEnvelope>()
+        .await
+        .map_err(|_| BridgeError::Protocol)?;
+    if body.read_cursor.read_seq != read_seq {
+        return Err(BridgeError::Protocol);
+    }
+    with_rooms_handle(&inner.rooms, |store| {
+        let cursor = store.update_room_read_cursor(
+            key,
+            credential.local_human_member_id.as_str(),
+            ocean_core::RoomReadCursorUpdateRequest {
+                read_seq: body.read_cursor.read_seq.unwrap_or(0),
+            },
+        )?;
+        if body.read_cursor.read_seq.is_none() && cursor.read_seq.is_some() {
+            return Err(ocean_store::RoomStoreError::FederationCorruption(
+                "null read cursor unexpectedly materialized local sequence".into(),
+            ));
+        }
+        Ok::<(), ocean_store::RoomStoreError>(())
+    })
+    .map_err(|_| BridgeError::Store)?;
+    publish_room_read_cursor_wake_on(&inner.read_cursor_wakes, key);
+    Ok(())
 }
 
 fn persist_lease_lost(
@@ -3270,6 +3444,7 @@ mod tests {
             rooms,
             RoomWakeBus::default(),
             RoomAccessWakeBus::default(),
+            RoomReadCursorWakeBus::default(),
             CancellationToken::new(),
             Duration::from_millis(20),
         )
@@ -3331,6 +3506,7 @@ mod tests {
             rooms.clone(),
             RoomWakeBus::default(),
             access_wakes,
+            RoomReadCursorWakeBus::default(),
             CancellationToken::new(),
         );
 
@@ -3379,6 +3555,7 @@ mod tests {
             rooms.clone(),
             RoomWakeBus::default(),
             RoomAccessWakeBus::default(),
+            RoomReadCursorWakeBus::default(),
             CancellationToken::new(),
         );
         let slot = supervisor.slot_for(&key).await;
@@ -3522,6 +3699,7 @@ mod tests {
             rooms,
             RoomWakeBus::default(),
             RoomAccessWakeBus::default(),
+            RoomReadCursorWakeBus::default(),
             trigger_tx,
             CancellationToken::new(),
             Duration::from_secs(60),
@@ -3628,6 +3806,7 @@ mod tests {
             rooms.clone(),
             RoomWakeBus::default(),
             RoomAccessWakeBus::default(),
+            RoomReadCursorWakeBus::default(),
             trigger_tx,
             CancellationToken::new(),
             Duration::from_secs(60),
@@ -3706,6 +3885,7 @@ mod tests {
             rooms.clone(),
             RoomWakeBus::default(),
             RoomAccessWakeBus::default(),
+            RoomReadCursorWakeBus::default(),
             trigger_tx,
             CancellationToken::new(),
             Duration::from_secs(60),
@@ -3891,6 +4071,7 @@ mod tests {
             rooms,
             RoomWakeBus::default(),
             RoomAccessWakeBus::default(),
+            RoomReadCursorWakeBus::default(),
             CancellationToken::new(),
         );
         for index in 0..64 {
@@ -4802,6 +4983,7 @@ mod tests {
             rooms.clone(),
             RoomWakeBus::default(),
             RoomAccessWakeBus::default(),
+            RoomReadCursorWakeBus::default(),
             CancellationToken::new(),
             Duration::from_millis(20),
         );
@@ -4923,6 +5105,7 @@ mod tests {
             rooms.clone(),
             RoomWakeBus::default(),
             access_wakes,
+            RoomReadCursorWakeBus::default(),
             CancellationToken::new(),
             Duration::from_millis(20),
         );
@@ -4983,6 +5166,7 @@ mod tests {
             rooms.clone(),
             RoomWakeBus::default(),
             RoomAccessWakeBus::default(),
+            RoomReadCursorWakeBus::default(),
             CancellationToken::new(),
             Duration::from_millis(20),
         );
@@ -5045,6 +5229,7 @@ mod tests {
             rooms: rooms.clone(),
             room_wakes,
             access_wakes,
+            read_cursor_wakes: RoomReadCursorWakeBus::default(),
             trigger_tx,
             shutdown: CancellationToken::new(),
             scan_interval: Duration::from_millis(20),
@@ -5147,6 +5332,7 @@ mod tests {
             rooms.clone(),
             room_wakes,
             access_wakes,
+            RoomReadCursorWakeBus::default(),
             shutdown,
             Duration::from_millis(20),
         );
@@ -5478,6 +5664,7 @@ mod tests {
             rooms.clone(),
             RoomWakeBus::default(),
             RoomAccessWakeBus::default(),
+            RoomReadCursorWakeBus::default(),
             CancellationToken::new(),
             Duration::from_millis(20),
         );
@@ -5551,6 +5738,7 @@ mod tests {
             rooms.clone(),
             RoomWakeBus::default(),
             RoomAccessWakeBus::default(),
+            RoomReadCursorWakeBus::default(),
             CancellationToken::new(),
             Duration::from_millis(20),
         );
@@ -5672,6 +5860,7 @@ mod tests {
             rooms.clone(),
             RoomWakeBus::default(),
             RoomAccessWakeBus::default(),
+            RoomReadCursorWakeBus::default(),
             CancellationToken::new(),
             Duration::from_millis(20),
         );
@@ -5763,6 +5952,7 @@ mod tests {
             rooms.clone(),
             RoomWakeBus::default(),
             RoomAccessWakeBus::default(),
+            RoomReadCursorWakeBus::default(),
             CancellationToken::new(),
             Duration::from_millis(20),
         );
@@ -5801,6 +5991,7 @@ mod tests {
             rooms.clone(),
             RoomWakeBus::default(),
             RoomAccessWakeBus::default(),
+            RoomReadCursorWakeBus::default(),
             CancellationToken::new(),
             Duration::from_millis(20),
         );
@@ -5848,6 +6039,7 @@ mod tests {
             rooms,
             RoomWakeBus::default(),
             RoomAccessWakeBus::default(),
+            RoomReadCursorWakeBus::default(),
             CancellationToken::new(),
             Duration::from_millis(20),
         );
@@ -5943,6 +6135,7 @@ mod tests {
             rooms.clone(),
             room_wakes,
             access_wakes,
+            RoomReadCursorWakeBus::default(),
             CancellationToken::new(),
             Duration::from_millis(20),
         );

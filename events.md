@@ -5935,3 +5935,11 @@ mention+thread-reply dispatch dedup on one row, and agent reply root/session
 attribution with fallback. Verified: 53/53 persistent_rooms, fmt, clippy -D
 warnings (daemon), cargo check --workspace.
 _________________________________________________________________________________
+time:      [06:26] [04-08-26]
+agent:     [ocean-subagent] [gpt-5] [ocean-os-room-state-closer]
+worktree:  feat/rooms-federated-cursor-presence
+type:      [feature]
+area:      [backend]
+
+Completed the rooms federated cursor/presence closeout in ocean-daemon. Wired RoomReadCursorWakeBus through FederationSupervisor init/test fixtures and persistent-room fake state, added federated SSE handling for explicit `presence` and `room_read_cursor` events, and published read-cursor wakes after authoritative mirrored cursor commits. Persistent room events SSE now includes Local-room read-cursor bootstrap/live tail support without breaking existing transcript replay semantics; HTTP tests were updated to tolerate the new bootstrap ordering. Verified targeted daemon/store cursor tests, full daemon tests, daemon clippy -D warnings, cargo fmt --check, and diff --check.
+_________________________________________________________________________________

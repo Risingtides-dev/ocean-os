@@ -1077,6 +1077,7 @@ async fn main() -> anyhow::Result<()> {
         rooms.clone(),
         room_wakes.clone(),
         room_access_wakes.clone(),
+        room_read_cursor_wakes.clone(),
         federated_trigger_tx,
         shutdown.clone(),
     );
@@ -13749,11 +13750,13 @@ mod tests {
         let rooms = Arc::new(Mutex::new(store));
         let room_wakes = RoomWakeBus::default();
         let room_access_wakes = RoomAccessWakeBus::default();
+        let room_read_cursor_wakes = RoomReadCursorWakeBus::default();
         let shutdown = CancellationToken::new();
         let room_federation = FederationSupervisor::test_disabled(
             rooms.clone(),
             room_wakes.clone(),
             room_access_wakes.clone(),
+            room_read_cursor_wakes.clone(),
             shutdown.clone(),
         );
         AppState {
@@ -15477,11 +15480,13 @@ mod tests {
         let rooms = Arc::new(Mutex::new(store));
         let room_wakes = RoomWakeBus::default();
         let room_access_wakes = RoomAccessWakeBus::default();
+        let room_read_cursor_wakes = RoomReadCursorWakeBus::default();
         let shutdown = CancellationToken::new();
         let room_federation = FederationSupervisor::test_disabled(
             rooms.clone(),
             room_wakes.clone(),
             room_access_wakes.clone(),
+            room_read_cursor_wakes.clone(),
             shutdown.clone(),
         );
         AppState {
@@ -15861,11 +15866,13 @@ mod tests {
         let rooms = Arc::new(Mutex::new(store));
         let room_wakes = RoomWakeBus::default();
         let room_access_wakes = RoomAccessWakeBus::default();
+        let room_read_cursor_wakes = RoomReadCursorWakeBus::default();
         let shutdown = CancellationToken::new();
         let room_federation = FederationSupervisor::test_disabled(
             rooms.clone(),
             room_wakes.clone(),
             room_access_wakes.clone(),
+            room_read_cursor_wakes.clone(),
             shutdown.clone(),
         );
         let state = AppState {
@@ -17637,11 +17644,13 @@ mod tests {
         let rooms = Arc::new(Mutex::new(store));
         let room_wakes = RoomWakeBus::default();
         let room_access_wakes = RoomAccessWakeBus::default();
+        let room_read_cursor_wakes = RoomReadCursorWakeBus::default();
         let shutdown = CancellationToken::new();
         let room_federation = FederationSupervisor::test_disabled(
             rooms.clone(),
             room_wakes.clone(),
             room_access_wakes.clone(),
+            room_read_cursor_wakes.clone(),
             shutdown.clone(),
         );
         let titles = ocean_longhouse::SqliteTitleRegistry::open(dir.join("titles.db"))

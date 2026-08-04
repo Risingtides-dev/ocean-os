@@ -2801,6 +2801,7 @@ mod tests {
             state.rooms.clone(),
             state.room_wakes.clone(),
             state.room_access_wakes.clone(),
+            state.room_read_cursor_wakes.clone(),
             state.shutdown.clone(),
             std::time::Duration::from_secs(60),
         );
@@ -4446,13 +4447,25 @@ mod tests {
             access_wire.contains("event: room_access"),
             "expected room_access first, got: {access_wire:?}"
         );
-        // Second frame: room_message.
+        // Optional Local-room read cursor bootstrap may arrive before transcript replay.
         let frame = tokio::time::timeout(std::time::Duration::from_millis(250), body.frame())
             .await
-            .expect("message frame exceeded 250ms")
+            .expect("next frame exceeded 250ms")
             .expect("SSE body ended")
             .expect("SSE body error");
-        let wire = std::str::from_utf8(frame.data_ref().expect("SSE data frame")).unwrap();
+        let mut wire = std::str::from_utf8(frame.data_ref().expect("SSE data frame"))
+            .unwrap()
+            .to_string();
+        if wire.contains("event: room_read_cursor\n") {
+            let frame = tokio::time::timeout(std::time::Duration::from_millis(250), body.frame())
+                .await
+                .expect("message frame exceeded 250ms")
+                .expect("SSE body ended")
+                .expect("SSE body error");
+            wire = std::str::from_utf8(frame.data_ref().expect("SSE data frame"))
+                .unwrap()
+                .to_string();
+        }
         assert!(wire.contains("event: room_message\n"), "wire: {wire:?}");
         assert!(wire.contains("id: 0\n"), "wire: {wire:?}");
         let data = wire
@@ -4506,13 +4519,25 @@ mod tests {
             access_wire.contains("event: room_access"),
             "expected room_access first, got: {access_wire:?}"
         );
-        // Next frame: room_message with resume from id 2.
+        // Optional Local-room read cursor bootstrap may arrive before replay.
         let frame = tokio::time::timeout(std::time::Duration::from_millis(250), body.frame())
             .await
             .expect("resume frame exceeded 250ms")
             .expect("SSE body ended")
             .expect("SSE body error");
-        let wire = std::str::from_utf8(frame.data_ref().expect("SSE data frame")).unwrap();
+        let mut wire = std::str::from_utf8(frame.data_ref().expect("SSE data frame"))
+            .unwrap()
+            .to_string();
+        if wire.contains("event: room_read_cursor\n") {
+            let frame = tokio::time::timeout(std::time::Duration::from_millis(250), body.frame())
+                .await
+                .expect("resume message frame exceeded 250ms")
+                .expect("SSE body ended")
+                .expect("SSE body error");
+            wire = std::str::from_utf8(frame.data_ref().expect("SSE data frame"))
+                .unwrap()
+                .to_string();
+        }
         assert!(wire.contains("id: 2\n"), "wire: {wire:?}");
         assert!(wire.contains("\"body\":\"two\""), "wire: {wire:?}");
         assert!(!wire.contains("\"body\":\"one\""), "wire: {wire:?}");
