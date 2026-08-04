@@ -959,6 +959,18 @@ pub enum RoomAccessState {
     Revoked,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RoomReadCursorProjection {
+    #[serde(default)]
+    pub read_seq: Option<u64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RoomReadCursorUpdateRequest {
+    pub read_seq: u64,
+}
+
 // ── Invite intent types (P1 — types + serialization; routes deferred) ──
 
 /// `POST /v1/rooms/persistent/{key}/invites` — request body (Surface
