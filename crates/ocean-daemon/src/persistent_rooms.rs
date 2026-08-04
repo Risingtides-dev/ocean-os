@@ -12,10 +12,11 @@ use axum::{
 };
 use chrono::Utc;
 use ocean_agent_sdk::{AgentSessionId, AgentTurnEvent};
-use ocean_core::{RoomArtifactKind, RoomArtifactState,
+use ocean_core::{
     evaluate_trigger_policy, PermissionMode, PromptRequest, PublicAgentDescriptor, RequestState,
-    RoomAccessProjection, RoomAccessState, RoomKey, RoomMessage, RoomMessageKind, RoomParticipant,
-    RoomParticipantKind, RoomTriggerEvent, RoomTriggerPolicy,
+    RoomAccessProjection, RoomAccessState, RoomArtifactKind, RoomArtifactState, RoomKey,
+    RoomMessage, RoomMessageKind, RoomParticipant, RoomParticipantKind, RoomTriggerEvent,
+    RoomTriggerPolicy,
 };
 #[cfg(test)]
 use ocean_core::{OutboxItemState, RoomOutboxItem};
@@ -789,15 +790,17 @@ pub(super) async fn room_create_artifact(
     // `classify_local_author` already applies to messages (Agent|System are
     // daemon-only author kinds). Enforce it here too instead of trusting the
     // client one layer down.
-    let claimed_kind = with_rooms(&state, |store| store.get(&key)).ok().and_then(|rec| {
-        rec.and_then(|rec| {
-            rec.room
-                .participants
-                .iter()
-                .find(|p| p.id == req.author_id)
-                .map(|p| p.kind)
-        })
-    });
+    let claimed_kind = with_rooms(&state, |store| store.get(&key))
+        .ok()
+        .and_then(|rec| {
+            rec.and_then(|rec| {
+                rec.room
+                    .participants
+                    .iter()
+                    .find(|p| p.id == req.author_id)
+                    .map(|p| p.kind)
+            })
+        });
     if matches!(
         claimed_kind,
         Some(RoomParticipantKind::Agent) | Some(RoomParticipantKind::System)
@@ -4525,7 +4528,11 @@ mod tests {
                 }),
             )
             .await;
-            assert_eq!(status, StatusCode::BAD_REQUEST, "id {bad:?} must be refused");
+            assert_eq!(
+                status,
+                StatusCode::BAD_REQUEST,
+                "id {bad:?} must be refused"
+            );
             assert_eq!(body["code"], json!("invalid_participant_id"));
         }
 

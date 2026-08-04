@@ -319,10 +319,7 @@ impl std::fmt::Display for RoomStoreError {
                 agent,
                 owner,
                 reason,
-            } => write!(
-                f,
-                "agent '{agent}' cannot be owned by '{owner}': {reason}"
-            ),
+            } => write!(f, "agent '{agent}' cannot be owned by '{owner}': {reason}"),
             Self::Db(e) => write!(f, "sqlite error: {e}"),
             Self::Encode(e) => write!(f, "encode error: {e}"),
             Self::Io(e) => write!(f, "io error: {e}"),
@@ -4563,14 +4560,32 @@ mod tests {
 
         // Alice amends first and wins.
         let (a2, _) = s
-            .amend_artifact(&key, "t1", 1, Some("Ship the thing v2"), None, None, "alice", now())
+            .amend_artifact(
+                &key,
+                "t1",
+                1,
+                Some("Ship the thing v2"),
+                None,
+                None,
+                "alice",
+                now(),
+            )
             .unwrap();
         assert_eq!(a2.version, 2);
 
         // Bob still holds the version he read. He must be refused.
         let before = s.get(&key).unwrap().unwrap().transcript.len();
         let err = s
-            .amend_artifact(&key, "t1", 1, Some("Bob's clobber"), None, None, "bob", now())
+            .amend_artifact(
+                &key,
+                "t1",
+                1,
+                Some("Bob's clobber"),
+                None,
+                None,
+                "bob",
+                now(),
+            )
             .unwrap_err();
         match err {
             RoomStoreError::ArtifactVersionConflict {
@@ -4728,15 +4743,18 @@ mod tests {
     #[test]
     fn an_agent_artifact_records_the_worker_it_acted_for() {
         let (mut s, key) = artifact_room();
-        s.add_agent_participant_with_owner(
-            &key,
-            owned_agent("scribe", "Scribe"),
-            "alice",
-            now(),
-        )
-        .unwrap();
+        s.add_agent_participant_with_owner(&key, owned_agent("scribe", "Scribe"), "alice", now())
+            .unwrap();
         let (a, _) = s
-            .create_artifact(&key, "t1", RoomArtifactKind::Task, "Ship it", "", "scribe", now())
+            .create_artifact(
+                &key,
+                "t1",
+                RoomArtifactKind::Task,
+                "Ship it",
+                "",
+                "scribe",
+                now(),
+            )
             .unwrap();
         assert_eq!(a.created_by, "scribe");
         assert_eq!(
@@ -4747,7 +4765,15 @@ mod tests {
 
         // A human author has no one behind them.
         let (h, _) = s
-            .create_artifact(&key, "t2", RoomArtifactKind::Task, "Direct", "", "bob", now())
+            .create_artifact(
+                &key,
+                "t2",
+                RoomArtifactKind::Task,
+                "Direct",
+                "",
+                "bob",
+                now(),
+            )
             .unwrap();
         assert_eq!(h.on_behalf_of, None);
     }
@@ -4761,8 +4787,16 @@ mod tests {
         let (mut s, key) = artifact_room();
         s.add_agent_participant_with_owner(&key, owned_agent("scribe", "Scribe"), "alice", now())
             .unwrap();
-        s.create_artifact(&key, "t1", RoomArtifactKind::Task, "Ship it", "", "scribe", now())
-            .unwrap();
+        s.create_artifact(
+            &key,
+            "t1",
+            RoomArtifactKind::Task,
+            "Ship it",
+            "",
+            "scribe",
+            now(),
+        )
+        .unwrap();
         // The live binding is removed entirely. If `on_behalf_of` were a join
         // rather than a snapshot, every artifact that agent created would lose
         // its chain to a human the moment the binding went away.
@@ -4782,10 +4816,26 @@ mod tests {
     #[test]
     fn a_duplicate_artifact_id_is_a_client_conflict_not_a_server_fault() {
         let (mut s, key) = artifact_room();
-        s.create_artifact(&key, "t1", RoomArtifactKind::Task, "First", "", "alice", now())
-            .unwrap();
+        s.create_artifact(
+            &key,
+            "t1",
+            RoomArtifactKind::Task,
+            "First",
+            "",
+            "alice",
+            now(),
+        )
+        .unwrap();
         let err = s
-            .create_artifact(&key, "t1", RoomArtifactKind::Task, "Second", "", "bob", now())
+            .create_artifact(
+                &key,
+                "t1",
+                RoomArtifactKind::Task,
+                "Second",
+                "",
+                "bob",
+                now(),
+            )
             .unwrap_err();
         assert!(
             matches!(err, RoomStoreError::ArtifactAlreadyExists { .. }),
@@ -4803,7 +4853,15 @@ mod tests {
     fn dropping_an_artifact_keeps_it_readable_as_a_tombstone() {
         let (mut s, key) = artifact_room();
         let (a, _) = s
-            .create_artifact(&key, "t1", RoomArtifactKind::Task, "Maybe", "", "alice", now())
+            .create_artifact(
+                &key,
+                "t1",
+                RoomArtifactKind::Task,
+                "Maybe",
+                "",
+                "alice",
+                now(),
+            )
             .unwrap();
         s.amend_artifact(
             &key,
@@ -4898,7 +4956,10 @@ mod tests {
             .iter()
             .find(|p| p.id == "alice")
             .unwrap();
-        assert_eq!(alice.display_name, "Alice", "display name must not be stolen");
+        assert_eq!(
+            alice.display_name, "Alice",
+            "display name must not be stolen"
+        );
         assert_eq!(alice.kind, RoomParticipantKind::Human);
     }
 
@@ -5085,7 +5146,10 @@ mod tests {
         // marker, no binding. A half-applied ownership is the exact
         // "claimed a durable effect that did not happen" class.
         let after = s.get(&key).unwrap().unwrap();
-        assert_eq!(after.room.participants.len(), before.room.participants.len());
+        assert_eq!(
+            after.room.participants.len(),
+            before.room.participants.len()
+        );
         assert_eq!(after.transcript.len(), before.transcript.len());
         assert!(s.agent_owners(&key).unwrap().is_empty());
     }
