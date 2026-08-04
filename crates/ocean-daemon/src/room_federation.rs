@@ -1593,13 +1593,15 @@ impl FederationSupervisor {
         {
             return Err(IntentError::Forbidden);
         }
-        let members = project_roster(&self.inner, credential, envelope, true).map_err(|error| {
-            if error == BridgeError::Store {
-                IntentError::Store
-            } else {
-                IntentError::Protocol
-            }
-        })?;
+        let members = project_roster(&self.inner, credential, envelope, &HashSet::new()).map_err(
+            |error| {
+                if error == BridgeError::Store {
+                    IntentError::Store
+                } else {
+                    IntentError::Protocol
+                }
+            },
+        )?;
         if slot
             .control
             .mutate(|| slot.generation.load(Ordering::Acquire) == generation)
@@ -1740,6 +1742,7 @@ async fn run_epoch(
     sender_notify: Arc<Notify>,
     cancel: CancellationToken,
 ) -> EpochOutcome {
+    let mut live_human_member_ids = HashSet::<String>::new();
     let key = credential.room_id.clone();
     let cursor = match cursor_or_zero(durable_cursor(&inner.rooms, &key)) {
         Ok(cursor) => cursor,
@@ -1793,7 +1796,7 @@ async fn run_epoch(
     };
 
     // Roster is committed before the first room_event of every connection epoch.
-    let members = match fetch_roster(&inner, &client, &credential, true).await {
+    let members = match fetch_roster(&inner, &client, &credential, &live_human_member_ids).await {
         Ok(members) => members,
         Err(EpochOutcome::Revoked) => return EpochOutcome::Revoked,
         Err(outcome) => return outcome,
@@ -1891,7 +1894,7 @@ async fn run_epoch(
                         if sequence != last_accepted {
                             break EpochOutcome::Recover;
                         }
-                        match fetch_roster(&inner, &client, &credential, true).await {
+                        match fetch_roster(&inner, &client, &credential, &live_human_member_ids).await {
                             Ok(members) => {
                                 let Ok(current_state) = durable_state(&inner.rooms, &key) else {
                                     break EpochOutcome::Recover;
@@ -1903,7 +1906,7 @@ async fn run_epoch(
                             Err(outcome) => break outcome,
                         }
                     }
-                    "presence" => {
+                    "room_presence" => {
                         let Ok(frame) = parse_sse_json::<PresenceFrame>(&event.data) else {
                             break EpochOutcome::Recover;
                         };
@@ -1913,7 +1916,13 @@ async fn run_epoch(
                         let Ok(current_state) = durable_state(&inner.rooms, &key) else {
                             break EpochOutcome::Recover;
                         };
-                        if !apply_presence_frame(&inner, &key, current_state, &frame.members) {
+                        if !apply_presence_frame(
+                            &inner,
+                            &key,
+                            current_state,
+                            &frame.members,
+                            &mut live_human_member_ids,
+                        ) {
                             break EpochOutcome::Recover;
                         }
                     }
@@ -2321,7 +2330,7 @@ async fn fetch_roster(
     inner: &Arc<SupervisorInner>,
     client: &FederationClient,
     credential: &RoomCredential,
-    lease_healthy: bool,
+    live_human_member_ids: &HashSet<String>,
 ) -> Result<Vec<FederatedRoomMemberProjection>, EpochOutcome> {
     let url = client
         .room_endpoint(&credential.room_id, "members")
@@ -2342,14 +2351,15 @@ async fn fetch_roster(
     let envelope: MembersEnvelope = read_bounded_json(response, BODY_LIMIT)
         .await
         .map_err(|_| EpochOutcome::Recover)?;
-    project_roster(inner, credential, envelope, lease_healthy).map_err(|_| EpochOutcome::Recover)
+    project_roster(inner, credential, envelope, live_human_member_ids)
+        .map_err(|_| EpochOutcome::Recover)
 }
 
 fn project_roster(
     inner: &Arc<SupervisorInner>,
     credential: &RoomCredential,
     envelope: MembersEnvelope,
-    lease_healthy: bool,
+    live_human_member_ids: &HashSet<String>,
 ) -> Result<Vec<FederatedRoomMemberProjection>, BridgeError> {
     let mut members = Vec::with_capacity(envelope.members.len());
     let mut member_ids = HashSet::with_capacity(envelope.members.len());
@@ -2370,15 +2380,15 @@ fn project_roster(
         } else {
             false
         };
-        let local_agent = member.owner_member_id.as_deref()
-            == Some(credential.local_human_member_id.as_str())
-            && binding;
-        let local_human = member.actor_type == FederatedActorType::User
-            && member.member_id == credential.local_human_member_id;
-        let presence = if lease_healthy && (local_human || local_agent) {
-            MemberPresence::Live
-        } else {
-            MemberPresence::Unavailable
+        let derived_presence = match member.actor_type {
+            FederatedActorType::User => {
+                Some(if live_human_member_ids.contains(&member.member_id) {
+                    MemberPresence::Live
+                } else {
+                    MemberPresence::Unavailable
+                })
+            }
+            FederatedActorType::Agent => None,
         };
         members.push(FederatedRoomMemberProjection {
             member_id: member.member_id,
@@ -2388,7 +2398,7 @@ fn project_roster(
             display_name: member.display_name,
             public_agent_descriptor: member.public_agent_descriptor,
             joined_at: member.joined_at,
-            derived_presence: Some(presence),
+            derived_presence,
             local_binding_available: (member.actor_type == FederatedActorType::Agent)
                 .then_some(binding),
         });
@@ -2439,7 +2449,7 @@ async fn ingest_message_row(
                 // no-op, while Ingested coalesces roster + message into one
                 // access wake.
                 let current_state = durable_state(&inner.rooms, &credential.room_id)?;
-                let members = fetch_roster(inner, client, credential, true)
+                let members = fetch_roster(inner, client, credential, &HashSet::new())
                     .await
                     .map_err(|outcome| match outcome {
                         EpochOutcome::Revoked => BridgeError::Revoked,
@@ -2618,17 +2628,28 @@ fn apply_presence_frame(
     key: &RoomKey,
     state: RoomAccessState,
     incoming: &[PresenceWireMember],
+    live_human_member_ids: &mut HashSet<String>,
 ) -> bool {
     let projection = match with_rooms_handle(&inner.rooms, |store| store.room_access(key)) {
         Ok(projection) => projection,
         Err(_) => return false,
     };
+    if incoming.iter().any(|member| {
+        member.actor_type != FederatedActorType::User
+            || member.member_id.is_empty()
+            || member.display_name.is_empty()
+            || member.joined_at.is_empty()
+    }) {
+        return false;
+    }
     let live_humans: HashSet<&str> = incoming
         .iter()
         .filter(|member| member.actor_type == FederatedActorType::User)
         .map(|member| member.member_id.as_str())
         .collect();
     let mut members = projection.members;
+    live_human_member_ids.clear();
+    live_human_member_ids.extend(live_humans.iter().map(|member_id| (*member_id).to_string()));
     for member in &mut members {
         match member.actor_type {
             FederatedActorType::User => {
@@ -2688,7 +2709,14 @@ fn lease_lost_transition(
 ) -> Result<(), BridgeError> {
     let mut members = projection?.members;
     for member in &mut members {
-        member.derived_presence = Some(MemberPresence::Unavailable);
+        match member.actor_type {
+            FederatedActorType::User => {
+                member.derived_presence = Some(MemberPresence::Unavailable);
+            }
+            FederatedActorType::Agent => {
+                member.derived_presence = None;
+            }
+        }
     }
     if commit(members) {
         Ok(())
@@ -2716,7 +2744,14 @@ async fn revoke_room(inner: &Arc<SupervisorInner>, key: &RoomKey) {
         let projection = store.room_access(key)?;
         let mut members = projection.members;
         for member in &mut members {
-            member.derived_presence = Some(MemberPresence::Unavailable);
+            match member.actor_type {
+                FederatedActorType::User => {
+                    member.derived_presence = Some(MemberPresence::Unavailable);
+                }
+                FederatedActorType::Agent => {
+                    member.derived_presence = None;
+                }
+            }
         }
         store.update_room_access_safe(key, Some(RoomAccessState::Revoked), Some(&members), None)?;
         Ok::<(), ocean_store::RoomStoreError>(())
@@ -5399,6 +5434,26 @@ mod tests {
         server.abort();
     }
 
+    fn test_supervisor_inner(rooms: RoomStoreHandle) -> Arc<SupervisorInner> {
+        let (trigger_tx, _) = mpsc::unbounded_channel();
+        Arc::new(SupervisorInner {
+            client: None,
+            owner_token: None,
+            invalid_config: false,
+            rooms,
+            room_wakes: RoomWakeBus::default(),
+            access_wakes: RoomAccessWakeBus::default(),
+            read_cursor_wakes: RoomReadCursorWakeBus::default(),
+            trigger_tx,
+            shutdown: CancellationToken::new(),
+            slots: Mutex::new(HashMap::new()),
+            recovery: Mutex::new(None),
+            shutting_down: AtomicBool::new(false),
+            next_generation: AtomicU64::new(0),
+            scan_interval: Duration::from_millis(20),
+        })
+    }
+
     async fn run_control_recovery(event_name: &str, data: Value) {
         let key = RoomKey::new(format!("control-{event_name}"));
         let human = "11111111-1111-4111-8111-111111111111";
@@ -5435,12 +5490,8 @@ mod tests {
         tokio::time::timeout(Duration::from_secs(60), async {
             loop {
                 let connected = fake.sse_tx.lock().await.is_some();
-                let live = with_rooms_handle(&rooms, |s| s.room_access(&key))
-                    .unwrap()
-                    .members
-                    .first()
-                    .is_some_and(|m| m.derived_presence == Some(MemberPresence::Live));
-                if connected && live {
+                let projection = with_rooms_handle(&rooms, |s| s.room_access(&key)).unwrap();
+                if connected && projection.state == RoomAccessState::Live {
                     break;
                 }
                 tokio::time::sleep(Duration::from_millis(5)).await;
@@ -5465,10 +5516,12 @@ mod tests {
                 let projection = with_rooms_handle(&rooms, |s| s.room_access(&key)).unwrap();
                 if projection.state == RoomAccessState::Recovering
                     && projection.last_confirmed_global_sequence == Some(5)
-                    && projection
-                        .members
-                        .iter()
-                        .all(|m| m.derived_presence == Some(MemberPresence::Unavailable))
+                    && projection.members.iter().all(|m| match m.actor_type {
+                        FederatedActorType::User => {
+                            m.derived_presence == Some(MemberPresence::Unavailable)
+                        }
+                        FederatedActorType::Agent => m.derived_presence.is_none(),
+                    })
                 {
                     break;
                 }
@@ -5507,6 +5560,132 @@ mod tests {
             }),
         )
         .await;
+    }
+
+    #[tokio::test]
+    async fn room_presence_event_accepts_only_canonical_shape_and_preserves_cursor() {
+        let key = RoomKey::new("presence-canonical");
+        let human = "11111111-1111-4111-8111-111111111111";
+        let remote_human = "22222222-2222-4222-8222-222222222222";
+        let agent = "33333333-3333-4333-8333-333333333333";
+        let mut store = ocean_store::SqliteRoomStore::open_in_memory().unwrap();
+        store
+            .create(key.clone(), "Presence", None, chrono::Utc::now())
+            .unwrap();
+        store
+            .install_room_credential(&key, "presence-bearer", human)
+            .unwrap();
+        store
+            .update_room_access_safe(
+                &key,
+                Some(RoomAccessState::Live),
+                Some(&[
+                    FederatedRoomMemberProjection {
+                        member_id: human.into(),
+                        owner_member_id: None,
+                        actor_type: FederatedActorType::User,
+                        role_in_room: FederatedRoomRole::Owner,
+                        display_name: "Human".into(),
+                        public_agent_descriptor: None,
+                        joined_at: "2026-07-17T00:00:00Z".into(),
+                        derived_presence: Some(MemberPresence::Unavailable),
+                        local_binding_available: None,
+                    },
+                    FederatedRoomMemberProjection {
+                        member_id: remote_human.into(),
+                        owner_member_id: None,
+                        actor_type: FederatedActorType::User,
+                        role_in_room: FederatedRoomRole::Member,
+                        display_name: "Remote".into(),
+                        public_agent_descriptor: None,
+                        joined_at: "2026-07-17T00:00:01Z".into(),
+                        derived_presence: Some(MemberPresence::Unavailable),
+                        local_binding_available: None,
+                    },
+                    FederatedRoomMemberProjection {
+                        member_id: agent.into(),
+                        owner_member_id: Some(human.into()),
+                        actor_type: FederatedActorType::Agent,
+                        role_in_room: FederatedRoomRole::Member,
+                        display_name: "Agent".into(),
+                        public_agent_descriptor: Some(PublicAgentDescriptor {
+                            display_name: "Agent".into(),
+                            description: None,
+                            model_alias: None,
+                            skills_count: 0,
+                            subagent_names: vec![],
+                        }),
+                        joined_at: "2026-07-17T00:00:02Z".into(),
+                        derived_presence: None,
+                        local_binding_available: Some(true),
+                    },
+                ]),
+                Some(7),
+            )
+            .unwrap();
+        let rooms = Arc::new(std::sync::Mutex::new(store));
+
+        assert!(apply_presence_frame(
+            &test_supervisor_inner(rooms.clone()),
+            &key,
+            RoomAccessState::Live,
+            &[PresenceWireMember {
+                member_id: human.into(),
+                actor_type: FederatedActorType::User,
+                role_in_room: FederatedRoomRole::Owner,
+                display_name: "Human".into(),
+                joined_at: "2026-07-17T00:00:00Z".into(),
+            }],
+            &mut HashSet::new(),
+        ));
+        let projection = with_rooms_handle(&rooms, |s| s.room_access(&key)).unwrap();
+        assert_eq!(projection.last_confirmed_global_sequence, Some(7));
+        assert_eq!(
+            projection.members[0].derived_presence,
+            Some(MemberPresence::Live)
+        );
+        assert_eq!(
+            projection.members[1].derived_presence,
+            Some(MemberPresence::Unavailable)
+        );
+        assert_eq!(projection.members[2].derived_presence, None);
+
+        let snapshot = projection.clone();
+        assert!(!apply_presence_frame(
+            &test_supervisor_inner(rooms.clone()),
+            &key,
+            RoomAccessState::Live,
+            &[PresenceWireMember {
+                member_id: remote_human.into(),
+                actor_type: FederatedActorType::Agent,
+                role_in_room: FederatedRoomRole::Member,
+                display_name: "Remote".into(),
+                joined_at: "2026-07-17T00:00:01Z".into(),
+            }],
+            &mut HashSet::new(),
+        ));
+        assert_eq!(
+            with_rooms_handle(&rooms, |s| s.room_access(&key)).unwrap(),
+            snapshot
+        );
+
+        assert!(!apply_presence_frame(
+            &test_supervisor_inner(rooms.clone()),
+            &key,
+            RoomAccessState::Live,
+            &[PresenceWireMember {
+                member_id: String::new(),
+                actor_type: FederatedActorType::User,
+                role_in_room: FederatedRoomRole::Member,
+                display_name: "Remote".into(),
+                joined_at: "2026-07-17T00:00:01Z".into(),
+            }],
+            &mut HashSet::new(),
+        ));
+        assert_eq!(
+            with_rooms_handle(&rooms, |s| s.room_access(&key)).unwrap(),
+            snapshot
+        );
     }
 
     #[tokio::test]
@@ -5821,22 +6000,17 @@ mod tests {
         assert_eq!(request_meta[0].1.as_deref(), Some("Bearer secret-bearer"));
         assert_eq!(request_meta[0].2.as_deref(), Some("0"));
 
-        // Roster committed before first event; healthy lease makes local human Live.
+        // Roster committed before first event; humans default Unavailable and agents None
+        // until an exact room_presence frame arrives.
         let projection = with_rooms_handle(&rooms, |s| s.room_access(&key)).unwrap();
         assert_eq!(projection.state, RoomAccessState::Recovering);
         assert_eq!(
             projection.members[0].derived_presence,
-            Some(MemberPresence::Live)
-        );
-        assert_eq!(
-            projection.members[1].derived_presence,
-            Some(MemberPresence::Live)
-        );
-        assert_eq!(projection.members[1].local_binding_available, Some(true));
-        assert_eq!(
-            projection.members[2].derived_presence,
             Some(MemberPresence::Unavailable)
         );
+        assert_eq!(projection.members[1].derived_presence, None);
+        assert_eq!(projection.members[1].local_binding_available, Some(true));
+        assert_eq!(projection.members[2].derived_presence, None);
         assert_eq!(projection.members[2].local_binding_available, Some(false));
         assert_eq!(
             projection.members[3].derived_presence,
@@ -5844,8 +6018,60 @@ mod tests {
         );
         assert_eq!(projection.members[3].local_binding_available, None);
 
-        // Ordered SSE is the ONLY confirmation rail.
         let tx = fake.sse_tx.lock().await.clone().expect("SSE connected");
+        tx.send(Ok(Event::default().event("room_presence").data(
+            json!({
+                "room_id":"fed-e2e",
+                "members":[
+                    {
+                        "member_id": local_human,
+                        "actor_type":"user",
+                        "role_in_room":"owner",
+                        "display_name":"Owner Human",
+                        "joined_at":"2026-07-17T00:00:00Z"
+                    },
+                    {
+                        "member_id": "44444444-4444-4444-8444-444444444444",
+                        "actor_type":"user",
+                        "role_in_room":"member",
+                        "display_name":"Remote Human",
+                        "joined_at":"2026-07-17T00:00:03Z"
+                    }
+                ]
+            })
+            .to_string(),
+        )))
+        .await
+        .unwrap();
+        tokio::time::timeout(Duration::from_secs(60), async {
+            loop {
+                let projection = with_rooms_handle(&rooms, |s| s.room_access(&key)).unwrap();
+                if projection.members[0].derived_presence == Some(MemberPresence::Live)
+                    && projection.members[1].derived_presence.is_none()
+                    && projection.members[2].derived_presence.is_none()
+                    && projection.members[3].derived_presence == Some(MemberPresence::Live)
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("presence projection applied");
+        while access_rx.try_recv().is_ok() {}
+        let projection = with_rooms_handle(&rooms, |s| s.room_access(&key)).unwrap();
+        assert_eq!(
+            projection.members[0].derived_presence,
+            Some(MemberPresence::Live)
+        );
+        assert_eq!(projection.members[1].derived_presence, None);
+        assert_eq!(projection.members[2].derived_presence, None);
+        assert_eq!(
+            projection.members[3].derived_presence,
+            Some(MemberPresence::Live)
+        );
+
+        // Ordered SSE is the ONLY confirmation rail.
         let row = json!({
             "id":"ledger-1",
             "sequence":"1",
@@ -5966,7 +6192,8 @@ mod tests {
             .expect("access bus open");
 
         // Control-frame id may be inherited by eventsource-stream; branch by
-        // event type and ignore it. Heartbeat refreshes roster, not cursor.
+        // event type and ignore it. Heartbeat refreshes roster using cached
+        // live human ids, not cursor.
         tx.send(Ok(Event::default()
             .event("heartbeat")
             .id("2")
@@ -5982,6 +6209,17 @@ mod tests {
                 .unwrap()
                 .last_confirmed_global_sequence,
             Some(2)
+        );
+        let projection = with_rooms_handle(&rooms, |s| s.room_access(&key)).unwrap();
+        assert_eq!(
+            projection.members[0].derived_presence,
+            Some(MemberPresence::Live)
+        );
+        assert_eq!(projection.members[1].derived_presence, None);
+        assert_eq!(projection.members[2].derived_presence, None);
+        assert_eq!(
+            projection.members[3].derived_presence,
+            Some(MemberPresence::Live)
         );
 
         // A previously unknown author triggers one immediate roster refresh;
@@ -6088,10 +6326,12 @@ mod tests {
             loop {
                 let projection = with_rooms_handle(&rooms, |s| s.room_access(&key)).unwrap();
                 if projection.state == RoomAccessState::Recovering
-                    && projection
-                        .members
-                        .iter()
-                        .all(|m| m.derived_presence == Some(MemberPresence::Unavailable))
+                    && projection.members.iter().all(|m| match m.actor_type {
+                        FederatedActorType::User => {
+                            m.derived_presence == Some(MemberPresence::Unavailable)
+                        }
+                        FederatedActorType::Agent => m.derived_presence.is_none(),
+                    })
                 {
                     break;
                 }
@@ -6210,10 +6450,12 @@ mod tests {
                     PostAction::Recover => {
                         row.state == ocean_core::OutboxItemState::Pending
                             && projection.state == RoomAccessState::Recovering
-                            && projection
-                                .members
-                                .iter()
-                                .all(|m| m.derived_presence == Some(MemberPresence::Unavailable))
+                            && projection.members.iter().all(|m| match m.actor_type {
+                                FederatedActorType::User => {
+                                    m.derived_presence == Some(MemberPresence::Unavailable)
+                                }
+                                FederatedActorType::Agent => m.derived_presence.is_none(),
+                            })
                     }
                     PostAction::AwaitConfirmation => false,
                 };
@@ -6624,10 +6866,12 @@ mod tests {
                         .outbox
                         .iter()
                         .all(|row| row.state == ocean_core::OutboxItemState::Failed)
-                    && projection
-                        .members
-                        .iter()
-                        .all(|m| m.derived_presence == Some(MemberPresence::Unavailable))
+                    && projection.members.iter().all(|m| match m.actor_type {
+                        FederatedActorType::User => {
+                            m.derived_presence == Some(MemberPresence::Unavailable)
+                        }
+                        FederatedActorType::Agent => m.derived_presence.is_none(),
+                    })
                 {
                     break;
                 }
