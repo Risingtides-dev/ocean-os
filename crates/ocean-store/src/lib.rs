@@ -1284,6 +1284,7 @@ impl SqliteRoomStore {
     /// is not in the room is a lie, and lies are what this campaign removes. The
     /// System line is written in the SAME transaction, so an artifact can never
     /// exist that the room's history does not account for.
+    #[allow(clippy::too_many_arguments)]
     pub fn create_artifact(
         &mut self,
         key: &RoomKey,
