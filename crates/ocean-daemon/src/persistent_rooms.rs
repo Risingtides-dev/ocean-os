@@ -2164,10 +2164,8 @@ pub(super) async fn room_get_read_cursor(
                     })),
                 ),
                 Err(crate::room_federation::IntentError::Forbidden) => (
-                    StatusCode::CONFLICT,
-                    Json(
-                        json!({ "ok": false, "code": "room_read_cursor_unsupported", "error": "read cursor unsupported for access state 'live'" }),
-                    ),
+                    StatusCode::FORBIDDEN,
+                    Json(json!({ "ok": false, "error": "membership_revoked" })),
                 ),
                 Err(crate::room_federation::IntentError::Conflict) => {
                     room_read_cursor_unsupported_response(RoomAccessState::Live)
@@ -2863,6 +2861,26 @@ mod tests {
         Json(fake.roster.lock().await.clone()).into_response()
     }
 
+    async fn route_room_read_cursor_unauthorized() -> axum::response::Response {
+        StatusCode::UNAUTHORIZED.into_response()
+    }
+
+    async fn start_route_read_cursor_unauthorized_bedrock() -> (String, tokio::task::JoinHandle<()>)
+    {
+        let app = axum::Router::new()
+            .route(
+                "/api/v1/rooms/{room}/read-cursor",
+                axum::routing::get(route_room_read_cursor_unauthorized),
+            )
+            .with_state(RouteBedrock::new());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        (format!("http://{address}"), server)
+    }
+
     async fn start_route_bedrock() -> (String, tokio::task::JoinHandle<()>) {
         let fake = RouteBedrock::new();
         let app = axum::Router::new()
@@ -3029,6 +3047,35 @@ mod tests {
         .await;
         assert_eq!(status, StatusCode::CONFLICT);
         assert_eq!(body.0["code"], json!("room_read_cursor_unsupported"));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn room_read_cursor_live_get_truthfully_reports_revoked_without_mutating_mirror() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut state = fake_convene_state(&tmp);
+        let key = RoomKey::new("cursor-handler-live-revoked");
+        with_rooms(&state, |store| {
+            store.create(key.clone(), "Cursor Handler Live Revoked", None, Utc::now())?;
+            store.update_room_access_safe(&key, Some(RoomAccessState::Live), None, None)?;
+            store.install_room_credential(&key, "bearer", "principal")?;
+            Ok::<_, ocean_store::RoomStoreError>(())
+        })
+        .unwrap();
+
+        let (base, server) = start_route_read_cursor_unauthorized_bedrock().await;
+        state = with_route_supervisor(state, &base);
+
+        let (status, body) =
+            room_get_read_cursor(State(state.clone()), Path(key.as_str().to_string())).await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        assert_eq!(body.0, json!({"ok": false, "error": "membership_revoked"}));
+
+        let cursor = with_rooms(&state, |store| store.room_read_cursor(&key, "principal")).unwrap();
+        assert_eq!(cursor.read_seq, None);
+        assert_eq!(cursor.mirrored_upstream_read_seq, None);
+
+        server.abort();
+        state.room_federation.shutdown().await;
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
