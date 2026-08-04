@@ -5935,3 +5935,19 @@ mention+thread-reply dispatch dedup on one row, and agent reply root/session
 attribution with fallback. Verified: 53/53 persistent_rooms, fmt, clippy -D
 warnings (daemon), cargo check --workspace.
 _________________________________________________________________________________
+
+time:      [15:20] [04-08-26]
+agent:     [ocean], [gpt-5.6-sol]
+worktree:  [main]
+type:      [fix]
+area:      [frontend]
+
+Fixed fresh-session model authority so a model selected before the first prompt
+is persisted through the session-config RPC before SessionBound reloads daemon
+authority. This prevents session creation's global-model seed from snapping the
+TUI back to gpt-5.6-sol while the submitted turn still carries the selected
+override; pin failures now fail closed before turn admission. Independent review
+confirmed the ordering closes the reported normal path. Verified: cargo fmt
+--check; cargo test -p ocean-tui (463 passed, 1 ignored); cargo build -p
+ocean-tui --release; git diff --check.
+_________________________________________________________________________________
