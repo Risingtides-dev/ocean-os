@@ -1009,6 +1009,23 @@ impl SqliteRoomStore {
                 }
             }
         }
+        {
+            let existing = self.room_read_cursor_mirror_column_names()?;
+            if existing.is_empty() {
+                self.conn.execute_batch(
+                    r#"
+                    CREATE TABLE IF NOT EXISTS room_read_cursor_mirrors (
+                        room_id       TEXT NOT NULL REFERENCES rooms(id) ON DELETE CASCADE,
+                        principal_id  TEXT NOT NULL,
+                        mirrored_upstream_read_seq TEXT,
+                        PRIMARY KEY (room_id, principal_id)
+                    );
+                    CREATE INDEX IF NOT EXISTS idx_room_read_cursor_mirrors_room
+                        ON room_read_cursor_mirrors(room_id);
+                    "#,
+                )?;
+            }
+        }
         self.conn.execute_batch(
             r#"
             CREATE INDEX IF NOT EXISTS idx_messages_room_seq ON messages(room_id, seq);
@@ -1050,6 +1067,16 @@ impl SqliteRoomStore {
             );
 
             CREATE INDEX IF NOT EXISTS idx_room_read_cursors_room ON room_read_cursors(room_id);
+
+            CREATE TABLE IF NOT EXISTS room_read_cursor_mirrors (
+                room_id       TEXT NOT NULL REFERENCES rooms(id) ON DELETE CASCADE,
+                principal_id  TEXT NOT NULL,
+                mirrored_upstream_read_seq TEXT,
+                PRIMARY KEY (room_id, principal_id)
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_room_read_cursor_mirrors_room
+                ON room_read_cursor_mirrors(room_id);
 
             -- ── P2-A federation durability (private tables) ──────────────
             -- Bearer tokens and registration keys below are PRIVATE: they are
@@ -1195,6 +1222,18 @@ impl SqliteRoomStore {
     fn message_column_names(&self) -> Result<std::collections::HashSet<String>> {
         let mut stmt = self.conn.prepare("PRAGMA table_info(messages)")?;
         // PRAGMA table_info columns: (cid, name, type, notnull, dflt_value, pk).
+        let rows = stmt.query_map([], |row| row.get::<_, String>(1))?;
+        let mut out = std::collections::HashSet::new();
+        for r in rows {
+            out.insert(r?);
+        }
+        Ok(out)
+    }
+
+    fn room_read_cursor_mirror_column_names(&self) -> Result<std::collections::HashSet<String>> {
+        let mut stmt = self
+            .conn
+            .prepare("PRAGMA table_info(room_read_cursor_mirrors)")?;
         let rows = stmt.query_map([], |row| row.get::<_, String>(1))?;
         let mut out = std::collections::HashSet::new();
         for r in rows {
@@ -3361,9 +3400,25 @@ impl SqliteRoomStore {
                 |r| r.get::<_, String>(0),
             )
             .optional()?
-            .map(|t| parse_canonical_u64_text(&t))
+            .map(|read_seq| parse_canonical_u64_text(&read_seq))
             .transpose()?;
-        Ok(RoomReadCursorProjection { read_seq })
+        let mirrored_upstream_read_seq = self
+            .conn
+            .query_row(
+                "SELECT mirrored_upstream_read_seq
+                 FROM room_read_cursor_mirrors WHERE room_id = ?1 AND principal_id = ?2",
+                params![key.as_str(), principal_id],
+                |r| r.get::<_, Option<String>>(0),
+            )
+            .optional()?
+            .flatten()
+            .as_deref()
+            .map(parse_canonical_u64_text)
+            .transpose()?;
+        Ok(RoomReadCursorProjection {
+            read_seq,
+            mirrored_upstream_read_seq,
+        })
     }
 
     pub fn update_room_read_cursor(
@@ -3415,7 +3470,69 @@ impl SqliteRoomStore {
             )?;
         }
         tx.commit()?;
-        Ok(RoomReadCursorProjection { read_seq: next })
+        Ok(RoomReadCursorProjection {
+            read_seq: next,
+            mirrored_upstream_read_seq: None,
+        })
+    }
+
+    pub fn set_room_read_cursor_mirror(
+        &mut self,
+        key: &RoomKey,
+        principal_id: &str,
+        mirrored_upstream_read_seq: Option<u64>,
+    ) -> Result<RoomReadCursorProjection> {
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let room_exists: Option<i64> = tx
+            .query_row(
+                "SELECT 1 FROM rooms WHERE id = ?1",
+                params![key.as_str()],
+                |r| r.get(0),
+            )
+            .optional()?;
+        if room_exists.is_none() {
+            return Err(RoomStoreError::UnknownRoom(key.clone()));
+        }
+        let current_mirror = tx
+            .query_row(
+                "SELECT mirrored_upstream_read_seq
+                 FROM room_read_cursor_mirrors WHERE room_id = ?1 AND principal_id = ?2",
+                params![key.as_str(), principal_id],
+                |r| r.get::<_, Option<String>>(0),
+            )
+            .optional()?
+            .flatten()
+            .as_deref()
+            .map(parse_canonical_u64_text)
+            .transpose()?;
+        if current_mirror != mirrored_upstream_read_seq {
+            tx.execute(
+                "INSERT INTO room_read_cursor_mirrors (room_id, principal_id, mirrored_upstream_read_seq)
+                 VALUES (?1, ?2, ?3)
+                 ON CONFLICT(room_id, principal_id) DO UPDATE SET mirrored_upstream_read_seq = excluded.mirrored_upstream_read_seq",
+                params![
+                    key.as_str(),
+                    principal_id,
+                    mirrored_upstream_read_seq.map(write_u64_text),
+                ],
+            )?;
+        }
+        let read_seq = tx
+            .query_row(
+                "SELECT read_seq FROM room_read_cursors WHERE room_id = ?1 AND principal_id = ?2",
+                params![key.as_str(), principal_id],
+                |r| r.get::<_, String>(0),
+            )
+            .optional()?
+            .map(|read_seq| parse_canonical_u64_text(&read_seq))
+            .transpose()?;
+        tx.commit()?;
+        Ok(RoomReadCursorProjection {
+            read_seq,
+            mirrored_upstream_read_seq: mirrored_upstream_read_seq.or(current_mirror),
+        })
     }
 
     /// Replace the room's SAFE projection fields — state, member roster,
@@ -7116,6 +7233,64 @@ mod tests {
         assert!(parse_canonical_u64_text("42\t").is_err());
         // Trailing non-digit.
         assert!(parse_canonical_u64_text("42x").is_err());
+    }
+
+    #[test]
+    fn migrate_adds_read_cursor_mirror_table_without_changing_legacy_not_null_local_cursor() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("legacy-read-cursor.db");
+        {
+            let conn = rusqlite::Connection::open(&path).unwrap();
+            conn.execute_batch(
+                r#"
+                PRAGMA foreign_keys = ON;
+                CREATE TABLE rooms (
+                    id TEXT PRIMARY KEY,
+                    name TEXT NOT NULL,
+                    trigger_policy TEXT,
+                    workspace_root TEXT,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    closed_at TEXT
+                );
+                CREATE TABLE room_read_cursors (
+                    room_id TEXT NOT NULL REFERENCES rooms(id) ON DELETE CASCADE,
+                    principal_id TEXT NOT NULL,
+                    read_seq TEXT NOT NULL,
+                    PRIMARY KEY (room_id, principal_id)
+                );
+                INSERT INTO rooms (id, name, trigger_policy, workspace_root, created_at, updated_at, closed_at)
+                VALUES ('legacy-read-cursor', 'Legacy', NULL, NULL, '2026-07-17T00:00:00Z', '2026-07-17T00:00:00Z', NULL);
+                INSERT INTO room_read_cursors (room_id, principal_id, read_seq)
+                VALUES ('legacy-read-cursor', 'principal', '32');
+                "#,
+            )
+            .unwrap();
+        }
+
+        let s = SqliteRoomStore::open(&path).unwrap();
+        let mirror_columns = s.room_read_cursor_mirror_column_names().unwrap();
+        assert!(mirror_columns.contains("mirrored_upstream_read_seq"));
+        let projection = s
+            .room_read_cursor(&RoomKey::new("legacy-read-cursor"), "principal")
+            .unwrap();
+        assert_eq!(projection.read_seq, Some(32));
+        assert_eq!(projection.mirrored_upstream_read_seq, None);
+
+        let mut stmt = s
+            .conn
+            .prepare("PRAGMA table_info(room_read_cursors)")
+            .unwrap();
+        let notnull: Vec<(String, i64)> = stmt
+            .query_map([], |row| {
+                Ok((row.get::<_, String>(1)?, row.get::<_, i64>(3)?))
+            })
+            .unwrap()
+            .map(|r| r.unwrap())
+            .collect();
+        assert!(notnull
+            .iter()
+            .any(|(name, flag)| name == "read_seq" && *flag == 1));
     }
 
     // ── exact Local projection, semantics ──────────────────────────────────

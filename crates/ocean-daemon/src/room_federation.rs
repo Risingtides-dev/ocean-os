@@ -20,7 +20,8 @@ use eventsource_stream::Eventsource;
 use ocean_core::{
     evaluate_trigger_policy, FederatedActorType, FederatedRoomMemberProjection, FederatedRoomRole,
     InviteResponse, MemberPresence, PublicAgentDescriptor, RoomAccessProjection, RoomAccessState,
-    RoomKey, RoomMessageKind, RoomOutboxItem, RoomParticipantKind, RoomTriggerEvent,
+    RoomKey, RoomMessageKind, RoomOutboxItem, RoomParticipantKind, RoomReadCursorProjection,
+    RoomTriggerEvent,
 };
 use ocean_store::{ConfirmedEvent, IngestOutcome, PendingRedemption, RoomCredential, RoomStore};
 use reqwest::{redirect::Policy, Client, StatusCode, Url};
@@ -419,6 +420,10 @@ struct RunningRoom {
 }
 
 impl FederationSupervisor {
+    pub(super) fn local_human_read_cursor_principal(&self) -> &str {
+        "federated-local-human-read-cursor"
+    }
+
     pub(super) fn from_env(
         rooms: RoomStoreHandle,
         room_wakes: RoomWakeBus,
@@ -474,6 +479,7 @@ impl FederationSupervisor {
     }
 
     #[cfg(test)]
+    #[allow(clippy::too_many_arguments)]
     fn for_test_with_trigger(
         base: &str,
         rooms: RoomStoreHandle,
@@ -1169,6 +1175,218 @@ impl FederationSupervisor {
         .map_err(|_| IntentError::Store)
     }
 
+    pub(super) async fn room_get_read_cursor(
+        &self,
+        key: &RoomKey,
+    ) -> Result<RoomReadCursorProjection, IntentError> {
+        let slot = self.slot_for(key).await;
+        let (credential, access) = with_rooms_handle(&self.inner.rooms, |store| {
+            if store.get(key)?.is_none() {
+                return Err(ocean_store::RoomStoreError::UnknownRoom(key.clone()));
+            }
+            Ok::<_, ocean_store::RoomStoreError>((
+                store.room_credential(key)?,
+                store.room_access(key)?,
+            ))
+        })
+        .map_err(|error| match error {
+            ocean_store::RoomStoreError::UnknownRoom(_) => IntentError::NotFound,
+            _ => IntentError::Store,
+        })?;
+        let credential = credential.ok_or(IntentError::Conflict)?;
+        if access.state != RoomAccessState::Live {
+            return Err(IntentError::Conflict);
+        }
+        let client = self.inner.client.clone().ok_or(IntentError::Unavailable)?;
+        let url = client
+            .endpoint(&["api", "v1", "rooms", key.as_str(), "read-cursor"])
+            .map_err(|_| IntentError::Unavailable)?;
+        let generation = slot.generation.load(Ordering::Acquire);
+        let response = match slot
+            .control
+            .send(
+                client
+                    .http
+                    .get(url)
+                    .timeout(REQUEST_TIMEOUT)
+                    .bearer_auth(&credential.bearer_token),
+                &self.inner.shutdown,
+            )
+            .await
+        {
+            AdmittedSend::Response(Ok(response)) => response,
+            AdmittedSend::Response(Err(_)) | AdmittedSend::Cancelled => {
+                return Err(IntentError::Unavailable)
+            }
+            AdmittedSend::Closed => return Err(IntentError::Forbidden),
+        };
+        match response.status() {
+            StatusCode::OK => {}
+            StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN => {
+                self.revoke_control(key).await;
+                return Err(IntentError::Forbidden);
+            }
+            StatusCode::NOT_FOUND => return Err(IntentError::NotFound),
+            StatusCode::NOT_IMPLEMENTED => return Err(IntentError::Conflict),
+            s if s == StatusCode::TOO_MANY_REQUESTS || s.is_server_error() => {
+                return Err(IntentError::Unavailable)
+            }
+            _ => return Err(IntentError::Protocol),
+        }
+        let body: ReadCursorBody = read_bounded_json(response, BODY_LIMIT)
+            .await
+            .map_err(control_body_error)?;
+        if body.room_id != key.as_str() {
+            return Err(IntentError::Protocol);
+        }
+        let sequence = match body.sequence {
+            Some(sequence) => {
+                Some(parse_canonical_u64(&sequence).map_err(|_| IntentError::Protocol)?)
+            }
+            None => None,
+        };
+        let projection = slot
+            .control
+            .mutate(|| {
+                if slot.generation.load(Ordering::Acquire) != generation {
+                    return Err(GuardedMutationError::Generation);
+                }
+                let result = with_rooms_handle(&self.inner.rooms, |store| {
+                    store.set_room_read_cursor_mirror(
+                        key,
+                        &credential.local_human_member_id,
+                        sequence,
+                    )
+                });
+                match result {
+                    Ok(cursor) => Ok(cursor),
+                    Err(ocean_store::RoomStoreError::UnknownRoom(_)) => {
+                        Err(GuardedMutationError::NotFound)
+                    }
+                    Err(_) => Err(GuardedMutationError::Store),
+                }
+            })
+            .await
+            .ok_or(IntentError::Forbidden)?;
+        let projection = match projection {
+            Ok(cursor) => cursor,
+            Err(GuardedMutationError::Generation) => return Err(IntentError::Forbidden),
+            Err(GuardedMutationError::NotFound) => return Err(IntentError::NotFound),
+            Err(GuardedMutationError::Store) => return Err(IntentError::Store),
+        };
+        publish_room_read_cursor_wake_on(&self.inner.read_cursor_wakes, key);
+        Ok(projection)
+    }
+
+    pub(super) async fn room_patch_read_cursor(
+        &self,
+        key: &RoomKey,
+        read_seq: u64,
+    ) -> Result<RoomReadCursorProjection, IntentError> {
+        let slot = self.slot_for(key).await;
+        let (credential, access) = with_rooms_handle(&self.inner.rooms, |store| {
+            if store.get(key)?.is_none() {
+                return Err(ocean_store::RoomStoreError::UnknownRoom(key.clone()));
+            }
+            Ok::<_, ocean_store::RoomStoreError>((
+                store.room_credential(key)?,
+                store.room_access(key)?,
+            ))
+        })
+        .map_err(|error| match error {
+            ocean_store::RoomStoreError::UnknownRoom(_) => IntentError::NotFound,
+            _ => IntentError::Store,
+        })?;
+        let credential = credential.ok_or(IntentError::Conflict)?;
+        if access.state != RoomAccessState::Live {
+            return Err(IntentError::Conflict);
+        }
+        let client = self.inner.client.clone().ok_or(IntentError::Unavailable)?;
+        let url = client
+            .endpoint(&["api", "v1", "rooms", key.as_str(), "read-cursor"])
+            .map_err(|_| IntentError::Unavailable)?;
+        let generation = slot.generation.load(Ordering::Acquire);
+        let response = match slot
+            .control
+            .send(
+                client
+                    .http
+                    .patch(url)
+                    .timeout(REQUEST_TIMEOUT)
+                    .bearer_auth(&credential.bearer_token)
+                    .json(&serde_json::json!({ "sequence": read_seq.to_string() })),
+                &self.inner.shutdown,
+            )
+            .await
+        {
+            AdmittedSend::Response(Ok(response)) => response,
+            AdmittedSend::Response(Err(_)) | AdmittedSend::Cancelled => {
+                return Err(IntentError::Unavailable)
+            }
+            AdmittedSend::Closed => return Err(IntentError::Forbidden),
+        };
+        match response.status() {
+            StatusCode::OK => {}
+            StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN => {
+                self.revoke_control(key).await;
+                return Err(IntentError::Forbidden);
+            }
+            StatusCode::NOT_FOUND => return Err(IntentError::NotFound),
+            StatusCode::NOT_IMPLEMENTED => return Err(IntentError::Conflict),
+            StatusCode::CONFLICT | StatusCode::BAD_REQUEST => return Err(IntentError::Protocol),
+            s if s == StatusCode::TOO_MANY_REQUESTS || s.is_server_error() => {
+                return Err(IntentError::Unavailable)
+            }
+            _ => return Err(IntentError::Protocol),
+        }
+        let body: ReadCursorBody = read_bounded_json(response, BODY_LIMIT)
+            .await
+            .map_err(control_body_error)?;
+        if body.room_id != key.as_str() {
+            return Err(IntentError::Protocol);
+        }
+        let sequence = match body.sequence {
+            Some(sequence) => {
+                Some(parse_canonical_u64(&sequence).map_err(|_| IntentError::Protocol)?)
+            }
+            None => None,
+        };
+        if sequence != Some(read_seq) {
+            return Err(IntentError::Protocol);
+        }
+        let projection = slot
+            .control
+            .mutate(|| {
+                if slot.generation.load(Ordering::Acquire) != generation {
+                    return Err(GuardedMutationError::Generation);
+                }
+                let result = with_rooms_handle(&self.inner.rooms, |store| {
+                    store.set_room_read_cursor_mirror(
+                        key,
+                        &credential.local_human_member_id,
+                        sequence,
+                    )
+                });
+                match result {
+                    Ok(cursor) => Ok(cursor),
+                    Err(ocean_store::RoomStoreError::UnknownRoom(_)) => {
+                        Err(GuardedMutationError::NotFound)
+                    }
+                    Err(_) => Err(GuardedMutationError::Store),
+                }
+            })
+            .await
+            .ok_or(IntentError::Forbidden)?;
+        let projection = match projection {
+            Ok(cursor) => cursor,
+            Err(GuardedMutationError::Generation) => return Err(IntentError::Forbidden),
+            Err(GuardedMutationError::NotFound) => return Err(IntentError::NotFound),
+            Err(GuardedMutationError::Store) => return Err(IntentError::Store),
+        };
+        publish_room_read_cursor_wake_on(&self.inner.read_cursor_wakes, key);
+        Ok(projection)
+    }
+
     pub(super) async fn register_agents(
         &self,
         key: &RoomKey,
@@ -1706,8 +1924,9 @@ async fn run_epoch(
                         if frame.room_id != key.as_str() {
                             break EpochOutcome::Recover;
                         }
-                        match commit_mirrored_read_cursor(&inner, &client, &credential, &key, frame.sequence).await {
-                            Ok(()) => {}
+                        match apply_mirrored_read_cursor_frame(&inner, &credential, &key, frame.sequence) {
+                            Ok(true) => publish_room_read_cursor_wake_on(&inner.read_cursor_wakes, &key),
+                            Ok(false) => {}
                             Err(BridgeError::Revoked) => break EpochOutcome::Revoked,
                             Err(_) => break EpochOutcome::Recover,
                         }
@@ -1796,6 +2015,19 @@ struct ReadCursorFrame {
 #[serde(deny_unknown_fields)]
 struct RevokedFrame {
     reason: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ReadCursorBody {
+    room_id: String,
+    sequence: Option<String>,
+    #[allow(dead_code)]
+    #[serde(default)]
+    changed: Option<bool>,
+    #[allow(dead_code)]
+    #[serde(default)]
+    clamped: Option<bool>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -2415,70 +2647,27 @@ fn apply_presence_frame(
     commit_access(inner, key, state, Some(&members), None)
 }
 
-async fn commit_mirrored_read_cursor(
+fn apply_mirrored_read_cursor_frame(
     inner: &Arc<SupervisorInner>,
-    client: &FederationClient,
     credential: &RoomCredential,
     key: &RoomKey,
     sequence: Option<String>,
-) -> Result<(), BridgeError> {
+) -> Result<bool, BridgeError> {
     let read_seq = match sequence {
         Some(sequence) => Some(parse_canonical_u64(&sequence)?),
         None => None,
     };
-    let url = client
-        .room_endpoint(key, "read-cursor")
-        .map_err(|_| BridgeError::Protocol)?;
-    let response = client
-        .http
-        .patch(url)
-        .timeout(REQUEST_TIMEOUT)
-        .bearer_auth(&credential.bearer_token)
-        .json(&serde_json::json!({ "read_seq": read_seq }))
-        .send()
-        .await
-        .map_err(|_| BridgeError::Transport)?;
-    match response.status() {
-        StatusCode::OK => {}
-        StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN => return Err(BridgeError::Revoked),
-        StatusCode::BAD_REQUEST | StatusCode::CONFLICT => return Err(BridgeError::Protocol),
-        _ => return Err(BridgeError::Transport),
-    }
-    #[derive(Deserialize)]
-    #[serde(deny_unknown_fields)]
-    struct ReadCursorPatchBody {
-        read_seq: Option<u64>,
-    }
-    #[derive(Deserialize)]
-    #[serde(deny_unknown_fields)]
-    struct ReadCursorPatchEnvelope {
-        read_cursor: ReadCursorPatchBody,
-    }
-    let body = response
-        .json::<ReadCursorPatchEnvelope>()
-        .await
-        .map_err(|_| BridgeError::Protocol)?;
-    if body.read_cursor.read_seq != read_seq {
-        return Err(BridgeError::Protocol);
-    }
-    with_rooms_handle(&inner.rooms, |store| {
-        let cursor = store.update_room_read_cursor(
+    let changed = with_rooms_handle(&inner.rooms, |store| {
+        let before = store.room_read_cursor(key, credential.local_human_member_id.as_str())?;
+        let after = store.set_room_read_cursor_mirror(
             key,
             credential.local_human_member_id.as_str(),
-            ocean_core::RoomReadCursorUpdateRequest {
-                read_seq: body.read_cursor.read_seq.unwrap_or(0),
-            },
+            read_seq,
         )?;
-        if body.read_cursor.read_seq.is_none() && cursor.read_seq.is_some() {
-            return Err(ocean_store::RoomStoreError::FederationCorruption(
-                "null read cursor unexpectedly materialized local sequence".into(),
-            ));
-        }
-        Ok::<(), ocean_store::RoomStoreError>(())
+        Ok::<bool, ocean_store::RoomStoreError>(before != after)
     })
     .map_err(|_| BridgeError::Store)?;
-    publish_room_read_cursor_wake_on(&inner.read_cursor_wakes, key);
-    Ok(())
+    Ok(changed)
 }
 
 fn persist_lease_lost(
@@ -2945,6 +3134,192 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn room_read_cursor_frame_updates_mirror_without_http_or_confirmed_cursor() {
+        let key = RoomKey::new("cursor-frame-room");
+        let mut store = ocean_store::SqliteRoomStore::open_in_memory().unwrap();
+        store
+            .create(key.clone(), "Cursor", None, chrono::Utc::now())
+            .unwrap();
+        store
+            .update_room_access_safe(&key, Some(RoomAccessState::Live), Some(&[]), Some(9))
+            .unwrap();
+        store
+            .install_room_credential(&key, "bearer", "principal")
+            .unwrap();
+        store
+            .update_room_read_cursor(
+                &key,
+                "principal",
+                ocean_core::RoomReadCursorUpdateRequest { read_seq: 9 },
+            )
+            .unwrap();
+        let rooms = Arc::new(std::sync::Mutex::new(store));
+        let fake = FakeBedrock::new(key.as_str(), "bearer");
+        let (base, server) = start_fake_bedrock(fake.clone()).await;
+        let supervisor = FederationSupervisor::for_test(
+            &base,
+            rooms.clone(),
+            RoomWakeBus::default(),
+            RoomAccessWakeBus::default(),
+            RoomReadCursorWakeBus::default(),
+            CancellationToken::new(),
+            Duration::from_millis(25),
+        );
+        let inner = supervisor.inner.clone();
+        let credential = with_rooms_handle(&rooms, |store| store.room_credential(&key))
+            .unwrap()
+            .unwrap();
+        apply_mirrored_read_cursor_frame(
+            &inner,
+            &credential,
+            &key,
+            Some("9007199254740993".into()),
+        )
+        .unwrap();
+        let cursor =
+            with_rooms_handle(&rooms, |store| store.room_read_cursor(&key, "principal")).unwrap();
+        let access = with_rooms_handle(&rooms, |store| store.room_access(&key)).unwrap();
+        assert_eq!(cursor.read_seq, None);
+        assert_eq!(
+            cursor.mirrored_upstream_read_seq,
+            Some(9_007_199_254_740_993)
+        );
+        assert_eq!(access.last_confirmed_global_sequence, Some(9));
+        assert!(fake.read_cursor_calls.lock().await.is_empty());
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn room_read_cursor_live_get_and_patch_use_exact_path_body_and_optional_clamped() {
+        let key = RoomKey::new("cursor-live-room");
+        let mut store = ocean_store::SqliteRoomStore::open_in_memory().unwrap();
+        store
+            .create(key.clone(), "Cursor", None, chrono::Utc::now())
+            .unwrap();
+        store
+            .update_room_access_safe(&key, Some(RoomAccessState::Live), Some(&[]), None)
+            .unwrap();
+        store
+            .install_room_credential(&key, "bearer", "principal")
+            .unwrap();
+        store
+            .update_room_read_cursor(
+                &key,
+                "principal",
+                ocean_core::RoomReadCursorUpdateRequest { read_seq: 0 },
+            )
+            .unwrap();
+        let rooms = Arc::new(std::sync::Mutex::new(store));
+        let fake = FakeBedrock::new(key.as_str(), "bearer");
+        *fake.read_cursor_response.lock().await =
+            json!({"room_id": key.as_str(), "sequence": null, "clamped": false});
+        let (base, server) = start_fake_bedrock(fake.clone()).await;
+        let supervisor = FederationSupervisor::for_test(
+            &base,
+            rooms.clone(),
+            RoomWakeBus::default(),
+            RoomAccessWakeBus::default(),
+            RoomReadCursorWakeBus::default(),
+            CancellationToken::new(),
+            Duration::from_millis(25),
+        );
+
+        let got = supervisor.room_get_read_cursor(&key).await.unwrap();
+        assert_eq!(got.mirrored_upstream_read_seq, None);
+
+        *fake.read_cursor_response.lock().await = json!({
+            "room_id": key.as_str(),
+            "sequence": "9007199254740993",
+            "changed": true,
+            "clamped": false
+        });
+        let patched = supervisor
+            .room_patch_read_cursor(&key, 9_007_199_254_740_993)
+            .await
+            .unwrap();
+        assert_eq!(
+            patched.mirrored_upstream_read_seq,
+            Some(9_007_199_254_740_993)
+        );
+
+        let calls = fake.read_cursor_calls.lock().await.clone();
+        assert_eq!(calls.len(), 2);
+        assert_eq!(calls[0].method, "GET");
+        assert_eq!(calls[0].path, format!("/api/v1/rooms/{}/read-cursor", key));
+        assert_eq!(calls[0].authorization.as_deref(), Some("Bearer bearer"));
+        assert!(calls[0].body.is_none());
+        assert_eq!(calls[1].method, "PATCH");
+        assert_eq!(calls[1].path, format!("/api/v1/rooms/{}/read-cursor", key));
+        assert_eq!(calls[1].authorization.as_deref(), Some("Bearer bearer"));
+        assert_eq!(
+            calls[1].body.as_ref().unwrap(),
+            &json!({"sequence":"9007199254740993"})
+        );
+
+        let cursor =
+            with_rooms_handle(&rooms, |store| store.room_read_cursor(&key, "principal")).unwrap();
+        assert_eq!(
+            cursor.mirrored_upstream_read_seq,
+            Some(9_007_199_254_740_993)
+        );
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn room_read_cursor_live_rejects_mismatch_without_mirror_or_wake() {
+        let key = RoomKey::new("cursor-mismatch-room");
+        let mut store = ocean_store::SqliteRoomStore::open_in_memory().unwrap();
+        store
+            .create(key.clone(), "Cursor", None, chrono::Utc::now())
+            .unwrap();
+        store
+            .update_room_access_safe(&key, Some(RoomAccessState::Live), Some(&[]), None)
+            .unwrap();
+        store
+            .install_room_credential(&key, "bearer", "principal")
+            .unwrap();
+        store
+            .update_room_read_cursor(
+                &key,
+                "principal",
+                ocean_core::RoomReadCursorUpdateRequest { read_seq: 0 },
+            )
+            .unwrap();
+        let rooms = Arc::new(std::sync::Mutex::new(store));
+        let wakes = RoomReadCursorWakeBus::default();
+        let mut rx = wakes.subscribe();
+        let fake = FakeBedrock::new(key.as_str(), "bearer");
+        *fake.read_cursor_response.lock().await = json!({
+            "room_id": key.as_str(),
+            "sequence": "7",
+            "changed": true,
+            "clamped": false
+        });
+        let (base, server) = start_fake_bedrock(fake.clone()).await;
+        let supervisor = FederationSupervisor::for_test(
+            &base,
+            rooms.clone(),
+            RoomWakeBus::default(),
+            RoomAccessWakeBus::default(),
+            wakes,
+            CancellationToken::new(),
+            Duration::from_millis(25),
+        );
+
+        assert_eq!(
+            supervisor.room_patch_read_cursor(&key, 8).await,
+            Err(IntentError::Protocol)
+        );
+        let cursor =
+            with_rooms_handle(&rooms, |store| store.room_read_cursor(&key, "principal")).unwrap();
+        assert_eq!(cursor.mirrored_upstream_read_seq, None);
+        assert!(tokio::time::timeout(Duration::from_millis(50), rx.recv())
+            .await
+            .is_err());
+        server.abort();
+    }
+
+    #[tokio::test]
     async fn revoke_admission_gate_blocks_post_response_mutation() {
         let gate = AdmissionGate::new();
         let mutations = std::sync::Mutex::new(0);
@@ -2994,13 +3369,24 @@ mod tests {
     type RequestMeta = (String, Option<String>, Option<String>);
 
     #[derive(Clone)]
+    struct ReadCursorCall {
+        method: String,
+        path: String,
+        authorization: Option<String>,
+        body: Option<Value>,
+    }
+
+    #[derive(Clone)]
     struct FakeBedrock {
         bearer: Arc<String>,
         room: Arc<String>,
         sse_tx: Arc<Mutex<Option<FakeSseTx>>>,
         posts: Arc<Mutex<Vec<Value>>>,
+        read_cursor_calls: Arc<Mutex<Vec<ReadCursorCall>>>,
         request_meta: Arc<Mutex<Vec<RequestMeta>>>,
         members: Arc<Mutex<Value>>,
+        read_cursor_status: Arc<AtomicU16>,
+        read_cursor_response: Arc<Mutex<Value>>,
         members_status: Arc<AtomicU16>,
         events_status: Arc<AtomicU16>,
         hold_events_response: Arc<AtomicBool>,
@@ -3020,8 +3406,13 @@ mod tests {
                 room: Arc::new(room.to_string()),
                 sse_tx: Arc::new(Mutex::new(None)),
                 posts: Arc::new(Mutex::new(Vec::new())),
+                read_cursor_calls: Arc::new(Mutex::new(Vec::new())),
                 request_meta: Arc::new(Mutex::new(Vec::new())),
                 members: Arc::new(Mutex::new(json!({"members":[]}))),
+                read_cursor_status: Arc::new(AtomicU16::new(200)),
+                read_cursor_response: Arc::new(Mutex::new(
+                    json!({"room_id": room, "sequence": null}),
+                )),
                 members_status: Arc::new(AtomicU16::new(200)),
                 events_status: Arc::new(AtomicU16::new(200)),
                 hold_events_response: Arc::new(AtomicBool::new(false)),
@@ -3109,6 +3500,55 @@ mod tests {
         Json(state.members.lock().await.clone()).into_response()
     }
 
+    async fn fake_read_cursor_get(
+        State(state): State<FakeBedrock>,
+        Path(room): Path<String>,
+        headers: HeaderMap,
+    ) -> axum::response::Response {
+        state.read_cursor_calls.lock().await.push(ReadCursorCall {
+            method: "GET".into(),
+            path: format!("/api/v1/rooms/{room}/read-cursor"),
+            authorization: bearer(&headers),
+            body: None,
+        });
+        if room != *state.room
+            || bearer(&headers).as_deref() != Some(format!("Bearer {}", state.bearer).as_str())
+        {
+            return StatusCode::UNAUTHORIZED.into_response();
+        }
+        let status = StatusCode::from_u16(state.read_cursor_status.load(Ordering::Acquire))
+            .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
+        if status != StatusCode::OK {
+            return status.into_response();
+        }
+        Json(state.read_cursor_response.lock().await.clone()).into_response()
+    }
+
+    async fn fake_read_cursor_patch(
+        State(state): State<FakeBedrock>,
+        Path(room): Path<String>,
+        headers: HeaderMap,
+        Json(body): Json<Value>,
+    ) -> axum::response::Response {
+        state.read_cursor_calls.lock().await.push(ReadCursorCall {
+            method: "PATCH".into(),
+            path: format!("/api/v1/rooms/{room}/read-cursor"),
+            authorization: bearer(&headers),
+            body: Some(body.clone()),
+        });
+        if room != *state.room
+            || bearer(&headers).as_deref() != Some(format!("Bearer {}", state.bearer).as_str())
+        {
+            return StatusCode::UNAUTHORIZED.into_response();
+        }
+        let status = StatusCode::from_u16(state.read_cursor_status.load(Ordering::Acquire))
+            .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
+        if status != StatusCode::OK {
+            return status.into_response();
+        }
+        Json(state.read_cursor_response.lock().await.clone()).into_response()
+    }
+
     async fn fake_ledger(
         State(state): State<FakeBedrock>,
         headers: HeaderMap,
@@ -3136,6 +3576,10 @@ mod tests {
         let app = Router::new()
             .route("/api/v1/rooms/{room}/events", get(fake_events))
             .route("/api/v1/rooms/{room}/members", get(fake_members))
+            .route(
+                "/api/v1/rooms/{room}/read-cursor",
+                get(fake_read_cursor_get).patch(fake_read_cursor_patch),
+            )
             .route("/api/v1/ledger/events", post(fake_ledger))
             .with_state(state);
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();

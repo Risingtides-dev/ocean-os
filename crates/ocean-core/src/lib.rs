@@ -963,6 +963,8 @@ pub enum RoomAccessState {
 pub struct RoomReadCursorProjection {
     #[serde(default)]
     pub read_seq: Option<u64>,
+    #[serde(default)]
+    pub mirrored_upstream_read_seq: Option<u64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
