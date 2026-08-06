@@ -113,6 +113,11 @@ enum Command {
         /// Default is to fail (a wake targets a specific existing agent).
         #[arg(long)]
         allow_new_session: bool,
+        /// Pin this wake turn to a specific model id (e.g. `glm-4.6`). Absent =
+        /// the daemon's current global model. Lets one pad roster run several
+        /// Ocean seats on different models without flipping the daemon default.
+        #[arg(long)]
+        model: Option<String>,
     },
 }
 
@@ -172,6 +177,7 @@ async fn main() -> Result<()> {
             timeout_seconds,
             no_wait,
             allow_new_session,
+            model,
         } => {
             let code = wake_once(
                 &cli.daemon_url,
@@ -185,6 +191,7 @@ async fn main() -> Result<()> {
                     timeout_seconds,
                     no_wait,
                     allow_new_session,
+                    model,
                 },
             )
             .await
@@ -213,6 +220,7 @@ struct WakeArgs {
     timeout_seconds: u64,
     no_wait: bool,
     allow_new_session: bool,
+    model: Option<String>,
 }
 
 async fn wake_once(daemon_url: &str, args: WakeArgs) -> Result<i32> {
@@ -278,6 +286,11 @@ async fn wake_once(daemon_url: &str, args: WakeArgs) -> Result<i32> {
     }
     if let Some(sid) = session_id.as_ref() {
         body["session_id"] = json!(sid);
+    }
+    // Per-seat model: the daemon treats an explicit model_id as a hard pin for
+    // this turn (a bad alias fails cleanly rather than silently substituting).
+    if let Some(model) = args.model.as_ref() {
+        body["model_id"] = json!(model);
     }
 
     let url = format!("{base}/v1/agent/turns");

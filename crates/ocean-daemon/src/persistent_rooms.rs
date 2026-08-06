@@ -14,8 +14,9 @@ use chrono::Utc;
 use ocean_agent_sdk::{AgentSessionId, AgentTurnEvent};
 use ocean_core::{
     evaluate_trigger_policy, PermissionMode, PromptRequest, PublicAgentDescriptor, RequestState,
-    RoomAccessProjection, RoomAccessState, RoomKey, RoomMessage, RoomMessageKind, RoomParticipant,
-    RoomParticipantKind, RoomTriggerEvent, RoomTriggerPolicy,
+    RoomAccessProjection, RoomAccessState, RoomArtifactKind, RoomArtifactState, RoomKey,
+    RoomMessage, RoomMessageKind, RoomParticipant, RoomParticipantKind, RoomTriggerEvent,
+    RoomTriggerPolicy,
 };
 #[cfg(test)]
 use ocean_core::{OutboxItemState, RoomOutboxItem};
@@ -318,6 +319,27 @@ pub(super) fn room_store_error_response(
         // The room exists but is not federated: a client-side misuse of a
         // federation-only operation, not a server fault.
         RoomNotFederated(_) => StatusCode::CONFLICT,
+        // The caller named an owner that is not a Human in this room's roster
+        // (or gave an owner to a non-Agent). That is a malformed request, and
+        // the store refused it having written nothing.
+        InvalidAgentOwner { .. } => StatusCode::BAD_REQUEST,
+        // A join that would re-kind an existing participant is a takeover, not
+        // a reconnect. 409: the id is taken by a different kind of actor.
+        ParticipantKindConflict { .. } => StatusCode::CONFLICT,
+        // The caller read a stale artifact. 409 with the actual version in the
+        // body is the whole contract: re-read and retry. Never a silent merge.
+        ArtifactVersionConflict { .. } => StatusCode::CONFLICT,
+        UnknownArtifact { .. } => StatusCode::NOT_FOUND,
+        // A client naming collision is the most ordinary error this endpoint
+        // sees. Before this it tripped the PK constraint and surfaced as a 500 —
+        // a client mistake reported as a server fault.
+        ArtifactAlreadyExists { .. } => StatusCode::CONFLICT,
+        // Nothing to change is a client mistake, not a conflict to retry.
+        ArtifactUnchanged { .. } => StatusCode::BAD_REQUEST,
+        ParticipantRecordImmutable { .. } => StatusCode::CONFLICT,
+        // An artifact attributed to someone not in the room is a lie, not a
+        // server fault.
+        ArtifactAuthorNotInRoster { .. } => StatusCode::FORBIDDEN,
         // A durable backend can fail on I/O or (de)serialization, which the
         // in-memory registry never could. Surface those as 500s, not as a
         // misleading 4xx. Federation corruption is a fail-closed integrity
@@ -557,13 +579,33 @@ pub(super) async fn room_get(
             return Ok(None);
         };
         let access = reg.room_access(&key)?;
-        Ok(Some((record, access)))
+        // Which worker owns which agent in THIS room. Adjacent to the roster,
+        // never a field on RoomParticipant (the federated design reserves
+        // owner/sovereignty for Bedrock's authenticated principal mapping).
+        // Absent key == no local ownership recorded, which is what every
+        // pre-existing room reports.
+        let owners = reg.agent_owners(&key)?;
+        Ok(Some((record, access, owners)))
     }) {
-        Ok(Some((rec, access))) => (
+        Ok(Some((rec, access, owners))) => (
             StatusCode::OK,
-            Json(
-                json!({ "ok": true, "room": rec.room, "transcript": rec.transcript, "access": access }),
-            ),
+            Json(json!({
+                "ok": true,
+                "room": rec.room,
+                "transcript": rec.transcript,
+                "access": access,
+                "agent_owners": owners
+                    .into_iter()
+                    .map(|(agent, owner, owner_present)| json!({
+                        "agent_id": agent,
+                        "owner_id": owner,
+                        // "owned" is not "owner still in the room". A worker can
+                        // leave and the binding outlives them; the room says so
+                        // rather than asserting a live claim it cannot prove.
+                        "owner_present": owner_present,
+                    }))
+                    .collect::<Vec<_>>(),
+            })),
         ),
         Ok(None) => (
             StatusCode::NOT_FOUND,
@@ -582,6 +624,12 @@ pub(super) struct RoomJoinRequest {
     /// What kind of actor is joining. Defaults to `human`.
     #[serde(default = "default_participant_kind")]
     pub(super) kind: RoomParticipantKind,
+    /// The WORKER who owns this agent. Only meaningful for `kind: Agent`, and
+    /// the owner must already be a Human on this room's roster. This is the
+    /// local half of "a worker persists alongside their agents": it makes
+    /// "my agent" a real relationship in a room with no federation.
+    #[serde(default)]
+    pub(super) owner_id: Option<String>,
 }
 
 fn default_participant_kind() -> RoomParticipantKind {
@@ -595,6 +643,51 @@ pub(super) async fn room_join(
     Json(req): Json<RoomJoinRequest>,
 ) -> (StatusCode, Json<serde_json::Value>) {
     let key = RoomKey::new(key.trim());
+    // `System` is the DAEMON'S OWN author identity. Every audit row it writes is
+    // authored `("system", System)` — the auto-convene notice, the "not bound"
+    // note, the turn-failure line. If a client may join as System, the
+    // `ParticipantJoined` marker it produces is a System-authored transcript row
+    // that a reader cannot tell apart from a genuine daemon audit line. That is
+    // transcript forgery, so System is refused at JOIN for the same reason
+    // `classify_local_author` refuses it at POST (:743-748) — the two gates now
+    // agree instead of only the second one holding.
+    if matches!(req.kind, RoomParticipantKind::System) {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({
+                "ok": false,
+                "code": "forged_participant_kind",
+                "error": "'system' is the daemon's own author identity and cannot be joined",
+            })),
+        );
+    }
+    // Join and post must agree on what an id IS. `classify_local_author` treats
+    // roster ids as canonical and refuses anything that is empty or not equal to
+    // its own trim (:751-753). Without the same rule here, joining as `" john "`
+    // succeeds and then that participant can NEVER post — a permanent, silent,
+    // self-inflicted denial with no way to discover the cause. Refuse it at the
+    // door instead.
+    let id = req.id.trim();
+    if id.is_empty() || id != req.id {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({
+                "ok": false,
+                "code": "invalid_participant_id",
+                "error": "participant id must be non-empty and carry no leading or trailing whitespace",
+            })),
+        );
+    }
+    if req.display_name.trim().is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({
+                "ok": false,
+                "code": "invalid_display_name",
+                "error": "display_name must not be empty",
+            })),
+        );
+    }
     // Named-agent binding (TASK-9): an Agent participant MUST name a resolvable
     // folder-as-agent. Reject an unresolved name with a typed 4xx so a phantom
     // agent can never enter the roster as an Agent (it would later convene a
@@ -612,13 +705,31 @@ pub(super) async fn room_join(
             );
         }
     }
+    // An owner is only meaningful for an Agent. Refuse it elsewhere rather than
+    // silently dropping it — a caller that believed it recorded ownership and
+    // did not is the false-success class this work exists to remove.
+    if req.owner_id.is_some() && !matches!(req.kind, RoomParticipantKind::Agent) {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({
+                "ok": false,
+                "code": "owner_requires_agent",
+                "error": "owner_id is only valid for a participant of kind 'agent'",
+            })),
+        );
+    }
+    let owner_id = req.owner_id.clone();
     let participant = RoomParticipant {
         id: req.id,
         kind: req.kind,
         display_name: req.display_name,
     };
-    let result = with_rooms(&state, |reg| {
-        reg.add_participant_with_message(&key, participant, Utc::now())
+    let result = with_rooms(&state, |reg| match owner_id.as_deref() {
+        // The store validates the owner against the live roster INSIDE the same
+        // transaction as the insert, so a concurrent leave cannot strand an
+        // agent owned by someone who is gone.
+        Some(owner) => reg.add_agent_participant_with_owner(&key, participant, owner, Utc::now()),
+        None => reg.add_participant_with_message(&key, participant, Utc::now()),
     });
     match result {
         Ok((rec, message)) => {
@@ -628,6 +739,193 @@ pub(super) async fn room_join(
                 Json(json!({ "ok": true, "room": rec.room })),
             )
         }
+        Err(e) => room_store_error_response(e),
+    }
+}
+
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct CreateArtifactRequest {
+    pub(super) id: String,
+    pub(super) kind: RoomArtifactKind,
+    pub(super) title: String,
+    #[serde(default)]
+    pub(super) body: String,
+    /// Participant id of the author — human OR agent. Validated against the
+    /// roster inside the store transaction.
+    pub(super) author_id: String,
+}
+
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct AmendArtifactRequest {
+    /// The version the caller READ. Compare-and-swap: if the artifact has moved
+    /// on, the write is refused with the actual version rather than merged.
+    pub(super) expected_version: u64,
+    #[serde(default)]
+    pub(super) title: Option<String>,
+    #[serde(default)]
+    pub(super) body: Option<String>,
+    #[serde(default)]
+    pub(super) state: Option<RoomArtifactState>,
+    pub(super) author_id: String,
+}
+
+/// `POST /v1/rooms/persistent/{key}/artifacts` — record something the room
+/// produced: a task, a decision, or captured knowledge.
+pub(super) async fn room_create_artifact(
+    State(state): State<AppState>,
+    Path(key): Path<String>,
+    Json(req): Json<CreateArtifactRequest>,
+) -> (StatusCode, Json<serde_json::Value>) {
+    let key = RoomKey::new(key.trim());
+    if req.id.trim().is_empty() || req.id != req.id.trim() {
+        return invalid_request_response();
+    }
+    if req.title.trim().is_empty() {
+        return invalid_request_response();
+    }
+    // Finding B: `author_id` is caller-supplied and only roster-checked, so a
+    // hostile local caller could author an artifact AS somebody's agent. An
+    // agent's artifact is produced by the daemon's own convene path, never by a
+    // client claiming an agent's identity over the wire — the same rule
+    // `classify_local_author` already applies to messages (Agent|System are
+    // daemon-only author kinds). Enforce it here too instead of trusting the
+    // client one layer down.
+    let claimed_kind = with_rooms(&state, |store| store.get(&key))
+        .ok()
+        .and_then(|rec| {
+            rec.and_then(|rec| {
+                rec.room
+                    .participants
+                    .iter()
+                    .find(|p| p.id == req.author_id)
+                    .map(|p| p.kind)
+            })
+        });
+    if matches!(
+        claimed_kind,
+        Some(RoomParticipantKind::Agent) | Some(RoomParticipantKind::System)
+    ) {
+        return (
+            StatusCode::FORBIDDEN,
+            Json(json!({
+                "ok": false,
+                "code": "forged_artifact_author",
+                "error": "an agent's artifact is authored by the daemon, not by a client claiming its identity",
+            })),
+        );
+    }
+    let result = with_rooms(&state, |store| {
+        store.create_artifact(
+            &key,
+            &req.id,
+            req.kind,
+            &req.title,
+            &req.body,
+            &req.author_id,
+            Utc::now(),
+        )
+    });
+    match result {
+        Ok((artifact, message)) => {
+            // The transcript line is live on the room's SSE, so every client
+            // learns the artifact exists without polling.
+            publish_room_wake(&state, &key, &message);
+            (
+                StatusCode::CREATED,
+                Json(json!({ "ok": true, "artifact": artifact })),
+            )
+        }
+        Err(e) => room_store_error_response(e),
+    }
+}
+
+/// `POST /v1/rooms/persistent/{key}/artifacts/{artifact_id}/amend` — rewrite an
+/// artifact in place under compare-and-swap.
+pub(super) async fn room_amend_artifact(
+    State(state): State<AppState>,
+    Path((key, artifact_id)): Path<(String, String)>,
+    Json(req): Json<AmendArtifactRequest>,
+) -> (StatusCode, Json<serde_json::Value>) {
+    let key = RoomKey::new(key.trim());
+    let result = with_rooms(&state, |store| {
+        store.amend_artifact(
+            &key,
+            artifact_id.trim(),
+            req.expected_version,
+            req.title.as_deref(),
+            req.body.as_deref(),
+            req.state,
+            &req.author_id,
+            Utc::now(),
+        )
+    });
+    match result {
+        Ok((artifact, message)) => {
+            publish_room_wake(&state, &key, &message);
+            (
+                StatusCode::OK,
+                Json(json!({ "ok": true, "artifact": artifact })),
+            )
+        }
+        // A stale write must hand back where to re-read from, not just "409".
+        Err(ocean_store::RoomStoreError::ArtifactVersionConflict {
+            expected, actual, ..
+        }) => (
+            StatusCode::CONFLICT,
+            Json(json!({
+                "ok": false,
+                "code": "artifact_version_conflict",
+                "expected_version": expected,
+                "actual_version": actual,
+                "error": format!("artifact is at version {actual}, not {expected}; re-read and retry"),
+            })),
+        ),
+        Err(e) => room_store_error_response(e),
+    }
+}
+
+/// `GET /v1/rooms/persistent/{key}/artifacts/{artifact_id}` — one artifact.
+///
+/// This is the other half of the compare-and-swap contract. A 409 tells a caller
+/// their version is stale and hands back the actual one, but without a
+/// single-artifact read the only recovery is to re-list the whole room: fine at
+/// five artifacts, absurd at two hundred. With this the conflict->re-read->retry
+/// loop is one round trip.
+pub(super) async fn room_get_artifact(
+    State(state): State<AppState>,
+    Path((key, artifact_id)): Path<(String, String)>,
+) -> (StatusCode, Json<serde_json::Value>) {
+    let key = RoomKey::new(key.trim());
+    match with_rooms(&state, |store| store.artifact(&key, artifact_id.trim())) {
+        Ok(Some(artifact)) => (
+            StatusCode::OK,
+            Json(json!({ "ok": true, "artifact": artifact })),
+        ),
+        Ok(None) => (
+            StatusCode::NOT_FOUND,
+            Json(json!({
+                "ok": false,
+                "code": "unknown_artifact",
+                "error": format!("room '{key}' has no artifact '{}'", artifact_id.trim()),
+            })),
+        ),
+        Err(e) => room_store_error_response(e),
+    }
+}
+
+/// `GET /v1/rooms/persistent/{key}/artifacts` — everything this room produced.
+pub(super) async fn room_list_artifacts(
+    State(state): State<AppState>,
+    Path(key): Path<String>,
+) -> (StatusCode, Json<serde_json::Value>) {
+    let key = RoomKey::new(key.trim());
+    match with_rooms(&state, |store| store.artifacts(&key)) {
+        Ok(artifacts) => (
+            StatusCode::OK,
+            Json(json!({ "ok": true, "artifacts": artifacts })),
+        ),
         Err(e) => room_store_error_response(e),
     }
 }
@@ -3648,6 +3946,7 @@ mod tests {
                 id: "amy".into(),
                 display_name: "Amy".into(),
                 kind: RoomParticipantKind::Human,
+                owner_id: None,
             }),
         )
         .await;
@@ -3682,6 +3981,7 @@ mod tests {
                 id: "helper".into(),
                 display_name: "Helper".into(),
                 kind: RoomParticipantKind::Agent,
+                owner_id: None,
             }),
         )
         .await;
@@ -3937,6 +4237,358 @@ mod tests {
         }
     }
 
+    /// END TO END: a worker adds their agent over HTTP, and the room reports
+    /// that the agent is THEIRS. This is the whole point of the feature — the
+    /// store gates prove the write, this proves it is reachable and projected.
+    /// Mutation: make `room_join` ignore `owner_id` (always take the
+    /// non-owner store path) -> agent_owners comes back empty -> RED.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn join_records_agent_ownership_and_room_get_projects_it() {
+        let _guard = AUTO_CONVENE_ENV_LOCK.lock().await;
+        let _env = TestEnvRestore::capture(&[
+            "OCEAN_CONFIG_DIR",
+            "OCEAN_MODEL",
+            "OCEAN_YOLO",
+            "OCEAN_AGENTS_DIR",
+        ]);
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = fake_convene_state(&tmp);
+        let agents_root = tmp.path().join("agents");
+        write_agent_fixture(&agents_root, "researcher", "model = \"fake-ok\"\n", None);
+        std::env::set_var("OCEAN_AGENTS_DIR", &agents_root);
+        let key = RoomKey::new("owned-room");
+        create_mention_room(&state, &key);
+
+        // The worker joins first — an agent cannot be owned by someone absent.
+        let (status, _) = room_join(
+            State(state.clone()),
+            Path(key.as_str().to_string()),
+            Json(RoomJoinRequest {
+                id: "alice".into(),
+                display_name: "Alice".into(),
+                kind: RoomParticipantKind::Human,
+                owner_id: None,
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+
+        // Then adds THEIR agent.
+        let (status, _) = room_join(
+            State(state.clone()),
+            Path(key.as_str().to_string()),
+            Json(RoomJoinRequest {
+                id: "researcher".into(),
+                display_name: "Researcher".into(),
+                kind: RoomParticipantKind::Agent,
+                owner_id: Some("alice".into()),
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+
+        let (status, Json(body)) =
+            room_get(State(state.clone()), Path(key.as_str().to_string())).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            body["agent_owners"],
+            json!([{ "agent_id": "researcher", "owner_id": "alice", "owner_present": true }]),
+            "the room must report whose agent this is"
+        );
+    }
+
+    /// An owner named for a participant who is not on the roster is refused,
+    /// and the refusal writes nothing — no roster row, no join marker.
+    /// Mutation: delete the store's `None =>` owner arm -> RED.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn join_with_an_absent_owner_is_refused_and_writes_nothing() {
+        let _guard = AUTO_CONVENE_ENV_LOCK.lock().await;
+        let _env = TestEnvRestore::capture(&[
+            "OCEAN_CONFIG_DIR",
+            "OCEAN_MODEL",
+            "OCEAN_YOLO",
+            "OCEAN_AGENTS_DIR",
+        ]);
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = fake_convene_state(&tmp);
+        let agents_root = tmp.path().join("agents");
+        write_agent_fixture(&agents_root, "researcher", "model = \"fake-ok\"\n", None);
+        std::env::set_var("OCEAN_AGENTS_DIR", &agents_root);
+        let key = RoomKey::new("absent-owner");
+        create_mention_room(&state, &key);
+
+        let (status, _body) = room_join(
+            State(state.clone()),
+            Path(key.as_str().to_string()),
+            Json(RoomJoinRequest {
+                id: "researcher".into(),
+                display_name: "Researcher".into(),
+                kind: RoomParticipantKind::Agent,
+                owner_id: Some("nobody".into()),
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+
+        let room = with_rooms(&state, |store| store.get(&key))
+            .expect("room lookup")
+            .expect("room exists");
+        assert!(
+            room.room.participants.is_empty(),
+            "a refused owner must leave no roster row"
+        );
+        assert!(
+            room.transcript.is_empty(),
+            "a refused owner must forge no join marker"
+        );
+    }
+
+    /// Only an Agent may carry an owner; anything else is refused rather than
+    /// silently dropped. A caller that believed it recorded ownership and did
+    /// not is the false-success class.
+    /// Mutation: delete the `owner_requires_agent` arm -> RED.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn owner_id_on_a_non_agent_is_refused() {
+        let _guard = AUTO_CONVENE_ENV_LOCK.lock().await;
+        let _env = TestEnvRestore::capture(&[
+            "OCEAN_CONFIG_DIR",
+            "OCEAN_MODEL",
+            "OCEAN_YOLO",
+            "OCEAN_AGENTS_DIR",
+        ]);
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = fake_convene_state(&tmp);
+        let key = RoomKey::new("owner-on-human");
+        create_mention_room(&state, &key);
+
+        let (status, Json(body)) = room_join(
+            State(state.clone()),
+            Path(key.as_str().to_string()),
+            Json(RoomJoinRequest {
+                id: "bob".into(),
+                display_name: "Bob".into(),
+                kind: RoomParticipantKind::Human,
+                owner_id: Some("alice".into()),
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(body["code"], json!("owner_requires_agent"));
+    }
+
+    /// Finding B (pro-adversary): `author_id` is caller-supplied and only
+    /// roster-checked, so a hostile local caller could author an artifact AS
+    /// somebody's agent. An agent's artifact is produced by the daemon's convene
+    /// path, never by a client claiming its identity over the wire.
+    /// Mutation: delete the forged_artifact_author arm -> RED.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_client_cannot_author_an_artifact_as_an_agent() {
+        let _guard = AUTO_CONVENE_ENV_LOCK.lock().await;
+        let _env = TestEnvRestore::capture(&[
+            "OCEAN_CONFIG_DIR",
+            "OCEAN_MODEL",
+            "OCEAN_YOLO",
+            "OCEAN_AGENTS_DIR",
+        ]);
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = fake_convene_state(&tmp);
+        let agents_root = tmp.path().join("agents");
+        write_agent_fixture(&agents_root, "researcher", "model = \"fake-ok\"\n", None);
+        std::env::set_var("OCEAN_AGENTS_DIR", &agents_root);
+        let key = RoomKey::new("forge-artifact");
+        create_mention_room(&state, &key);
+        for (id, name, kind) in [
+            ("alice", "Alice", RoomParticipantKind::Human),
+            ("researcher", "Researcher", RoomParticipantKind::Agent),
+        ] {
+            let (status, _) = room_join(
+                State(state.clone()),
+                Path(key.as_str().to_string()),
+                Json(RoomJoinRequest {
+                    id: id.into(),
+                    display_name: name.into(),
+                    kind,
+                    owner_id: None,
+                }),
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK);
+        }
+
+        let (status, Json(body)) = room_create_artifact(
+            State(state.clone()),
+            Path(key.as_str().to_string()),
+            Json(CreateArtifactRequest {
+                id: "forged".into(),
+                kind: RoomArtifactKind::Task,
+                title: "I am the agent".into(),
+                body: String::new(),
+                author_id: "researcher".into(),
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        assert_eq!(body["code"], json!("forged_artifact_author"));
+
+        let (status, Json(list)) =
+            room_list_artifacts(State(state.clone()), Path(key.as_str().to_string())).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            list["artifacts"].as_array().map(|a| a.len()),
+            Some(0),
+            "a forged artifact must not exist"
+        );
+
+        // A human author on the same route still works.
+        let (status, _) = room_create_artifact(
+            State(state.clone()),
+            Path(key.as_str().to_string()),
+            Json(CreateArtifactRequest {
+                id: "real".into(),
+                kind: RoomArtifactKind::Task,
+                title: "Real task".into(),
+                body: String::new(),
+                author_id: "alice".into(),
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED);
+    }
+
+    /// The daemon authors every audit row as ("system", System). If a client can
+    /// join as System, its ParticipantJoined marker is a System-authored
+    /// transcript row indistinguishable from a genuine daemon audit line.
+    /// Mutation: delete the System arm in `room_join` -> RED.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn system_kind_cannot_join_over_http() {
+        let _guard = AUTO_CONVENE_ENV_LOCK.lock().await;
+        let _env = TestEnvRestore::capture(&[
+            "OCEAN_CONFIG_DIR",
+            "OCEAN_MODEL",
+            "OCEAN_YOLO",
+            "OCEAN_AGENTS_DIR",
+        ]);
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = fake_convene_state(&tmp);
+        let key = RoomKey::new("system-join");
+        create_mention_room(&state, &key);
+
+        let (status, Json(body)) = room_join(
+            State(state.clone()),
+            Path(key.as_str().to_string()),
+            Json(RoomJoinRequest {
+                id: "system".into(),
+                display_name: "Ocean System".into(),
+                kind: RoomParticipantKind::System,
+                owner_id: None,
+            }),
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(body["code"], json!("forged_participant_kind"));
+        let room = with_rooms(&state, |store| store.get(&key))
+            .expect("room lookup")
+            .expect("room exists");
+        assert!(
+            room.room.participants.is_empty(),
+            "a refused System join must leave no roster row"
+        );
+        assert!(
+            room.transcript.is_empty(),
+            "a refused System join must forge no transcript marker"
+        );
+    }
+
+    /// Join and post must agree on what an id is. `classify_local_author`
+    /// refuses an untrimmed id at POST, so accepting one at JOIN strands that
+    /// participant forever with no way to discover why.
+    /// Mutation: delete the id-normalization arm in `room_join` -> RED.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn join_refuses_the_untrimmed_id_that_post_would_strand() {
+        let _guard = AUTO_CONVENE_ENV_LOCK.lock().await;
+        let _env = TestEnvRestore::capture(&[
+            "OCEAN_CONFIG_DIR",
+            "OCEAN_MODEL",
+            "OCEAN_YOLO",
+            "OCEAN_AGENTS_DIR",
+        ]);
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = fake_convene_state(&tmp);
+        let key = RoomKey::new("untrimmed-join");
+        create_mention_room(&state, &key);
+
+        for bad in [" john ", "", "   "] {
+            let (status, Json(body)) = room_join(
+                State(state.clone()),
+                Path(key.as_str().to_string()),
+                Json(RoomJoinRequest {
+                    id: bad.into(),
+                    display_name: "John".into(),
+                    kind: RoomParticipantKind::Human,
+                    owner_id: None,
+                }),
+            )
+            .await;
+            assert_eq!(
+                status,
+                StatusCode::BAD_REQUEST,
+                "id {bad:?} must be refused"
+            );
+            assert_eq!(body["code"], json!("invalid_participant_id"));
+        }
+
+        // The canonical spelling still joins, and can therefore post.
+        let (status, _) = room_join(
+            State(state.clone()),
+            Path(key.as_str().to_string()),
+            Json(RoomJoinRequest {
+                id: "john".into(),
+                display_name: "John".into(),
+                kind: RoomParticipantKind::Human,
+                owner_id: None,
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let room = with_rooms(&state, |store| store.get(&key))
+            .expect("room lookup")
+            .expect("room exists");
+        assert_eq!(room.room.participants.len(), 1);
+        assert_eq!(room.room.participants[0].id, "john");
+    }
+
+    /// An empty display name produces a " joined" marker with no author to read.
+    /// Mutation: delete the display_name arm -> RED.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn join_refuses_an_empty_display_name() {
+        let _guard = AUTO_CONVENE_ENV_LOCK.lock().await;
+        let _env = TestEnvRestore::capture(&[
+            "OCEAN_CONFIG_DIR",
+            "OCEAN_MODEL",
+            "OCEAN_YOLO",
+            "OCEAN_AGENTS_DIR",
+        ]);
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = fake_convene_state(&tmp);
+        let key = RoomKey::new("blank-name-join");
+        create_mention_room(&state, &key);
+
+        let (status, Json(body)) = room_join(
+            State(state.clone()),
+            Path(key.as_str().to_string()),
+            Json(RoomJoinRequest {
+                id: "ghost".into(),
+                display_name: "   ".into(),
+                kind: RoomParticipantKind::Human,
+                owner_id: None,
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(body["code"], json!("invalid_display_name"));
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn missing_agentdef_join_is_rejected() {
         let _guard = AUTO_CONVENE_ENV_LOCK.lock().await;
@@ -3961,6 +4613,7 @@ mod tests {
                 id: "phantom".into(),
                 display_name: "Phantom".into(),
                 kind: RoomParticipantKind::Agent,
+                owner_id: None,
             }),
         )
         .await;
@@ -4077,6 +4730,7 @@ env = { FIXTURE = "1" }
                 id: "bound-agent".into(),
                 display_name: "Bound Agent".into(),
                 kind: RoomParticipantKind::Agent,
+                owner_id: None,
             }),
         )
         .await;
@@ -4148,6 +4802,7 @@ env = { FIXTURE = "1" }
                 id: "data-only".into(),
                 display_name: "Data Only".into(),
                 kind: RoomParticipantKind::Agent,
+                owner_id: None,
             }),
         )
         .await;
