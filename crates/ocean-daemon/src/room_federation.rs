@@ -1967,7 +1967,14 @@ async fn run_epoch(
                             break EpochOutcome::Recover;
                         }
                         let result = if row.event_type == "message" {
-                            ingest_message_row(&inner, &client, &credential, row).await
+                            ingest_message_row(
+                                &inner,
+                                &client,
+                                &credential,
+                                row,
+                                &live_human_member_ids,
+                            )
+                            .await
                         } else {
                             advance_non_message(&inner, &key, sequence)
                         };
@@ -2531,6 +2538,7 @@ async fn ingest_message_row(
     client: &FederationClient,
     credential: &RoomCredential,
     row: WireLedgerRow,
+    live_human_member_ids: &HashSet<String>,
 ) -> Result<IngestDisposition, BridgeError> {
     let sequence = parse_canonical_u64(&row.sequence)?;
     let source_id = row.source_id.ok_or(BridgeError::Protocol)?;
@@ -2561,9 +2569,12 @@ async fn ingest_message_row(
                 // One immediate current-epoch roster fetch, then conservative
                 // Human. Do NOT commit/wake yet: Duplicate must remain a total
                 // no-op, while Ingested coalesces roster + message into one
-                // access wake.
+                // access wake. Reuse the epoch's live-human cache so this
+                // out-of-band refresh derives the same presence a heartbeat
+                // or presence frame would, instead of an empty set that
+                // would mark every human member Unavailable.
                 let current_state = durable_state(&inner.rooms, &credential.room_id)?;
-                let members = fetch_roster(inner, client, credential, &HashSet::new())
+                let members = fetch_roster(inner, client, credential, live_human_member_ids)
                     .await
                     .map_err(|outcome| match outcome {
                         EpochOutcome::Revoked => BridgeError::Revoked,
@@ -4434,6 +4445,7 @@ mod tests {
             supervisor.inner.client.as_ref().unwrap(),
             &credential,
             p2c_message_row(&key, "ledger-user", 1, human, vec![target.into()]),
+            &HashSet::new(),
         )
         .await
         .unwrap();
@@ -4453,6 +4465,7 @@ mod tests {
                 human,
                 vec![target.into()],
             ),
+            &HashSet::new(),
         )
         .await
         .unwrap();
@@ -4542,6 +4555,7 @@ mod tests {
             supervisor.inner.client.as_ref().unwrap(),
             &credential,
             p2c_message_row(&key, "ledger-unknown", 1, unknown, vec![target.into()]),
+            &HashSet::new(),
         )
         .await
         .unwrap();
@@ -4557,10 +4571,117 @@ mod tests {
             supervisor.inner.client.as_ref().unwrap(),
             &credential,
             p2c_message_row(&key, "ledger-agent", 2, target, vec![target.into()]),
+            &HashSet::new(),
         )
         .await
         .unwrap();
         assert!(trigger_rx.try_recv().is_err());
+        server.abort();
+    }
+
+    /// Regression for PR #366 review comment 3727657452: the immediate
+    /// roster refresh triggered by an unknown-author message must derive
+    /// human presence from the epoch's live-human cache, not an empty set.
+    /// Passing an empty set would mark every human member Unavailable even
+    /// though the caller's epoch already knows they are live, silently
+    /// clobbering `derived_presence` on unrelated members as a side effect
+    /// of an author-kind lookup.
+    #[tokio::test]
+    async fn p2c_unknown_author_roster_refresh_preserves_epoch_live_human_presence() {
+        let key = RoomKey::new("unknown-author-presence-room");
+        let human = "11111111-1111-4111-8111-111111111111";
+        let unknown = "22222222-2222-4222-8222-222222222222";
+        let target = "33333333-3333-4333-8333-333333333333";
+        let mut store = ocean_store::SqliteRoomStore::open_in_memory().unwrap();
+        store
+            .create(
+                key.clone(),
+                "Unknown Author Presence",
+                None,
+                chrono::Utc::now(),
+            )
+            .unwrap();
+        store
+            .install_room_credential(&key, "bearer", human)
+            .unwrap();
+        store.bind_room_agent(&key, target, "sage", "key").unwrap();
+        store
+            .update_room_access_safe(
+                &key,
+                Some(RoomAccessState::Live),
+                Some(&[
+                    p2c_projected_member(human, FederatedActorType::User, None),
+                    p2c_projected_member(target, FederatedActorType::Agent, Some(human)),
+                ]),
+                None,
+            )
+            .unwrap();
+        let rooms = Arc::new(std::sync::Mutex::new(store));
+        let fake = FakeBedrock::new(key.as_str(), "bearer");
+        // The roster the unknown-author refresh will fetch does not itself
+        // carry presence; `human`'s liveness must come from the epoch's
+        // cached live-human set passed into `ingest_message_row`, not the
+        // server response.
+        *fake.members.lock().await = json!({"members":[
+            {
+                "member_id":human,
+                "actor_type":"user",
+                "role_in_room":"owner",
+                "display_name":"Human",
+                "joined_at":"2026-07-17T00:00:00Z"
+            },
+            {
+                "member_id":target,
+                "owner_member_id":human,
+                "actor_type":"agent",
+                "role_in_room":"member",
+                "display_name":"sage",
+                "public_agent_descriptor":{"display_name":"sage","skills_count":0},
+                "joined_at":"2026-07-17T00:00:00Z"
+            }
+        ]});
+        let (base, server) = start_fake_bedrock(fake).await;
+        let supervisor = FederationSupervisor::for_test(
+            &base,
+            rooms.clone(),
+            RoomWakeBus::default(),
+            RoomAccessWakeBus::default(),
+            RoomReadCursorWakeBus::default(),
+            CancellationToken::new(),
+            Duration::from_secs(60),
+        );
+        let credential = RoomCredential {
+            room_id: key.clone(),
+            bearer_token: "bearer".into(),
+            local_human_member_id: human.into(),
+        };
+
+        // The epoch already knows `human` is live (e.g. via an earlier
+        // heartbeat or room_presence frame); a message from an unknown
+        // author must not discard that knowledge.
+        let live_human_member_ids: HashSet<String> = HashSet::from([human.to_string()]);
+        let outcome = ingest_message_row(
+            &supervisor.inner,
+            supervisor.inner.client.as_ref().unwrap(),
+            &credential,
+            p2c_message_row(&key, "ledger-unknown", 1, unknown, vec![]),
+            &live_human_member_ids,
+        )
+        .await
+        .unwrap();
+        assert_eq!(outcome, IngestDisposition::Committed);
+
+        let projection = with_rooms_handle(&rooms, |s| s.room_access(&key)).unwrap();
+        let human_member = projection
+            .members
+            .iter()
+            .find(|member| member.member_id == human)
+            .expect("human member present after roster refresh");
+        assert_eq!(
+            human_member.derived_presence,
+            Some(MemberPresence::Live),
+            "unknown-author roster refresh must preserve epoch live-human presence, not mark it Unavailable"
+        );
         server.abort();
     }
 
@@ -4621,6 +4742,7 @@ mod tests {
             supervisor.inner.client.as_ref().unwrap(),
             &credential,
             p2c_message_row(&key, "policy-off", 1, human, vec![bound_agent.into()]),
+            &HashSet::new(),
         )
         .await
         .unwrap();
@@ -4641,6 +4763,7 @@ mod tests {
             supervisor.inner.client.as_ref().unwrap(),
             &credential,
             p2c_message_row(&key, "human-target", 2, human, vec![remote_human.into()]),
+            &HashSet::new(),
         )
         .await
         .unwrap();
@@ -4655,6 +4778,7 @@ mod tests {
                 human,
                 vec![remote_agent.into()],
             ),
+            &HashSet::new(),
         )
         .await
         .unwrap();
@@ -6584,6 +6708,26 @@ mod tests {
         })
         .await
         .expect("unknown author refreshed and mapped as Agent");
+        // Regression for PR #366 review comment 3727657452: the unknown-author
+        // roster refresh must reuse this epoch's live-human cache (populated
+        // above via the room_presence frame and reconfirmed by heartbeat), not
+        // an empty set that would mark every human member Unavailable.
+        let post_refresh = with_rooms_handle(&rooms, |s| s.room_access(&key)).unwrap();
+        assert_eq!(
+            post_refresh.members[0].derived_presence,
+            Some(MemberPresence::Live),
+            "unknown-author roster refresh must preserve epoch live-human presence for local_human"
+        );
+        assert_eq!(
+            post_refresh
+                .members
+                .iter()
+                .find(|m| m.member_id == "44444444-4444-4444-8444-444444444444")
+                .expect("remote human present after roster refresh")
+                .derived_presence,
+            Some(MemberPresence::Live),
+            "unknown-author roster refresh must preserve epoch live-human presence for remote human"
+        );
         tokio::time::timeout(Duration::from_secs(60), message_rx.recv())
             .await
             .expect("unknown-author message wake")
