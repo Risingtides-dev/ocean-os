@@ -1059,6 +1059,8 @@ impl SqliteRoomStore {
                 PRIMARY KEY (room_id, client_event_id)
             );
 
+            CREATE INDEX IF NOT EXISTS idx_outbox_room_state ON outbox(room_id, state);
+
             CREATE TABLE IF NOT EXISTS room_read_cursors (
                 room_id       TEXT NOT NULL REFERENCES rooms(id) ON DELETE CASCADE,
                 principal_id  TEXT NOT NULL,
@@ -3059,6 +3061,40 @@ pub enum IngestOutcome {
     Duplicate,
 }
 
+/// Outcome of [`SqliteRoomStore::set_room_read_cursor_mirror`]'s
+/// compare-and-swap (M5): distinguishes a write that was actually applied
+/// from one that was rejected because a fresher write already landed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RoomReadCursorMirrorCas {
+    /// `expected_prior_mirror` matched the on-disk mirror: the write was
+    /// applied, including an authoritative clear to `None` if requested.
+    Applied(RoomReadCursorProjection),
+    /// `expected_prior_mirror` did not match the on-disk mirror — a fresher
+    /// response already landed for this room/principal since the caller
+    /// snapshotted it. Nothing was written; the unchanged current
+    /// projection is returned so the caller can reconcile (e.g. drop the
+    /// stale response, or re-snapshot and retry).
+    Stale(RoomReadCursorProjection),
+}
+
+impl RoomReadCursorMirrorCas {
+    /// The projection either just applied or already current on disk.
+    /// Convenient when a caller only cares about "what is the mirror now",
+    /// not whether this particular call moved it.
+    pub fn into_projection(self) -> RoomReadCursorProjection {
+        match self {
+            RoomReadCursorMirrorCas::Applied(projection) => projection,
+            RoomReadCursorMirrorCas::Stale(projection) => projection,
+        }
+    }
+
+    /// `true` if this call's write was applied (as opposed to rejected as
+    /// stale).
+    pub fn was_applied(&self) -> bool {
+        matches!(self, RoomReadCursorMirrorCas::Applied(_))
+    }
+}
+
 impl SqliteRoomStore {
     /// Read the stable daemon instance id, minting it on first use (P2-A).
     /// One row guarded by `CHECK (singleton = 1)`; the id is a random v4 UUID
@@ -3489,12 +3525,38 @@ impl SqliteRoomStore {
         })
     }
 
+    /// Compare-and-swap [`SqliteRoomStore::set_room_read_cursor_mirror`] on
+    /// the mirror value the caller observed immediately before issuing the
+    /// (racy, out-of-order-capable) upstream request whose response this
+    /// call is now applying (M5).
+    ///
+    /// Upstream read-cursor round trips (GET poll and PATCH) run concurrently
+    /// per room/principal and are NOT guaranteed to land in send order, so a
+    /// slow response describing an OLDER upstream state can arrive after a
+    /// fast response has already written a NEWER one. Without a CAS guard,
+    /// applying the slow response would regress — or, worse, clear — the
+    /// newer mirror even though both requests share the same room
+    /// generation (the existing federation `generation` counter only guards
+    /// against a revoke/rejoin in between; it does not order two in-flight
+    /// requests against each other).
+    ///
+    /// Callers MUST snapshot `expected_prior_mirror` from
+    /// [`SqliteRoomStore::room_read_cursor`] right before sending the
+    /// upstream request (the same point at which they already snapshot the
+    /// room generation). The write — including an authoritative clear to
+    /// `None` — is applied only if the on-disk mirror still equals that
+    /// snapshot, i.e. nothing fresher landed while the request was in
+    /// flight; otherwise it is rejected as stale and the current projection
+    /// is returned unchanged. A clear is therefore never rejected for being
+    /// a clear — only for being stale relative to a mirror another response
+    /// already advanced.
     pub fn set_room_read_cursor_mirror(
         &mut self,
         key: &RoomKey,
         principal_id: &str,
+        expected_prior_mirror: Option<u64>,
         mirrored_upstream_read_seq: Option<u64>,
-    ) -> Result<RoomReadCursorProjection> {
+    ) -> Result<RoomReadCursorMirrorCas> {
         let tx = self
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -3520,6 +3582,27 @@ impl SqliteRoomStore {
             .as_deref()
             .map(parse_canonical_u64_text)
             .transpose()?;
+        let read_current_read_seq = |tx: &rusqlite::Transaction<'_>| -> Result<Option<u64>> {
+            tx.query_row(
+                "SELECT read_seq FROM room_read_cursors WHERE room_id = ?1 AND principal_id = ?2",
+                params![key.as_str(), principal_id],
+                |r| r.get::<_, String>(0),
+            )
+            .optional()?
+            .map(|read_seq| parse_canonical_u64_text(&read_seq))
+            .transpose()
+        };
+        if current_mirror != expected_prior_mirror {
+            // A fresher response already landed since the caller snapshotted
+            // `expected_prior_mirror`: reject this write as stale rather than
+            // regressing (or wrongly clearing) the newer value.
+            let read_seq = read_current_read_seq(&tx)?;
+            tx.commit()?;
+            return Ok(RoomReadCursorMirrorCas::Stale(RoomReadCursorProjection {
+                read_seq,
+                mirrored_upstream_read_seq: current_mirror,
+            }));
+        }
         if current_mirror != mirrored_upstream_read_seq {
             tx.execute(
                 "INSERT INTO room_read_cursor_mirrors (room_id, principal_id, mirrored_upstream_read_seq)
@@ -3532,20 +3615,12 @@ impl SqliteRoomStore {
                 ],
             )?;
         }
-        let read_seq = tx
-            .query_row(
-                "SELECT read_seq FROM room_read_cursors WHERE room_id = ?1 AND principal_id = ?2",
-                params![key.as_str(), principal_id],
-                |r| r.get::<_, String>(0),
-            )
-            .optional()?
-            .map(|read_seq| parse_canonical_u64_text(&read_seq))
-            .transpose()?;
+        let read_seq = read_current_read_seq(&tx)?;
         tx.commit()?;
-        Ok(RoomReadCursorProjection {
+        Ok(RoomReadCursorMirrorCas::Applied(RoomReadCursorProjection {
             read_seq,
-            mirrored_upstream_read_seq: mirrored_upstream_read_seq.or(current_mirror),
-        })
+            mirrored_upstream_read_seq,
+        }))
     }
 
     /// Replace the room's SAFE projection fields — state, member roster,
@@ -7094,6 +7169,206 @@ mod tests {
             .unwrap();
         assert_eq!(first, second);
         assert_eq!(second.read_seq, Some(0));
+    }
+
+    // ── M1: idx_outbox_room_state must exist after migrate ────────────────
+    // The outbox index used to be embedded inside the `CREATE TABLE outbox`
+    // statement's column list, which produced invalid SQL that failed on
+    // every open(). Assert the index is actually present, not merely that
+    // migrate() didn't error.
+    #[test]
+    fn migrate_creates_outbox_room_state_index() {
+        let s = store();
+        let mut stmt = s.conn.prepare("PRAGMA index_list(outbox)").unwrap();
+        let index_names: Vec<String> = stmt
+            .query_map([], |row| row.get::<_, String>(1))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        assert!(
+            index_names.contains(&"idx_outbox_room_state".to_string()),
+            "expected idx_outbox_room_state in {index_names:?}"
+        );
+    }
+
+    #[test]
+    fn reopening_an_existing_db_still_has_outbox_room_state_index() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("reopen-outbox-index.db");
+        {
+            let mut s = SqliteRoomStore::open(&path).unwrap();
+            s.create(RoomKey::new("reopen-room"), "Reopen", None, now())
+                .unwrap();
+        }
+        let s = SqliteRoomStore::open(&path).unwrap();
+        let mut stmt = s.conn.prepare("PRAGMA index_list(outbox)").unwrap();
+        let index_names: Vec<String> = stmt
+            .query_map([], |row| row.get::<_, String>(1))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        assert!(index_names.contains(&"idx_outbox_room_state".to_string()));
+    }
+
+    // ── M5: set_room_read_cursor_mirror CAS ────────────────────────────────
+
+    fn cas_room(s: &mut SqliteRoomStore, name: &str) -> RoomKey {
+        let key = RoomKey::new(name);
+        s.create(key.clone(), name, None, now()).unwrap();
+        key
+    }
+
+    #[test]
+    fn set_room_read_cursor_mirror_applies_when_expected_prior_matches() {
+        let mut s = store();
+        let key = cas_room(&mut s, "mirror-cas-apply");
+        // Absent row: expected_prior_mirror is None.
+        let outcome = s
+            .set_room_read_cursor_mirror(&key, "principal", None, Some(5))
+            .unwrap();
+        assert!(outcome.was_applied());
+        assert_eq!(
+            outcome.clone().into_projection().mirrored_upstream_read_seq,
+            Some(5)
+        );
+        let projection = s.room_read_cursor(&key, "principal").unwrap();
+        assert_eq!(projection.mirrored_upstream_read_seq, Some(5));
+    }
+
+    /// H2 regression: an authoritative clear (`None`) applied via a matching
+    /// CAS must be reflected exactly in the returned projection, not
+    /// silently replaced by the prior on-disk value.
+    #[test]
+    fn set_room_read_cursor_mirror_clear_projection_reports_none_not_stale_value() {
+        let mut s = store();
+        let key = cas_room(&mut s, "mirror-cas-clear-projection");
+        let first = s
+            .set_room_read_cursor_mirror(&key, "principal", None, Some(42))
+            .unwrap();
+        assert!(first.was_applied());
+        let cleared = s
+            .set_room_read_cursor_mirror(&key, "principal", Some(42), None)
+            .unwrap();
+        assert!(cleared.was_applied());
+        let projection = cleared.into_projection();
+        assert_eq!(
+            projection.mirrored_upstream_read_seq, None,
+            "authoritative clear must report None, never fall back to the prior value"
+        );
+        // And the on-disk row genuinely reflects the clear, not just the
+        // in-memory return value.
+        let reread = s.room_read_cursor(&key, "principal").unwrap();
+        assert_eq!(reread.mirrored_upstream_read_seq, None);
+    }
+
+    /// M5 core regression: a stale (out-of-order) response describing an
+    /// older mirror state must never regress a newer mirror that already
+    /// landed while it was in flight.
+    #[test]
+    fn set_room_read_cursor_mirror_rejects_stale_regression() {
+        let mut s = store();
+        let key = cas_room(&mut s, "mirror-cas-stale-regression");
+        // Fast response lands first: mirror advances None -> 50.
+        let fast = s
+            .set_room_read_cursor_mirror(&key, "principal", None, Some(50))
+            .unwrap();
+        assert!(fast.was_applied());
+        // Slow response was snapshotted before the fast one landed (its
+        // expected_prior_mirror is still None) and now tries to write a
+        // smaller value.
+        let stale = s
+            .set_room_read_cursor_mirror(&key, "principal", None, Some(30))
+            .unwrap();
+        match stale {
+            RoomReadCursorMirrorCas::Stale(projection) => {
+                assert_eq!(projection.mirrored_upstream_read_seq, Some(50));
+            }
+            RoomReadCursorMirrorCas::Applied(_) => panic!("stale write must not apply"),
+        }
+        let reread = s.room_read_cursor(&key, "principal").unwrap();
+        assert_eq!(
+            reread.mirrored_upstream_read_seq,
+            Some(50),
+            "the newer mirror must survive the stale regression attempt"
+        );
+    }
+
+    /// M5: a stale response must not be able to CLEAR a newer mirror either
+    /// — "stale" is rejected uniformly regardless of whether the rejected
+    /// write would have regressed to a lower number or to `None`.
+    #[test]
+    fn set_room_read_cursor_mirror_rejects_stale_clear() {
+        let mut s = store();
+        let key = cas_room(&mut s, "mirror-cas-stale-clear");
+        let fast = s
+            .set_room_read_cursor_mirror(&key, "principal", None, Some(99))
+            .unwrap();
+        assert!(fast.was_applied());
+        // A stale GET response snapshotted before `fast` landed (so it still
+        // believes the prior mirror was None) reports upstream has no
+        // cursor. Applying it blindly would wrongly clear a mirror that has
+        // since moved on.
+        let stale_clear = s
+            .set_room_read_cursor_mirror(&key, "principal", None, None)
+            .unwrap();
+        match stale_clear {
+            RoomReadCursorMirrorCas::Stale(projection) => {
+                assert_eq!(projection.mirrored_upstream_read_seq, Some(99));
+            }
+            RoomReadCursorMirrorCas::Applied(_) => panic!("stale clear must not apply"),
+        }
+        let reread = s.room_read_cursor(&key, "principal").unwrap();
+        assert_eq!(reread.mirrored_upstream_read_seq, Some(99));
+    }
+
+    /// M5: an authoritative clear based on a fresh, matching snapshot must
+    /// still be allowed to succeed — the CAS guard rejects staleness, not
+    /// clearing itself.
+    #[test]
+    fn set_room_read_cursor_mirror_allows_authoritative_clear_when_fresh() {
+        let mut s = store();
+        let key = cas_room(&mut s, "mirror-cas-authoritative-clear");
+        let applied = s
+            .set_room_read_cursor_mirror(&key, "principal", None, Some(7))
+            .unwrap();
+        assert!(applied.was_applied());
+        // Caller re-snapshots (expected_prior_mirror = Some(7), matching
+        // current on-disk state) before issuing the clear.
+        let cleared = s
+            .set_room_read_cursor_mirror(&key, "principal", Some(7), None)
+            .unwrap();
+        assert!(
+            cleared.was_applied(),
+            "a fresh, correctly-based clear must apply"
+        );
+        assert_eq!(cleared.into_projection().mirrored_upstream_read_seq, None);
+    }
+
+    #[test]
+    fn set_room_read_cursor_mirror_no_op_write_is_still_applied() {
+        let mut s = store();
+        let key = cas_room(&mut s, "mirror-cas-noop");
+        let first = s
+            .set_room_read_cursor_mirror(&key, "principal", None, Some(3))
+            .unwrap();
+        assert!(first.was_applied());
+        // Same expected prior, same value: still counts as Applied (no
+        // staleness), even though the underlying row is unchanged.
+        let second = s
+            .set_room_read_cursor_mirror(&key, "principal", Some(3), Some(3))
+            .unwrap();
+        assert!(second.was_applied());
+        assert_eq!(second.into_projection().mirrored_upstream_read_seq, Some(3));
+    }
+
+    #[test]
+    fn set_room_read_cursor_mirror_unknown_room_errors() {
+        let mut s = store();
+        let key = RoomKey::new("mirror-cas-unknown-room");
+        let err = s
+            .set_room_read_cursor_mirror(&key, "principal", None, Some(1))
+            .unwrap_err();
+        assert!(matches!(err, RoomStoreError::UnknownRoom(k) if k == key));
     }
 
     #[test]

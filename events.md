@@ -5982,3 +5982,11 @@ Added an end-to-end regression proving one tool execution across a failed/retrie
 final synthesis. Verified full ocean-runtime tests (191 passed across targets),
 `cargo check -p ocean-daemon`, fmt, diff check, and independent review approval.
 _________________________________________________________________________________
+time:      [02:12] [06-08-26]
+agent:     [ocean], [gpt-5.6-sol], [pm]
+worktree:  feat/rooms-unread-integrated
+type:      [bug report]: close unread cursor and federated presence review defects
+area:      [backend]: ocean-daemon persistent rooms and ocean-store cursor durability
+
+Re-anchored the durable Rooms unread/presence delta onto merged main and closed the defect-first review findings: repaired the route manifest tripwire, aligned Live SSE cursor principals with credential-owned human ids, accepted explicitly flagged authoritative upstream clamping, made presence projection updates atomic and tolerant of mixed actor frames, unified read-cursor response shape, preserved `next_cursor: null`, restored the fresh-schema outbox state index, made clear projections truthful, and added CAS protection against stale mirror regressions and clears. Added focused daemon/store regressions. Verified `cargo fmt --all -- --check`, `git diff --check`, ocean-store library tests (146 passed), ocean-daemon binary tests (681 passed), and strict all-target clippy for ocean-daemon/ocean-store/ocean-core.
+_________________________________________________________________________________

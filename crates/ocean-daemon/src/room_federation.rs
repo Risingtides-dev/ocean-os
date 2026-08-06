@@ -79,6 +79,75 @@ enum GuardedMutationError {
     Store,
 }
 
+/// Upper bound on convergence retries in [`converge_room_read_cursor_mirror`].
+/// Real contention is at most a handful of in-flight GET/PATCH/push-frame
+/// writers per room/principal; this only guards against pathological churn
+/// so the mutate-guarded write path can never spin unbounded.
+const READ_CURSOR_MIRROR_CONVERGE_ATTEMPTS: usize = 8;
+
+/// Apply a read-cursor mirror write with a bounded convergence retry (F2).
+///
+/// The store's `set_room_read_cursor_mirror` is a strict compare-and-swap:
+/// a write is rejected as `Stale` whenever the on-disk mirror no longer
+/// equals the caller's `expected_prior_mirror` snapshot, regardless of
+/// whether the value this call is carrying is actually newer than what's
+/// there. Two upstream round trips (GET poll, PATCH, or a `room_read_cursor`
+/// push frame) can both succeed and race each other; without a retry, the
+/// response that merely lands second is dropped outright even when its
+/// `sequence` is the numerically newest one seen — a silent regression of
+/// the mirror to whichever response happened to land first.
+///
+/// This wrapper retries a losing `Some(sequence)` write against the fresh
+/// on-disk value as long as the value it carries is still strictly newer,
+/// so concurrent successful writes converge to the newest authoritative
+/// sequence instead of the loser being dropped. An authoritative clear
+/// (`sequence: None`) is never retried — it stays strictly CAS-protected,
+/// exactly as before: a clear that is stale relative to a fresher `Some`
+/// mirror is rejected outright, and a losing `Some` write whose value is
+/// not actually newer than what's already on disk is also left rejected
+/// rather than forced.
+fn converge_room_read_cursor_mirror(
+    rooms: &RoomStoreHandle,
+    key: &RoomKey,
+    principal_id: &str,
+    mut expected_prior_mirror: Option<u64>,
+    sequence: Option<u64>,
+) -> Result<ocean_store::RoomReadCursorMirrorCas, ocean_store::RoomStoreError> {
+    for _ in 0..READ_CURSOR_MIRROR_CONVERGE_ATTEMPTS {
+        let cas = with_rooms_handle(rooms, |store| {
+            store.set_room_read_cursor_mirror(key, principal_id, expected_prior_mirror, sequence)
+        })?;
+        let current = match &cas {
+            ocean_store::RoomReadCursorMirrorCas::Applied(_) => return Ok(cas),
+            ocean_store::RoomReadCursorMirrorCas::Stale(projection) => {
+                projection.mirrored_upstream_read_seq
+            }
+        };
+        let candidate = match sequence {
+            Some(candidate) => candidate,
+            // A clear is never retried: staying strictly CAS-protected is
+            // the whole point of an authoritative clear.
+            None => return Ok(cas),
+        };
+        let is_newer = match current {
+            Some(existing) => candidate > existing,
+            None => true,
+        };
+        if !is_newer {
+            // Our write is not actually newer than what already landed —
+            // this is the ordinary, correct "we lost the race and that's
+            // fine" outcome, not something to retry.
+            return Ok(cas);
+        }
+        expected_prior_mirror = current;
+    }
+    // Retry budget exhausted under pathological contention: return the last
+    // attempt's outcome (whatever it is) rather than looping forever.
+    with_rooms_handle(rooms, |store| {
+        store.set_room_read_cursor_mirror(key, principal_id, expected_prior_mirror, sequence)
+    })
+}
+
 #[derive(Clone)]
 pub(super) struct AgentRegistrationInput {
     pub(super) agent_name: String,
@@ -420,10 +489,6 @@ struct RunningRoom {
 }
 
 impl FederationSupervisor {
-    pub(super) fn local_human_read_cursor_principal(&self) -> &str {
-        "federated-local-human-read-cursor"
-    }
-
     pub(super) fn from_env(
         rooms: RoomStoreHandle,
         room_wakes: RoomWakeBus,
@@ -1202,6 +1267,17 @@ impl FederationSupervisor {
             .endpoint(&["api", "v1", "rooms", key.as_str(), "read-cursor"])
             .map_err(|_| IntentError::Unavailable)?;
         let generation = slot.generation.load(Ordering::Acquire);
+        // The store's mirror write is a compare-and-swap (M5): snapshot the
+        // expected prior mirror at the SAME point we snapshot `generation`
+        // (right before issuing the request) so a fresher response that
+        // lands from a concurrent GET/PATCH/frame while this one is in
+        // flight is detected and this write is rejected as stale instead of
+        // clobbering it.
+        let expected_prior_mirror = with_rooms_handle(&self.inner.rooms, |store| {
+            store.room_read_cursor(key, &credential.local_human_member_id)
+        })
+        .map_err(|_| IntentError::Store)?
+        .mirrored_upstream_read_seq;
         let response = match slot
             .control
             .send(
@@ -1245,21 +1321,21 @@ impl FederationSupervisor {
             }
             None => None,
         };
-        let projection = slot
+        let cas = slot
             .control
             .mutate(|| {
                 if slot.generation.load(Ordering::Acquire) != generation {
                     return Err(GuardedMutationError::Generation);
                 }
-                let result = with_rooms_handle(&self.inner.rooms, |store| {
-                    store.set_room_read_cursor_mirror(
-                        key,
-                        &credential.local_human_member_id,
-                        sequence,
-                    )
-                });
+                let result = converge_room_read_cursor_mirror(
+                    &self.inner.rooms,
+                    key,
+                    &credential.local_human_member_id,
+                    expected_prior_mirror,
+                    sequence,
+                );
                 match result {
-                    Ok(cursor) => Ok(cursor),
+                    Ok(cas) => Ok(cas),
                     Err(ocean_store::RoomStoreError::UnknownRoom(_)) => {
                         Err(GuardedMutationError::NotFound)
                     }
@@ -1268,13 +1344,21 @@ impl FederationSupervisor {
             })
             .await
             .ok_or(IntentError::Forbidden)?;
-        let projection = match projection {
-            Ok(cursor) => cursor,
+        let cas = match cas {
+            Ok(cas) => cas,
             Err(GuardedMutationError::Generation) => return Err(IntentError::Forbidden),
             Err(GuardedMutationError::NotFound) => return Err(IntentError::NotFound),
             Err(GuardedMutationError::Store) => return Err(IntentError::Store),
         };
-        publish_room_read_cursor_wake_on(&self.inner.read_cursor_wakes, key);
+        // A `Stale` result means a fresher write already landed concurrently
+        // (another GET/PATCH, or a `room_read_cursor` push frame); that
+        // write already published its own wake, so only re-publish when
+        // THIS call's write was the one actually applied.
+        let applied = cas.was_applied();
+        let projection = cas.into_projection();
+        if applied {
+            publish_room_read_cursor_wake_on(&self.inner.read_cursor_wakes, key);
+        }
         Ok(projection)
     }
 
@@ -1306,6 +1390,14 @@ impl FederationSupervisor {
             .endpoint(&["api", "v1", "rooms", key.as_str(), "read-cursor"])
             .map_err(|_| IntentError::Unavailable)?;
         let generation = slot.generation.load(Ordering::Acquire);
+        // Snapshot the CAS `expected_prior_mirror` (M5) at the same point as
+        // `generation`, before the request goes out — see the matching
+        // comment in `room_get_read_cursor`.
+        let expected_prior_mirror = with_rooms_handle(&self.inner.rooms, |store| {
+            store.room_read_cursor(key, &credential.local_human_member_id)
+        })
+        .map_err(|_| IntentError::Store)?
+        .mirrored_upstream_read_seq;
         let response = match slot
             .control
             .send(
@@ -1351,24 +1443,37 @@ impl FederationSupervisor {
             }
             None => None,
         };
-        if sequence != Some(read_seq) {
+        // The upstream read-cursor store is authoritative for `read_seq` and
+        // may clamp our request down to its own known high-water mark; it
+        // signals that explicitly via `clamped: true` (H3). Trust that
+        // signal instead of rejecting a truthfully clamped response as a
+        // protocol violation — but only within the bound the signal claims
+        // to describe: a genuine clamp can only ever return a sequence that
+        // is `Some` and no greater than what we requested (F4). A response
+        // that flags `clamped: true` yet reports no sequence, or a
+        // sequence ABOVE what we asked for, is not a truthful clamp-down —
+        // it is still rejected as a protocol violation, exactly like an
+        // unflagged mismatch.
+        let truthfully_clamped =
+            body.clamped == Some(true) && matches!(sequence, Some(clamped) if clamped <= read_seq);
+        if sequence != Some(read_seq) && !truthfully_clamped {
             return Err(IntentError::Protocol);
         }
-        let projection = slot
+        let cas = slot
             .control
             .mutate(|| {
                 if slot.generation.load(Ordering::Acquire) != generation {
                     return Err(GuardedMutationError::Generation);
                 }
-                let result = with_rooms_handle(&self.inner.rooms, |store| {
-                    store.set_room_read_cursor_mirror(
-                        key,
-                        &credential.local_human_member_id,
-                        sequence,
-                    )
-                });
+                let result = converge_room_read_cursor_mirror(
+                    &self.inner.rooms,
+                    key,
+                    &credential.local_human_member_id,
+                    expected_prior_mirror,
+                    sequence,
+                );
                 match result {
-                    Ok(cursor) => Ok(cursor),
+                    Ok(cas) => Ok(cas),
                     Err(ocean_store::RoomStoreError::UnknownRoom(_)) => {
                         Err(GuardedMutationError::NotFound)
                     }
@@ -1377,13 +1482,19 @@ impl FederationSupervisor {
             })
             .await
             .ok_or(IntentError::Forbidden)?;
-        let projection = match projection {
-            Ok(cursor) => cursor,
+        let cas = match cas {
+            Ok(cas) => cas,
             Err(GuardedMutationError::Generation) => return Err(IntentError::Forbidden),
             Err(GuardedMutationError::NotFound) => return Err(IntentError::NotFound),
             Err(GuardedMutationError::Store) => return Err(IntentError::Store),
         };
-        publish_room_read_cursor_wake_on(&self.inner.read_cursor_wakes, key);
+        // Same stale-write handling as `room_get_read_cursor`: only
+        // re-publish the wake for a write this call actually applied.
+        let applied = cas.was_applied();
+        let projection = cas.into_projection();
+        if applied {
+            publish_room_read_cursor_wake_on(&self.inner.read_cursor_wakes, key);
+        }
         Ok(projection)
     }
 
@@ -2034,7 +2145,10 @@ struct ReadCursorBody {
     #[allow(dead_code)]
     #[serde(default)]
     changed: Option<bool>,
-    #[allow(dead_code)]
+    /// The upstream read-cursor store clamped our requested `read_seq` down
+    /// to its own authoritative high-water mark. `room_patch_read_cursor`
+    /// (H3) trusts this signal instead of demanding the response echo the
+    /// exact requested value.
     #[serde(default)]
     clamped: Option<bool>,
 }
@@ -2630,42 +2744,59 @@ fn apply_presence_frame(
     incoming: &[PresenceWireMember],
     live_human_member_ids: &mut HashSet<String>,
 ) -> bool {
-    let projection = match with_rooms_handle(&inner.rooms, |store| store.room_access(key)) {
-        Ok(projection) => projection,
-        Err(_) => return false,
-    };
-    if incoming.iter().any(|member| {
-        member.actor_type != FederatedActorType::User
-            || member.member_id.is_empty()
-            || member.display_name.is_empty()
-            || member.joined_at.is_empty()
-    }) {
+    // `room_presence` frames report the currently-live human members; other
+    // actor types carry no presence meaning here, so a mixed/additive frame
+    // that also echoes non-User entries (M4) is handled by ignoring them
+    // rather than discarding the whole update. The one thing that can't be
+    // safely interpreted is a User entry with an empty `member_id` — that
+    // alone still fails the frame.
+    if incoming
+        .iter()
+        .any(|member| member.actor_type == FederatedActorType::User && member.member_id.is_empty())
+    {
         return false;
     }
-    let live_humans: HashSet<&str> = incoming
+    let live_humans: HashSet<String> = incoming
         .iter()
         .filter(|member| member.actor_type == FederatedActorType::User)
-        .map(|member| member.member_id.as_str())
+        .map(|member| member.member_id.clone())
         .collect();
-    let mut members = projection.members;
-    live_human_member_ids.clear();
-    live_human_member_ids.extend(live_humans.iter().map(|member_id| (*member_id).to_string()));
-    for member in &mut members {
-        match member.actor_type {
-            FederatedActorType::User => {
-                member.derived_presence =
+    // Read the current roster, derive presence, and commit the update under
+    // a single lock acquisition (M3). Splitting this into a separate read
+    // (`with_rooms_handle`) followed by a separate `commit_access` call
+    // left a window for a concurrent writer — another presence frame, a
+    // heartbeat roster refresh, a message ingest — to interleave between
+    // the two lock acquisitions and have its update silently lost when this
+    // stale read was written back.
+    let committed = with_rooms_handle(&inner.rooms, |store| {
+        let projection = store.room_access(key)?;
+        let mut members = projection.members;
+        for member in &mut members {
+            member.derived_presence = match member.actor_type {
+                FederatedActorType::User => {
                     Some(if live_humans.contains(member.member_id.as_str()) {
                         MemberPresence::Live
                     } else {
                         MemberPresence::Unavailable
-                    });
-            }
-            FederatedActorType::Agent => {
-                member.derived_presence = None;
-            }
+                    })
+                }
+                FederatedActorType::Agent => None,
+            };
         }
+        store.update_room_access_safe(key, Some(state), Some(&members), None)
+    });
+    if committed.is_err() {
+        return false;
     }
-    commit_access(inner, key, state, Some(&members), None)
+    // Only replace the epoch-local live-humans cache after the durable
+    // commit has actually succeeded (M2). Clearing/repopulating it before
+    // the write was confirmed left it out of sync with the store on any
+    // failed commit (an UnknownRoom race, a poisoned-lock recovery that
+    // still errors, etc.), silently wiping the in-memory presence view the
+    // next roster fetch (`fetch_roster`/`project_roster`) derives from.
+    *live_human_member_ids = live_humans;
+    publish_room_access_wake_on(&inner.access_wakes, key);
+    true
 }
 
 fn apply_mirrored_read_cursor_frame(
@@ -2678,16 +2809,27 @@ fn apply_mirrored_read_cursor_frame(
         Some(sequence) => Some(parse_canonical_u64(&sequence)?),
         None => None,
     };
-    let changed = with_rooms_handle(&inner.rooms, |store| {
-        let before = store.room_read_cursor(key, credential.local_human_member_id.as_str())?;
-        let after = store.set_room_read_cursor_mirror(
-            key,
-            credential.local_human_member_id.as_str(),
-            read_seq,
-        )?;
-        Ok::<bool, ocean_store::RoomStoreError>(before != after)
+    let before = with_rooms_handle(&inner.rooms, |store| {
+        store.room_read_cursor(key, credential.local_human_member_id.as_str())
     })
     .map_err(|_| BridgeError::Store)?;
+    let cas = converge_room_read_cursor_mirror(
+        &inner.rooms,
+        key,
+        credential.local_human_member_id.as_str(),
+        before.mirrored_upstream_read_seq,
+        read_seq,
+    )
+    .map_err(|_| BridgeError::Store)?;
+    // F5: `was_applied()` only tells us the (possibly retried/converged)
+    // write was accepted, not that it actually moved the value — writing
+    // back the same sequence that was already mirrored (a duplicate/no-op
+    // frame) is `Applied` (it's not stale) but is not a real change, and
+    // must not trigger a wake. True change detection compares what
+    // actually landed on disk against what was there immediately before
+    // this write started.
+    let changed = cas.was_applied()
+        && cas.into_projection().mirrored_upstream_read_seq != before.mirrored_upstream_read_seq;
     Ok(changed)
 }
 
@@ -3351,6 +3493,105 @@ mod tests {
         assert!(tokio::time::timeout(Duration::from_millis(50), rx.recv())
             .await
             .is_err());
+        server.abort();
+    }
+
+    /// H3 regression: the upstream read-cursor store is authoritative and
+    /// may clamp our requested `read_seq` down to its own high-water mark,
+    /// signalling that explicitly via `"clamped": true`. That truthful,
+    /// explicitly-flagged response must be accepted and mirrored — not
+    /// treated as the same protocol violation as an unflagged mismatch.
+    #[tokio::test]
+    async fn room_read_cursor_live_patch_accepts_flagged_authoritative_clamp() {
+        let key = RoomKey::new("cursor-clamped-room");
+        let mut store = ocean_store::SqliteRoomStore::open_in_memory().unwrap();
+        store
+            .create(key.clone(), "Cursor", None, chrono::Utc::now())
+            .unwrap();
+        store
+            .update_room_access_safe(&key, Some(RoomAccessState::Live), Some(&[]), None)
+            .unwrap();
+        store
+            .install_room_credential(&key, "bearer", "principal")
+            .unwrap();
+        let rooms = Arc::new(std::sync::Mutex::new(store));
+        let wakes = RoomReadCursorWakeBus::default();
+        let mut rx = wakes.subscribe();
+        let fake = FakeBedrock::new(key.as_str(), "bearer");
+        *fake.read_cursor_response.lock().await = json!({
+            "room_id": key.as_str(),
+            "sequence": "7",
+            "changed": true,
+            "clamped": true
+        });
+        let (base, server) = start_fake_bedrock(fake.clone()).await;
+        let supervisor = FederationSupervisor::for_test(
+            &base,
+            rooms.clone(),
+            RoomWakeBus::default(),
+            RoomAccessWakeBus::default(),
+            wakes,
+            CancellationToken::new(),
+            Duration::from_millis(25),
+        );
+
+        let patched = supervisor
+            .room_patch_read_cursor(&key, 8)
+            .await
+            .expect("an authoritative, explicitly-clamped response must be accepted");
+        assert_eq!(patched.mirrored_upstream_read_seq, Some(7));
+        let cursor =
+            with_rooms_handle(&rooms, |store| store.room_read_cursor(&key, "principal")).unwrap();
+        assert_eq!(cursor.mirrored_upstream_read_seq, Some(7));
+        assert!(tokio::time::timeout(Duration::from_millis(200), rx.recv())
+            .await
+            .is_ok());
+        server.abort();
+    }
+
+    /// H3: a response that neither echoes the requested value NOR claims to
+    /// be clamped is still rejected as a protocol violation — the fix only
+    /// trusts an explicit `clamped: true` signal, it does not silently
+    /// accept every non-matching sequence.
+    #[tokio::test]
+    async fn room_read_cursor_live_patch_still_rejects_unflagged_lower_sequence() {
+        let key = RoomKey::new("cursor-unflagged-lower-room");
+        let mut store = ocean_store::SqliteRoomStore::open_in_memory().unwrap();
+        store
+            .create(key.clone(), "Cursor", None, chrono::Utc::now())
+            .unwrap();
+        store
+            .update_room_access_safe(&key, Some(RoomAccessState::Live), Some(&[]), None)
+            .unwrap();
+        store
+            .install_room_credential(&key, "bearer", "principal")
+            .unwrap();
+        let rooms = Arc::new(std::sync::Mutex::new(store));
+        let fake = FakeBedrock::new(key.as_str(), "bearer");
+        *fake.read_cursor_response.lock().await = json!({
+            "room_id": key.as_str(),
+            "sequence": "7",
+            "changed": true,
+            "clamped": false
+        });
+        let (base, server) = start_fake_bedrock(fake.clone()).await;
+        let supervisor = FederationSupervisor::for_test(
+            &base,
+            rooms.clone(),
+            RoomWakeBus::default(),
+            RoomAccessWakeBus::default(),
+            RoomReadCursorWakeBus::default(),
+            CancellationToken::new(),
+            Duration::from_millis(25),
+        );
+
+        assert_eq!(
+            supervisor.room_patch_read_cursor(&key, 8).await,
+            Err(IntentError::Protocol)
+        );
+        let cursor =
+            with_rooms_handle(&rooms, |store| store.room_read_cursor(&key, "principal")).unwrap();
+        assert_eq!(cursor.mirrored_upstream_read_seq, None);
         server.abort();
     }
 
@@ -5563,7 +5804,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn room_presence_event_accepts_only_canonical_shape_and_preserves_cursor() {
+    async fn room_presence_event_ignores_mixed_actor_types_and_preserves_cursor() {
         let key = RoomKey::new("presence-canonical");
         let human = "11111111-1111-4111-8111-111111111111";
         let remote_human = "22222222-2222-4222-8222-222222222222";
@@ -5624,6 +5865,7 @@ mod tests {
             )
             .unwrap();
         let rooms = Arc::new(std::sync::Mutex::new(store));
+        let mut live_human_member_ids: HashSet<String> = HashSet::new();
 
         assert!(apply_presence_frame(
             &test_supervisor_inner(rooms.clone()),
@@ -5636,7 +5878,7 @@ mod tests {
                 display_name: "Human".into(),
                 joined_at: "2026-07-17T00:00:00Z".into(),
             }],
-            &mut HashSet::new(),
+            &mut live_human_member_ids,
         ));
         let projection = with_rooms_handle(&rooms, |s| s.room_access(&key)).unwrap();
         assert_eq!(projection.last_confirmed_global_sequence, Some(7));
@@ -5649,26 +5891,57 @@ mod tests {
             Some(MemberPresence::Unavailable)
         );
         assert_eq!(projection.members[2].derived_presence, None);
+        assert_eq!(
+            live_human_member_ids,
+            HashSet::from([human.to_string()]),
+            "live-humans cache reflects the committed frame"
+        );
 
-        let snapshot = projection.clone();
-        assert!(!apply_presence_frame(
+        // M4: a mixed frame that additively echoes a non-User (agent) entry
+        // alongside the live human must not be treated as a protocol
+        // violation that tears down the epoch — the agent entry carries no
+        // presence meaning here and is ignored, while the human's live
+        // status is still applied.
+        assert!(apply_presence_frame(
             &test_supervisor_inner(rooms.clone()),
             &key,
             RoomAccessState::Live,
-            &[PresenceWireMember {
-                member_id: remote_human.into(),
-                actor_type: FederatedActorType::Agent,
-                role_in_room: FederatedRoomRole::Member,
-                display_name: "Remote".into(),
-                joined_at: "2026-07-17T00:00:01Z".into(),
-            }],
-            &mut HashSet::new(),
+            &[
+                PresenceWireMember {
+                    member_id: human.into(),
+                    actor_type: FederatedActorType::User,
+                    role_in_room: FederatedRoomRole::Owner,
+                    display_name: "Human".into(),
+                    joined_at: "2026-07-17T00:00:00Z".into(),
+                },
+                PresenceWireMember {
+                    member_id: agent.into(),
+                    actor_type: FederatedActorType::Agent,
+                    role_in_room: FederatedRoomRole::Member,
+                    display_name: "Agent".into(),
+                    joined_at: "2026-07-17T00:00:02Z".into(),
+                },
+            ],
+            &mut live_human_member_ids,
         ));
+        let projection = with_rooms_handle(&rooms, |s| s.room_access(&key)).unwrap();
         assert_eq!(
-            with_rooms_handle(&rooms, |s| s.room_access(&key)).unwrap(),
-            snapshot
+            projection.members[0].derived_presence,
+            Some(MemberPresence::Live)
         );
+        assert_eq!(
+            projection.members[1].derived_presence,
+            Some(MemberPresence::Unavailable)
+        );
+        assert_eq!(projection.members[2].derived_presence, None);
+        assert_eq!(live_human_member_ids, HashSet::from([human.to_string()]));
 
+        // M2: a malformed frame (an empty `member_id` on a User entry can't
+        // be matched against the roster) is rejected WITHOUT mutating
+        // either the durable projection or the epoch-local live-humans
+        // cache.
+        let snapshot = projection.clone();
+        let cache_before = live_human_member_ids.clone();
         assert!(!apply_presence_frame(
             &test_supervisor_inner(rooms.clone()),
             &key,
@@ -5680,11 +5953,45 @@ mod tests {
                 display_name: "Remote".into(),
                 joined_at: "2026-07-17T00:00:01Z".into(),
             }],
-            &mut HashSet::new(),
+            &mut live_human_member_ids,
         ));
         assert_eq!(
             with_rooms_handle(&rooms, |s| s.room_access(&key)).unwrap(),
             snapshot
+        );
+        assert_eq!(live_human_member_ids, cache_before);
+    }
+
+    /// M2 regression: when the durable commit fails (here, an unknown
+    /// room), `apply_presence_frame` must return `false` without touching
+    /// the caller's `live_human_member_ids` cache at all. A prior
+    /// implementation cleared and repopulated that cache from the incoming
+    /// frame BEFORE the store commit was confirmed, so a failed write
+    /// silently wiped the in-memory presence view out from under the next
+    /// roster fetch even though nothing durable had changed.
+    #[tokio::test]
+    async fn apply_presence_frame_does_not_wipe_live_cache_when_commit_fails() {
+        let store = ocean_store::SqliteRoomStore::open_in_memory().unwrap();
+        let rooms = Arc::new(std::sync::Mutex::new(store));
+        let key = RoomKey::new("presence-unknown-room");
+        let mut live_human_member_ids: HashSet<String> = HashSet::from(["stale-human".to_string()]);
+
+        assert!(!apply_presence_frame(
+            &test_supervisor_inner(rooms.clone()),
+            &key,
+            RoomAccessState::Live,
+            &[PresenceWireMember {
+                member_id: "11111111-1111-4111-8111-111111111111".into(),
+                actor_type: FederatedActorType::User,
+                role_in_room: FederatedRoomRole::Owner,
+                display_name: "Human".into(),
+                joined_at: "2026-07-17T00:00:00Z".into(),
+            }],
+            &mut live_human_member_ids,
+        ));
+        assert_eq!(
+            live_human_member_ids,
+            HashSet::from(["stale-human".to_string()])
         );
     }
 

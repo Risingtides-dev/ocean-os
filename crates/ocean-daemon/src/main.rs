@@ -12655,9 +12655,13 @@ mod tests {
         .await;
         assert_eq!(status, StatusCode::OK);
         let list = persistent_room_http_json(&raw);
-        assert_json_object_keys(&list, &["ok", "rooms", "read_states", "has_more"]);
+        assert_json_object_keys(
+            &list,
+            &["ok", "rooms", "read_states", "next_cursor", "has_more"],
+        );
         assert_eq!(list["ok"], true);
         assert_eq!(list["rooms"].as_array().unwrap().len(), 1);
+        assert_eq!(list["next_cursor"], serde_json::Value::Null);
         assert_eq!(
             list["read_states"],
             json!([{
@@ -24816,13 +24820,15 @@ mod tests {
             "live Router::route registrations and GET / discovery must match"
         );
         // 95 -> 98: room artifacts added POST+GET /artifacts and
-        // POST /artifacts/{artifact_id}/amend. Moved DELIBERATELY. The parity
-        // assertion above is the real gate — it proves every advertised route is
-        // actually registered — and this count is the tripwire that forces a
-        // human to look when the surface grows.
+        // POST /artifacts/{artifact_id}/amend.
+        // 99 -> 101: durable read-cursor projection added GET+PATCH
+        // /v1/rooms/persistent/{key}/read-cursor. Moved DELIBERATELY. The
+        // parity assertion above is the real gate — it proves every
+        // advertised route is actually registered — and this count is the
+        // tripwire that forces a human to look when the surface grows.
         assert_eq!(
             banner.len(),
-            99,
+            101,
             "route baseline changed; review the manifest"
         );
 
