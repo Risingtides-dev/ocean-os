@@ -1,6 +1,7 @@
 use std::{
     collections::HashSet,
     convert::Infallible,
+    pin::Pin,
     sync::{Arc, Mutex},
 };
 
@@ -15,8 +16,8 @@ use ocean_agent_sdk::{AgentSessionId, AgentTurnEvent};
 use ocean_core::{
     evaluate_trigger_policy, PermissionMode, PromptRequest, PublicAgentDescriptor, RequestState,
     RoomAccessProjection, RoomAccessState, RoomArtifactKind, RoomArtifactState, RoomKey,
-    RoomMessage, RoomMessageKind, RoomParticipant, RoomParticipantKind, RoomTriggerEvent,
-    RoomTriggerPolicy,
+    RoomMessage, RoomMessageKind, RoomParticipant, RoomParticipantKind, RoomReadCursorProjection,
+    RoomReadCursorUpdateRequest, RoomTriggerEvent, RoomTriggerPolicy,
 };
 #[cfg(test)]
 use ocean_core::{OutboxItemState, RoomOutboxItem};
@@ -117,6 +118,11 @@ pub(super) struct RoomAccessWakeHint {
     room: RoomKey,
 }
 
+#[derive(Debug, Clone)]
+pub(super) struct RoomReadCursorWakeHint {
+    room: RoomKey,
+}
+
 /// Daemon-wide bounded wake channel for room access projection changes.
 #[derive(Clone)]
 pub(super) struct RoomAccessWakeBus {
@@ -152,6 +158,41 @@ impl RoomAccessWakeBus {
     fn publish(&self, room: &RoomKey) {
         let _ = self.tx.send(RoomAccessWakeHint { room: room.clone() });
     }
+}
+
+/// Daemon-wide bounded wake channel for room read-cursor projection changes.
+#[derive(Clone)]
+pub(super) struct RoomReadCursorWakeBus {
+    tx: broadcast::Sender<RoomReadCursorWakeHint>,
+}
+
+impl Default for RoomReadCursorWakeBus {
+    fn default() -> Self {
+        Self::new(64)
+    }
+}
+
+impl RoomReadCursorWakeBus {
+    pub(super) fn new(capacity: usize) -> Self {
+        let (tx, _) = broadcast::channel(capacity);
+        Self { tx }
+    }
+
+    pub(super) fn subscribe(&self) -> broadcast::Receiver<RoomReadCursorWakeHint> {
+        self.tx.subscribe()
+    }
+
+    fn publish(&self, room: &RoomKey) {
+        let _ = self.tx.send(RoomReadCursorWakeHint { room: room.clone() });
+    }
+}
+
+pub(super) fn publish_room_read_cursor_wake(state: &AppState, room: &RoomKey) {
+    publish_room_read_cursor_wake_on(&state.room_read_cursor_wakes, room);
+}
+
+pub(super) fn publish_room_read_cursor_wake_on(wakes: &RoomReadCursorWakeBus, room: &RoomKey) {
+    wakes.publish(room);
 }
 
 /// Publish an access-projection wake hint only after the store adapter has
@@ -538,6 +579,28 @@ pub(super) struct RoomsListQuery {
     pub(super) cursor: Option<String>,
 }
 
+#[derive(Debug, Clone, serde::Serialize, PartialEq, Eq)]
+struct PersistentRoomReadState {
+    room_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    latest_seq: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    read_seq: Option<String>,
+}
+
+#[derive(Debug, Clone, serde::Serialize, PartialEq, Eq)]
+struct PersistentRoomsListResponse {
+    ok: bool,
+    rooms: Vec<ocean_core::Room>,
+    read_states: Vec<PersistentRoomReadState>,
+    // Deliberately NOT `skip_serializing_if`: pre-existing pollers rely on the
+    // key always being present (`"next_cursor": null` on the final page), so
+    // omitting the key on a single-page response would be a silent wire
+    // compatibility break.
+    next_cursor: Option<String>,
+    has_more: bool,
+}
+
 /// `GET /v1/rooms/persistent?limit=&cursor=` — list open persistent rooms, one
 /// bounded page at a time (OCEAN-250). Rooms are ordered most-recently-updated
 /// first; the `rooms` array shape is unchanged, with additive
@@ -546,15 +609,62 @@ pub(super) async fn rooms_list_persistent(
     State(state): State<AppState>,
     Query(q): Query<RoomsListQuery>,
 ) -> (StatusCode, Json<serde_json::Value>) {
-    match with_rooms(&state, |reg| reg.list_page(q.cursor.as_deref(), q.limit)) {
-        Ok(page) => (
+    match with_rooms(&state, |reg| {
+        let page = reg.list_page(q.cursor.as_deref(), q.limit)?;
+        let read_states = page
+            .rooms
+            .iter()
+            .map(|room| {
+                let key = room.id.clone();
+                let access = reg.room_access(&key)?;
+                let principal: Option<String> = match access.state {
+                    RoomAccessState::Local => Some(local_room_read_cursor_principal().to_string()),
+                    RoomAccessState::Live
+                    | RoomAccessState::Connecting
+                    | RoomAccessState::Recovering
+                    | RoomAccessState::Revoked => reg
+                        .room_credential(&key)?
+                        .map(|credential| credential.local_human_member_id),
+                };
+                let cursor = match principal.as_deref() {
+                    Some(principal) => reg.room_read_cursor(&key, principal)?,
+                    None => RoomReadCursorProjection {
+                        read_seq: None,
+                        mirrored_upstream_read_seq: None,
+                    },
+                };
+                let latest_seq = match access.state {
+                    RoomAccessState::Local => reg.room_latest_durable_seq(&key)?,
+                    RoomAccessState::Live => access.last_confirmed_global_sequence,
+                    RoomAccessState::Connecting
+                    | RoomAccessState::Recovering
+                    | RoomAccessState::Revoked => access.last_confirmed_global_sequence,
+                };
+                let read_seq = match access.state {
+                    RoomAccessState::Local => cursor.read_seq,
+                    RoomAccessState::Live
+                    | RoomAccessState::Connecting
+                    | RoomAccessState::Recovering
+                    | RoomAccessState::Revoked => cursor.mirrored_upstream_read_seq,
+                };
+                Ok::<_, ocean_store::RoomStoreError>(PersistentRoomReadState {
+                    room_id: room.id.to_string(),
+                    latest_seq: latest_seq.map(|seq| seq.to_string()),
+                    read_seq: read_seq.map(|seq| seq.to_string()),
+                })
+            })
+            .collect::<Result<Vec<_>, ocean_store::RoomStoreError>>()?;
+        Ok::<_, ocean_store::RoomStoreError>(PersistentRoomsListResponse {
+            ok: true,
+            rooms: page.rooms,
+            read_states,
+            next_cursor: page.next_cursor,
+            has_more: page.has_more,
+        })
+    }) {
+        Ok(response) => (
             StatusCode::OK,
-            Json(json!({
-                "ok": true,
-                "rooms": page.rooms,
-                "next_cursor": page.next_cursor,
-                "has_more": page.has_more,
-            })),
+            Json(serde_json::to_value(response).unwrap()),
         ),
         Err(e) => room_store_error_response(e),
     }
@@ -2042,6 +2152,211 @@ pub(super) async fn room_snapshot(
     }
 }
 
+#[derive(Debug, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct RoomReadCursorPatchRequest {
+    pub(super) read_seq: u64,
+}
+
+/// Canonical `GET`/`PATCH .../read-cursor` response body — used for BOTH
+/// Local and Live rooms so callers see one schema regardless of access
+/// state. `read_seq` is stringified (matching every other sequence number
+/// in this API) because raw `u64` values above 2^53 are not
+/// JS-number-precision-safe.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+struct RoomReadCursorBody {
+    room_id: String,
+    read_seq: Option<String>,
+}
+
+fn local_room_read_cursor_principal() -> &'static str {
+    "daemon-local-room-read-cursor"
+}
+
+/// The read-cursor mirror principal for a Live room is the local human's
+/// per-room federated member id installed with the room credential — NOT a
+/// fixed constant. `room_federation::FederationSupervisor::room_get_read_cursor`
+/// / `room_patch_read_cursor` always mutate `room_read_cursor_mirrors` keyed
+/// by `credential.local_human_member_id`, so any reader here must resolve the
+/// exact same key or it will silently observe an always-empty cursor (H1).
+fn live_room_read_cursor_principal(
+    store: &ocean_store::SqliteRoomStore,
+    key: &RoomKey,
+) -> Result<Option<String>, ocean_store::RoomStoreError> {
+    Ok(store
+        .room_credential(key)?
+        .map(|credential| credential.local_human_member_id))
+}
+
+fn room_read_cursor_unsupported_response(
+    state: RoomAccessState,
+) -> (StatusCode, Json<serde_json::Value>) {
+    (
+        StatusCode::CONFLICT,
+        Json(json!({
+            "ok": false,
+            "code": "room_read_cursor_unsupported",
+            "error": format!("read cursor unsupported for access state '{state:?}'")
+                .to_lowercase()
+                .replace("roomaccessstate::", "")
+        })),
+    )
+}
+
+pub(super) async fn room_get_read_cursor(
+    State(state): State<AppState>,
+    Path(raw_key): Path<String>,
+) -> (StatusCode, Json<serde_json::Value>) {
+    let trimmed = raw_key.trim();
+    if trimmed.is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "ok": false, "error": "invalid room key; must be non-empty" })),
+        );
+    }
+    let key = RoomKey::new(trimmed);
+    match with_rooms(&state, |store| {
+        let access = store.room_access(&key)?;
+        match access.state {
+            RoomAccessState::Local => Ok(Ok(store
+                .room_read_cursor(&key, local_room_read_cursor_principal())?
+                .read_seq)),
+            RoomAccessState::Live => Ok(Err(RoomAccessState::Live)),
+            other => Ok(Err(other)),
+        }
+    }) {
+        Ok(Ok(read_seq)) => (
+            StatusCode::OK,
+            Json(json!({
+                "ok": true,
+                "cursor": RoomReadCursorBody {
+                    room_id: key.as_str().to_string(),
+                    read_seq: read_seq.map(|seq| seq.to_string()),
+                }
+            })),
+        ),
+        Ok(Err(RoomAccessState::Live)) => {
+            match state.room_federation.room_get_read_cursor(&key).await {
+                Ok(cursor) => (
+                    StatusCode::OK,
+                    Json(json!({
+                        "ok": true,
+                        "cursor": RoomReadCursorBody {
+                            room_id: key.as_str().to_string(),
+                            read_seq: cursor
+                                .mirrored_upstream_read_seq
+                                .map(|seq| seq.to_string()),
+                        }
+                    })),
+                ),
+                Err(crate::room_federation::IntentError::Forbidden) => (
+                    StatusCode::FORBIDDEN,
+                    Json(json!({ "ok": false, "error": "membership_revoked" })),
+                ),
+                Err(crate::room_federation::IntentError::Conflict) => {
+                    room_read_cursor_unsupported_response(RoomAccessState::Live)
+                }
+                Err(crate::room_federation::IntentError::NotFound) => (
+                    StatusCode::NOT_FOUND,
+                    Json(
+                        json!({ "ok": false, "error": format!("no open room with key '{}'", key) }),
+                    ),
+                ),
+                Err(_) => (
+                    StatusCode::BAD_GATEWAY,
+                    Json(json!({ "ok": false, "error": "federated read cursor unavailable" })),
+                ),
+            }
+        }
+        Ok(Err(state)) => room_read_cursor_unsupported_response(state),
+        Err(e) => room_store_error_response(e),
+    }
+}
+
+pub(super) async fn room_patch_read_cursor(
+    State(state): State<AppState>,
+    Path(raw_key): Path<String>,
+    body: axum::body::Bytes,
+) -> (StatusCode, Json<serde_json::Value>) {
+    let req: RoomReadCursorPatchRequest = match serde_json::from_slice(&body) {
+        Ok(r) => r,
+        Err(_) => return invalid_request_response(),
+    };
+    let trimmed = raw_key.trim();
+    if trimmed.is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "ok": false, "error": "invalid room key; must be non-empty" })),
+        );
+    }
+    let key = RoomKey::new(trimmed);
+    match with_rooms(&state, |store| {
+        let access = store.room_access(&key)?;
+        if access.state == RoomAccessState::Local {
+            let cursor = store.update_room_read_cursor(
+                &key,
+                local_room_read_cursor_principal(),
+                RoomReadCursorUpdateRequest {
+                    read_seq: req.read_seq,
+                },
+            )?;
+            return Ok(Ok(cursor.read_seq));
+        }
+        if access.state == RoomAccessState::Live {
+            return Ok(Err(RoomAccessState::Live));
+        }
+        Ok(Err(access.state))
+    }) {
+        Ok(Ok(read_seq)) => {
+            publish_room_read_cursor_wake(&state, &key);
+            (
+                StatusCode::OK,
+                Json(json!({
+                    "ok": true,
+                    "cursor": RoomReadCursorBody {
+                        room_id: key.as_str().to_string(),
+                        read_seq: read_seq.map(|seq| seq.to_string()),
+                    }
+                })),
+            )
+        }
+        Ok(Err(RoomAccessState::Live)) => match state
+            .room_federation
+            .room_patch_read_cursor(&key, req.read_seq)
+            .await
+        {
+            Ok(cursor) => (
+                StatusCode::OK,
+                Json(json!({
+                    "ok": true,
+                    "cursor": RoomReadCursorBody {
+                        room_id: key.as_str().to_string(),
+                        read_seq: cursor.mirrored_upstream_read_seq.map(|seq| seq.to_string()),
+                    }
+                })),
+            ),
+            Err(crate::room_federation::IntentError::Conflict) => {
+                room_read_cursor_unsupported_response(RoomAccessState::Live)
+            }
+            Err(crate::room_federation::IntentError::Forbidden) => (
+                StatusCode::FORBIDDEN,
+                Json(json!({ "ok": false, "error": "membership_revoked" })),
+            ),
+            Err(crate::room_federation::IntentError::NotFound) => (
+                StatusCode::NOT_FOUND,
+                Json(json!({ "ok": false, "error": format!("no open room with key '{}'", key) })),
+            ),
+            Err(crate::room_federation::IntentError::Protocol) => invalid_request_response(),
+            Err(_) => (
+                StatusCode::BAD_GATEWAY,
+                Json(json!({ "ok": false, "error": "federated read cursor unavailable" })),
+            ),
+        },
+        Ok(Err(state)) => room_read_cursor_unsupported_response(state),
+        Err(e) => room_store_error_response(e),
+    }
+}
+
 #[derive(Debug, serde::Deserialize, Default)]
 pub(super) struct RoomEventsQuery {
     /// Replay starts strictly after this room-scoped sequence number.
@@ -2223,16 +2538,53 @@ pub(super) async fn room_events(
         ));
     }
 
-    // Subscribe to BOTH wake buses BEFORE the first replay query.
+    // Subscribe to ALL wake buses BEFORE the first replay query. The cursor
+    // tail gets its own independent access-bus subscription (in addition to
+    // `access_hints` consumed by `run_room_access_tail` below) so an access
+    // wake alone — e.g. a federated Connecting/Recovering -> Live transition
+    // that does not itself carry a fresh upstream cursor frame — is enough to
+    // make the cursor tail re-check and emit (see `run_room_read_cursor_tail`).
     let message_hints = state.room_wakes.subscribe();
     let access_hints = state.room_access_wakes.subscribe();
+    let cursor_access_hints = state.room_access_wakes.subscribe();
+    let cursor_hints = state.room_read_cursor_wakes.subscribe();
 
     // Verify room exists (open rooms only) and read initial access snapshot.
-    let initial_access = match with_rooms(&state, |store| {
+    //
+    // `initial_cursor` is `None` for the transitional/dead access states
+    // (Connecting/Recovering/Revoked) where the read-cursor projection is
+    // undefined (F1/F3). The cursor tail below is spawned unconditionally
+    // regardless of the *current* access state: it re-reads access fresh on
+    // every wake hint, so a connection opened mid-Connecting/Recovering stays
+    // subscribed through the transition and still emits the current cursor
+    // the moment access becomes Live, without requiring the client to
+    // reconnect (see `run_room_read_cursor_tail`).
+    let (initial_access, initial_cursor) = match with_rooms(&state, |store| {
         if store.get(&room)?.is_none() {
             return Err(ocean_store::RoomStoreError::UnknownRoom(room.clone()));
         }
-        store.room_access(&room)
+        let access = store.room_access(&room)?;
+        let cursor = match access.state {
+            RoomAccessState::Local => Some(RoomReadCursorBody {
+                room_id: room.as_str().to_string(),
+                read_seq: store
+                    .room_read_cursor(&room, local_room_read_cursor_principal())?
+                    .read_seq
+                    .map(|seq| seq.to_string()),
+            }),
+            RoomAccessState::Live => Some(RoomReadCursorBody {
+                room_id: room.as_str().to_string(),
+                read_seq: match live_room_read_cursor_principal(store, &room)? {
+                    Some(principal) => store
+                        .room_read_cursor(&room, &principal)?
+                        .mirrored_upstream_read_seq
+                        .map(|seq| seq.to_string()),
+                    None => None,
+                },
+            }),
+            _ => None,
+        };
+        Ok((access, cursor))
     }) {
         Ok(proj) => proj,
         Err(ocean_store::RoomStoreError::UnknownRoom(_)) => {
@@ -2267,11 +2619,44 @@ pub(super) async fn room_events(
         Ok(Event::default().event("room_access").data(data))
     });
 
+    // Cursor tail: spawned unconditionally, regardless of the access state
+    // observed above. If `/events` is opened while a federated room is
+    // Connecting or Recovering — normal startup/reconnect states — the tail
+    // must stay subscribed on `cursor_hints` for this same long-lived
+    // connection rather than being dropped, so it can wake and emit the
+    // current cursor the instant access becomes Live without requiring the
+    // client to reconnect. `run_room_read_cursor_tail` re-reads access fresh
+    // on every wake hint and already suppresses emissions for the
+    // unsupported states (Connecting/Recovering/Revoked) on its own.
+    let (cursor_tx, cursor_rx) = mpsc::channel::<RoomReadCursorBody>(16);
+    tokio::spawn(run_room_read_cursor_tail(
+        state.clone(),
+        room.clone(),
+        initial_cursor.clone(),
+        cursor_hints,
+        cursor_access_hints,
+        cursor_tx,
+    ));
+    let cursor_stream = ReceiverStream::new(cursor_rx).map(|cursor| -> Result<Event, Infallible> {
+        let data = serde_json::to_string(&cursor).expect("RoomReadCursorBody serializable");
+        Ok(Event::default().event("room_read_cursor").data(data))
+    });
+
     // Merge: initial access frame first, then interleave messages + access updates.
     let init_data =
         serde_json::to_string(&initial_access).expect("RoomAccessProjection serializable");
     let init_event = Ok(Event::default().event("room_access").data(init_data));
-    let merged = tokio_stream::once(init_event).chain(msg_stream.merge(acc_stream));
+    let cursor_init = initial_cursor
+        .map(|cursor| {
+            let data = serde_json::to_string(&cursor).expect("RoomReadCursorBody serializable");
+            Ok(Event::default().event("room_read_cursor").data(data))
+        })
+        .into_iter();
+    let cursor_events: Pin<Box<dyn Stream<Item = Result<Event, Infallible>> + Send>> =
+        Box::pin(tokio_stream::iter(cursor_init).chain(cursor_stream));
+    let merged = tokio_stream::once(init_event)
+        .chain(msg_stream.merge(acc_stream))
+        .merge(cursor_events);
     let stream = sse_until_shutdown(merged, state.shutdown.clone());
     Ok(Sse::new(stream).keep_alive(KeepAlive::new().interval(SSE_KEEPALIVE_INTERVAL)))
 }
@@ -2310,6 +2695,105 @@ async fn run_room_access_tail(
         if last_access.as_ref() != Some(&proj) {
             last_access = Some(proj.clone());
             if tx.send(proj).await.is_err() {
+                return;
+            }
+        }
+    }
+}
+
+/// Read-cursor tail: on every wake hint (or lag), re-derive the wire-safe
+/// `RoomReadCursorBody` and send it downstream if changed. `read_seq` is
+/// stringified here (not left as a raw `u64` on the wire) so this event uses
+/// the exact same JS-number-precision-safe schema as the REST
+/// `GET`/`PATCH .../read-cursor` handlers (`RoomReadCursorBody`) — one shape
+/// for both Local and Live rooms, chosen by which store field is
+/// authoritative for the current access state (F3).
+///
+/// Local and Live are the only access states with a defined, trustworthy
+/// read-cursor projection (this matches `room_read_cursor_unsupported_response`
+/// in the REST handlers, which reject Connecting/Recovering/Revoked the same
+/// way). For those three transitional/dead states this tail must NOT fall
+/// back to reading under `local_room_read_cursor_principal()` — that principal
+/// was never written to for a federated room, so doing so would silently
+/// replace a real federated cursor value with an empty one and flicker the
+/// client to a cleared "local" cursor on every Connecting/Recovering/Revoked
+/// hop. Instead it skips the emission entirely, leaving `last_cursor`
+/// (and the client's last-rendered projection) untouched. The federated
+/// credential row is never touched by this skip, so the moment the room
+/// returns to Live the credential-scoped principal resolves exactly as
+/// before and the tail resumes emitting from where it left off (F1).
+///
+/// Also selects on `access_hints`: the upstream mirror does not necessarily
+/// re-emit a `room_read_cursor` federation frame at the exact moment access
+/// flips Connecting/Recovering -> Live (that mirror value may already be
+/// durable from before the reconnect), so an access wake alone must be
+/// enough to re-derive and emit the current cursor for a connection that was
+/// opened mid-transition and has been sitting on a stale/absent projection.
+async fn run_room_read_cursor_tail(
+    state: AppState,
+    room: RoomKey,
+    mut last_cursor: Option<RoomReadCursorBody>,
+    mut hints: broadcast::Receiver<RoomReadCursorWakeHint>,
+    mut access_hints: broadcast::Receiver<RoomAccessWakeHint>,
+    tx: mpsc::Sender<RoomReadCursorBody>,
+) {
+    loop {
+        let should_read = tokio::select! {
+            _ = tx.closed() => return,
+            res = hints.recv() => match res {
+                Ok(hint) => hint.room == room,
+                Err(broadcast::error::RecvError::Lagged(_)) => true,
+                Err(broadcast::error::RecvError::Closed) => return,
+            },
+            res = access_hints.recv() => match res {
+                Ok(hint) => hint.room == room,
+                Err(broadcast::error::RecvError::Lagged(_)) => true,
+                Err(broadcast::error::RecvError::Closed) => return,
+            },
+        };
+        if !should_read {
+            continue;
+        }
+        let read_seq = match with_rooms(&state, |store| -> Result<_, ocean_store::RoomStoreError> {
+            let access = store.room_access(&room)?;
+            match access.state {
+                RoomAccessState::Local => Ok(Some(
+                    store
+                        .room_read_cursor(&room, local_room_read_cursor_principal())?
+                        .read_seq,
+                )),
+                RoomAccessState::Live => match live_room_read_cursor_principal(store, &room)? {
+                    Some(principal) => Ok(Some(
+                        store
+                            .room_read_cursor(&room, &principal)?
+                            .mirrored_upstream_read_seq,
+                    )),
+                    None => Ok(Some(None)),
+                },
+                // Read-cursor is unsupported while the federated link is not
+                // confirmed Live — skip the emission (F1) rather than
+                // resolving a principal at all.
+                RoomAccessState::Connecting
+                | RoomAccessState::Recovering
+                | RoomAccessState::Revoked => Ok(None),
+            }
+        }) {
+            Ok(read_seq) => read_seq,
+            Err(e) => {
+                tracing::warn!(room = %room, %e, "room read cursor tail read failed");
+                return;
+            }
+        };
+        let Some(read_seq) = read_seq else {
+            continue;
+        };
+        let cursor = RoomReadCursorBody {
+            room_id: room.as_str().to_string(),
+            read_seq: read_seq.map(|seq| seq.to_string()),
+        };
+        if last_cursor.as_ref() != Some(&cursor) {
+            last_cursor = Some(cursor.clone());
+            if tx.send(cursor).await.is_err() {
                 return;
             }
         }
@@ -2543,6 +3027,49 @@ mod tests {
         Json(fake.roster.lock().await.clone()).into_response()
     }
 
+    async fn route_room_read_cursor_unauthorized() -> axum::response::Response {
+        StatusCode::UNAUTHORIZED.into_response()
+    }
+
+    async fn start_route_read_cursor_unauthorized_bedrock() -> (String, tokio::task::JoinHandle<()>)
+    {
+        let app = axum::Router::new()
+            .route(
+                "/api/v1/rooms/{room}/read-cursor",
+                axum::routing::get(route_room_read_cursor_unauthorized),
+            )
+            .with_state(RouteBedrock::new());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        (format!("http://{address}"), server)
+    }
+
+    async fn route_room_read_cursor_ok(Path(room): Path<String>) -> axum::response::Response {
+        Json(json!({"room_id": room, "sequence": "77", "clamped": false})).into_response()
+    }
+
+    /// M6 regression fixture: an upstream that truthfully answers GET
+    /// `.../read-cursor` so the Live-room HTTP handler round trip can be
+    /// exercised end to end and checked against the SAME response schema
+    /// the Local-room path produces.
+    async fn start_route_read_cursor_ok_bedrock() -> (String, tokio::task::JoinHandle<()>) {
+        let app = axum::Router::new()
+            .route(
+                "/api/v1/rooms/{room}/read-cursor",
+                axum::routing::get(route_room_read_cursor_ok),
+            )
+            .with_state(RouteBedrock::new());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        (format!("http://{address}"), server)
+    }
+
     async fn start_route_bedrock() -> (String, tokio::task::JoinHandle<()>) {
         let fake = RouteBedrock::new();
         let app = axum::Router::new()
@@ -2582,6 +3109,7 @@ mod tests {
             state.rooms.clone(),
             state.room_wakes.clone(),
             state.room_access_wakes.clone(),
+            state.room_read_cursor_wakes.clone(),
             state.shutdown.clone(),
             std::time::Duration::from_secs(60),
         );
@@ -2624,6 +3152,658 @@ mod tests {
             derived_presence: Some(ocean_core::MemberPresence::Unavailable),
             local_binding_available: None,
         }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn rooms_list_persistent_includes_ordered_read_states_for_local_and_live() {
+        let tmp = tempfile::tempdir().unwrap();
+        let state = fake_convene_state(&tmp);
+        let local = RoomKey::new("list-read-local");
+        let live = RoomKey::new("list-read-live");
+        with_rooms(&state, |store| {
+            store.create(local.clone(), "Local", None, Utc::now())?;
+            store.append_message(
+                &local,
+                "u1",
+                RoomParticipantKind::Human,
+                RoomMessageKind::Message,
+                "local first",
+                Utc::now(),
+            )?;
+            store.update_room_read_cursor(
+                &local,
+                local_room_read_cursor_principal(),
+                RoomReadCursorUpdateRequest { read_seq: 0 },
+            )?;
+
+            store.create(live.clone(), "Live", None, Utc::now())?;
+            store.update_room_access_safe(
+                &live,
+                Some(RoomAccessState::Live),
+                None,
+                Some(u64::MAX),
+            )?;
+            store.install_room_credential(&live, "bearer-secret", "live-principal")?;
+            store.set_room_read_cursor_mirror(
+                &live,
+                "live-principal",
+                None,
+                Some((1u64 << 53) + 7),
+            )?;
+            Ok::<_, ocean_store::RoomStoreError>(())
+        })
+        .unwrap();
+
+        let (status, body) = rooms_list_persistent(
+            State(state.clone()),
+            Query(RoomsListQuery {
+                limit: Some(10),
+                cursor: None,
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body.0["ok"], json!(true));
+        let rooms = body.0["rooms"].as_array().unwrap();
+        let read_states = body.0["read_states"].as_array().unwrap();
+        assert_eq!(rooms.len(), 2);
+        assert_eq!(read_states.len(), 2);
+        for (room, read_state) in rooms.iter().zip(read_states.iter()) {
+            assert_eq!(read_state["room_id"], room["id"]);
+        }
+        assert_eq!(
+            read_states[0],
+            json!({
+                "room_id": live.as_str(),
+                "latest_seq": u64::MAX.to_string(),
+                "read_seq": ((1u64 << 53) + 7).to_string()
+            })
+        );
+        assert_eq!(
+            read_states[1],
+            json!({
+                "room_id": local.as_str(),
+                "latest_seq": "0",
+                "read_seq": "0"
+            })
+        );
+        let encoded = serde_json::to_string(&body.0).unwrap();
+        assert!(encoded.contains(&format!("\"latest_seq\":\"{}\"", u64::MAX)));
+        assert!(encoded.contains("\"read_seq\":\"9007199254740999\""));
+        assert!(!encoded.contains("bearer-secret"));
+        assert!(!encoded.contains("live-principal"));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn rooms_list_persistent_uses_durable_metadata_for_non_live_federated_states() {
+        let tmp = tempfile::tempdir().unwrap();
+        let state = fake_convene_state(&tmp);
+        let key = RoomKey::new("list-read-connecting");
+        with_rooms(&state, |store| {
+            store.create(key.clone(), "Connecting", None, Utc::now())?;
+            store.update_room_access_safe(
+                &key,
+                Some(RoomAccessState::Connecting),
+                None,
+                Some(42),
+            )?;
+            store.install_room_credential(&key, "bearer-secret", "connecting-principal")?;
+            store.set_room_read_cursor_mirror(&key, "connecting-principal", None, Some(7))?;
+            Ok::<_, ocean_store::RoomStoreError>(())
+        })
+        .unwrap();
+
+        let (status, body) = rooms_list_persistent(
+            State(state),
+            Query(RoomsListQuery {
+                limit: Some(10),
+                cursor: None,
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            body.0["read_states"],
+            json!([{
+                "room_id": key.as_str(),
+                "latest_seq": "42",
+                "read_seq": "7"
+            }])
+        );
+        let encoded = serde_json::to_string(&body.0).unwrap();
+        assert!(!encoded.contains("bearer-secret"));
+        assert!(!encoded.contains("connecting-principal"));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn room_read_cursor_handlers_truthfully_distinguish_absent_zero_and_unsupported() {
+        let tmp = tempfile::tempdir().unwrap();
+        let state = fake_convene_state(&tmp);
+        let key = RoomKey::new("cursor-handler-local");
+        with_rooms(&state, |store| {
+            store.create(key.clone(), "Cursor Handler Local", None, Utc::now())?;
+            Ok::<_, ocean_store::RoomStoreError>(())
+        })
+        .unwrap();
+
+        let (status, body) =
+            room_get_read_cursor(State(state.clone()), Path(key.as_str().to_string())).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            body.0,
+            json!({"ok": true, "cursor": {"room_id": "cursor-handler-local", "read_seq": null}})
+        );
+
+        with_rooms(&state, |store| {
+            store.append_message(
+                &key,
+                "u1",
+                RoomParticipantKind::Human,
+                RoomMessageKind::Message,
+                "first",
+                Utc::now(),
+            )?;
+            Ok::<_, ocean_store::RoomStoreError>(())
+        })
+        .unwrap();
+
+        let (status, body) = room_patch_read_cursor(
+            State(state.clone()),
+            Path(key.as_str().to_string()),
+            Bytes::from_static(br#"{"read_seq":0}"#),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            body.0,
+            json!({"ok": true, "cursor": {"room_id": "cursor-handler-local", "read_seq": "0"}})
+        );
+
+        let (status, body) =
+            room_get_read_cursor(State(state.clone()), Path(key.as_str().to_string())).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            body.0,
+            json!({"ok": true, "cursor": {"room_id": "cursor-handler-local", "read_seq": "0"}})
+        );
+
+        let (status, body) = room_patch_read_cursor(
+            State(state.clone()),
+            Path(key.as_str().to_string()),
+            Bytes::from_static(br#"{"read_seq":0,"extra":true}"#),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(body.0["ok"], json!(false));
+
+        let federated = RoomKey::new("cursor-handler-live");
+        with_rooms(&state, |store| {
+            store.create(federated.clone(), "Cursor Handler Live", None, Utc::now())?;
+            store.update_room_access_safe(&federated, Some(RoomAccessState::Live), None, None)?;
+            Ok::<_, ocean_store::RoomStoreError>(())
+        })
+        .unwrap();
+
+        let (status, body) =
+            room_get_read_cursor(State(state.clone()), Path(federated.as_str().to_string())).await;
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert_eq!(body.0["code"], json!("room_read_cursor_unsupported"));
+
+        let (status, body) = room_patch_read_cursor(
+            State(state),
+            Path(federated.as_str().to_string()),
+            Bytes::from_static(br#"{"read_seq":0}"#),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert_eq!(body.0["code"], json!("room_read_cursor_unsupported"));
+    }
+
+    /// M6 + H1 regression: the Live-room `GET .../read-cursor` response uses
+    /// the SAME `{room_id, read_seq}` schema as the Local-room response
+    /// (previously it returned `{room_id, sequence}`, a different shape),
+    /// and the value it reports is read back from the SAME store principal
+    /// the SSE read-cursor tail resolves for that room — the per-credential
+    /// `local_human_member_id`, not a fixed placeholder string that nothing
+    /// ever writes to.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn room_read_cursor_live_get_matches_local_schema_and_sse_principal() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut state = fake_convene_state(&tmp);
+        let key = RoomKey::new("cursor-handler-live-ok");
+        with_rooms(&state, |store| {
+            store.create(key.clone(), "Cursor Handler Live Ok", None, Utc::now())?;
+            store.update_room_access_safe(&key, Some(RoomAccessState::Live), None, None)?;
+            store.install_room_credential(&key, "bearer", "member-live-ok")?;
+            Ok::<_, ocean_store::RoomStoreError>(())
+        })
+        .unwrap();
+
+        let (base, server) = start_route_read_cursor_ok_bedrock().await;
+        state = with_route_supervisor(state, &base);
+
+        let (status, body) =
+            room_get_read_cursor(State(state.clone()), Path(key.as_str().to_string())).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            body.0,
+            json!({"ok": true, "cursor": {"room_id": key.as_str(), "read_seq": "77"}})
+        );
+
+        // The federation client durably mirrors what the upstream reported
+        // (77) keyed by the credential's `local_human_member_id`.
+        let cursor = with_rooms(&state, |store| {
+            store.room_read_cursor(&key, "member-live-ok")
+        })
+        .unwrap();
+        assert_eq!(cursor.mirrored_upstream_read_seq, Some(77));
+
+        // H1: both the initial SSE snapshot logic and the read-cursor tail
+        // must resolve that exact same principal, or they would silently
+        // observe an always-empty cursor for this (and every) Live room.
+        let resolved = with_rooms(&state, |store| {
+            let access = store.room_access(&key)?;
+            assert_eq!(access.state, RoomAccessState::Live);
+            match live_room_read_cursor_principal(store, &key)? {
+                Some(principal) => store.room_read_cursor(&key, &principal),
+                None => panic!("expected a room credential principal for a Live room"),
+            }
+        })
+        .unwrap();
+        assert_eq!(resolved.mirrored_upstream_read_seq, Some(77));
+
+        let (tx, mut rx) = tokio::sync::mpsc::channel(4);
+        let hints = state.room_read_cursor_wakes.subscribe();
+        let access_hints = state.room_access_wakes.test_subscribe();
+        tokio::spawn(run_room_read_cursor_tail(
+            state.clone(),
+            key.clone(),
+            Some(RoomReadCursorBody {
+                room_id: key.as_str().to_string(),
+                read_seq: None,
+            }),
+            hints,
+            access_hints,
+            tx,
+        ));
+        publish_room_read_cursor_wake(&state, &key);
+        let tailed = tokio::time::timeout(std::time::Duration::from_secs(1), rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(tailed.room_id, key.as_str());
+        assert_eq!(tailed.read_seq, Some("77".to_string()));
+
+        server.abort();
+        state.room_federation.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn room_read_cursor_live_get_truthfully_reports_revoked_without_mutating_mirror() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut state = fake_convene_state(&tmp);
+        let key = RoomKey::new("cursor-handler-live-revoked");
+        with_rooms(&state, |store| {
+            store.create(key.clone(), "Cursor Handler Live Revoked", None, Utc::now())?;
+            store.update_room_access_safe(&key, Some(RoomAccessState::Live), None, None)?;
+            store.install_room_credential(&key, "bearer", "principal")?;
+            Ok::<_, ocean_store::RoomStoreError>(())
+        })
+        .unwrap();
+
+        let (base, server) = start_route_read_cursor_unauthorized_bedrock().await;
+        state = with_route_supervisor(state, &base);
+
+        let (status, body) =
+            room_get_read_cursor(State(state.clone()), Path(key.as_str().to_string())).await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        assert_eq!(body.0, json!({"ok": false, "error": "membership_revoked"}));
+
+        let cursor = with_rooms(&state, |store| store.room_read_cursor(&key, "principal")).unwrap();
+        assert_eq!(cursor.read_seq, None);
+        assert_eq!(cursor.mirrored_upstream_read_seq, None);
+
+        server.abort();
+        state.room_federation.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn room_read_cursor_tail_emits_absent_then_zero_on_wake() {
+        let tmp = tempfile::tempdir().unwrap();
+        let state = fake_convene_state(&tmp);
+        let key = RoomKey::new("cursor-tail-local");
+        with_rooms(&state, |store| {
+            store.create(key.clone(), "Cursor Tail Local", None, Utc::now())?;
+            Ok::<_, ocean_store::RoomStoreError>(())
+        })
+        .unwrap();
+
+        let (tx, mut rx) = tokio::sync::mpsc::channel(4);
+        let hints = state.room_read_cursor_wakes.subscribe();
+        let access_hints = state.room_access_wakes.test_subscribe();
+        tokio::spawn(run_room_read_cursor_tail(
+            state.clone(),
+            key.clone(),
+            Some(RoomReadCursorBody {
+                room_id: key.as_str().to_string(),
+                read_seq: None,
+            }),
+            hints,
+            access_hints,
+            tx,
+        ));
+
+        with_rooms(&state, |store| {
+            store.append_message(
+                &key,
+                "u1",
+                RoomParticipantKind::Human,
+                RoomMessageKind::Message,
+                "first",
+                Utc::now(),
+            )?;
+            store.update_room_read_cursor(
+                &key,
+                local_room_read_cursor_principal(),
+                RoomReadCursorUpdateRequest { read_seq: 0 },
+            )?;
+            Ok::<_, ocean_store::RoomStoreError>(())
+        })
+        .unwrap();
+        publish_room_read_cursor_wake(&state, &key);
+
+        let cursor = tokio::time::timeout(std::time::Duration::from_secs(1), rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(cursor.room_id, key.as_str());
+        assert_eq!(cursor.read_seq, Some("0".to_string()));
+    }
+
+    /// F1 regression: while the federated link is not confirmed Live
+    /// (Connecting/Recovering/Revoked), the read-cursor tail must skip
+    /// emissions entirely rather than falling back to
+    /// `local_room_read_cursor_principal()` — that principal is never
+    /// written to for a federated room, so reading it would flicker the
+    /// client from the last real federated cursor value to a fabricated
+    /// cleared/local one on every transient hop. The federated credential
+    /// principal must also still resolve correctly once the room returns to
+    /// Live, proving it was never disturbed by the skip.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn room_read_cursor_tail_retains_federated_principal_and_skips_unsupported_transitions() {
+        let tmp = tempfile::tempdir().unwrap();
+        let state = fake_convene_state(&tmp);
+        let key = RoomKey::new("cursor-tail-transition");
+        with_rooms(&state, |store| {
+            store.create(key.clone(), "Cursor Tail Transition", None, Utc::now())?;
+            store.update_room_access_safe(&key, Some(RoomAccessState::Live), None, Some(1))?;
+            store.install_room_credential(&key, "bearer-secret", "federated-principal")?;
+            store.set_room_read_cursor_mirror(&key, "federated-principal", None, Some(5))?;
+            Ok::<_, ocean_store::RoomStoreError>(())
+        })
+        .unwrap();
+
+        let (tx, mut rx) = tokio::sync::mpsc::channel(4);
+        let hints = state.room_read_cursor_wakes.subscribe();
+        let access_hints = state.room_access_wakes.test_subscribe();
+        tokio::spawn(run_room_read_cursor_tail(
+            state.clone(),
+            key.clone(),
+            None,
+            hints,
+            access_hints,
+            tx,
+        ));
+
+        publish_room_read_cursor_wake(&state, &key);
+        let live = tokio::time::timeout(std::time::Duration::from_secs(1), rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(live.read_seq, Some("5".to_string()));
+
+        // Connecting: read-cursor unsupported. Must skip, not flicker.
+        with_rooms(&state, |store| {
+            store.update_room_access_safe(&key, Some(RoomAccessState::Connecting), None, None)
+        })
+        .unwrap();
+        publish_room_read_cursor_wake(&state, &key);
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(200), rx.recv())
+                .await
+                .is_err(),
+            "expected no room_read_cursor emission while access is Connecting"
+        );
+
+        // Revoked: same — still skip, credential row untouched.
+        with_rooms(&state, |store| {
+            store.update_room_access_safe(&key, Some(RoomAccessState::Revoked), None, None)
+        })
+        .unwrap();
+        publish_room_read_cursor_wake(&state, &key);
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(200), rx.recv())
+                .await
+                .is_err(),
+            "expected no room_read_cursor emission while access is Revoked"
+        );
+
+        // Back to Live: the federated credential principal must still
+        // resolve correctly (never cleared to the local principal), so the
+        // mirrored value is read again without any manual re-installation.
+        with_rooms(&state, |store| {
+            store.update_room_access_safe(&key, Some(RoomAccessState::Live), None, Some(2))?;
+            store.set_room_read_cursor_mirror(&key, "federated-principal", Some(5), Some(9))
+        })
+        .unwrap();
+        publish_room_read_cursor_wake(&state, &key);
+        let resumed = tokio::time::timeout(std::time::Duration::from_secs(1), rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(resumed.read_seq, Some("9".to_string()));
+    }
+
+    /// PR #366 review comment 3727657446 regression: `/events` opened while a
+    /// federated room is `Connecting` must not drop the cursor tail. The
+    /// handler used to gate spawning `run_room_read_cursor_tail` on
+    /// `read_cursor_supported`, so a connection opened mid-Connecting never
+    /// started a tail at all and would never observe a `room_read_cursor`
+    /// frame later, even after access became `Live`, without the client
+    /// reconnecting. Proves over the real HTTP SSE handler, on the same
+    /// still-open connection:
+    /// - the initial snapshot is `room_access: Connecting` with no
+    ///   `room_read_cursor` bootstrap frame (projection undefined);
+    /// - no `room_read_cursor` frame arrives while still Connecting;
+    /// - once access flips to Live — mirroring
+    ///   `room_federation::commit_access`, which publishes only an access
+    ///   wake, not a read-cursor wake — the same connection still emits the
+    ///   current cursor, proving the tail stayed subscribed through the
+    ///   transition and reacted to the access wake alone.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn room_events_http_cursor_tail_survives_connecting_and_emits_on_live_without_reconnect()
+    {
+        let _guard = AUTO_CONVENE_ENV_LOCK.lock().await;
+        use http_body_util::BodyExt as _;
+        use tower::ServiceExt as _;
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = fake_convene_state(&tmp);
+        let key = RoomKey::new("cursor-transition-live");
+        create_plain_room(&state, &key);
+        with_rooms(&state, |store| {
+            store.update_room_access_safe(&key, Some(RoomAccessState::Connecting), None, None)?;
+            store.install_room_credential(&key, "bearer-secret", "transition-principal")?;
+            Ok::<_, ocean_store::RoomStoreError>(())
+        })
+        .unwrap();
+
+        let app = super::super::room_routes().with_state(state.clone());
+        let request = axum::http::Request::builder()
+            .uri(format!("/v1/rooms/persistent/{key}/events"))
+            .body(axum::body::Body::empty())
+            .unwrap();
+        let response = app.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let mut body = response.into_body();
+
+        // Only one frame up front: the initial room_access snapshot
+        // (Connecting). No room_read_cursor bootstrap frame — the projection
+        // is undefined while access is unsupported.
+        let frame = tokio::time::timeout(std::time::Duration::from_millis(500), body.frame())
+            .await
+            .expect("frame timeout")
+            .expect("SSE body ended")
+            .expect("SSE body error");
+        let text = String::from_utf8_lossy(&frame.into_data().unwrap_or_default()).to_string();
+        assert!(
+            text.contains("event: room_access\n"),
+            "expected initial room_access frame, got: {text:?}"
+        );
+        assert!(
+            text.contains("\"state\":\"connecting\""),
+            "expected Connecting access snapshot, got: {text:?}"
+        );
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(200), body.frame())
+                .await
+                .is_err(),
+            "expected no room_read_cursor frame while access is Connecting"
+        );
+
+        // Same still-open connection observes a reconnect completion: access
+        // flips straight to Live and the federated mirror already carries a
+        // durable cursor value from before the reconnect (no fresh upstream
+        // `room_read_cursor` federation frame arrives).
+        with_rooms(&state, |store| {
+            store.update_room_access_safe(&key, Some(RoomAccessState::Live), None, None)?;
+            store.set_room_read_cursor_mirror(&key, "transition-principal", None, Some(42))?;
+            Ok::<_, ocean_store::RoomStoreError>(())
+        })
+        .unwrap();
+        publish_room_access_wake(&state, &key);
+
+        let mut saw_access_live = false;
+        let mut saw_cursor = false;
+        for _ in 0..4 {
+            if saw_access_live && saw_cursor {
+                break;
+            }
+            let frame = tokio::time::timeout(std::time::Duration::from_secs(1), body.frame())
+                .await
+                .expect("frame timeout")
+                .expect("SSE body ended")
+                .expect("SSE body error");
+            let text = String::from_utf8_lossy(&frame.into_data().unwrap_or_default()).to_string();
+            if text.contains("event: room_access\n") && text.contains("\"state\":\"live\"") {
+                saw_access_live = true;
+            }
+            if text.contains("event: room_read_cursor\n") {
+                saw_cursor = true;
+                let data = text
+                    .lines()
+                    .find_map(|line| line.strip_prefix("data: "))
+                    .expect("data line");
+                let parsed: serde_json::Value = serde_json::from_str(data).unwrap();
+                assert_eq!(parsed, json!({ "room_id": key.as_str(), "read_seq": "42" }));
+            }
+        }
+        assert!(saw_access_live, "expected a Live room_access frame");
+        assert!(
+            saw_cursor,
+            "expected the still-open connection to emit the current room_read_cursor without reconnecting"
+        );
+    }
+
+    /// F3 regression: the SSE `room_read_cursor` wire uses the same
+    /// JS-number-precision-safe decimal-string schema as REST
+    /// (`RoomReadCursorBody`) — a `read_seq` above 2^53 must serialize as a
+    /// quoted string, never a bare JS-unsafe number, for both the initial
+    /// bootstrap frame and subsequent tail emissions.
+    ///
+    /// Uses a Live room's federated mirror (`set_room_read_cursor_mirror`)
+    /// rather than the Local `room_read_cursors` path: `update_room_read_cursor`
+    /// clamps the requested value to the room's message high-water seq, so a
+    /// fixture with no messages could never durably persist a raw >2^53
+    /// value there. The federated mirror has no such clamp (it stores
+    /// whatever the upstream reports), matching how
+    /// `rooms_list_persistent_includes_ordered_read_states_for_local_and_live`
+    /// already proves this exact value round-trips through the REST list
+    /// endpoint.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn room_read_cursor_sse_wire_uses_js_safe_decimal_strings_above_2_53() {
+        let _guard = AUTO_CONVENE_ENV_LOCK.lock().await;
+        use http_body_util::BodyExt as _;
+        use tower::ServiceExt as _;
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = fake_convene_state(&tmp);
+        let key = RoomKey::new("cursor-precision-live");
+        create_plain_room(&state, &key);
+        let huge = (1u64 << 53) + 11;
+        with_rooms(&state, |store| {
+            store.update_room_access_safe(&key, Some(RoomAccessState::Live), None, None)?;
+            store.install_room_credential(&key, "bearer-secret", "huge-principal")?;
+            store.set_room_read_cursor_mirror(&key, "huge-principal", None, Some(huge))?;
+            Ok::<_, ocean_store::RoomStoreError>(())
+        })
+        .unwrap();
+
+        let app = super::super::room_routes().with_state(state);
+        let request = axum::http::Request::builder()
+            .uri(format!("/v1/rooms/persistent/{key}/events"))
+            .body(axum::body::Body::empty())
+            .unwrap();
+        let response = app.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let mut body = response.into_body();
+
+        // Only two frames expected up front (no messages, no access churn):
+        // the S2-P1 initial room_access frame and the read-cursor bootstrap.
+        // Order between them is not contractually fixed (they're merged
+        // concurrently), so read both and match by event name.
+        let frame_a = tokio::time::timeout(std::time::Duration::from_millis(500), body.frame())
+            .await
+            .expect("frame a timeout")
+            .expect("SSE body ended")
+            .expect("SSE body error");
+        let text_a = String::from_utf8_lossy(&frame_a.into_data().unwrap_or_default()).to_string();
+        let frame_b = tokio::time::timeout(std::time::Duration::from_millis(500), body.frame())
+            .await
+            .expect("frame b timeout")
+            .expect("SSE body ended")
+            .expect("SSE body error");
+        let text_b = String::from_utf8_lossy(&frame_b.into_data().unwrap_or_default()).to_string();
+
+        let cursor_wire = if text_a.contains("event: room_read_cursor\n") {
+            text_a
+        } else {
+            assert!(
+                text_b.contains("event: room_read_cursor\n"),
+                "expected a room_read_cursor bootstrap frame, got: {text_a:?} / {text_b:?}"
+            );
+            text_b
+        };
+        let data = cursor_wire
+            .lines()
+            .find_map(|line| line.strip_prefix("data: "))
+            .expect("data line");
+        // Wire-level proof: the huge value must appear as a quoted decimal
+        // string, never a bare JSON number (which would silently lose
+        // precision in JS's IEEE-754 f64 doubles above 2^53).
+        assert!(
+            data.contains(&format!("\"read_seq\":\"{huge}\"")),
+            "expected JS-safe quoted decimal string in: {data:?}"
+        );
+        assert!(
+            !data.contains(&format!("\"read_seq\":{huge}")),
+            "read_seq must never be a bare unsafe number: {data:?}"
+        );
+        let parsed: serde_json::Value = serde_json::from_str(data).unwrap();
+        assert_eq!(
+            parsed,
+            json!({ "room_id": key.as_str(), "read_seq": huge.to_string() })
+        );
     }
 
     #[test]
@@ -4105,13 +5285,25 @@ mod tests {
             access_wire.contains("event: room_access"),
             "expected room_access first, got: {access_wire:?}"
         );
-        // Second frame: room_message.
+        // Optional Local-room read cursor bootstrap may arrive before transcript replay.
         let frame = tokio::time::timeout(std::time::Duration::from_millis(250), body.frame())
             .await
-            .expect("message frame exceeded 250ms")
+            .expect("next frame exceeded 250ms")
             .expect("SSE body ended")
             .expect("SSE body error");
-        let wire = std::str::from_utf8(frame.data_ref().expect("SSE data frame")).unwrap();
+        let mut wire = std::str::from_utf8(frame.data_ref().expect("SSE data frame"))
+            .unwrap()
+            .to_string();
+        if wire.contains("event: room_read_cursor\n") {
+            let frame = tokio::time::timeout(std::time::Duration::from_millis(250), body.frame())
+                .await
+                .expect("message frame exceeded 250ms")
+                .expect("SSE body ended")
+                .expect("SSE body error");
+            wire = std::str::from_utf8(frame.data_ref().expect("SSE data frame"))
+                .unwrap()
+                .to_string();
+        }
         assert!(wire.contains("event: room_message\n"), "wire: {wire:?}");
         assert!(wire.contains("id: 0\n"), "wire: {wire:?}");
         let data = wire
@@ -4165,13 +5357,25 @@ mod tests {
             access_wire.contains("event: room_access"),
             "expected room_access first, got: {access_wire:?}"
         );
-        // Next frame: room_message with resume from id 2.
+        // Optional Local-room read cursor bootstrap may arrive before replay.
         let frame = tokio::time::timeout(std::time::Duration::from_millis(250), body.frame())
             .await
             .expect("resume frame exceeded 250ms")
             .expect("SSE body ended")
             .expect("SSE body error");
-        let wire = std::str::from_utf8(frame.data_ref().expect("SSE data frame")).unwrap();
+        let mut wire = std::str::from_utf8(frame.data_ref().expect("SSE data frame"))
+            .unwrap()
+            .to_string();
+        if wire.contains("event: room_read_cursor\n") {
+            let frame = tokio::time::timeout(std::time::Duration::from_millis(250), body.frame())
+                .await
+                .expect("resume message frame exceeded 250ms")
+                .expect("SSE body ended")
+                .expect("SSE body error");
+            wire = std::str::from_utf8(frame.data_ref().expect("SSE data frame"))
+                .unwrap()
+                .to_string();
+        }
         assert!(wire.contains("id: 2\n"), "wire: {wire:?}");
         assert!(wire.contains("\"body\":\"two\""), "wire: {wire:?}");
         assert!(!wire.contains("\"body\":\"one\""), "wire: {wire:?}");
@@ -5301,31 +6505,35 @@ env = { FIXTURE = "1" }
 
     use crate::tests::fake_convene_file_state;
 
+    fn seed_live_with_failed_projection(client_event_id: &str) -> RoomAccessProjection {
+        RoomAccessProjection {
+            state: RoomAccessState::Live,
+            last_confirmed_global_sequence: Some(1),
+            members: vec![],
+            outbox: vec![RoomOutboxItem {
+                client_event_id: client_event_id.into(),
+                source_id: "src".into(),
+                source_sequence: 10,
+                author_member_id: "auth".into(),
+                event_type: "chat.message".into(),
+                payload: json!({"text": "hi"}),
+                mention_member_ids: vec![],
+                state: OutboxItemState::Failed,
+            }],
+        }
+    }
+
     /// Create a room with Live access and one Failed outbox item.
     fn seed_live_with_failed(state: &AppState, key: &RoomKey, client_event_id: &str) {
         seed_access(
             state,
             key,
-            RoomAccessProjection {
-                state: RoomAccessState::Live,
-                last_confirmed_global_sequence: Some(1),
-                members: vec![],
-                outbox: vec![RoomOutboxItem {
-                    client_event_id: client_event_id.into(),
-                    source_id: "src".into(),
-                    source_sequence: 10,
-                    author_member_id: "auth".into(),
-                    event_type: "chat.message".into(),
-                    payload: json!({"text": "hi"}),
-                    mention_member_ids: vec![],
-                    state: OutboxItemState::Failed,
-                }],
-            },
+            seed_live_with_failed_projection(client_event_id),
         );
     }
 
-    /// Read one SSE event+data from a streaming body.
-    async fn read_sse_frame(body: &mut Body) -> (String, serde_json::Value) {
+    /// Read one SSE event frame from a streaming body.
+    async fn read_sse_frame(body: &mut Body) -> SseFrame {
         use http_body_util::BodyExt as _;
         let frame = tokio::time::timeout(Duration::from_millis(500), body.frame())
             .await
@@ -5333,17 +6541,62 @@ env = { FIXTURE = "1" }
             .expect("SSE body ended")
             .expect("SSE body error");
         let text = String::from_utf8_lossy(&frame.into_data().unwrap_or_default()).to_string();
-        let event_type = text
+        parse_sse_frame(&text)
+    }
+
+    #[derive(Debug)]
+    struct SseFrame {
+        event: String,
+        id: Option<String>,
+        data: serde_json::Value,
+    }
+
+    fn parse_sse_frame(text: &str) -> SseFrame {
+        let event = text
             .lines()
             .find_map(|line| line.strip_prefix("event: "))
             .unwrap_or("")
             .to_string();
-        let data: serde_json::Value = text
+        let id = text
+            .lines()
+            .find_map(|line| line.strip_prefix("id: "))
+            .map(str::to_string);
+        let data = text
             .lines()
             .find_map(|line| line.strip_prefix("data: "))
             .map(|d| serde_json::from_str(d).expect("valid JSON"))
             .unwrap_or(serde_json::Value::Null);
-        (event_type, data)
+        SseFrame { event, id, data }
+    }
+
+    async fn read_until_access_frame(body: &mut Body, dur: Duration) -> SseFrame {
+        use http_body_util::BodyExt as _;
+        let deadline = tokio::time::Instant::now() + dur;
+        loop {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "timed out waiting for room_access SSE frame"
+            );
+            let frame = tokio::time::timeout(Duration::from_millis(50), body.frame())
+                .await
+                .expect("frame timeout")
+                .expect("SSE body ended")
+                .expect("SSE body error");
+            let parsed = parse_sse_frame(&String::from_utf8_lossy(
+                &frame.into_data().unwrap_or_default(),
+            ));
+            if parsed.event == "room_access" {
+                return parsed;
+            }
+            assert_eq!(
+                parsed.event, "room_read_cursor",
+                "unexpected interleaved SSE event before room_access"
+            );
+            assert!(
+                parsed.id.is_none(),
+                "room_read_cursor bootstrap must not consume or alter Last-Event-ID"
+            );
+        }
     }
 
     /// Drain the body for `dur` and report whether any `room_access` frame arrived.
@@ -5390,6 +6643,8 @@ env = { FIXTURE = "1" }
                 state: OutboxItemState::Pending,
             }],
         };
+        let initial_expected =
+            serde_json::to_value(seed_live_with_failed_projection("evt-both")).unwrap();
         let expected = serde_json::to_value(&expected_proj).unwrap();
 
         let app1 = room_routes().with_state(state.clone());
@@ -5416,11 +6671,12 @@ env = { FIXTURE = "1" }
         let mut body1 = resp1.into_body();
         let mut body2 = resp2.into_body();
 
-        // Both start with initial room_access.
-        let (ev1, _) = read_sse_frame(&mut body1).await;
-        assert_eq!(ev1, "room_access");
-        let (ev2, _) = read_sse_frame(&mut body2).await;
-        assert_eq!(ev2, "room_access");
+        // Both subscribers must observe the exact initial access projection, but
+        // a no-id cursor bootstrap may interleave first.
+        let init1 = read_until_access_frame(&mut body1, Duration::from_millis(500)).await;
+        assert_eq!(init1.data, initial_expected);
+        let init2 = read_until_access_frame(&mut body2, Duration::from_millis(500)).await;
+        assert_eq!(init2.data, initial_expected);
 
         // Retry triggers access change + wake.
         let app_retry = room_routes().with_state(state.clone());
@@ -5435,13 +6691,13 @@ env = { FIXTURE = "1" }
             .unwrap();
         assert_eq!(resp.status(), StatusCode::ACCEPTED);
 
-        // Both must receive a follow-up room_access frame.
-        let (ev1b, data1) = read_sse_frame(&mut body1).await;
-        assert_eq!(ev1b, "room_access");
-        assert_eq!(data1, expected, "subscriber 1 mismatched");
-        let (ev2b, data2) = read_sse_frame(&mut body2).await;
-        assert_eq!(ev2b, "room_access");
-        assert_eq!(data2, expected, "subscriber 2 mismatched");
+        // Both must receive exactly one follow-up room_access frame; any
+        // interleaved bootstrap/read-cursor frames must be no-id and not affect
+        // message Last-Event-ID semantics.
+        let sub1 = read_until_access_frame(&mut body1, Duration::from_secs(1)).await;
+        assert_eq!(sub1.data, expected, "subscriber 1 mismatched");
+        let sub2 = read_until_access_frame(&mut body2, Duration::from_secs(1)).await;
+        assert_eq!(sub2.data, expected, "subscriber 2 mismatched");
     }
 
     /// (3) Dedup: same-room unchanged hint produces no access frame. Also proves
@@ -5469,9 +6725,9 @@ env = { FIXTURE = "1" }
         let mut body_a = resp_a.into_body();
 
         // Consume initial access frame.
-        let (ev, data) = read_sse_frame(&mut body_a).await;
-        assert_eq!(ev, "room_access");
-        assert_eq!(data["outbox"][0]["client_event_id"], json!("evt-a"));
+        let frame = read_sse_frame(&mut body_a).await;
+        assert_eq!(frame.event, "room_access");
+        assert_eq!(frame.data["outbox"][0]["client_event_id"], json!("evt-a"));
 
         // 1) Publish same-room unchanged hint → must produce NO access frame.
         publish_room_access_wake(&state, &room_a);
@@ -5591,7 +6847,11 @@ env = { FIXTURE = "1" }
             .unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
         assert_eq!(state.room_wakes.receiver_count(), 1);
-        assert_eq!(state.room_access_wakes.receiver_count(), 1);
+        // Two independent subscriptions: one for the access-projection tail
+        // and one dedicated to the cursor tail (so an access wake alone can
+        // make the cursor tail re-check on a federated Connecting/Recovering
+        // -> Live transition; see `run_room_read_cursor_tail`).
+        assert_eq!(state.room_access_wakes.receiver_count(), 2);
 
         drop(resp);
 

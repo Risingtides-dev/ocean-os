@@ -196,10 +196,10 @@ use model_roles::resolve_effective_model_id;
 use model_roles::{load_model_roles, resolve_advisor_alias, resolve_turn_model};
 use persistent_rooms::{
     resolve_named_agent, room_create, room_create_invite, room_db_path, room_events, room_get,
-    room_join, room_leave, room_post_message, room_redeem_invite, room_register_agents,
-    room_retry_outbox, room_snapshot, room_transcript, rooms_list_persistent,
-    run_federated_trigger_dispatcher, with_rooms, with_rooms_handle, RoomAccessWakeBus,
-    RoomStoreHandle, RoomWakeBus,
+    room_get_read_cursor, room_join, room_leave, room_patch_read_cursor, room_post_message,
+    room_redeem_invite, room_register_agents, room_retry_outbox, room_snapshot, room_transcript,
+    rooms_list_persistent, run_federated_trigger_dispatcher, with_rooms, with_rooms_handle,
+    RoomAccessWakeBus, RoomReadCursorWakeBus, RoomStoreHandle, RoomWakeBus,
 };
 use project_registry::{
     canonical_git_common_dir, discover_project_worktrees, project_create, project_delete,
@@ -293,10 +293,10 @@ struct AppState {
     /// payload is only `(room, seq)`; SQLite remains authoritative for replay,
     /// live delivery, lag recovery, ordering, and deduplication.
     room_wakes: RoomWakeBus,
-    /// Bounded room-scoped wake hints for access projection changes (S2-P1).
-    /// Separate from `room_wakes` so a heavy transcript tail does not
-    /// back-pressure access-projection subscribers.
+    /// Bounded room-scoped wake hints for access-projection changes.
     room_access_wakes: RoomAccessWakeBus,
+    /// Bounded room-scoped wake hints for read-cursor changes.
+    room_read_cursor_wakes: RoomReadCursorWakeBus,
     /// AppState-owned cloneable outbound Bedrock supervisor. P2-C reuses its
     /// idempotent start/wake/stop seam after redeem and local outbox enqueue.
     room_federation: FederationSupervisor,
@@ -1047,6 +1047,7 @@ async fn main() -> anyhow::Result<()> {
     let rooms = Arc::new(Mutex::new(room_store));
     let room_wakes = RoomWakeBus::default();
     let room_access_wakes = RoomAccessWakeBus::default();
+    let room_read_cursor_wakes = RoomReadCursorWakeBus::default();
     let shutdown = CancellationToken::new();
 
     // Keep the local proxy credential fresh without ever distributing the
@@ -1076,6 +1077,7 @@ async fn main() -> anyhow::Result<()> {
         rooms.clone(),
         room_wakes.clone(),
         room_access_wakes.clone(),
+        room_read_cursor_wakes.clone(),
         federated_trigger_tx,
         shutdown.clone(),
     );
@@ -1093,6 +1095,7 @@ async fn main() -> anyhow::Result<()> {
         rooms,
         room_wakes,
         room_access_wakes,
+        room_read_cursor_wakes,
         room_federation,
         titles: Arc::new(Mutex::new(title_registry)),
         revoker: Arc::new(ocean_longhouse::Revoker::new()),
@@ -1536,6 +1539,8 @@ fn banner_routes() -> &'static [&'static str] {
         "POST /v1/rooms/persistent/{key}/artifacts/{artifact_id}/amend",
         "GET /v1/rooms/persistent/{key}/snapshot",
         "GET /v1/rooms/persistent/{key}/events",
+        "GET /v1/rooms/persistent/{key}/read-cursor",
+        "PATCH /v1/rooms/persistent/{key}/read-cursor",
         "POST /v1/rooms/persistent/{key}/outbox/retry",
         "GET /v1/sessions",
         "GET /v1/sessions/{id}",
@@ -2800,6 +2805,10 @@ fn room_routes() -> Router<AppState> {
         // Merged SSE: room_message + room_access frames, with durable replay
         // and access-projection tail (S2-P1).
         .route("/v1/rooms/persistent/{key}/events", get(room_events))
+        .route(
+            "/v1/rooms/persistent/{key}/read-cursor",
+            get(room_get_read_cursor).patch(room_patch_read_cursor),
+        )
         .route(
             "/v1/rooms/persistent/{key}/outbox/retry",
             post(room_retry_outbox),
@@ -12646,9 +12655,19 @@ mod tests {
         .await;
         assert_eq!(status, StatusCode::OK);
         let list = persistent_room_http_json(&raw);
-        assert_json_object_keys(&list, &["ok", "rooms", "next_cursor", "has_more"]);
+        assert_json_object_keys(
+            &list,
+            &["ok", "rooms", "read_states", "next_cursor", "has_more"],
+        );
         assert_eq!(list["ok"], true);
         assert_eq!(list["rooms"].as_array().unwrap().len(), 1);
+        assert_eq!(list["next_cursor"], serde_json::Value::Null);
+        assert_eq!(
+            list["read_states"],
+            json!([{
+                "room_id": "lifecycle-room"
+            }])
+        );
         assert_eq!(list["rooms"][0]["id"], "lifecycle-room");
         assert_eq!(list["rooms"][0]["name"], "  Verbatim Room Name  ");
         assert!(list["rooms"][0].get("workspace_root").is_none());
@@ -13757,11 +13776,13 @@ mod tests {
         let rooms = Arc::new(Mutex::new(store));
         let room_wakes = RoomWakeBus::default();
         let room_access_wakes = RoomAccessWakeBus::default();
+        let room_read_cursor_wakes = RoomReadCursorWakeBus::default();
         let shutdown = CancellationToken::new();
         let room_federation = FederationSupervisor::test_disabled(
             rooms.clone(),
             room_wakes.clone(),
             room_access_wakes.clone(),
+            room_read_cursor_wakes.clone(),
             shutdown.clone(),
         );
         AppState {
@@ -13777,6 +13798,7 @@ mod tests {
             rooms,
             room_wakes,
             room_access_wakes,
+            room_read_cursor_wakes: RoomReadCursorWakeBus::default(),
             room_federation,
             titles: Arc::new(Mutex::new(
                 ocean_longhouse::SqliteTitleRegistry::open_in_memory().expect("in-mem titles"),
@@ -15484,11 +15506,13 @@ mod tests {
         let rooms = Arc::new(Mutex::new(store));
         let room_wakes = RoomWakeBus::default();
         let room_access_wakes = RoomAccessWakeBus::default();
+        let room_read_cursor_wakes = RoomReadCursorWakeBus::default();
         let shutdown = CancellationToken::new();
         let room_federation = FederationSupervisor::test_disabled(
             rooms.clone(),
             room_wakes.clone(),
             room_access_wakes.clone(),
+            room_read_cursor_wakes.clone(),
             shutdown.clone(),
         );
         AppState {
@@ -15504,6 +15528,7 @@ mod tests {
             rooms,
             room_wakes,
             room_access_wakes,
+            room_read_cursor_wakes: RoomReadCursorWakeBus::default(),
             room_federation,
             titles: Arc::new(Mutex::new(
                 ocean_longhouse::SqliteTitleRegistry::open_in_memory().expect("in-mem titles"),
@@ -15867,11 +15892,13 @@ mod tests {
         let rooms = Arc::new(Mutex::new(store));
         let room_wakes = RoomWakeBus::default();
         let room_access_wakes = RoomAccessWakeBus::default();
+        let room_read_cursor_wakes = RoomReadCursorWakeBus::default();
         let shutdown = CancellationToken::new();
         let room_federation = FederationSupervisor::test_disabled(
             rooms.clone(),
             room_wakes.clone(),
             room_access_wakes.clone(),
+            room_read_cursor_wakes.clone(),
             shutdown.clone(),
         );
         let state = AppState {
@@ -15887,6 +15914,7 @@ mod tests {
             rooms,
             room_wakes,
             room_access_wakes,
+            room_read_cursor_wakes: RoomReadCursorWakeBus::default(),
             room_federation,
             titles: Arc::new(Mutex::new(
                 ocean_longhouse::SqliteTitleRegistry::open_in_memory().expect("in-mem titles"),
@@ -17642,11 +17670,13 @@ mod tests {
         let rooms = Arc::new(Mutex::new(store));
         let room_wakes = RoomWakeBus::default();
         let room_access_wakes = RoomAccessWakeBus::default();
+        let room_read_cursor_wakes = RoomReadCursorWakeBus::default();
         let shutdown = CancellationToken::new();
         let room_federation = FederationSupervisor::test_disabled(
             rooms.clone(),
             room_wakes.clone(),
             room_access_wakes.clone(),
+            room_read_cursor_wakes.clone(),
             shutdown.clone(),
         );
         let titles = ocean_longhouse::SqliteTitleRegistry::open(dir.join("titles.db"))
@@ -17664,6 +17694,7 @@ mod tests {
             rooms,
             room_wakes,
             room_access_wakes,
+            room_read_cursor_wakes: RoomReadCursorWakeBus::default(),
             room_federation,
             titles: Arc::new(Mutex::new(titles)),
             revoker: Arc::new(ocean_longhouse::Revoker::new()),
@@ -24789,13 +24820,15 @@ mod tests {
             "live Router::route registrations and GET / discovery must match"
         );
         // 95 -> 98: room artifacts added POST+GET /artifacts and
-        // POST /artifacts/{artifact_id}/amend. Moved DELIBERATELY. The parity
-        // assertion above is the real gate — it proves every advertised route is
-        // actually registered — and this count is the tripwire that forces a
-        // human to look when the surface grows.
+        // POST /artifacts/{artifact_id}/amend.
+        // 99 -> 101: durable read-cursor projection added GET+PATCH
+        // /v1/rooms/persistent/{key}/read-cursor. Moved DELIBERATELY. The
+        // parity assertion above is the real gate — it proves every
+        // advertised route is actually registered — and this count is the
+        // tripwire that forces a human to look when the surface grows.
         assert_eq!(
             banner.len(),
-            99,
+            101,
             "route baseline changed; review the manifest"
         );
 
