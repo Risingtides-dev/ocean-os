@@ -12,6 +12,11 @@ This crate owns the Ocean agent loop and permission-gated tool execution runtime
 
 ## Local Contracts
 
+- A turn that is waiting must say why. Both retry layers — the provider layer's
+  request retry (via the `retry_observer` the loop installs on `StreamOptions`)
+  and the loop's own clean-round replay — emit `AgentEvent::ProviderRetrying`
+  with a `RetryScope`. Silent retrying is what makes a degraded network
+  indistinguishable from a hung agent; do not add a third quiet wait.
 - Permission gates are mandatory; do not add execution paths that bypass them.
   `PermissionPolicy::should_check` owns the approval-mode boundary: manual may
   broaden checks to all known tools, automatic follows each tool's conservative

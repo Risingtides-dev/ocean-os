@@ -46,6 +46,14 @@ This crate owns the multi-provider LLM wire protocol layer for Anthropic, OpenAI
   `tool_choice: "none"`. K3 omits fixed temperature, uses
   `max_completion_tokens`, maps enabled reasoning to `max`, and replays
   `reasoning_content` only from same-provider `kimi-k3` assistant history.
+- Retries are operator-visible, not log-only. `with_retry_observed` notifies an
+  optional `StreamOptions::retry_observer` before each backoff sleep; providers
+  must pass `options.retry_observer` through so a reconnect can reach a surface
+  instead of leaving clients on a silent spinner. `with_retry` remains the
+  log-only form for call sites with no user-facing stream. The reported `reason`
+  is a fixed `RetryReason` vocabulary classified from the error type — never
+  provider body text, which is attacker-influenced, unbounded, and fans out to
+  every connected client.
 - `OCEAN_PROMPT_CAPTURE_DIR` is an opt-in local diagnostics path: capture the
   complete serialized JSON body only (never request headers or endpoint URLs),
   warn-and-continue on capture failures, and retain owner-only permissions
