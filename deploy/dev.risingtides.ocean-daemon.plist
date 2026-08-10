@@ -73,6 +73,22 @@
          without per-call permission prompts. Set OCEAN_YOLO=0 to gate. -->
     <key>OCEAN_YOLO</key>
     <string>1</string>
+    <!-- Retry policy for a residential/Wi-Fi uplink (see ocean-protocol::retry).
+         The 3-attempt default assumes a healthy link: it treats a connect
+         failure as near-fatal and burns the whole budget in ~3s. On a degraded
+         link (measured 40% of TLS connects failing, 1s+ RTT to the local
+         gateway) three tries is not a retry policy, it is a coin flip — every
+         provider then reports the same `error sending request for url`, the
+         failover target fails identically, and a turn dies with no reply.
+         Eight attempts against a 40%-loss link fails ~0.07% of the time instead
+         of ~6%; the 8s ceiling keeps the worst-case wait bounded (~36s total)
+         rather than letting the 60s default stall a turn behind one bad hop. -->
+    <key>OCEAN_RETRY_MAX_ATTEMPTS</key>
+    <string>8</string>
+    <key>OCEAN_RETRY_BASE_BACKOFF_MS</key>
+    <string>400</string>
+    <key>OCEAN_RETRY_MAX_BACKOFF_MS</key>
+    <string>8000</string>
     <!-- Opt-in local diagnostic: captures complete provider JSON bodies (system
          instruction, trimmed transcript, and tool schemas) under this directory.
          Bodies include private conversation content; the protocol layer writes
