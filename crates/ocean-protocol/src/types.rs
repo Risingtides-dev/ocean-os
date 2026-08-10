@@ -237,6 +237,11 @@ pub struct StreamOptions {
     /// preserving the historical Anthropic `x-api-key` behavior for callers
     /// using default options.
     pub auth: AuthMethod,
+    /// Optional sink notified each time this request is retried, so a caller
+    /// with a user-facing event stream can say "reconnecting, attempt 2/8"
+    /// instead of leaving a client on a silent spinner. `None` (the default)
+    /// keeps retries log-only, exactly as before.
+    pub retry_observer: Option<crate::retry::RetryObserver>,
 }
 
 /// Model descriptor — analogous to the Model<TApi> interface in ocean-protocol.

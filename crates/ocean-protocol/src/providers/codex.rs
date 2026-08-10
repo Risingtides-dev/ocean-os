@@ -18,7 +18,9 @@ use serde_json::{json, Value};
 
 use crate::error::{Error, Result};
 use crate::providers::Provider;
-use crate::retry::{classify_status, parse_retry_after, retry_config, with_retry, Attempt};
+use crate::retry::{
+    classify_status, parse_retry_after, retry_config, with_retry_observed, Attempt,
+};
 use crate::stream::AssistantMessageEventStream;
 use crate::types::{
     now_ms, AssistantMessage, AssistantMessageEvent, Content, Context, Message, Model, StopReason,
@@ -807,56 +809,61 @@ impl Provider for CodexProvider {
         // a stable id across every model round; ad-hoc calls get one random id.
         let session_id = request_session_id(options);
 
-        let resp = with_retry(retry_config(), cancel.as_ref(), |_| {
-            let client = self.client.clone();
-            let url = url.clone();
-            let access = access.clone();
-            let account_id = account_id.clone();
-            let body = body.clone();
-            let session_id = session_id.clone();
-            async move {
-                let req = apply_request_headers(
-                    client.post(&url),
-                    &access,
-                    &session_id,
-                    account_id.as_deref(),
-                );
-                let r = match req.json(&body).send().await {
-                    Ok(r) => r,
-                    Err(e) => {
-                        return if e.is_timeout() || e.is_connect() {
-                            Attempt::Retry {
-                                error: Error::Http(e),
-                                retry_after: None,
+        let resp = with_retry_observed(
+            retry_config(),
+            cancel.as_ref(),
+            options.retry_observer.as_ref(),
+            |_| {
+                let client = self.client.clone();
+                let url = url.clone();
+                let access = access.clone();
+                let account_id = account_id.clone();
+                let body = body.clone();
+                let session_id = session_id.clone();
+                async move {
+                    let req = apply_request_headers(
+                        client.post(&url),
+                        &access,
+                        &session_id,
+                        account_id.as_deref(),
+                    );
+                    let r = match req.json(&body).send().await {
+                        Ok(r) => r,
+                        Err(e) => {
+                            return if e.is_timeout() || e.is_connect() {
+                                Attempt::Retry {
+                                    error: Error::Http(e),
+                                    retry_after: None,
+                                }
+                            } else {
+                                Attempt::Fatal(Error::Http(e))
                             }
-                        } else {
-                            Attempt::Fatal(Error::Http(e))
                         }
+                    };
+                    let status = r.status();
+                    if status.is_success() {
+                        return Attempt::Ok(r);
                     }
-                };
-                let status = r.status();
-                if status.is_success() {
-                    return Attempt::Ok(r);
+                    let retry_after = r
+                        .headers()
+                        .get("retry-after")
+                        .and_then(|v| v.to_str().ok())
+                        .and_then(parse_retry_after);
+                    let body = r.text().await.unwrap_or_default();
+                    let err = Error::ProviderError {
+                        status: status.as_u16(),
+                        body,
+                    };
+                    match classify_status(status.as_u16()) {
+                        Some(_) => Attempt::Retry {
+                            error: err,
+                            retry_after,
+                        },
+                        None => Attempt::Fatal(err),
+                    }
                 }
-                let retry_after = r
-                    .headers()
-                    .get("retry-after")
-                    .and_then(|v| v.to_str().ok())
-                    .and_then(parse_retry_after);
-                let body = r.text().await.unwrap_or_default();
-                let err = Error::ProviderError {
-                    status: status.as_u16(),
-                    body,
-                };
-                match classify_status(status.as_u16()) {
-                    Some(_) => Attempt::Retry {
-                        error: err,
-                        retry_after,
-                    },
-                    None => Attempt::Fatal(err),
-                }
-            }
-        })
+            },
+        )
         .await?;
 
         let api = model.api.clone();

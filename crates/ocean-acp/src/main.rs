@@ -1201,6 +1201,7 @@ fn event_session_id(event: &ocean_agent_sdk::AgentTurnEvent) -> Option<String> {
     let id = match event {
         E::TurnStarted { session_id, .. }
         | E::ModelRerouted { session_id, .. }
+        | E::ProviderRetrying { session_id, .. }
         | E::AssistantTextDelta { session_id, .. }
         | E::ThinkingDelta { session_id, .. }
         | E::ToolCallStarted { session_id, .. }

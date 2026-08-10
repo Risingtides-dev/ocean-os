@@ -154,6 +154,94 @@ fn parse_env_millis(key: &str) -> Option<Duration> {
     parse_env_u64(key).map(Duration::from_millis)
 }
 
+/// Why a request is being retried, classified into a short operator-facing
+/// phrase.
+///
+/// Deliberately a fixed vocabulary rather than the underlying [`Error`]'s
+/// `Display`: a provider error body is attacker-influenced and can be
+/// arbitrarily long, and surfacing raw text to every client would put unbounded
+/// upstream content on screen. The variants below carry everything a human needs
+/// to know ("the network dropped" vs "we're being throttled") and nothing else.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RetryReason {
+    /// Connect/DNS/TLS/timeout — the endpoint was unreachable ([`Error::Http`]).
+    Connection,
+    /// HTTP 429.
+    RateLimited,
+    /// HTTP 5xx.
+    ServerError,
+    /// Anything else classified as retry-worthy by a provider.
+    Transient,
+}
+
+impl RetryReason {
+    /// Short lowercase phrase for status rows and transcripts.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Connection => "connection failed",
+            Self::RateLimited => "rate limited",
+            Self::ServerError => "server error",
+            Self::Transient => "transient error",
+        }
+    }
+
+    /// Classify the error that caused a retry.
+    pub fn classify(error: &Error) -> Self {
+        match error {
+            Error::Http(_) => Self::Connection,
+            Error::ProviderError { status, .. } => match classify_status(*status) {
+                Some(ClassifiedStatus::RateLimited) => Self::RateLimited,
+                Some(ClassifiedStatus::ServerError) => Self::ServerError,
+                None => Self::Transient,
+            },
+            Error::RetryExhausted { source, .. } => Self::classify(source),
+            _ => Self::Transient,
+        }
+    }
+}
+
+/// One "about to retry" notification, emitted *before* the backoff sleep.
+///
+/// `attempt` is the attempt that just failed (1-based), so a client can render
+/// "retrying 2/8" and know how much budget is left.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RetryNotice {
+    pub attempt: u32,
+    pub max_attempts: u32,
+    pub delay_ms: u64,
+    pub reason: RetryReason,
+}
+
+/// Sink for [`RetryNotice`]s, installed by the caller that owns a user-facing
+/// event stream (the agent loop) and threaded down via
+/// [`crate::StreamOptions::retry_observer`].
+///
+/// Retries used to be `tracing::warn!`-only. On a degraded link that meant a
+/// turn could spend its entire budget silently reconnecting while the client
+/// showed nothing but "working" — indistinguishable from a hang, which reads as
+/// "the agent is broken" rather than "the network is bad". This is the seam that
+/// lets the truth reach a surface.
+#[derive(Clone)]
+pub struct RetryObserver(std::sync::Arc<dyn Fn(RetryNotice) + Send + Sync>);
+
+impl RetryObserver {
+    pub fn new(f: impl Fn(RetryNotice) + Send + Sync + 'static) -> Self {
+        Self(std::sync::Arc::new(f))
+    }
+
+    pub fn notify(&self, notice: RetryNotice) {
+        (self.0)(notice)
+    }
+}
+
+// `StreamOptions` derives `Debug`; a boxed closure can't, so print the presence
+// of an observer rather than blocking the derive on the whole options struct.
+impl std::fmt::Debug for RetryObserver {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("RetryObserver(..)")
+    }
+}
+
 /// Outcome of a single attempt.
 #[allow(clippy::large_enum_variant)]
 pub enum Attempt<T> {
@@ -170,6 +258,24 @@ pub enum Attempt<T> {
 pub async fn with_retry<T, F, Fut>(
     cfg: &RetryConfig,
     cancel: Option<&CancellationToken>,
+    f: F,
+) -> Result<T>
+where
+    F: FnMut(u32) -> Fut,
+    Fut: std::future::Future<Output = Attempt<T>>,
+{
+    with_retry_observed(cfg, cancel, None, f).await
+}
+
+/// [`with_retry`], plus an optional [`RetryObserver`] notified before each
+/// backoff sleep.
+///
+/// Split from `with_retry` rather than added as a parameter so call sites with
+/// no user-facing stream to report to (e.g. `ocean-mcp`) stay untouched.
+pub async fn with_retry_observed<T, F, Fut>(
+    cfg: &RetryConfig,
+    cancel: Option<&CancellationToken>,
+    observer: Option<&RetryObserver>,
     mut f: F,
 ) -> Result<T>
 where
@@ -189,6 +295,7 @@ where
             Attempt::Ok(v) => return Ok(v),
             Attempt::Fatal(e) => return Err(e),
             Attempt::Retry { error, retry_after } => {
+                let reason = RetryReason::classify(&error);
                 last_err = Some(error);
                 let _ = &last_err;
                 if attempt >= cfg.max_attempts {
@@ -200,6 +307,16 @@ where
                     .min(cfg.max_delay);
                 let delay = retry_after.map(|d| d.min(cfg.max_delay)).unwrap_or(backoff);
                 tracing::warn!(?delay, attempt, "retrying after transient error");
+                // Before the sleep, not after: the whole point is to tell the
+                // operator *while* we are waiting, not once the wait is over.
+                if let Some(obs) = observer {
+                    obs.notify(RetryNotice {
+                        attempt,
+                        max_attempts: cfg.max_attempts,
+                        delay_ms: delay.as_millis() as u64,
+                        reason,
+                    });
+                }
                 tokio::select! {
                     _ = sleep(delay) => {},
                     _ = async {
@@ -372,5 +489,149 @@ mod tests {
             "accessor must return the cached instance"
         );
         assert_eq!(a.max_attempts, b.max_attempts);
+    }
+
+    // ── retry observability ─────────────────────────────────────────────────
+
+    fn collector() -> (RetryObserver, std::sync::Arc<Mutex<Vec<RetryNotice>>>) {
+        let seen = std::sync::Arc::new(Mutex::new(Vec::new()));
+        let sink = std::sync::Arc::clone(&seen);
+        let obs = RetryObserver::new(move |n| sink.lock().unwrap().push(n));
+        (obs, seen)
+    }
+
+    fn http_error() -> Error {
+        Error::Other("boom".into())
+    }
+
+    /// One notice per *wait*, not per attempt: a 3-attempt budget that fails
+    /// throughout sleeps twice, so the operator sees "1/3" then "2/3" and never
+    /// a "3/3" that promises a wait which never happens.
+    #[tokio::test]
+    async fn observer_sees_one_notice_per_backoff_not_per_attempt() {
+        let cfg = RetryConfig {
+            max_attempts: 3,
+            base_delay: Duration::from_millis(1),
+            max_delay: Duration::from_millis(1),
+        };
+        let (obs, seen) = collector();
+
+        let out: Result<()> = with_retry_observed(&cfg, None, Some(&obs), |_| async {
+            Attempt::Retry {
+                error: http_error(),
+                retry_after: None,
+            }
+        })
+        .await;
+
+        assert!(matches!(
+            out,
+            Err(Error::RetryExhausted { attempts: 3, .. })
+        ));
+        let seen = seen.lock().unwrap();
+        assert_eq!(seen.len(), 2, "3 attempts => 2 waits => 2 notices");
+        assert_eq!(seen[0].attempt, 1);
+        assert_eq!(seen[1].attempt, 2);
+        assert!(
+            seen.iter().all(|n| n.max_attempts == 3),
+            "every notice carries the budget so a client can render x/y"
+        );
+    }
+
+    /// A call that succeeds on the first try must stay completely silent —
+    /// otherwise every healthy turn would flash a spurious reconnect notice.
+    #[tokio::test]
+    async fn observer_silent_when_first_attempt_succeeds() {
+        let cfg = RetryConfig::default();
+        let (obs, seen) = collector();
+
+        let out: Result<u8> =
+            with_retry_observed(&cfg, None, Some(&obs), |_| async { Attempt::Ok(7) }).await;
+
+        assert_eq!(out.unwrap(), 7);
+        assert!(seen.lock().unwrap().is_empty());
+    }
+
+    /// A `Retry-After` hint is what the operator actually waits, so it — not the
+    /// computed backoff — must be the delay reported.
+    #[tokio::test]
+    async fn notice_reports_the_delay_actually_waited() {
+        let cfg = RetryConfig {
+            max_attempts: 2,
+            base_delay: Duration::from_millis(1),
+            max_delay: Duration::from_millis(50),
+        };
+        let (obs, seen) = collector();
+
+        let _: Result<()> = with_retry_observed(&cfg, None, Some(&obs), |_| async {
+            Attempt::Retry {
+                error: http_error(),
+                retry_after: Some(Duration::from_millis(40)),
+            }
+        })
+        .await;
+
+        assert_eq!(seen.lock().unwrap()[0].delay_ms, 40);
+    }
+
+    /// The reported reason is a fixed phrase derived from the error class, never
+    /// the provider's own text — an upstream body is attacker-influenced and
+    /// must not reach a client through this path.
+    #[test]
+    fn reason_classification_is_a_fixed_vocabulary() {
+        assert_eq!(
+            RetryReason::classify(&Error::ProviderError {
+                status: 429,
+                body: "slow down".into()
+            }),
+            RetryReason::RateLimited
+        );
+        assert_eq!(
+            RetryReason::classify(&Error::ProviderError {
+                status: 503,
+                body: "oops".into()
+            }),
+            RetryReason::ServerError
+        );
+        // An exhausted retry is classified by what actually failed underneath.
+        assert_eq!(
+            RetryReason::classify(&Error::RetryExhausted {
+                attempts: 3,
+                source: Box::new(Error::ProviderError {
+                    status: 429,
+                    body: String::new()
+                }),
+            }),
+            RetryReason::RateLimited
+        );
+
+        let secret = "sk-live-do-not-leak";
+        let reason = RetryReason::classify(&Error::ProviderError {
+            status: 500,
+            body: format!("bad key {secret}"),
+        });
+        assert!(
+            !reason.as_str().contains(secret),
+            "classified reason must never carry provider body text"
+        );
+    }
+
+    /// `with_retry` keeps its historical signature and stays log-only, so call
+    /// sites with no surface to report to are unaffected.
+    #[tokio::test]
+    async fn plain_with_retry_still_works_without_an_observer() {
+        let cfg = RetryConfig {
+            max_attempts: 2,
+            base_delay: Duration::from_millis(1),
+            max_delay: Duration::from_millis(1),
+        };
+        let mut calls = 0;
+        let out: Result<u8> = with_retry(&cfg, None, |_| {
+            calls += 1;
+            async move { Attempt::Ok(1) }
+        })
+        .await;
+        assert_eq!(out.unwrap(), 1);
+        assert_eq!(calls, 1);
     }
 }

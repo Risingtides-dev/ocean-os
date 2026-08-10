@@ -374,6 +374,15 @@ pub struct ChatComponent {
     input: String,
     model: Option<String>,
     busy: bool,
+    /// Live "we are reconnecting" line for the status row, set by
+    /// `ProviderRetrying` and cleared the moment the turn makes progress again.
+    ///
+    /// Deliberately status, not a transcript card: a bad link retries up to the
+    /// whole budget, and one card per attempt would bury the conversation in
+    /// notices about a turn that may well succeed. The status row is exactly
+    /// where the misleading bare "working" was shown, so the correction belongs
+    /// there.
+    retry_status: Option<String>,
     /// Monotonic local identity for optimistic user echoes. Daemon admission
     /// failures may arrive after unrelated stream events, so prompt text or a
     /// tail index alone cannot safely identify the row to roll back.
@@ -1868,6 +1877,8 @@ impl ChatComponent {
         self.last_viewport_rows = None;
         self.scroll_back = 0;
         self.busy = false;
+        // Another session's reconnect says nothing about this one.
+        self.retry_status = None;
     }
 
     /// Replace same-session history from a fenced authoritative snapshot while
@@ -2205,6 +2216,13 @@ impl ChatComponent {
     pub fn activity(&self) -> Option<&str> {
         if !self.busy {
             return None;
+        }
+        // A reconnect outranks both a running tool and the generic fallback: it
+        // is the only one of the three that explains why nothing is happening.
+        // This is the line that used to read "working" for minutes on a
+        // degraded link while the daemon quietly burned its retry budget.
+        if let Some(retry) = self.retry_status.as_deref() {
+            return Some(retry);
         }
         self.turns
             .iter()
@@ -3648,6 +3666,8 @@ impl Component for ChatComponent {
                 AgentTurnEvent::TurnStarted { model, .. } => {
                     // A fresh turn invalidates the previous throughput reading.
                     self.last_tok_per_s = None;
+                    // …and any reconnect notice from the turn before it.
+                    self.retry_status = None;
                     if let Some(m) = model {
                         self.model = Some(m.clone());
                     }
@@ -3672,8 +3692,27 @@ impl Component for ChatComponent {
                         model: effective.clone(),
                     });
                 }
-                AgentTurnEvent::AssistantTextDelta { delta, .. } => self.push_assistant(delta),
-                AgentTurnEvent::ThinkingDelta { delta, .. } => self.push_thinking(delta),
+                // Network honesty: the turn is alive but reconnecting. Show it in
+                // the status row instead of the bare "working" that made a
+                // degraded link look like a hung agent.
+                AgentTurnEvent::ProviderRetrying {
+                    attempt,
+                    max_attempts,
+                    reason,
+                    ..
+                } => {
+                    self.retry_status =
+                        Some(format!("reconnecting {attempt}/{max_attempts} — {reason}"));
+                }
+                AgentTurnEvent::AssistantTextDelta { delta, .. } => {
+                    // Progress: whatever we were retrying went through.
+                    self.retry_status = None;
+                    self.push_assistant(delta)
+                }
+                AgentTurnEvent::ThinkingDelta { delta, .. } => {
+                    self.retry_status = None;
+                    self.push_thinking(delta)
+                }
                 AgentTurnEvent::ToolCallStarted { call, .. } => {
                     let name = call.name.to_string();
                     // Edit tools render as diff cards; a malformed payload yields
@@ -3764,6 +3803,9 @@ impl Component for ChatComponent {
                     tokens_per_second,
                     ..
                 } => {
+                    // The turn is over either way — a reconnect notice must not
+                    // outlive it and imply the next turn is struggling too.
+                    self.retry_status = None;
                     let matches_accepted_submission = self.accepted_turn_id == Some(*turn_id);
                     if matches_accepted_submission {
                         self.pending_submission_id = None;
@@ -6079,6 +6121,124 @@ mod tests {
         }
         chat.busy = false;
         assert_eq!(chat.activity(), None, "idle chat reports no activity");
+    }
+
+    // ── retry visibility ───────────────────────────────────────────────────
+    //
+    // The bug these cover: a degraded link made the daemon burn its whole retry
+    // budget while the status row showed a bare "working", which is
+    // indistinguishable from a hung agent.
+
+    fn provider_retrying(attempt: u32, max_attempts: u32, reason: &str) -> Action {
+        Action::AgentEvent(Box::new(AgentTurnEvent::ProviderRetrying {
+            session_id: AgentSessionId(Uuid::nil()),
+            turn_id: AgentTurnId(Uuid::nil()),
+            attempt,
+            max_attempts,
+            delay_ms: 800,
+            reason: reason.to_string(),
+            scope: "request".into(),
+        }))
+    }
+
+    fn text_delta(delta: &str) -> Action {
+        Action::AgentEvent(Box::new(AgentTurnEvent::AssistantTextDelta {
+            session_id: AgentSessionId(Uuid::nil()),
+            turn_id: AgentTurnId(Uuid::nil()),
+            delta: delta.to_string(),
+        }))
+    }
+
+    #[test]
+    fn retrying_replaces_the_bare_working_activity_with_the_reason() {
+        let mut chat = ChatComponent {
+            busy: true,
+            ..Default::default()
+        };
+        assert_eq!(chat.activity(), Some("working"));
+
+        chat.update(&provider_retrying(2, 8, "connection failed"));
+
+        assert_eq!(
+            chat.activity(),
+            Some("reconnecting 2/8 — connection failed"),
+            "a stalled turn must say why it is stalled"
+        );
+    }
+
+    #[test]
+    fn retry_status_outranks_a_running_tool() {
+        let mut chat = ChatComponent {
+            busy: true,
+            ..Default::default()
+        };
+        let id = add_tool(&mut chat, "bash", "");
+        if let Some(Turn::Tool { status, .. }) = chat.tool_by_id(&id) {
+            *status = ToolStatus::Running;
+        }
+        assert_eq!(chat.activity(), Some("bash"));
+
+        chat.update(&provider_retrying(1, 8, "rate limited"));
+        assert_eq!(
+            chat.activity(),
+            Some("reconnecting 1/8 — rate limited"),
+            "the reconnect explains the stall; the tool name does not"
+        );
+    }
+
+    #[test]
+    fn streamed_output_clears_the_retry_status() {
+        let mut chat = ChatComponent {
+            busy: true,
+            ..Default::default()
+        };
+        chat.update(&provider_retrying(3, 8, "connection failed"));
+        assert!(chat.activity().unwrap().starts_with("reconnecting"));
+
+        chat.update(&text_delta("hello"));
+
+        assert_eq!(
+            chat.activity(),
+            Some("working"),
+            "output means the reconnect succeeded — the notice must not persist"
+        );
+    }
+
+    #[test]
+    fn retry_status_does_not_outlive_its_turn() {
+        let mut chat = ChatComponent {
+            busy: true,
+            ..Default::default()
+        };
+        chat.update(&provider_retrying(4, 8, "server error"));
+        chat.update(&turn_finished(AgentTurnStatus::Completed, None));
+        assert_eq!(chat.activity(), None, "turn over, activity gone");
+
+        // A later healthy turn must not inherit the previous turn's reconnect.
+        chat.update(&Action::AgentEvent(Box::new(AgentTurnEvent::TurnStarted {
+            session_id: AgentSessionId(Uuid::nil()),
+            turn_id: AgentTurnId(Uuid::nil()),
+            model: None,
+        })));
+        assert_eq!(chat.activity(), Some("working"));
+    }
+
+    #[test]
+    fn retrying_does_not_push_transcript_cards() {
+        let mut chat = ChatComponent {
+            busy: true,
+            ..Default::default()
+        };
+        let before = chat.turns.len();
+        for attempt in 1..=8 {
+            chat.update(&provider_retrying(attempt, 8, "connection failed"));
+        }
+        assert_eq!(
+            chat.turns.len(),
+            before,
+            "retries are transient status; a full budget must not bury the \
+             transcript in eight notice cards"
+        );
     }
 
     #[test]

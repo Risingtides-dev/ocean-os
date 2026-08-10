@@ -220,10 +220,17 @@ impl ObservatoryAdapter {
                 turn_topology(turn_id.to_string(), session_id.to_string()),
                 no_correlation(),
             )),
+            // Transient transport status with no durable-fact counterpart. Its
+            // payload is a fixed vocabulary and would be safe to forward, but
+            // admitting it would need a new `EventKind`, and a reconnect that
+            // succeeds changed nothing the Observatory records — the turn's
+            // outcome already tells that story. Deliberately dropped, not
+            // forgotten.
+            AgentTurnEvent::ProviderRetrying { .. }
             // Forbidden content variants: text/thinking deltas, tool output
             // chunks, and arbitrary extension/component/canvas payloads never
             // cross this boundary.
-            AgentTurnEvent::AssistantTextDelta { .. }
+            | AgentTurnEvent::AssistantTextDelta { .. }
             | AgentTurnEvent::ThinkingDelta { .. }
             | AgentTurnEvent::ToolCallChunk { .. }
             | AgentTurnEvent::BrowserActivity { .. }

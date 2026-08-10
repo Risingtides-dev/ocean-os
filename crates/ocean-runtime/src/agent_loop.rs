@@ -17,7 +17,8 @@ use tracing::{instrument, Instrument};
 
 use crate::error::{AgentError, Result};
 use crate::types::{
-    AgentConfig, AgentEvent, AgentTool, AgentToolResult, PermissionDecision, ToolSideEffect,
+    AgentConfig, AgentEvent, AgentTool, AgentToolResult, PermissionDecision, RetryScope,
+    ToolSideEffect,
 };
 
 const DYNAMIC_SEARCH_TOOL: &str = "search_tools";
@@ -593,6 +594,29 @@ pub async fn run_agent_with_history(
         {
             options.reasoning = Some(config.thinking_level);
         }
+        // Let the provider layer's request retries reach this turn's event
+        // stream. Without this the only trace of a reconnect is a daemon log
+        // line, so a client on a bad link sees an unchanging "working" for the
+        // entire retry budget and cannot tell a slow model from a dead network.
+        // Only installed when the caller wired a sink, and never overrides an
+        // observer a caller set deliberately.
+        if options.retry_observer.is_none() {
+            if let Some(sink) = events.clone() {
+                let sid = sid.clone();
+                options.retry_observer = Some(ocean_protocol::retry::RetryObserver::new(
+                    move |notice: ocean_protocol::retry::RetryNotice| {
+                        let _ = sink.send(AgentEvent::ProviderRetrying {
+                            session_id: sid.clone(),
+                            attempt: notice.attempt,
+                            max_attempts: notice.max_attempts,
+                            delay_ms: notice.delay_ms,
+                            reason: notice.reason.as_str().to_string(),
+                            scope: RetryScope::Request,
+                        });
+                    },
+                ));
+            }
+        }
 
         let mut final_message: Option<ocean_protocol::AssistantMessage> = None;
         let mut stop = StopReason::Stop;
@@ -739,6 +763,22 @@ pub async fn run_agent_with_history(
                         attempt,
                         delay_ms = delay.as_millis() as u64,
                         "transient provider stream failure on a clean round; retrying"
+                    );
+                    // Same reasoning as the request-level observer: a clean-round
+                    // replay is invisible by design (nothing was emitted), which
+                    // is exactly why it needs to be *announced* — otherwise the
+                    // turn just appears to stall. The phrase is fixed, not the
+                    // error's text, so no provider body reaches a client.
+                    emit(
+                        &events,
+                        AgentEvent::ProviderRetrying {
+                            session_id: sid.clone(),
+                            attempt,
+                            max_attempts: MAX_ROUND_ATTEMPTS,
+                            delay_ms: delay.as_millis() as u64,
+                            reason: "stream dropped".to_string(),
+                            scope: RetryScope::Round,
+                        },
                     );
                     tokio::select! {
                         biased;

@@ -84,6 +84,17 @@ pub fn event_to_update(event: &AgentTurnEvent) -> Option<SessionUpdate> {
             "⚠ {requested} unavailable — turn running on {effective} (fallback)\n"
         )))),
 
+        // Network honesty: a silent reconnect is indistinguishable from a hung
+        // agent in an editor, so say it out loud the same way a reroute does.
+        AgentTurnEvent::ProviderRetrying {
+            attempt,
+            max_attempts,
+            reason,
+            ..
+        } => Some(SessionUpdate::AgentMessageChunk(text_chunk(format!(
+            "⚠ {reason} — reconnecting ({attempt}/{max_attempts})\n"
+        )))),
+
         AgentTurnEvent::ThinkingDelta { delta, .. } => {
             Some(SessionUpdate::AgentThoughtChunk(text_chunk(delta.clone())))
         }

@@ -269,6 +269,29 @@ impl AgentConfig {
     }
 }
 
+/// Which layer is retrying, for [`AgentEvent::ProviderRetrying`].
+///
+/// Ocean retries in two independent places and they mean different things to an
+/// operator: the provider layer never got a response at all, whereas the agent
+/// loop had a stream that dropped part-way and is replaying a round it knows
+/// emitted nothing. Collapsing them would make "retrying 2/8" ambiguous.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RetryScope {
+    /// `ocean-protocol` is re-issuing the HTTP request.
+    Request,
+    /// The agent loop is re-running a clean round after a mid-stream drop.
+    Round,
+}
+
+impl RetryScope {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Request => "request",
+            Self::Round => "round",
+        }
+    }
+}
+
 /// Events emitted by the agent loop, mirroring `AgentEvent` in TS.
 ///
 /// Every variant carries a `session_id: Option<String>` — the session the run
@@ -351,6 +374,25 @@ pub enum AgentEvent {
         effective: String,
         reason: String,
     },
+    /// A provider call failed transiently and is being retried after `delay_ms`.
+    ///
+    /// Retries were `tracing::warn!`-only, so a turn on a degraded link could
+    /// spend two minutes silently reconnecting while every surface showed an
+    /// unchanging "working" — indistinguishable from a hang. An operator reads
+    /// that as "the agent is broken" and starts debugging the wrong system.
+    /// `scope` distinguishes the provider-layer request retry from the agent
+    /// loop's clean-round retry so a surface can tell them apart.
+    ProviderRetrying {
+        session_id: Option<String>,
+        /// The attempt that just failed (1-based).
+        attempt: u32,
+        max_attempts: u32,
+        delay_ms: u64,
+        /// Short classified phrase, e.g. "connection failed". Never raw
+        /// provider text.
+        reason: String,
+        scope: RetryScope,
+    },
     /// The agent wants the client to mount or update an interactive component.
     /// Clients maintain a component registry per session.
     Render {
@@ -407,6 +449,7 @@ impl AgentEvent {
             | AgentEvent::ToolExecutionEnd { session_id, .. }
             | AgentEvent::PermissionDenied { session_id, .. }
             | AgentEvent::ModelRerouted { session_id, .. }
+            | AgentEvent::ProviderRetrying { session_id, .. }
             | AgentEvent::Render { session_id, .. }
             | AgentEvent::Unmount { session_id, .. }
             | AgentEvent::BrowserActivity { session_id, .. }

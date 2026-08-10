@@ -6359,6 +6359,27 @@ async fn agent_turn(
                         reason,
                     });
                 }
+                // Same honesty rule as the reroute above: a turn that is quietly
+                // reconnecting must say so, or every surface shows a bare
+                // "working" that is indistinguishable from a hang.
+                AgentEvent::ProviderRetrying {
+                    attempt,
+                    max_attempts,
+                    delay_ms,
+                    reason,
+                    scope,
+                    ..
+                } => {
+                    bridge_bus.emit(AgentTurnEvent::ProviderRetrying {
+                        session_id: bridge_session_id,
+                        turn_id: bridge_turn_id,
+                        attempt,
+                        max_attempts,
+                        delay_ms,
+                        reason,
+                        scope: scope.as_str().to_string(),
+                    });
+                }
                 AgentEvent::ThinkingDelta { delta, .. } => {
                     if delta.is_empty() {
                         continue;
@@ -9100,6 +9121,7 @@ mod tests {
             // Relayed onto the SSE wire (see the bridge match arms).
             AgentEvent::TextDelta { .. }
             | AgentEvent::ModelRerouted { .. }
+            | AgentEvent::ProviderRetrying { .. }
             | AgentEvent::ThinkingDelta { .. }
             | AgentEvent::ToolExecutionStart { .. }
             | AgentEvent::ToolExecutionEnd { .. }

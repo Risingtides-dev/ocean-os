@@ -8,6 +8,9 @@ pub(super) fn agent_to_ocean_event(event: AgentTurnEvent) -> Option<OceanEvent> 
             turn_id: _, delta, ..
         } => Some(OceanEvent::AssistantDelta { text: delta }),
         AgentTurnEvent::ModelRerouted { .. } => None,
+        // Transient connection status, not a transcript fact: it has no
+        // `OceanEvent` counterpart and must not land in the durable log.
+        AgentTurnEvent::ProviderRetrying { .. } => None,
         AgentTurnEvent::ThinkingDelta { .. } => None,
         AgentTurnEvent::ToolCallStarted {
             turn_id: _, call, ..
@@ -62,6 +65,7 @@ pub(super) fn agent_event_type_name(event: &AgentTurnEvent) -> &'static str {
     match event {
         AgentTurnEvent::TurnStarted { .. } => "turn_started",
         AgentTurnEvent::ModelRerouted { .. } => "model_rerouted",
+        AgentTurnEvent::ProviderRetrying { .. } => "provider_retrying",
         AgentTurnEvent::AssistantTextDelta { .. } => "assistant_text_delta",
         AgentTurnEvent::ThinkingDelta { .. } => "thinking_delta",
         AgentTurnEvent::ToolCallStarted { .. } => "tool_call_started",
