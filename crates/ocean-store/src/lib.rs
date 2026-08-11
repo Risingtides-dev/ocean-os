@@ -85,8 +85,9 @@ use std::path::Path;
 use chrono::{DateTime, Utc};
 use ocean_core::{
     FederatedMessageMeta, FederatedRoomMemberProjection, OutboxItemState, Room,
-    RoomAccessProjection, RoomAccessState, RoomKey, RoomMessage, RoomMessageKind, RoomOutboxItem,
-    RoomParticipant, RoomParticipantKind, RoomTriggerPolicy,
+    RoomAccessProjection, RoomAccessState, RoomArtifact, RoomArtifactKind, RoomArtifactState,
+    RoomKey, RoomMessage, RoomMessageKind, RoomOutboxItem, RoomParticipant, RoomParticipantKind,
+    RoomReadCursorProjection, RoomReadCursorUpdateRequest, RoomTriggerPolicy,
 };
 use rusqlite::{params, Connection, OptionalExtension, TransactionBehavior};
 
@@ -211,6 +212,54 @@ pub enum RoomStoreError {
     /// with the incoming row. Carries opaque ids/sequences only — never a
     /// bearer, registration key, or any secret material (P2-A).
     FederationCorruption(String),
+    /// An artifact write presented a version that is not the current one.
+    /// Compare-and-swap refused it: the caller read stale state, and merging
+    /// would silently discard whatever the other writer just did.
+    ArtifactVersionConflict {
+        room: RoomKey,
+        artifact: String,
+        expected: u64,
+        actual: u64,
+    },
+    /// A re-join tried to MUTATE an existing participant record (display name,
+    /// ownership). The join route is unauthenticated, so "rename" and "steal
+    /// this identity" are indistinguishable requests; an existing record is
+    /// immutable via join and an identical re-join stays idempotent.
+    ParticipantRecordImmutable {
+        room: RoomKey,
+        participant: String,
+        field: &'static str,
+    },
+    /// An amend that would change nothing. Bumping the version on a no-op both
+    /// records an update that did not happen and invalidates every other
+    /// writer's `expected_version`, which is a denial-of-honest-writes lever.
+    ArtifactUnchanged { room: RoomKey, artifact: String },
+    /// An artifact with that id already exists in this room. A client naming
+    /// collision is the most ordinary error this endpoint sees; it must not
+    /// surface as a server fault.
+    ArtifactAlreadyExists { room: RoomKey, artifact: String },
+    /// No artifact with that id in this room.
+    UnknownArtifact { room: RoomKey, artifact: String },
+    /// The author of an artifact write is not on this room's roster.
+    ArtifactAuthorNotInRoster { room: RoomKey, author: String },
+    /// A join tried to replace an existing participant with one of a DIFFERENT
+    /// kind (e.g. a Bot taking over an Agent's id). Re-joining your own id with
+    /// the same kind stays idempotent; changing the kind is a takeover and is
+    /// refused with nothing written.
+    ParticipantKindConflict {
+        room: RoomKey,
+        participant: String,
+        existing: String,
+        offered: String,
+    },
+    /// An Agent participant was offered with an owner that is not a Human in
+    /// this room's roster (or a non-Agent was given an owner). Fail-closed:
+    /// nothing is written when this is returned.
+    InvalidAgentOwner {
+        agent: String,
+        owner: String,
+        reason: String,
+    },
     /// An underlying SQLite error.
     Db(rusqlite::Error),
     /// A stored value could not be (de)serialized.
@@ -232,6 +281,53 @@ impl std::fmt::Display for RoomStoreError {
                 write!(f, "room '{k}' is not federated (no access projection)")
             }
             Self::FederationCorruption(m) => write!(f, "federation corruption: {m}"),
+            Self::ArtifactVersionConflict {
+                room,
+                artifact,
+                expected,
+                actual,
+            } => write!(
+                f,
+                "room '{room}': artifact '{artifact}' is at version {actual}, \
+                 not {expected}; re-read it and retry"
+            ),
+            Self::ParticipantRecordImmutable {
+                room,
+                participant,
+                field,
+            } => write!(
+                f,
+                "room '{room}': participant '{participant}' already exists; \
+                 '{field}' cannot be changed by re-joining"
+            ),
+            Self::ArtifactUnchanged { room, artifact } => write!(
+                f,
+                "room '{room}': amend of '{artifact}' would change nothing"
+            ),
+            Self::ArtifactAlreadyExists { room, artifact } => {
+                write!(f, "room '{room}' already has an artifact '{artifact}'")
+            }
+            Self::UnknownArtifact { room, artifact } => {
+                write!(f, "room '{room}' has no artifact '{artifact}'")
+            }
+            Self::ArtifactAuthorNotInRoster { room, author } => {
+                write!(f, "room '{room}' has no participant '{author}'")
+            }
+            Self::ParticipantKindConflict {
+                room,
+                participant,
+                existing,
+                offered,
+            } => write!(
+                f,
+                "room '{room}': participant '{participant}' already exists as a \
+                 '{existing}'; refusing to replace it with a '{offered}'"
+            ),
+            Self::InvalidAgentOwner {
+                agent,
+                owner,
+                reason,
+            } => write!(f, "agent '{agent}' cannot be owned by '{owner}': {reason}"),
             Self::Db(e) => write!(f, "sqlite error: {e}"),
             Self::Encode(e) => write!(f, "encode error: {e}"),
             Self::Io(e) => write!(f, "io error: {e}"),
@@ -813,6 +909,72 @@ impl SqliteRoomStore {
                 PRIMARY KEY (room_id, id)
             );
 
+            -- Which WORKER owns which agent participant, within one local room.
+            -- This is the local half of "a worker persists alongside their
+            -- agents": it makes "my agent" a real concept in a room that has no
+            -- federation and no authenticated principal.
+            --
+            -- It is deliberately an ADJACENT table, not a column on
+            -- `participants`, because the federated-rooms design forbids growing
+            -- `ocean_core::RoomParticipant` with an owner/sovereignty field —
+            -- federated sovereignty is derived from Bedrock's authenticated
+            -- principal mapping, never from a local participant row. Keeping the
+            -- local binding adjacent means the two models never fight, and the
+            -- 31 existing RoomParticipant construction sites are untouched.
+            --
+            -- ON DELETE CASCADE on room_id drops bindings with the room. The
+            -- owner is stored as a participant id, validated by the caller
+            -- against the live roster inside the SAME transaction as the insert.
+            CREATE TABLE IF NOT EXISTS room_agent_owners (
+                room_id    TEXT NOT NULL REFERENCES rooms(id) ON DELETE CASCADE,
+                agent_id   TEXT NOT NULL,   -- the Agent participant's id
+                owner_id   TEXT NOT NULL,   -- the Human participant who owns it
+                created_at TEXT NOT NULL,
+                PRIMARY KEY (room_id, agent_id)
+            );
+
+            -- Room-scoped ARTIFACTS: the durable thing a conversation produces.
+            -- A transcript is a recording; nobody re-reads 4,000 lines to find
+            -- what they agreed to. An artifact is the agreed thing itself —
+            -- a task, a decision, a note — created by a human OR an agent and
+            -- AMENDED IN PLACE as the conversation moves, so the room shows
+            -- current state instead of requiring an archaeological dig.
+            --
+            -- `version` is a compare-and-swap guard, not decoration. The roster
+            -- clobber (two writers racing on one block, last-writer-wins) ate a
+            -- live roster twice in the prior campaign and reproduced on THIS
+            -- campaign's own pad the day it was created. An artifact that two
+            -- people edit during the same call is the same shape of race, so a
+            -- stale write is REFUSED, never merged and never silently applied.
+            CREATE TABLE IF NOT EXISTS room_artifacts (
+                room_id     TEXT NOT NULL REFERENCES rooms(id) ON DELETE CASCADE,
+                artifact_id TEXT NOT NULL,
+                kind        TEXT NOT NULL,   -- task | decision | note
+                title       TEXT NOT NULL,
+                body        TEXT NOT NULL,
+                state       TEXT NOT NULL,   -- open | done | dropped
+                created_by  TEXT NOT NULL,   -- participant id
+                created_at  TEXT NOT NULL,
+                updated_by  TEXT NOT NULL,
+                updated_at  TEXT NOT NULL,
+                -- The WORKER an agent author was acting for, snapshotted at
+                -- write time. NULL when a human authored it directly.
+                --
+                -- Denormalized on purpose: `room_agent_owners` is live state and
+                -- can be re-pointed or removed, but history must not rewrite. If
+                -- this were a join, deleting a binding would silently orphan
+                -- every artifact that agent ever created. Derived SERVER-SIDE
+                -- inside the write transaction — never accepted from the client,
+                -- because an asserted identity one layer down is exactly what
+                -- the roster check exists to prevent.
+                on_behalf_of TEXT,
+                version     INTEGER NOT NULL,
+                PRIMARY KEY (room_id, artifact_id)
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_room_artifacts_room
+                ON room_artifacts(room_id, state, updated_at);
+
             CREATE TABLE IF NOT EXISTS messages (
                 room_id     TEXT NOT NULL REFERENCES rooms(id) ON DELETE CASCADE,
                 seq         INTEGER NOT NULL,        -- per-room monotonic
@@ -845,6 +1007,23 @@ impl SqliteRoomStore {
                         [],
                     )?;
                 }
+            }
+        }
+        {
+            let existing = self.room_read_cursor_mirror_column_names()?;
+            if existing.is_empty() {
+                self.conn.execute_batch(
+                    r#"
+                    CREATE TABLE IF NOT EXISTS room_read_cursor_mirrors (
+                        room_id       TEXT NOT NULL REFERENCES rooms(id) ON DELETE CASCADE,
+                        principal_id  TEXT NOT NULL,
+                        mirrored_upstream_read_seq TEXT,
+                        PRIMARY KEY (room_id, principal_id)
+                    );
+                    CREATE INDEX IF NOT EXISTS idx_room_read_cursor_mirrors_room
+                        ON room_read_cursor_mirrors(room_id);
+                    "#,
+                )?;
             }
         }
         self.conn.execute_batch(
@@ -881,6 +1060,25 @@ impl SqliteRoomStore {
             );
 
             CREATE INDEX IF NOT EXISTS idx_outbox_room_state ON outbox(room_id, state);
+
+            CREATE TABLE IF NOT EXISTS room_read_cursors (
+                room_id       TEXT NOT NULL REFERENCES rooms(id) ON DELETE CASCADE,
+                principal_id  TEXT NOT NULL,
+                read_seq      TEXT NOT NULL,
+                PRIMARY KEY (room_id, principal_id)
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_room_read_cursors_room ON room_read_cursors(room_id);
+
+            CREATE TABLE IF NOT EXISTS room_read_cursor_mirrors (
+                room_id       TEXT NOT NULL REFERENCES rooms(id) ON DELETE CASCADE,
+                principal_id  TEXT NOT NULL,
+                mirrored_upstream_read_seq TEXT,
+                PRIMARY KEY (room_id, principal_id)
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_room_read_cursor_mirrors_room
+                ON room_read_cursor_mirrors(room_id);
 
             -- ── P2-A federation durability (private tables) ──────────────
             -- Bearer tokens and registration keys below are PRIVATE: they are
@@ -1034,6 +1232,18 @@ impl SqliteRoomStore {
         Ok(out)
     }
 
+    fn room_read_cursor_mirror_column_names(&self) -> Result<std::collections::HashSet<String>> {
+        let mut stmt = self
+            .conn
+            .prepare("PRAGMA table_info(room_read_cursor_mirrors)")?;
+        let rows = stmt.query_map([], |row| row.get::<_, String>(1))?;
+        let mut out = std::collections::HashSet::new();
+        for r in rows {
+            out.insert(r?);
+        }
+        Ok(out)
+    }
+
     /// Like [`get`](Self::get) but also returns soft-closed rooms (audit view).
     pub fn get_including_closed(&self, key: &RoomKey) -> Result<Option<RoomRecord>> {
         self.load_record(key, true)
@@ -1119,6 +1329,513 @@ impl SqliteRoomStore {
             workspace_root,
         };
         Ok(Some(RoomRecord { room, transcript }))
+    }
+
+    /// Create a room artifact and explain it in the transcript, atomically.
+    ///
+    /// The author must be on the roster — an artifact attributed to somebody who
+    /// is not in the room is a lie, and lies are what this campaign removes. The
+    /// System line is written in the SAME transaction, so an artifact can never
+    /// exist that the room's history does not account for.
+    #[allow(clippy::too_many_arguments)]
+    pub fn create_artifact(
+        &mut self,
+        key: &RoomKey,
+        artifact_id: &str,
+        kind: RoomArtifactKind,
+        title: &str,
+        body: &str,
+        author: &str,
+        now: DateTime<Utc>,
+    ) -> Result<(RoomArtifact, RoomMessage)> {
+        if !self.room_is_open(key)? {
+            return Err(RoomStoreError::UnknownRoom(key.clone()));
+        }
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        Self::require_roster_author_on(&tx, key, author)?;
+        // A duplicate id is a client naming collision, not a server fault.
+        // Without this the INSERT trips the PK constraint and surfaces as a 500.
+        let taken: Option<String> = tx
+            .query_row(
+                "SELECT artifact_id FROM room_artifacts WHERE room_id = ?1 AND artifact_id = ?2",
+                params![key.as_str(), artifact_id],
+                |r| r.get(0),
+            )
+            .optional()?;
+        if taken.is_some() {
+            return Err(RoomStoreError::ArtifactAlreadyExists {
+                room: key.clone(),
+                artifact: artifact_id.to_string(),
+            });
+        }
+        let on_behalf_of = Self::acting_for_on(&tx, key, author)?;
+        let ts = now.to_rfc3339();
+        // Version starts at 1 so "0" can never be mistaken for a valid read.
+        tx.execute(
+            "INSERT INTO room_artifacts
+                (room_id, artifact_id, kind, title, body, state,
+                 created_by, created_at, updated_by, updated_at, on_behalf_of, version)
+             VALUES (?1, ?2, ?3, ?4, ?5, 'open', ?6, ?7, ?6, ?7, ?8, 1)",
+            params![
+                key.as_str(),
+                artifact_id,
+                encode_artifact_kind(kind),
+                title,
+                body,
+                author,
+                ts,
+                on_behalf_of
+            ],
+        )?;
+        let message = Self::insert_message_on(
+            &tx,
+            key,
+            MessageDraft::marker(
+                "system",
+                RoomParticipantKind::System,
+                RoomMessageKind::System,
+                &format!("{author} created {} '{title}'", encode_artifact_kind(kind)),
+            ),
+            now,
+        )?;
+        Self::touch_on(&tx, key, now)?;
+        tx.commit()?;
+        let artifact = self
+            .artifact(key, artifact_id)?
+            .expect("artifact just inserted");
+        Ok((artifact, message))
+    }
+
+    /// Amend an artifact in place under compare-and-swap.
+    ///
+    /// `expected_version` is what the caller read. If the artifact has moved on,
+    /// this REFUSES with the actual version rather than merging — because the
+    /// alternative is last-writer-wins, which is precisely the bug that ate a
+    /// live roster twice. Nothing is written on refusal.
+    #[allow(clippy::too_many_arguments)]
+    pub fn amend_artifact(
+        &mut self,
+        key: &RoomKey,
+        artifact_id: &str,
+        expected_version: u64,
+        title: Option<&str>,
+        body: Option<&str>,
+        state: Option<RoomArtifactState>,
+        author: &str,
+        now: DateTime<Utc>,
+    ) -> Result<(RoomArtifact, RoomMessage)> {
+        if !self.room_is_open(key)? {
+            return Err(RoomStoreError::UnknownRoom(key.clone()));
+        }
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        Self::require_roster_author_on(&tx, key, author)?;
+
+        let current: Option<(i64, String, String, String)> = tx
+            .query_row(
+                "SELECT version, title, body, state FROM room_artifacts
+                  WHERE room_id = ?1 AND artifact_id = ?2",
+                params![key.as_str(), artifact_id],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+            )
+            .optional()?;
+        let Some((actual, cur_title, cur_body, cur_state)) = current else {
+            return Err(RoomStoreError::UnknownArtifact {
+                room: key.clone(),
+                artifact: artifact_id.to_string(),
+            });
+        };
+        let actual = u64::try_from(actual).map_err(|_| {
+            RoomStoreError::Encode(format!("artifact '{artifact_id}' has a negative version"))
+        })?;
+        if actual != expected_version {
+            return Err(RoomStoreError::ArtifactVersionConflict {
+                room: key.clone(),
+                artifact: artifact_id.to_string(),
+                expected: expected_version,
+                actual,
+            });
+        }
+
+        let next_title = title.unwrap_or(&cur_title).to_string();
+        let next_body = body.unwrap_or(&cur_body).to_string();
+        let next_state = state
+            .map(encode_artifact_state)
+            .unwrap_or(cur_state.as_str())
+            .to_string();
+        // An amend that changes NOTHING must not pretend it did. Bumping the
+        // version on a no-op writes a transcript line saying somebody updated
+        // the artifact when they did not — the room's own history telling a lie
+        // — and, worse, it invalidates every other writer's `expected_version`.
+        // Any roster member could then issue content-free amends in a loop and
+        // starve honest writers out of the CAS forever. Refuse it: nothing
+        // changed, so there is nothing to record.
+        if next_title == cur_title && next_body == cur_body && next_state == cur_state {
+            return Err(RoomStoreError::ArtifactUnchanged {
+                room: key.clone(),
+                artifact: artifact_id.to_string(),
+            });
+        }
+        let ts = now.to_rfc3339();
+        tx.execute(
+            "UPDATE room_artifacts
+                SET title = ?3, body = ?4, state = ?5,
+                    updated_by = ?6, updated_at = ?7, version = version + 1
+              WHERE room_id = ?1 AND artifact_id = ?2",
+            params![
+                key.as_str(),
+                artifact_id,
+                next_title,
+                next_body,
+                next_state,
+                author,
+                ts
+            ],
+        )?;
+        let message = Self::insert_message_on(
+            &tx,
+            key,
+            MessageDraft::marker(
+                "system",
+                RoomParticipantKind::System,
+                RoomMessageKind::System,
+                &format!("{author} updated '{next_title}' (v{})", actual + 1),
+            ),
+            now,
+        )?;
+        Self::touch_on(&tx, key, now)?;
+        tx.commit()?;
+        let artifact = self
+            .artifact(key, artifact_id)?
+            .expect("artifact just updated");
+        Ok((artifact, message))
+    }
+
+    /// One artifact by id.
+    pub fn artifact(&self, key: &RoomKey, artifact_id: &str) -> Result<Option<RoomArtifact>> {
+        self.conn
+            .query_row(
+                "SELECT artifact_id, kind, title, body, state, created_by, created_at,
+                        updated_by, updated_at, version, on_behalf_of
+                   FROM room_artifacts WHERE room_id = ?1 AND artifact_id = ?2",
+                params![key.as_str(), artifact_id],
+                Self::map_artifact,
+            )
+            .optional()?
+            .transpose()
+    }
+
+    /// Every artifact in a room, newest change first.
+    pub fn artifacts(&self, key: &RoomKey) -> Result<Vec<RoomArtifact>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT artifact_id, kind, title, body, state, created_by, created_at,
+                    updated_by, updated_at, version, on_behalf_of
+               FROM room_artifacts WHERE room_id = ?1
+              ORDER BY updated_at DESC, artifact_id",
+        )?;
+        let rows = stmt.query_map(params![key.as_str()], Self::map_artifact)?;
+        let mut out = Vec::new();
+        for r in rows {
+            out.push(r??);
+        }
+        Ok(out)
+    }
+
+    fn map_artifact(row: &rusqlite::Row<'_>) -> rusqlite::Result<Result<RoomArtifact>> {
+        let kind: String = row.get(1)?;
+        let state: String = row.get(4)?;
+        let version: i64 = row.get(9)?;
+        Ok((|| {
+            Ok(RoomArtifact {
+                id: row.get(0)?,
+                kind: decode_artifact_kind(&kind)?,
+                title: row.get(2)?,
+                body: row.get(3)?,
+                state: decode_artifact_state(&state)?,
+                created_by: row.get(5)?,
+                created_at: row.get(6)?,
+                updated_by: row.get(7)?,
+                updated_at: row.get(8)?,
+                version: u64::try_from(version)
+                    .map_err(|_| RoomStoreError::Encode("negative artifact version".into()))?,
+                on_behalf_of: row.get(10)?,
+            })
+        })())
+    }
+
+    /// Drop an agent's ownership binding. The artifacts that agent already
+    /// created keep their snapshotted `on_behalf_of` — history does not rewrite.
+    pub fn remove_agent_owner(&mut self, key: &RoomKey, agent_id: &str) -> Result<bool> {
+        let n = self.conn.execute(
+            "DELETE FROM room_agent_owners WHERE room_id = ?1 AND agent_id = ?2",
+            params![key.as_str(), agent_id],
+        )?;
+        Ok(n > 0)
+    }
+
+    /// Which WORKER this author is acting for, if the author is an agent with a
+    /// recorded owner. Read inside the caller's transaction and snapshotted by
+    /// the caller, so later changes to the live binding never rewrite history.
+    fn acting_for_on(
+        tx: &rusqlite::Transaction<'_>,
+        key: &RoomKey,
+        author: &str,
+    ) -> Result<Option<String>> {
+        Ok(tx
+            .query_row(
+                "SELECT owner_id FROM room_agent_owners WHERE room_id = ?1 AND agent_id = ?2",
+                params![key.as_str(), author],
+                |r| r.get::<_, String>(0),
+            )
+            .optional()?)
+    }
+
+    /// An artifact author must be on the roster. Runs inside the caller's
+    /// transaction so a concurrent leave cannot race it.
+    fn require_roster_author_on(
+        tx: &rusqlite::Transaction<'_>,
+        key: &RoomKey,
+        author: &str,
+    ) -> Result<()> {
+        let found: Option<String> = tx
+            .query_row(
+                "SELECT id FROM participants WHERE room_id = ?1 AND id = ?2",
+                params![key.as_str(), author],
+                |r| r.get(0),
+            )
+            .optional()?;
+        if found.is_none() {
+            return Err(RoomStoreError::ArtifactAuthorNotInRoster {
+                room: key.clone(),
+                author: author.to_string(),
+            });
+        }
+        Ok(())
+    }
+
+    /// Refuse a join that would REPLACE an existing participant with one of a
+    /// different kind.
+    ///
+    /// `add_participant_with_message` is deliberately idempotent-on-id
+    /// (DELETE-then-INSERT), which is correct for a reconnect or a rename. But
+    /// with no authorization on the join route, last-writer-wins on `kind` is a
+    /// working takeover: re-join an Agent's id as a `Bot` and the Agent roster
+    /// row is destroyed, so `@that-agent` stops convening (it no longer resolves
+    /// as an Agent) while the attacker may post under that id — `Bot` is NOT one
+    /// of the kinds the post-time author gate rejects.
+    ///
+    /// Same-kind re-join stays allowed, so reconnects and display-name changes
+    /// keep working. Runs INSIDE the caller's transaction so it cannot be raced.
+    fn guard_participant_kind_on(
+        tx: &rusqlite::Transaction<'_>,
+        key: &RoomKey,
+        participant: &RoomParticipant,
+    ) -> Result<()> {
+        let existing: Option<(String, String)> = tx
+            .query_row(
+                "SELECT kind, display_name FROM participants WHERE room_id = ?1 AND id = ?2",
+                params![key.as_str(), participant.id],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .optional()?;
+        let offered = encode_participant_kind(participant.kind);
+        if let Some((existing, existing_name)) = existing {
+            if existing != offered {
+                return Err(RoomStoreError::ParticipantKindConflict {
+                    room: key.clone(),
+                    participant: participant.id.clone(),
+                    existing,
+                    offered: offered.to_string(),
+                });
+            }
+            // Same kind, different display name is STILL a takeover. The join
+            // route has no authentication, so "rename" and "steal this person's
+            // name" are the same request — and the transcript's historical lines
+            // stay attributed to the id whose label just changed under them.
+            // An existing participant record is therefore IMMUTABLE via join:
+            // an identical re-join is idempotent (reconnect), anything else is
+            // refused. A genuine rename needs an authenticated path, which does
+            // not exist yet; inventing one here by accident is how the display
+            // name got stealable in the first place.
+            if existing_name != participant.display_name {
+                return Err(RoomStoreError::ParticipantRecordImmutable {
+                    room: key.clone(),
+                    participant: participant.id.clone(),
+                    field: "display_name",
+                });
+            }
+        }
+        Ok(())
+    }
+
+    /// Add an Agent participant AND record the worker who owns it, atomically.
+    ///
+    /// This is the local half of "a worker persists alongside their agents".
+    /// The owner must already be a `Human` in this room's roster; that check
+    /// runs INSIDE the transaction, so a concurrent `remove_participant` cannot
+    /// slip between validation and insert and leave an agent owned by someone
+    /// who is no longer here (the TOCTOU that the remove path still has).
+    ///
+    /// Fail-closed: an unknown or non-Human owner is `InvalidAgentOwner` and
+    /// NOTHING is written — no participant row, no join marker, no binding.
+    /// A partially-applied ownership is exactly the "durable effect claimed but
+    /// not verified" class this campaign exists to kill.
+    pub fn add_agent_participant_with_owner(
+        &mut self,
+        key: &RoomKey,
+        participant: RoomParticipant,
+        owner_id: &str,
+        now: DateTime<Utc>,
+    ) -> Result<(RoomRecord, RoomMessage)> {
+        if !self.room_is_open(key)? {
+            return Err(RoomStoreError::UnknownRoom(key.clone()));
+        }
+        if participant.kind != RoomParticipantKind::Agent {
+            return Err(RoomStoreError::InvalidAgentOwner {
+                agent: participant.id.clone(),
+                owner: owner_id.to_string(),
+                reason: "only an Agent participant can have an owner".into(),
+            });
+        }
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+
+        Self::guard_participant_kind_on(&tx, key, &participant)?;
+        // A3: re-adding an existing agent with a DIFFERENT owner is ownership
+        // theft by the same unauthenticated route. Re-pointing an agent to a new
+        // worker is a real operation, but it needs an authenticated actor, not
+        // an anonymous re-join.
+        let prior_owner: Option<String> = tx
+            .query_row(
+                "SELECT owner_id FROM room_agent_owners WHERE room_id = ?1 AND agent_id = ?2",
+                params![key.as_str(), participant.id],
+                |r| r.get(0),
+            )
+            .optional()?;
+        if let Some(prior) = prior_owner {
+            if prior != owner_id {
+                return Err(RoomStoreError::ParticipantRecordImmutable {
+                    room: key.clone(),
+                    participant: participant.id.clone(),
+                    field: "owner_id",
+                });
+            }
+        }
+        // Positive proof, inside the write lock: the owner must be a Human that
+        // is in this room right now. We do not trust the caller's roster read.
+        let owner_kind: Option<String> = tx
+            .query_row(
+                "SELECT kind FROM participants WHERE room_id = ?1 AND id = ?2",
+                params![key.as_str(), owner_id],
+                |r| r.get(0),
+            )
+            .optional()?;
+        match owner_kind.as_deref() {
+            Some("human") => {}
+            Some(other) => {
+                return Err(RoomStoreError::InvalidAgentOwner {
+                    agent: participant.id,
+                    owner: owner_id.to_string(),
+                    reason: format!("owner is a '{other}', not a human"),
+                })
+            }
+            None => {
+                return Err(RoomStoreError::InvalidAgentOwner {
+                    agent: participant.id,
+                    owner: owner_id.to_string(),
+                    reason: "owner is not in this room's roster".into(),
+                })
+            }
+        }
+
+        tx.execute(
+            "DELETE FROM participants WHERE room_id = ?1 AND id = ?2",
+            params![key.as_str(), participant.id],
+        )?;
+        let next_pos: i64 = tx.query_row(
+            "SELECT COALESCE(MAX(position) + 1, 0) FROM participants WHERE room_id = ?1",
+            params![key.as_str()],
+            |r| r.get(0),
+        )?;
+        tx.execute(
+            "INSERT INTO participants (room_id, id, kind, display_name, position)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![
+                key.as_str(),
+                participant.id,
+                encode_participant_kind(participant.kind),
+                participant.display_name,
+                next_pos,
+            ],
+        )?;
+        tx.execute(
+            "INSERT INTO room_agent_owners (room_id, agent_id, owner_id, created_at)
+             VALUES (?1, ?2, ?3, ?4)
+             ON CONFLICT(room_id, agent_id) DO UPDATE SET owner_id = excluded.owner_id,
+                                                          created_at = excluded.created_at",
+            params![key.as_str(), participant.id, owner_id, now.to_rfc3339()],
+        )?;
+        let message = Self::insert_message_on(
+            &tx,
+            key,
+            MessageDraft::marker(
+                &participant.id,
+                participant.kind,
+                RoomMessageKind::ParticipantJoined,
+                &format!("{} joined", participant.display_name),
+            ),
+            now,
+        )?;
+        Self::touch_on(&tx, key, now)?;
+        tx.commit()?;
+        let record = self.load_record(key, false)?.expect("room exists");
+        Ok((record, message))
+    }
+
+    /// Every agent->owner binding in this room, as
+    /// `(agent_id, owner_id, owner_present)`, ordered by roster position.
+    ///
+    /// `owner_present` is load-bearing and is the reason this does not simply
+    /// join on the owner. A worker can leave — and `room_leave` still takes no
+    /// authorization, so anyone can evict them — which would leave the binding
+    /// pointing at somebody who is gone. Reporting that as a live "researcher
+    /// belongs to alice" is the room asserting something it cannot prove; but
+    /// silently DROPPING the row is its own lie, because the ownership really
+    /// did happen and the agent really is unclaimed now.
+    ///
+    /// So the projection tells the truth twice: who owns it, and whether that
+    /// worker is still here. Same rule as presence — "joined" is not "here now",
+    /// and "owned" is not "owner still in the room".
+    pub fn agent_owners(&self, key: &RoomKey) -> Result<Vec<(String, String, bool)>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT o.agent_id,
+                    o.owner_id,
+                    EXISTS (
+                        SELECT 1 FROM participants owner
+                         WHERE owner.room_id = o.room_id AND owner.id = o.owner_id
+                    ) AS owner_present
+               FROM room_agent_owners o
+               JOIN participants p
+                 ON p.room_id = o.room_id AND p.id = o.agent_id
+              WHERE o.room_id = ?1
+              ORDER BY p.position",
+        )?;
+        let rows = stmt.query_map(params![key.as_str()], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, i64>(2)? != 0,
+            ))
+        })?;
+        let mut out = Vec::new();
+        for r in rows {
+            out.push(r?);
+        }
+        Ok(out)
     }
 
     fn load_participants(&self, key: &RoomKey) -> Result<Vec<RoomParticipant>> {
@@ -1510,6 +2227,7 @@ impl RoomStore for SqliteRoomStore {
         let tx = self
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        Self::guard_participant_kind_on(&tx, key, &participant)?;
         // Idempotent on id: replace any existing entry, appending at the end of
         // the roster ordering (MAX(position)+1) to mirror the Vec push.
         tx.execute(
@@ -2343,6 +3061,40 @@ pub enum IngestOutcome {
     Duplicate,
 }
 
+/// Outcome of [`SqliteRoomStore::set_room_read_cursor_mirror`]'s
+/// compare-and-swap (M5): distinguishes a write that was actually applied
+/// from one that was rejected because a fresher write already landed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RoomReadCursorMirrorCas {
+    /// `expected_prior_mirror` matched the on-disk mirror: the write was
+    /// applied, including an authoritative clear to `None` if requested.
+    Applied(RoomReadCursorProjection),
+    /// `expected_prior_mirror` did not match the on-disk mirror — a fresher
+    /// response already landed for this room/principal since the caller
+    /// snapshotted it. Nothing was written; the unchanged current
+    /// projection is returned so the caller can reconcile (e.g. drop the
+    /// stale response, or re-snapshot and retry).
+    Stale(RoomReadCursorProjection),
+}
+
+impl RoomReadCursorMirrorCas {
+    /// The projection either just applied or already current on disk.
+    /// Convenient when a caller only cares about "what is the mirror now",
+    /// not whether this particular call moved it.
+    pub fn into_projection(self) -> RoomReadCursorProjection {
+        match self {
+            RoomReadCursorMirrorCas::Applied(projection) => projection,
+            RoomReadCursorMirrorCas::Stale(projection) => projection,
+        }
+    }
+
+    /// `true` if this call's write was applied (as opposed to rejected as
+    /// stale).
+    pub fn was_applied(&self) -> bool {
+        matches!(self, RoomReadCursorMirrorCas::Applied(_))
+    }
+}
+
 impl SqliteRoomStore {
     /// Read the stable daemon instance id, minting it on first use (P2-A).
     /// One row guarded by `CHECK (singleton = 1)`; the id is a random v4 UUID
@@ -2666,6 +3418,209 @@ impl SqliteRoomStore {
             params![redemption_id],
         )?;
         Ok(n > 0)
+    }
+
+    pub fn room_read_cursor(
+        &self,
+        key: &RoomKey,
+        principal_id: &str,
+    ) -> Result<RoomReadCursorProjection> {
+        if !self.room_exists(key)? {
+            return Err(RoomStoreError::UnknownRoom(key.clone()));
+        }
+        let read_seq = self
+            .conn
+            .query_row(
+                "SELECT read_seq FROM room_read_cursors WHERE room_id = ?1 AND principal_id = ?2",
+                params![key.as_str(), principal_id],
+                |r| r.get::<_, String>(0),
+            )
+            .optional()?
+            .map(|read_seq| parse_canonical_u64_text(&read_seq))
+            .transpose()?;
+        let mirrored_upstream_read_seq = self
+            .conn
+            .query_row(
+                "SELECT mirrored_upstream_read_seq
+                 FROM room_read_cursor_mirrors WHERE room_id = ?1 AND principal_id = ?2",
+                params![key.as_str(), principal_id],
+                |r| r.get::<_, Option<String>>(0),
+            )
+            .optional()?
+            .flatten()
+            .as_deref()
+            .map(parse_canonical_u64_text)
+            .transpose()?;
+        Ok(RoomReadCursorProjection {
+            read_seq,
+            mirrored_upstream_read_seq,
+        })
+    }
+
+    pub fn room_latest_durable_seq(&self, key: &RoomKey) -> Result<Option<u64>> {
+        if !self.room_exists(key)? {
+            return Err(RoomStoreError::UnknownRoom(key.clone()));
+        }
+        self.conn
+            .query_row(
+                "SELECT MAX(seq) FROM messages WHERE room_id = ?1",
+                params![key.as_str()],
+                |r| r.get(0),
+            )
+            .map_err(Into::into)
+    }
+
+    pub fn update_room_read_cursor(
+        &mut self,
+        key: &RoomKey,
+        principal_id: &str,
+        requested: RoomReadCursorUpdateRequest,
+    ) -> Result<RoomReadCursorProjection> {
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let room_exists: Option<i64> = tx
+            .query_row(
+                "SELECT 1 FROM rooms WHERE id = ?1",
+                params![key.as_str()],
+                |r| r.get(0),
+            )
+            .optional()?;
+        if room_exists.is_none() {
+            return Err(RoomStoreError::UnknownRoom(key.clone()));
+        }
+        let high_water: Option<u64> = tx.query_row(
+            "SELECT MAX(seq) FROM messages WHERE room_id = ?1",
+            params![key.as_str()],
+            |r| r.get(0),
+        )?;
+        let clamped = high_water.map(|high_water| requested.read_seq.min(high_water));
+        let current = tx
+            .query_row(
+                "SELECT read_seq FROM room_read_cursors WHERE room_id = ?1 AND principal_id = ?2",
+                params![key.as_str(), principal_id],
+                |r| r.get::<_, String>(0),
+            )
+            .optional()?
+            .map(|t| parse_canonical_u64_text(&t))
+            .transpose()?;
+        let next = match (current, clamped) {
+            (Some(current), Some(clamped)) => Some(current.max(clamped)),
+            (Some(current), None) => Some(current),
+            (None, Some(clamped)) => Some(clamped),
+            (None, None) => None,
+        };
+        if let Some(next) = next {
+            tx.execute(
+                "INSERT INTO room_read_cursors (room_id, principal_id, read_seq)
+                 VALUES (?1, ?2, ?3)
+                 ON CONFLICT(room_id, principal_id) DO UPDATE SET read_seq = excluded.read_seq",
+                params![key.as_str(), principal_id, write_u64_text(next)],
+            )?;
+        }
+        tx.commit()?;
+        Ok(RoomReadCursorProjection {
+            read_seq: next,
+            mirrored_upstream_read_seq: None,
+        })
+    }
+
+    /// Compare-and-swap [`SqliteRoomStore::set_room_read_cursor_mirror`] on
+    /// the mirror value the caller observed immediately before issuing the
+    /// (racy, out-of-order-capable) upstream request whose response this
+    /// call is now applying (M5).
+    ///
+    /// Upstream read-cursor round trips (GET poll and PATCH) run concurrently
+    /// per room/principal and are NOT guaranteed to land in send order, so a
+    /// slow response describing an OLDER upstream state can arrive after a
+    /// fast response has already written a NEWER one. Without a CAS guard,
+    /// applying the slow response would regress — or, worse, clear — the
+    /// newer mirror even though both requests share the same room
+    /// generation (the existing federation `generation` counter only guards
+    /// against a revoke/rejoin in between; it does not order two in-flight
+    /// requests against each other).
+    ///
+    /// Callers MUST snapshot `expected_prior_mirror` from
+    /// [`SqliteRoomStore::room_read_cursor`] right before sending the
+    /// upstream request (the same point at which they already snapshot the
+    /// room generation). The write — including an authoritative clear to
+    /// `None` — is applied only if the on-disk mirror still equals that
+    /// snapshot, i.e. nothing fresher landed while the request was in
+    /// flight; otherwise it is rejected as stale and the current projection
+    /// is returned unchanged. A clear is therefore never rejected for being
+    /// a clear — only for being stale relative to a mirror another response
+    /// already advanced.
+    pub fn set_room_read_cursor_mirror(
+        &mut self,
+        key: &RoomKey,
+        principal_id: &str,
+        expected_prior_mirror: Option<u64>,
+        mirrored_upstream_read_seq: Option<u64>,
+    ) -> Result<RoomReadCursorMirrorCas> {
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let room_exists: Option<i64> = tx
+            .query_row(
+                "SELECT 1 FROM rooms WHERE id = ?1",
+                params![key.as_str()],
+                |r| r.get(0),
+            )
+            .optional()?;
+        if room_exists.is_none() {
+            return Err(RoomStoreError::UnknownRoom(key.clone()));
+        }
+        let current_mirror = tx
+            .query_row(
+                "SELECT mirrored_upstream_read_seq
+                 FROM room_read_cursor_mirrors WHERE room_id = ?1 AND principal_id = ?2",
+                params![key.as_str(), principal_id],
+                |r| r.get::<_, Option<String>>(0),
+            )
+            .optional()?
+            .flatten()
+            .as_deref()
+            .map(parse_canonical_u64_text)
+            .transpose()?;
+        let read_current_read_seq = |tx: &rusqlite::Transaction<'_>| -> Result<Option<u64>> {
+            tx.query_row(
+                "SELECT read_seq FROM room_read_cursors WHERE room_id = ?1 AND principal_id = ?2",
+                params![key.as_str(), principal_id],
+                |r| r.get::<_, String>(0),
+            )
+            .optional()?
+            .map(|read_seq| parse_canonical_u64_text(&read_seq))
+            .transpose()
+        };
+        if current_mirror != expected_prior_mirror {
+            // A fresher response already landed since the caller snapshotted
+            // `expected_prior_mirror`: reject this write as stale rather than
+            // regressing (or wrongly clearing) the newer value.
+            let read_seq = read_current_read_seq(&tx)?;
+            tx.commit()?;
+            return Ok(RoomReadCursorMirrorCas::Stale(RoomReadCursorProjection {
+                read_seq,
+                mirrored_upstream_read_seq: current_mirror,
+            }));
+        }
+        if current_mirror != mirrored_upstream_read_seq {
+            tx.execute(
+                "INSERT INTO room_read_cursor_mirrors (room_id, principal_id, mirrored_upstream_read_seq)
+                 VALUES (?1, ?2, ?3)
+                 ON CONFLICT(room_id, principal_id) DO UPDATE SET mirrored_upstream_read_seq = excluded.mirrored_upstream_read_seq",
+                params![
+                    key.as_str(),
+                    principal_id,
+                    mirrored_upstream_read_seq.map(write_u64_text),
+                ],
+            )?;
+        }
+        let read_seq = read_current_read_seq(&tx)?;
+        tx.commit()?;
+        Ok(RoomReadCursorMirrorCas::Applied(RoomReadCursorProjection {
+            read_seq,
+            mirrored_upstream_read_seq,
+        }))
     }
 
     /// Replace the room's SAFE projection fields — state, member roster,
@@ -3383,6 +4338,44 @@ fn json_string(s: &str) -> String {
     format!("\"{escaped}\"")
 }
 
+fn encode_artifact_kind(k: RoomArtifactKind) -> &'static str {
+    match k {
+        RoomArtifactKind::Task => "task",
+        RoomArtifactKind::Decision => "decision",
+        RoomArtifactKind::Note => "note",
+    }
+}
+
+fn decode_artifact_kind(s: &str) -> Result<RoomArtifactKind> {
+    match s {
+        "task" => Ok(RoomArtifactKind::Task),
+        "decision" => Ok(RoomArtifactKind::Decision),
+        "note" => Ok(RoomArtifactKind::Note),
+        other => Err(RoomStoreError::Encode(format!(
+            "unknown artifact kind '{other}'"
+        ))),
+    }
+}
+
+fn encode_artifact_state(s: RoomArtifactState) -> &'static str {
+    match s {
+        RoomArtifactState::Open => "open",
+        RoomArtifactState::Done => "done",
+        RoomArtifactState::Dropped => "dropped",
+    }
+}
+
+fn decode_artifact_state(s: &str) -> Result<RoomArtifactState> {
+    match s {
+        "open" => Ok(RoomArtifactState::Open),
+        "done" => Ok(RoomArtifactState::Done),
+        "dropped" => Ok(RoomArtifactState::Dropped),
+        other => Err(RoomStoreError::Encode(format!(
+            "unknown artifact state '{other}'"
+        ))),
+    }
+}
+
 fn encode_participant_kind(k: RoomParticipantKind) -> &'static str {
     match k {
         RoomParticipantKind::Human => "human",
@@ -3835,6 +4828,846 @@ mod tests {
             .collect();
         assert_eq!(ids, vec!["room-002".to_string(), "room-000".to_string()]);
         assert!(!page.has_more);
+    }
+
+    fn artifact_room() -> (SqliteRoomStore, RoomKey) {
+        let mut s = store();
+        let key = RoomKey::new("call");
+        s.create(key.clone(), "Call", None, now()).unwrap();
+        s.add_participant(&key, human("alice", "Alice"), now())
+            .unwrap();
+        s.add_participant(&key, human("bob", "Bob"), now()).unwrap();
+        s.add_participant(&key, owned_agent("scribe", "Scribe"), now())
+            .unwrap();
+        (s, key)
+    }
+
+    /// THE race gate. Two people editing the same task during one call both read
+    /// v1. The first write wins; the second MUST be refused with the actual
+    /// version, not merged and not silently applied. Last-writer-wins here is
+    /// the same bug that ate a live roster twice in the prior campaign.
+    /// Mutation: delete the `actual != expected_version` check -> the second
+    /// write clobbers the first -> RED.
+    #[test]
+    fn a_stale_amend_is_refused_with_the_actual_version_and_writes_nothing() {
+        let (mut s, key) = artifact_room();
+        let (a, _) = s
+            .create_artifact(
+                &key,
+                "t1",
+                RoomArtifactKind::Task,
+                "Ship the thing",
+                "",
+                "alice",
+                now(),
+            )
+            .unwrap();
+        assert_eq!(a.version, 1);
+
+        // Alice amends first and wins.
+        let (a2, _) = s
+            .amend_artifact(
+                &key,
+                "t1",
+                1,
+                Some("Ship the thing v2"),
+                None,
+                None,
+                "alice",
+                now(),
+            )
+            .unwrap();
+        assert_eq!(a2.version, 2);
+
+        // Bob still holds the version he read. He must be refused.
+        let before = s.get(&key).unwrap().unwrap().transcript.len();
+        let err = s
+            .amend_artifact(
+                &key,
+                "t1",
+                1,
+                Some("Bob's clobber"),
+                None,
+                None,
+                "bob",
+                now(),
+            )
+            .unwrap_err();
+        match err {
+            RoomStoreError::ArtifactVersionConflict {
+                expected, actual, ..
+            } => {
+                assert_eq!(expected, 1);
+                assert_eq!(actual, 2, "the refusal must tell Bob where to re-read from");
+            }
+            other => panic!("expected ArtifactVersionConflict, got {other:?}"),
+        }
+
+        // Alice's work survives, and the refusal wrote NOTHING.
+        let current = s.artifact(&key, "t1").unwrap().unwrap();
+        assert_eq!(current.title, "Ship the thing v2");
+        assert_eq!(current.version, 2);
+        assert_eq!(current.updated_by, "alice");
+        assert_eq!(
+            s.get(&key).unwrap().unwrap().transcript.len(),
+            before,
+            "a refused amend must not write a transcript line"
+        );
+    }
+
+    /// An artifact is the durable thing a call produced. It must outlive the
+    /// process. Mutation: drop the INSERT in create_artifact -> RED.
+    #[test]
+    fn artifacts_survive_a_store_reopen() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("rooms.db");
+        let key = RoomKey::new("call");
+        {
+            let mut s = SqliteRoomStore::open(&path).unwrap();
+            s.create(key.clone(), "Call", None, now()).unwrap();
+            s.add_participant(&key, human("alice", "Alice"), now())
+                .unwrap();
+            s.create_artifact(
+                &key,
+                "d1",
+                RoomArtifactKind::Decision,
+                "Use Bedrock for fanout",
+                "rejected creator-host",
+                "alice",
+                now(),
+            )
+            .unwrap();
+        }
+        let s = SqliteRoomStore::open(&path).unwrap();
+        let a = s.artifact(&key, "d1").unwrap().expect("artifact persisted");
+        assert_eq!(a.title, "Use Bedrock for fanout");
+        assert_eq!(a.kind, RoomArtifactKind::Decision);
+        assert_eq!(a.state, RoomArtifactState::Open);
+        assert_eq!(a.created_by, "alice");
+    }
+
+    /// "Zoom, but the room remembers": an AGENT keeps a live card and rewrites
+    /// it in place as the call moves. Same path as a human, attributed to the
+    /// agent.
+    #[test]
+    fn an_agent_can_keep_a_live_card_and_amend_it_in_place() {
+        let (mut s, key) = artifact_room();
+        let (a, _) = s
+            .create_artifact(
+                &key,
+                "board",
+                RoomArtifactKind::Note,
+                "Action items",
+                "- [ ] nothing yet",
+                "scribe",
+                now(),
+            )
+            .unwrap();
+        assert_eq!(a.created_by, "scribe");
+
+        let (a2, msg) = s
+            .amend_artifact(
+                &key,
+                "board",
+                a.version,
+                None,
+                Some("- [ ] alice: ship the thing\n- [ ] bob: write the gate"),
+                None,
+                "scribe",
+                now(),
+            )
+            .unwrap();
+        assert_eq!(a2.version, 2);
+        assert!(a2.body.contains("alice: ship the thing"));
+        assert_eq!(a2.updated_by, "scribe");
+        // The room's own history explains the change.
+        assert_eq!(msg.kind, RoomMessageKind::System);
+        assert!(msg.body.contains("scribe updated"));
+    }
+
+    /// An artifact attributed to someone not in the room is a lie.
+    /// Mutation: delete `require_roster_author_on` from create -> RED.
+    #[test]
+    fn an_artifact_author_must_be_on_the_roster() {
+        let (mut s, key) = artifact_room();
+        let err = s
+            .create_artifact(
+                &key,
+                "t9",
+                RoomArtifactKind::Task,
+                "ghost task",
+                "",
+                "mallory",
+                now(),
+            )
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            RoomStoreError::ArtifactAuthorNotInRoster { .. }
+        ));
+        assert!(s.artifacts(&key).unwrap().is_empty());
+    }
+
+    /// Every artifact creation is explained in the transcript, in the SAME
+    /// transaction — so an artifact can never exist that the room's history does
+    /// not account for. Mutation: delete the insert_message_on call -> RED.
+    #[test]
+    fn creating_an_artifact_explains_itself_in_the_transcript() {
+        let (mut s, key) = artifact_room();
+        let before = s.get(&key).unwrap().unwrap().transcript.len();
+        let (_, msg) = s
+            .create_artifact(
+                &key,
+                "t1",
+                RoomArtifactKind::Task,
+                "Ship the thing",
+                "",
+                "alice",
+                now(),
+            )
+            .unwrap();
+        let after = s.get(&key).unwrap().unwrap();
+        assert_eq!(after.transcript.len(), before + 1);
+        assert_eq!(msg.author_kind, RoomParticipantKind::System);
+        assert!(msg.body.contains("alice created task 'Ship the thing'"));
+    }
+
+    /// Amending something that does not exist is refused, not silently created.
+    #[test]
+    fn amending_an_unknown_artifact_is_refused() {
+        let (mut s, key) = artifact_room();
+        let err = s
+            .amend_artifact(&key, "nope", 1, Some("x"), None, None, "alice", now())
+            .unwrap_err();
+        assert!(matches!(err, RoomStoreError::UnknownArtifact { .. }));
+        assert!(s.artifacts(&key).unwrap().is_empty());
+    }
+
+    /// An agent-authored artifact must record the WORKER it acted for, derived
+    /// server-side and snapshotted, so accountability survives the binding
+    /// changing later. Mutation: make `acting_for_on` return Ok(None) -> RED.
+    #[test]
+    fn an_agent_artifact_records_the_worker_it_acted_for() {
+        let (mut s, key) = artifact_room();
+        s.add_agent_participant_with_owner(&key, owned_agent("scribe", "Scribe"), "alice", now())
+            .unwrap();
+        let (a, _) = s
+            .create_artifact(
+                &key,
+                "t1",
+                RoomArtifactKind::Task,
+                "Ship it",
+                "",
+                "scribe",
+                now(),
+            )
+            .unwrap();
+        assert_eq!(a.created_by, "scribe");
+        assert_eq!(
+            a.on_behalf_of.as_deref(),
+            Some("alice"),
+            "an agent's artifact must name the human behind it"
+        );
+
+        // A human author has no one behind them.
+        let (h, _) = s
+            .create_artifact(
+                &key,
+                "t2",
+                RoomArtifactKind::Task,
+                "Direct",
+                "",
+                "bob",
+                now(),
+            )
+            .unwrap();
+        assert_eq!(h.on_behalf_of, None);
+    }
+
+    /// History must not rewrite. Re-pointing the live binding AFTER the fact
+    /// must not change who an existing artifact was created on behalf of.
+    /// Mutation: make `artifact()` join room_agent_owners instead of reading the
+    /// snapshotted column -> RED.
+    #[test]
+    fn re_pointing_ownership_does_not_rewrite_existing_artifact_attribution() {
+        let (mut s, key) = artifact_room();
+        s.add_agent_participant_with_owner(&key, owned_agent("scribe", "Scribe"), "alice", now())
+            .unwrap();
+        s.create_artifact(
+            &key,
+            "t1",
+            RoomArtifactKind::Task,
+            "Ship it",
+            "",
+            "scribe",
+            now(),
+        )
+        .unwrap();
+        // The live binding is removed entirely. If `on_behalf_of` were a join
+        // rather than a snapshot, every artifact that agent created would lose
+        // its chain to a human the moment the binding went away.
+        s.remove_agent_owner(&key, "scribe").unwrap();
+        assert!(s.agent_owners(&key).unwrap().is_empty());
+        let a = s.artifact(&key, "t1").unwrap().unwrap();
+        assert_eq!(
+            a.on_behalf_of.as_deref(),
+            Some("alice"),
+            "the artifact was created for alice; that is history, not live state"
+        );
+    }
+
+    /// F3 (kimi-verify): an amend that changes nothing must not bump the
+    /// version or write a transcript line. Beyond the lie, a content-free amend
+    /// invalidates every other writer's expected_version — a roster member could
+    /// loop it and starve honest writers out of the CAS.
+    /// Mutation: delete the unchanged check -> version burns, transcript grows,
+    /// and the room claims an update that never happened -> RED.
+    #[test]
+    fn a_no_op_amend_is_refused_and_does_not_burn_the_version() {
+        let (mut s, key) = artifact_room();
+        let (a, _) = s
+            .create_artifact(
+                &key,
+                "t1",
+                RoomArtifactKind::Task,
+                "Ship it",
+                "b",
+                "alice",
+                now(),
+            )
+            .unwrap();
+        let before = s.get(&key).unwrap().unwrap().transcript.len();
+
+        // Explicit all-None amend.
+        let err = s
+            .amend_artifact(&key, "t1", a.version, None, None, None, "bob", now())
+            .unwrap_err();
+        assert!(matches!(err, RoomStoreError::ArtifactUnchanged { .. }));
+
+        // Same-value amend is equally a no-op.
+        let err = s
+            .amend_artifact(
+                &key,
+                "t1",
+                a.version,
+                Some("Ship it"),
+                Some("b"),
+                Some(RoomArtifactState::Open),
+                "bob",
+                now(),
+            )
+            .unwrap_err();
+        assert!(matches!(err, RoomStoreError::ArtifactUnchanged { .. }));
+
+        let after = s.artifact(&key, "t1").unwrap().unwrap();
+        assert_eq!(after.version, 1, "a no-op must not burn the CAS version");
+        assert_eq!(
+            after.updated_by, "alice",
+            "no-op must not reassign updated_by"
+        );
+        assert_eq!(
+            s.get(&key).unwrap().unwrap().transcript.len(),
+            before,
+            "a no-op must not claim an update in the transcript"
+        );
+
+        // A real change still works at the unchanged version.
+        let (a2, _) = s
+            .amend_artifact(&key, "t1", 1, Some("Ship it now"), None, None, "bob", now())
+            .unwrap();
+        assert_eq!(a2.version, 2);
+    }
+
+    /// A duplicate id is a client naming collision (409), never a server fault
+    /// (500). Mutation: delete the `taken.is_some()` guard -> the PK constraint
+    /// trips and surfaces as RoomStoreError::Db -> RED.
+    #[test]
+    fn a_duplicate_artifact_id_is_a_client_conflict_not_a_server_fault() {
+        let (mut s, key) = artifact_room();
+        s.create_artifact(
+            &key,
+            "t1",
+            RoomArtifactKind::Task,
+            "First",
+            "",
+            "alice",
+            now(),
+        )
+        .unwrap();
+        let err = s
+            .create_artifact(
+                &key,
+                "t1",
+                RoomArtifactKind::Task,
+                "Second",
+                "",
+                "bob",
+                now(),
+            )
+            .unwrap_err();
+        assert!(
+            matches!(err, RoomStoreError::ArtifactAlreadyExists { .. }),
+            "expected ArtifactAlreadyExists, got {err:?}"
+        );
+        // The original is untouched and no second row appeared.
+        let a = s.artifact(&key, "t1").unwrap().unwrap();
+        assert_eq!(a.title, "First");
+        assert_eq!(s.artifacts(&key).unwrap().len(), 1);
+    }
+
+    /// A dropped task is a tombstone, not a delete — a retracted decision must
+    /// stay explainable.
+    #[test]
+    fn dropping_an_artifact_keeps_it_readable_as_a_tombstone() {
+        let (mut s, key) = artifact_room();
+        let (a, _) = s
+            .create_artifact(
+                &key,
+                "t1",
+                RoomArtifactKind::Task,
+                "Maybe",
+                "",
+                "alice",
+                now(),
+            )
+            .unwrap();
+        s.amend_artifact(
+            &key,
+            "t1",
+            a.version,
+            None,
+            None,
+            Some(RoomArtifactState::Dropped),
+            "bob",
+            now(),
+        )
+        .unwrap();
+        let a = s.artifact(&key, "t1").unwrap().unwrap();
+        assert_eq!(a.state, RoomArtifactState::Dropped);
+        assert_eq!(a.title, "Maybe", "a tombstone keeps its content");
+        assert_eq!(a.updated_by, "bob");
+    }
+
+    fn bot(id: &str, name: &str) -> RoomParticipant {
+        RoomParticipant {
+            id: id.into(),
+            kind: RoomParticipantKind::Bot,
+            display_name: name.into(),
+        }
+    }
+
+    /// THE agent-silencing gate. Confirmed live by the flash-identity lane:
+    /// re-joining an Agent's id as a `Bot` destroyed the Agent roster row, so
+    /// `@researcher` stopped convening, and `Bot` is not one of the kinds the
+    /// post-time author gate rejects — so the attacker could also speak in that
+    /// agent's name. Mutation: delete the `guard_participant_kind_on` call in
+    /// `add_participant_with_message` -> the Bot replaces the Agent -> RED.
+    #[test]
+    fn a_bot_cannot_take_over_an_agents_id_and_silence_it() {
+        let mut s = store();
+        let key = RoomKey::new("r1");
+        s.create(key.clone(), "R1", None, now()).unwrap();
+        s.add_participant(&key, human("alice", "Alice"), now())
+            .unwrap();
+        s.add_participant(&key, owned_agent("researcher", "Researcher"), now())
+            .unwrap();
+
+        let err = s
+            .add_participant(&key, bot("researcher", "Not The Researcher"), now())
+            .unwrap_err();
+        match err {
+            RoomStoreError::ParticipantKindConflict {
+                existing, offered, ..
+            } => {
+                assert_eq!(existing, "agent");
+                assert_eq!(offered, "bot");
+            }
+            other => panic!("expected ParticipantKindConflict, got {other:?}"),
+        }
+
+        // The agent must still be an Agent, or @mention convene is dead.
+        let rec = s.get(&key).unwrap().unwrap();
+        let researcher = rec
+            .room
+            .participants
+            .iter()
+            .find(|p| p.id == "researcher")
+            .expect("researcher still on the roster");
+        assert_eq!(researcher.kind, RoomParticipantKind::Agent);
+        assert_eq!(researcher.display_name, "Researcher");
+    }
+
+    /// The identity-takeover half: a human id cannot be re-kinded either, and
+    /// the refusal writes NOTHING (no join marker for the imposter).
+    #[test]
+    fn a_join_cannot_re_kind_an_existing_human_and_writes_nothing() {
+        let mut s = store();
+        let key = RoomKey::new("r1");
+        s.create(key.clone(), "R1", None, now()).unwrap();
+        s.add_participant(&key, human("alice", "Alice"), now())
+            .unwrap();
+        let before = s.get(&key).unwrap().unwrap();
+
+        let err = s
+            .add_participant(&key, bot("alice", "Eve"), now())
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            RoomStoreError::ParticipantKindConflict { .. }
+        ));
+
+        let after = s.get(&key).unwrap().unwrap();
+        assert_eq!(after.transcript.len(), before.transcript.len());
+        let alice = after
+            .room
+            .participants
+            .iter()
+            .find(|p| p.id == "alice")
+            .unwrap();
+        assert_eq!(
+            alice.display_name, "Alice",
+            "display name must not be stolen"
+        );
+        assert_eq!(alice.kind, RoomParticipantKind::Human);
+    }
+
+    /// Same-kind re-join MUST stay idempotent — reconnects and renames are the
+    /// legitimate case the DELETE-then-INSERT exists for. Mutation: make the
+    /// guard reject on any existing row -> RED (this is the over-reach gate).
+    /// An IDENTICAL re-join stays idempotent — that is the reconnect case the
+    /// DELETE-then-INSERT exists for. Mutation: make the guard reject any
+    /// existing row -> RED.
+    #[test]
+    fn an_identical_rejoin_is_still_idempotent() {
+        let mut s = store();
+        let key = RoomKey::new("r1");
+        s.create(key.clone(), "R1", None, now()).unwrap();
+        s.add_participant(&key, human("alice", "Alice"), now())
+            .unwrap();
+        s.add_participant(&key, human("alice", "Alice"), now())
+            .unwrap();
+        let rec = s.get(&key).unwrap().unwrap();
+        assert_eq!(rec.room.participants.len(), 1, "no duplicate roster row");
+        assert_eq!(rec.room.participants[0].display_name, "Alice");
+    }
+
+    /// A1 (pro-adversary): same kind, different display name is display-name
+    /// THEFT, because the join route has no authentication and the transcript's
+    /// historical lines stay attributed to the id whose label just changed.
+    /// Mutation: delete the display_name arm of guard_participant_kind_on -> RED.
+    #[test]
+    fn a_rejoin_cannot_steal_an_existing_participants_display_name() {
+        let mut s = store();
+        let key = RoomKey::new("r1");
+        s.create(key.clone(), "R1", None, now()).unwrap();
+        s.add_participant(&key, human("alice", "Alice"), now())
+            .unwrap();
+        let err = s
+            .add_participant(&key, human("alice", "Eve"), now())
+            .unwrap_err();
+        match err {
+            RoomStoreError::ParticipantRecordImmutable { field, .. } => {
+                assert_eq!(field, "display_name")
+            }
+            other => panic!("expected ParticipantRecordImmutable, got {other:?}"),
+        }
+        let rec = s.get(&key).unwrap().unwrap();
+        assert_eq!(rec.room.participants[0].display_name, "Alice");
+    }
+
+    /// A3 (pro-adversary): re-adding an existing agent under a DIFFERENT owner
+    /// is ownership theft by the same unauthenticated route.
+    /// Mutation: delete the prior_owner check -> RED.
+    #[test]
+    fn a_rejoin_cannot_re_point_an_agent_to_a_different_owner() {
+        let mut s = store();
+        let key = RoomKey::new("r1");
+        s.create(key.clone(), "R1", None, now()).unwrap();
+        s.add_participant(&key, human("alice", "Alice"), now())
+            .unwrap();
+        s.add_participant(&key, human("bob", "Bob"), now()).unwrap();
+        s.add_agent_participant_with_owner(
+            &key,
+            owned_agent("researcher", "Researcher"),
+            "alice",
+            now(),
+        )
+        .unwrap();
+        let err = s
+            .add_agent_participant_with_owner(
+                &key,
+                owned_agent("researcher", "Researcher"),
+                "bob",
+                now(),
+            )
+            .unwrap_err();
+        match err {
+            RoomStoreError::ParticipantRecordImmutable { field, .. } => {
+                assert_eq!(field, "owner_id")
+            }
+            other => panic!("expected ParticipantRecordImmutable, got {other:?}"),
+        }
+        assert_eq!(
+            s.agent_owners(&key).unwrap(),
+            vec![("researcher".to_string(), "alice".to_string(), true)],
+            "the agent must still belong to alice"
+        );
+    }
+
+    /// The owner-aware path is guarded too: a Bot cannot displace an owned agent.
+    #[test]
+    fn owned_agent_is_also_protected_from_kind_takeover() {
+        let mut s = store();
+        let key = RoomKey::new("r1");
+        s.create(key.clone(), "R1", None, now()).unwrap();
+        s.add_participant(&key, human("alice", "Alice"), now())
+            .unwrap();
+        s.add_agent_participant_with_owner(
+            &key,
+            owned_agent("researcher", "Researcher"),
+            "alice",
+            now(),
+        )
+        .unwrap();
+        let err = s
+            .add_participant(&key, bot("researcher", "Imposter"), now())
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            RoomStoreError::ParticipantKindConflict { .. }
+        ));
+        assert_eq!(
+            s.agent_owners(&key).unwrap(),
+            vec![("researcher".to_string(), "alice".to_string(), true)],
+            "ownership must survive a refused takeover"
+        );
+    }
+
+    fn owned_agent(id: &str, name: &str) -> RoomParticipant {
+        RoomParticipant {
+            id: id.into(),
+            kind: RoomParticipantKind::Agent,
+            display_name: name.into(),
+        }
+    }
+
+    /// THE persistence gate for "a worker persists alongside their agents".
+    /// A worker adds their agent; the process dies; the room comes back. The
+    /// agent must still be THEIRS. Mutation: drop the `room_agent_owners`
+    /// INSERT in `add_agent_participant_with_owner` -> the reopened room reports
+    /// no owner -> RED.
+    #[test]
+    fn agent_owner_survives_store_reopen() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("rooms.db");
+        let key = RoomKey::new("r1");
+        {
+            let mut s = SqliteRoomStore::open(&path).unwrap();
+            s.create(key.clone(), "R1", None, now()).unwrap();
+            s.add_participant(&key, human("alice", "Alice"), now())
+                .unwrap();
+            s.add_agent_participant_with_owner(
+                &key,
+                owned_agent("researcher", "Researcher"),
+                "alice",
+                now(),
+            )
+            .unwrap();
+            assert_eq!(
+                s.agent_owners(&key).unwrap(),
+                vec![("researcher".to_string(), "alice".to_string(), true)]
+            );
+        }
+        // New process, same file: the binding is still there and still Alice's.
+        let s = SqliteRoomStore::open(&path).unwrap();
+        assert_eq!(
+            s.agent_owners(&key).unwrap(),
+            vec![("researcher".to_string(), "alice".to_string(), true)],
+            "an agent must still belong to its worker after a restart"
+        );
+    }
+
+    /// Fail-closed, and NOTHING is written. Mutation: delete the `None =>`
+    /// rejection arm in `add_agent_participant_with_owner` -> the agent lands
+    /// with a dangling owner -> RED.
+    #[test]
+    fn agent_owner_absent_from_roster_is_refused_and_writes_nothing() {
+        let mut s = store();
+        let key = RoomKey::new("r1");
+        s.create(key.clone(), "R1", None, now()).unwrap();
+        let before = s.get(&key).unwrap().unwrap();
+
+        let err = s
+            .add_agent_participant_with_owner(
+                &key,
+                owned_agent("researcher", "Researcher"),
+                "nobody",
+                now(),
+            )
+            .unwrap_err();
+        assert!(
+            matches!(err, RoomStoreError::InvalidAgentOwner { .. }),
+            "expected InvalidAgentOwner, got {err:?}"
+        );
+
+        // The refusal must leave NO partial state: no participant, no join
+        // marker, no binding. A half-applied ownership is the exact
+        // "claimed a durable effect that did not happen" class.
+        let after = s.get(&key).unwrap().unwrap();
+        assert_eq!(
+            after.room.participants.len(),
+            before.room.participants.len()
+        );
+        assert_eq!(after.transcript.len(), before.transcript.len());
+        assert!(s.agent_owners(&key).unwrap().is_empty());
+    }
+
+    /// An agent may not be owned by another agent. Mutation: change the
+    /// `Some("human") => {}` guard to accept any kind -> RED.
+    #[test]
+    fn agent_owner_must_be_a_human_not_another_agent() {
+        let mut s = store();
+        let key = RoomKey::new("r1");
+        s.create(key.clone(), "R1", None, now()).unwrap();
+        s.add_participant(&key, human("alice", "Alice"), now())
+            .unwrap();
+        s.add_agent_participant_with_owner(
+            &key,
+            owned_agent("researcher", "Researcher"),
+            "alice",
+            now(),
+        )
+        .unwrap();
+
+        let err = s
+            .add_agent_participant_with_owner(
+                &key,
+                owned_agent("archivist", "Archivist"),
+                "researcher", // an Agent, not a worker
+                now(),
+            )
+            .unwrap_err();
+        match err {
+            RoomStoreError::InvalidAgentOwner { reason, .. } => {
+                assert!(reason.contains("not a human"), "reason was: {reason}")
+            }
+            other => panic!("expected InvalidAgentOwner, got {other:?}"),
+        }
+        assert_eq!(s.agent_owners(&key).unwrap().len(), 1);
+    }
+
+    /// Only an Agent can carry an owner. Mutation: delete the `kind != Agent`
+    /// guard -> a Human gets an owner row -> RED.
+    #[test]
+    fn only_an_agent_participant_can_have_an_owner() {
+        let mut s = store();
+        let key = RoomKey::new("r1");
+        s.create(key.clone(), "R1", None, now()).unwrap();
+        s.add_participant(&key, human("alice", "Alice"), now())
+            .unwrap();
+        let err = s
+            .add_agent_participant_with_owner(&key, human("bob", "Bob"), "alice", now())
+            .unwrap_err();
+        assert!(matches!(err, RoomStoreError::InvalidAgentOwner { .. }));
+        assert!(s.agent_owners(&key).unwrap().is_empty());
+    }
+
+    /// Re-adding the same agent re-points the binding rather than duplicating
+    /// it, and the roster does not grow.
+    #[test]
+    #[should_panic(expected = "ParticipantRecordImmutable")]
+    fn re_adding_an_agent_repoints_its_owner_without_duplicating() {
+        let mut s = store();
+        let key = RoomKey::new("r1");
+        s.create(key.clone(), "R1", None, now()).unwrap();
+        s.add_participant(&key, human("alice", "Alice"), now())
+            .unwrap();
+        s.add_participant(&key, human("bob", "Bob"), now()).unwrap();
+        s.add_agent_participant_with_owner(
+            &key,
+            owned_agent("researcher", "Researcher"),
+            "alice",
+            now(),
+        )
+        .unwrap();
+        s.add_agent_participant_with_owner(
+            &key,
+            owned_agent("researcher", "Researcher"),
+            "bob",
+            now(),
+        )
+        .unwrap();
+        assert_eq!(
+            s.agent_owners(&key).unwrap(),
+            vec![("researcher".to_string(), "bob".to_string(), true)]
+        );
+        let rec = s.get(&key).unwrap().unwrap();
+        assert_eq!(rec.room.participants.len(), 3);
+    }
+
+    /// THE truthfulness gate for ownership. A worker adds their agent, then
+    /// leaves — and `room_leave` takes no authorization, so anyone can make that
+    /// happen. The binding must NOT silently vanish (the ownership really did
+    /// happen and the agent really is unclaimed now), and it must NOT be
+    /// reported as a live claim (the owner is gone). It reports both facts.
+    /// Mutation: replace the EXISTS subquery with a constant 1 -> the room
+    /// claims a departed owner is present -> RED.
+    #[test]
+    fn ownership_survives_the_owner_leaving_but_stops_claiming_they_are_here() {
+        let mut s = store();
+        let key = RoomKey::new("r1");
+        s.create(key.clone(), "R1", None, now()).unwrap();
+        s.add_participant(&key, human("alice", "Alice"), now())
+            .unwrap();
+        s.add_agent_participant_with_owner(
+            &key,
+            owned_agent("researcher", "Researcher"),
+            "alice",
+            now(),
+        )
+        .unwrap();
+        assert_eq!(
+            s.agent_owners(&key).unwrap(),
+            vec![("researcher".to_string(), "alice".to_string(), true)]
+        );
+
+        // Alice leaves. Nothing stops this today.
+        s.remove_participant(&key, "alice", now()).unwrap();
+
+        let owners = s.agent_owners(&key).unwrap();
+        assert_eq!(
+            owners,
+            vec![("researcher".to_string(), "alice".to_string(), false)],
+            "the binding must survive, and must stop claiming alice is here"
+        );
+    }
+
+    /// Dropping the room drops its bindings (FK CASCADE), so a deleted room
+    /// cannot leave orphaned ownership behind.
+    #[test]
+    fn agent_owner_bindings_cascade_with_the_room() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("rooms.db");
+        let key = RoomKey::new("r1");
+        let mut s = SqliteRoomStore::open(&path).unwrap();
+        s.create(key.clone(), "R1", None, now()).unwrap();
+        s.add_participant(&key, human("alice", "Alice"), now())
+            .unwrap();
+        s.add_agent_participant_with_owner(
+            &key,
+            owned_agent("researcher", "Researcher"),
+            "alice",
+            now(),
+        )
+        .unwrap();
+        s.conn
+            .execute("DELETE FROM rooms WHERE id = ?1", params![key.as_str()])
+            .unwrap();
+        let n: i64 = s
+            .conn
+            .query_row("SELECT COUNT(*) FROM room_agent_owners", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(n, 0, "bindings must cascade with the room");
     }
 
     #[test]
@@ -5146,6 +6979,399 @@ mod tests {
     // ── exact {"state":"local"} open + closed ──────────────────────────────
 
     #[test]
+    fn room_latest_durable_seq_absent_and_zero_round_trip() {
+        let mut s = store();
+        let key = RoomKey::new("latest-seq");
+        s.create(key.clone(), "Latest Seq", None, now()).unwrap();
+        assert_eq!(s.room_latest_durable_seq(&key).unwrap(), None);
+
+        s.append_message(
+            &key,
+            "u1",
+            RoomParticipantKind::Human,
+            RoomMessageKind::Message,
+            "zero",
+            now(),
+        )
+        .unwrap();
+        assert_eq!(s.room_latest_durable_seq(&key).unwrap(), Some(0));
+    }
+
+    #[test]
+    fn room_latest_durable_seq_unknown_room_errors() {
+        let s = store();
+        let err = s
+            .room_latest_durable_seq(&RoomKey::new("missing-latest"))
+            .unwrap_err();
+        assert!(matches!(err, RoomStoreError::UnknownRoom(_)));
+    }
+
+    #[test]
+    fn room_read_cursor_defaults_to_none_for_absent_row() {
+        let mut s = store();
+        let key = RoomKey::new("cursor-none");
+        s.create(key.clone(), "Cursor None", None, now()).unwrap();
+
+        let cursor = s.room_read_cursor(&key, "principal").unwrap();
+        assert_eq!(cursor.read_seq, None);
+    }
+
+    #[test]
+    fn room_read_cursor_unknown_room_errors() {
+        let s = store();
+        let err = s
+            .room_read_cursor(&RoomKey::new("missing-cursor"), "principal")
+            .unwrap_err();
+        assert!(matches!(err, RoomStoreError::UnknownRoom(_)));
+    }
+
+    #[test]
+    fn room_read_cursor_update_is_monotonic_and_clamped() {
+        let mut s = store();
+        let key = RoomKey::new("cursor-clamp");
+        s.create(key.clone(), "Cursor Clamp", None, now()).unwrap();
+        s.append_message(
+            &key,
+            "u1",
+            RoomParticipantKind::Human,
+            RoomMessageKind::Message,
+            "one",
+            now(),
+        )
+        .unwrap();
+        s.append_message(
+            &key,
+            "u1",
+            RoomParticipantKind::Human,
+            RoomMessageKind::Message,
+            "two",
+            now(),
+        )
+        .unwrap();
+
+        let updated = s
+            .update_room_read_cursor(
+                &key,
+                "principal",
+                RoomReadCursorUpdateRequest { read_seq: 99 },
+            )
+            .unwrap();
+        assert_eq!(updated.read_seq, Some(1));
+
+        let non_regressed = s
+            .update_room_read_cursor(
+                &key,
+                "principal",
+                RoomReadCursorUpdateRequest { read_seq: 0 },
+            )
+            .unwrap();
+        assert_eq!(non_regressed.read_seq, Some(1));
+    }
+
+    #[test]
+    fn room_read_cursor_survives_reopen() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("rooms.db");
+        let key = RoomKey::new("cursor-reopen");
+        {
+            let mut s = SqliteRoomStore::open(&path).unwrap();
+            s.create(key.clone(), "Cursor Reopen", None, now()).unwrap();
+            s.append_message(
+                &key,
+                "u1",
+                RoomParticipantKind::Human,
+                RoomMessageKind::Message,
+                "one",
+                now(),
+            )
+            .unwrap();
+            s.update_room_read_cursor(
+                &key,
+                "principal",
+                RoomReadCursorUpdateRequest { read_seq: 0 },
+            )
+            .unwrap();
+        }
+        let s = SqliteRoomStore::open(&path).unwrap();
+        assert_eq!(
+            s.room_read_cursor(&key, "principal").unwrap().read_seq,
+            Some(0)
+        );
+    }
+
+    #[test]
+    fn room_read_cursor_update_without_messages_keeps_absent_projection() {
+        let mut s = store();
+        let key = RoomKey::new("cursor-no-messages");
+        s.create(key.clone(), "Cursor No Messages", None, now())
+            .unwrap();
+
+        let updated = s
+            .update_room_read_cursor(
+                &key,
+                "principal",
+                RoomReadCursorUpdateRequest { read_seq: 99 },
+            )
+            .unwrap();
+        assert_eq!(updated.read_seq, None);
+        assert_eq!(
+            s.room_read_cursor(&key, "principal").unwrap().read_seq,
+            None
+        );
+    }
+
+    #[test]
+    fn corrupt_room_read_cursor_text_is_store_error() {
+        let mut s = store();
+        let key = RoomKey::new("cursor-corrupt");
+        s.create(key.clone(), "Cursor Corrupt", None, now())
+            .unwrap();
+        s.conn
+            .execute(
+                "INSERT INTO room_read_cursors (room_id, principal_id, read_seq) VALUES (?1, 'principal', 'bad')",
+                params![key.as_str()],
+            )
+            .unwrap();
+        let err = s.room_read_cursor(&key, "principal").unwrap_err();
+        assert!(
+            matches!(&err, RoomStoreError::Encode(msg) if msg.contains("invalid") || msg.contains("u64"))
+        );
+    }
+
+    #[test]
+    fn room_read_cursor_update_is_idempotent_for_same_value() {
+        let mut s = store();
+        let key = RoomKey::new("cursor-idempotent");
+        s.create(key.clone(), "Cursor Idempotent", None, now())
+            .unwrap();
+        s.append_message(
+            &key,
+            "u1",
+            RoomParticipantKind::Human,
+            RoomMessageKind::Message,
+            "one",
+            now(),
+        )
+        .unwrap();
+        let first = s
+            .update_room_read_cursor(
+                &key,
+                "principal",
+                RoomReadCursorUpdateRequest { read_seq: 0 },
+            )
+            .unwrap();
+        let second = s
+            .update_room_read_cursor(
+                &key,
+                "principal",
+                RoomReadCursorUpdateRequest { read_seq: 0 },
+            )
+            .unwrap();
+        assert_eq!(first, second);
+        assert_eq!(second.read_seq, Some(0));
+    }
+
+    // ── M1: idx_outbox_room_state must exist after migrate ────────────────
+    // The outbox index used to be embedded inside the `CREATE TABLE outbox`
+    // statement's column list, which produced invalid SQL that failed on
+    // every open(). Assert the index is actually present, not merely that
+    // migrate() didn't error.
+    #[test]
+    fn migrate_creates_outbox_room_state_index() {
+        let s = store();
+        let mut stmt = s.conn.prepare("PRAGMA index_list(outbox)").unwrap();
+        let index_names: Vec<String> = stmt
+            .query_map([], |row| row.get::<_, String>(1))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        assert!(
+            index_names.contains(&"idx_outbox_room_state".to_string()),
+            "expected idx_outbox_room_state in {index_names:?}"
+        );
+    }
+
+    #[test]
+    fn reopening_an_existing_db_still_has_outbox_room_state_index() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("reopen-outbox-index.db");
+        {
+            let mut s = SqliteRoomStore::open(&path).unwrap();
+            s.create(RoomKey::new("reopen-room"), "Reopen", None, now())
+                .unwrap();
+        }
+        let s = SqliteRoomStore::open(&path).unwrap();
+        let mut stmt = s.conn.prepare("PRAGMA index_list(outbox)").unwrap();
+        let index_names: Vec<String> = stmt
+            .query_map([], |row| row.get::<_, String>(1))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        assert!(index_names.contains(&"idx_outbox_room_state".to_string()));
+    }
+
+    // ── M5: set_room_read_cursor_mirror CAS ────────────────────────────────
+
+    fn cas_room(s: &mut SqliteRoomStore, name: &str) -> RoomKey {
+        let key = RoomKey::new(name);
+        s.create(key.clone(), name, None, now()).unwrap();
+        key
+    }
+
+    #[test]
+    fn set_room_read_cursor_mirror_applies_when_expected_prior_matches() {
+        let mut s = store();
+        let key = cas_room(&mut s, "mirror-cas-apply");
+        // Absent row: expected_prior_mirror is None.
+        let outcome = s
+            .set_room_read_cursor_mirror(&key, "principal", None, Some(5))
+            .unwrap();
+        assert!(outcome.was_applied());
+        assert_eq!(
+            outcome.clone().into_projection().mirrored_upstream_read_seq,
+            Some(5)
+        );
+        let projection = s.room_read_cursor(&key, "principal").unwrap();
+        assert_eq!(projection.mirrored_upstream_read_seq, Some(5));
+    }
+
+    /// H2 regression: an authoritative clear (`None`) applied via a matching
+    /// CAS must be reflected exactly in the returned projection, not
+    /// silently replaced by the prior on-disk value.
+    #[test]
+    fn set_room_read_cursor_mirror_clear_projection_reports_none_not_stale_value() {
+        let mut s = store();
+        let key = cas_room(&mut s, "mirror-cas-clear-projection");
+        let first = s
+            .set_room_read_cursor_mirror(&key, "principal", None, Some(42))
+            .unwrap();
+        assert!(first.was_applied());
+        let cleared = s
+            .set_room_read_cursor_mirror(&key, "principal", Some(42), None)
+            .unwrap();
+        assert!(cleared.was_applied());
+        let projection = cleared.into_projection();
+        assert_eq!(
+            projection.mirrored_upstream_read_seq, None,
+            "authoritative clear must report None, never fall back to the prior value"
+        );
+        // And the on-disk row genuinely reflects the clear, not just the
+        // in-memory return value.
+        let reread = s.room_read_cursor(&key, "principal").unwrap();
+        assert_eq!(reread.mirrored_upstream_read_seq, None);
+    }
+
+    /// M5 core regression: a stale (out-of-order) response describing an
+    /// older mirror state must never regress a newer mirror that already
+    /// landed while it was in flight.
+    #[test]
+    fn set_room_read_cursor_mirror_rejects_stale_regression() {
+        let mut s = store();
+        let key = cas_room(&mut s, "mirror-cas-stale-regression");
+        // Fast response lands first: mirror advances None -> 50.
+        let fast = s
+            .set_room_read_cursor_mirror(&key, "principal", None, Some(50))
+            .unwrap();
+        assert!(fast.was_applied());
+        // Slow response was snapshotted before the fast one landed (its
+        // expected_prior_mirror is still None) and now tries to write a
+        // smaller value.
+        let stale = s
+            .set_room_read_cursor_mirror(&key, "principal", None, Some(30))
+            .unwrap();
+        match stale {
+            RoomReadCursorMirrorCas::Stale(projection) => {
+                assert_eq!(projection.mirrored_upstream_read_seq, Some(50));
+            }
+            RoomReadCursorMirrorCas::Applied(_) => panic!("stale write must not apply"),
+        }
+        let reread = s.room_read_cursor(&key, "principal").unwrap();
+        assert_eq!(
+            reread.mirrored_upstream_read_seq,
+            Some(50),
+            "the newer mirror must survive the stale regression attempt"
+        );
+    }
+
+    /// M5: a stale response must not be able to CLEAR a newer mirror either
+    /// — "stale" is rejected uniformly regardless of whether the rejected
+    /// write would have regressed to a lower number or to `None`.
+    #[test]
+    fn set_room_read_cursor_mirror_rejects_stale_clear() {
+        let mut s = store();
+        let key = cas_room(&mut s, "mirror-cas-stale-clear");
+        let fast = s
+            .set_room_read_cursor_mirror(&key, "principal", None, Some(99))
+            .unwrap();
+        assert!(fast.was_applied());
+        // A stale GET response snapshotted before `fast` landed (so it still
+        // believes the prior mirror was None) reports upstream has no
+        // cursor. Applying it blindly would wrongly clear a mirror that has
+        // since moved on.
+        let stale_clear = s
+            .set_room_read_cursor_mirror(&key, "principal", None, None)
+            .unwrap();
+        match stale_clear {
+            RoomReadCursorMirrorCas::Stale(projection) => {
+                assert_eq!(projection.mirrored_upstream_read_seq, Some(99));
+            }
+            RoomReadCursorMirrorCas::Applied(_) => panic!("stale clear must not apply"),
+        }
+        let reread = s.room_read_cursor(&key, "principal").unwrap();
+        assert_eq!(reread.mirrored_upstream_read_seq, Some(99));
+    }
+
+    /// M5: an authoritative clear based on a fresh, matching snapshot must
+    /// still be allowed to succeed — the CAS guard rejects staleness, not
+    /// clearing itself.
+    #[test]
+    fn set_room_read_cursor_mirror_allows_authoritative_clear_when_fresh() {
+        let mut s = store();
+        let key = cas_room(&mut s, "mirror-cas-authoritative-clear");
+        let applied = s
+            .set_room_read_cursor_mirror(&key, "principal", None, Some(7))
+            .unwrap();
+        assert!(applied.was_applied());
+        // Caller re-snapshots (expected_prior_mirror = Some(7), matching
+        // current on-disk state) before issuing the clear.
+        let cleared = s
+            .set_room_read_cursor_mirror(&key, "principal", Some(7), None)
+            .unwrap();
+        assert!(
+            cleared.was_applied(),
+            "a fresh, correctly-based clear must apply"
+        );
+        assert_eq!(cleared.into_projection().mirrored_upstream_read_seq, None);
+    }
+
+    #[test]
+    fn set_room_read_cursor_mirror_no_op_write_is_still_applied() {
+        let mut s = store();
+        let key = cas_room(&mut s, "mirror-cas-noop");
+        let first = s
+            .set_room_read_cursor_mirror(&key, "principal", None, Some(3))
+            .unwrap();
+        assert!(first.was_applied());
+        // Same expected prior, same value: still counts as Applied (no
+        // staleness), even though the underlying row is unchanged.
+        let second = s
+            .set_room_read_cursor_mirror(&key, "principal", Some(3), Some(3))
+            .unwrap();
+        assert!(second.was_applied());
+        assert_eq!(second.into_projection().mirrored_upstream_read_seq, Some(3));
+    }
+
+    #[test]
+    fn set_room_read_cursor_mirror_unknown_room_errors() {
+        let mut s = store();
+        let key = RoomKey::new("mirror-cas-unknown-room");
+        let err = s
+            .set_room_read_cursor_mirror(&key, "principal", None, Some(1))
+            .unwrap_err();
+        assert!(matches!(err, RoomStoreError::UnknownRoom(k) if k == key));
+    }
+
+    #[test]
     fn local_access_state_open_and_closed() {
         let mut s = store();
         let key = RoomKey::new("r-local-state");
@@ -5323,6 +7549,64 @@ mod tests {
         assert!(parse_canonical_u64_text("42\t").is_err());
         // Trailing non-digit.
         assert!(parse_canonical_u64_text("42x").is_err());
+    }
+
+    #[test]
+    fn migrate_adds_read_cursor_mirror_table_without_changing_legacy_not_null_local_cursor() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("legacy-read-cursor.db");
+        {
+            let conn = rusqlite::Connection::open(&path).unwrap();
+            conn.execute_batch(
+                r#"
+                PRAGMA foreign_keys = ON;
+                CREATE TABLE rooms (
+                    id TEXT PRIMARY KEY,
+                    name TEXT NOT NULL,
+                    trigger_policy TEXT,
+                    workspace_root TEXT,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    closed_at TEXT
+                );
+                CREATE TABLE room_read_cursors (
+                    room_id TEXT NOT NULL REFERENCES rooms(id) ON DELETE CASCADE,
+                    principal_id TEXT NOT NULL,
+                    read_seq TEXT NOT NULL,
+                    PRIMARY KEY (room_id, principal_id)
+                );
+                INSERT INTO rooms (id, name, trigger_policy, workspace_root, created_at, updated_at, closed_at)
+                VALUES ('legacy-read-cursor', 'Legacy', NULL, NULL, '2026-07-17T00:00:00Z', '2026-07-17T00:00:00Z', NULL);
+                INSERT INTO room_read_cursors (room_id, principal_id, read_seq)
+                VALUES ('legacy-read-cursor', 'principal', '32');
+                "#,
+            )
+            .unwrap();
+        }
+
+        let s = SqliteRoomStore::open(&path).unwrap();
+        let mirror_columns = s.room_read_cursor_mirror_column_names().unwrap();
+        assert!(mirror_columns.contains("mirrored_upstream_read_seq"));
+        let projection = s
+            .room_read_cursor(&RoomKey::new("legacy-read-cursor"), "principal")
+            .unwrap();
+        assert_eq!(projection.read_seq, Some(32));
+        assert_eq!(projection.mirrored_upstream_read_seq, None);
+
+        let mut stmt = s
+            .conn
+            .prepare("PRAGMA table_info(room_read_cursors)")
+            .unwrap();
+        let notnull: Vec<(String, i64)> = stmt
+            .query_map([], |row| {
+                Ok((row.get::<_, String>(1)?, row.get::<_, i64>(3)?))
+            })
+            .unwrap()
+            .map(|r| r.unwrap())
+            .collect();
+        assert!(notnull
+            .iter()
+            .any(|(name, flag)| name == "read_seq" && *flag == 1));
     }
 
     // ── exact Local projection, semantics ──────────────────────────────────

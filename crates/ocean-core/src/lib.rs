@@ -533,6 +533,56 @@ pub struct RoomTriggerPolicy {
     pub on_schedule: Option<String>,
 }
 
+/// What a room artifact IS. A conversation produces these; the transcript only
+/// records that it happened.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RoomArtifactKind {
+    /// Something someone agreed to do.
+    Task,
+    /// Something the room decided, so it does not get re-litigated.
+    Decision,
+    /// Captured knowledge that is neither a task nor a decision.
+    Note,
+}
+
+/// Lifecycle of a room artifact. `Dropped` is a tombstone, never a delete —
+/// history is append-only and a retracted task must stay explainable.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RoomArtifactState {
+    Open,
+    Done,
+    Dropped,
+}
+
+/// A durable, room-scoped artifact: the thing a call actually produces.
+///
+/// `version` is a compare-and-swap guard. Two people editing the same task
+/// during one call is the same race that clobbered a live roster twice in the
+/// prior campaign, so a stale write is refused rather than merged.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RoomArtifact {
+    pub id: String,
+    pub kind: RoomArtifactKind,
+    pub title: String,
+    pub body: String,
+    pub state: RoomArtifactState,
+    /// Participant id of whoever created it — human OR agent.
+    pub created_by: String,
+    pub created_at: String,
+    /// Participant id of whoever last changed it.
+    pub updated_by: String,
+    pub updated_at: String,
+    /// The worker an agent author was acting for, snapshotted at write time.
+    /// `None` when a human authored directly. Derived server-side; never
+    /// accepted from a client.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub on_behalf_of: Option<String>,
+    /// Monotonic per-artifact. A writer must present the version it read.
+    pub version: u64,
+}
+
 /// A participant in a [`Room`] — a human, agent, bot, tool, or system actor.
 /// Minimal identity foundation per the collaboration model (OCEAN-39): enough
 /// to attribute messages and assemble a roster. Capabilities, transport, and
@@ -907,6 +957,20 @@ pub enum RoomAccessState {
     Recovering,
     /// Membership revoked or token invalidated.
     Revoked,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RoomReadCursorProjection {
+    #[serde(default)]
+    pub read_seq: Option<u64>,
+    #[serde(default)]
+    pub mirrored_upstream_read_seq: Option<u64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RoomReadCursorUpdateRequest {
+    pub read_seq: u64,
 }
 
 // ── Invite intent types (P1 — types + serialization; routes deferred) ──

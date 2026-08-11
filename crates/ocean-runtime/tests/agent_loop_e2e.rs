@@ -575,6 +575,54 @@ async fn final_round_after_tool_result_disables_tools_and_forces_reply() {
 }
 
 #[tokio::test]
+async fn clean_final_synthesis_error_retries_without_replaying_tools() {
+    let ran = Arc::new(AtomicUsize::new(0));
+    let provider = Arc::new(MockProvider::new(vec![
+        vec![done(
+            vec![tool_call("call-1", "echo", serde_json::json!({}))],
+            StopReason::ToolUse,
+        )],
+        vec![AssistantMessageEvent::Error {
+            reason: StopReason::Error,
+            error: AssistantMessage {
+                error_message: Some("one-off final synthesis failure".into()),
+                ..assistant_msg(vec![], StopReason::Error)
+            },
+        }],
+        vec![done(
+            vec![Content::text("recovered final answer")],
+            StopReason::Stop,
+        )],
+    ]));
+    let cfg = AgentConfig::new(Model::anthropic_claude_sonnet_4_6(), "test system")
+        .with_session_id("e2e")
+        .with_provider(provider.clone())
+        .with_max_turns(2)
+        .with_tools(vec![Arc::new(EchoTool { ran: ran.clone() })]);
+
+    let run = ocean_runtime::run_agent(&cfg, user("inspect, then answer"), None)
+        .await
+        .expect("a clean final synthesis failure should recover");
+
+    assert_eq!(provider.call_count(), 3);
+    assert_eq!(
+        ran.load(Ordering::SeqCst),
+        1,
+        "tool side effects must not replay"
+    );
+    let last_text = run
+        .messages
+        .iter()
+        .rev()
+        .find_map(|message| match message {
+            Message::Assistant(assistant) => assistant.content.iter().find_map(|c| c.as_text()),
+            _ => None,
+        })
+        .expect("recovered final assistant text");
+    assert_eq!(last_text, "recovered final answer");
+}
+
+#[tokio::test]
 async fn multi_round_tool_loop_runs_tool_then_completes() {
     let ran = Arc::new(AtomicUsize::new(0));
     let provider = Arc::new(MockProvider::new(vec![

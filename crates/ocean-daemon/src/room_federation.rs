@@ -20,7 +20,8 @@ use eventsource_stream::Eventsource;
 use ocean_core::{
     evaluate_trigger_policy, FederatedActorType, FederatedRoomMemberProjection, FederatedRoomRole,
     InviteResponse, MemberPresence, PublicAgentDescriptor, RoomAccessProjection, RoomAccessState,
-    RoomKey, RoomMessageKind, RoomOutboxItem, RoomParticipantKind, RoomTriggerEvent,
+    RoomKey, RoomMessageKind, RoomOutboxItem, RoomParticipantKind, RoomReadCursorProjection,
+    RoomTriggerEvent,
 };
 use ocean_store::{ConfirmedEvent, IngestOutcome, PendingRedemption, RoomCredential, RoomStore};
 use reqwest::{redirect::Policy, Client, StatusCode, Url};
@@ -35,8 +36,8 @@ use tokio_stream::StreamExt;
 use tokio_util::sync::CancellationToken;
 
 use crate::persistent_rooms::{
-    publish_room_access_wake_on, publish_room_wake_on, with_rooms_handle, RoomAccessWakeBus,
-    RoomStoreHandle, RoomWakeBus,
+    publish_room_access_wake_on, publish_room_read_cursor_wake_on, publish_room_wake_on,
+    with_rooms_handle, RoomAccessWakeBus, RoomReadCursorWakeBus, RoomStoreHandle, RoomWakeBus,
 };
 
 const FEDERATION_URL_ENV: &str = "OCEAN_FEDERATION_URL";
@@ -76,6 +77,75 @@ enum GuardedMutationError {
     Generation,
     NotFound,
     Store,
+}
+
+/// Upper bound on convergence retries in [`converge_room_read_cursor_mirror`].
+/// Real contention is at most a handful of in-flight GET/PATCH/push-frame
+/// writers per room/principal; this only guards against pathological churn
+/// so the mutate-guarded write path can never spin unbounded.
+const READ_CURSOR_MIRROR_CONVERGE_ATTEMPTS: usize = 8;
+
+/// Apply a read-cursor mirror write with a bounded convergence retry (F2).
+///
+/// The store's `set_room_read_cursor_mirror` is a strict compare-and-swap:
+/// a write is rejected as `Stale` whenever the on-disk mirror no longer
+/// equals the caller's `expected_prior_mirror` snapshot, regardless of
+/// whether the value this call is carrying is actually newer than what's
+/// there. Two upstream round trips (GET poll, PATCH, or a `room_read_cursor`
+/// push frame) can both succeed and race each other; without a retry, the
+/// response that merely lands second is dropped outright even when its
+/// `sequence` is the numerically newest one seen — a silent regression of
+/// the mirror to whichever response happened to land first.
+///
+/// This wrapper retries a losing `Some(sequence)` write against the fresh
+/// on-disk value as long as the value it carries is still strictly newer,
+/// so concurrent successful writes converge to the newest authoritative
+/// sequence instead of the loser being dropped. An authoritative clear
+/// (`sequence: None`) is never retried — it stays strictly CAS-protected,
+/// exactly as before: a clear that is stale relative to a fresher `Some`
+/// mirror is rejected outright, and a losing `Some` write whose value is
+/// not actually newer than what's already on disk is also left rejected
+/// rather than forced.
+fn converge_room_read_cursor_mirror(
+    rooms: &RoomStoreHandle,
+    key: &RoomKey,
+    principal_id: &str,
+    mut expected_prior_mirror: Option<u64>,
+    sequence: Option<u64>,
+) -> Result<ocean_store::RoomReadCursorMirrorCas, ocean_store::RoomStoreError> {
+    for _ in 0..READ_CURSOR_MIRROR_CONVERGE_ATTEMPTS {
+        let cas = with_rooms_handle(rooms, |store| {
+            store.set_room_read_cursor_mirror(key, principal_id, expected_prior_mirror, sequence)
+        })?;
+        let current = match &cas {
+            ocean_store::RoomReadCursorMirrorCas::Applied(_) => return Ok(cas),
+            ocean_store::RoomReadCursorMirrorCas::Stale(projection) => {
+                projection.mirrored_upstream_read_seq
+            }
+        };
+        let candidate = match sequence {
+            Some(candidate) => candidate,
+            // A clear is never retried: staying strictly CAS-protected is
+            // the whole point of an authoritative clear.
+            None => return Ok(cas),
+        };
+        let is_newer = match current {
+            Some(existing) => candidate > existing,
+            None => true,
+        };
+        if !is_newer {
+            // Our write is not actually newer than what already landed —
+            // this is the ordinary, correct "we lost the race and that's
+            // fine" outcome, not something to retry.
+            return Ok(cas);
+        }
+        expected_prior_mirror = current;
+    }
+    // Retry budget exhausted under pathological contention: return the last
+    // attempt's outcome (whatever it is) rather than looping forever.
+    with_rooms_handle(rooms, |store| {
+        store.set_room_read_cursor_mirror(key, principal_id, expected_prior_mirror, sequence)
+    })
 }
 
 #[derive(Clone)]
@@ -308,6 +378,7 @@ struct SupervisorInit {
     rooms: RoomStoreHandle,
     room_wakes: RoomWakeBus,
     access_wakes: RoomAccessWakeBus,
+    read_cursor_wakes: RoomReadCursorWakeBus,
     trigger_tx: mpsc::UnboundedSender<FederatedTriggerDispatch>,
     shutdown: CancellationToken,
     scan_interval: Duration,
@@ -320,6 +391,7 @@ struct SupervisorInner {
     rooms: RoomStoreHandle,
     room_wakes: RoomWakeBus,
     access_wakes: RoomAccessWakeBus,
+    read_cursor_wakes: RoomReadCursorWakeBus,
     trigger_tx: mpsc::UnboundedSender<FederatedTriggerDispatch>,
     shutdown: CancellationToken,
     slots: Mutex<HashMap<RoomKey, Arc<RoomSlot>>>,
@@ -421,6 +493,7 @@ impl FederationSupervisor {
         rooms: RoomStoreHandle,
         room_wakes: RoomWakeBus,
         access_wakes: RoomAccessWakeBus,
+        read_cursor_wakes: RoomReadCursorWakeBus,
         trigger_tx: mpsc::UnboundedSender<FederatedTriggerDispatch>,
         shutdown: CancellationToken,
     ) -> Self {
@@ -440,6 +513,7 @@ impl FederationSupervisor {
             rooms,
             room_wakes,
             access_wakes,
+            read_cursor_wakes,
             trigger_tx,
             shutdown,
             scan_interval: SENDER_SCAN_INTERVAL,
@@ -452,6 +526,7 @@ impl FederationSupervisor {
         rooms: RoomStoreHandle,
         room_wakes: RoomWakeBus,
         access_wakes: RoomAccessWakeBus,
+        read_cursor_wakes: RoomReadCursorWakeBus,
         shutdown: CancellationToken,
         scan_interval: Duration,
     ) -> Self {
@@ -461,6 +536,7 @@ impl FederationSupervisor {
             rooms,
             room_wakes,
             access_wakes,
+            read_cursor_wakes,
             trigger_tx,
             shutdown,
             scan_interval,
@@ -468,11 +544,13 @@ impl FederationSupervisor {
     }
 
     #[cfg(test)]
+    #[allow(clippy::too_many_arguments)]
     fn for_test_with_trigger(
         base: &str,
         rooms: RoomStoreHandle,
         room_wakes: RoomWakeBus,
         access_wakes: RoomAccessWakeBus,
+        read_cursor_wakes: RoomReadCursorWakeBus,
         trigger_tx: mpsc::UnboundedSender<FederatedTriggerDispatch>,
         shutdown: CancellationToken,
         scan_interval: Duration,
@@ -484,6 +562,7 @@ impl FederationSupervisor {
             rooms,
             room_wakes,
             access_wakes,
+            read_cursor_wakes,
             trigger_tx,
             shutdown,
             scan_interval,
@@ -495,6 +574,7 @@ impl FederationSupervisor {
         rooms: RoomStoreHandle,
         room_wakes: RoomWakeBus,
         access_wakes: RoomAccessWakeBus,
+        read_cursor_wakes: RoomReadCursorWakeBus,
         shutdown: CancellationToken,
     ) -> Self {
         let (trigger_tx, _) = mpsc::unbounded_channel();
@@ -505,6 +585,7 @@ impl FederationSupervisor {
             rooms,
             room_wakes,
             access_wakes,
+            read_cursor_wakes,
             trigger_tx,
             shutdown,
             scan_interval: SENDER_SCAN_INTERVAL,
@@ -520,6 +601,7 @@ impl FederationSupervisor {
                 rooms: init.rooms,
                 room_wakes: init.room_wakes,
                 access_wakes: init.access_wakes,
+                read_cursor_wakes: init.read_cursor_wakes,
                 trigger_tx: init.trigger_tx,
                 shutdown: init.shutdown,
                 slots: Mutex::new(HashMap::new()),
@@ -1158,6 +1240,264 @@ impl FederationSupervisor {
         .map_err(|_| IntentError::Store)
     }
 
+    pub(super) async fn room_get_read_cursor(
+        &self,
+        key: &RoomKey,
+    ) -> Result<RoomReadCursorProjection, IntentError> {
+        let slot = self.slot_for(key).await;
+        let (credential, access) = with_rooms_handle(&self.inner.rooms, |store| {
+            if store.get(key)?.is_none() {
+                return Err(ocean_store::RoomStoreError::UnknownRoom(key.clone()));
+            }
+            Ok::<_, ocean_store::RoomStoreError>((
+                store.room_credential(key)?,
+                store.room_access(key)?,
+            ))
+        })
+        .map_err(|error| match error {
+            ocean_store::RoomStoreError::UnknownRoom(_) => IntentError::NotFound,
+            _ => IntentError::Store,
+        })?;
+        let credential = credential.ok_or(IntentError::Conflict)?;
+        if access.state != RoomAccessState::Live {
+            return Err(IntentError::Conflict);
+        }
+        let client = self.inner.client.clone().ok_or(IntentError::Unavailable)?;
+        let url = client
+            .endpoint(&["api", "v1", "rooms", key.as_str(), "read-cursor"])
+            .map_err(|_| IntentError::Unavailable)?;
+        let generation = slot.generation.load(Ordering::Acquire);
+        // The store's mirror write is a compare-and-swap (M5): snapshot the
+        // expected prior mirror at the SAME point we snapshot `generation`
+        // (right before issuing the request) so a fresher response that
+        // lands from a concurrent GET/PATCH/frame while this one is in
+        // flight is detected and this write is rejected as stale instead of
+        // clobbering it.
+        let expected_prior_mirror = with_rooms_handle(&self.inner.rooms, |store| {
+            store.room_read_cursor(key, &credential.local_human_member_id)
+        })
+        .map_err(|_| IntentError::Store)?
+        .mirrored_upstream_read_seq;
+        let response = match slot
+            .control
+            .send(
+                client
+                    .http
+                    .get(url)
+                    .timeout(REQUEST_TIMEOUT)
+                    .bearer_auth(&credential.bearer_token),
+                &self.inner.shutdown,
+            )
+            .await
+        {
+            AdmittedSend::Response(Ok(response)) => response,
+            AdmittedSend::Response(Err(_)) | AdmittedSend::Cancelled => {
+                return Err(IntentError::Unavailable)
+            }
+            AdmittedSend::Closed => return Err(IntentError::Forbidden),
+        };
+        match response.status() {
+            StatusCode::OK => {}
+            StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN => {
+                self.revoke_control(key).await;
+                return Err(IntentError::Forbidden);
+            }
+            StatusCode::NOT_FOUND => return Err(IntentError::NotFound),
+            StatusCode::NOT_IMPLEMENTED => return Err(IntentError::Conflict),
+            s if s == StatusCode::TOO_MANY_REQUESTS || s.is_server_error() => {
+                return Err(IntentError::Unavailable)
+            }
+            _ => return Err(IntentError::Protocol),
+        }
+        let body: ReadCursorBody = read_bounded_json(response, BODY_LIMIT)
+            .await
+            .map_err(control_body_error)?;
+        if body.room_id != key.as_str() {
+            return Err(IntentError::Protocol);
+        }
+        let sequence = match body.sequence {
+            Some(sequence) => {
+                Some(parse_canonical_u64(&sequence).map_err(|_| IntentError::Protocol)?)
+            }
+            None => None,
+        };
+        let cas = slot
+            .control
+            .mutate(|| {
+                if slot.generation.load(Ordering::Acquire) != generation {
+                    return Err(GuardedMutationError::Generation);
+                }
+                let result = converge_room_read_cursor_mirror(
+                    &self.inner.rooms,
+                    key,
+                    &credential.local_human_member_id,
+                    expected_prior_mirror,
+                    sequence,
+                );
+                match result {
+                    Ok(cas) => Ok(cas),
+                    Err(ocean_store::RoomStoreError::UnknownRoom(_)) => {
+                        Err(GuardedMutationError::NotFound)
+                    }
+                    Err(_) => Err(GuardedMutationError::Store),
+                }
+            })
+            .await
+            .ok_or(IntentError::Forbidden)?;
+        let cas = match cas {
+            Ok(cas) => cas,
+            Err(GuardedMutationError::Generation) => return Err(IntentError::Forbidden),
+            Err(GuardedMutationError::NotFound) => return Err(IntentError::NotFound),
+            Err(GuardedMutationError::Store) => return Err(IntentError::Store),
+        };
+        // A `Stale` result means a fresher write already landed concurrently
+        // (another GET/PATCH, or a `room_read_cursor` push frame); that
+        // write already published its own wake, so only re-publish when
+        // THIS call's write was the one actually applied.
+        let applied = cas.was_applied();
+        let projection = cas.into_projection();
+        if applied {
+            publish_room_read_cursor_wake_on(&self.inner.read_cursor_wakes, key);
+        }
+        Ok(projection)
+    }
+
+    pub(super) async fn room_patch_read_cursor(
+        &self,
+        key: &RoomKey,
+        read_seq: u64,
+    ) -> Result<RoomReadCursorProjection, IntentError> {
+        let slot = self.slot_for(key).await;
+        let (credential, access) = with_rooms_handle(&self.inner.rooms, |store| {
+            if store.get(key)?.is_none() {
+                return Err(ocean_store::RoomStoreError::UnknownRoom(key.clone()));
+            }
+            Ok::<_, ocean_store::RoomStoreError>((
+                store.room_credential(key)?,
+                store.room_access(key)?,
+            ))
+        })
+        .map_err(|error| match error {
+            ocean_store::RoomStoreError::UnknownRoom(_) => IntentError::NotFound,
+            _ => IntentError::Store,
+        })?;
+        let credential = credential.ok_or(IntentError::Conflict)?;
+        if access.state != RoomAccessState::Live {
+            return Err(IntentError::Conflict);
+        }
+        let client = self.inner.client.clone().ok_or(IntentError::Unavailable)?;
+        let url = client
+            .endpoint(&["api", "v1", "rooms", key.as_str(), "read-cursor"])
+            .map_err(|_| IntentError::Unavailable)?;
+        let generation = slot.generation.load(Ordering::Acquire);
+        // Snapshot the CAS `expected_prior_mirror` (M5) at the same point as
+        // `generation`, before the request goes out — see the matching
+        // comment in `room_get_read_cursor`.
+        let expected_prior_mirror = with_rooms_handle(&self.inner.rooms, |store| {
+            store.room_read_cursor(key, &credential.local_human_member_id)
+        })
+        .map_err(|_| IntentError::Store)?
+        .mirrored_upstream_read_seq;
+        let response = match slot
+            .control
+            .send(
+                client
+                    .http
+                    .patch(url)
+                    .timeout(REQUEST_TIMEOUT)
+                    .bearer_auth(&credential.bearer_token)
+                    .json(&serde_json::json!({ "sequence": read_seq.to_string() })),
+                &self.inner.shutdown,
+            )
+            .await
+        {
+            AdmittedSend::Response(Ok(response)) => response,
+            AdmittedSend::Response(Err(_)) | AdmittedSend::Cancelled => {
+                return Err(IntentError::Unavailable)
+            }
+            AdmittedSend::Closed => return Err(IntentError::Forbidden),
+        };
+        match response.status() {
+            StatusCode::OK => {}
+            StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN => {
+                self.revoke_control(key).await;
+                return Err(IntentError::Forbidden);
+            }
+            StatusCode::NOT_FOUND => return Err(IntentError::NotFound),
+            StatusCode::NOT_IMPLEMENTED => return Err(IntentError::Conflict),
+            StatusCode::CONFLICT | StatusCode::BAD_REQUEST => return Err(IntentError::Protocol),
+            s if s == StatusCode::TOO_MANY_REQUESTS || s.is_server_error() => {
+                return Err(IntentError::Unavailable)
+            }
+            _ => return Err(IntentError::Protocol),
+        }
+        let body: ReadCursorBody = read_bounded_json(response, BODY_LIMIT)
+            .await
+            .map_err(control_body_error)?;
+        if body.room_id != key.as_str() {
+            return Err(IntentError::Protocol);
+        }
+        let sequence = match body.sequence {
+            Some(sequence) => {
+                Some(parse_canonical_u64(&sequence).map_err(|_| IntentError::Protocol)?)
+            }
+            None => None,
+        };
+        // The upstream read-cursor store is authoritative for `read_seq` and
+        // may clamp our request down to its own known high-water mark; it
+        // signals that explicitly via `clamped: true` (H3). Trust that
+        // signal instead of rejecting a truthfully clamped response as a
+        // protocol violation — but only within the bound the signal claims
+        // to describe: a genuine clamp can only ever return a sequence that
+        // is `Some` and no greater than what we requested (F4). A response
+        // that flags `clamped: true` yet reports no sequence, or a
+        // sequence ABOVE what we asked for, is not a truthful clamp-down —
+        // it is still rejected as a protocol violation, exactly like an
+        // unflagged mismatch.
+        let truthfully_clamped =
+            body.clamped == Some(true) && matches!(sequence, Some(clamped) if clamped <= read_seq);
+        if sequence != Some(read_seq) && !truthfully_clamped {
+            return Err(IntentError::Protocol);
+        }
+        let cas = slot
+            .control
+            .mutate(|| {
+                if slot.generation.load(Ordering::Acquire) != generation {
+                    return Err(GuardedMutationError::Generation);
+                }
+                let result = converge_room_read_cursor_mirror(
+                    &self.inner.rooms,
+                    key,
+                    &credential.local_human_member_id,
+                    expected_prior_mirror,
+                    sequence,
+                );
+                match result {
+                    Ok(cas) => Ok(cas),
+                    Err(ocean_store::RoomStoreError::UnknownRoom(_)) => {
+                        Err(GuardedMutationError::NotFound)
+                    }
+                    Err(_) => Err(GuardedMutationError::Store),
+                }
+            })
+            .await
+            .ok_or(IntentError::Forbidden)?;
+        let cas = match cas {
+            Ok(cas) => cas,
+            Err(GuardedMutationError::Generation) => return Err(IntentError::Forbidden),
+            Err(GuardedMutationError::NotFound) => return Err(IntentError::NotFound),
+            Err(GuardedMutationError::Store) => return Err(IntentError::Store),
+        };
+        // Same stale-write handling as `room_get_read_cursor`: only
+        // re-publish the wake for a write this call actually applied.
+        let applied = cas.was_applied();
+        let projection = cas.into_projection();
+        if applied {
+            publish_room_read_cursor_wake_on(&self.inner.read_cursor_wakes, key);
+        }
+        Ok(projection)
+    }
+
     pub(super) async fn register_agents(
         &self,
         key: &RoomKey,
@@ -1364,13 +1704,15 @@ impl FederationSupervisor {
         {
             return Err(IntentError::Forbidden);
         }
-        let members = project_roster(&self.inner, credential, envelope, true).map_err(|error| {
-            if error == BridgeError::Store {
-                IntentError::Store
-            } else {
-                IntentError::Protocol
-            }
-        })?;
+        let members = project_roster(&self.inner, credential, envelope, &HashSet::new()).map_err(
+            |error| {
+                if error == BridgeError::Store {
+                    IntentError::Store
+                } else {
+                    IntentError::Protocol
+                }
+            },
+        )?;
         if slot
             .control
             .mutate(|| slot.generation.load(Ordering::Acquire) == generation)
@@ -1511,6 +1853,7 @@ async fn run_epoch(
     sender_notify: Arc<Notify>,
     cancel: CancellationToken,
 ) -> EpochOutcome {
+    let mut live_human_member_ids = HashSet::<String>::new();
     let key = credential.room_id.clone();
     let cursor = match cursor_or_zero(durable_cursor(&inner.rooms, &key)) {
         Ok(cursor) => cursor,
@@ -1564,7 +1907,7 @@ async fn run_epoch(
     };
 
     // Roster is committed before the first room_event of every connection epoch.
-    let members = match fetch_roster(&inner, &client, &credential, true).await {
+    let members = match fetch_roster(&inner, &client, &credential, &live_human_member_ids).await {
         Ok(members) => members,
         Err(EpochOutcome::Revoked) => return EpochOutcome::Revoked,
         Err(outcome) => return outcome,
@@ -1624,7 +1967,14 @@ async fn run_epoch(
                             break EpochOutcome::Recover;
                         }
                         let result = if row.event_type == "message" {
-                            ingest_message_row(&inner, &client, &credential, row).await
+                            ingest_message_row(
+                                &inner,
+                                &client,
+                                &credential,
+                                row,
+                                &live_human_member_ids,
+                            )
+                            .await
                         } else {
                             advance_non_message(&inner, &key, sequence)
                         };
@@ -1662,16 +2012,50 @@ async fn run_epoch(
                         if sequence != last_accepted {
                             break EpochOutcome::Recover;
                         }
-                        match fetch_roster(&inner, &client, &credential, true).await {
+                        match fetch_roster(&inner, &client, &credential, &live_human_member_ids).await {
                             Ok(members) => {
                                 let Ok(current_state) = durable_state(&inner.rooms, &key) else {
                                     break EpochOutcome::Recover;
                                 };
-                                if !commit_access(&inner, &key, current_state, Some(&members), None) {
+                                if !commit_presence_snapshot(&inner, &key, current_state, &members) {
                                     break EpochOutcome::Recover;
                                 }
                             }
                             Err(outcome) => break outcome,
+                        }
+                    }
+                    "room_presence" => {
+                        let Ok(frame) = parse_sse_json::<PresenceFrame>(&event.data) else {
+                            break EpochOutcome::Recover;
+                        };
+                        if frame.room_id != key.as_str() {
+                            break EpochOutcome::Recover;
+                        }
+                        let Ok(current_state) = durable_state(&inner.rooms, &key) else {
+                            break EpochOutcome::Recover;
+                        };
+                        if !apply_presence_frame(
+                            &inner,
+                            &key,
+                            current_state,
+                            &frame.members,
+                            &mut live_human_member_ids,
+                        ) {
+                            break EpochOutcome::Recover;
+                        }
+                    }
+                    "room_read_cursor" => {
+                        let Ok(frame) = parse_sse_json::<ReadCursorFrame>(&event.data) else {
+                            break EpochOutcome::Recover;
+                        };
+                        if frame.room_id != key.as_str() {
+                            break EpochOutcome::Recover;
+                        }
+                        match apply_mirrored_read_cursor_frame(&inner, &credential, &key, frame.sequence) {
+                            Ok(true) => publish_room_read_cursor_wake_on(&inner.read_cursor_wakes, &key),
+                            Ok(false) => {}
+                            Err(BridgeError::Revoked) => break EpochOutcome::Revoked,
+                            Err(_) => break EpochOutcome::Recover,
                         }
                     }
                     "resync_required" => {
@@ -1729,8 +2113,51 @@ struct ResyncFrame {
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
+struct PresenceFrame {
+    room_id: String,
+    members: Vec<PresenceWireMember>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PresenceWireMember {
+    member_id: String,
+    actor_type: FederatedActorType,
+    #[allow(dead_code)]
+    role_in_room: FederatedRoomRole,
+    #[allow(dead_code)]
+    display_name: String,
+    #[allow(dead_code)]
+    joined_at: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ReadCursorFrame {
+    room_id: String,
+    sequence: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct RevokedFrame {
     reason: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ReadCursorBody {
+    room_id: String,
+    sequence: Option<String>,
+    #[allow(dead_code)]
+    #[serde(default)]
+    changed: Option<bool>,
+    /// The upstream read-cursor store clamped our requested `read_seq` down
+    /// to its own authoritative high-water mark. `room_patch_read_cursor`
+    /// (H3) trusts this signal instead of demanding the response echo the
+    /// exact requested value.
+    #[serde(default)]
+    clamped: Option<bool>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -2024,7 +2451,7 @@ async fn fetch_roster(
     inner: &Arc<SupervisorInner>,
     client: &FederationClient,
     credential: &RoomCredential,
-    lease_healthy: bool,
+    live_human_member_ids: &HashSet<String>,
 ) -> Result<Vec<FederatedRoomMemberProjection>, EpochOutcome> {
     let url = client
         .room_endpoint(&credential.room_id, "members")
@@ -2045,14 +2472,15 @@ async fn fetch_roster(
     let envelope: MembersEnvelope = read_bounded_json(response, BODY_LIMIT)
         .await
         .map_err(|_| EpochOutcome::Recover)?;
-    project_roster(inner, credential, envelope, lease_healthy).map_err(|_| EpochOutcome::Recover)
+    project_roster(inner, credential, envelope, live_human_member_ids)
+        .map_err(|_| EpochOutcome::Recover)
 }
 
 fn project_roster(
     inner: &Arc<SupervisorInner>,
     credential: &RoomCredential,
     envelope: MembersEnvelope,
-    lease_healthy: bool,
+    live_human_member_ids: &HashSet<String>,
 ) -> Result<Vec<FederatedRoomMemberProjection>, BridgeError> {
     let mut members = Vec::with_capacity(envelope.members.len());
     let mut member_ids = HashSet::with_capacity(envelope.members.len());
@@ -2073,15 +2501,15 @@ fn project_roster(
         } else {
             false
         };
-        let local_agent = member.owner_member_id.as_deref()
-            == Some(credential.local_human_member_id.as_str())
-            && binding;
-        let local_human = member.actor_type == FederatedActorType::User
-            && member.member_id == credential.local_human_member_id;
-        let presence = if lease_healthy && (local_human || local_agent) {
-            MemberPresence::Live
-        } else {
-            MemberPresence::Unavailable
+        let derived_presence = match member.actor_type {
+            FederatedActorType::User => {
+                Some(if live_human_member_ids.contains(&member.member_id) {
+                    MemberPresence::Live
+                } else {
+                    MemberPresence::Unavailable
+                })
+            }
+            FederatedActorType::Agent => None,
         };
         members.push(FederatedRoomMemberProjection {
             member_id: member.member_id,
@@ -2091,7 +2519,7 @@ fn project_roster(
             display_name: member.display_name,
             public_agent_descriptor: member.public_agent_descriptor,
             joined_at: member.joined_at,
-            derived_presence: Some(presence),
+            derived_presence,
             local_binding_available: (member.actor_type == FederatedActorType::Agent)
                 .then_some(binding),
         });
@@ -2110,6 +2538,7 @@ async fn ingest_message_row(
     client: &FederationClient,
     credential: &RoomCredential,
     row: WireLedgerRow,
+    live_human_member_ids: &HashSet<String>,
 ) -> Result<IngestDisposition, BridgeError> {
     let sequence = parse_canonical_u64(&row.sequence)?;
     let source_id = row.source_id.ok_or(BridgeError::Protocol)?;
@@ -2140,9 +2569,12 @@ async fn ingest_message_row(
                 // One immediate current-epoch roster fetch, then conservative
                 // Human. Do NOT commit/wake yet: Duplicate must remain a total
                 // no-op, while Ingested coalesces roster + message into one
-                // access wake.
+                // access wake. Reuse the epoch's live-human cache so this
+                // out-of-band refresh derives the same presence a heartbeat
+                // or presence frame would, instead of an empty set that
+                // would mark every human member Unavailable.
                 let current_state = durable_state(&inner.rooms, &credential.room_id)?;
-                let members = fetch_roster(inner, client, credential, true)
+                let members = fetch_roster(inner, client, credential, live_human_member_ids)
                     .await
                     .map_err(|outcome| match outcome {
                         EpochOutcome::Revoked => BridgeError::Revoked,
@@ -2307,6 +2739,111 @@ fn commit_state_only(inner: &Arc<SupervisorInner>, key: &RoomKey, state: RoomAcc
     commit_access(inner, key, state, None, None)
 }
 
+fn commit_presence_snapshot(
+    inner: &Arc<SupervisorInner>,
+    key: &RoomKey,
+    state: RoomAccessState,
+    members: &[FederatedRoomMemberProjection],
+) -> bool {
+    commit_access(inner, key, state, Some(members), None)
+}
+
+fn apply_presence_frame(
+    inner: &Arc<SupervisorInner>,
+    key: &RoomKey,
+    state: RoomAccessState,
+    incoming: &[PresenceWireMember],
+    live_human_member_ids: &mut HashSet<String>,
+) -> bool {
+    // `room_presence` frames report the currently-live human members; other
+    // actor types carry no presence meaning here, so a mixed/additive frame
+    // that also echoes non-User entries (M4) is handled by ignoring them
+    // rather than discarding the whole update. The one thing that can't be
+    // safely interpreted is a User entry with an empty `member_id` — that
+    // alone still fails the frame.
+    if incoming
+        .iter()
+        .any(|member| member.actor_type == FederatedActorType::User && member.member_id.is_empty())
+    {
+        return false;
+    }
+    let live_humans: HashSet<String> = incoming
+        .iter()
+        .filter(|member| member.actor_type == FederatedActorType::User)
+        .map(|member| member.member_id.clone())
+        .collect();
+    // Read the current roster, derive presence, and commit the update under
+    // a single lock acquisition (M3). Splitting this into a separate read
+    // (`with_rooms_handle`) followed by a separate `commit_access` call
+    // left a window for a concurrent writer — another presence frame, a
+    // heartbeat roster refresh, a message ingest — to interleave between
+    // the two lock acquisitions and have its update silently lost when this
+    // stale read was written back.
+    let committed = with_rooms_handle(&inner.rooms, |store| {
+        let projection = store.room_access(key)?;
+        let mut members = projection.members;
+        for member in &mut members {
+            member.derived_presence = match member.actor_type {
+                FederatedActorType::User => {
+                    Some(if live_humans.contains(member.member_id.as_str()) {
+                        MemberPresence::Live
+                    } else {
+                        MemberPresence::Unavailable
+                    })
+                }
+                FederatedActorType::Agent => None,
+            };
+        }
+        store.update_room_access_safe(key, Some(state), Some(&members), None)
+    });
+    if committed.is_err() {
+        return false;
+    }
+    // Only replace the epoch-local live-humans cache after the durable
+    // commit has actually succeeded (M2). Clearing/repopulating it before
+    // the write was confirmed left it out of sync with the store on any
+    // failed commit (an UnknownRoom race, a poisoned-lock recovery that
+    // still errors, etc.), silently wiping the in-memory presence view the
+    // next roster fetch (`fetch_roster`/`project_roster`) derives from.
+    *live_human_member_ids = live_humans;
+    publish_room_access_wake_on(&inner.access_wakes, key);
+    true
+}
+
+fn apply_mirrored_read_cursor_frame(
+    inner: &Arc<SupervisorInner>,
+    credential: &RoomCredential,
+    key: &RoomKey,
+    sequence: Option<String>,
+) -> Result<bool, BridgeError> {
+    let read_seq = match sequence {
+        Some(sequence) => Some(parse_canonical_u64(&sequence)?),
+        None => None,
+    };
+    let before = with_rooms_handle(&inner.rooms, |store| {
+        store.room_read_cursor(key, credential.local_human_member_id.as_str())
+    })
+    .map_err(|_| BridgeError::Store)?;
+    let cas = converge_room_read_cursor_mirror(
+        &inner.rooms,
+        key,
+        credential.local_human_member_id.as_str(),
+        before.mirrored_upstream_read_seq,
+        read_seq,
+    )
+    .map_err(|_| BridgeError::Store)?;
+    // F5: `was_applied()` only tells us the (possibly retried/converged)
+    // write was accepted, not that it actually moved the value — writing
+    // back the same sequence that was already mirrored (a duplicate/no-op
+    // frame) is `Applied` (it's not stale) but is not a real change, and
+    // must not trigger a wake. True change detection compares what
+    // actually landed on disk against what was there immediately before
+    // this write started.
+    let changed = cas.was_applied()
+        && cas.into_projection().mirrored_upstream_read_seq != before.mirrored_upstream_read_seq;
+    Ok(changed)
+}
+
 fn persist_lease_lost(
     inner: &Arc<SupervisorInner>,
     key: &RoomKey,
@@ -2325,7 +2862,14 @@ fn lease_lost_transition(
 ) -> Result<(), BridgeError> {
     let mut members = projection?.members;
     for member in &mut members {
-        member.derived_presence = Some(MemberPresence::Unavailable);
+        match member.actor_type {
+            FederatedActorType::User => {
+                member.derived_presence = Some(MemberPresence::Unavailable);
+            }
+            FederatedActorType::Agent => {
+                member.derived_presence = None;
+            }
+        }
     }
     if commit(members) {
         Ok(())
@@ -2353,7 +2897,14 @@ async fn revoke_room(inner: &Arc<SupervisorInner>, key: &RoomKey) {
         let projection = store.room_access(key)?;
         let mut members = projection.members;
         for member in &mut members {
-            member.derived_presence = Some(MemberPresence::Unavailable);
+            match member.actor_type {
+                FederatedActorType::User => {
+                    member.derived_presence = Some(MemberPresence::Unavailable);
+                }
+                FederatedActorType::Agent => {
+                    member.derived_presence = None;
+                }
+            }
         }
         store.update_room_access_safe(key, Some(RoomAccessState::Revoked), Some(&members), None)?;
         Ok::<(), ocean_store::RoomStoreError>(())
@@ -2771,6 +3322,291 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn room_read_cursor_frame_updates_mirror_without_http_or_confirmed_cursor() {
+        let key = RoomKey::new("cursor-frame-room");
+        let mut store = ocean_store::SqliteRoomStore::open_in_memory().unwrap();
+        store
+            .create(key.clone(), "Cursor", None, chrono::Utc::now())
+            .unwrap();
+        store
+            .update_room_access_safe(&key, Some(RoomAccessState::Live), Some(&[]), Some(9))
+            .unwrap();
+        store
+            .install_room_credential(&key, "bearer", "principal")
+            .unwrap();
+        store
+            .update_room_read_cursor(
+                &key,
+                "principal",
+                ocean_core::RoomReadCursorUpdateRequest { read_seq: 9 },
+            )
+            .unwrap();
+        let rooms = Arc::new(std::sync::Mutex::new(store));
+        let fake = FakeBedrock::new(key.as_str(), "bearer");
+        let (base, server) = start_fake_bedrock(fake.clone()).await;
+        let supervisor = FederationSupervisor::for_test(
+            &base,
+            rooms.clone(),
+            RoomWakeBus::default(),
+            RoomAccessWakeBus::default(),
+            RoomReadCursorWakeBus::default(),
+            CancellationToken::new(),
+            Duration::from_millis(25),
+        );
+        let inner = supervisor.inner.clone();
+        let credential = with_rooms_handle(&rooms, |store| store.room_credential(&key))
+            .unwrap()
+            .unwrap();
+        apply_mirrored_read_cursor_frame(
+            &inner,
+            &credential,
+            &key,
+            Some("9007199254740993".into()),
+        )
+        .unwrap();
+        let cursor =
+            with_rooms_handle(&rooms, |store| store.room_read_cursor(&key, "principal")).unwrap();
+        let access = with_rooms_handle(&rooms, |store| store.room_access(&key)).unwrap();
+        assert_eq!(cursor.read_seq, None);
+        assert_eq!(
+            cursor.mirrored_upstream_read_seq,
+            Some(9_007_199_254_740_993)
+        );
+        assert_eq!(access.last_confirmed_global_sequence, Some(9));
+        assert!(fake.read_cursor_calls.lock().await.is_empty());
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn room_read_cursor_live_get_and_patch_use_exact_path_body_and_optional_clamped() {
+        let key = RoomKey::new("cursor-live-room");
+        let mut store = ocean_store::SqliteRoomStore::open_in_memory().unwrap();
+        store
+            .create(key.clone(), "Cursor", None, chrono::Utc::now())
+            .unwrap();
+        store
+            .update_room_access_safe(&key, Some(RoomAccessState::Live), Some(&[]), None)
+            .unwrap();
+        store
+            .install_room_credential(&key, "bearer", "principal")
+            .unwrap();
+        store
+            .update_room_read_cursor(
+                &key,
+                "principal",
+                ocean_core::RoomReadCursorUpdateRequest { read_seq: 0 },
+            )
+            .unwrap();
+        let rooms = Arc::new(std::sync::Mutex::new(store));
+        let fake = FakeBedrock::new(key.as_str(), "bearer");
+        *fake.read_cursor_response.lock().await =
+            json!({"room_id": key.as_str(), "sequence": null, "clamped": false});
+        let (base, server) = start_fake_bedrock(fake.clone()).await;
+        let supervisor = FederationSupervisor::for_test(
+            &base,
+            rooms.clone(),
+            RoomWakeBus::default(),
+            RoomAccessWakeBus::default(),
+            RoomReadCursorWakeBus::default(),
+            CancellationToken::new(),
+            Duration::from_millis(25),
+        );
+
+        let got = supervisor.room_get_read_cursor(&key).await.unwrap();
+        assert_eq!(got.mirrored_upstream_read_seq, None);
+
+        *fake.read_cursor_response.lock().await = json!({
+            "room_id": key.as_str(),
+            "sequence": "9007199254740993",
+            "changed": true,
+            "clamped": false
+        });
+        let patched = supervisor
+            .room_patch_read_cursor(&key, 9_007_199_254_740_993)
+            .await
+            .unwrap();
+        assert_eq!(
+            patched.mirrored_upstream_read_seq,
+            Some(9_007_199_254_740_993)
+        );
+
+        let calls = fake.read_cursor_calls.lock().await.clone();
+        assert_eq!(calls.len(), 2);
+        assert_eq!(calls[0].method, "GET");
+        assert_eq!(calls[0].path, format!("/api/v1/rooms/{}/read-cursor", key));
+        assert_eq!(calls[0].authorization.as_deref(), Some("Bearer bearer"));
+        assert!(calls[0].body.is_none());
+        assert_eq!(calls[1].method, "PATCH");
+        assert_eq!(calls[1].path, format!("/api/v1/rooms/{}/read-cursor", key));
+        assert_eq!(calls[1].authorization.as_deref(), Some("Bearer bearer"));
+        assert_eq!(
+            calls[1].body.as_ref().unwrap(),
+            &json!({"sequence":"9007199254740993"})
+        );
+
+        let cursor =
+            with_rooms_handle(&rooms, |store| store.room_read_cursor(&key, "principal")).unwrap();
+        assert_eq!(
+            cursor.mirrored_upstream_read_seq,
+            Some(9_007_199_254_740_993)
+        );
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn room_read_cursor_live_rejects_mismatch_without_mirror_or_wake() {
+        let key = RoomKey::new("cursor-mismatch-room");
+        let mut store = ocean_store::SqliteRoomStore::open_in_memory().unwrap();
+        store
+            .create(key.clone(), "Cursor", None, chrono::Utc::now())
+            .unwrap();
+        store
+            .update_room_access_safe(&key, Some(RoomAccessState::Live), Some(&[]), None)
+            .unwrap();
+        store
+            .install_room_credential(&key, "bearer", "principal")
+            .unwrap();
+        store
+            .update_room_read_cursor(
+                &key,
+                "principal",
+                ocean_core::RoomReadCursorUpdateRequest { read_seq: 0 },
+            )
+            .unwrap();
+        let rooms = Arc::new(std::sync::Mutex::new(store));
+        let wakes = RoomReadCursorWakeBus::default();
+        let mut rx = wakes.subscribe();
+        let fake = FakeBedrock::new(key.as_str(), "bearer");
+        *fake.read_cursor_response.lock().await = json!({
+            "room_id": key.as_str(),
+            "sequence": "7",
+            "changed": true,
+            "clamped": false
+        });
+        let (base, server) = start_fake_bedrock(fake.clone()).await;
+        let supervisor = FederationSupervisor::for_test(
+            &base,
+            rooms.clone(),
+            RoomWakeBus::default(),
+            RoomAccessWakeBus::default(),
+            wakes,
+            CancellationToken::new(),
+            Duration::from_millis(25),
+        );
+
+        assert_eq!(
+            supervisor.room_patch_read_cursor(&key, 8).await,
+            Err(IntentError::Protocol)
+        );
+        let cursor =
+            with_rooms_handle(&rooms, |store| store.room_read_cursor(&key, "principal")).unwrap();
+        assert_eq!(cursor.mirrored_upstream_read_seq, None);
+        assert!(tokio::time::timeout(Duration::from_millis(50), rx.recv())
+            .await
+            .is_err());
+        server.abort();
+    }
+
+    /// H3 regression: the upstream read-cursor store is authoritative and
+    /// may clamp our requested `read_seq` down to its own high-water mark,
+    /// signalling that explicitly via `"clamped": true`. That truthful,
+    /// explicitly-flagged response must be accepted and mirrored — not
+    /// treated as the same protocol violation as an unflagged mismatch.
+    #[tokio::test]
+    async fn room_read_cursor_live_patch_accepts_flagged_authoritative_clamp() {
+        let key = RoomKey::new("cursor-clamped-room");
+        let mut store = ocean_store::SqliteRoomStore::open_in_memory().unwrap();
+        store
+            .create(key.clone(), "Cursor", None, chrono::Utc::now())
+            .unwrap();
+        store
+            .update_room_access_safe(&key, Some(RoomAccessState::Live), Some(&[]), None)
+            .unwrap();
+        store
+            .install_room_credential(&key, "bearer", "principal")
+            .unwrap();
+        let rooms = Arc::new(std::sync::Mutex::new(store));
+        let wakes = RoomReadCursorWakeBus::default();
+        let mut rx = wakes.subscribe();
+        let fake = FakeBedrock::new(key.as_str(), "bearer");
+        *fake.read_cursor_response.lock().await = json!({
+            "room_id": key.as_str(),
+            "sequence": "7",
+            "changed": true,
+            "clamped": true
+        });
+        let (base, server) = start_fake_bedrock(fake.clone()).await;
+        let supervisor = FederationSupervisor::for_test(
+            &base,
+            rooms.clone(),
+            RoomWakeBus::default(),
+            RoomAccessWakeBus::default(),
+            wakes,
+            CancellationToken::new(),
+            Duration::from_millis(25),
+        );
+
+        let patched = supervisor
+            .room_patch_read_cursor(&key, 8)
+            .await
+            .expect("an authoritative, explicitly-clamped response must be accepted");
+        assert_eq!(patched.mirrored_upstream_read_seq, Some(7));
+        let cursor =
+            with_rooms_handle(&rooms, |store| store.room_read_cursor(&key, "principal")).unwrap();
+        assert_eq!(cursor.mirrored_upstream_read_seq, Some(7));
+        assert!(tokio::time::timeout(Duration::from_millis(200), rx.recv())
+            .await
+            .is_ok());
+        server.abort();
+    }
+
+    /// H3: a response that neither echoes the requested value NOR claims to
+    /// be clamped is still rejected as a protocol violation — the fix only
+    /// trusts an explicit `clamped: true` signal, it does not silently
+    /// accept every non-matching sequence.
+    #[tokio::test]
+    async fn room_read_cursor_live_patch_still_rejects_unflagged_lower_sequence() {
+        let key = RoomKey::new("cursor-unflagged-lower-room");
+        let mut store = ocean_store::SqliteRoomStore::open_in_memory().unwrap();
+        store
+            .create(key.clone(), "Cursor", None, chrono::Utc::now())
+            .unwrap();
+        store
+            .update_room_access_safe(&key, Some(RoomAccessState::Live), Some(&[]), None)
+            .unwrap();
+        store
+            .install_room_credential(&key, "bearer", "principal")
+            .unwrap();
+        let rooms = Arc::new(std::sync::Mutex::new(store));
+        let fake = FakeBedrock::new(key.as_str(), "bearer");
+        *fake.read_cursor_response.lock().await = json!({
+            "room_id": key.as_str(),
+            "sequence": "7",
+            "changed": true,
+            "clamped": false
+        });
+        let (base, server) = start_fake_bedrock(fake.clone()).await;
+        let supervisor = FederationSupervisor::for_test(
+            &base,
+            rooms.clone(),
+            RoomWakeBus::default(),
+            RoomAccessWakeBus::default(),
+            RoomReadCursorWakeBus::default(),
+            CancellationToken::new(),
+            Duration::from_millis(25),
+        );
+
+        assert_eq!(
+            supervisor.room_patch_read_cursor(&key, 8).await,
+            Err(IntentError::Protocol)
+        );
+        let cursor =
+            with_rooms_handle(&rooms, |store| store.room_read_cursor(&key, "principal")).unwrap();
+        assert_eq!(cursor.mirrored_upstream_read_seq, None);
+        server.abort();
+    }
+
+    #[tokio::test]
     async fn revoke_admission_gate_blocks_post_response_mutation() {
         let gate = AdmissionGate::new();
         let mutations = std::sync::Mutex::new(0);
@@ -2820,13 +3656,24 @@ mod tests {
     type RequestMeta = (String, Option<String>, Option<String>);
 
     #[derive(Clone)]
+    struct ReadCursorCall {
+        method: String,
+        path: String,
+        authorization: Option<String>,
+        body: Option<Value>,
+    }
+
+    #[derive(Clone)]
     struct FakeBedrock {
         bearer: Arc<String>,
         room: Arc<String>,
         sse_tx: Arc<Mutex<Option<FakeSseTx>>>,
         posts: Arc<Mutex<Vec<Value>>>,
+        read_cursor_calls: Arc<Mutex<Vec<ReadCursorCall>>>,
         request_meta: Arc<Mutex<Vec<RequestMeta>>>,
         members: Arc<Mutex<Value>>,
+        read_cursor_status: Arc<AtomicU16>,
+        read_cursor_response: Arc<Mutex<Value>>,
         members_status: Arc<AtomicU16>,
         events_status: Arc<AtomicU16>,
         hold_events_response: Arc<AtomicBool>,
@@ -2846,8 +3693,13 @@ mod tests {
                 room: Arc::new(room.to_string()),
                 sse_tx: Arc::new(Mutex::new(None)),
                 posts: Arc::new(Mutex::new(Vec::new())),
+                read_cursor_calls: Arc::new(Mutex::new(Vec::new())),
                 request_meta: Arc::new(Mutex::new(Vec::new())),
                 members: Arc::new(Mutex::new(json!({"members":[]}))),
+                read_cursor_status: Arc::new(AtomicU16::new(200)),
+                read_cursor_response: Arc::new(Mutex::new(
+                    json!({"room_id": room, "sequence": null}),
+                )),
                 members_status: Arc::new(AtomicU16::new(200)),
                 events_status: Arc::new(AtomicU16::new(200)),
                 hold_events_response: Arc::new(AtomicBool::new(false)),
@@ -2935,6 +3787,55 @@ mod tests {
         Json(state.members.lock().await.clone()).into_response()
     }
 
+    async fn fake_read_cursor_get(
+        State(state): State<FakeBedrock>,
+        Path(room): Path<String>,
+        headers: HeaderMap,
+    ) -> axum::response::Response {
+        state.read_cursor_calls.lock().await.push(ReadCursorCall {
+            method: "GET".into(),
+            path: format!("/api/v1/rooms/{room}/read-cursor"),
+            authorization: bearer(&headers),
+            body: None,
+        });
+        if room != *state.room
+            || bearer(&headers).as_deref() != Some(format!("Bearer {}", state.bearer).as_str())
+        {
+            return StatusCode::UNAUTHORIZED.into_response();
+        }
+        let status = StatusCode::from_u16(state.read_cursor_status.load(Ordering::Acquire))
+            .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
+        if status != StatusCode::OK {
+            return status.into_response();
+        }
+        Json(state.read_cursor_response.lock().await.clone()).into_response()
+    }
+
+    async fn fake_read_cursor_patch(
+        State(state): State<FakeBedrock>,
+        Path(room): Path<String>,
+        headers: HeaderMap,
+        Json(body): Json<Value>,
+    ) -> axum::response::Response {
+        state.read_cursor_calls.lock().await.push(ReadCursorCall {
+            method: "PATCH".into(),
+            path: format!("/api/v1/rooms/{room}/read-cursor"),
+            authorization: bearer(&headers),
+            body: Some(body.clone()),
+        });
+        if room != *state.room
+            || bearer(&headers).as_deref() != Some(format!("Bearer {}", state.bearer).as_str())
+        {
+            return StatusCode::UNAUTHORIZED.into_response();
+        }
+        let status = StatusCode::from_u16(state.read_cursor_status.load(Ordering::Acquire))
+            .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
+        if status != StatusCode::OK {
+            return status.into_response();
+        }
+        Json(state.read_cursor_response.lock().await.clone()).into_response()
+    }
+
     async fn fake_ledger(
         State(state): State<FakeBedrock>,
         headers: HeaderMap,
@@ -2962,6 +3863,10 @@ mod tests {
         let app = Router::new()
             .route("/api/v1/rooms/{room}/events", get(fake_events))
             .route("/api/v1/rooms/{room}/members", get(fake_members))
+            .route(
+                "/api/v1/rooms/{room}/read-cursor",
+                get(fake_read_cursor_get).patch(fake_read_cursor_patch),
+            )
             .route("/api/v1/ledger/events", post(fake_ledger))
             .with_state(state);
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -3270,6 +4175,7 @@ mod tests {
             rooms,
             RoomWakeBus::default(),
             RoomAccessWakeBus::default(),
+            RoomReadCursorWakeBus::default(),
             CancellationToken::new(),
             Duration::from_millis(20),
         )
@@ -3331,6 +4237,7 @@ mod tests {
             rooms.clone(),
             RoomWakeBus::default(),
             access_wakes,
+            RoomReadCursorWakeBus::default(),
             CancellationToken::new(),
         );
 
@@ -3379,6 +4286,7 @@ mod tests {
             rooms.clone(),
             RoomWakeBus::default(),
             RoomAccessWakeBus::default(),
+            RoomReadCursorWakeBus::default(),
             CancellationToken::new(),
         );
         let slot = supervisor.slot_for(&key).await;
@@ -3522,6 +4430,7 @@ mod tests {
             rooms,
             RoomWakeBus::default(),
             RoomAccessWakeBus::default(),
+            RoomReadCursorWakeBus::default(),
             trigger_tx,
             CancellationToken::new(),
             Duration::from_secs(60),
@@ -3536,6 +4445,7 @@ mod tests {
             supervisor.inner.client.as_ref().unwrap(),
             &credential,
             p2c_message_row(&key, "ledger-user", 1, human, vec![target.into()]),
+            &HashSet::new(),
         )
         .await
         .unwrap();
@@ -3555,6 +4465,7 @@ mod tests {
                 human,
                 vec![target.into()],
             ),
+            &HashSet::new(),
         )
         .await
         .unwrap();
@@ -3628,6 +4539,7 @@ mod tests {
             rooms.clone(),
             RoomWakeBus::default(),
             RoomAccessWakeBus::default(),
+            RoomReadCursorWakeBus::default(),
             trigger_tx,
             CancellationToken::new(),
             Duration::from_secs(60),
@@ -3643,6 +4555,7 @@ mod tests {
             supervisor.inner.client.as_ref().unwrap(),
             &credential,
             p2c_message_row(&key, "ledger-unknown", 1, unknown, vec![target.into()]),
+            &HashSet::new(),
         )
         .await
         .unwrap();
@@ -3658,10 +4571,117 @@ mod tests {
             supervisor.inner.client.as_ref().unwrap(),
             &credential,
             p2c_message_row(&key, "ledger-agent", 2, target, vec![target.into()]),
+            &HashSet::new(),
         )
         .await
         .unwrap();
         assert!(trigger_rx.try_recv().is_err());
+        server.abort();
+    }
+
+    /// Regression for PR #366 review comment 3727657452: the immediate
+    /// roster refresh triggered by an unknown-author message must derive
+    /// human presence from the epoch's live-human cache, not an empty set.
+    /// Passing an empty set would mark every human member Unavailable even
+    /// though the caller's epoch already knows they are live, silently
+    /// clobbering `derived_presence` on unrelated members as a side effect
+    /// of an author-kind lookup.
+    #[tokio::test]
+    async fn p2c_unknown_author_roster_refresh_preserves_epoch_live_human_presence() {
+        let key = RoomKey::new("unknown-author-presence-room");
+        let human = "11111111-1111-4111-8111-111111111111";
+        let unknown = "22222222-2222-4222-8222-222222222222";
+        let target = "33333333-3333-4333-8333-333333333333";
+        let mut store = ocean_store::SqliteRoomStore::open_in_memory().unwrap();
+        store
+            .create(
+                key.clone(),
+                "Unknown Author Presence",
+                None,
+                chrono::Utc::now(),
+            )
+            .unwrap();
+        store
+            .install_room_credential(&key, "bearer", human)
+            .unwrap();
+        store.bind_room_agent(&key, target, "sage", "key").unwrap();
+        store
+            .update_room_access_safe(
+                &key,
+                Some(RoomAccessState::Live),
+                Some(&[
+                    p2c_projected_member(human, FederatedActorType::User, None),
+                    p2c_projected_member(target, FederatedActorType::Agent, Some(human)),
+                ]),
+                None,
+            )
+            .unwrap();
+        let rooms = Arc::new(std::sync::Mutex::new(store));
+        let fake = FakeBedrock::new(key.as_str(), "bearer");
+        // The roster the unknown-author refresh will fetch does not itself
+        // carry presence; `human`'s liveness must come from the epoch's
+        // cached live-human set passed into `ingest_message_row`, not the
+        // server response.
+        *fake.members.lock().await = json!({"members":[
+            {
+                "member_id":human,
+                "actor_type":"user",
+                "role_in_room":"owner",
+                "display_name":"Human",
+                "joined_at":"2026-07-17T00:00:00Z"
+            },
+            {
+                "member_id":target,
+                "owner_member_id":human,
+                "actor_type":"agent",
+                "role_in_room":"member",
+                "display_name":"sage",
+                "public_agent_descriptor":{"display_name":"sage","skills_count":0},
+                "joined_at":"2026-07-17T00:00:00Z"
+            }
+        ]});
+        let (base, server) = start_fake_bedrock(fake).await;
+        let supervisor = FederationSupervisor::for_test(
+            &base,
+            rooms.clone(),
+            RoomWakeBus::default(),
+            RoomAccessWakeBus::default(),
+            RoomReadCursorWakeBus::default(),
+            CancellationToken::new(),
+            Duration::from_secs(60),
+        );
+        let credential = RoomCredential {
+            room_id: key.clone(),
+            bearer_token: "bearer".into(),
+            local_human_member_id: human.into(),
+        };
+
+        // The epoch already knows `human` is live (e.g. via an earlier
+        // heartbeat or room_presence frame); a message from an unknown
+        // author must not discard that knowledge.
+        let live_human_member_ids: HashSet<String> = HashSet::from([human.to_string()]);
+        let outcome = ingest_message_row(
+            &supervisor.inner,
+            supervisor.inner.client.as_ref().unwrap(),
+            &credential,
+            p2c_message_row(&key, "ledger-unknown", 1, unknown, vec![]),
+            &live_human_member_ids,
+        )
+        .await
+        .unwrap();
+        assert_eq!(outcome, IngestDisposition::Committed);
+
+        let projection = with_rooms_handle(&rooms, |s| s.room_access(&key)).unwrap();
+        let human_member = projection
+            .members
+            .iter()
+            .find(|member| member.member_id == human)
+            .expect("human member present after roster refresh");
+        assert_eq!(
+            human_member.derived_presence,
+            Some(MemberPresence::Live),
+            "unknown-author roster refresh must preserve epoch live-human presence, not mark it Unavailable"
+        );
         server.abort();
     }
 
@@ -3706,6 +4726,7 @@ mod tests {
             rooms.clone(),
             RoomWakeBus::default(),
             RoomAccessWakeBus::default(),
+            RoomReadCursorWakeBus::default(),
             trigger_tx,
             CancellationToken::new(),
             Duration::from_secs(60),
@@ -3721,6 +4742,7 @@ mod tests {
             supervisor.inner.client.as_ref().unwrap(),
             &credential,
             p2c_message_row(&key, "policy-off", 1, human, vec![bound_agent.into()]),
+            &HashSet::new(),
         )
         .await
         .unwrap();
@@ -3741,6 +4763,7 @@ mod tests {
             supervisor.inner.client.as_ref().unwrap(),
             &credential,
             p2c_message_row(&key, "human-target", 2, human, vec![remote_human.into()]),
+            &HashSet::new(),
         )
         .await
         .unwrap();
@@ -3755,6 +4778,7 @@ mod tests {
                 human,
                 vec![remote_agent.into()],
             ),
+            &HashSet::new(),
         )
         .await
         .unwrap();
@@ -3891,6 +4915,7 @@ mod tests {
             rooms,
             RoomWakeBus::default(),
             RoomAccessWakeBus::default(),
+            RoomReadCursorWakeBus::default(),
             CancellationToken::new(),
         );
         for index in 0..64 {
@@ -4774,6 +5799,26 @@ mod tests {
         server.abort();
     }
 
+    fn test_supervisor_inner(rooms: RoomStoreHandle) -> Arc<SupervisorInner> {
+        let (trigger_tx, _) = mpsc::unbounded_channel();
+        Arc::new(SupervisorInner {
+            client: None,
+            owner_token: None,
+            invalid_config: false,
+            rooms,
+            room_wakes: RoomWakeBus::default(),
+            access_wakes: RoomAccessWakeBus::default(),
+            read_cursor_wakes: RoomReadCursorWakeBus::default(),
+            trigger_tx,
+            shutdown: CancellationToken::new(),
+            slots: Mutex::new(HashMap::new()),
+            recovery: Mutex::new(None),
+            shutting_down: AtomicBool::new(false),
+            next_generation: AtomicU64::new(0),
+            scan_interval: Duration::from_millis(20),
+        })
+    }
+
     async fn run_control_recovery(event_name: &str, data: Value) {
         let key = RoomKey::new(format!("control-{event_name}"));
         let human = "11111111-1111-4111-8111-111111111111";
@@ -4802,6 +5847,7 @@ mod tests {
             rooms.clone(),
             RoomWakeBus::default(),
             RoomAccessWakeBus::default(),
+            RoomReadCursorWakeBus::default(),
             CancellationToken::new(),
             Duration::from_millis(20),
         );
@@ -4809,12 +5855,8 @@ mod tests {
         tokio::time::timeout(Duration::from_secs(60), async {
             loop {
                 let connected = fake.sse_tx.lock().await.is_some();
-                let live = with_rooms_handle(&rooms, |s| s.room_access(&key))
-                    .unwrap()
-                    .members
-                    .first()
-                    .is_some_and(|m| m.derived_presence == Some(MemberPresence::Live));
-                if connected && live {
+                let projection = with_rooms_handle(&rooms, |s| s.room_access(&key)).unwrap();
+                if connected && projection.state == RoomAccessState::Live {
                     break;
                 }
                 tokio::time::sleep(Duration::from_millis(5)).await;
@@ -4839,10 +5881,12 @@ mod tests {
                 let projection = with_rooms_handle(&rooms, |s| s.room_access(&key)).unwrap();
                 if projection.state == RoomAccessState::Recovering
                     && projection.last_confirmed_global_sequence == Some(5)
-                    && projection
-                        .members
-                        .iter()
-                        .all(|m| m.derived_presence == Some(MemberPresence::Unavailable))
+                    && projection.members.iter().all(|m| match m.actor_type {
+                        FederatedActorType::User => {
+                            m.derived_presence == Some(MemberPresence::Unavailable)
+                        }
+                        FederatedActorType::Agent => m.derived_presence.is_none(),
+                    })
                 {
                     break;
                 }
@@ -4881,6 +5925,198 @@ mod tests {
             }),
         )
         .await;
+    }
+
+    #[tokio::test]
+    async fn room_presence_event_ignores_mixed_actor_types_and_preserves_cursor() {
+        let key = RoomKey::new("presence-canonical");
+        let human = "11111111-1111-4111-8111-111111111111";
+        let remote_human = "22222222-2222-4222-8222-222222222222";
+        let agent = "33333333-3333-4333-8333-333333333333";
+        let mut store = ocean_store::SqliteRoomStore::open_in_memory().unwrap();
+        store
+            .create(key.clone(), "Presence", None, chrono::Utc::now())
+            .unwrap();
+        store
+            .install_room_credential(&key, "presence-bearer", human)
+            .unwrap();
+        store
+            .update_room_access_safe(
+                &key,
+                Some(RoomAccessState::Live),
+                Some(&[
+                    FederatedRoomMemberProjection {
+                        member_id: human.into(),
+                        owner_member_id: None,
+                        actor_type: FederatedActorType::User,
+                        role_in_room: FederatedRoomRole::Owner,
+                        display_name: "Human".into(),
+                        public_agent_descriptor: None,
+                        joined_at: "2026-07-17T00:00:00Z".into(),
+                        derived_presence: Some(MemberPresence::Unavailable),
+                        local_binding_available: None,
+                    },
+                    FederatedRoomMemberProjection {
+                        member_id: remote_human.into(),
+                        owner_member_id: None,
+                        actor_type: FederatedActorType::User,
+                        role_in_room: FederatedRoomRole::Member,
+                        display_name: "Remote".into(),
+                        public_agent_descriptor: None,
+                        joined_at: "2026-07-17T00:00:01Z".into(),
+                        derived_presence: Some(MemberPresence::Unavailable),
+                        local_binding_available: None,
+                    },
+                    FederatedRoomMemberProjection {
+                        member_id: agent.into(),
+                        owner_member_id: Some(human.into()),
+                        actor_type: FederatedActorType::Agent,
+                        role_in_room: FederatedRoomRole::Member,
+                        display_name: "Agent".into(),
+                        public_agent_descriptor: Some(PublicAgentDescriptor {
+                            display_name: "Agent".into(),
+                            description: None,
+                            model_alias: None,
+                            skills_count: 0,
+                            subagent_names: vec![],
+                        }),
+                        joined_at: "2026-07-17T00:00:02Z".into(),
+                        derived_presence: None,
+                        local_binding_available: Some(true),
+                    },
+                ]),
+                Some(7),
+            )
+            .unwrap();
+        let rooms = Arc::new(std::sync::Mutex::new(store));
+        let mut live_human_member_ids: HashSet<String> = HashSet::new();
+
+        assert!(apply_presence_frame(
+            &test_supervisor_inner(rooms.clone()),
+            &key,
+            RoomAccessState::Live,
+            &[PresenceWireMember {
+                member_id: human.into(),
+                actor_type: FederatedActorType::User,
+                role_in_room: FederatedRoomRole::Owner,
+                display_name: "Human".into(),
+                joined_at: "2026-07-17T00:00:00Z".into(),
+            }],
+            &mut live_human_member_ids,
+        ));
+        let projection = with_rooms_handle(&rooms, |s| s.room_access(&key)).unwrap();
+        assert_eq!(projection.last_confirmed_global_sequence, Some(7));
+        assert_eq!(
+            projection.members[0].derived_presence,
+            Some(MemberPresence::Live)
+        );
+        assert_eq!(
+            projection.members[1].derived_presence,
+            Some(MemberPresence::Unavailable)
+        );
+        assert_eq!(projection.members[2].derived_presence, None);
+        assert_eq!(
+            live_human_member_ids,
+            HashSet::from([human.to_string()]),
+            "live-humans cache reflects the committed frame"
+        );
+
+        // M4: a mixed frame that additively echoes a non-User (agent) entry
+        // alongside the live human must not be treated as a protocol
+        // violation that tears down the epoch — the agent entry carries no
+        // presence meaning here and is ignored, while the human's live
+        // status is still applied.
+        assert!(apply_presence_frame(
+            &test_supervisor_inner(rooms.clone()),
+            &key,
+            RoomAccessState::Live,
+            &[
+                PresenceWireMember {
+                    member_id: human.into(),
+                    actor_type: FederatedActorType::User,
+                    role_in_room: FederatedRoomRole::Owner,
+                    display_name: "Human".into(),
+                    joined_at: "2026-07-17T00:00:00Z".into(),
+                },
+                PresenceWireMember {
+                    member_id: agent.into(),
+                    actor_type: FederatedActorType::Agent,
+                    role_in_room: FederatedRoomRole::Member,
+                    display_name: "Agent".into(),
+                    joined_at: "2026-07-17T00:00:02Z".into(),
+                },
+            ],
+            &mut live_human_member_ids,
+        ));
+        let projection = with_rooms_handle(&rooms, |s| s.room_access(&key)).unwrap();
+        assert_eq!(
+            projection.members[0].derived_presence,
+            Some(MemberPresence::Live)
+        );
+        assert_eq!(
+            projection.members[1].derived_presence,
+            Some(MemberPresence::Unavailable)
+        );
+        assert_eq!(projection.members[2].derived_presence, None);
+        assert_eq!(live_human_member_ids, HashSet::from([human.to_string()]));
+
+        // M2: a malformed frame (an empty `member_id` on a User entry can't
+        // be matched against the roster) is rejected WITHOUT mutating
+        // either the durable projection or the epoch-local live-humans
+        // cache.
+        let snapshot = projection.clone();
+        let cache_before = live_human_member_ids.clone();
+        assert!(!apply_presence_frame(
+            &test_supervisor_inner(rooms.clone()),
+            &key,
+            RoomAccessState::Live,
+            &[PresenceWireMember {
+                member_id: String::new(),
+                actor_type: FederatedActorType::User,
+                role_in_room: FederatedRoomRole::Member,
+                display_name: "Remote".into(),
+                joined_at: "2026-07-17T00:00:01Z".into(),
+            }],
+            &mut live_human_member_ids,
+        ));
+        assert_eq!(
+            with_rooms_handle(&rooms, |s| s.room_access(&key)).unwrap(),
+            snapshot
+        );
+        assert_eq!(live_human_member_ids, cache_before);
+    }
+
+    /// M2 regression: when the durable commit fails (here, an unknown
+    /// room), `apply_presence_frame` must return `false` without touching
+    /// the caller's `live_human_member_ids` cache at all. A prior
+    /// implementation cleared and repopulated that cache from the incoming
+    /// frame BEFORE the store commit was confirmed, so a failed write
+    /// silently wiped the in-memory presence view out from under the next
+    /// roster fetch even though nothing durable had changed.
+    #[tokio::test]
+    async fn apply_presence_frame_does_not_wipe_live_cache_when_commit_fails() {
+        let store = ocean_store::SqliteRoomStore::open_in_memory().unwrap();
+        let rooms = Arc::new(std::sync::Mutex::new(store));
+        let key = RoomKey::new("presence-unknown-room");
+        let mut live_human_member_ids: HashSet<String> = HashSet::from(["stale-human".to_string()]);
+
+        assert!(!apply_presence_frame(
+            &test_supervisor_inner(rooms.clone()),
+            &key,
+            RoomAccessState::Live,
+            &[PresenceWireMember {
+                member_id: "11111111-1111-4111-8111-111111111111".into(),
+                actor_type: FederatedActorType::User,
+                role_in_room: FederatedRoomRole::Owner,
+                display_name: "Human".into(),
+                joined_at: "2026-07-17T00:00:00Z".into(),
+            }],
+            &mut live_human_member_ids,
+        ));
+        assert_eq!(
+            live_human_member_ids,
+            HashSet::from(["stale-human".to_string()])
+        );
     }
 
     #[tokio::test]
@@ -4923,6 +6159,7 @@ mod tests {
             rooms.clone(),
             RoomWakeBus::default(),
             access_wakes,
+            RoomReadCursorWakeBus::default(),
             CancellationToken::new(),
             Duration::from_millis(20),
         );
@@ -4983,6 +6220,7 @@ mod tests {
             rooms.clone(),
             RoomWakeBus::default(),
             RoomAccessWakeBus::default(),
+            RoomReadCursorWakeBus::default(),
             CancellationToken::new(),
             Duration::from_millis(20),
         );
@@ -5045,6 +6283,7 @@ mod tests {
             rooms: rooms.clone(),
             room_wakes,
             access_wakes,
+            read_cursor_wakes: RoomReadCursorWakeBus::default(),
             trigger_tx,
             shutdown: CancellationToken::new(),
             scan_interval: Duration::from_millis(20),
@@ -5147,6 +6386,7 @@ mod tests {
             rooms.clone(),
             room_wakes,
             access_wakes,
+            RoomReadCursorWakeBus::default(),
             shutdown,
             Duration::from_millis(20),
         );
@@ -5191,22 +6431,17 @@ mod tests {
         assert_eq!(request_meta[0].1.as_deref(), Some("Bearer secret-bearer"));
         assert_eq!(request_meta[0].2.as_deref(), Some("0"));
 
-        // Roster committed before first event; healthy lease makes local human Live.
+        // Roster committed before first event; humans default Unavailable and agents None
+        // until an exact room_presence frame arrives.
         let projection = with_rooms_handle(&rooms, |s| s.room_access(&key)).unwrap();
         assert_eq!(projection.state, RoomAccessState::Recovering);
         assert_eq!(
             projection.members[0].derived_presence,
-            Some(MemberPresence::Live)
-        );
-        assert_eq!(
-            projection.members[1].derived_presence,
-            Some(MemberPresence::Live)
-        );
-        assert_eq!(projection.members[1].local_binding_available, Some(true));
-        assert_eq!(
-            projection.members[2].derived_presence,
             Some(MemberPresence::Unavailable)
         );
+        assert_eq!(projection.members[1].derived_presence, None);
+        assert_eq!(projection.members[1].local_binding_available, Some(true));
+        assert_eq!(projection.members[2].derived_presence, None);
         assert_eq!(projection.members[2].local_binding_available, Some(false));
         assert_eq!(
             projection.members[3].derived_presence,
@@ -5214,8 +6449,60 @@ mod tests {
         );
         assert_eq!(projection.members[3].local_binding_available, None);
 
-        // Ordered SSE is the ONLY confirmation rail.
         let tx = fake.sse_tx.lock().await.clone().expect("SSE connected");
+        tx.send(Ok(Event::default().event("room_presence").data(
+            json!({
+                "room_id":"fed-e2e",
+                "members":[
+                    {
+                        "member_id": local_human,
+                        "actor_type":"user",
+                        "role_in_room":"owner",
+                        "display_name":"Owner Human",
+                        "joined_at":"2026-07-17T00:00:00Z"
+                    },
+                    {
+                        "member_id": "44444444-4444-4444-8444-444444444444",
+                        "actor_type":"user",
+                        "role_in_room":"member",
+                        "display_name":"Remote Human",
+                        "joined_at":"2026-07-17T00:00:03Z"
+                    }
+                ]
+            })
+            .to_string(),
+        )))
+        .await
+        .unwrap();
+        tokio::time::timeout(Duration::from_secs(60), async {
+            loop {
+                let projection = with_rooms_handle(&rooms, |s| s.room_access(&key)).unwrap();
+                if projection.members[0].derived_presence == Some(MemberPresence::Live)
+                    && projection.members[1].derived_presence.is_none()
+                    && projection.members[2].derived_presence.is_none()
+                    && projection.members[3].derived_presence == Some(MemberPresence::Live)
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("presence projection applied");
+        while access_rx.try_recv().is_ok() {}
+        let projection = with_rooms_handle(&rooms, |s| s.room_access(&key)).unwrap();
+        assert_eq!(
+            projection.members[0].derived_presence,
+            Some(MemberPresence::Live)
+        );
+        assert_eq!(projection.members[1].derived_presence, None);
+        assert_eq!(projection.members[2].derived_presence, None);
+        assert_eq!(
+            projection.members[3].derived_presence,
+            Some(MemberPresence::Live)
+        );
+
+        // Ordered SSE is the ONLY confirmation rail.
         let row = json!({
             "id":"ledger-1",
             "sequence":"1",
@@ -5336,7 +6623,8 @@ mod tests {
             .expect("access bus open");
 
         // Control-frame id may be inherited by eventsource-stream; branch by
-        // event type and ignore it. Heartbeat refreshes roster, not cursor.
+        // event type and ignore it. Heartbeat refreshes roster using cached
+        // live human ids, not cursor.
         tx.send(Ok(Event::default()
             .event("heartbeat")
             .id("2")
@@ -5352,6 +6640,17 @@ mod tests {
                 .unwrap()
                 .last_confirmed_global_sequence,
             Some(2)
+        );
+        let projection = with_rooms_handle(&rooms, |s| s.room_access(&key)).unwrap();
+        assert_eq!(
+            projection.members[0].derived_presence,
+            Some(MemberPresence::Live)
+        );
+        assert_eq!(projection.members[1].derived_presence, None);
+        assert_eq!(projection.members[2].derived_presence, None);
+        assert_eq!(
+            projection.members[3].derived_presence,
+            Some(MemberPresence::Live)
         );
 
         // A previously unknown author triggers one immediate roster refresh;
@@ -5409,6 +6708,26 @@ mod tests {
         })
         .await
         .expect("unknown author refreshed and mapped as Agent");
+        // Regression for PR #366 review comment 3727657452: the unknown-author
+        // roster refresh must reuse this epoch's live-human cache (populated
+        // above via the room_presence frame and reconfirmed by heartbeat), not
+        // an empty set that would mark every human member Unavailable.
+        let post_refresh = with_rooms_handle(&rooms, |s| s.room_access(&key)).unwrap();
+        assert_eq!(
+            post_refresh.members[0].derived_presence,
+            Some(MemberPresence::Live),
+            "unknown-author roster refresh must preserve epoch live-human presence for local_human"
+        );
+        assert_eq!(
+            post_refresh
+                .members
+                .iter()
+                .find(|m| m.member_id == "44444444-4444-4444-8444-444444444444")
+                .expect("remote human present after roster refresh")
+                .derived_presence,
+            Some(MemberPresence::Live),
+            "unknown-author roster refresh must preserve epoch live-human presence for remote human"
+        );
         tokio::time::timeout(Duration::from_secs(60), message_rx.recv())
             .await
             .expect("unknown-author message wake")
@@ -5458,10 +6777,12 @@ mod tests {
             loop {
                 let projection = with_rooms_handle(&rooms, |s| s.room_access(&key)).unwrap();
                 if projection.state == RoomAccessState::Recovering
-                    && projection
-                        .members
-                        .iter()
-                        .all(|m| m.derived_presence == Some(MemberPresence::Unavailable))
+                    && projection.members.iter().all(|m| match m.actor_type {
+                        FederatedActorType::User => {
+                            m.derived_presence == Some(MemberPresence::Unavailable)
+                        }
+                        FederatedActorType::Agent => m.derived_presence.is_none(),
+                    })
                 {
                     break;
                 }
@@ -5478,6 +6799,7 @@ mod tests {
             rooms.clone(),
             RoomWakeBus::default(),
             RoomAccessWakeBus::default(),
+            RoomReadCursorWakeBus::default(),
             CancellationToken::new(),
             Duration::from_millis(20),
         );
@@ -5551,6 +6873,7 @@ mod tests {
             rooms.clone(),
             RoomWakeBus::default(),
             RoomAccessWakeBus::default(),
+            RoomReadCursorWakeBus::default(),
             CancellationToken::new(),
             Duration::from_millis(20),
         );
@@ -5578,10 +6901,12 @@ mod tests {
                     PostAction::Recover => {
                         row.state == ocean_core::OutboxItemState::Pending
                             && projection.state == RoomAccessState::Recovering
-                            && projection
-                                .members
-                                .iter()
-                                .all(|m| m.derived_presence == Some(MemberPresence::Unavailable))
+                            && projection.members.iter().all(|m| match m.actor_type {
+                                FederatedActorType::User => {
+                                    m.derived_presence == Some(MemberPresence::Unavailable)
+                                }
+                                FederatedActorType::Agent => m.derived_presence.is_none(),
+                            })
                     }
                     PostAction::AwaitConfirmation => false,
                 };
@@ -5672,6 +6997,7 @@ mod tests {
             rooms.clone(),
             RoomWakeBus::default(),
             RoomAccessWakeBus::default(),
+            RoomReadCursorWakeBus::default(),
             CancellationToken::new(),
             Duration::from_millis(20),
         );
@@ -5763,6 +7089,7 @@ mod tests {
             rooms.clone(),
             RoomWakeBus::default(),
             RoomAccessWakeBus::default(),
+            RoomReadCursorWakeBus::default(),
             CancellationToken::new(),
             Duration::from_millis(20),
         );
@@ -5801,6 +7128,7 @@ mod tests {
             rooms.clone(),
             RoomWakeBus::default(),
             RoomAccessWakeBus::default(),
+            RoomReadCursorWakeBus::default(),
             CancellationToken::new(),
             Duration::from_millis(20),
         );
@@ -5848,6 +7176,7 @@ mod tests {
             rooms,
             RoomWakeBus::default(),
             RoomAccessWakeBus::default(),
+            RoomReadCursorWakeBus::default(),
             CancellationToken::new(),
             Duration::from_millis(20),
         );
@@ -5943,6 +7272,7 @@ mod tests {
             rooms.clone(),
             room_wakes,
             access_wakes,
+            RoomReadCursorWakeBus::default(),
             CancellationToken::new(),
             Duration::from_millis(20),
         );
@@ -5987,10 +7317,12 @@ mod tests {
                         .outbox
                         .iter()
                         .all(|row| row.state == ocean_core::OutboxItemState::Failed)
-                    && projection
-                        .members
-                        .iter()
-                        .all(|m| m.derived_presence == Some(MemberPresence::Unavailable))
+                    && projection.members.iter().all(|m| match m.actor_type {
+                        FederatedActorType::User => {
+                            m.derived_presence == Some(MemberPresence::Unavailable)
+                        }
+                        FederatedActorType::Agent => m.derived_presence.is_none(),
+                    })
                 {
                     break;
                 }

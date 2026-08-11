@@ -11,8 +11,8 @@ access projections, the outbox, and the restart-safe federation core
 - **Scope:** `crates/ocean-store/`
 - **Parent contract:** `../AGENTS.md` — read it first
 - **Owns:** room/roster/transcript persistence, `room_access` + `outbox`
-  durability, federation credential custody, producer counters, confirmed
-  ingest, trigger-claim journal
+  durability, local and mirrored room read cursors, federation credential
+  custody, producer counters, confirmed ingest, trigger-claim journal
 - **Does not own:** HTTP projection (daemon), federation network client,
   agent sessions/memory, Longhouse titles
 
@@ -25,6 +25,10 @@ access projections, the outbox, and the restart-safe federation core
   as canonical decimal u64 TEXT, `member_projection` JSON).
 - `outbox` — locally-authored unconfirmed events with full producer tuple
   (`client_event_id`, `source_id`, `source_sequence`) and stable `position`.
+- `room_read_cursors` and `room_read_cursor_mirrors` — per-principal local and
+  upstream-mirrored read positions as canonical decimal u64 TEXT. Mirror writes
+  use `RoomReadCursorMirrorCas`: callers supply the previously observed mirror;
+  mismatches return `Stale` without writing, including stale clears.
 - P2-A federation tables: `federation_instance` (singleton instance id),
   `room_federation` (bearer credential — PRIVATE), `room_member_bindings`
   (member→agent binding, `registration_key` PRIVATE, agent name unique per
@@ -87,6 +91,11 @@ access projections, the outbox, and the restart-safe federation core
 - **`update_room_access_safe` is the runtime refresh path**: it never touches
   the outbox and its cursor only advances. `replace_room_access` is
   destructive test seeding only.
+- **Mirrored cursor writes are compare-and-swap.** `set_room_read_cursor_mirror`
+  evaluates the expected prior mirror and write under one IMMEDIATE transaction.
+  `Applied` returns the durable projection; `Stale` never mutates the row. Callers
+  must handle newer concurrent `Some` values monotonically while reserving a
+  clear for an expectation that still matches.
 
 ## Work Guidance
 

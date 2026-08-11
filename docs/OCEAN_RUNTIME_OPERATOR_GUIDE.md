@@ -556,8 +556,14 @@ POST   /v1/rooms/persistent/{key}/participants            join { id, display_nam
 DELETE /v1/rooms/persistent/{key}/participants/{participant_id}  leave
 POST   /v1/rooms/persistent/{key}/messages                post message { author_id, author_kind?, body }
 GET    /v1/rooms/persistent/{key}/transcript              read transcript (?after_seq=N&limit=M)
+POST   /v1/rooms/persistent/{key}/artifacts               record what the room produced { id, kind: task|decision|note, title, body?, author_id }; 201 { artifact }. Author must be on the roster (403). Every create writes a System transcript line in the SAME transaction, so an artifact can never exist that the room's history does not explain.
+GET    /v1/rooms/persistent/{key}/artifacts               list this room's artifacts, most recently changed first
+GET    /v1/rooms/persistent/{key}/artifacts/{artifact_id}  read one artifact; the cheap half of the CAS loop (409 -> re-read -> retry in one round trip); 404 unknown
+POST   /v1/rooms/persistent/{key}/artifacts/{artifact_id}/amend   rewrite in place under compare-and-swap { expected_version, title?, body?, state?, author_id }; 200 { artifact }, 409 { code: artifact_version_conflict, expected_version, actual_version } when the artifact moved on — re-read and retry, never a silent merge; 404 unknown artifact
 GET    /v1/rooms/persistent/{key}/snapshot                hydrate: room+participants+transcript+last_seq+next_seq+has_more (?after_seq=N&limit=M)
 GET    /v1/rooms/persistent/{key}/events                  SSE: initial full room_access projection (no id) + id-bearing room_message frames via ?after_seq=N / Last-Event-ID replay, then post-commit access-update + message tail; open non-call rooms only
+GET    /v1/rooms/persistent/{key}/read-cursor             fetch the daemon-owned read cursor projection for Local/Live rooms; closed/pending/revoked return typed unsupported
+PATCH  /v1/rooms/persistent/{key}/read-cursor             advance the daemon-owned read cursor { read_seq }; Local/Live only, monotonic, publishes room_read_cursor wake on success
 POST   /v1/rooms/persistent/{key}/outbox/retry            retry a locally-authored federated event awaiting Bedrock confirmation { client_event_id }; 202 on success, 403 revoked, 404 unknown room/item, 409 pending/local, 400 malformed body, 500 sanitized store error
 POST   /v1/rooms/persistent/{key}/invites                 bootstrap owner if Local, then mint invite { recipient_name?, ttl_minutes? }; raw InviteResponse 201
 POST   /v1/rooms/persistent/invites/redeem                restart-safe redeem/self-join { code }; raw RoomAccessProjection 200

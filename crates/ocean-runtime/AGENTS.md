@@ -25,9 +25,18 @@ This crate owns the Ocean agent loop and permission-gated tool execution runtime
 - Built-in filesystem/process tools must resolve relative paths and shell commands against the turn's `SessionContext.cwd`, not the daemon process cwd.
 - On Unix, `BashTool` owns a fresh process group and Halt/timeout must kill the complete ordinary descendant tree before dropping the direct child handle. Disarm group cleanup only after `child.wait()` completes; deliberately re-sessioned descendants and non-Unix tree termination are outside this contract.
 - `LazyBrowser` (legacy-chromium feature only) startup remains mutex-single-flight: one caller probes/launches while peers wait. Bound lock wait, liveness, and launch separately; a liveness timeout preserves the cached handle, while cancellation/launch timeout must cache nothing partial and leave the slot retryable. Default builds compile no Chromium backend: the 19 `browser_*` tools keep identical schemas and return `browser_host_unavailable`; never let a default build launch or probe a browser.
-- Tool-using turns must reserve a final synthesis path: do not let repeated tool calls consume the entire turn budget without a user-visible assistant reply.
-- Assistant text present in a provider's terminal message must be emitted as `TextDelta` when the provider did not stream text chunks, so SSE clients always render the final reply.
-- Emit `TurnCheckpoint` only at provider-valid round boundaries. Its delta must preserve transcript order and, for tool rounds, include the assistant tool-call message followed by every corresponding ordered `ToolResult`; never checkpoint an incomplete batch.
+- Tool-using turns must reserve a final synthesis path: do not let repeated tool
+  calls consume the entire turn budget without a user-visible assistant reply.
+  A clean failure in that read-only, tool-free final synthesis round may retry
+  within the existing bounded round-attempt budget; it must never replay tools,
+  retry cancellation, or broaden ordinary-round retry policy.
+- Assistant text present in a provider's terminal message must be emitted as
+  `TextDelta` when the provider did not stream text chunks, so SSE clients always
+  render the final reply.
+- Emit `TurnCheckpoint` only at provider-valid round boundaries. Its delta must
+  preserve transcript order and, for tool rounds, include the assistant tool-call
+  message followed by every corresponding ordered `ToolResult`; never checkpoint
+  an incomplete batch.
 - Runtime events must remain compatible with `ocean-core` event contracts and daemon SSE streaming.
 - `ToolExecutionEnd` intentionally sends full live content/details while only the transcript copy is capped (32 KiB text / 256 KiB image). The per-turn event sink remains unbounded; changes to this ownership seam require the finite queue/RSS characterization test and daemon replay review.
 - Keep provider concerns outside runtime unless mediated through the protocol/provider layers.

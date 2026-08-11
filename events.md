@@ -5935,6 +5935,22 @@ mention+thread-reply dispatch dedup on one row, and agent reply root/session
 attribution with fallback. Verified: 53/53 persistent_rooms, fmt, clippy -D
 warnings (daemon), cargo check --workspace.
 _________________________________________________________________________________
+time:      [06:26] [04-08-26]
+agent:     [ocean-subagent] [gpt-5] [ocean-os-room-state-closer]
+worktree:  feat/rooms-federated-cursor-presence
+type:      [feature]
+area:      [backend]
+
+Completed the rooms federated cursor/presence closeout in ocean-daemon. Wired RoomReadCursorWakeBus through FederationSupervisor init/test fixtures and persistent-room fake state, added federated SSE handling for explicit `presence` and `room_read_cursor` events, and published read-cursor wakes after authoritative mirrored cursor commits. Persistent room events SSE now includes Local-room read-cursor bootstrap/live tail support without breaking existing transcript replay semantics; HTTP tests were updated to tolerate the new bootstrap ordering. Verified targeted daemon/store cursor tests, full daemon tests, daemon clippy -D warnings, cargo fmt --check, and diff --check.
+_________________________________________________________________________________
+
+time:      [12:00] [08-08-25]
+agent:     [ocean-subagent], [gpt-5], [daemon-cursor-gate-closer]
+worktree:  feat/rooms-federated-cursor-presence
+type:      [bug report]: close persistent-room SSE/bootstrap and route-parity regressions
+area:      [backend]: ocean-daemon persistent rooms + operator route guide
+
+Updated `crates/ocean-daemon/src/persistent_rooms.rs` tests so merged room SSE accepts interleaved no-id `room_read_cursor` bootstrap frames while still requiring each subscriber to receive exactly the intended `room_access` update, preserving Last-Event-ID semantics for message replay. Added the missing GET/PATCH `/v1/rooms/persistent/{key}/read-cursor` entries to `crates/ocean-daemon/src/main.rs` banner discovery and `docs/OCEAN_RUNTIME_OPERATOR_GUIDE.md` quick reference, then re-ran focused daemon regressions, full `cargo test -p ocean-daemon`, strict daemon all-target clippy, and fmt/diff checks.
 
 time:      [15:20] [04-08-26]
 agent:     [ocean], [gpt-5.6-sol]
@@ -5950,4 +5966,35 @@ override; pin failures now fail closed before turn admission. Independent review
 confirmed the ordering closes the reported normal path. Verified: cargo fmt
 --check; cargo test -p ocean-tui (463 passed, 1 ignored); cargo build -p
 ocean-tui --release; git diff --check.
+_________________________________________________________________________________
+
+time:      [21:04] [08-04-2026]
+agent:     [ocean], [gpt-5.6-sol]
+worktree:  [fix/failure-honesty]
+type:      [fix]
+area:      [runtime]
+
+Made the reserved, tool-free final synthesis round resilient to a clean provider
+failure: it now retries within the existing bounded round-attempt budget without
+replaying tools or retrying cancellation. Exhausted failures now log their exact
+turn/request/session-correlated terminal error instead of leaving only `ok=false`.
+Added an end-to-end regression proving one tool execution across a failed/retried
+final synthesis. Verified full ocean-runtime tests (191 passed across targets),
+`cargo check -p ocean-daemon`, fmt, diff check, and independent review approval.
+_________________________________________________________________________________
+time:      [02:12] [06-08-26]
+agent:     [ocean], [gpt-5.6-sol], [pm]
+worktree:  feat/rooms-unread-integrated
+type:      [bug report]: close unread cursor and federated presence review defects
+area:      [backend]: ocean-daemon persistent rooms and ocean-store cursor durability
+
+Re-anchored the durable Rooms unread/presence delta onto merged main and closed the defect-first review findings: repaired the route manifest tripwire, aligned Live SSE cursor principals with credential-owned human ids, accepted explicitly flagged authoritative upstream clamping, made presence projection updates atomic and tolerant of mixed actor frames, unified read-cursor response shape, preserved `next_cursor: null`, restored the fresh-schema outbox state index, made clear projections truthful, and added CAS protection against stale mirror regressions and clears. Added focused daemon/store regressions. Verified `cargo fmt --all -- --check`, `git diff --check`, ocean-store library tests (146 passed), ocean-daemon binary tests (681 passed), and strict all-target clippy for ocean-daemon/ocean-store/ocean-core.
+_________________________________________________________________________________
+time:      [07:11] [06-08-26]
+agent:     [ocean], [gpt-5.6-sol], [pm]
+worktree:  feat/rooms-unread-integrated
+type:      [bug report]: close PR 366 transitional cursor and presence findings
+area:      [backend]: ocean-daemon persistent room SSE and federation presence
+
+Kept room read-cursor tails subscribed when an events connection opens during a federated Connecting or Recovering state, suppressing unsupported projections until an access wake transitions the room to Live and the current mirrored cursor can be emitted without reconnecting. Unknown-author roster refresh now derives presence from the authenticated epoch's live-human set instead of marking every human unavailable. Added focused transition and presence regressions. Verified formatting, diff check, docs-check, ocean-store library tests (146 passed), ocean-daemon binary tests (683 passed), and strict all-target clippy for ocean-daemon/ocean-store/ocean-core.
 _________________________________________________________________________________
