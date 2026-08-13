@@ -276,6 +276,15 @@ async fn wake_once(daemon_url: &str, args: WakeArgs) -> Result<i32> {
         return Ok(WAKE_FAILED);
     }
 
+    // P1: preflight the requested model against the daemon's ready list.
+    // A dispatch to a model the daemon cannot run must never report "running".
+    if let Some(model) = args.model.as_ref() {
+        if let Err(preflight_err) = preflight_model(&client, base, model).await {
+            eprintln!("wake: model preflight failed — {preflight_err}");
+            return Ok(WAKE_FAILED);
+        }
+    }
+
     let mut body = json!({
         "prompt": prompt,
         "cwd": args.cwd,
@@ -421,6 +430,135 @@ async fn wait_for_turn_finished(base: &str, session_id: &str, turn_id: &str) -> 
         }
     }
     anyhow::bail!("event stream ended before turn {turn_id} finished")
+}
+
+/// Call `GET /v1/models` and check that `model_id` is both known to the daemon
+/// AND ready (provider credential present). Returns `Ok(())` when the model can
+/// be dispatched; returns `Err` with a human-readable refusal that names the
+/// model and lists ready alternatives. A typo (unknown id) also suggests the
+/// nearest valid id via simple edit-distance matching.
+async fn preflight_model(
+    client: &reqwest::Client,
+    base: &str,
+    model_id: &str,
+) -> Result<(), String> {
+    let url = format!("{base}/v1/models");
+    let models_resp = client
+        .get(&url)
+        .send()
+        .await
+        .map_err(|e| format!("could not fetch model list from {url}: {e}"))?;
+    let body: serde_json::Value = models_resp
+        .json()
+        .await
+        .map_err(|e| format!("could not parse model list: {e}"))?;
+    let models: Vec<serde_json::Value> = body
+        .get("models")
+        .and_then(|v| v.as_array())
+        .cloned()
+        .unwrap_or_default();
+    if models.is_empty() {
+        return Err(format!(
+            "model `{model_id}`: daemon returned an empty model list"
+        ));
+    }
+
+    // Find the requested model in the registry.
+    let entry = models
+        .iter()
+        .find(|m| m.get("id").and_then(|v| v.as_str()) == Some(model_id));
+
+    match entry {
+        Some(entry) => {
+            let ready = entry
+                .get("ready")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
+            if !ready {
+                // Model is known but not ready — list ready alternatives.
+                let ready_ids: Vec<&str> = models
+                    .iter()
+                    .filter(|m| m.get("ready").and_then(|v| v.as_bool()).unwrap_or(false))
+                    .filter_map(|m| m.get("id").and_then(|v| v.as_str()))
+                    .collect();
+                if ready_ids.is_empty() {
+                    return Err(format!(
+                        "model `{model_id}` is NOT ready (provider credential missing or configuration error) — no ready models available"
+                    ));
+                }
+                return Err(format!(
+                    "model `{model_id}` is NOT ready (provider credential missing or configuration error)\n  ready models: {}",
+                    ready_ids.join(", ")
+                ));
+            }
+            Ok(())
+        }
+        None => {
+            // Unknown model id — collect valid ids and suggest nearest.
+            let known_ids: Vec<&str> = models
+                .iter()
+                .filter_map(|m| m.get("id").and_then(|v| v.as_str()))
+                .collect();
+            let suggestion = nearest_model(model_id, &known_ids);
+            match suggestion {
+                Some(nearest) => Err(format!(
+                    "unknown model `{model_id}` — did you mean `{nearest}`?\n  valid models: {}",
+                    known_ids.join(", ")
+                )),
+                None => Err(format!(
+                    "unknown model `{model_id}`\n  valid models: {}",
+                    known_ids.join(", ")
+                )),
+            }
+        }
+    }
+}
+
+/// Simple edit-distance–based nearest match for typo suggestions.
+/// Returns the valid id with the smallest Levenshtein distance. Returns `None`
+/// only when the candidate list is empty or every distance exceeds 3/4 of the
+/// longer string length (a sanity cap: wildly different ids never suggest).
+fn nearest_model<'a>(query: &str, candidates: &[&'a str]) -> Option<&'a str> {
+    let q = query.to_lowercase();
+    candidates
+        .iter()
+        .filter_map(|c| {
+            let dist = levenshtein(&q, &c.to_lowercase());
+            let max_len = q.len().max(c.len());
+            // Only suggest if the distance is at most 3/4 the longer length.
+            if max_len > 0 && dist * 4 <= max_len * 3 {
+                Some((dist, *c))
+            } else {
+                None
+            }
+        })
+        .min_by_key(|(d, _)| *d)
+        .map(|(_, c)| c)
+}
+
+/// Levenshtein (edit) distance between two strings.
+fn levenshtein(a: &str, b: &str) -> usize {
+    let a_chars: Vec<char> = a.chars().collect();
+    let b_chars: Vec<char> = b.chars().collect();
+    let n = a_chars.len();
+    let m = b_chars.len();
+    if n == 0 {
+        return m;
+    }
+    if m == 0 {
+        return n;
+    }
+    let mut prev: Vec<usize> = (0..=m).collect();
+    let mut curr = vec![0usize; m + 1];
+    for i in 1..=n {
+        curr[0] = i;
+        for j in 1..=m {
+            let cost = if a_chars[i - 1] == b_chars[j - 1] { 0 } else { 1 };
+            curr[j] = (prev[j] + 1).min(curr[j - 1] + 1).min(prev[j - 1] + cost);
+        }
+        std::mem::swap(&mut prev, &mut curr);
+    }
+    prev[m]
 }
 
 async fn run_once(daemon_url: &str, path: &Path) -> Result<()> {
@@ -666,4 +804,75 @@ fn launchd_plist(
         stdout,
         stderr
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn levenshtein_identical() {
+        assert_eq!(levenshtein("k3", "k3"), 0);
+    }
+
+    #[test]
+    fn levenshtein_one_substitution() {
+        assert_eq!(levenshtein("kimi-k3", "k3"), 5);
+    }
+
+    #[test]
+    fn levenshtein_one_insertion() {
+        assert_eq!(levenshtein("cat", "cats"), 1);
+    }
+
+    #[test]
+    fn levenshtein_one_deletion() {
+        assert_eq!(levenshtein("cats", "cat"), 1);
+    }
+
+    #[test]
+    fn levenshtein_empty_lhs() {
+        assert_eq!(levenshtein("", "abc"), 3);
+    }
+
+    #[test]
+    fn levenshtein_empty_rhs() {
+        assert_eq!(levenshtein("abc", ""), 3);
+    }
+
+    #[test]
+    fn nearest_model_suggests_close_match() {
+        let candidates = &["k3", "deepseek-v4-pro", "gpt-5.6-sol"];
+        assert_eq!(nearest_model("kimi-k3", candidates), Some("k3"));
+    }
+
+    #[test]
+    fn nearest_model_exact_match_found() {
+        let candidates = &["k3", "kimi-k3"];
+        assert_eq!(nearest_model("k3", candidates), Some("k3"));
+    }
+
+    #[test]
+    fn nearest_model_too_far_returns_none() {
+        let candidates = &["k3", "deepseek-v4-pro"];
+        assert_eq!(nearest_model("xyzzy-wizard-extreme", candidates), None);
+    }
+
+    #[test]
+    fn nearest_model_case_insensitive() {
+        let candidates = &["K3", "deepseek-v4-pro"];
+        assert_eq!(nearest_model("k3", candidates), Some("K3"));
+    }
+
+    #[test]
+    fn nearest_model_empty_candidates() {
+        let candidates: &[&str] = &[];
+        assert_eq!(nearest_model("k3", candidates), None);
+    }
+
+    #[test]
+    fn nearest_model_short_typo() {
+        let candidates = &["gpt-5.6-sol", "gpt-4o", "k3"];
+        assert_eq!(nearest_model("gpt-5.6-sol", candidates), Some("gpt-5.6-sol"));
+    }
 }

@@ -41,6 +41,17 @@ pub struct Session {
     /// label from the first user message. See [`session_display_title`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub title: Option<String>,
+    /// Terminal status of the most recent turn: "completed" or "failed".
+    /// Set by the daemon after each turn finishes; read by operators to
+    /// distinguish a thinking agent from one whose last turn died silently.
+    /// Old session files predate this field and deserialize as `None`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_turn_status: Option<String>,
+    /// Error text from the most recent turn, when `last_turn_status` is
+    /// "failed". Empty for successful turns. Truncated by the daemon to a
+    /// reasonable length to keep session files compact.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_turn_error: Option<String>,
 }
 
 impl Session {
@@ -67,6 +78,8 @@ impl Session {
             git_commit: None,
             client_type: None,
             title: None,
+            last_turn_status: None,
+            last_turn_error: None,
         }
     }
 
@@ -1178,6 +1191,8 @@ pub(crate) fn session_detail(session: Session) -> SessionDetail {
         git_branch: session.git_branch,
         git_commit: session.git_commit,
         client_type: session.client_type,
+        last_turn_status: session.last_turn_status.clone(),
+        last_turn_error: session.last_turn_error.clone(),
         // Resolved by the daemon's `enrich_session_detail` from
         // `workspace_root` (it owns the project store path); the agent layer
         // has no project index, so it leaves the binding unresolved here.
@@ -1440,6 +1455,8 @@ mod history_search_tests {
             git_commit: None,
             client_type: None,
             title: None,
+            last_turn_status: None,
+            last_turn_error: None,
         }
     }
 

@@ -9,6 +9,7 @@ members = [
   "crates/ocean-agent",
   "crates/ocean-agent-sdk",
   "crates/ocean-ast",
+  "crates/ocean-board",
   "crates/ocean-minimizer",
   "crates/ocean-walker",
   "crates/ocean-search",
@@ -31,7 +32,7 @@ members = [
   "crates/ocean-observatory",
   "xtask",
 ]
-# ocean-ast, ocean-minimizer, ocean-walker, and ocean-search are standalone,
+# ocean-ast, ocean-board, ocean-minimizer, ocean-walker, and ocean-search are standalone,
 # unwired libraries; xtask is a dev-only task runner (the cargo-xtask pattern). They compile under
 # workspace commands, but bare `cargo build` / `cargo test` skips them via
 # default-members.

@@ -60,3 +60,6 @@ target-ci/
 
 # Cloudflare Wrangler local cache
 .wrangler/
+
+# stitchpad runtime (isolated history)
+.stitchpad/

@@ -461,6 +461,13 @@ pub struct SessionDetail {
     /// rebound is always reflected without rewriting session files.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub owning_project: Option<ProjectRef>,
+    /// Terminal status of the most recent turn on this session: "completed"
+    /// or "failed". Set by the daemon after each turn finishes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_turn_status: Option<String>,
+    /// Error text from the most recent turn, when it failed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_turn_error: Option<String>,
 }
 
 /// A lightweight reference to the [`Project`] a session belongs to: just the

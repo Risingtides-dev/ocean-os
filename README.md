@@ -37,19 +37,11 @@ Prerequisites: Rust 1.88 or newer and a configured model/provider. See
 lanes, supervision, and recovery.
 
 ```bash
-cargo build --workspace --release
-
-# The daemon intentionally refuses a repository cwd. Start it from a neutral
-# directory so an unbound turn cannot accidentally bind to this checkout.
-OCEAN_MODEL=<model-alias> \
-  sh -c 'cd "$HOME" && /absolute/path/to/ocean-os/target/release/ocean-daemon'
-
-curl -fsS http://127.0.0.1:4780/health
-
-# In another terminal:
-./target/release/ocean-rs prompt "Reply with: pong"
-./target/release/ocean-tui
+# Builds missing release binaries, starts the daemon when needed, and opens the TUI.
+./ocean
 ```
+
+The launcher preserves the caller's working directory for project/session binding while the TUI starts the daemon from a neutral directory. Pass TUI arguments through normally (`./ocean --help`). For direct binary and CLI workflows, see [`docs/OPERATIONS.md`](docs/OPERATIONS.md).
 
 For the supervised macOS service, use `ops/install-ocean-daemon.sh` rather than hand-copying a daemon binary. The script enforces the `main` branch; operators must separately verify a clean tree and `HEAD == origin/main` as documented in `docs/OPERATIONS.md`.
 

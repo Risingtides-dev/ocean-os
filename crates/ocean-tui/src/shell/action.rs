@@ -366,4 +366,51 @@ pub enum Action {
         permission_id: ocean_core::PermissionId,
         allow: bool,
     },
+    /// `/board <room-key>` — open a persistent room's Kanban board projection
+    /// in the center surface. `None` re-enters the last opened board.
+    OpenBoard {
+        room_key: Option<String>,
+    },
+    /// Async board hydrate completed: the full transcript page walk is done.
+    /// `generation` rejects A→B→A board switches; `last_seq` is where the app
+    /// starts the room events SSE tail (strictly after).
+    BoardHydrated {
+        generation: u64,
+        room_key: String,
+        /// Retained `(clock, author_id, body)` rows — the component re-folds
+        /// them through `ocean_board::project` on every update so hydrate plus
+        /// live tail equals full replay by construction.
+        rows: Vec<crate::shell::components::board::BoardRow>,
+        last_seq: u64,
+    },
+    /// One live room message from the board's SSE tail. The component appends
+    /// it to its retained rows and re-folds — the fold is order-independent.
+    BoardRoomMessage {
+        generation: u64,
+        message: Box<ocean_core::RoomMessage>,
+    },
+    /// The board's room SSE stream dropped. The client task reconnects from
+    /// the last event id; the component shows a truthful "reconnecting" state
+    /// until the next message or hydrate clears it.
+    BoardStreamGap {
+        generation: u64,
+    },
+    /// The board component committed an input-mode draft as an encoded card
+    /// envelope body; the app posts it through the room message path.
+    BoardPostCard {
+        body: String,
+    },
+    /// A card-op POST completed. The card itself still arrives only via the
+    /// SSE echo — `Ok` just releases the component's pending draft; `Err`
+    /// carries the draft back so nothing typed is lost.
+    BoardPostFinished {
+        generation: u64,
+        result: Result<(), String>,
+    },
+    /// Board hydrate failed (room missing, transport, decode). The app
+    /// surfaces the error and stays off the board surface.
+    BoardOpFailed {
+        generation: u64,
+        message: String,
+    },
 }

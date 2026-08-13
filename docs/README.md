@@ -71,6 +71,7 @@ Active plans:
 
 Proposals awaiting operator ruling:
 
+- [`specs/2026-08-09-ocean-team-manager-gate1-manifest.md`](specs/2026-08-09-ocean-team-manager-gate1-manifest.md) — proposed product and implementation contract for a transcript-authoritative community board, closed-loop human work, Team Home, privacy-safe capture, and a separately gated extension-owned agent-execution lane; it truthfully classifies the current dirty board work as an unshipped prototype and authorizes no implementation before operator acceptance.
 - [`specs/2026-07-19-cross-device-approval-and-attention.md`](specs/2026-07-19-cross-device-approval-and-attention.md) — phased design for permission-block notifications, a daemon-wide "Needs you" attention surface, and Web Push background reach, building on the 2026-07-19 `/web` `/desk` `/beam` session-handoff fabric. Phase 1 (notify on block) is accepted and implemented in `ocean-surface-ui`; Phases 2–3 remain proposed.
 
 Active implementation reference:

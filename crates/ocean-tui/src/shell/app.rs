@@ -46,6 +46,7 @@ use super::{
         chat::{sanitize_line, ChatComponent},
         editor::EditorComponent,
         file_tree::FileTreeComponent,
+        board::BoardComponent,
         graph::GraphComponent,
         pty_pane::PtyComponent,
         session_rail::SessionRailComponent,
@@ -151,6 +152,7 @@ enum Center {
     Editor,
     Graph,
     WorkflowGraph,
+    Board,
 }
 
 fn visible_image_placements(
@@ -165,7 +167,7 @@ fn visible_image_placements(
     match center {
         Center::Chat => chat.to_vec(),
         Center::Editor => editor.to_vec(),
-        Center::Graph | Center::WorkflowGraph => Vec::new(),
+        Center::Graph | Center::WorkflowGraph | Center::Board => Vec::new(),
     }
 }
 
@@ -263,6 +265,12 @@ const PROVIDER_TABLE: &[(ProviderSection, &str, &str, &[&str])] = &[
         "DeepSeek",
         "deepseek",
         &["DEEPSEEK_API_KEY", "OCEAN_DEEPSEEK_API_KEY"],
+    ),
+    (
+        ProviderSection::Agent,
+        "Kimi K3 — coding plan",
+        "kimi-coding",
+        &["KIMI_CODING_API_KEY", "OCEAN_KIMI_CODING_KEY"],
     ),
     (
         ProviderSection::Agent,
@@ -436,6 +444,15 @@ pub struct App {
     editor: EditorComponent,
     graph: GraphComponent,
     workflow_graph: WorkflowGraphComponent,
+    board: BoardComponent,
+    /// Monotonic identity for the current board view. Re-opening a board (or
+    /// switching rooms) invalidates queued hydrate/stream completions from the
+    /// superseded board — the same A→B→A guard the session binding uses.
+    board_generation: u64,
+    /// The board's room events SSE tail; aborted on board switch.
+    board_stream_task: Option<tokio::task::JoinHandle<()>>,
+    /// Last successfully opened board room — bare `/board` re-enters it.
+    last_board_room: Option<String>,
     right_rail_mode: RightRailMode,
     center: Center,
     focus: Focus,
@@ -694,6 +711,10 @@ impl App {
             editor: EditorComponent::new(root.clone()),
             graph: GraphComponent::new(root),
             workflow_graph: WorkflowGraphComponent::default(),
+            board: BoardComponent::default(),
+            board_generation: 0,
+            board_stream_task: None,
+            last_board_room: None,
             right_rail_mode: RightRailMode::Files,
             // Land in the chat, typing-ready — the rail is one click away.
             center: Center::Chat,
@@ -1524,6 +1545,7 @@ impl App {
                         Center::Editor => self.editor.handle_mouse(m),
                         Center::Graph => self.graph.handle_mouse(m),
                         Center::WorkflowGraph => self.workflow_graph.handle_mouse(m),
+                        Center::Board => self.board.handle_mouse(m),
                     },
                 };
                 if let Some(a) = action {
@@ -1627,6 +1649,11 @@ impl App {
                 match self.focus {
                     // Chat owns Esc (its `/` palette dismiss) — don't intercept.
                     Focus::Center if self.center == Center::Chat => {}
+                    // The board's one-line input owns Esc too (cancel the
+                    // draft); a board with no open input falls through to the
+                    // escape hatch below like every other center surface.
+                    Focus::Center
+                        if self.center == Center::Board && self.board.has_open_input() => {}
                     // Editor/graph and the side rails → straight back to chat.
                     Focus::Center | Focus::Sessions | Focus::Tree => {
                         self.center = Center::Chat;
@@ -1673,6 +1700,7 @@ impl App {
                 Center::Editor => self.editor.handle_event(&evt),
                 Center::Graph => self.graph.handle_event(&evt),
                 Center::WorkflowGraph => self.workflow_graph.handle_event(&evt),
+                Center::Board => self.board.handle_event(&evt),
             },
         };
         if let Some(a) = action {
@@ -1800,6 +1828,76 @@ impl App {
                 self.focus_to(Focus::Center);
             }
         }
+    }
+
+    /// `/board <room-key>` — hydrate the room's transcript, fold it into a
+    /// board, and start the live tail. The app owns the async boundary; the
+    /// component owns rows + fold. Hydrate paging finishes at `last_seq`, then
+    /// the events SSE replays strictly after it — snapshot+tail with no seam.
+    fn open_board(&mut self, room_key: String) {
+        self.board_generation = self.board_generation.wrapping_add(1);
+        let generation = self.board_generation;
+        if let Some(task) = self.board_stream_task.take() {
+            task.abort();
+        }
+        self.last_board_room = Some(room_key.clone());
+        self.board.begin(room_key.clone(), generation);
+        self.center = Center::Board;
+        self.focus_to(Focus::Center);
+        let client = self.client.clone();
+        let tx = self.actions_tx.clone();
+        tokio::spawn(async move {
+            let result = async {
+                let snapshot = client.room_snapshot(&room_key).await?;
+                // Join-if-absent: the daemon classifies post authors by exact
+                // id+kind roster match, so the operator must be on the roster
+                // before any card op can land.
+                let on_roster = snapshot
+                    .participants
+                    .iter()
+                    .any(|p| p.id == "ec" && p.kind == ocean_core::RoomParticipantKind::Human);
+                if !on_roster {
+                    client.join_room(&room_key, "ec", "EC").await?;
+                }
+                let mut rows: Vec<crate::shell::components::board::BoardRow> = snapshot
+                    .transcript
+                    .iter()
+                    .map(crate::shell::components::board::BoardRow::from_message)
+                    .collect();
+                let mut last_seq = snapshot.last_seq;
+                let mut has_more = snapshot.has_more;
+                let mut next_seq = snapshot.next_seq;
+                while has_more {
+                    let Some(after) = next_seq else { break };
+                    let page = client.room_transcript_page(&room_key, after).await?;
+                    last_seq = page
+                        .messages
+                        .last()
+                        .map(|m| m.seq)
+                        .unwrap_or(last_seq)
+                        .max(last_seq);
+                    rows.extend(
+                        page.messages
+                            .iter()
+                            .map(crate::shell::components::board::BoardRow::from_message),
+                    );
+                    has_more = page.has_more;
+                    next_seq = page.next_seq;
+                }
+                Ok::<_, String>((rows, last_seq))
+            }
+            .await;
+            let action = match result {
+                Ok((rows, last_seq)) => Action::BoardHydrated {
+                    generation,
+                    room_key,
+                    rows,
+                    last_seq,
+                },
+                Err(message) => Action::BoardOpFailed { generation, message },
+            };
+            let _ = tx.send(action);
+        });
     }
 
     fn load_image_paths(&mut self, paths: Vec<PathBuf>) {
@@ -2671,6 +2769,64 @@ impl App {
                     self.focus_to(Focus::Term);
                 }
             },
+            // `/board <room-key>` — open (or bare: re-enter) a room's board.
+            Action::OpenBoard { room_key } => {
+                match room_key.clone().or_else(|| self.last_board_room.clone()) {
+                    Some(key) => self.open_board(key),
+                    None => self.set_notice("usage: /board <room-key>".to_string()),
+                }
+            }
+            // Hydrate finished: start the live tail strictly after the last
+            // hydrated seq. The component folds the rows via its own update.
+            Action::BoardHydrated {
+                generation,
+                room_key,
+                last_seq,
+                ..
+            } => {
+                if *generation == self.board_generation {
+                    self.board_stream_task = Some(self.client.spawn_room_event_stream(
+                        room_key.clone(),
+                        *last_seq,
+                        *generation,
+                        self.actions_tx.clone(),
+                    ));
+                }
+            }
+            // Stale-generation board traffic (A→B→A room switch) is dropped at
+            // the app boundary; current traffic falls through to the component.
+            Action::BoardRoomMessage { generation, .. }
+            | Action::BoardStreamGap { generation }
+            | Action::BoardPostFinished { generation, .. } => {
+                if *generation != self.board_generation {
+                    return;
+                }
+            }
+            // Card-op intent from the component: post the encoded envelope
+            // through the room's existing message path. No local echo — the
+            // SSE tail delivers the change back into the same fold.
+            Action::BoardPostCard { body } => {
+                let Some(room_key) = self.board.room_key().map(str::to_string) else {
+                    self.set_notice("no board room is open".to_string());
+                    return;
+                };
+                let generation = self.board_generation;
+                let client = self.client.clone();
+                let tx = self.actions_tx.clone();
+                let body = body.clone();
+                tokio::spawn(async move {
+                    let result = client.post_room_message(&room_key, "ec", &body).await;
+                    let _ = tx.send(Action::BoardPostFinished { generation, result });
+                });
+            }
+            Action::BoardOpFailed { generation, message } => {
+                if *generation == self.board_generation {
+                    // Stay honest: back to chat, board keeps its error state.
+                    self.center = Center::Chat;
+                    self.focus_to(Focus::Center);
+                    self.set_notice(errfmt::humanize(message));
+                }
+            }
             // `/new`: drop the bound session (and its stream) so the next turn
             // mints a fresh one; the chat cleared its own transcript already.
             Action::NewSession => {
@@ -3202,6 +3358,9 @@ impl App {
             self.herdr.observe(&action, self.session_id);
         }
         if let Some(next) = self.chat.update(&action) {
+            self.dispatch(next);
+        }
+        if let Some(next) = self.board.update(&action) {
             self.dispatch(next);
         }
         if let Some(next) = self.tray.update(&action) {
@@ -5034,7 +5193,9 @@ impl App {
             match self.center {
                 Center::Chat => SelectionSpace::Chat,
                 Center::Editor if self.editor.has_tabs() => SelectionSpace::Editor,
-                Center::Editor | Center::Graph | Center::WorkflowGraph => SelectionSpace::Screen,
+                Center::Editor | Center::Graph | Center::WorkflowGraph | Center::Board => {
+                    SelectionSpace::Screen
+                }
             }
         }
     }
@@ -5078,6 +5239,7 @@ impl App {
         self.chat.focused = center && self.center == Center::Chat;
         self.editor.focused = center && self.center == Center::Editor;
         self.graph.focused = center && self.center == Center::Graph;
+        self.board.focused = center && self.center == Center::Board;
         self.usage.focused =
             self.focus == Focus::Tree && self.right_rail_mode == RightRailMode::Usage;
         self.workflow_graph.focused = (self.focus == Focus::Tree
@@ -5496,6 +5658,7 @@ impl App {
             Center::Editor => format!(" {}", self.editor.crumb()),
             Center::Graph => String::new(),
             Center::WorkflowGraph => " workflow execution graph".into(),
+            Center::Board => String::new(),
         };
         frame.render_widget(
             Paragraph::new(Span::styled(crumb, Style::default().fg(theme::COMMENT)))
@@ -5513,6 +5676,7 @@ impl App {
             Center::Editor => self.editor.draw(frame, r_center),
             Center::Graph => self.graph.draw(frame, r_center),
             Center::WorkflowGraph => self.workflow_graph.draw(frame, r_center),
+            Center::Board => self.board.draw(frame, r_center),
         }
         if tree_w > 0 {
             match self.right_rail_mode {
@@ -5660,6 +5824,7 @@ impl App {
             Center::Editor => "editor",
             Center::Graph => "graph",
             Center::WorkflowGraph => "workflow graph",
+            Center::Board => "board",
         };
         let line = Line::from(vec![
             Span::styled(
@@ -7920,6 +8085,17 @@ mod tests {
         assert_eq!(realtime.section, ProviderSection::Voice);
         assert_ne!(realtime.block_key, "openai");
         assert!(!realtime.is_oauth());
+    }
+
+    #[test]
+    fn login_popup_exposes_kimi_k3_coding_credential() {
+        let row = PROVIDER_TABLE
+            .iter()
+            .find(|(_, _, block_key, _)| *block_key == "kimi-coding")
+            .expect("dedicated Kimi coding-plan row");
+        assert_eq!(row.0, ProviderSection::Agent);
+        assert!(row.1.contains("Kimi K3"));
+        assert_eq!(row.3, &["KIMI_CODING_API_KEY", "OCEAN_KIMI_CODING_KEY"]);
     }
 
     #[test]

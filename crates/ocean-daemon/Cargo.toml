@@ -63,6 +63,7 @@ base64.workspace = true
 getrandom.workspace = true
 ocean-agent.workspace = true
 ocean-agent-sdk.workspace = true
+ocean-board = { path = "../ocean-board" }
 ocean-browser = { workspace = true, optional = true }
 ocean-call.workspace = true
 ocean-core.workspace = true

@@ -58,6 +58,7 @@ Use `crates/AGENTS.md` for all current workspace packages, ownership exclusions,
 - The Chromium browser backend is quarantined behind the default-off `legacy-chromium` feature (details and validation in `crates/AGENTS.md`) pending the OceanWebKit browser host; default builds must compile no chromiumoxide and must never launch or probe a browser.
 - Minimum supported Rust is 1.88, enforced by the MSRV lane; do not lower it without pinning the resolved dependency graph and proving every supported feature.
 - Build: `cargo build --workspace --release`.
+- Local bootstrap: `./ocean` builds missing release daemon/TUI binaries, then opens the TUI; the TUI health-checks and safely autostarts the local daemon.
 - TUI change: `cargo build -p ocean-tui --release`.
 - Daemon restarts: standing authorization to restart from `main`; use specific-PID kill, not blind `pkill`.
 - Daemon health: `GET /health` (not `/v1/health`).

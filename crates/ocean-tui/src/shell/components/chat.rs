@@ -2517,6 +2517,13 @@ impl ChatComponent {
             "/beam" => Some(Action::BeamSession),
             "/files" => Some(Action::Navigate(Nav::Files)),
             "/graph" => Some(Action::Navigate(Nav::Graph)),
+            "/board" => Some(Action::OpenBoard {
+                room_key: if args.is_empty() {
+                    None
+                } else {
+                    Some(args.to_string())
+                },
+            }),
             "/terminal" => Some(Action::Navigate(Nav::Terminal)),
             "/settings" => Some(Action::OpenSettings),
             "/permissions" => Some(Action::OpenPermissions),

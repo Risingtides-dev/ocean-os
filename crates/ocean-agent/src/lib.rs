@@ -1505,6 +1505,43 @@ impl AgentRuntime {
         Ok(Some(session::session_detail(session)))
     }
 
+    /// Record the outcome of a completed turn on the session so operators can
+    /// distinguish a thinking agent from one whose last turn died silently.
+    /// The caller MUST hold the matching session operation lease.
+    pub fn record_turn_completed_with_lease(
+        &self,
+        lease: &SessionOperationLease,
+        ok: bool,
+        error: &str,
+    ) -> anyhow::Result<()> {
+        let id = lease.id;
+        let Some(mut session) = session::load_resumable(&self.config_dir, id)? else {
+            return Ok(());
+        };
+        session.last_turn_status = Some(if ok {
+            "completed".to_string()
+        } else {
+            "failed".to_string()
+        });
+        session.last_turn_error = if ok {
+            None
+        } else {
+            let err = error.trim();
+            if err.is_empty() {
+                Some("turn failed with no error detail".to_string())
+            } else {
+                // Cap at a reasonable length to keep session files compact.
+                if err.len() > 4000 {
+                    Some(format!("{}…[truncated]", &err[..4000]))
+                } else {
+                    Some(err.to_string())
+                }
+            }
+        };
+        session::save(&self.config_dir, &session)?;
+        Ok(())
+    }
+
     /// Read the authoritative public session projection under the same mutation
     /// lane as turns/compact/config/message append. This is refresh-only: it
     /// performs no provider call and never changes persistence.

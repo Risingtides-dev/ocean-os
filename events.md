@@ -5935,3 +5935,92 @@ mention+thread-reply dispatch dedup on one row, and agent reply root/session
 attribution with fallback. Verified: 53/53 persistent_rooms, fmt, clippy -D
 warnings (daemon), cargo check --workspace.
 _________________________________________________________________________________
+
+_________________________________________________________________________________
+time:      [11:10pm] [16-07-26]
+agent:     [pi], [gpt-5.6]
+worktree:  main
+type:      [workflow]: Add one-command local Ocean bootstrap
+area:      [infra]: Daemon and TUI startup
+
+Added the executable repo-root `./ocean` launcher. It builds missing release daemon/TUI binaries, points TUI daemon discovery at the sibling release daemon while preserving explicit overrides, and execs the TUI with caller arguments and cwd intact. The existing TUI health/autostart path owns launchd-aware or detached neutral-cwd daemon startup. The launcher resolves symlink chains, and this workstation now exposes it as `~/.local/bin/ocean` so bare `ocean` works from any directory. Updated root and operator quick-start guidance.
+
+_________________________________________________________________________________
+time:      [12:20am] [01-08-26]
+agent:     [codex], [gpt-5.6]
+worktree:  main
+type:      [fix]
+area:      [tui]: Kimi K3 coding-plan configuration
+
+Added a dedicated `/providers` row for the existing `kimi-coding` K3 route so
+coding-plan keys are stored under the credential block the runtime resolves,
+instead of the raw metered Moonshot `kimi` block. The operator credential was
+migrated locally without exposing it, the invalid raw-Moonshot duplicate was
+removed, and a fresh session-bound Ocean prompt returned exactly
+`KIMI_K3_FINAL_OK` (HTTP 200, provider `kimi-coding`, 6,107 total tokens, 1M
+context window). Verified the focused and full TUI test suites,
+`cargo check -p ocean-tui`, `cargo build -p ocean-tui --release`, and
+`cargo xtask docs-check`.
+
+_________________________________________________________________________________
+time:      [11:45am] [06-08-26]
+agent:     [claude], [opus-5]
+worktree:  main
+type:      [feat]: Add `ocean-board` card envelope and board projection
+area:      [board]: Rising Tides community Kanban, phase 1
+
+Added the standalone `ocean-board` crate: a pure, I/O-free library that encodes
+Kanban card events into room message bodies and folds a room transcript into a
+board. A board is a projection over the existing per-room transcript, not a new
+durable authority; no cards table and no parallel room-event log.
+
+Cards are keyed by a client-generated `card_id` carried inside a tagged JSON
+envelope in `body`, deliberately not by `thread_parent_seq`. `ocean-store`'s
+`append_federated_message` writes `thread_parent_seq` and `session_id` as NULL
+and the federated wire `MessagePayload` is `deny_unknown_fields` over
+client_event_id/author_member_id/body/mention_member_ids, so thread structure
+does not survive federation; a thread-keyed card would work locally and flatten
+on every remote seat. Ordering uses `EventClock`: Bedrock `global_sequence`
+(identical across seats, documented as the confirmed display order) outranks
+local `seq`, which is per-daemon and therefore divergent. Pending events sort
+after confirmed ones for optimistic local moves.
+
+The fold resolves last-writer-wins per field rather than per card, so it is
+order-independent: hydrate-plus-live-tail equals full replay, and replay is
+idempotent. Tagged envelopes from a newer schema are counted as unsupported
+rather than dropped as chat; untagged bodies are never promoted to cards, so
+ordinary conversation and cards coexist in one room.
+
+The crate is intentionally outside `default-members` with recorded rationale —
+no daemon routes, client, or agent triggers are wired. Verified: 19/19
+`cargo test -p ocean-board`, `cargo clippy -p ocean-board --all-targets -D
+warnings`, `cargo xtask docs-check` PASS (31 packages), and index parity
+against `cargo metadata --no-deps`.
+
+_________________________________________________________________________________
+time:      [01:35am] [09-08-26]
+agent:     [codex], [gpt-5]
+worktree:  main (dirty; pre-existing board and unrelated local changes preserved)
+type:      [plan]
+area:      [team-manager]: Ratify the path from Room board to closed-loop team operating system
+
+Audited Ocean Team Manager foundations across the local Ocean repositories and
+the KINGMAKER-SYSTEMS/Rising Tides GitHub estate, then recovered the prior
+Stitchpad board handoff. Confirmed that `ocean-board`, the daemon board route,
+and TUI board are useful uncommitted prototype work rather than a shipped
+feature; no product code, running daemon, commit, or branch state was changed.
+
+Published the proposed Gate 1 manifest for a transcript-authoritative work-item
+model, candidate/commitment separation, authenticated governance, evidence-
+bearing closure, one deduplicated Attention stream, privacy-safe Team Home,
+human assignment, capture/triage, pilot SLOs, administrative-burden budgets,
+and an ordered Gate 0–8 program. Independent DeepSeek V4 Pro, Kimi K3, and
+Claude Opus 5 Stitchpad reviews were reconciled. The manifest explicitly splits
+reachable human assignment (Gate 5a) from agent execution (Gate 5b), which
+remains blocked on a separately accepted Crew Stage B-or-later implementation
+manifest. Status remains proposed; it authorizes no implementation before an
+operator ruling. `git diff --check` passed for the planning changes. The
+repository-wide `cargo xtask docs-check` reached the new active documents but
+remains blocked by ten pre-existing broken local links under the ignored
+`ocean-bedrock/node_modules` dependency tree; that dependency state was left
+untouched.

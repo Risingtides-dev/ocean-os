@@ -984,6 +984,235 @@ impl DaemonClient {
             .await
             .map_err(|e| e.to_string())
     }
+
+    // ── persistent rooms (board projection surface) ──────────────────────
+    //
+    // The board view is a projection over a room transcript. These are the
+    // only room endpoints the TUI consumes: hydrate reads (`snapshot` +
+    // `transcript` paging), the live tail (`events` SSE), and the single
+    // existing write path (`messages` POST). There is no board-specific write
+    // authority anywhere in this lane.
+
+    /// `GET /v1/rooms/persistent/{key}/snapshot` — roster + first bounded
+    /// transcript page + cursors, the board hydrate's first read.
+    pub async fn room_snapshot(&self, room_key: &str) -> Result<RoomSnapshot, String> {
+        let payload = self
+            .http
+            .get(format!(
+                "{}/v1/rooms/persistent/{room_key}/snapshot",
+                self.base
+            ))
+            .send()
+            .await
+            .map_err(|e| format!("room snapshot could not reach the daemon: {e}"))?
+            .json::<serde_json::Value>()
+            .await
+            .map_err(|e| format!("room snapshot response was not valid JSON: {e}"))?;
+        RoomSnapshot::from_payload(&payload)
+    }
+
+    /// `GET /v1/rooms/persistent/{key}/transcript?after_seq=` — one bounded
+    /// page of the transcript for the hydrate page walk.
+    pub async fn room_transcript_page(
+        &self,
+        room_key: &str,
+        after_seq: u64,
+    ) -> Result<TranscriptPage, String> {
+        let payload = self
+            .http
+            .get(format!(
+                "{}/v1/rooms/persistent/{room_key}/transcript",
+                self.base
+            ))
+            .query(&[("after_seq", after_seq)])
+            .send()
+            .await
+            .map_err(|e| format!("room transcript could not reach the daemon: {e}"))?
+            .json::<serde_json::Value>()
+            .await
+            .map_err(|e| format!("room transcript response was not valid JSON: {e}"))?;
+        TranscriptPage::from_payload(&payload)
+    }
+
+    /// `POST /v1/rooms/persistent/{key}/participants` — join the roster. The
+    /// caller joins only when the snapshot roster lacks the id (join-if-absent);
+    /// the daemon classifies post authors by exact id+kind roster match.
+    pub async fn join_room(
+        &self,
+        room_key: &str,
+        id: &str,
+        display_name: &str,
+    ) -> Result<(), String> {
+        let payload = self
+            .http
+            .post(format!(
+                "{}/v1/rooms/persistent/{room_key}/participants",
+                self.base
+            ))
+            .json(&serde_json::json!({
+                "id": id,
+                "display_name": display_name,
+                "kind": "human",
+            }))
+            .send()
+            .await
+            .map_err(|e| format!("room join could not reach the daemon: {e}"))?
+            .json::<serde_json::Value>()
+            .await
+            .map_err(|e| format!("room join response was not valid JSON: {e}"))?;
+        ok_or_payload_error(&payload)
+    }
+
+    /// `POST /v1/rooms/persistent/{key}/messages` — the only write path. For
+    /// card ops the body is the entire encoded `CardEnvelope`; the resulting
+    /// card change arrives back over the events SSE tail, never from this
+    /// response.
+    pub async fn post_room_message(
+        &self,
+        room_key: &str,
+        author_id: &str,
+        body: &str,
+    ) -> Result<(), String> {
+        let payload = self
+            .http
+            .post(format!(
+                "{}/v1/rooms/persistent/{room_key}/messages",
+                self.base
+            ))
+            .json(&serde_json::json!({
+                "author_id": author_id,
+                "author_kind": "human",
+                "body": body,
+            }))
+            .send()
+            .await
+            .map_err(|e| format!("room post could not reach the daemon: {e}"))?
+            .json::<serde_json::Value>()
+            .await
+            .map_err(|e| format!("room post response was not valid JSON: {e}"))?;
+        ok_or_payload_error(&payload)
+    }
+
+    /// `GET /v1/rooms/persistent/{key}/events?after_seq=` — the room's live
+    /// tail. Mirrors [`Self::spawn_event_stream`]: the default total timeout
+    /// would silently kill a long-lived SSE body, so the request overrides it;
+    /// reconnects resume from `Last-Event-ID` (the daemon replays strictly
+    /// after it — no gaps, no duplicates). `room_access` frames are roster
+    /// projections the board view does not consume.
+    pub fn spawn_room_event_stream(
+        &self,
+        room_key: String,
+        after_seq: u64,
+        generation: u64,
+        actions: mpsc::UnboundedSender<Action>,
+    ) -> tokio::task::JoinHandle<()> {
+        let http = self.http.clone();
+        let url = format!(
+            "{}/v1/rooms/persistent/{room_key}/events?after_seq={after_seq}",
+            self.base
+        );
+        tokio::spawn(async move {
+            let mut last_event_id: Option<String> = None;
+            loop {
+                let mut req = http
+                    .get(&url)
+                    .timeout(std::time::Duration::from_secs(60 * 60 * 24 * 365));
+                if let Some(id) = &last_event_id {
+                    req = req.header("Last-Event-ID", id.clone());
+                }
+                if let Ok(resp) = req.send().await.and_then(|r| r.error_for_status()) {
+                    let mut stream = resp.bytes_stream();
+                    let mut buf = String::new();
+                    while let Some(chunk) = stream.next().await {
+                        let Ok(bytes) = chunk else { break };
+                        buf.push_str(&String::from_utf8_lossy(&bytes));
+                        while let Some(idx) = buf.find("\n\n") {
+                            let frame = buf[..idx].to_string();
+                            buf.drain(..idx + 2);
+                            if let Some(id) = parse_sse_id(&frame) {
+                                last_event_id = Some(id);
+                            }
+                            if parse_sse_event(&frame) != Some("room_message") {
+                                continue;
+                            }
+                            if let Some(message) =
+                                parse_sse_data::<ocean_core::RoomMessage>(&frame)
+                            {
+                                let _ = actions.send(Action::BoardRoomMessage {
+                                    generation,
+                                    message: Box::new(message),
+                                });
+                            }
+                        }
+                    }
+                }
+                // Dropped (or failed to connect): report the gap honestly, brief
+                // backoff, then resubscribe from the last seen seq.
+                let _ = actions.send(Action::BoardStreamGap { generation });
+                tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+            }
+        })
+    }
+}
+
+/// The pieces of `GET .../snapshot` the board hydrate needs.
+#[derive(Debug, Clone)]
+pub struct RoomSnapshot {
+    pub participants: Vec<ocean_core::RoomParticipant>,
+    pub transcript: Vec<ocean_core::RoomMessage>,
+    pub next_seq: Option<u64>,
+    pub has_more: bool,
+    /// Highest transcript seq in this snapshot (0 for an empty room) — the
+    /// resume point for both paging and the events tail.
+    pub last_seq: u64,
+}
+
+impl RoomSnapshot {
+    fn from_payload(payload: &serde_json::Value) -> Result<Self, String> {
+        ok_or_payload_error(payload)?;
+        Ok(Self {
+            participants: serde_json::from_value(payload["participants"].clone())
+                .map_err(|e| format!("invalid room roster in snapshot: {e}"))?,
+            transcript: serde_json::from_value(payload["transcript"].clone())
+                .map_err(|e| format!("invalid room transcript in snapshot: {e}"))?,
+            next_seq: payload["next_seq"].as_u64(),
+            has_more: payload["has_more"].as_bool().unwrap_or(false),
+            last_seq: payload["last_seq"].as_u64().unwrap_or(0),
+        })
+    }
+}
+
+/// One bounded page of `GET .../transcript`.
+#[derive(Debug, Clone)]
+pub struct TranscriptPage {
+    pub messages: Vec<ocean_core::RoomMessage>,
+    pub next_seq: Option<u64>,
+    pub has_more: bool,
+}
+
+impl TranscriptPage {
+    fn from_payload(payload: &serde_json::Value) -> Result<Self, String> {
+        ok_or_payload_error(payload)?;
+        Ok(Self {
+            messages: serde_json::from_value(payload["transcript"].clone())
+                .map_err(|e| format!("invalid room transcript page: {e}"))?,
+            next_seq: payload["next_seq"].as_u64(),
+            has_more: payload["has_more"].as_bool().unwrap_or(false),
+        })
+    }
+}
+
+/// Room endpoints answer errors as `{ "ok": false, "error": ... }` with a
+/// non-2xx status; treat a missing/false `ok` as the failure it is.
+fn ok_or_payload_error(payload: &serde_json::Value) -> Result<(), String> {
+    if payload["ok"].as_bool().unwrap_or(false) {
+        Ok(())
+    } else {
+        Err(payload["error"]
+            .as_str()
+            .unwrap_or("the daemon rejected the room request")
+            .to_string())
+    }
 }
 
 /// One language server from `GET /v1/lsp`, for the `/lsp` panel.

@@ -1893,6 +1893,89 @@ fn room_message_tail(
     ReceiverStream::new(rx)
 }
 
+/// `GET /v1/rooms/persistent/{key}/board` — fold the room transcript into a Kanban
+/// board via [`ocean_board::project`].
+///
+/// Pages through the full transcript via [`read_transcript_page`] (open rooms) or
+/// the soft-closed audit view (finished calls), constructs one
+/// [`ocean_board::BoardEvent`] per message, then applies the order-independent
+/// last-writer-wins fold. Messages that are not card envelopes are ordinary chat
+/// and are skipped by the projection.
+///
+/// The response is the serialized [`ocean_board::Board`]: column names in display
+/// order, cards keyed by `card_id`, and an `unsupported_events` counter for
+/// envelopes this build could not apply.
+pub(super) async fn room_board(
+    State(state): State<AppState>,
+    Path(key): Path<String>,
+) -> (StatusCode, Json<serde_json::Value>) {
+    let key = RoomKey::new(key.trim());
+
+    let result = with_rooms(&state, |reg| {
+        // Verify room exists (open first, then soft-closed for finished calls).
+        match reg.get(&key) {
+            Ok(Some(_)) => {}
+            Ok(None) => match reg.get_including_closed(&key) {
+                Ok(Some(_)) => {}
+                Ok(None) => {
+                    return Err(ocean_store::RoomStoreError::UnknownRoom(key.clone()));
+                }
+                Err(e) => return Err(e),
+            },
+            Err(e) => return Err(e),
+        }
+
+        // Collect every message into an owned Vec so BoardEvent borrows stay
+        // alive through the projection call.
+        let mut all_messages: Vec<RoomMessage> = Vec::new();
+        let mut after_seq: Option<u64> = None;
+        loop {
+            let page = read_transcript_page(reg, &key, after_seq, None)?;
+            if page.messages.is_empty() {
+                break;
+            }
+            let has_more = page.has_more;
+            after_seq = page.next_seq;
+            all_messages.extend(page.messages);
+            if !has_more {
+                break;
+            }
+        }
+
+        let events: Vec<ocean_board::BoardEvent<'_>> = all_messages
+            .iter()
+            .map(|msg| {
+                let clock = match &msg.federated {
+                    Some(meta) => ocean_board::EventClock::Confirmed(meta.global_sequence),
+                    None => ocean_board::EventClock::Pending(msg.seq),
+                };
+                ocean_board::BoardEvent {
+                    clock,
+                    author_id: &msg.author_id,
+                    body: &msg.body,
+                }
+            })
+            .collect();
+
+        Ok(ocean_board::project(events))
+    });
+
+    match result {
+        Ok(board) => (
+            StatusCode::OK,
+            Json(json!({
+                "ok": true,
+                "board": board,
+            })),
+        ),
+        Err(ocean_store::RoomStoreError::UnknownRoom(_)) => (
+            StatusCode::NOT_FOUND,
+            Json(json!({ "ok": false, "error": "room not found" })),
+        ),
+        Err(e) => room_store_error_response(e),
+    }
+}
+
 /// `GET /v1/rooms/persistent/{key}/events?after_seq=N` — durable replay plus a
 /// room-scoped live SSE tail. Every frame is `event: room_message`, `id: <seq>`
 /// with the exact existing `RoomMessage` JSON. SQLite is authoritative; the

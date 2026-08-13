@@ -195,9 +195,9 @@ use model_catalog::{model_get, model_set, models_list};
 use model_roles::resolve_effective_model_id;
 use model_roles::{load_model_roles, resolve_advisor_alias, resolve_turn_model};
 use persistent_rooms::{
-    resolve_named_agent, room_create, room_create_invite, room_db_path, room_events, room_get,
-    room_join, room_leave, room_post_message, room_redeem_invite, room_register_agents,
-    room_retry_outbox, room_snapshot, room_transcript, rooms_list_persistent,
+    resolve_named_agent, room_board, room_create, room_create_invite, room_db_path, room_events,
+    room_get, room_join, room_leave, room_post_message, room_redeem_invite,
+    room_register_agents, room_retry_outbox, room_snapshot, room_transcript, rooms_list_persistent,
     run_federated_trigger_dispatcher, with_rooms, with_rooms_handle, RoomAccessWakeBus,
     RoomStoreHandle, RoomWakeBus,
 };
@@ -1531,6 +1531,7 @@ fn banner_routes() -> &'static [&'static str] {
         "POST /v1/rooms/persistent/{key}/members/agents",
         "GET /v1/rooms/persistent/{key}/transcript",
         "GET /v1/rooms/persistent/{key}/snapshot",
+        "GET /v1/rooms/persistent/{key}/board",
         "GET /v1/rooms/persistent/{key}/events",
         "POST /v1/rooms/persistent/{key}/outbox/retry",
         "GET /v1/sessions",
@@ -2781,6 +2782,7 @@ fn room_routes() -> Router<AppState> {
             get(room_transcript),
         )
         .route("/v1/rooms/persistent/{key}/snapshot", get(room_snapshot))
+        .route("/v1/rooms/persistent/{key}/board", get(room_board))
         // Merged SSE: room_message + room_access frames, with durable replay
         // and access-projection tail (S2-P1).
         .route("/v1/rooms/persistent/{key}/events", get(room_events))
@@ -6753,6 +6755,16 @@ async fn agent_turn(
         // this turn's wall_ms/ok into the metrics (OCEAN-303).
         drop(in_flight);
         bg_state.metrics.record_turn(res.wall_ms, res.ok);
+        // P2: record turn outcome on the session so operators can distinguish
+        // a thinking agent from one whose last turn died silently. Best-effort
+        // (a failing session-write must not kill the terminal TurnFinished).
+        if let Err(e) = bg_state.runtime.record_turn_completed_with_lease(
+            &session_lease,
+            res.ok,
+            &res.stderr,
+        ) {
+            tracing::warn!(%session_id, error = %e, "agent_turn: failed to record turn outcome on session");
+        }
         // Wait for the bridge to drain (the sender has been dropped by now).
         let _ = bridge.await;
         // Prefer real provider usage; fall back to a visible-text estimate only
@@ -11584,6 +11596,8 @@ mod tests {
             git_commit: None,
             client_type: None,
             owning_project: None,
+            last_turn_status: None,
+            last_turn_error: None,
         }
     }
 

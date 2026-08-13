@@ -1,3 +1,4 @@
+pub mod board;
 pub mod chat;
 pub mod editor;
 pub mod file_tree;

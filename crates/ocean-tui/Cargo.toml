@@ -13,6 +13,10 @@ clap.workspace = true
 crossterm = { version = "0.29", features = ["event-stream"] }
 ocean-agent-sdk.workspace = true
 ocean-core.workspace = true
+# Board projection over room transcripts (pure, serde-only) — path dep, mirroring
+# ocean-daemon; ocean-board is a workspace member but intentionally not a
+# workspace.dependencies entry.
+ocean-board = { path = "../ocean-board" }
 ratatui = { version = "0.30", features = ["unstable-rendered-line-info"] }
 reqwest.workspace = true
 serde.workspace = true

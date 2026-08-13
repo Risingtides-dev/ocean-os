@@ -16,6 +16,12 @@ approved design or permission to alter public contracts.
 - [ ] Keep cross-repository session, voice, component, and room contracts under
       executable drift checks rather than prose-only synchronization.
 
+## Ocean Team Manager
+
+- [ ] Obtain operator ruling on the proposed [`Gate 1 product and implementation manifest`](docs/specs/2026-08-09-ocean-team-manager-gate1-manifest.md). It defines the transcript-authoritative work model, community versus team-manager modes, authenticated governance, candidate/commitment separation, evidence-bearing closure, one deduplicated Attention stream, privacy-safe Team Home aggregation, pilot burden/SLO gates, and the ordered Gate 0–8 program.
+- [ ] Recover and independently review the current dirty `ocean-board`/daemon/TUI prototype without presenting it as shipped or losing unrelated working-tree changes.
+- [ ] Keep durable agent execution blocked until a separate Crew Stage B-or-later implementation manifest is written and accepted; the already-ratified Extension Stage A program does not provide execution requests, leases, continuation, or durable effects.
+
 ## Ocean Observatory
 
 - [x] Gate 0 decisions accepted — see [`docs/specs/2026-07-17-observatory-gate0-decisions.md`](docs/specs/2026-07-17-observatory-gate0-decisions.md), including the operator's 90s-game visual-parity ruling on truthful events with a durable event store.

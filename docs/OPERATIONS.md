@@ -37,8 +37,21 @@ The binaries are:
 
 ## Run locally
 
-The daemon refuses to start inside a Git repository by design. Build in the
-checkout, then launch the absolute binary from a neutral directory:
+The repository launcher builds the release daemon and TUI when either binary is
+missing, then opens the TUI. The TUI probes the default local endpoint and
+starts or kickstarts the daemon safely when needed:
+
+```bash
+./ocean
+```
+
+It preserves the launch cwd for project/session binding, passes all arguments to
+`ocean-tui`, and honors explicit `OCEAN_DAEMON_BIN`, `OCEAN_DAEMON_URL`, and
+`OCEAN_TUI_AUTOSTART` overrides.
+
+For a direct daemon launch, the daemon refuses to start inside a Git repository
+by design. Build in the checkout, then launch the absolute binary from a neutral
+directory:
 
 ```bash
 repo="$(pwd)"

@@ -1,0 +1,29 @@
+#!/usr/bin/env bash
+# Build the local Ocean binaries when needed, then launch the TUI. The TUI owns
+# the health probe and safely starts (or kickstarts) the daemon from a neutral
+# working directory when the default local endpoint is unavailable.
+set -euo pipefail
+
+SOURCE="${BASH_SOURCE[0]}"
+while [[ -L "$SOURCE" ]]; do
+  SOURCE_DIR="$(cd "$(dirname "$SOURCE")" && pwd)"
+  SOURCE="$(readlink "$SOURCE")"
+  [[ "$SOURCE" = /* ]] || SOURCE="$SOURCE_DIR/$SOURCE"
+done
+REPO="$(cd "$(dirname "$SOURCE")" && pwd)"
+DAEMON="$REPO/target/release/ocean-daemon"
+TUI="$REPO/target/release/ocean-tui"
+
+if [[ ! -x "$DAEMON" || ! -x "$TUI" ]]; then
+  echo "==> building ocean-daemon and ocean-tui (release)" >&2
+  cargo build \
+    --manifest-path "$REPO/Cargo.toml" \
+    -p ocean-daemon \
+    -p ocean-tui \
+    --release
+fi
+
+# Preserve an explicit operator override. Otherwise make daemon discovery
+# independent of PATH and of the directory from which this launcher is called.
+export OCEAN_DAEMON_BIN="${OCEAN_DAEMON_BIN:-$DAEMON}"
+exec "$TUI" "$@"
