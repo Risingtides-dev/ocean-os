@@ -6052,3 +6052,23 @@ in-flight GLM 4.7 delta review was cancelled and will not count as final proof;
 the authoritative GLM review and production probe must use `glm-5.3` after the
 candidate catalog is running. Verified focused route/catalog tests and strict
 all-target `ocean-providers` clippy.
+
+_________________________________________________________________________________
+time:      [12:16pm] [14-08-26]
+agent:     [codex], [gpt-5]
+worktree:  fix/session-model-pin-provenance
+type:      [test]
+area:      [sessions], [providers]: Independent final-diff review
+
+DeepSeek V4 Pro independently reviewed the rebased session-provenance delta at
+9029ff2 through a fresh Stitchpad/Ocean session and returned PASS with no P0-P2
+findings. The first GLM 5.3 candidate review made 32 source-inspection rounds
+but did not publish a terminal verdict inside the bounded window; its exact
+request was cancelled and confirmed terminal before retry. A fresh GLM 5.3
+session then verified `model=glm-5.3`, `provider=glm`, `model_source=session`,
+and `config_revision=1`, independently reviewed final commit 34cc488, and
+returned PASS with no P0-P2 findings. The candidate wire path therefore proves
+both the same-global create-time pin fix and the new exact GLM 5.3 route.
+Verified full ocean-agent (207) and ocean-daemon (686) tests, all 46
+ocean-providers tests, workspace strict clippy/check, formatting, diff check,
+and docs-check before publication.
