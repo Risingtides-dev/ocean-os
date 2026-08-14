@@ -109,11 +109,13 @@ impl DaemonClient {
     pub async fn create_agent_session_retrying(
         &self,
         workspace_root: &str,
+        model: Option<&str>,
         on_retry: impl FnMut(usize, usize),
     ) -> Result<AgentSessionCreateResponse, String> {
         let req = AgentSessionCreateRequest {
             workspace_root: workspace_root.to_string(),
             project_id: None,
+            model: model.map(str::to_string),
             client_type: Some("tui".into()),
         };
         let url = format!("{}/v1/agent/sessions", self.base);
@@ -832,12 +834,17 @@ pub struct ModelsResponse {
 pub struct SessionConfigResponse {
     pub session_id: AgentSessionId,
     pub model: String,
+    #[serde(default)]
+    pub config_revision: u64,
 }
 
 #[derive(serde::Serialize)]
 struct SessionModelPatch<'a> {
     model: &'a str,
 }
+
+const SESSION_ACTIVE_OPERATION: &str = "session has an active operation; try again shortly";
+const SESSION_MODEL_RETRY_DELAY: Duration = Duration::from_millis(if cfg!(test) { 5 } else { 500 });
 
 /// One retained memory from `GET /v1/memory`, for the `/memory` browser.
 #[derive(Debug, Clone, serde::Deserialize)]
@@ -919,6 +926,32 @@ impl DaemonClient {
         }
         serde_json::from_value(payload)
             .map_err(|error| format!("invalid session model response: {error}"))
+    }
+
+    /// Persist a model as soon as the daemon-owned session operation lease is
+    /// idle. A running turn legitimately makes PATCH return 409; treating that
+    /// as a terminal save failure made the picker snap back to the old model.
+    /// The caller owns/aborts this future when a newer pick or session binding
+    /// supersedes it, so only the latest generation may release queued work.
+    pub async fn set_session_model_when_idle(
+        &self,
+        session_id: AgentSessionId,
+        model: &str,
+        mut on_wait: impl FnMut(),
+    ) -> Result<SessionConfigResponse, String> {
+        let mut announced_wait = false;
+        loop {
+            match self.set_session_model(session_id, model).await {
+                Err(error) if error == SESSION_ACTIVE_OPERATION => {
+                    if !announced_wait {
+                        announced_wait = true;
+                        on_wait();
+                    }
+                    tokio::time::sleep(SESSION_MODEL_RETRY_DELAY).await;
+                }
+                result => return result,
+            }
+        }
     }
 
     /// `GET /v1/memory` — the operator's retained memories, for `/memory`.
@@ -1197,6 +1230,71 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn session_model_waits_through_active_operation_conflicts() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind model retry server");
+        let address = listener.local_addr().expect("mock address");
+        let session_id = AgentSessionId(uuid::Uuid::from_u128(32));
+        let server = tokio::spawn(async move {
+            let mut requests = Vec::new();
+            for attempt in 0..3 {
+                let (mut socket, _) = listener.accept().await.expect("accept model patch");
+                let mut request = vec![0u8; 8192];
+                let read = socket.read(&mut request).await.expect("read model patch");
+                requests.push(String::from_utf8_lossy(&request[..read]).to_string());
+                let (status, body) = if attempt < 2 {
+                    (
+                        "409 Conflict",
+                        serde_json::json!({
+                            "ok": false,
+                            "error": SESSION_ACTIVE_OPERATION,
+                        })
+                        .to_string(),
+                    )
+                } else {
+                    (
+                        "200 OK",
+                        serde_json::json!({
+                            "session_id": session_id,
+                            "model": "gpt-5.6-sol",
+                            "provider": "openai-codex",
+                            "model_source": "session",
+                        })
+                        .to_string(),
+                    )
+                };
+                let response = format!(
+                    "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                socket
+                    .write_all(response.as_bytes())
+                    .await
+                    .expect("write model patch response");
+            }
+            requests
+        });
+
+        let client = DaemonClient::new(&format!("http://{address}")).expect("client");
+        let mut wait_notices = 0;
+        let saved = client
+            .set_session_model_when_idle(session_id, "gpt-5.6-sol", || wait_notices += 1)
+            .await
+            .expect("model persists after turn settles");
+
+        assert_eq!(saved.model, "gpt-5.6-sol");
+        assert_eq!(wait_notices, 1, "waiting is announced once, not per poll");
+        let requests = server.await.expect("mock server completed");
+        assert_eq!(requests.len(), 3);
+        assert!(requests.iter().all(|request| request.starts_with(&format!(
+            "PATCH /v1/agent/sessions/{session_id}/config HTTP/1.1"
+        ))));
+    }
+
+    #[tokio::test]
     async fn busy_409_decodes_typed_body_without_exposing_raw_http_error() {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
@@ -1409,7 +1507,7 @@ mod tests {
         let ws = "/tmp/ocean-tui-live-test";
         std::fs::create_dir_all(ws).unwrap();
         let sess = client
-            .create_agent_session_retrying(ws, |_, _| {})
+            .create_agent_session_retrying(ws, None, |_, _| {})
             .await
             .expect("mint session");
         println!("session: {}", sess.session_id);

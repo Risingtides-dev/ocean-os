@@ -13,7 +13,7 @@ use std::{
 };
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
-use ocean_agent_sdk::{AgentTurnEvent, AgentTurnId, ThinkingLevel, ToolCallId};
+use ocean_agent_sdk::{AgentTurnEvent, AgentTurnId, AgentTurnStatus, ThinkingLevel, ToolCallId};
 use ocean_core::{OceanEvent, PermissionId};
 use ratatui::{
     buffer::Buffer,
@@ -364,6 +364,15 @@ impl DictationUi {
     }
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+enum QueuePauseOwner {
+    #[default]
+    None,
+    Terminal,
+    Recovery,
+    Interrupt,
+}
+
 #[derive(Default)]
 pub struct ChatComponent {
     /// Throughput of the LAST finished turn, exactly as the daemon reported
@@ -390,7 +399,7 @@ pub struct ChatComponent {
     pending_submission_id: Option<u64>,
     accepted_submission_id: Option<u64>,
     accepted_turn_id: Option<AgentTurnId>,
-    finished_while_awaiting_ack: Vec<AgentTurnId>,
+    finished_while_awaiting_ack: Vec<(AgentTurnId, AgentTurnStatus)>,
     /// Byte-index cursor position in the composer. `None` means trailing
     /// (at `input.len()`), which is also the Default so `chat_with` and
     /// direct `input = …` writes all self-seat at the end.
@@ -402,8 +411,19 @@ pub struct ChatComponent {
     /// visible across streaming growth, composer resize, and pinned cards.
     last_wrapped_rows: Option<u16>,
     last_viewport_rows: Option<u16>,
-    /// Prompts entered while a turn is active, submitted FIFO after each finish.
+    /// Prompts entered while a turn is active, submitted FIFO after a clean
+    /// completion. Cancellation, turn failure, or an in-flight model switch
+    /// pauses the queue so control actions cannot accidentally start more work.
     queued_prompts: VecDeque<String>,
+    queued_prompts_paused: bool,
+    /// Typed barrier ownership prevents Enter/probe/sync completion from
+    /// releasing a pending model save or a later failed/cancelled terminal.
+    queued_prompts_pause_owner: QueuePauseOwner,
+    /// Independently layered model barrier. Interrupt/terminal/recovery may sit
+    /// above it without destroying the exact generation the save must retire.
+    queued_prompts_model_generation: Option<u64>,
+    /// Monotonic identity source for new model barriers.
+    queued_prompts_pause_generation: u64,
     /// Highlighted row in the `/` command palette (see `slash_matches`).
     menu_sel: usize,
     /// Streaming markdown renderer + frozen-block cache for assistant text.
@@ -1873,6 +1893,7 @@ impl ChatComponent {
         self.accepted_turn_id = None;
         self.finished_while_awaiting_ack.clear();
         self.queued_prompts.clear();
+        self.clear_queue_pause();
         self.last_wrapped_rows = None;
         self.last_viewport_rows = None;
         self.scroll_back = 0;
@@ -1886,18 +1907,185 @@ impl ChatComponent {
     /// switches use `load_history` directly and intentionally drop this queue.
     pub fn load_synchronized_history(&mut self, msgs: Vec<crate::shell::sessions::HistoryMsg>) {
         let queued = std::mem::take(&mut self.queued_prompts);
+        let queue_was_paused = self.queued_prompts_paused;
+        let queue_pause_owner = self.queued_prompts_pause_owner;
+        let queue_model_generation = self.queued_prompts_model_generation;
         self.load_history(msgs);
         self.queued_prompts = queued;
+        self.queued_prompts_paused = queue_was_paused;
+        self.queued_prompts_pause_owner = queue_pause_owner;
+        self.queued_prompts_model_generation = queue_model_generation;
         self.turns
             .extend(self.queued_prompts.iter().cloned().map(Turn::Queued));
     }
 
-    pub fn release_queued_prompt(&mut self) -> Option<Action> {
-        self.submit_next_queued_prompt()
+    fn refresh_queue_pause(&mut self) {
+        self.queued_prompts_paused = self.queued_prompts_pause_owner != QueuePauseOwner::None
+            || self.queued_prompts_model_generation.is_some();
+    }
+
+    fn clear_queue_pause(&mut self) {
+        self.queued_prompts_pause_owner = QueuePauseOwner::None;
+        self.queued_prompts_model_generation = None;
+        self.refresh_queue_pause();
+    }
+
+    fn clear_non_model_queue_pause(&mut self) {
+        self.queued_prompts_pause_owner = QueuePauseOwner::None;
+        self.refresh_queue_pause();
+    }
+
+    /// Abandon an exact model barrier when its unbound session mint definitely
+    /// failed, before Chat restores the rejected root. No work is submitted.
+    pub fn abandon_model_queued_prompt(&mut self, expected: u64) -> bool {
+        if self.queued_prompts_model_generation != Some(expected) {
+            return false;
+        }
+        self.queued_prompts_model_generation = None;
+        self.refresh_queue_pause();
+        true
+    }
+
+    /// Settle an exact failed model save without running queued work on the old
+    /// authority. Convert ordinary/recovery ownership to an explicit terminal
+    /// pause; a live interrupt/terminal owner already provides the stronger hold.
+    pub fn fail_model_queued_prompt(&mut self, expected: u64) -> bool {
+        if self.queued_prompts_model_generation != Some(expected) {
+            return false;
+        }
+        self.queued_prompts_model_generation = None;
+        if matches!(
+            self.queued_prompts_pause_owner,
+            QueuePauseOwner::None | QueuePauseOwner::Recovery
+        ) {
+            self.queued_prompts_pause_owner = QueuePauseOwner::Terminal;
+        }
+        self.refresh_queue_pause();
+        true
+    }
+
+    /// A successful model save retires only its exact layered barrier. A later
+    /// interrupt/terminal/recovery owner can keep the FIFO paused independently.
+    pub fn release_model_queued_prompt(&mut self, expected: u64) -> Option<Action> {
+        if self.queued_prompts_model_generation != Some(expected) {
+            return None;
+        }
+        self.queued_prompts_model_generation = None;
+        self.refresh_queue_pause();
+        if self.queued_prompts_paused {
+            None
+        } else {
+            self.submit_next_queued_prompt()
+        }
+    }
+
+    /// A fenced activity/sync result may retire only uncertainty ownership or
+    /// an ordinary unpaused FIFO. A layered model/terminal/interrupt barrier
+    /// remains authoritative.
+    pub fn release_recovered_queued_prompt(&mut self) -> Option<Action> {
+        if !matches!(
+            self.queued_prompts_pause_owner,
+            QueuePauseOwner::None | QueuePauseOwner::Recovery
+        ) {
+            return None;
+        }
+        self.clear_non_model_queue_pause();
+        if self.queued_prompts_paused {
+            None
+        } else {
+            self.submit_next_queued_prompt()
+        }
+    }
+
+    fn release_terminal_queued_prompt(&mut self) -> Option<Action> {
+        if self.queued_prompts_pause_owner != QueuePauseOwner::Terminal {
+            return None;
+        }
+        self.clear_non_model_queue_pause();
+        if self.queued_prompts_paused {
+            None
+        } else {
+            self.submit_next_queued_prompt()
+        }
+    }
+
+    /// A fenced idle snapshot after a stop means no cancellable operation is
+    /// left. Clear an empty interrupt owner, or convert it to a terminal pause so
+    /// retained follow-ups have the documented empty-Enter recovery path.
+    pub fn resolve_interrupt_after_idle_sync(&mut self) {
+        if self.queued_prompts_pause_owner != QueuePauseOwner::Interrupt {
+            return;
+        }
+        self.queued_prompts_pause_owner = if self.queued_prompts.is_empty() {
+            QueuePauseOwner::None
+        } else {
+            QueuePauseOwner::Terminal
+        };
+        self.refresh_queue_pause();
+    }
+
+    pub fn paused_queued_prompt_count(&self) -> usize {
+        if self.queued_prompts_paused {
+            self.queued_prompts.len()
+        } else {
+            0
+        }
+    }
+
+    fn pause_queued_prompts(&mut self, owner: QueuePauseOwner) {
+        // Set the barrier even when the queue is empty: the operator may enter
+        // a follow-up after requesting stop/model-switch but before the current
+        // turn settles, and that later prompt must inherit the pause.
+        self.queued_prompts_pause_owner = owner;
+        self.refresh_queue_pause();
+    }
+
+    pub fn pause_queued_prompts_for_model(&mut self) -> u64 {
+        self.queued_prompts_pause_generation = self.queued_prompts_pause_generation.wrapping_add(1);
+        let generation = self.queued_prompts_pause_generation;
+        // A model selection made after a terminal/interrupt/uncertainty outcome
+        // is an explicit recovery action and supersedes that non-model owner.
+        self.queued_prompts_pause_owner = QueuePauseOwner::None;
+        self.queued_prompts_model_generation = Some(generation);
+        self.refresh_queue_pause();
+        generation
+    }
+
+    fn pause_queued_prompts_for_terminal(&mut self) {
+        self.pause_queued_prompts(QueuePauseOwner::Terminal);
+    }
+
+    fn pause_queued_prompts_for_recovery(&mut self) {
+        // Outcome-unknown may arrive after a pre-ACK terminal event. Recovery
+        // uncertainty is weaker than an already-observed failed/cancelled
+        // terminal and must never make that barrier auto-releasable by a probe.
+        if self.queued_prompts_pause_owner != QueuePauseOwner::Terminal {
+            self.pause_queued_prompts(QueuePauseOwner::Recovery);
+        }
+    }
+
+    fn pause_queued_prompts_for_interrupt(&mut self) {
+        // A terminal event may beat HTTP acknowledgement. A later Esc cannot
+        // downgrade that observed failure/cancellation into an unreleasable
+        // pre-ACK interrupt owner.
+        if self.queued_prompts_pause_owner != QueuePauseOwner::Terminal {
+            self.pause_queued_prompts(QueuePauseOwner::Interrupt);
+        }
+    }
+
+    fn discard_queued_prompts(&mut self) -> usize {
+        let count = self.queued_prompts.len();
+        self.queued_prompts.clear();
+        // Stop owns the visible FIFO and non-model control layer, not a
+        // separately pending model commit. Preserve that exact generation so a
+        // future prompt still waits for durable model authority.
+        self.clear_non_model_queue_pause();
+        self.turns.retain(|turn| !matches!(turn, Turn::Queued(_)));
+        count
     }
 
     fn submit_next_queued_prompt(&mut self) -> Option<Action> {
-        if self.busy {
+        if self.busy || self.queued_prompts_paused {
             return None;
         }
         let prompt = self.queued_prompts.pop_front()?;
@@ -2191,13 +2379,22 @@ impl ChatComponent {
 
     pub fn acceptance_already_finished(&self, submission_id: u64, turn_id: AgentTurnId) -> bool {
         self.pending_submission_id == Some(submission_id)
-            && self.finished_while_awaiting_ack.contains(&turn_id)
+            && self
+                .finished_while_awaiting_ack
+                .iter()
+                .any(|(finished_id, _)| *finished_id == turn_id)
     }
 
     #[cfg(test)]
     pub fn seed_pending_submission_for_test(&mut self, submission_id: u64) {
         self.pending_submission_id = Some(submission_id);
         self.busy = true;
+    }
+
+    #[cfg(test)]
+    pub fn seed_queued_prompt_for_test(&mut self, prompt: &str) {
+        self.queued_prompts.push_back(prompt.to_string());
+        self.turns.push(Turn::Queued(prompt.to_string()));
     }
 
     /// Adopt authoritative knowledge that the bound session already has an
@@ -2415,11 +2612,25 @@ impl ChatComponent {
         let args = args.trim();
         match name {
             "/quit" => Some(Action::Quit),
+            "/stop" | "/abort" => {
+                let cleared = self.discard_queued_prompts();
+                if self.busy {
+                    self.pause_queued_prompts_for_interrupt();
+                    Some(Action::InterruptTurn)
+                } else {
+                    Some(Action::Status(if cleared == 0 {
+                        "nothing is running".into()
+                    } else {
+                        format!("stopped · {cleared} queued message(s) cleared")
+                    }))
+                }
+            }
             "/clear" => {
                 self.turns.clear();
                 self.md.clear();
                 self.clear_tool_ui_state();
                 self.queued_prompts.clear();
+                self.clear_queue_pause();
                 self.last_wrapped_rows = None;
                 self.last_viewport_rows = None;
                 self.scroll_back = 0;
@@ -2466,6 +2677,7 @@ impl ChatComponent {
                 self.pinned = None;
                 self.pinned_visible = true;
                 self.queued_prompts.clear();
+                self.clear_queue_pause();
                 self.last_wrapped_rows = None;
                 self.last_viewport_rows = None;
                 self.scroll_back = 0;
@@ -3095,6 +3307,7 @@ impl Component for ChatComponent {
                         self.md.clear();
                         self.clear_tool_ui_state();
                         self.queued_prompts.clear();
+                        self.clear_queue_pause();
                         self.last_wrapped_rows = None;
                         self.last_viewport_rows = None;
                         self.scroll_back = 0;
@@ -3252,7 +3465,22 @@ impl Component for ChatComponent {
             (KeyCode::Enter, _) => {
                 let text = self.input.trim().to_string();
                 if text.is_empty() {
-                    return None;
+                    return if self.busy {
+                        None
+                    } else {
+                        self.release_terminal_queued_prompt()
+                    };
+                }
+                // A markdown backtick accidentally prefixed the real incident's
+                // stop command. Stop/abort are control-only and safe to recover;
+                // never send that typo to the model as another queued prompt.
+                if matches!(text.as_str(), "`/stop" | "`/stop`" | "`/abort" | "`/abort`") {
+                    let command = if text.contains("abort") {
+                        "/abort"
+                    } else {
+                        "/stop"
+                    };
+                    return self.run_slash(command, "");
                 }
                 if text.starts_with('/') {
                     let (name, args) = match text.split_once(char::is_whitespace) {
@@ -3281,7 +3509,7 @@ impl Component for ChatComponent {
                         return Some(Action::Status(hint));
                     }
                 }
-                if self.busy {
+                if self.busy || self.queued_prompts_paused {
                     self.history.push(&text);
                     self.reset_history_nav();
                     self.input.clear();
@@ -3301,6 +3529,7 @@ impl Component for ChatComponent {
                 self.scroll_back = 0;
                 self.turns.push(Turn::User(text.clone()));
                 self.busy = true;
+                self.clear_queue_pause();
                 self.next_submission_id = self.next_submission_id.wrapping_add(1);
                 let submission_id = self.next_submission_id;
                 self.pending_submission_id = Some(submission_id);
@@ -3529,6 +3758,13 @@ impl Component for ChatComponent {
             _ => {}
         }
 
+        if matches!(action, Action::InterruptTurn) {
+            // A stop request is an operator control barrier. App creates the
+            // model-change barrier directly so it can retain the exact
+            // generation that a later successful save is allowed to release.
+            self.pause_queued_prompts_for_interrupt();
+        }
+
         // The turn (or its session mint) never reached the daemon, even after
         // the blip-retry window: unwind the spinner, say so in the transcript,
         // and put the prompt back in the composer so nothing typed is lost.
@@ -3542,18 +3778,42 @@ impl Component for ChatComponent {
                 return None;
             }
             self.busy = false;
+            // Definite pre-execution rejection is not a failed turn. A pre-ACK
+            // stop/uncertainty owner is moot because no request exists, but an
+            // independently layered model save remains authoritative.
+            self.clear_non_model_queue_pause();
+            let model_pin_pending = self.queued_prompts_model_generation.is_some();
             let msg = errfmt::humanize(err);
             let prefix = if errfmt::is_connect_shaped(err) {
                 "couldn't reach the daemon"
             } else {
                 "turn could not start"
             };
+            let recovery = if model_pin_pending {
+                "Your prompt is first in the queue behind the model pin."
+            } else {
+                "Your prompt is back in the composer."
+            };
             self.turns.push(Turn::Assistant(format!(
-                "{} {prefix} — {msg}\n\nYour prompt is back in the composer.",
+                "{} {prefix} — {msg}\n\n{recovery}",
                 g("⚠", "!")
             )));
-            if self.input.is_empty() {
+            if model_pin_pending {
+                self.queued_prompts.push_front(prompt.clone());
+                let insert_at = self
+                    .turns
+                    .iter()
+                    .position(|turn| matches!(turn, Turn::Queued(_)))
+                    .unwrap_or(self.turns.len());
+                self.turns.insert(insert_at, Turn::Queued(prompt.clone()));
+            } else {
+                if !self.input.is_empty() {
+                    let draft = std::mem::take(&mut self.input);
+                    self.queued_prompts.push_back(draft.clone());
+                    self.turns.push(Turn::Queued(draft));
+                }
                 self.input = prompt.clone();
+                self.cursor = None;
             }
             self.scroll_back = 0;
             return None;
@@ -3591,8 +3851,11 @@ impl Component for ChatComponent {
         } = action
         {
             if self.pending_submission_id == Some(*submission_id) {
-                let finished_before_ack = self.finished_while_awaiting_ack.contains(turn_id);
-                if finished_before_ack {
+                let finished_before_ack = self
+                    .finished_while_awaiting_ack
+                    .iter()
+                    .find_map(|(finished_id, status)| (finished_id == turn_id).then_some(*status));
+                if finished_before_ack.is_some() {
                     self.pending_submission_id = None;
                     self.accepted_submission_id = None;
                     self.accepted_turn_id = None;
@@ -3605,8 +3868,22 @@ impl Component for ChatComponent {
                     self.accepted_turn_id = Some(*turn_id);
                 }
                 self.finished_while_awaiting_ack.clear();
-                if finished_before_ack {
-                    return self.submit_next_queued_prompt();
+                if let Some(status) = finished_before_ack {
+                    if let Some(next) = self.submit_next_queued_prompt() {
+                        return Some(next);
+                    }
+                    if self.queued_prompts_paused && !self.queued_prompts.is_empty() {
+                        let outcome = match status {
+                            AgentTurnStatus::Cancelled => "interrupted",
+                            AgentTurnStatus::Failed => "failed",
+                            AgentTurnStatus::Completed => "completed",
+                            AgentTurnStatus::Queued | AgentTurnStatus::Running => "stopped",
+                        };
+                        return Some(Action::Status(format!(
+                            "turn {outcome} · {} queued message(s) paused · Enter runs next",
+                            self.queued_prompts.len()
+                        )));
+                    }
                 }
             }
             return None;
@@ -3625,6 +3902,7 @@ impl Component for ChatComponent {
             self.accepted_submission_id = None;
             self.accepted_turn_id = None;
             self.finished_while_awaiting_ack.clear();
+            self.pause_queued_prompts_for_recovery();
             // HTTP acknowledgement and the authoritative session stream are
             // independent. A TurnStarted may already have arrived, or the
             // daemon may still be executing even though the ACK socket closed.
@@ -3814,7 +4092,7 @@ impl Component for ChatComponent {
                     } else if self.pending_submission_id.is_some()
                         && self.accepted_submission_id.is_none()
                     {
-                        self.finished_while_awaiting_ack.push(*turn_id);
+                        self.finished_while_awaiting_ack.push((*turn_id, *status));
                         if self.finished_while_awaiting_ack.len() > 4 {
                             self.finished_while_awaiting_ack.remove(0);
                         }
@@ -3823,11 +4101,12 @@ impl Component for ChatComponent {
                         self.busy = false;
                     }
                     self.last_tok_per_s = *tokens_per_second;
-                    if matches!(status, ocean_agent_sdk::AgentTurnStatus::Cancelled) {
+                    let cancelled = matches!(status, ocean_agent_sdk::AgentTurnStatus::Cancelled);
+                    let failed = matches!(status, ocean_agent_sdk::AgentTurnStatus::Failed)
+                        || error.is_some();
+                    if cancelled {
                         self.turns.push(Turn::Interrupted);
-                    } else if matches!(status, ocean_agent_sdk::AgentTurnStatus::Failed)
-                        || error.is_some()
-                    {
+                    } else if failed {
                         let note = if let Some(e) = error {
                             format!(
                                 "{} turn failed — {}",
@@ -3839,8 +4118,37 @@ impl Component for ChatComponent {
                         };
                         self.turns.push(Turn::ErrorNotice { note });
                     }
-                    if let Some(next) = self.submit_next_queued_prompt() {
-                        return Some(next);
+                    if cancelled || failed {
+                        self.pause_queued_prompts_for_terminal();
+                        if !self.busy && !self.queued_prompts.is_empty() {
+                            let outcome = if cancelled { "interrupted" } else { "failed" };
+                            return Some(Action::Status(format!(
+                                "turn {outcome} · {} queued message(s) paused · Enter runs next",
+                                self.queued_prompts.len()
+                            )));
+                        }
+                    } else {
+                        if self.queued_prompts_pause_owner == QueuePauseOwner::Interrupt {
+                            // The stop lost the race to a clean completion. Keep
+                            // the operator's no-more-work intent, but convert it
+                            // to the terminal barrier that empty Enter can
+                            // explicitly release instead of leaving an
+                            // unreleasable Interrupt owner behind.
+                            self.pause_queued_prompts_for_terminal();
+                            if !self.queued_prompts.is_empty() {
+                                return Some(Action::Status(format!(
+                                    "turn completed before interrupt · {} queued message(s) paused · Enter runs next",
+                                    self.queued_prompts.len()
+                                )));
+                            }
+                        } else {
+                            if self.queued_prompts_pause_owner == QueuePauseOwner::Recovery {
+                                self.clear_non_model_queue_pause();
+                            }
+                            if let Some(next) = self.submit_next_queued_prompt() {
+                                return Some(next);
+                            }
+                        }
                     }
                 }
                 AgentTurnEvent::Extension {
@@ -7063,6 +7371,7 @@ mod tests {
         else {
             panic!("expected tagged submission");
         };
+        chat.update(&Action::InterruptTurn);
         chat.update(&Action::TurnSendFailed {
             submission_id,
             prompt: "hi".into(),
@@ -7076,6 +7385,11 @@ mod tests {
             msg.contains("couldn't reach the daemon"),
             "connect error should use daemon prefix, got: {msg}"
         );
+        assert_eq!(chat.input, "hi");
+        assert!(matches!(
+            chat.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+            Some(Action::SubmitPrompt { prompt, .. }) if prompt == "hi"
+        ));
     }
 
     #[test]
@@ -7200,6 +7514,244 @@ mod tests {
     }
 
     #[test]
+    fn cancellation_pauses_follow_ups_until_explicit_empty_enter() {
+        let mut chat = ChatComponent {
+            input: "do this after".into(),
+            busy: true,
+            ..Default::default()
+        };
+        let queued = chat.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(matches!(queued, Some(Action::Status(_))));
+
+        let interrupt = chat.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert!(matches!(interrupt, Some(Action::InterruptTurn)));
+        chat.update(&Action::InterruptTurn);
+        let terminal = chat.update(&turn_finished(AgentTurnStatus::Cancelled, None));
+
+        assert!(matches!(terminal, Some(Action::Status(message)) if message.contains("paused")));
+        assert!(!chat.is_busy());
+        assert!(chat.queued_prompts_paused);
+        assert_eq!(
+            chat.queued_prompts.front().map(String::as_str),
+            Some("do this after")
+        );
+
+        let resumed = chat.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(matches!(
+            resumed,
+            Some(Action::SubmitPrompt { prompt, .. }) if prompt == "do this after"
+        ));
+    }
+
+    #[test]
+    fn failed_turn_pauses_follow_ups_instead_of_retry_storming() {
+        let mut chat = ChatComponent {
+            input: "queued behind failure".into(),
+            busy: true,
+            ..Default::default()
+        };
+        let _ = chat.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+
+        let terminal = chat.update(&turn_finished(
+            AgentTurnStatus::Failed,
+            Some("provider authentication failed"),
+        ));
+
+        assert!(
+            matches!(terminal, Some(Action::Status(message)) if message.contains("failed") && message.contains("paused"))
+        );
+        assert!(chat.queued_prompts_paused);
+        assert_eq!(chat.queued_prompts.len(), 1);
+        assert!(!chat.is_busy());
+    }
+
+    #[test]
+    fn model_switch_holds_fifo_until_the_save_path_releases_it() {
+        let mut chat = ChatComponent {
+            busy: true,
+            ..Default::default()
+        };
+        let model_pause = chat.pause_queued_prompts_for_model();
+        chat.input = "run on the new model".into();
+        let _ = chat.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+
+        assert!(chat
+            .update(&turn_finished(AgentTurnStatus::Completed, None))
+            .is_none());
+        assert!(chat.queued_prompts_paused);
+        assert!(chat
+            .handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+            .is_none());
+        assert!(chat.release_recovered_queued_prompt().is_none());
+        assert_eq!(chat.paused_queued_prompt_count(), 1);
+        let released = chat.release_model_queued_prompt(model_pause);
+        assert!(matches!(
+            released,
+            Some(Action::SubmitPrompt { prompt, .. }) if prompt == "run on the new model"
+        ));
+    }
+
+    #[test]
+    fn later_terminal_pause_beats_earlier_model_save_release() {
+        for status in [AgentTurnStatus::Failed, AgentTurnStatus::Cancelled] {
+            let mut chat = ChatComponent {
+                busy: true,
+                ..Default::default()
+            };
+            let model_pause = chat.pause_queued_prompts_for_model();
+            chat.input = "must remain paused".into();
+            let _ = chat.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+            let error = matches!(status, AgentTurnStatus::Failed).then_some("provider failed");
+
+            let _ = chat.update(&turn_finished(status, error));
+            assert!(chat.release_model_queued_prompt(model_pause).is_none());
+            assert!(chat.release_recovered_queued_prompt().is_none());
+            assert_eq!(chat.paused_queued_prompt_count(), 1);
+            assert!(!chat.is_busy());
+            chat.input = "also stays paused".into();
+            assert!(matches!(
+                chat.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+                Some(Action::Status(message)) if message.contains("queued")
+            ));
+            assert_eq!(chat.paused_queued_prompt_count(), 2);
+            assert!(!chat.is_busy());
+
+            // A model selection made AFTER the terminal outcome is an explicit
+            // recovery action and may release the newer barrier.
+            let recovery_pause = chat.pause_queued_prompts_for_model();
+            assert!(matches!(
+                chat.release_model_queued_prompt(recovery_pause),
+                Some(Action::SubmitPrompt { prompt, .. }) if prompt == "must remain paused"
+            ));
+        }
+    }
+
+    #[test]
+    fn stop_clears_fifo_but_preserves_pending_model_layer() {
+        let mut chat = ChatComponent {
+            busy: true,
+            ..Default::default()
+        };
+        let model_generation = chat.pause_queued_prompts_for_model();
+        chat.input = "old queued".into();
+        let _ = chat.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+
+        let stop = chat.run_slash("/stop", "").expect("interrupt action");
+        chat.update(&stop);
+        assert!(chat.queued_prompts.is_empty());
+        let _ = chat.update(&turn_finished(AgentTurnStatus::Cancelled, None));
+        chat.input = "future work".into();
+        let _ = chat.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert_eq!(chat.paused_queued_prompt_count(), 1);
+        assert!(chat
+            .handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+            .is_none());
+        assert_eq!(chat.paused_queued_prompt_count(), 1);
+        assert!(matches!(
+            chat.release_model_queued_prompt(model_generation),
+            Some(Action::SubmitPrompt { prompt, .. }) if prompt == "future work"
+        ));
+    }
+
+    #[test]
+    fn idle_sync_resolves_interrupt_owner_after_outcome_unknown_stop() {
+        let mut stopped = ChatComponent {
+            input: "root".into(),
+            ..Default::default()
+        };
+        let Some(Action::SubmitPrompt { submission_id, .. }) =
+            stopped.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+        else {
+            panic!("expected root submission");
+        };
+        stopped.update(&Action::TurnOutcomeUnknown {
+            submission_id,
+            session_id: AgentSessionId(Uuid::from_u128(9940)),
+            err: "ack lost".into(),
+        });
+        let stop = stopped.run_slash("/stop", "").expect("stop action");
+        stopped.update(&stop);
+        stopped.load_synchronized_history(Vec::new());
+        stopped.resolve_interrupt_after_idle_sync();
+        stopped.input = "future".into();
+        assert!(matches!(
+            stopped.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+            Some(Action::SubmitPrompt { prompt, .. }) if prompt == "future"
+        ));
+
+        let mut escaped = ChatComponent {
+            input: "root".into(),
+            ..Default::default()
+        };
+        let Some(Action::SubmitPrompt { submission_id, .. }) =
+            escaped.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+        else {
+            panic!("expected root submission");
+        };
+        escaped.input = "follow-up".into();
+        let _ = escaped.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        escaped.update(&Action::TurnOutcomeUnknown {
+            submission_id,
+            session_id: AgentSessionId(Uuid::from_u128(9941)),
+            err: "ack lost".into(),
+        });
+        escaped.update(&Action::InterruptTurn);
+        escaped.load_synchronized_history(Vec::new());
+        escaped.resolve_interrupt_after_idle_sync();
+        assert!(escaped.release_recovered_queued_prompt().is_none());
+        assert!(matches!(
+            escaped.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+            Some(Action::SubmitPrompt { prompt, .. }) if prompt == "follow-up"
+        ));
+    }
+
+    #[test]
+    fn completed_turn_converts_interrupt_to_releasable_terminal_pause() {
+        let mut chat = ChatComponent {
+            busy: true,
+            ..Default::default()
+        };
+        chat.input = "wait".into();
+        let _ = chat.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        chat.update(&Action::InterruptTurn);
+
+        let outcome = chat.update(&turn_finished(AgentTurnStatus::Completed, None));
+
+        assert!(
+            matches!(outcome, Some(Action::Status(message)) if message.contains("completed before interrupt"))
+        );
+        assert!(!chat.is_busy());
+        assert!(matches!(
+            chat.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+            Some(Action::SubmitPrompt { prompt, .. }) if prompt == "wait"
+        ));
+    }
+
+    #[test]
+    fn stop_and_markdown_prefixed_stop_clear_the_fifo_before_interrupting() {
+        for command in ["/stop", "`/stop"] {
+            let mut chat = ChatComponent {
+                busy: true,
+                ..Default::default()
+            };
+            for prompt in ["first", "second"] {
+                chat.input = prompt.into();
+                let _ = chat.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+            }
+            chat.input = command.into();
+
+            let action = chat.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+
+            assert!(matches!(action, Some(Action::InterruptTurn)));
+            assert!(chat.queued_prompts.is_empty());
+            assert!(!chat
+                .turns
+                .iter()
+                .any(|turn| matches!(turn, Turn::Queued(_))));
+        }
+    }
+
+    #[test]
     fn queued_finish_before_ack_releases_fifo_after_acceptance() {
         let mut chat = ChatComponent {
             input: "root".into(),
@@ -7236,6 +7788,91 @@ mod tests {
     }
 
     #[test]
+    fn failed_or_cancelled_finish_before_ack_preserves_truthful_paused_status() {
+        for (index, status, expected) in [
+            (0_u128, AgentTurnStatus::Failed, "turn failed"),
+            (1_u128, AgentTurnStatus::Cancelled, "turn interrupted"),
+        ] {
+            let mut chat = ChatComponent {
+                input: "root".into(),
+                ..Default::default()
+            };
+            let Some(Action::SubmitPrompt { submission_id, .. }) =
+                chat.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+            else {
+                panic!("expected root submission");
+            };
+            chat.input = "follow-up".into();
+            let _ = chat.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+            let turn_id = AgentTurnId(Uuid::from_u128(9910 + index));
+            let error = matches!(status, AgentTurnStatus::Failed).then_some("provider failed");
+
+            assert!(chat
+                .update(&turn_finished_for(turn_id, status, error))
+                .is_none());
+            assert!(chat.is_busy(), "ACK is still unresolved");
+            chat.update(&Action::InterruptTurn);
+
+            let outcome = chat.update(&Action::TurnAccepted {
+                submission_id,
+                turn_id,
+            });
+            assert!(
+                matches!(outcome, Some(Action::Status(message)) if message.contains(expected) && message.contains("paused")),
+                "{status:?} must retain its real terminal outcome"
+            );
+            assert!(!chat.is_busy());
+            assert_eq!(chat.queued_prompts.len(), 1);
+            assert!(chat.queued_prompts_paused);
+            assert!(matches!(
+                chat.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+                Some(Action::SubmitPrompt { prompt, .. }) if prompt == "follow-up"
+            ));
+        }
+    }
+
+    #[test]
+    fn pre_ack_terminal_outcome_beats_later_unknown_probe_recovery() {
+        for (index, status) in [
+            (0_u128, AgentTurnStatus::Failed),
+            (1_u128, AgentTurnStatus::Cancelled),
+        ] {
+            let mut chat = ChatComponent {
+                input: "root".into(),
+                ..Default::default()
+            };
+            let Some(Action::SubmitPrompt { submission_id, .. }) =
+                chat.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+            else {
+                panic!("expected root submission");
+            };
+            chat.input = "follow-up".into();
+            let _ = chat.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+            let error = matches!(status, AgentTurnStatus::Failed).then_some("provider failed");
+            let _ = chat.update(&turn_finished_for(
+                AgentTurnId(Uuid::from_u128(9920 + index)),
+                status,
+                error,
+            ));
+
+            chat.update(&Action::TurnOutcomeUnknown {
+                submission_id,
+                session_id: AgentSessionId(Uuid::from_u128(9930 + index)),
+                err: "ack connection closed".into(),
+            });
+            assert!(chat.is_busy(), "probe still owns activity resolution");
+            chat.load_synchronized_history(Vec::new());
+
+            assert!(chat.release_recovered_queued_prompt().is_none());
+            assert_eq!(chat.paused_queued_prompt_count(), 1);
+            assert!(matches!(
+                chat.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+                Some(Action::SubmitPrompt { prompt, .. }) if prompt == "follow-up"
+            ));
+        }
+    }
+
+    #[test]
     fn definite_failures_and_busy_rejections_preserve_follow_up_fifo() {
         let mut failed = ChatComponent {
             input: "root".into(),
@@ -7261,6 +7898,15 @@ mod tests {
             .turns
             .iter()
             .any(|turn| matches!(turn, Turn::Queued(text) if text == "follow-up")));
+        assert!(matches!(
+            failed.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+            Some(Action::SubmitPrompt { prompt, .. }) if prompt == "root"
+        ));
+        assert_eq!(
+            failed.queued_prompts.front().map(String::as_str),
+            Some("follow-up"),
+            "retrying the definitely-unsent root preserves later FIFO"
+        );
 
         let mut busy = ChatComponent {
             input: "root".into(),
@@ -7294,6 +7940,107 @@ mod tests {
     }
 
     #[test]
+    fn definite_failure_preserves_new_draft_behind_restored_root() {
+        let mut chat = ChatComponent {
+            input: "root".into(),
+            ..Default::default()
+        };
+        let Some(Action::SubmitPrompt { submission_id, .. }) =
+            chat.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+        else {
+            panic!("expected root submission");
+        };
+        chat.input = "new draft".into();
+
+        chat.update(&Action::TurnSendFailed {
+            submission_id,
+            prompt: "root".into(),
+            err: "connect failed".into(),
+        });
+
+        assert_eq!(chat.input, "root");
+        assert_eq!(
+            chat.queued_prompts
+                .iter()
+                .map(String::as_str)
+                .collect::<Vec<_>>(),
+            vec!["new draft"]
+        );
+        assert!(matches!(
+            chat.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+            Some(Action::SubmitPrompt { prompt, .. }) if prompt == "root"
+        ));
+    }
+
+    #[test]
+    fn definite_failure_preserves_equal_text_as_a_distinct_draft() {
+        let mut chat = ChatComponent {
+            input: "same".into(),
+            ..Default::default()
+        };
+        let Some(Action::SubmitPrompt { submission_id, .. }) =
+            chat.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+        else {
+            panic!("expected root submission");
+        };
+        chat.input = "same".into();
+
+        chat.update(&Action::TurnSendFailed {
+            submission_id,
+            prompt: "same".into(),
+            err: "connect failed".into(),
+        });
+
+        assert_eq!(chat.input, "same");
+        assert_eq!(chat.queued_prompts.len(), 1);
+        assert_eq!(
+            chat.queued_prompts.front().map(String::as_str),
+            Some("same")
+        );
+    }
+
+    #[test]
+    fn definite_failure_preserves_model_barrier_and_retries_root_before_follow_up() {
+        let mut chat = ChatComponent {
+            input: "root".into(),
+            ..Default::default()
+        };
+        let Some(Action::SubmitPrompt { submission_id, .. }) =
+            chat.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+        else {
+            panic!("expected root submission");
+        };
+        let model_generation = chat.pause_queued_prompts_for_model();
+        chat.input = "follow-up".into();
+        let _ = chat.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        chat.update(&Action::InterruptTurn);
+
+        chat.update(&Action::TurnSendFailed {
+            submission_id,
+            prompt: "root".into(),
+            err: "connect failed".into(),
+        });
+
+        assert_eq!(
+            chat.queued_prompts
+                .iter()
+                .map(String::as_str)
+                .collect::<Vec<_>>(),
+            vec!["root", "follow-up"]
+        );
+        assert!(chat.input.is_empty());
+        assert!(chat.queued_prompts_paused);
+        assert!(matches!(
+            chat.release_model_queued_prompt(model_generation),
+            Some(Action::SubmitPrompt { prompt, .. }) if prompt == "root"
+        ));
+        assert_eq!(
+            chat.queued_prompts.front().map(String::as_str),
+            Some("follow-up")
+        );
+    }
+
+    #[test]
     fn fenced_same_session_history_preserves_busy_rejection_fifo() {
         let mut chat = ChatComponent {
             input: "root".into(),
@@ -7321,7 +8068,7 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec!["root", "follow-up"]
         );
-        let next = chat.release_queued_prompt();
+        let next = chat.release_recovered_queued_prompt();
         assert!(matches!(
             next,
             Some(Action::SubmitPrompt { prompt, .. }) if prompt == "root"

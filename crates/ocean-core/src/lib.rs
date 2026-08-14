@@ -262,6 +262,9 @@ pub struct SessionSyncSnapshot {
     pub session_id: SessionId,
     pub model: String,
     pub provider: String,
+    /// Monotonic persisted model-config revision. Legacy sessions begin at 0.
+    #[serde(default)]
+    pub config_revision: u64,
     #[serde(default)]
     pub transcript: Vec<SessionTranscriptEntry>,
     /// Visible user/assistant rows omitted from the front by response bounds.
@@ -424,6 +427,9 @@ pub struct SessionDetail {
     pub updated_ms: i64,
     pub model: String,
     pub provider: String,
+    /// Monotonic persisted model-config revision. Legacy sessions begin at 0.
+    #[serde(default)]
+    pub config_revision: u64,
     pub turns: u32,
     pub title: String,
     pub state: SessionRunState,

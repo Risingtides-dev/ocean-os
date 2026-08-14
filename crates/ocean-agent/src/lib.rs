@@ -1782,6 +1782,18 @@ impl AgentRuntime {
         cwd: &str,
         client_type: Option<String>,
     ) -> anyhow::Result<(SessionId, String, Option<String>)> {
+        self.create_session_with_model(cwd, client_type, None)
+    }
+
+    /// Atomically mint a session with an optional already-resolved catalog
+    /// model/provider pair. Explicit model creation advances config revision to
+    /// one in the same persisted write; no post-create PATCH window exists.
+    pub fn create_session_with_model(
+        &self,
+        cwd: &str,
+        client_type: Option<String>,
+        initial_model: Option<(String, String)>,
+    ) -> anyhow::Result<(SessionId, String, Option<String>)> {
         anyhow::ensure!(
             !cwd.trim().is_empty(),
             "cannot create a session: no working directory to bind it to"
@@ -1793,6 +1805,9 @@ impl AgentRuntime {
         // already be steering).
         let session_id = SessionId::new_v4();
         let mut session = session::Session::new_with_id(session_id, &snapshot.model);
+        if let Some((model, provider)) = initial_model {
+            session.set_model(model, provider);
+        }
         session.bind_workspace(Path::new(cwd));
         if client_type.is_some() {
             session.client_type = client_type.clone();

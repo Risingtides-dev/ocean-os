@@ -8,6 +8,9 @@ pub struct Session {
     pub updated_ms: i64,
     pub model: String,
     pub provider: String,
+    /// Monotonic model-config authority. Legacy session files deserialize at 0.
+    #[serde(default)]
+    pub config_revision: u64,
     pub messages: Vec<Message>,
     /// Workspace anchor — git toplevel if the cwd is inside a repo,
     /// else the cwd itself. Used to bucket sessions per project.
@@ -60,6 +63,7 @@ impl Session {
             updated_ms: now,
             model: model.id.clone(),
             provider: model.provider.clone(),
+            config_revision: 0,
             messages: Vec::new(),
             workspace_root: None,
             cwd: None,
@@ -105,6 +109,7 @@ impl Session {
     pub fn set_model(&mut self, model: String, provider: String) {
         self.model = model;
         self.provider = provider;
+        self.config_revision = self.config_revision.saturating_add(1);
         self.updated_ms = ocean_protocol::now_ms();
     }
 
@@ -1164,6 +1169,7 @@ pub(crate) fn session_detail(session: Session) -> SessionDetail {
         updated_ms: session.updated_ms,
         model: session.model,
         provider: session.provider,
+        config_revision: session.config_revision,
         turns: session.messages.len() as u32,
         title,
         state: SessionRunState::Stored,
@@ -1271,6 +1277,7 @@ pub(crate) fn session_sync_snapshot(session: &Session) -> ocean_core::SessionSyn
         session_id: session.id,
         model: session.model.clone(),
         provider: session.provider.clone(),
+        config_revision: session.config_revision,
         truncated_messages: visible_count.saturating_sub(transcript.len()) as u64,
         truncated_text_bytes,
         transcript,
@@ -1423,6 +1430,31 @@ fn truncate_title(text: &str) -> String {
 }
 
 #[cfg(test)]
+mod config_revision_tests {
+    use super::*;
+
+    #[test]
+    fn legacy_session_revision_defaults_to_zero_and_model_pins_advance_it() {
+        let mut session: Session = serde_json::from_value(serde_json::json!({
+            "id": SessionId::new_v4(),
+            "created_ms": 1,
+            "updated_ms": 1,
+            "model": "legacy-model",
+            "provider": "legacy-provider",
+            "messages": []
+        }))
+        .expect("legacy session remains readable");
+
+        assert_eq!(session.config_revision, 0);
+        session.set_model("model-a".into(), "provider-a".into());
+        session.set_model("model-b".into(), "provider-b".into());
+        assert_eq!(session.config_revision, 2);
+        assert_eq!(session.model, "model-b");
+        assert_eq!(session.provider, "provider-b");
+    }
+}
+
+#[cfg(test)]
 mod history_search_tests {
     use super::*;
 
@@ -1433,6 +1465,7 @@ mod history_search_tests {
             updated_ms: 100,
             model: "fake".into(),
             provider: "fake".into(),
+            config_revision: 0,
             messages,
             workspace_root: Some("/tmp/history-workspace".into()),
             cwd: Some("/tmp/history-workspace".into()),

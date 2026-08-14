@@ -193,6 +193,7 @@ mod tests {
                     session_id,
                     model: "deepseek-v4-pro".into(),
                     provider: "deepseek".into(),
+                    config_revision: 1,
                 },
                 "session_config_changed",
             ),

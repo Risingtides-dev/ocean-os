@@ -53,7 +53,14 @@ This crate owns the long-running Ocean HTTP service on `:4780`, including API ro
 - Product turns and legacy/call turns (legacy requests pin a session id before
   admission) take the shared non-blocking session operation lease before
   `TurnStarted`, invalidation, or request registration and retain it through
-  persistence plus terminal publication. Durable-room turns wait on the same
+  persistence plus terminal publication. The registry's exact terminal
+  transition is authoritative for the agent-rail `TurnFinished`: a cancel race
+  must publish `Cancelled` with no failure error even when the runtime result
+  was res-derived as failed or completed, and an orphan guard that settles a
+  cancelling task must emit the matching cancelled terminal frame rather than
+  leaving the agent rail open. Repeated settlement of an already-terminal
+  cancelled request must not refire the terminal callback or emit another frame.
+  Durable-room turns wait on the same
   lane after their durable queued footprint and before request registration, so
   a committed trigger is never dropped. An ordinary product turn registers its
   request, mints terminal authority, and constructs/captures the orphan guard
@@ -74,11 +81,19 @@ This crate owns the long-running Ocean HTTP service on `:4780`, including API ro
   snapshot/fence, and rejects a busy lease with 409. Only genuine absence maps
   to 404; unreadable/internal errors are sanitized 500s and provider failures
   remain `200 ok:false`. No model compaction logic belongs in the daemon.
+- `POST /v1/agent/sessions` accepts an optional catalog model and persists that
+  model/provider atomically with the new session at `config_revision: 1` before
+  returning or publishing `SessionCreated`; unknown model ids fail 400 without
+  creating a session. This is the first-turn pin path, not a create→PATCH pair.
 - Session-config RPC v1 is `GET/PATCH /v1/agent/sessions/{id}/config`;
   PATCH accepts strict model-only JSON (malformed or extra-key bodies return
   exact `400 {"ok":false,"error":"invalid_request"}`), persists the catalog
-  model/provider pair, and emits one session-scoped `SessionConfigChanged`.
-  Permission state is read-only and `permission_mode.env_override` is a boolean
+  model/provider pair plus a monotonic legacy-default-zero `config_revision`,
+  returns that revision from GET/PATCH and synchronized snapshots, and emits it
+  on exactly one session-scoped `SessionConfigChanged`.
+  Model metadata does not mutate transcript history, so this route must not also
+  emit the generic `ocean.session_changed` sync invalidation. Permission state
+  is read-only and `permission_mode.env_override` is a boolean
   presence flag. Only
   absent sessions map to 404; corrupt/internal reads and writes return sanitized
   500s. Turn selection is explicit model > resolved role > named-agent model >

@@ -424,6 +424,31 @@ struct SpaceHold {
     started: bool,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ModelConfigTaskKind {
+    Load,
+    Save,
+}
+
+struct ModelConfigTask {
+    session_id: AgentSessionId,
+    generation: u64,
+    kind: ModelConfigTaskKind,
+    queue_pause_generation: Option<u64>,
+    handle: tokio::task::JoinHandle<()>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct PendingModelPin {
+    /// `None` only while the first session is still being created.
+    session_id: Option<AgentSessionId>,
+    model: String,
+    /// Local selection generation. An event may independently retire this pin
+    /// only while the task for this exact latest generation still owns it.
+    generation: u64,
+    queue_pause_generation: u64,
+}
+
 pub struct App {
     client: DaemonClient,
     workspace_root: String,
@@ -440,9 +465,13 @@ pub struct App {
     center: Center,
     focus: Focus,
     session_id: Option<AgentSessionId>,
-    /// Request id from the bound session's latest authoritative `TurnStarted`;
-    /// the daemon defines the agent turn id as this cancellable request id.
+    /// Request id from the bound session's latest authoritative `TurnStarted`
+    /// or accepted turn acknowledgement; the daemon defines the agent turn id
+    /// as this cancellable request id.
     active_request_id: Option<RequestId>,
+    /// Esc may land before either acknowledgement path exposes the request id.
+    /// Keep that stop intent armed and fire it the instant the id arrives.
+    interrupt_pending: bool,
     /// Monotonic identity for the current session binding. A→B→A rebinding
     /// cannot make an old completion current merely because the UUID matches.
     session_binding_generation: u64,
@@ -461,6 +490,19 @@ pub struct App {
     /// Invalidates late session-model GET/PATCH completions across rapid model
     /// picks and A→B→A session switches.
     model_config_generation: u64,
+    /// Latest monotonic daemon authority accepted for the bound session.
+    model_config_revision: Option<u64>,
+    /// Daemon-owned model at `model_config_revision`. While a newer local pin is
+    /// pending, `model_override` may remain optimistic but this value still
+    /// records external authority for response-order adjudication.
+    authoritative_model: Option<String>,
+    /// Latest session model read/save. Same-session saves serialize so an older
+    /// already-admitted PATCH cannot commit after a newer selection.
+    model_config_task: Option<ModelConfigTask>,
+    /// Local selection awaiting durable session authority. Revisioned events
+    /// remain observable while this optimistic selection is pending; the PATCH
+    /// response/event revision decides which authority is newest.
+    pending_model_pin: Option<PendingModelPin>,
     /// The live SSE subscription for `session_id`. Held so a session switch
     /// aborts the superseded stream instead of leaking it (a leaked stream
     /// kept pumping a stale session's events into the chat).
@@ -700,12 +742,17 @@ impl App {
             focus: Focus::Center,
             session_id: None,
             active_request_id: None,
+            interrupt_pending: false,
             session_binding_generation: 0,
             stream_generation: 0,
             session_activity_probe_generation: 0,
             herdr: HerdrReporter::from_env(),
             model_override: None,
             model_config_generation: 0,
+            model_config_revision: None,
+            authoritative_model: None,
+            model_config_task: None,
+            pending_model_pin: None,
             stream_task: None,
             health_task: None,
             status: String::new(),
@@ -1922,6 +1969,19 @@ impl App {
                 submission_id, err, ..
             } if self.chat.has_pending_submission(*submission_id) => {
                 self.pending_images.append(&mut self.in_flight_images);
+                self.active_request_id = None;
+                self.interrupt_pending = false;
+                if self.session_id.is_none() {
+                    if let Some(queue_generation) = self
+                        .pending_model_pin
+                        .as_ref()
+                        .filter(|pending| pending.session_id.is_none())
+                        .map(|pending| pending.queue_pause_generation)
+                    {
+                        self.pending_model_pin = None;
+                        self.chat.abandon_model_queued_prompt(queue_generation);
+                    }
+                }
                 self.set_notice(errfmt::humanize(err));
             }
             Action::TurnSessionBusy {
@@ -1949,11 +2009,24 @@ impl App {
                 turn_id,
             } if self.chat.has_pending_submission(*submission_id) => {
                 self.in_flight_images.clear();
-                if self
+                let already_finished = self
                     .chat
-                    .acceptance_already_finished(*submission_id, *turn_id)
-                {
+                    .acceptance_already_finished(*submission_id, *turn_id);
+                if already_finished {
+                    // The terminal event won the race; do not resurrect its id
+                    // as a live cancellation target after it already settled.
+                    self.active_request_id = None;
+                    self.interrupt_pending = false;
                     self.herdr.resolve_activity();
+                } else {
+                    // The acknowledgement is just as authoritative as
+                    // TurnStarted: its turn id is the daemon request id. This
+                    // closes the window where an immediate Esc had nothing it
+                    // could cancel.
+                    self.active_request_id = Some(turn_id.0);
+                    if self.interrupt_pending {
+                        follow_up = Some(Action::InterruptTurn);
+                    }
                 }
             }
             Action::TurnOutcomeUnknown {
@@ -2000,20 +2073,21 @@ impl App {
                 {
                     match result {
                         Ok(sync) => {
-                            let installed =
-                                sync.snapshot.as_ref().zip(sync.fence.as_ref()).is_some_and(
-                                    |(snapshot, fence)| {
-                                        self.install_synchronized_session(
-                                            *session_id,
-                                            *binding_generation,
-                                            snapshot,
-                                            fence,
-                                        )
-                                    },
-                                );
+                            let (installed, model_follow_up) =
+                                match sync.snapshot.as_ref().zip(sync.fence.as_ref()) {
+                                    Some((snapshot, fence)) => self.install_synchronized_session(
+                                        *session_id,
+                                        *binding_generation,
+                                        snapshot,
+                                        fence,
+                                        true,
+                                    ),
+                                    None => (false, None),
+                                };
                             if installed {
                                 self.herdr.resolve_activity();
-                                follow_up = self.chat.release_queued_prompt();
+                                follow_up = model_follow_up
+                                    .or_else(|| self.chat.release_recovered_queued_prompt());
                             }
                             if installed && *after_busy_rejection {
                                 self.set_notice(if follow_up.is_some() {
@@ -2196,18 +2270,17 @@ impl App {
                 self.compact_request_in_flight = false;
                 match result {
                     Ok(response) => {
-                        let installed = response
-                            .sync
-                            .as_ref()
-                            .zip(response.fence.as_ref())
-                            .is_some_and(|(snapshot, fence)| {
-                                self.install_synchronized_session(
+                        let (installed, model_follow_up) =
+                            match response.sync.as_ref().zip(response.fence.as_ref()) {
+                                Some((snapshot, fence)) => self.install_synchronized_session(
                                     *session_id,
                                     *binding_generation,
                                     snapshot,
                                     fence,
-                                )
-                            });
+                                    !follow_with_sync,
+                                ),
+                                None => (false, None),
+                            };
                         if installed && follow_with_sync {
                             self.begin_compact_reload(
                                 *session_id,
@@ -2216,7 +2289,8 @@ impl App {
                             );
                         } else if installed {
                             self.clear_compact_hold();
-                            follow_up = self.chat.release_queued_prompt();
+                            follow_up = model_follow_up
+                                .or_else(|| self.chat.release_recovered_queued_prompt());
                             if response.elided_messages == 0 {
                                 self.set_notice(
                                     "nothing to compact · recent context already protected".into(),
@@ -2285,20 +2359,21 @@ impl App {
                 }
                 match result {
                     Ok(sync) => {
-                        let installed =
-                            sync.snapshot.as_ref().zip(sync.fence.as_ref()).is_some_and(
-                                |(snapshot, fence)| {
-                                    self.install_synchronized_session(
-                                        *session_id,
-                                        *binding_generation,
-                                        snapshot,
-                                        fence,
-                                    )
-                                },
-                            );
+                        let (installed, model_follow_up) =
+                            match sync.snapshot.as_ref().zip(sync.fence.as_ref()) {
+                                Some((snapshot, fence)) => self.install_synchronized_session(
+                                    *session_id,
+                                    *binding_generation,
+                                    snapshot,
+                                    fence,
+                                    true,
+                                ),
+                                None => (false, None),
+                            };
                         if installed {
                             self.clear_compact_hold();
-                            follow_up = self.chat.release_queued_prompt();
+                            follow_up = model_follow_up
+                                .or_else(|| self.chat.release_recovered_queued_prompt());
                             self.set_notice("synchronized session context reloaded".into());
                         } else {
                             self.compact_refresh_required = true;
@@ -2319,6 +2394,7 @@ impl App {
             }
             Action::InterruptTurn => {
                 if let Some(request_id) = self.active_request_id {
+                    self.interrupt_pending = false;
                     self.set_notice("interrupt requested…".into());
                     let client = self.client.clone();
                     let tx = self.actions_tx.clone();
@@ -2327,8 +2403,14 @@ impl App {
                             client.cancel_request(request_id).await,
                         ));
                     });
+                } else if self.chat.is_busy() {
+                    self.interrupt_pending = true;
+                    self.set_notice(
+                        "stop armed · cancelling as soon as the turn is accepted".into(),
+                    );
                 } else {
-                    self.set_notice("turn is starting — no cancellable request id yet".into());
+                    self.interrupt_pending = false;
+                    self.set_notice("nothing is running".into());
                 }
             }
             Action::InterruptFinished(result) => match result {
@@ -2373,11 +2455,27 @@ impl App {
                     AgentTurnEvent::TurnStarted { turn_id, .. } => {
                         self.in_flight_images.clear();
                         self.active_request_id = Some(turn_id.0);
+                        if self.interrupt_pending {
+                            follow_up = Some(Action::InterruptTurn);
+                        }
                     }
-                    AgentTurnEvent::TurnFinished { turn_id, .. }
-                        if self.active_request_id == Some(turn_id.0) =>
-                    {
-                        self.active_request_id = None;
+                    AgentTurnEvent::TurnFinished { turn_id, .. } => {
+                        if self.active_request_id == Some(turn_id.0) {
+                            self.active_request_id = None;
+                            self.interrupt_pending = false;
+                        }
+                    }
+                    AgentTurnEvent::SessionConfigChanged {
+                        session_id,
+                        model,
+                        config_revision,
+                        ..
+                    } => {
+                        // Config changes have a dedicated scoped event and do
+                        // not invalidate transcript history. Reflect remote (or
+                        // our own in-flight) model pins without forcing a full
+                        // session sync that could reject a queued follow-up.
+                        self.observe_session_model_authority(*session_id, model, *config_revision);
                     }
                     _ => {}
                 }
@@ -2632,6 +2730,12 @@ impl App {
                 self.stream_generation = self.stream_generation.wrapping_add(1);
                 self.session_id = None;
                 self.active_request_id = None;
+                self.interrupt_pending = false;
+                self.abort_model_config_task();
+                self.pending_model_pin = None;
+                self.model_config_generation = self.model_config_generation.wrapping_add(1);
+                self.model_config_revision = None;
+                self.authoritative_model = None;
                 self.clear_compact_hold();
                 self.chat.load_history(Vec::new()); // clear the transcript
                 self.rail.live_id = None;
@@ -2684,6 +2788,12 @@ impl App {
                 self.stream_generation = self.stream_generation.wrapping_add(1);
                 self.session_id = None;
                 self.active_request_id = None;
+                self.interrupt_pending = false;
+                self.abort_model_config_task();
+                self.pending_model_pin = None;
+                self.model_config_generation = self.model_config_generation.wrapping_add(1);
+                self.model_config_revision = None;
+                self.authoritative_model = None;
                 self.clear_compact_hold();
                 self.center = Center::Chat;
                 self.focus_to(Focus::Center);
@@ -2729,25 +2839,96 @@ impl App {
                 None => self.set_notice("no session yet — send a message first".into()),
             },
             // `/model <id>`: update immediately, then pin the selection through
-            // daemon session-config authority. An unbound choice seeds the next
-            // session; its first turn persists the same model server-side.
+            // daemon session-config authority. An active turn owns the session
+            // lease, so the latest generation waits through that expected 409
+            // instead of snapping the picker back to the old model.
             Action::SetModel(id) => {
                 self.model_override = Some(id.clone());
                 self.model_config_generation = self.model_config_generation.wrapping_add(1);
                 if let Some(session_id) = self.session_id {
+                    let queue_pause_generation = self.chat.pause_queued_prompts_for_model();
                     let generation = self.model_config_generation;
-                    let requested = id.clone();
-                    let client = self.client.clone();
-                    let tx = self.actions_tx.clone();
-                    tokio::spawn(async move {
-                        let result = client.set_session_model(session_id, &requested).await;
-                        let _ = tx.send(Action::SessionModelResolved {
-                            session_id,
-                            generation,
-                            requested: Some(requested),
-                            result,
-                        });
+                    self.pending_model_pin = Some(PendingModelPin {
+                        session_id: Some(session_id),
+                        model: id.clone(),
+                        generation,
+                        queue_pause_generation,
                     });
+                    let save_already_running =
+                        self.model_config_task.as_ref().is_some_and(|task| {
+                            task.session_id == session_id && task.kind == ModelConfigTaskKind::Save
+                        });
+                    if !save_already_running {
+                        self.abort_model_config_task();
+                        self.start_session_model_save(
+                            session_id,
+                            id.clone(),
+                            generation,
+                            queue_pause_generation,
+                        );
+                    }
+                    self.set_notice(if self.chat.is_busy() {
+                        format!("model queued · {id} · waiting for current turn")
+                    } else if save_already_running {
+                        format!("model queued · {id} · waiting for prior save")
+                    } else {
+                        format!("saving model · {id}")
+                    });
+                } else if self.chat.is_busy() {
+                    // A choice made while first-session creation is already
+                    // running needs a post-bind pin and therefore owns a real
+                    // queue barrier.
+                    let queue_pause_generation = self.chat.pause_queued_prompts_for_model();
+                    self.pending_model_pin = Some(PendingModelPin {
+                        session_id: None,
+                        model: id.clone(),
+                        generation: self.model_config_generation,
+                        queue_pause_generation,
+                    });
+                    self.set_notice(format!("model queued · {id} · waiting for new session"));
+                } else {
+                    // No session or RPC exists yet. The selected model is carried
+                    // by first-session creation itself, so installing a save-owned
+                    // barrier here would deadlock that very first prompt.
+                    self.pending_model_pin = None;
+                    self.set_notice(format!("model selected · {id} · next session"));
+                }
+            }
+            Action::FinalizeObservedModelPin {
+                session_id,
+                model,
+                config_revision,
+                queue_pause_generation,
+            } => {
+                if self.session_id != Some(*session_id) {
+                    return;
+                }
+                if self.model_authority_matches(model, *config_revision) {
+                    self.model_override = Some(model.clone());
+                    follow_up = self
+                        .chat
+                        .release_model_queued_prompt(*queue_pause_generation);
+                    let paused = self.chat.paused_queued_prompt_count();
+                    self.set_notice(if paused > 0 {
+                        format!(
+                            "model pinned · {model} · {paused} queued message(s) remain paused · Enter runs next"
+                        )
+                    } else {
+                        format!("model pinned · {model}")
+                    });
+                } else {
+                    self.chat.fail_model_queued_prompt(*queue_pause_generation);
+                    if let Some(authoritative) = self.authoritative_model.clone() {
+                        self.model_override = Some(authoritative.clone());
+                        self.set_notice(format!(
+                            "model selection superseded · current model {authoritative} · queued messages remain paused · Enter runs next"
+                        ));
+                    } else {
+                        self.set_notice(
+                            "model selection superseded · queued messages remain paused · Enter runs next"
+                                .into(),
+                        );
+                    }
                 }
             }
             Action::SessionModelResolved {
@@ -2756,22 +2937,157 @@ impl App {
                 requested,
                 result,
             } => {
-                if self.session_id == Some(*session_id)
-                    && self.model_config_generation == *generation
-                {
+                let kind = if requested.is_some() {
+                    ModelConfigTaskKind::Save
+                } else {
+                    ModelConfigTaskKind::Load
+                };
+                if !self.model_task_matches(*session_id, *generation, kind) {
+                    return;
+                }
+                let queue_pause_generation = self
+                    .model_config_task
+                    .as_ref()
+                    .and_then(|task| task.queue_pause_generation);
+                self.model_config_task.take();
+                if self.session_id != Some(*session_id) {
+                    return;
+                }
+
+                if let Some(requested) = requested {
+                    if self.model_config_generation != *generation {
+                        if let Some(latest) =
+                            self.pending_model_pin_for_session(*session_id).cloned()
+                        {
+                            self.start_session_model_save(
+                                *session_id,
+                                latest.model,
+                                self.model_config_generation,
+                                latest.queue_pause_generation,
+                            );
+                        }
+                        return;
+                    }
                     match result {
                         Ok(config) if config.session_id == *session_id => {
-                            self.model_override = Some(config.model.clone());
-                            if requested.is_some() {
-                                self.set_notice(format!("model pinned · {}", config.model));
+                            self.apply_authoritative_session_model(
+                                *session_id,
+                                &config.model,
+                                config.config_revision,
+                            );
+                            let response_is_latest = config.model == *requested
+                                && self
+                                    .model_authority_matches(&config.model, config.config_revision);
+                            if self.pending_model_for_session(*session_id) == Some(requested) {
+                                self.pending_model_pin = None;
+                            }
+                            if response_is_latest {
+                                self.model_override = Some(config.model.clone());
+                                follow_up = queue_pause_generation.and_then(|generation| {
+                                    self.chat.release_model_queued_prompt(generation)
+                                });
+                                let paused = self.chat.paused_queued_prompt_count();
+                                self.set_notice(if paused > 0 {
+                                    format!(
+                                        "model pinned · {} · {paused} queued message(s) remain paused · Enter runs next",
+                                        config.model
+                                    )
+                                } else {
+                                    format!("model pinned · {}", config.model)
+                                });
+                            } else {
+                                if let Some(generation) = queue_pause_generation {
+                                    self.chat.fail_model_queued_prompt(generation);
+                                }
+                                if let Some(authoritative) = self.authoritative_model.clone() {
+                                    self.model_override = Some(authoritative.clone());
+                                    self.set_notice(format!(
+                                        "model selection superseded · current model {authoritative} · queued messages remain paused"
+                                    ));
+                                } else {
+                                    self.set_notice(
+                                        "model selection superseded · queued messages remain paused"
+                                            .into(),
+                                    );
+                                }
                             }
                         }
                         Ok(_) => {
-                            self.set_notice("model save returned the wrong session".into());
+                            self.set_notice(
+                                "model save returned the wrong session · verifying authority"
+                                    .into(),
+                            );
+                            self.reconcile_session_model_after_save_error(
+                                *session_id,
+                                requested.clone(),
+                            );
                         }
                         Err(error) => {
-                            self.set_notice(format!("model save failed · {error}"));
-                            self.load_session_model(*session_id);
+                            self.set_notice(format!(
+                                "model save acknowledgement failed · {error} · verifying authority"
+                            ));
+                            self.reconcile_session_model_after_save_error(
+                                *session_id,
+                                requested.clone(),
+                            );
+                        }
+                    }
+                } else if self.model_config_generation == *generation {
+                    match result {
+                        Ok(config) if config.session_id == *session_id => {
+                            let applied = self.apply_authoritative_session_model(
+                                *session_id,
+                                &config.model,
+                                config.config_revision,
+                            );
+                            if let Some(pending) =
+                                self.pending_model_pin_for_session(*session_id).cloned()
+                            {
+                                if applied
+                                    && self.model_authority_matches(
+                                        &pending.model,
+                                        config.config_revision,
+                                    )
+                                {
+                                    if let Some(queue_generation) = self.retire_matching_model_pin(
+                                        *session_id,
+                                        &pending.model,
+                                        config.config_revision,
+                                        true,
+                                    ) {
+                                        follow_up =
+                                            self.chat.release_model_queued_prompt(queue_generation);
+                                        self.set_notice(format!(
+                                            "model pinned · {}",
+                                            pending.model
+                                        ));
+                                    }
+                                } else if self.fail_pending_model_pin(*session_id) {
+                                    self.set_notice(format!(
+                                        "model save failed · current model {} · queued messages remain paused · Enter runs next",
+                                        config.model
+                                    ));
+                                }
+                            }
+                        }
+                        Ok(_) => {
+                            if self.fail_pending_model_pin(*session_id) {
+                                self.set_notice(
+                                    "model verification returned the wrong session · queued messages remain paused"
+                                        .into(),
+                                );
+                            } else {
+                                self.set_notice("model load returned the wrong session".into());
+                            }
+                        }
+                        Err(error) => {
+                            if self.fail_pending_model_pin(*session_id) {
+                                self.set_notice(format!(
+                                    "model verification failed · {error} · queued messages remain paused"
+                                ));
+                            } else {
+                                self.set_notice(format!("model load failed · {error}"));
+                            }
                         }
                     }
                 }
@@ -3201,7 +3517,15 @@ impl App {
         if herdr_event_is_current {
             self.herdr.observe(&action, self.session_id);
         }
-        if let Some(next) = self.chat.update(&action) {
+        let chat_follow_up = self.chat.update(&action);
+        // A terminal event for an adopted/pre-ACK turn may have no request id
+        // App can correlate. Once Chat proves there is no active turn left,
+        // retire the armed stop. While a newer submission is still busy, keep
+        // the intent: an unrelated older TurnFinished must not disarm it.
+        if self.interrupt_pending && !self.chat.is_busy() {
+            self.interrupt_pending = false;
+        }
+        if let Some(next) = chat_follow_up {
             self.dispatch(next);
         }
         if let Some(next) = self.tray.update(&action) {
@@ -3237,14 +3561,209 @@ impl App {
         self.apply_focus();
     }
 
+    fn abort_model_config_task(&mut self) {
+        if let Some(task) = self.model_config_task.take() {
+            task.handle.abort();
+        }
+    }
+
+    fn model_task_matches(
+        &self,
+        session_id: AgentSessionId,
+        generation: u64,
+        kind: ModelConfigTaskKind,
+    ) -> bool {
+        self.model_config_task.as_ref().is_some_and(|task| {
+            task.session_id == session_id && task.generation == generation && task.kind == kind
+        })
+    }
+
+    fn pending_model_pin_for_session(
+        &self,
+        session_id: AgentSessionId,
+    ) -> Option<&PendingModelPin> {
+        self.pending_model_pin.as_ref().filter(|pending| {
+            pending.session_id.is_none() || pending.session_id == Some(session_id)
+        })
+    }
+
+    fn pending_model_for_session(&self, session_id: AgentSessionId) -> Option<&str> {
+        self.pending_model_pin_for_session(session_id)
+            .map(|pending| pending.model.as_str())
+    }
+
+    fn start_session_model_save(
+        &mut self,
+        session_id: AgentSessionId,
+        requested: String,
+        generation: u64,
+        queue_pause_generation: u64,
+    ) {
+        debug_assert!(self.model_config_task.is_none());
+        let client = self.client.clone();
+        let tx = self.actions_tx.clone();
+        let task_requested = requested.clone();
+        let handle = tokio::spawn(async move {
+            let result = client
+                .set_session_model_when_idle(session_id, &task_requested, || {})
+                .await;
+            let _ = tx.send(Action::SessionModelResolved {
+                session_id,
+                generation,
+                requested: Some(task_requested),
+                result,
+            });
+        });
+        self.model_config_task = Some(ModelConfigTask {
+            session_id,
+            generation,
+            kind: ModelConfigTaskKind::Save,
+            queue_pause_generation: Some(queue_pause_generation),
+            handle,
+        });
+    }
+
+    /// Apply revisioned model authority from a scoped event, HTTP response, or
+    /// fenced snapshot. Older authorities can never overwrite newer ones. A
+    /// differing local pin remains optimistic in the footer while pending, but
+    /// the daemon-owned value is still recorded so its PATCH response can detect
+    /// that another surface superseded it.
+    fn apply_authoritative_session_model(
+        &mut self,
+        session_id: AgentSessionId,
+        model: &str,
+        config_revision: u64,
+    ) -> bool {
+        if self
+            .model_config_revision
+            .is_some_and(|current| current > config_revision)
+        {
+            return false;
+        }
+        if config_revision != 0
+            && self.model_config_revision == Some(config_revision)
+            && self
+                .authoritative_model
+                .as_deref()
+                .is_some_and(|current| current != model)
+        {
+            // Equal nonzero revisions with different payloads violate daemon
+            // authority; retain the first observed value rather than making
+            // arrival order authoritative. Revision zero is the additive-wire
+            // fallback for a legacy daemon and therefore cannot provide a fence.
+            return false;
+        }
+
+        self.model_config_revision = Some(config_revision);
+        self.authoritative_model = Some(model.to_string());
+        let preserve_pending_intent = self
+            .pending_model_pin_for_session(session_id)
+            .is_some_and(|pending| pending.model != model);
+        if !preserve_pending_intent {
+            self.model_override = Some(model.to_string());
+        }
+
+        let stale_load = self.model_config_task.as_ref().is_some_and(|task| {
+            task.session_id == session_id && task.kind == ModelConfigTaskKind::Load
+        });
+        let has_pending_pin = self.pending_model_pin_for_session(session_id).is_some();
+        if stale_load && !has_pending_pin {
+            // An ordinary event supersedes a plain binding GET. Reconciliation
+            // loads stay owned while any pending pin exists: a matching event's
+            // correlated retirement aborts it, while a differing event lets its
+            // bounded GET loop terminalize the final mismatch.
+            self.abort_model_config_task();
+            self.model_config_generation = self.model_config_generation.wrapping_add(1);
+        }
+        true
+    }
+
+    fn model_authority_matches(&self, model: &str, config_revision: u64) -> bool {
+        self.model_config_revision == Some(config_revision)
+            && self.authoritative_model.as_deref() == Some(model)
+    }
+
+    fn observe_session_model_authority(
+        &mut self,
+        session_id: AgentSessionId,
+        model: &str,
+        config_revision: u64,
+    ) {
+        if !self.apply_authoritative_session_model(session_id, model, config_revision) {
+            return;
+        }
+        let Some(queue_pause_generation) =
+            self.retire_matching_model_pin(session_id, model, config_revision, false)
+        else {
+            return;
+        };
+        // Do not recurse ahead of already-buffered B events. Queue the release
+        // behind the stream task's current FIFO so newer authority can win.
+        let _ = self.actions_tx.send(Action::FinalizeObservedModelPin {
+            session_id,
+            model: model.to_string(),
+            config_revision,
+            queue_pause_generation,
+        });
+    }
+
+    /// A matching revisioned event or fenced snapshot independently proves the
+    /// local pin durable. Retire its HTTP task and return the exact model-owned
+    /// queue token; the caller releases only after its own state installation is
+    /// safe (immediately for an event, after history replacement for a snapshot).
+    fn retire_matching_model_pin(
+        &mut self,
+        session_id: AgentSessionId,
+        model: &str,
+        config_revision: u64,
+        allow_completed_task: bool,
+    ) -> Option<u64> {
+        if !self.model_authority_matches(model, config_revision) {
+            return None;
+        }
+        let pending = self.pending_model_pin_for_session(session_id)?;
+        if pending.model != model {
+            return None;
+        }
+        let task_correlated = self.model_config_task.as_ref().is_some_and(|task| {
+            task.session_id == session_id
+                && task.generation == pending.generation
+                && task.generation == self.model_config_generation
+        });
+        if !allow_completed_task && !task_correlated {
+            return None;
+        }
+        let queue_pause_generation = pending.queue_pause_generation;
+        self.pending_model_pin = None;
+        if task_correlated {
+            self.abort_model_config_task();
+        }
+        self.model_override = Some(model.to_string());
+        Some(queue_pause_generation)
+    }
+
+    fn fail_pending_model_pin(&mut self, session_id: AgentSessionId) -> bool {
+        let Some(pending) = self.pending_model_pin_for_session(session_id).cloned() else {
+            return false;
+        };
+        self.pending_model_pin = None;
+        self.chat
+            .fail_model_queued_prompt(pending.queue_pause_generation);
+        if let Some(authoritative) = self.authoritative_model.clone() {
+            self.model_override = Some(authoritative);
+        }
+        true
+    }
+
     /// Refresh the model from the daemon-owned session record. The generation
     /// makes this safe across rapid session switches and model selections.
     fn load_session_model(&mut self, session_id: AgentSessionId) {
         self.model_config_generation = self.model_config_generation.wrapping_add(1);
+        self.abort_model_config_task();
         let generation = self.model_config_generation;
         let client = self.client.clone();
         let tx = self.actions_tx.clone();
-        tokio::spawn(async move {
+        let handle = tokio::spawn(async move {
             let result = client.session_config(session_id).await;
             let _ = tx.send(Action::SessionModelResolved {
                 session_id,
@@ -3252,6 +3771,65 @@ impl App {
                 requested: None,
                 result,
             });
+        });
+        self.model_config_task = Some(ModelConfigTask {
+            session_id,
+            generation,
+            kind: ModelConfigTaskKind::Load,
+            queue_pause_generation: None,
+            handle,
+        });
+    }
+
+    /// Reconcile a save whose HTTP acknowledgement failed. The server may still
+    /// commit and publish after the transport error, so retain the pending pin
+    /// while bounded GET retries give either persisted state or its scoped event
+    /// time to prove authority.
+    fn reconcile_session_model_after_save_error(
+        &mut self,
+        session_id: AgentSessionId,
+        requested: String,
+    ) {
+        debug_assert!(self.model_config_task.is_none());
+        let generation = self.model_config_generation;
+        let client = self.client.clone();
+        let tx = self.actions_tx.clone();
+        let handle = tokio::spawn(async move {
+            let mut last_result = Err("model reconciliation did not run".to_string());
+            for delay_ms in [100_u64, 250, 500, 1_000, 2_000] {
+                tokio::time::sleep(Duration::from_millis(delay_ms)).await;
+                let attempt = match tokio::time::timeout(
+                    Duration::from_secs(5),
+                    client.session_config(session_id),
+                )
+                .await
+                {
+                    Ok(result) => result,
+                    Err(_) => Err("model reconciliation timed out".into()),
+                };
+                let matched = matches!(
+                    &attempt,
+                    Ok(config)
+                        if config.session_id == session_id && config.model == requested
+                );
+                last_result = attempt;
+                if matched {
+                    break;
+                }
+            }
+            let _ = tx.send(Action::SessionModelResolved {
+                session_id,
+                generation,
+                requested: None,
+                result: last_result,
+            });
+        });
+        self.model_config_task = Some(ModelConfigTask {
+            session_id,
+            generation,
+            kind: ModelConfigTaskKind::Load,
+            queue_pause_generation: None,
+            handle,
         });
     }
 
@@ -3263,8 +3841,24 @@ impl App {
             // Switching/resuming replaces visible history. Increment even for
             // A→B→A or an explicit A→A resume so queued old envelopes cannot
             // become current merely because the UUID matches.
+            let preserve_pre_ack_interrupt = self.session_id.is_none()
+                && self.chat.has_pending_turn_submission()
+                && self.interrupt_pending;
             self.session_binding_generation = self.session_binding_generation.wrapping_add(1);
             self.active_request_id = None;
+            if !preserve_pre_ack_interrupt {
+                self.interrupt_pending = false;
+            }
+            self.model_config_revision = None;
+            self.authoritative_model = None;
+            if self.session_id != Some(id)
+                && self
+                    .pending_model_pin
+                    .as_ref()
+                    .is_some_and(|pending| pending.session_id.is_some())
+            {
+                self.pending_model_pin = None;
+            }
             self.clear_compact_hold();
         }
         if self.session_id == Some(id)
@@ -3280,7 +3874,27 @@ impl App {
         // subscription below — start it from a neutral SSE source.
         self.health.recover(HealthSource::Sse);
         self.session_id = Some(id);
-        self.load_session_model(id);
+        if let Some(pending) = self.pending_model_pin.as_mut() {
+            if pending.session_id.is_none() {
+                pending.session_id = Some(id);
+            }
+        }
+        if let Some(pending) = self.pending_model_pin_for_session(id).cloned() {
+            let save_running = self.model_config_task.as_ref().is_some_and(|task| {
+                task.session_id == id && task.kind == ModelConfigTaskKind::Save
+            });
+            if !save_running {
+                self.abort_model_config_task();
+                self.start_session_model_save(
+                    id,
+                    pending.model,
+                    self.model_config_generation,
+                    pending.queue_pause_generation,
+                );
+            }
+        } else {
+            self.load_session_model(id);
+        }
         self.stream_generation = self.stream_generation.wrapping_add(1);
         self.stream_task = Some(self.client.spawn_event_stream(
             id,
@@ -5119,6 +5733,12 @@ impl App {
         // event fence that proved this request target. Ordinary reconnects keep
         // it so Esc can still cancel the running turn.
         self.active_request_id = None;
+        // A replay reset invalidates the request id, not an operator's pre-ACK
+        // stop intent. Keep that intent armed while Chat still owns an active or
+        // outcome-unknown submission; fenced idle installation clears it.
+        if !self.chat.is_busy() {
+            self.interrupt_pending = false;
+        }
         if self.compact_request_in_flight
             && self.compacting_session == Some(session_id)
             && self.compact_binding_generation == binding_generation
@@ -5185,15 +5805,16 @@ impl App {
         binding_generation: u64,
         snapshot: &ocean_core::SessionSyncSnapshot,
         fence: &ocean_core::SessionEventFence,
-    ) -> bool {
+        retire_model_pin: bool,
+    ) -> (bool, Option<Action>) {
         if self.session_id != Some(session_id)
             || self.session_binding_generation != binding_generation
             || snapshot.session_id != session_id.0
         {
-            return false;
+            return (false, None);
         }
         let Some(event_id) = fence.event_id else {
-            return false;
+            return (false, None);
         };
         self.stream_generation = self.stream_generation.wrapping_add(1);
         let stream_generation = self.stream_generation;
@@ -5202,12 +5823,31 @@ impl App {
         }
         self.health.recover(HealthSource::Sse);
         let Ok(history) = crate::shell::sessions::history_from_sync_snapshot(snapshot) else {
-            return false;
+            return (false, None);
         };
+        let authority_applied = self.apply_authoritative_session_model(
+            session_id,
+            &snapshot.model,
+            snapshot.config_revision,
+        );
+        let model_release_generation = (retire_model_pin && authority_applied)
+            .then(|| {
+                self.retire_matching_model_pin(
+                    session_id,
+                    &snapshot.model,
+                    snapshot.config_revision,
+                    false,
+                )
+            })
+            .flatten();
         // A successful fenced snapshot proves the session is idle. Retire any
         // cancel target whose terminal event was missed before synchronization.
         self.active_request_id = None;
+        self.interrupt_pending = false;
         self.chat.load_synchronized_history(history);
+        self.chat.resolve_interrupt_after_idle_sync();
+        let model_follow_up = model_release_generation
+            .and_then(|generation| self.chat.release_model_queued_prompt(generation));
         self.stream_task = Some(self.client.spawn_event_stream(
             session_id,
             self.actions_tx.clone(),
@@ -5218,7 +5858,7 @@ impl App {
         ));
         self.sessions_requiring_sync.remove(&session_id);
         self.sessions_with_unknown_turn_outcome.remove(&session_id);
-        true
+        (true, model_follow_up)
     }
 
     fn spawn_session_activity_probe(
@@ -5300,28 +5940,13 @@ impl App {
                 None => {
                     let on_retry = retry_status("session", tx.clone());
                     match client
-                        .create_agent_session_retrying(&workspace, on_retry)
+                        .create_agent_session_retrying(&workspace, model_id.as_deref(), on_retry)
                         .await
                     {
                         Ok(resp) => {
-                            // A model chosen before the first message must become
-                            // session authority before binding. The create RPC
-                            // seeds a new session from the daemon-global model;
-                            // without this PATCH, SessionBound immediately loaded
-                            // that global model and appeared to "snap back" even
-                            // though the first turn used the requested override.
-                            if let Some(requested) = model_id.as_deref() {
-                                if let Err(e) =
-                                    client.set_session_model(resp.session_id, requested).await
-                                {
-                                    let _ = tx.send(Action::TurnSendFailed {
-                                        submission_id,
-                                        prompt,
-                                        err: format!("model pin: {e}"),
-                                    });
-                                    return;
-                                }
-                            }
+                            // The optional selected model was pinned atomically
+                            // by session creation; there is no create→PATCH lost-
+                            // acknowledgement window before this first turn.
                             // SessionBound → App::bind_session spawns the (single,
                             // self-healing) stream and holds its handle.
                             let _ = tx.send(Action::SessionBound(resp.session_id));
@@ -7872,6 +8497,115 @@ mod tests {
     }
 
     #[test]
+    fn interrupt_before_request_id_arms_instead_of_becoming_a_noop() {
+        let mut app = offline_app();
+        app.chat.adopt_active_turn();
+
+        app.dispatch(Action::InterruptTurn);
+
+        assert!(app.interrupt_pending);
+        assert!(app.status.contains("stop armed"));
+        assert_eq!(app.active_request_id, None);
+    }
+
+    #[tokio::test]
+    async fn accepted_ack_fires_an_armed_interrupt_with_the_exact_request_id() {
+        let mut app = offline_app();
+        let turn_id = ocean_agent_sdk::AgentTurnId(uuid::Uuid::from_u128(7003));
+        app.chat.seed_pending_submission_for_test(91);
+        app.interrupt_pending = true;
+
+        app.dispatch(Action::TurnAccepted {
+            submission_id: 91,
+            turn_id,
+        });
+
+        assert_eq!(app.active_request_id, Some(turn_id.0));
+        assert!(!app.interrupt_pending);
+        assert!(app.status.contains("interrupt requested"));
+    }
+
+    #[tokio::test]
+    async fn first_session_bind_preserves_pre_ack_interrupt_until_acceptance() {
+        let mut app = offline_app();
+        let session_id = AgentSessionId(uuid::Uuid::from_u128(7007));
+        let turn_id = ocean_agent_sdk::AgentTurnId(uuid::Uuid::from_u128(7008));
+        app.chat.seed_pending_submission_for_test(93);
+        app.interrupt_pending = true;
+
+        app.bind_session(session_id);
+        assert!(app.interrupt_pending, "first bind must preserve armed stop");
+        app.dispatch(Action::TurnAccepted {
+            submission_id: 93,
+            turn_id,
+        });
+
+        assert_eq!(app.active_request_id, Some(turn_id.0));
+        assert!(!app.interrupt_pending);
+        assert!(app.status.contains("interrupt requested"));
+        app.abort_model_config_task();
+        if let Some(task) = app.stream_task.take() {
+            task.abort();
+        }
+    }
+
+    #[tokio::test]
+    async fn replay_invalidation_preserves_pre_ack_interrupt_while_submission_is_busy() {
+        let mut app = offline_app();
+        let session_id = AgentSessionId(uuid::Uuid::from_u128(7009));
+        app.session_id = Some(session_id);
+        app.session_binding_generation = 4;
+        app.chat.seed_pending_submission_for_test(94);
+        app.interrupt_pending = true;
+
+        app.handle_session_invalidation(session_id, 4, "replaying");
+
+        assert!(
+            app.interrupt_pending,
+            "replay reset invalidates only the id, not the stop intent"
+        );
+    }
+
+    #[tokio::test]
+    async fn older_finish_cannot_disarm_stop_for_newer_pre_ack_submission() {
+        let mut app = offline_app();
+        let session_id = AgentSessionId(uuid::Uuid::from_u128(7004));
+        let old_turn = ocean_agent_sdk::AgentTurnId(uuid::Uuid::from_u128(7005));
+        let new_turn = ocean_agent_sdk::AgentTurnId(uuid::Uuid::from_u128(7006));
+        app.session_id = Some(session_id);
+        app.chat.seed_pending_submission_for_test(92);
+        app.interrupt_pending = true;
+
+        app.dispatch(Action::AgentEvent(Box::new(AgentTurnEvent::TurnFinished {
+            session_id,
+            turn_id: old_turn,
+            status: ocean_agent_sdk::AgentTurnStatus::Completed,
+            error: None,
+            wall_ms: Some(1),
+            output_tokens: None,
+            input_tokens: None,
+            cache_read_tokens: None,
+            tokens_per_second: None,
+            context_usage: None,
+        })));
+
+        assert!(
+            app.interrupt_pending,
+            "older finish must not consume stop intent"
+        );
+        assert!(app.chat.is_busy(), "newer submission is still awaiting ACK");
+
+        app.dispatch(Action::TurnAccepted {
+            submission_id: 92,
+            turn_id: new_turn,
+        });
+
+        assert_eq!(app.active_request_id, Some(new_turn.0));
+        assert!(!app.interrupt_pending);
+        assert!(app.status.contains("interrupt requested"));
+    }
+
+    #[test]
     fn tab_reaches_chat_palette_completion_instead_of_cycling_focus() {
         let mut app = offline_app();
         for c in "/mod".chars() {
@@ -8031,10 +8765,29 @@ mod tests {
         app.models_apply();
         assert_eq!(app.status_data().model, Some("deepseek-v4-pro"));
         assert_eq!(app.model_config_generation, 2);
+        assert!(app.pending_model_pin.is_none());
+        assert!(app.model_config_task.is_none());
+        for ch in "first prompt".chars() {
+            assert!(app
+                .chat
+                .handle_key(crossterm::event::KeyEvent::new(
+                    KeyCode::Char(ch),
+                    KeyModifiers::NONE,
+                ))
+                .is_none());
+        }
+        assert!(matches!(
+            app.chat
+                .handle_key(crossterm::event::KeyEvent::new(
+                    KeyCode::Enter,
+                    KeyModifiers::NONE,
+                )),
+            Some(Action::SubmitPrompt { prompt, .. }) if prompt == "first prompt"
+        ));
     }
 
-    #[test]
-    fn session_model_resolution_installs_only_current_authority() {
+    #[tokio::test]
+    async fn session_model_resolution_installs_only_current_authority() {
         use crate::shell::client::SessionConfigResponse;
 
         let mut app = offline_app();
@@ -8042,6 +8795,13 @@ mod tests {
         app.session_id = Some(current);
         app.model_config_generation = 7;
         app.model_override = Some("deepseek-v4-pro".into());
+        app.model_config_task = Some(ModelConfigTask {
+            session_id: current,
+            generation: 7,
+            kind: ModelConfigTaskKind::Load,
+            queue_pause_generation: None,
+            handle: tokio::spawn(async {}),
+        });
 
         app.dispatch(Action::SessionModelResolved {
             session_id: current,
@@ -8050,6 +8810,7 @@ mod tests {
             result: Ok(SessionConfigResponse {
                 session_id: current,
                 model: "claude-opus-4-6".into(),
+                config_revision: 10,
             }),
         });
         assert_eq!(app.model_override.as_deref(), Some("claude-opus-4-6"));
@@ -8061,6 +8822,7 @@ mod tests {
             result: Ok(SessionConfigResponse {
                 session_id: current,
                 model: "deepseek-v4-pro".into(),
+                config_revision: 9,
             }),
         });
         assert_eq!(
@@ -8068,6 +8830,666 @@ mod tests {
             Some("claude-opus-4-6"),
             "a late config load cannot snap the picker back"
         );
+    }
+
+    #[tokio::test]
+    async fn scoped_session_config_change_updates_model_without_transcript_sync() {
+        use crate::shell::client::SessionConfigResponse;
+
+        let mut app = offline_app();
+        let current = AgentSessionId(uuid::Uuid::from_u128(502));
+        app.session_id = Some(current);
+        app.model_override = Some("gemini-2.0-flash".into());
+        app.model_config_generation = 7;
+        app.model_config_task = Some(ModelConfigTask {
+            session_id: current,
+            generation: 7,
+            kind: ModelConfigTaskKind::Load,
+            queue_pause_generation: None,
+            handle: tokio::spawn(async {}),
+        });
+
+        app.dispatch(Action::AgentEvent(Box::new(
+            AgentTurnEvent::SessionConfigChanged {
+                session_id: current,
+                model: "gpt-5.6-sol".into(),
+                provider: "openai-codex".into(),
+                config_revision: 11,
+            },
+        )));
+
+        assert_eq!(app.model_override.as_deref(), Some("gpt-5.6-sol"));
+        assert!(!app.sessions_requiring_sync.contains(&current));
+        assert_eq!(app.compacting_session, None);
+        assert!(app.model_config_task.is_none());
+
+        app.dispatch(Action::SessionModelResolved {
+            session_id: current,
+            generation: 7,
+            requested: None,
+            result: Ok(SessionConfigResponse {
+                session_id: current,
+                model: "gemini-2.0-flash".into(),
+                config_revision: 10,
+            }),
+        });
+        assert_eq!(
+            app.model_override.as_deref(),
+            Some("gpt-5.6-sol"),
+            "stale binding GET cannot overwrite a newer config event"
+        );
+    }
+
+    #[tokio::test]
+    async fn successful_model_response_without_sse_event_retires_pin_and_releases_its_barrier() {
+        use crate::shell::client::SessionConfigResponse;
+
+        let mut app = offline_app();
+        let current = AgentSessionId(uuid::Uuid::from_u128(506));
+        app.session_id = Some(current);
+        app.model_config_generation = 1;
+        app.model_override = Some("deepseek-v4-flash".into());
+        let queue_pause_generation = app.chat.pause_queued_prompts_for_model();
+        app.chat.seed_queued_prompt_for_test("run after pin");
+        app.pending_model_pin = Some(PendingModelPin {
+            session_id: Some(current),
+            model: "deepseek-v4-flash".into(),
+            generation: 1,
+            queue_pause_generation,
+        });
+        app.model_config_task = Some(ModelConfigTask {
+            session_id: current,
+            generation: 1,
+            kind: ModelConfigTaskKind::Save,
+            queue_pause_generation: Some(queue_pause_generation),
+            handle: tokio::spawn(async {}),
+        });
+
+        app.dispatch(Action::SessionModelResolved {
+            session_id: current,
+            generation: 1,
+            requested: Some("deepseek-v4-flash".into()),
+            result: Ok(SessionConfigResponse {
+                session_id: current,
+                model: "deepseek-v4-flash".into(),
+                config_revision: 4,
+            }),
+        });
+
+        assert!(app.pending_model_pin.is_none());
+        assert_eq!(app.model_config_revision, Some(4));
+        assert_eq!(
+            app.authoritative_model.as_deref(),
+            Some("deepseek-v4-flash")
+        );
+        assert_eq!(app.chat.paused_queued_prompt_count(), 0);
+        assert!(
+            app.chat.is_busy(),
+            "matching HTTP authority released one prompt"
+        );
+    }
+
+    #[tokio::test]
+    async fn matching_config_event_survives_lost_http_ack_and_releases_model_barrier() {
+        let mut app = offline_app();
+        let current = AgentSessionId(uuid::Uuid::from_u128(508));
+        app.session_id = Some(current);
+        app.model_config_generation = 1;
+        app.model_override = Some("gpt-5.6-terra".into());
+        let queue_pause_generation = app.chat.pause_queued_prompts_for_model();
+        app.chat
+            .seed_queued_prompt_for_test("run after event authority");
+        app.pending_model_pin = Some(PendingModelPin {
+            session_id: Some(current),
+            model: "gpt-5.6-terra".into(),
+            generation: 1,
+            queue_pause_generation,
+        });
+        app.model_config_task = Some(ModelConfigTask {
+            session_id: current,
+            generation: 1,
+            kind: ModelConfigTaskKind::Save,
+            queue_pause_generation: Some(queue_pause_generation),
+            handle: tokio::spawn(async {}),
+        });
+        app.dispatch(Action::AgentEvent(Box::new(
+            AgentTurnEvent::SessionConfigChanged {
+                session_id: current,
+                model: "gpt-5.6-terra".into(),
+                provider: "openai-codex".into(),
+                config_revision: 4,
+            },
+        )));
+
+        let finalize = app
+            .actions_rx
+            .try_recv()
+            .expect("matching event queues independent finalization");
+        assert!(matches!(finalize, Action::FinalizeObservedModelPin { .. }));
+        app.dispatch(finalize);
+        app.dispatch(Action::SessionModelResolved {
+            session_id: current,
+            generation: 1,
+            requested: Some("gpt-5.6-terra".into()),
+            result: Err("response connection closed".into()),
+        });
+
+        assert!(app.pending_model_pin.is_none());
+        assert_eq!(app.model_config_revision, Some(4));
+        assert_eq!(app.chat.paused_queued_prompt_count(), 0);
+        assert!(app.chat.is_busy());
+        assert!(app.status.contains("model pinned"));
+    }
+
+    #[tokio::test]
+    async fn matching_config_event_after_http_error_retires_reconciling_pin() {
+        let mut app = offline_app();
+        let current = AgentSessionId(uuid::Uuid::from_u128(510));
+        app.session_id = Some(current);
+        app.model_config_generation = 1;
+        app.model_override = Some("gpt-5.6-terra".into());
+        let queue_pause_generation = app.chat.pause_queued_prompts_for_model();
+        app.chat.seed_queued_prompt_for_test("run after late event");
+        app.pending_model_pin = Some(PendingModelPin {
+            session_id: Some(current),
+            model: "gpt-5.6-terra".into(),
+            generation: 1,
+            queue_pause_generation,
+        });
+        app.model_config_task = Some(ModelConfigTask {
+            session_id: current,
+            generation: 1,
+            kind: ModelConfigTaskKind::Save,
+            queue_pause_generation: Some(queue_pause_generation),
+            handle: tokio::spawn(async {}),
+        });
+
+        app.dispatch(Action::SessionModelResolved {
+            session_id: current,
+            generation: 1,
+            requested: Some("gpt-5.6-terra".into()),
+            result: Err("response connection closed".into()),
+        });
+        assert!(app.pending_model_pin.is_some());
+        assert!(app
+            .model_config_task
+            .as_ref()
+            .is_some_and(|task| { task.kind == ModelConfigTaskKind::Load }));
+
+        app.dispatch(Action::AgentEvent(Box::new(
+            AgentTurnEvent::SessionConfigChanged {
+                session_id: current,
+                model: "gpt-5.6-terra".into(),
+                provider: "openai-codex".into(),
+                config_revision: 4,
+            },
+        )));
+        let finalize = app
+            .actions_rx
+            .try_recv()
+            .expect("late matching event queues finalization");
+        assert!(matches!(finalize, Action::FinalizeObservedModelPin { .. }));
+        app.dispatch(finalize);
+
+        assert!(app.pending_model_pin.is_none());
+        assert!(app.model_config_task.is_none());
+        assert_eq!(app.chat.paused_queued_prompt_count(), 0);
+        assert!(app.chat.is_busy());
+    }
+
+    #[tokio::test]
+    async fn mismatching_event_does_not_abort_model_reconciliation() {
+        use crate::shell::client::SessionConfigResponse;
+
+        let mut app = offline_app();
+        let current = AgentSessionId(uuid::Uuid::from_u128(512));
+        app.session_id = Some(current);
+        app.model_config_generation = 1;
+        app.model_override = Some("gpt-5.6-terra".into());
+        let queue_pause_generation = app.chat.pause_queued_prompts_for_model();
+        app.chat
+            .seed_queued_prompt_for_test("wait for reconciliation");
+        app.pending_model_pin = Some(PendingModelPin {
+            session_id: Some(current),
+            model: "gpt-5.6-terra".into(),
+            generation: 1,
+            queue_pause_generation,
+        });
+        app.model_config_task = Some(ModelConfigTask {
+            session_id: current,
+            generation: 1,
+            kind: ModelConfigTaskKind::Save,
+            queue_pause_generation: Some(queue_pause_generation),
+            handle: tokio::spawn(async {}),
+        });
+        app.dispatch(Action::SessionModelResolved {
+            session_id: current,
+            generation: 1,
+            requested: Some("gpt-5.6-terra".into()),
+            result: Err("response connection closed".into()),
+        });
+
+        app.dispatch(Action::AgentEvent(Box::new(
+            AgentTurnEvent::SessionConfigChanged {
+                session_id: current,
+                model: "gpt-5.6-sol".into(),
+                provider: "openai-codex".into(),
+                config_revision: 5,
+            },
+        )));
+        assert!(app.pending_model_pin.is_some());
+        assert!(app
+            .model_config_task
+            .as_ref()
+            .is_some_and(|task| { task.kind == ModelConfigTaskKind::Load }));
+        assert_eq!(app.model_override.as_deref(), Some("gpt-5.6-terra"));
+        assert_eq!(app.authoritative_model.as_deref(), Some("gpt-5.6-sol"));
+
+        app.dispatch(Action::SessionModelResolved {
+            session_id: current,
+            generation: 1,
+            requested: None,
+            result: Ok(SessionConfigResponse {
+                session_id: current,
+                model: "gpt-5.6-sol".into(),
+                config_revision: 5,
+            }),
+        });
+        assert!(app.pending_model_pin.is_none());
+        assert_eq!(app.model_override.as_deref(), Some("gpt-5.6-sol"));
+        assert_eq!(app.chat.paused_queued_prompt_count(), 1);
+        assert!(matches!(
+            app.chat.handle_key(crossterm::event::KeyEvent::new(
+                KeyCode::Enter,
+                KeyModifiers::NONE,
+            )),
+            Some(Action::SubmitPrompt { prompt, .. }) if prompt == "wait for reconciliation"
+        ));
+    }
+
+    #[tokio::test]
+    async fn failed_model_reconciliation_becomes_explicit_terminal_pause() {
+        use crate::shell::client::SessionConfigResponse;
+
+        let mut app = offline_app();
+        let current = AgentSessionId(uuid::Uuid::from_u128(511));
+        app.session_id = Some(current);
+        app.model_config_generation = 1;
+        app.model_override = Some("gpt-5.6-terra".into());
+        let queue_pause_generation = app.chat.pause_queued_prompts_for_model();
+        app.chat
+            .seed_queued_prompt_for_test("requires explicit recovery");
+        app.pending_model_pin = Some(PendingModelPin {
+            session_id: Some(current),
+            model: "gpt-5.6-terra".into(),
+            generation: 1,
+            queue_pause_generation,
+        });
+        app.model_config_task = Some(ModelConfigTask {
+            session_id: current,
+            generation: 1,
+            kind: ModelConfigTaskKind::Load,
+            queue_pause_generation: None,
+            handle: tokio::spawn(async {}),
+        });
+
+        app.dispatch(Action::SessionModelResolved {
+            session_id: current,
+            generation: 1,
+            requested: None,
+            result: Ok(SessionConfigResponse {
+                session_id: current,
+                model: "gpt-5.6-sol".into(),
+                config_revision: 0,
+            }),
+        });
+
+        assert!(app.pending_model_pin.is_none());
+        assert_eq!(app.model_override.as_deref(), Some("gpt-5.6-sol"));
+        assert!(app.chat.release_recovered_queued_prompt().is_none());
+        assert_eq!(app.chat.paused_queued_prompt_count(), 1);
+        assert!(matches!(
+            app.chat.handle_key(crossterm::event::KeyEvent::new(
+                KeyCode::Enter,
+                KeyModifiers::NONE,
+            )),
+            Some(Action::SubmitPrompt { prompt, .. }) if prompt == "requires explicit recovery"
+        ));
+    }
+
+    #[tokio::test]
+    async fn matching_fenced_snapshot_independently_retires_model_pin() {
+        let mut app = offline_app();
+        let current = AgentSessionId(uuid::Uuid::from_u128(509));
+        app.session_id = Some(current);
+        app.session_binding_generation = 3;
+        app.model_config_generation = 1;
+        app.model_override = Some("gpt-5.6-terra".into());
+        let queue_pause_generation = app.chat.pause_queued_prompts_for_model();
+        app.chat
+            .seed_queued_prompt_for_test("run after snapshot authority");
+        app.pending_model_pin = Some(PendingModelPin {
+            session_id: Some(current),
+            model: "gpt-5.6-terra".into(),
+            generation: 1,
+            queue_pause_generation,
+        });
+        app.model_config_task = Some(ModelConfigTask {
+            session_id: current,
+            generation: 1,
+            kind: ModelConfigTaskKind::Save,
+            queue_pause_generation: Some(queue_pause_generation),
+            handle: tokio::spawn(async {}),
+        });
+        let snapshot = ocean_core::SessionSyncSnapshot {
+            session_id: current.0,
+            model: "gpt-5.6-terra".into(),
+            provider: "openai-codex".into(),
+            config_revision: 4,
+            transcript: Vec::new(),
+            truncated_messages: 0,
+            truncated_text_bytes: 0,
+        };
+        let fence = ocean_core::SessionEventFence {
+            event_id: Some(uuid::Uuid::new_v4()),
+        };
+
+        let (installed, follow_up) =
+            app.install_synchronized_session(current, 3, &snapshot, &fence, true);
+
+        assert!(installed);
+        assert!(app.pending_model_pin.is_none());
+        assert!(app.model_config_task.is_none());
+        assert!(matches!(
+            follow_up,
+            Some(Action::SubmitPrompt { prompt, .. }) if prompt == "run after snapshot authority"
+        ));
+        if let Some(task) = app.stream_task.take() {
+            task.abort();
+        }
+    }
+
+    #[tokio::test]
+    async fn newer_config_event_beats_delayed_model_response_and_keeps_queue_paused() {
+        use crate::shell::client::SessionConfigResponse;
+
+        let mut app = offline_app();
+        let current = AgentSessionId(uuid::Uuid::from_u128(507));
+        app.session_id = Some(current);
+        app.model_config_generation = 1;
+        app.model_override = Some("deepseek-v4-flash".into());
+        let queue_pause_generation = app.chat.pause_queued_prompts_for_model();
+        app.chat.seed_queued_prompt_for_test("do not run stale");
+        app.pending_model_pin = Some(PendingModelPin {
+            session_id: Some(current),
+            model: "deepseek-v4-flash".into(),
+            generation: 1,
+            queue_pause_generation,
+        });
+        app.model_config_task = Some(ModelConfigTask {
+            session_id: current,
+            generation: 1,
+            kind: ModelConfigTaskKind::Save,
+            queue_pause_generation: Some(queue_pause_generation),
+            handle: tokio::spawn(async {}),
+        });
+
+        for (model, provider, config_revision) in [
+            ("deepseek-v4-flash", "deepseek", 4),
+            ("gpt-5.6-sol", "openai-codex", 5),
+        ] {
+            app.dispatch(Action::AgentEvent(Box::new(
+                AgentTurnEvent::SessionConfigChanged {
+                    session_id: current,
+                    model: model.into(),
+                    provider: provider.into(),
+                    config_revision,
+                },
+            )));
+        }
+        let finalize = app
+            .actions_rx
+            .try_recv()
+            .expect("matching A event queues finalization behind B");
+        assert!(matches!(finalize, Action::FinalizeObservedModelPin { .. }));
+        app.dispatch(finalize);
+        app.dispatch(Action::SessionModelResolved {
+            session_id: current,
+            generation: 1,
+            requested: Some("deepseek-v4-flash".into()),
+            result: Ok(SessionConfigResponse {
+                session_id: current,
+                model: "deepseek-v4-flash".into(),
+                config_revision: 4,
+            }),
+        });
+
+        assert!(app.pending_model_pin.is_none());
+        assert_eq!(app.model_config_revision, Some(5));
+        assert_eq!(app.authoritative_model.as_deref(), Some("gpt-5.6-sol"));
+        assert_eq!(app.model_override.as_deref(), Some("gpt-5.6-sol"));
+        assert_eq!(app.chat.paused_queued_prompt_count(), 1);
+        assert!(!app.chat.is_busy());
+        assert!(app.status.contains("superseded"));
+        assert!(matches!(
+            app.chat.handle_key(crossterm::event::KeyEvent::new(
+                KeyCode::Enter,
+                KeyModifiers::NONE,
+            )),
+            Some(Action::SubmitPrompt { prompt, .. }) if prompt == "do not run stale"
+        ));
+    }
+
+    #[tokio::test]
+    async fn delayed_same_model_event_cannot_retire_newer_generation() {
+        use crate::shell::client::SessionConfigResponse;
+
+        let mut app = offline_app();
+        let current = AgentSessionId(uuid::Uuid::from_u128(513));
+        app.session_id = Some(current);
+        app.model_config_generation = 3;
+        app.model_override = Some("deepseek-v4-flash".into());
+        let queue_pause_generation = app.chat.pause_queued_prompts_for_model();
+        app.chat
+            .seed_queued_prompt_for_test("wait for generation three");
+        app.pending_model_pin = Some(PendingModelPin {
+            session_id: Some(current),
+            model: "deepseek-v4-flash".into(),
+            generation: 3,
+            queue_pause_generation,
+        });
+        app.model_config_task = Some(ModelConfigTask {
+            session_id: current,
+            generation: 2,
+            kind: ModelConfigTaskKind::Save,
+            queue_pause_generation: Some(queue_pause_generation),
+            handle: tokio::spawn(async {}),
+        });
+
+        app.dispatch(Action::AgentEvent(Box::new(
+            AgentTurnEvent::SessionConfigChanged {
+                session_id: current,
+                model: "deepseek-v4-flash".into(),
+                provider: "deepseek".into(),
+                config_revision: 1,
+            },
+        )));
+        assert_eq!(
+            app.pending_model_pin.as_ref().map(|pin| pin.generation),
+            Some(3)
+        );
+        assert_eq!(
+            app.model_config_task.as_ref().map(|task| task.generation),
+            Some(2)
+        );
+        assert_eq!(app.chat.paused_queued_prompt_count(), 1);
+
+        app.dispatch(Action::SessionModelResolved {
+            session_id: current,
+            generation: 2,
+            requested: Some("gpt-5.6-sol".into()),
+            result: Ok(SessionConfigResponse {
+                session_id: current,
+                model: "gpt-5.6-sol".into(),
+                config_revision: 2,
+            }),
+        });
+        assert_eq!(
+            app.model_config_task.as_ref().map(|task| task.generation),
+            Some(3),
+            "the latest A selection must still receive its own serialized save"
+        );
+        app.abort_model_config_task();
+    }
+
+    #[tokio::test]
+    async fn rapid_model_picks_serialize_already_admitted_patch_requests() {
+        let mut app = offline_app();
+        let current = AgentSessionId(uuid::Uuid::from_u128(503));
+        app.session_id = Some(current);
+
+        app.dispatch(Action::SetModel("deepseek-v4-flash".into()));
+        let first_generation = app
+            .model_config_task
+            .as_ref()
+            .expect("first save task")
+            .generation;
+        app.dispatch(Action::SetModel("gpt-5.6-sol".into()));
+
+        let task = app
+            .model_config_task
+            .as_ref()
+            .expect("serialized save task");
+        assert_eq!(task.generation, first_generation);
+        assert_eq!(task.kind, ModelConfigTaskKind::Save);
+        assert_eq!(app.pending_model_for_session(current), Some("gpt-5.6-sol"));
+        app.dispatch(Action::AgentEvent(Box::new(
+            AgentTurnEvent::SessionConfigChanged {
+                session_id: current,
+                model: "deepseek-v4-flash".into(),
+                provider: "deepseek".into(),
+                config_revision: 1,
+            },
+        )));
+        assert_eq!(
+            app.model_override.as_deref(),
+            Some("gpt-5.6-sol"),
+            "older save event cannot overwrite the newer local intent"
+        );
+        app.abort_model_config_task();
+    }
+
+    #[tokio::test]
+    async fn stale_model_save_completion_starts_only_the_latest_pin() {
+        use crate::shell::client::SessionConfigResponse;
+
+        let mut app = offline_app();
+        let current = AgentSessionId(uuid::Uuid::from_u128(505));
+        app.session_id = Some(current);
+        app.model_config_generation = 2;
+        app.model_override = Some("gpt-5.6-sol".into());
+        app.pending_model_pin = Some(PendingModelPin {
+            session_id: Some(current),
+            model: "gpt-5.6-sol".into(),
+            generation: 2,
+            queue_pause_generation: 11,
+        });
+        app.model_config_task = Some(ModelConfigTask {
+            session_id: current,
+            generation: 1,
+            kind: ModelConfigTaskKind::Save,
+            queue_pause_generation: Some(10),
+            handle: tokio::spawn(async {}),
+        });
+
+        app.dispatch(Action::SessionModelResolved {
+            session_id: current,
+            generation: 1,
+            requested: Some("deepseek-v4-flash".into()),
+            result: Ok(SessionConfigResponse {
+                session_id: current,
+                model: "deepseek-v4-flash".into(),
+                config_revision: 1,
+            }),
+        });
+
+        let task = app.model_config_task.as_ref().expect("latest save starts");
+        assert_eq!(task.generation, 2);
+        assert_eq!(task.kind, ModelConfigTaskKind::Save);
+        assert_eq!(task.queue_pause_generation, Some(11));
+        assert_eq!(app.model_override.as_deref(), Some("gpt-5.6-sol"));
+        app.abort_model_config_task();
+    }
+
+    #[tokio::test]
+    async fn failed_first_session_mint_abandons_unbound_model_barrier_and_restores_root() {
+        let mut app = offline_app();
+        for ch in "root".chars() {
+            let _ = app.chat.handle_key(crossterm::event::KeyEvent::new(
+                KeyCode::Char(ch),
+                KeyModifiers::NONE,
+            ));
+        }
+        let Some(Action::SubmitPrompt { submission_id, .. }) = app.chat.handle_key(
+            crossterm::event::KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+        ) else {
+            panic!("expected first root submission");
+        };
+        app.dispatch(Action::SetModel("gpt-5.6-terra".into()));
+        app.chat.seed_queued_prompt_for_test("follow-up");
+        assert!(app.pending_model_pin.is_some());
+
+        app.dispatch(Action::TurnSendFailed {
+            submission_id,
+            prompt: "root".into(),
+            err: "session: connect failed".into(),
+        });
+
+        assert!(app.pending_model_pin.is_none());
+        assert!(matches!(
+            app.chat.handle_key(crossterm::event::KeyEvent::new(
+                KeyCode::Enter,
+                KeyModifiers::NONE,
+            )),
+            Some(Action::SubmitPrompt { prompt, .. }) if prompt == "root"
+        ));
+    }
+
+    #[tokio::test]
+    async fn model_pick_during_first_session_creation_pins_after_bind() {
+        let mut app = offline_app();
+        let session_id = AgentSessionId(uuid::Uuid::from_u128(504));
+        app.chat.adopt_active_turn();
+
+        app.dispatch(Action::SetModel("gpt-5.6-sol".into()));
+        let queue_pause_generation = app
+            .pending_model_pin
+            .as_ref()
+            .expect("pending first-session model")
+            .queue_pause_generation;
+        assert_eq!(
+            app.pending_model_pin,
+            Some(PendingModelPin {
+                session_id: None,
+                model: "gpt-5.6-sol".into(),
+                generation: 1,
+                queue_pause_generation,
+            })
+        );
+
+        app.bind_session(session_id);
+
+        assert_eq!(
+            app.pending_model_for_session(session_id),
+            Some("gpt-5.6-sol")
+        );
+        let task = app.model_config_task.as_ref().expect("post-bind model pin");
+        assert_eq!(task.session_id, session_id);
+        assert_eq!(task.kind, ModelConfigTaskKind::Save);
+        app.abort_model_config_task();
+        if let Some(task) = app.stream_task.take() {
+            task.abort();
+        }
     }
 
     #[test]
@@ -8106,6 +9528,7 @@ mod tests {
             session_id: session_id.0,
             model: "test-model".into(),
             provider: "fake".into(),
+            config_revision: 0,
             transcript: vec![ocean_core::SessionTranscriptEntry {
                 role: "assistant".into(),
                 timestamp_ms: None,
@@ -8868,6 +10291,7 @@ mod tests {
         app.session_id = Some(session_id);
         app.session_binding_generation = 5;
         app.stream_generation = 9;
+        app.model_override = Some("stale-local-model".into());
         app.dispatch(Action::AgentEvent(Box::new(AgentTurnEvent::TurnStarted {
             turn_id: ocean_agent_sdk::AgentTurnId(uuid::Uuid::from_u128(82)),
             session_id,
@@ -8911,6 +10335,11 @@ mod tests {
         assert!(!app.chat.is_busy());
         assert_eq!(app.active_request_id, None);
         assert_eq!(app.compacting_session, None);
+        assert_eq!(
+            app.model_override.as_deref(),
+            Some("test-model"),
+            "fenced sync snapshot restores authoritative session model"
+        );
         assert_eq!(
             app.chat.last_reply_for_test().as_deref(),
             Some("authoritative idle history")

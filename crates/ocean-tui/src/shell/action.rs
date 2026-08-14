@@ -234,6 +234,15 @@ pub enum Action {
         requested: Option<String>,
         result: Result<crate::shell::client::SessionConfigResponse, String>,
     },
+    /// A revisioned config event independently proved a local model pin durable.
+    /// Enqueued behind any config events the stream task already published so a
+    /// newer authority wins before this exact barrier may release.
+    FinalizeObservedModelPin {
+        session_id: AgentSessionId,
+        model: String,
+        config_revision: u64,
+        queue_pause_generation: u64,
+    },
     /// `/thinking <level>` — override the thinking level for subsequent turns
     /// this session (`None` = daemon default; rides `AgentTurnRequest`).
     SetThinking(Option<ThinkingLevel>),

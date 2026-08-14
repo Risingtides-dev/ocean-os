@@ -118,6 +118,7 @@ impl DaemonClient {
         let body = AgentSessionCreateRequest {
             workspace_root: cwd.to_string(),
             project_id: None,
+            model: None,
             client_type: Some(CLIENT_TYPE.to_string()),
         };
         let resp = self

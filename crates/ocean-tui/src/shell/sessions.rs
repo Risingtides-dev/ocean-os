@@ -641,6 +641,7 @@ mod tests {
             session_id: uuid::Uuid::nil(),
             model: "test".into(),
             provider: "fake".into(),
+            config_revision: 0,
             transcript: vec![
                 entry("user", "[TUI] hello"),
                 entry("assistant", "visible answer"),

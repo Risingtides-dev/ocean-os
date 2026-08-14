@@ -109,11 +109,44 @@ This crate owns the full-screen terminal steering cockpit (`ocean` binary) for i
   A bound session's model is daemon-owned config: `/model` and the picker must
   both dispatch `Action::SetModel` and persist through
   `PATCH /v1/agent/sessions/{id}/config`; the picker must never mutate only its
-  local footer projection. A model chosen before the first message must be
-  pinned immediately after the create-session RPC and before `SessionBound`,
-  because session creation starts from the daemon-global model. Binding reloads
+  local footer projection. A model chosen before the first message must ride the
+  optional model field of `POST /v1/agent/sessions` and be persisted atomically
+  with creation before `SessionBound`; never recreate a create→PATCH lost-ACK
+  window. Binding reloads
   `GET .../config`, and generation guards reject late load/save responses across
-  session switches.
+  session switches. A bound-session change (or a choice made during an already
+  running first-session mint) is a queue barrier; an idle unbound choice has no
+  save task and must leave the first prompt free to create/pin the session. If
+  that in-flight first-session mint definitely fails, abandon its unbound model
+  generation before restoring the root so no impossible future PATCH can strand
+  the FIFO.
+  Serialize already-admitted saves so an older PATCH cannot commit last, abort stale reads, wait through
+  active-operation conflicts, keep follow-ups paused, and release one only after
+  the latest requested model is durably pinned. Session config GET/PATCH,
+  `SessionConfigChanged`, and synchronized snapshots carry the persisted monotonic
+  `config_revision`; reject older authority so a delayed HTTP response cannot
+  overwrite a newer surface's event. A matching revisioned event may retire a
+  pending pin independently only while the task for that exact latest local
+  selection generation still owns it; an older A event must not retire a newer
+  A intent while an admitted B save is in flight. If the
+  save acknowledgement fails first, retain the pin through bounded config-GET
+  reconciliation so a later matching event can still prove it. A differing event
+  updates observed authority but must not abort that reconciliation; a final
+  mismatch/error or superseded finalization becomes a terminal pause rather than
+  silently running on old authority. That save
+  may release only the exact typed queue barrier its selection created. Keep
+  that model generation layered beneath a later interrupt/terminal/uncertainty
+  owner so stop cannot destroy it; if a definitely-unsent root fails while the
+  model pin remains pending, put that root ahead of every follow-up and let the
+  pin release it first. Preserve a newly typed draft behind any definitely-unsent
+  restored root. A later failed/cancelled terminal pause wins, including when it
+  arrives before HTTP acknowledgement and a later outcome-unknown probe or Esc;
+  uncertainty/interrupt ownership must not downgrade that terminal barrier. A model selection made
+  after failure is an explicit recovery action and may release its newer barrier. Probe/sync
+  completion releases only an uncertainty-owned or ordinary FIFO, never a model,
+  terminal, or interrupt barrier. A scoped `SessionConfigChanged` updates model
+  metadata without transcript sync; generic
+  `ocean.session_changed` remains a transcript invalidation.
 - The upper right rail is a mutable Work Surface slot, not a Files-owned pane.
   Its typed representations currently include explicit `Files`, session-scoped
   `Usage`, and daemon-wide `Workflow`; domain projections keep their real schemas
@@ -177,12 +210,27 @@ This crate owns the full-screen terminal steering cockpit (`ocean` binary) for i
   remains permission-first, `Ctrl+L` clears only an idle transcript, and
   `Up`/`Down` remain history/picker navigation. Composer sizing, caret paint,
   and scroll use Unicode cell width and follow the cursor row, never the final
-  input row. Enter during an active turn appends a FIFO follow-up prompt; only
-  authoritative `TurnFinished` releases the next queued submission. While a
-  turn is active, `Esc` posts cancellation for the exact bound
-  `TurnStarted.turn_id` request and leaves `busy` set until the authoritative
-  `TurnFinished` arrives; cancelled turns render a quiet interrupted marker.
-  Overlays and dictation retain first claim on `Esc`. Detached scrollback keeps
+  input row. Enter during an active turn appends a FIFO follow-up prompt. A
+  completed authoritative `TurnFinished` releases the next queued submission;
+  failed or cancelled admitted turns pause the FIFO instead of retrying it;
+  definite pre-execution send rejection restores the root composer prompt
+  without inventing a terminal barrier. While a terminal barrier remains,
+  non-empty prompts join the paused FIFO and an idle
+  empty Enter explicitly releases one prompt; empty Enter must not release a
+  model-save, interrupt, or uncertainty barrier. `/stop` and `/abort` clear
+  the visible local FIFO before cancelling but must not delete an independently
+  pending model generation. If a stop loses the race to clean completion, or a
+  fenced recovery snapshot proves the operation already idle, clear an empty
+  Interrupt owner or convert retained work to a terminal pause that empty Enter
+  can release.
+  While a turn is active, `Esc` posts
+  cancellation for the exact request id from `TurnStarted` or the accepted
+  acknowledgement; if neither has arrived yet, the stop intent stays armed
+  across first-session binding and replay-reset id invalidation, and fires once
+  the id becomes authoritative. Keep `busy` set until
+  `TurnFinished`; cancelled turns render a quiet interrupted marker, never a
+  failed-turn notice. Overlays and dictation retain first claim on `Esc`.
+  Detached scrollback keeps
   its viewport anchored when live content grows. `/compact` is an idle, bound-session action over the daemon-owned
   atomic compaction route. Replace chat only from the response's bounded public
   `SessionSyncSnapshot`, then restart the scoped SSE stream strictly after its

@@ -441,6 +441,10 @@ pub struct AgentSessionCreateRequest {
     /// the daemon falls back to the project's own `workspace_root`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub project_id: Option<Uuid>,
+    /// Optional catalog model to pin atomically with session creation. This
+    /// avoids a create-then-PATCH acknowledgement gap before the first turn.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
     /// Identifies the client surface so the agent can tailor responses on the
     /// first turn. Known values include "tui", "surface-web",
     /// "surface-tauri", "surface-extension", "cli", and "leo-voice".
@@ -677,6 +681,9 @@ pub enum AgentTurnEvent {
         session_id: AgentSessionId,
         model: String,
         provider: String,
+        /// Monotonic persisted config authority; legacy events deserialize at 0.
+        #[serde(default)]
+        config_revision: u64,
     },
     /// The agent wants the client to mount or update an interactive component.
     /// Clients maintain a component registry per session and render these
@@ -1111,6 +1118,25 @@ mod tests {
     }
 
     #[test]
+    fn legacy_session_config_event_defaults_revision_to_zero() {
+        let session_id = AgentSessionId::new_v4();
+        let event: AgentTurnEvent = serde_json::from_value(serde_json::json!({
+            "type": "session_config_changed",
+            "session_id": session_id,
+            "model": "legacy-model",
+            "provider": "legacy-provider"
+        }))
+        .expect("legacy event remains readable");
+        assert!(matches!(
+            event,
+            AgentTurnEvent::SessionConfigChanged {
+                config_revision: 0,
+                ..
+            }
+        ));
+    }
+
+    #[test]
     fn session_id_accessor_extracts_session_for_filtering() {
         // The daemon's per-session SSE filter relies on this accessor. A
         // session-bearing event returns its id; a council-wide Extension (no
@@ -1374,6 +1400,7 @@ mod tests {
                 session_id: sid,
                 model: "deepseek-v4-pro".into(),
                 provider: "deepseek".into(),
+                config_revision: 7,
             },
             // Session-scoped Extension: behaves like any session-bearing event.
             AgentTurnEvent::Extension {

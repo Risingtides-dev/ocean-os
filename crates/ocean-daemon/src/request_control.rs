@@ -201,8 +201,8 @@ pub(super) async fn update_request_permission_result(
 ///
 /// `on_finalize(final_state)` is the exact-once turn finalizer's atomic hook
 /// (TASK-61): it fires IFF *this* call performs the terminal transition — either
-/// the cancel-settle branch (`Cancelling`/`Cancelled` → `Cancelled`) or the
-/// normal desired-state branch (`Running` → `desired_state`). A call that finds
+/// the cancel-settle branch (`Cancelling` → `Cancelled`) or the normal
+/// desired-state branch (`Running` → `desired_state`). A call that finds
 /// the entry already terminal (a late twin — normal completion racing the orphan
 /// guard, or vice versa) returns the existing state and does NOT invoke the hook,
 /// so the terminal frame is emitted exactly once.
@@ -232,10 +232,7 @@ pub(super) async fn update_request_finished(
     let control = requests.get_mut(&request_id)?;
     let status = &mut control.status;
 
-    if matches!(
-        status.state,
-        RequestState::Cancelling | RequestState::Cancelled
-    ) {
+    if matches!(status.state, RequestState::Cancelling) {
         status.session_id = session_id.or(status.session_id);
         status.state = RequestState::Cancelled;
         status.message = Some(

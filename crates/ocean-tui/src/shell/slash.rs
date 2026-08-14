@@ -40,6 +40,18 @@ pub const COMMANDS: &[SlashCommand] = &[
         soon: false,
     },
     SlashCommand {
+        name: "/stop",
+        desc: "stop the active turn and clear queued follow-ups",
+        group: "session",
+        soon: false,
+    },
+    SlashCommand {
+        name: "/abort",
+        desc: "alias for /stop",
+        group: "session",
+        soon: false,
+    },
+    SlashCommand {
         name: "/resume",
         desc: "resume a past session",
         group: "session",
@@ -385,8 +397,9 @@ mod tests {
 
     #[test]
     fn prefix_beats_scattered() {
-        // "s" is a prefix of /sessions but appears mid-word in /files, /resume.
-        let ranked = filter("s");
+        // "ses" is a prefix of /sessions but appears only scattered elsewhere.
+        // Single "s" deliberately surfaces the critical /stop control first.
+        let ranked = filter("ses");
         assert_eq!(ranked[0].0.name, "/sessions");
     }
 
@@ -449,6 +462,8 @@ mod tests {
     #[test]
     fn is_command_recognizes_registry_only() {
         assert!(is_command("/model"));
+        assert!(is_command("/stop"));
+        assert!(is_command("/abort"));
         assert!(is_command("/permissions"));
         assert!(is_command("/compact"));
         assert!(!is_command("/home")); // a path, not a command
