@@ -5998,3 +5998,19 @@ area:      [backend]: ocean-daemon persistent room SSE and federation presence
 
 Kept room read-cursor tails subscribed when an events connection opens during a federated Connecting or Recovering state, suppressing unsupported projections until an access wake transitions the room to Live and the current mirrored cursor can be emitted without reconnecting. Unknown-author roster refresh now derives presence from the authenticated epoch's live-human set instead of marking every human unavailable. Added focused transition and presence regressions. Verified formatting, diff check, docs-check, ocean-store library tests (146 passed), ocean-daemon binary tests (683 passed), and strict all-target clippy for ocean-daemon/ocean-store/ocean-core.
 _________________________________________________________________________________
+time:      [11:24am] [14-08-26]
+agent:     [codex], [gpt-5]
+worktree:  fix/session-model-pin-provenance
+type:      [fix]
+area:      [sessions]: Persist explicit model-pin provenance
+
+Reproduced a Stitchpad/Ocean identity failure where a successful explicit
+session-model PATCH equal to the daemon global model still reported
+`model_source: global`. Replaced equality-only inference with the existing
+persisted monotonic `config_revision`: a positive revision proves an explicit
+session-config mutation under the existing session operation lease, while
+revision-zero inherited and legacy records preserve the former model-difference
+fallback. One `SessionModelConfig` resolver now drives both turn selection and
+config projection. Added legacy compatibility, same-model persistence,
+resolver, and daemon HTTP regression coverage. Live daemon rebuild/restart and
+fresh GLM/DeepSeek Stitchpad proof remain gated on independent review.

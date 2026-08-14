@@ -75,6 +75,7 @@ Proposals awaiting operator ruling:
 
 Active implementation reference:
 
+- [`specs/2026-08-14-session-model-pin-provenance.md`](specs/2026-08-14-session-model-pin-provenance.md) — operator-approved session-authority contract using the monotonic config revision to replace model/global equality inference, including revision-zero legacy fallback and live Stitchpad rollout gates.
 - [`specs/2026-07-03-omp-port-map.md`](specs/2026-07-03-omp-port-map.md) — source-researched OMP-to-Ocean mechanism map plus the dated implementation audit, including the implemented-but-unwired standalone walker and typed-search M1 crates. It is a prioritized reference, not current architecture; live runtime search adoption remains open through [`../ROADMAP.md`](../ROADMAP.md), and its original core-orchestration placement is superseded by the extension architecture.
 
 Completed extraction manifests are retained evidence, not independent work orders. The broader behavior-neutral daemon refactor remains active under `DAEMON_REFACTOR_MISSION.md`; consult its progress section and the current code-health plan before selecting the next checkpoint.
