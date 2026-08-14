@@ -6079,20 +6079,19 @@ async fn agent_turn(
     // selection and truthful `TurnStarted` announcement happen after the named
     // agent has resolved, when every precedence input is available.
     let (_provider, global_model) = state.runtime.current_model();
-    // Session-config RPC v1: a resumed session whose persisted model differs
-    // from the global selection pins that model as the turn's default. A pin
-    // equal to the global model is treated as unpinned so pre-RPC sessions
-    // (which all recorded the global model at creation) keep following the
-    // global selection exactly as before.
+    // Session-config RPC v1: a positive config revision proves an explicit pin,
+    // so a pin remains authoritative even when it equals the global model.
+    // Revision-zero records preserve the prior model-difference fallback.
     let session_model: Option<String> = if is_new_session {
         None
     } else {
         state
             .runtime
-            .session_detail(core_sid(session_id))
+            .session_model_config_optional(core_sid(session_id))
             .ok()
-            .map(|detail| detail.model)
-            .filter(|m| !m.trim().is_empty() && *m != global_model)
+            .flatten()
+            .filter(|config| config.is_session_pinned(&global_model))
+            .map(|config| config.model)
     };
 
     // Approval policy is daemon-owned and captured at turn start. The default
@@ -7829,13 +7828,10 @@ async fn agent_session(
 fn session_config_json(
     state: &AppState,
     session_id: AgentSessionId,
-    model: &str,
-    provider: &str,
-    config_revision: u64,
-    client_type: Option<&str>,
+    config: &ocean_agent::SessionModelConfig,
 ) -> serde_json::Value {
     let (_global_provider, global_model) = state.runtime.current_model();
-    let model_source = if !model.trim().is_empty() && model != global_model {
+    let model_source = if config.is_session_pinned(&global_model) {
         "session"
     } else {
         "global"
@@ -7843,10 +7839,10 @@ fn session_config_json(
     let config_dir = ocean_agent::config_dir_from_env();
     json!({
         "session_id": session_id,
-        "model": model,
-        "provider": provider,
-        "config_revision": config_revision,
-        "client_type": client_type,
+        "model": &config.model,
+        "provider": &config.provider,
+        "config_revision": config.config_revision,
+        "client_type": config.client_type.as_deref(),
         "permission_mode": {
             "persisted": ocean_agent::load_permission_mode(&config_dir),
             "effective": effective_permission_mode(),
@@ -7862,17 +7858,13 @@ async fn agent_session_config_get(
     State(state): State<AppState>,
     Path(session_id): Path<AgentSessionId>,
 ) -> (StatusCode, Json<serde_json::Value>) {
-    match state.runtime.session_detail_optional(core_sid(session_id)) {
-        Ok(Some(detail)) => (
+    match state
+        .runtime
+        .session_model_config_optional(core_sid(session_id))
+    {
+        Ok(Some(config)) => (
             StatusCode::OK,
-            Json(session_config_json(
-                &state,
-                session_id,
-                &detail.model,
-                &detail.provider,
-                detail.config_revision,
-                detail.client_type.as_deref(),
-            )),
+            Json(session_config_json(&state, session_id, &config)),
         ),
         Ok(None) => (
             StatusCode::NOT_FOUND,
@@ -7957,6 +7949,13 @@ async fn agent_session_config_patch(
         known.provider.clone(),
     ) {
         Ok(Some(detail)) => {
+            let config_revision = detail.config_revision;
+            let config = ocean_agent::SessionModelConfig {
+                model: detail.model,
+                provider: detail.provider,
+                config_revision,
+                client_type: detail.client_type,
+            };
             emit_agent(
                 &state.events,
                 &state.agent_events,
@@ -7965,19 +7964,12 @@ async fn agent_session_config_patch(
                     session_id,
                     model: known.id.clone(),
                     provider: known.provider.clone(),
-                    config_revision: detail.config_revision,
+                    config_revision,
                 },
             );
             (
                 StatusCode::OK,
-                Json(session_config_json(
-                    &state,
-                    session_id,
-                    &detail.model,
-                    &detail.provider,
-                    detail.config_revision,
-                    detail.client_type.as_deref(),
-                )),
+                Json(session_config_json(&state, session_id, &config)),
             )
         }
         Ok(None) => (
@@ -15923,6 +15915,46 @@ mod tests {
             )),
             "model metadata must not emit a transcript invalidation"
         );
+    }
+
+    #[tokio::test]
+    async fn session_config_reports_explicit_pin_when_model_equals_global() {
+        let _guard = AUTO_CONVENE_ENV_LOCK.lock().await;
+        let _env = TestEnvRestore::capture(&[
+            "OCEAN_CONFIG_DIR",
+            "OCEAN_MODEL",
+            "OCEAN_YOLO",
+            "OCEAN_LONGHOUSE_PREPARE",
+        ]);
+        let tmp = tempfile::tempdir().unwrap();
+        let state = fake_convene_state(&tmp);
+        let (session_id, _, _) = state
+            .runtime
+            .create_session(tmp.path().to_str().unwrap(), Some("stitchpad".into()))
+            .unwrap();
+        let sdk_session_id = sdk_sid(session_id);
+        let uri = format!("/v1/agent/sessions/{sdk_session_id}/config");
+        let app = app_router(cors_layer(Vec::new())).with_state(state.clone());
+
+        let (status, raw) =
+            session_config_http_request(app.clone(), Method::GET, uri.clone(), None).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(session_config_response_json(&raw)["model_source"], "global");
+
+        state
+            .runtime
+            .set_session_model(session_id, "fake-ok".into(), "fake".into())
+            .await
+            .unwrap()
+            .expect("session exists");
+
+        let (status, raw) = session_config_http_request(app, Method::GET, uri, None).await;
+        assert_eq!(status, StatusCode::OK);
+        let pinned = session_config_response_json(&raw);
+        assert_eq!(pinned["model"], "fake-ok");
+        assert_eq!(pinned["provider"], "fake");
+        assert_eq!(pinned["config_revision"], 1);
+        assert_eq!(pinned["model_source"], "session");
     }
 
     #[tokio::test]

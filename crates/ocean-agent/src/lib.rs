@@ -96,6 +96,35 @@ impl std::fmt::Display for HistorySearchCapacityError {
 
 impl std::error::Error for HistorySearchCapacityError {}
 
+/// Persisted session-model configuration used by daemon selection and config
+/// projection. `config_revision > 0` proves at least one explicit config RPC
+/// mutation; revision zero covers both inherited new sessions and legacy files.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SessionModelConfig {
+    pub model: String,
+    pub provider: String,
+    pub config_revision: u64,
+    pub client_type: Option<String>,
+}
+
+impl SessionModelConfig {
+    fn from_session(session: session::Session) -> Self {
+        Self {
+            model: session.model,
+            provider: session.provider,
+            config_revision: session.config_revision,
+            client_type: session.client_type,
+        }
+    }
+
+    /// Resolve explicit pin authority. A positive config revision proves an
+    /// explicit mutation even when the selected model equals the global model.
+    /// Revision-zero records preserve the legacy model-difference fallback.
+    pub fn is_session_pinned(&self, global_model: &str) -> bool {
+        self.config_revision > 0 || (!self.model.trim().is_empty() && self.model != global_model)
+    }
+}
+
 /// Classification of a deterministic transcript-text match.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -1436,6 +1465,16 @@ impl AgentRuntime {
     pub fn session_detail_optional(&self, id: SessionId) -> anyhow::Result<Option<SessionDetail>> {
         session::load_resumable(&self.config_dir, id)
             .map(|session| session.map(session::session_detail))
+    }
+
+    /// Read the persisted model/provider and explicit-pin provenance in one
+    /// load so config projection and turn selection share the same authority.
+    pub fn session_model_config_optional(
+        &self,
+        id: SessionId,
+    ) -> anyhow::Result<Option<SessionModelConfig>> {
+        session::load_resumable(&self.config_dir, id)
+            .map(|session| session.map(SessionModelConfig::from_session))
     }
 
     /// Append a client-authored message to a persisted session outside the
@@ -5083,6 +5122,53 @@ done
 
         // An empty cwd has nothing to bind to and is rejected.
         assert!(runtime.create_session("   ", None).is_err());
+
+        let _ = std::fs::remove_dir_all(config_dir);
+    }
+
+    #[test]
+    fn session_model_pin_resolution_prefers_durable_provenance_with_legacy_fallback() {
+        let config = |config_revision| SessionModelConfig {
+            model: "fake-ok".into(),
+            provider: "fake".into(),
+            config_revision,
+            client_type: Some("test".into()),
+        };
+
+        assert!(config(1).is_session_pinned("fake-ok"));
+        assert!(!config(0).is_session_pinned("fake-ok"));
+        assert!(config(0).is_session_pinned("fake-surface"));
+    }
+
+    #[tokio::test]
+    async fn same_model_session_pin_persists_explicit_provenance() {
+        let config_dir = temp_config_dir("same-model-session-pin");
+        let runtime = runtime(
+            config_dir.clone(),
+            provider_config(ProviderId::Fake, "fake-ok", false),
+        );
+        let (id, _, _) = runtime.create_session(".", Some("test".into())).unwrap();
+
+        let inherited = runtime
+            .session_model_config_optional(id)
+            .unwrap()
+            .expect("new session config");
+        assert_eq!(inherited.config_revision, 0);
+        assert!(!inherited.is_session_pinned("fake-ok"));
+
+        runtime
+            .set_session_model(id, "fake-ok".into(), "fake".into())
+            .await
+            .unwrap()
+            .expect("session exists");
+        let pinned = runtime
+            .session_model_config_optional(id)
+            .unwrap()
+            .expect("persisted session config");
+        assert_eq!(pinned.model, "fake-ok");
+        assert_eq!(pinned.provider, "fake");
+        assert_eq!(pinned.config_revision, 1);
+        assert!(pinned.is_session_pinned("fake-ok"));
 
         let _ = std::fs::remove_dir_all(config_dir);
     }

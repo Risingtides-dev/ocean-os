@@ -722,6 +722,7 @@ pub fn known_models() -> Vec<KnownModel> {
         m("kimi-k3", "kimi", "Kimi K3"),
         m("kimi-k2.6", "kimi", "Kimi K2.6"),
         m("kimi-k2", "kimi", "Kimi K2"),
+        m("glm-5.3", "glm", "GLM 5.3"),
         m("glm-5.2", "glm", "GLM 5.2"),
         m("glm-4.7", "glm", "GLM 4.7"),
         m("glm-4.6", "glm", "GLM 4.6"),
@@ -1080,6 +1081,13 @@ pub fn resolve_model_selection(env: &ProviderEnv) -> Result<ModelSelection, Prov
         "glm-5.2" | "glm-5-2" => Ok(model_selection(
             ProviderId::Glm,
             "glm-5.2",
+            glm_base_url(env),
+            200_000,
+            8_192,
+        )),
+        "glm-5.3" | "glm-5-3" => Ok(model_selection(
+            ProviderId::Glm,
+            "glm-5.3",
             glm_base_url(env),
             200_000,
             8_192,
@@ -2026,6 +2034,7 @@ mod tests {
             "kimi-k3",
             "kimi-k2.6",
             "kimi-k2",
+            "glm-5.3",
             "glm-5.2",
             "glm-4.7",
             "glm-4.6",
@@ -2289,11 +2298,15 @@ mod tests {
     }
 
     #[test]
-    fn glm_47_and_52_route_and_round_trip_through_known_models() {
+    fn current_glm_models_route_and_round_trip_through_known_models() {
         // New GLM ids route to ProviderId::Glm with the coding-plan base and
         // the shared 200k/8k limits, their hyphen aliases normalize to the same
         // canonical id, and they survive the known_models round-trip.
-        for (id, hyphen) in [("glm-4.7", "glm-4-7"), ("glm-5.2", "glm-5-2")] {
+        for (id, hyphen) in [
+            ("glm-4.7", "glm-4-7"),
+            ("glm-5.2", "glm-5-2"),
+            ("glm-5.3", "glm-5-3"),
+        ] {
             let sel = resolve_model_selection(&env(&[("OCEAN_MODEL", id)])).unwrap();
             assert_eq!(sel.provider, ProviderId::Glm);
             assert_eq!(sel.model, id);
@@ -2308,6 +2321,7 @@ mod tests {
             known_models().into_iter().map(|m| m.id).collect();
         assert!(listed.contains("glm-4.7"), "glm-4.7 must be in the picker");
         assert!(listed.contains("glm-5.2"), "glm-5.2 must be in the picker");
+        assert!(listed.contains("glm-5.3"), "glm-5.3 must be in the picker");
     }
 
     #[test]

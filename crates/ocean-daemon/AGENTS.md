@@ -96,7 +96,9 @@ This crate owns the long-running Ocean HTTP service on `:4780`, including API ro
   is read-only and `permission_mode.env_override` is a boolean
   presence flag. Only
   absent sessions map to 404; corrupt/internal reads and writes return sanitized
-  500s. Turn selection is explicit model > resolved role > named-agent model >
+  500s. `model_source` comes from ocean-agent's persisted `config_revision`
+  authority; model/global comparison is used only for revision-zero inherited
+  or legacy records. Turn selection is explicit model > resolved role > named-agent model >
   session pin > global; an explicitly named unresolved role stops at global,
   and `TurnStarted` announces the model passed to execution before any separately
   announced provider reroute.

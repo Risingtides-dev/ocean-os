@@ -5998,3 +5998,77 @@ area:      [backend]: ocean-daemon persistent room SSE and federation presence
 
 Kept room read-cursor tails subscribed when an events connection opens during a federated Connecting or Recovering state, suppressing unsupported projections until an access wake transitions the room to Live and the current mirrored cursor can be emitted without reconnecting. Unknown-author roster refresh now derives presence from the authenticated epoch's live-human set instead of marking every human unavailable. Added focused transition and presence regressions. Verified formatting, diff check, docs-check, ocean-store library tests (146 passed), ocean-daemon binary tests (683 passed), and strict all-target clippy for ocean-daemon/ocean-store/ocean-core.
 _________________________________________________________________________________
+time:      [11:24am] [14-08-26]
+agent:     [codex], [gpt-5]
+worktree:  fix/session-model-pin-provenance
+type:      [fix]
+area:      [sessions]: Persist explicit model-pin provenance
+
+Reproduced a Stitchpad/Ocean identity failure where a successful explicit
+session-model PATCH equal to the daemon global model still reported
+`model_source: global`. Replaced equality-only inference with the existing
+persisted monotonic `config_revision`: a positive revision proves an explicit
+session-config mutation under the existing session operation lease, while
+revision-zero inherited and legacy records preserve the former model-difference
+fallback. One `SessionModelConfig` resolver now drives both turn selection and
+config projection. Added legacy compatibility, same-model persistence,
+resolver, and daemon HTTP regression coverage. Live daemon rebuild/restart and
+fresh GLM/DeepSeek Stitchpad proof remain gated on independent review.
+
+_________________________________________________________________________________
+time:      [11:47am] [14-08-26]
+agent:     [codex], [gpt-5]
+worktree:  fix/session-model-pin-provenance
+type:      [test]
+area:      [sessions]: Review and live proof explicit model-pin provenance
+
+GLM 4.7 and DeepSeek V4 Pro independently reviewed the pre-rebase implementation
+at 4f7cd6e through a fresh isolated Stitchpad and both returned PASS with no
+actionable findings. Built that exact revision on isolated loopback port 4781
+using a separate config directory: a fresh glm-5.2 session began as global, an
+explicit same-model PATCH reported session, and the session authority survived
+a full daemon stop/start. Fresh GLM 5.2 and DeepSeek V4 Pro turns then ran
+without a per-turn model override in isolated Syzygy worktrees. Both published READY,
+committed exactly one marker file (e28a72f and 72c7ddc), published matching
+CLOSED reports, and left clean worktrees. No remote push or production deploy
+occurred; the production installer correctly rejects this local-only revision
+until it is contained in origin/main. After rebasing onto upstream 591772c, the
+implementation reuses the newly landed monotonic `config_revision` as pin
+provenance; that integration requires focused checks and independent delta
+review before merge.
+
+_________________________________________________________________________________
+time:      [12:03pm] [14-08-26]
+agent:     [codex], [gpt-5]
+worktree:  fix/session-model-pin-provenance
+type:      [feat]
+area:      [providers]: Route current GLM 5.3 seats explicitly
+
+Added `glm-5.3` to the public ready-model catalog and GLM resolver, including
+the `glm-5-3` normalized alias and the established Z.AI coding-plan limits.
+Extended the catalog/routing tripwires so Ocean and Stitchpad can pin the exact
+latest GLM id instead of falling back to an older global or display label. The
+in-flight GLM 4.7 delta review was cancelled and will not count as final proof;
+the authoritative GLM review and production probe must use `glm-5.3` after the
+candidate catalog is running. Verified focused route/catalog tests and strict
+all-target `ocean-providers` clippy.
+
+_________________________________________________________________________________
+time:      [12:16pm] [14-08-26]
+agent:     [codex], [gpt-5]
+worktree:  fix/session-model-pin-provenance
+type:      [test]
+area:      [sessions], [providers]: Independent final-diff review
+
+DeepSeek V4 Pro independently reviewed the rebased session-provenance delta at
+9029ff2 through a fresh Stitchpad/Ocean session and returned PASS with no P0-P2
+findings. The first GLM 5.3 candidate review made 32 source-inspection rounds
+but did not publish a terminal verdict inside the bounded window; its exact
+request was cancelled and confirmed terminal before retry. A fresh GLM 5.3
+session then verified `model=glm-5.3`, `provider=glm`, `model_source=session`,
+and `config_revision=1`, independently reviewed final commit 34cc488, and
+returned PASS with no P0-P2 findings. The candidate wire path therefore proves
+both the same-global create-time pin fix and the new exact GLM 5.3 route.
+Verified full ocean-agent (207) and ocean-daemon (686) tests, all 46
+ocean-providers tests, workspace strict clippy/check, formatting, diff check,
+and docs-check before publication.
