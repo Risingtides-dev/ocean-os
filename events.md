@@ -6014,3 +6014,25 @@ fallback. One `SessionModelConfig` resolver now drives both turn selection and
 config projection. Added legacy compatibility, same-model persistence,
 resolver, and daemon HTTP regression coverage. Live daemon rebuild/restart and
 fresh GLM/DeepSeek Stitchpad proof remain gated on independent review.
+
+_________________________________________________________________________________
+time:      [11:47am] [14-08-26]
+agent:     [codex], [gpt-5]
+worktree:  fix/session-model-pin-provenance
+type:      [test]
+area:      [sessions]: Review and live proof explicit model-pin provenance
+
+GLM 4.7 and DeepSeek V4 Pro independently reviewed the pre-rebase implementation
+at 4f7cd6e through a fresh isolated Stitchpad and both returned PASS with no
+actionable findings. Built that exact revision on isolated loopback port 4781
+using a separate config directory: a fresh glm-5.2 session began as global, an
+explicit same-model PATCH reported session, and the session authority survived
+a full daemon stop/start. Fresh GLM 5.2 and DeepSeek V4 Pro turns then ran
+without a per-turn model override in isolated Syzygy worktrees. Both published READY,
+committed exactly one marker file (e28a72f and 72c7ddc), published matching
+CLOSED reports, and left clean worktrees. No remote push or production deploy
+occurred; the production installer correctly rejects this local-only revision
+until it is contained in origin/main. After rebasing onto upstream 591772c, the
+implementation reuses the newly landed monotonic `config_revision` as pin
+provenance; that integration requires focused checks and independent delta
+review before merge.
