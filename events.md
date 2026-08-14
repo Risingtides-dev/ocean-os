@@ -6036,3 +6036,19 @@ until it is contained in origin/main. After rebasing onto upstream 591772c, the
 implementation reuses the newly landed monotonic `config_revision` as pin
 provenance; that integration requires focused checks and independent delta
 review before merge.
+
+_________________________________________________________________________________
+time:      [12:03pm] [14-08-26]
+agent:     [codex], [gpt-5]
+worktree:  fix/session-model-pin-provenance
+type:      [feat]
+area:      [providers]: Route current GLM 5.3 seats explicitly
+
+Added `glm-5.3` to the public ready-model catalog and GLM resolver, including
+the `glm-5-3` normalized alias and the established Z.AI coding-plan limits.
+Extended the catalog/routing tripwires so Ocean and Stitchpad can pin the exact
+latest GLM id instead of falling back to an older global or display label. The
+in-flight GLM 4.7 delta review was cancelled and will not count as final proof;
+the authoritative GLM review and production probe must use `glm-5.3` after the
+candidate catalog is running. Verified focused route/catalog tests and strict
+all-target `ocean-providers` clippy.
