@@ -6072,3 +6072,12 @@ both the same-global create-time pin fix and the new exact GLM 5.3 route.
 Verified full ocean-agent (207) and ocean-daemon (686) tests, all 46
 ocean-providers tests, workspace strict clippy/check, formatting, diff check,
 and docs-check before publication.
+
+_________________________________________________________________________________
+time:      [10:24] [17-08-26]
+agent:     [ocean], [gpt-5.6]
+worktree:  [main]
+type:      [plan]: Document distributed Rooms workspace architecture
+area:      [docs]: Rooms, Tailscale, resources, and multi-node execution
+
+Added the operator-directed Ocean Rooms distributed workspace concept. The document defines room-scoped agent authorization, per-node folder and compute contributions, logical room resource URIs, a coordinator/direct-data-plane split, Tailscale-backed node reachability, local grant enforcement, remote worker execution, revocation, concurrency, audit, Surface UX, repository ownership boundaries, explicit current gaps, staged delivery, and unresolved decisions. Indexed it as a proposal rather than current implementation or an implementation work order.
