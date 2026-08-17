@@ -72,6 +72,7 @@ Active plans:
 
 Proposals awaiting operator ruling:
 
+- [`specs/2026-08-17-ocean-rooms-gate0-decisions-and-threat-model.md`](specs/2026-08-17-ocean-rooms-gate0-decisions-and-threat-model.md) — proposed Gate 0 rulings for the approved distributed Rooms architecture: same-tailnet V1 scope, Ocean device identity bound to Tailscale peers, human-owned nodes, pinned local agent packages, folder-first resources, conservative capability ordering and approval defaults, fixed budgets, generation-bound revocation, a public coordinator contract, and an explicit threat model. Acceptance authorizes only preparation of the local room-agent Phase 1 manifest.
 - [`specs/2026-07-19-cross-device-approval-and-attention.md`](specs/2026-07-19-cross-device-approval-and-attention.md) — phased design for permission-block notifications, a daemon-wide "Needs you" attention surface, and Web Push background reach, building on the 2026-07-19 `/web` `/desk` `/beam` session-handoff fabric. Phase 1 (notify on block) is accepted and implemented in `ocean-surface-ui`; Phases 2–3 remain proposed.
 
 Active implementation reference:

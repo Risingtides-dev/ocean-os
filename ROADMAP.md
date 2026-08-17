@@ -28,7 +28,8 @@ across those computers. The architecture does not itself authorize code changes.
       cross-node namespace, Tailscale-backed direct operations, node-local
       enforcement, and extension-owned multi-node workflow policy.
 - [ ] Resolve the Phase 0 identity, trust, public coordinator, tailnet boundary,
-      approval-default, revocation, transfer-budget, and device-loss decisions.
+      approval-default, revocation, transfer-budget, and device-loss decisions in
+      the proposed [`Gate 0 decision and threat model`](docs/specs/2026-08-17-ocean-rooms-gate0-decisions-and-threat-model.md).
 - [ ] Write and independently review the exact Phase 1 implementation manifest
       for local room-agent authorization before changing routes or schemas.
 
