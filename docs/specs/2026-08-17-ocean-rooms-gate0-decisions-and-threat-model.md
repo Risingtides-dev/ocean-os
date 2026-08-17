@@ -1,10 +1,10 @@
 # Ocean Rooms — Gate 0 decisions and threat model
 
 **Date:** 2026-08-17
-**Status:** Proposed for operator ruling
+**Status:** Accepted by operator on 2026-08-17
 **Type:** Architecture decision record and security gate
 **Scope:** Resolves the open decisions in `2026-08-16-ocean-rooms-distributed-workspace-architecture.md`
-**Implementation authority:** None; acceptance authorizes preparation of a separately reviewed Phase 1 manifest, not code or schema changes
+**Implementation authority:** Acceptance authorizes preparation and review of a separately accepted Phase 1 manifest; it does not authorize code or schema changes
 
 ## 1. Purpose
 

@@ -6099,3 +6099,12 @@ type:      [plan]: Draft Rooms Gate 0 security decisions
 area:      [docs]: Distributed Rooms trust and threat model
 
 Drafted the ratification-ready Rooms Gate 0 decisions and threat model. It fixes the recommended same-tailnet V1 boundary, application-level node identity, human node ownership, pinned local agent packages, folder-first resource model, read-before-execute-before-write sequencing, distributed approval defaults, hard budgets, no offline queue, shared-context limits, public coordinator requirement, 60-second maximum stale-authority lease, audit boundary, typed failure semantics, abuse cases, and the exact local-only boundary for a later Phase 1 manifest. Indexed it as proposed with no implementation authority pending operator ruling. Fresh independent review found five security/ownership gaps; the draft now requires authenticated replay-safe authorizer proof, scopes resource-path invariants after Phase 1, blocks ordinary remote process tools until OS confinement is proven, distinguishes current compatibility bindings from the future authorization record, and ratifies an opaque resource URI. Delta review reported no blocking findings.
+
+_________________________________________________________________________________
+time:      [11:00] [17-08-26]
+agent:     [ocean], [gpt-5.6]
+worktree:  [main]
+type:      [plan]: Accept Rooms Gate 0
+area:      [docs]: Distributed Rooms security and scope gate
+
+Recorded the operator's explicit acceptance of the reviewed Rooms Gate 0 decisions and threat model. Promoted Gate 0 to accepted authority, closed the Phase 0 roadmap gate, and authorized preparation and review of the local-only Phase 1 room-agent authorization manifest while preserving the separate implementation-acceptance requirement.
