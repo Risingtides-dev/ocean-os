@@ -6081,3 +6081,12 @@ type:      [plan]: Document distributed Rooms workspace architecture
 area:      [docs]: Rooms, Tailscale, resources, and multi-node execution
 
 Added the operator-directed Ocean Rooms distributed workspace concept. The document defines room-scoped agent authorization, per-node folder and compute contributions, logical room resource URIs, a coordinator/direct-data-plane split, Tailscale-backed node reachability, local grant enforcement, remote worker execution, revocation, concurrency, audit, Surface UX, repository ownership boundaries, explicit current gaps, staged delivery, and unresolved decisions. Indexed it as a proposal rather than current implementation or an implementation work order.
+
+_________________________________________________________________________________
+time:      [10:31] [17-08-26]
+agent:     [ocean], [gpt-5.6]
+worktree:  [main]
+type:      [plan]: Ratify distributed Rooms architecture
+area:      [docs]: Rooms distributed workspace program
+
+Recorded the operator's approval of the Ocean Rooms distributed workspace architecture. Promoted the concept from awaiting ruling to an active ratified architecture, added the Phase 0 decisions and Phase 1 manifest gates to the roadmap, and kept implementation explicitly blocked on separately accepted phase manifests.

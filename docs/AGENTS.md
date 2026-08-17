@@ -37,7 +37,7 @@ This child contract governs current architecture, operations, cross-repository r
   are not design, migration, or prompt inputs.
 - A document under `specs/` or `superpowers/` is not current architecture merely because it exists. Preserve its status and verify implementation before using it as a work order.
 - Rooms means durable `/v1/rooms/persistent/*` collaboration plus the independent LiveKit token route; Track-0 projection-room material is historical.
-- `specs/2026-08-16-ocean-rooms-distributed-workspace-architecture.md` records the proposed multi-computer Rooms direction: room-scoped agent authorization, member-contributed resource grants, a logical cross-node namespace, Tailscale-backed direct operations with local enforcement, and extension-owned workflow policy. It is an operator-directed concept, not current implementation or implementation authorization.
+- `specs/2026-08-16-ocean-rooms-distributed-workspace-architecture.md` is the operator-approved (2026-08-17) multi-computer Rooms direction: room-scoped agent authorization, member-contributed resource grants, a logical cross-node namespace, Tailscale-backed direct operations with local enforcement, and extension-owned workflow policy. The architecture is ratified, but implementation still requires separately accepted phase manifests.
 
 ## Work Guidance
 

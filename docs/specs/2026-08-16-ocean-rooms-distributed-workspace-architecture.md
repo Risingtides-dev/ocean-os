@@ -1,9 +1,10 @@
 # Ocean Rooms distributed workspace architecture
 
-**Status:** operator-directed concept architecture; not an implementation manifest  
-**Date:** 2026-08-16  
-**Scope:** room-authorized agents, computers, folders, and distributed execution  
-**Implementation status:** proposed; current persistent Rooms do not provide this distributed resource fabric
+**Status:** operator-approved concept architecture; implementation requires separately accepted phase manifests
+**Date:** 2026-08-16
+**Approved:** 2026-08-17
+**Scope:** room-authorized agents, computers, folders, and distributed execution
+**Implementation status:** architecture ratified but not implemented; current persistent Rooms do not provide this distributed resource fabric
 
 ## 1. Purpose
 

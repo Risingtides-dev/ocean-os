@@ -16,6 +16,22 @@ approved design or permission to alter public contracts.
 - [ ] Keep cross-repository session, voice, component, and room contracts under
       executable drift checks rather than prose-only synchronization.
 
+## Ocean Rooms distributed workspace
+
+Architecture ratified 2026-08-17 in
+[`docs/specs/2026-08-16-ocean-rooms-distributed-workspace-architecture.md`](docs/specs/2026-08-16-ocean-rooms-distributed-workspace-architecture.md).
+Rooms is the authorization and work context through which members contribute
+folders and compute from their Ocean nodes and room-authorized agents work
+across those computers. The architecture does not itself authorize code changes.
+
+- [x] Ratify room-scoped agent bindings, contributed resource grants, the logical
+      cross-node namespace, Tailscale-backed direct operations, node-local
+      enforcement, and extension-owned multi-node workflow policy.
+- [ ] Resolve the Phase 0 identity, trust, public coordinator, tailnet boundary,
+      approval-default, revocation, transfer-budget, and device-loss decisions.
+- [ ] Write and independently review the exact Phase 1 implementation manifest
+      for local room-agent authorization before changing routes or schemas.
+
 ## Ocean Observatory
 
 - [x] Gate 0 decisions accepted — see [`docs/specs/2026-07-17-observatory-gate0-decisions.md`](docs/specs/2026-07-17-observatory-gate0-decisions.md), including the operator's 90s-game visual-parity ruling on truthful events with a durable event store.
