@@ -1,6 +1,16 @@
 # Ocean Rooms — Phase 1 implementation manifest: local room-agent authorization
 
-**Status:** proposed; requires independent review and operator acceptance before any route, schema, or migration lands
+**Status:** operator-accepted 2026-08-25 for **concurrent implementation and review**
+
+> **Deviation from Gate 0, recorded deliberately.** Gate 0 and the ROADMAP call
+> for independent review *before* implementation. The operator has ruled that
+> implementation and review proceed together. This document therefore carries
+> implementation authority now, and has **not** had an independent review pass.
+> Two consequences follow and are binding: the §15 open questions are answered
+> by the implementing changes rather than before them, and each must be closed
+> explicitly in a PR rather than by silence; and the §14 rollout gates still
+> apply — in particular no stage-2 work (contributed folders) opens until this
+> phase's tests in §12 are green.
 **Date:** 2026-08-25
 **Phase:** 1 of the Decision 6 capability delivery order
 **Authorizing documents:**
@@ -507,8 +517,10 @@ Rollout gates, in order:
 
 ## 15. Open questions for review
 
-These are deliberately unresolved; a reviewer should close them before
-acceptance.
+These are deliberately unresolved. Under the concurrent-review ruling they are
+closed by the implementing PRs: whichever change first depends on an answer
+must state the answer and why, in that PR's description. An implementation that
+silently assumes one is an incomplete change, not a finished one.
 
 1. **Operator key rotation.** §3.2 defines a key but no rotation. Should
    rotation invalidate in-flight admissions, or only future mutations?

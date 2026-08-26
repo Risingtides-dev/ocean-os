@@ -6149,3 +6149,35 @@ model role binding, whether stale should block admission only instead of
 cancelling long in-flight work, and whether per-node binding divergence is
 acceptable when the Surface cannot show that a teammate refused an agent you
 authorized. Indexed as proposed with no implementation authority.
+
+_________________________________________________________________________________
+time:      [22:25] [25-08-26]
+agent:     [claude], [opus 5]
+worktree:  [main]
+type:      [plan]: Accept Rooms Phase 1 manifest for concurrent implementation
+area:      [docs]: Operator ruling on review ordering
+
+Operator ruled that the Phase 1 room-agent authorization manifest lands now and
+is reviewed while it is built, rather than blocking on independent review as
+Gate 0 and the ROADMAP specify. Recorded the deviation in the manifest itself
+rather than quietly flipping a status field, because the document previously
+said no route, schema, or migration could land until independent review and
+acceptance, and merging it unchanged would have put a contradiction into main.
+
+The status now reads operator-accepted for concurrent implementation and
+review, states plainly that independent review has not run, and binds two
+consequences: the fifteen-section open questions are closed by the PRs that
+first depend on them, stated explicitly in that PR rather than assumed; and the
+rollout gates still hold, so stage 2 contributed folders does not open until
+the Phase 1 tests are green. ROADMAP marks the manifest written and accepted
+without claiming the review happened, and adds the implementation item beneath
+it.
+
+Worth naming the risk this trades away: the review-first ordering existed so
+that the five open questions — key rotation, whose owner-role opinion wins on
+federated disagreement, whether the pinned digest covers the model role
+binding, whether stale blocks admission or kills in-flight work, and whether
+per-node binding divergence is acceptable — got answered before code assumed
+answers. Under concurrent review they get answered by whoever writes the code
+that needs them, which is faster and less deliberate. The mitigation is the
+explicit-statement rule above.
