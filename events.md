@@ -6108,3 +6108,76 @@ type:      [plan]: Accept Rooms Gate 0
 area:      [docs]: Distributed Rooms security and scope gate
 
 Recorded the operator's explicit acceptance of the reviewed Rooms Gate 0 decisions and threat model. Promoted Gate 0 to accepted authority, closed the Phase 0 roadmap gate, and authorized preparation and review of the local-only Phase 1 room-agent authorization manifest while preserving the separate implementation-acceptance requirement.
+
+_________________________________________________________________________________
+time:      [22:05] [25-08-26]
+agent:     [claude], [opus 5]
+worktree:  [main]
+type:      [plan]: Propose Rooms Phase 1 room-agent authorization manifest
+area:      [docs]: Local-only room-agent authority record
+
+Drafted the Phase 1 implementation manifest the ROADMAP and Gate 0 §8 both call
+for, covering local room-agent authorization and deliberately nothing else. It
+fixes the daemon as the durable binding owner rather than the coordinator,
+because a binding is execution authority and the architecture holds that the
+coordinator never becomes local execution authority — which also keeps Phase 1
+working with no coordinator at all, as the public-Ocean contract requires.
+Specifies the binding record with a pinned definition digest and a generation,
+the four statuses and what each does to in-flight work, a fail-closed local
+operator principal with a header-only credential that refuses to degrade to
+ambient trust when its key is missing, replay-safe approval keyed on a decision
+id bound to a request digest, the browser anti-CSRF boundary, activation and
+context and memory policies defaulting to the quietest option, the
+requested-intersect-granted-intersect-runtime capability rule computed once at
+admission, the add/inspect/re-authorize/suspend/revoke routes, the Surface flow
+replacing the bare global-name picker, 27 required tests, and migration with an
+explicit note that downgrade is a security regression rather than a routine
+rollback.
+
+Compatibility is the load-bearing part: existing agent participants and
+federated agent descriptors keep rendering and keep their historical
+attribution, but confer no authority and are never upgraded into bindings. That
+is intended breakage — agents that act today via the name picker stop acting
+until an operator authorizes them — and the Surface has to say so plainly.
+ocean-bedrock requires no change and is explicitly forbidden from making a
+federated descriptor authorizing on a node.
+
+Left five questions open for the reviewer rather than settling them silently:
+operator key rotation semantics, which owner-role opinion wins when a federated
+room disagrees with the local store, whether the pinned digest should cover the
+model role binding, whether stale should block admission only instead of
+cancelling long in-flight work, and whether per-node binding divergence is
+acceptable when the Surface cannot show that a teammate refused an agent you
+authorized. Indexed as proposed with no implementation authority.
+
+_________________________________________________________________________________
+time:      [22:25] [25-08-26]
+agent:     [claude], [opus 5]
+worktree:  [main]
+type:      [plan]: Accept Rooms Phase 1 manifest for concurrent implementation
+area:      [docs]: Operator ruling on review ordering
+
+Operator ruled that the Phase 1 room-agent authorization manifest lands now and
+is reviewed while it is built, rather than blocking on independent review as
+Gate 0 and the ROADMAP specify. Recorded the deviation in the manifest itself
+rather than quietly flipping a status field, because the document previously
+said no route, schema, or migration could land until independent review and
+acceptance, and merging it unchanged would have put a contradiction into main.
+
+The status now reads operator-accepted for concurrent implementation and
+review, states plainly that independent review has not run, and binds two
+consequences: the fifteen-section open questions are closed by the PRs that
+first depend on them, stated explicitly in that PR rather than assumed; and the
+rollout gates still hold, so stage 2 contributed folders does not open until
+the Phase 1 tests are green. ROADMAP marks the manifest written and accepted
+without claiming the review happened, and adds the implementation item beneath
+it.
+
+Worth naming the risk this trades away: the review-first ordering existed so
+that the five open questions — key rotation, whose owner-role opinion wins on
+federated disagreement, whether the pinned digest covers the model role
+binding, whether stale blocks admission or kills in-flight work, and whether
+per-node binding divergence is acceptable — got answered before code assumed
+answers. Under concurrent review they get answered by whoever writes the code
+that needs them, which is faster and less deliberate. The mitigation is the
+explicit-statement rule above.

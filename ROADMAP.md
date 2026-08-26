@@ -30,8 +30,15 @@ across those computers. The architecture does not itself authorize code changes.
 - [x] Resolve the Phase 0 identity, trust, public coordinator, tailnet boundary,
       approval-default, revocation, transfer-budget, and device-loss decisions in
       the accepted [`Gate 0 decision and threat model`](docs/specs/2026-08-17-ocean-rooms-gate0-decisions-and-threat-model.md).
-- [ ] Write and independently review the exact Phase 1 implementation manifest
-      for local room-agent authorization before changing routes or schemas.
+- [x] Write the exact Phase 1 implementation manifest for local room-agent
+      authorization: [`Phase 1 room-agent authorization manifest`](docs/specs/2026-08-25-ocean-rooms-phase1-room-agent-authorization-manifest.md),
+      operator-accepted 2026-08-25 for concurrent implementation and review.
+      Independent review has NOT run; by operator ruling it proceeds alongside
+      implementation, and the manifest's open questions are closed by the PRs
+      that depend on them.
+- [ ] Implement Phase 1 against that manifest and close its §15 open questions
+      in the PRs that depend on them. Stage 2 (contributed folders) does not
+      open until the §12 tests are green.
 
 ## Ocean Observatory
 
