@@ -156,6 +156,8 @@ mod room_attachments;
 mod room_federation;
 /// One-shot room-transcript summary into the room's well-known artifact.
 mod room_summary;
+/// Fail-closed local operator principal for room-agent authorization mutations.
+mod room_operator;
 /// Host fulfillment lifecycle retained for the external `ocean-slack` extension.
 mod slack_canvas_fulfillment;
 /// Ephemeral OpenAI Realtime client-secret mint (voice phases 2/3) — the
