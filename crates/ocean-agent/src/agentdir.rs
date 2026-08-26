@@ -511,6 +511,322 @@ pub fn validate(def: &AgentDef) -> Vec<Diagnostic> {
     diags
 }
 
+/// Everything an operator can author for an agent from a surface.
+///
+/// This is the *write* counterpart to [`AgentDef`]. `instructions` is the only
+/// field the folder truly requires — a bare `instructions.md` is already a
+/// valid agent — so everything else is optional and simply omitted from
+/// `agent.toml` when unset, keeping hand-written folders and UI-written ones
+/// the same shape.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct AgentSpec {
+    #[serde(default)]
+    pub description: Option<String>,
+    #[serde(default)]
+    pub model: Option<String>,
+    #[serde(default)]
+    pub tools: Vec<String>,
+    #[serde(default)]
+    pub capabilities: Vec<String>,
+    #[serde(default)]
+    pub yolo: Option<bool>,
+    /// The system prompt. Required and non-empty: an agent with no instructions
+    /// has nothing to be.
+    #[serde(default)]
+    pub instructions: String,
+}
+
+/// Why an agent write was refused.
+#[derive(Debug)]
+pub enum WriteError {
+    /// Name is empty, too long, contains a separator/`..`, or is not the
+    /// restricted charset. Identity comes from the path, so an unsafe name is
+    /// a traversal, not a typo.
+    InvalidName(String),
+    /// `instructions` was empty. The one required slot.
+    MissingInstructions,
+    /// Create was asked for and the agent already exists.
+    AlreadyExists(String),
+    /// Update or delete was asked for and it does not.
+    NotFound(String),
+    /// Filesystem error.
+    Io(PathBuf, String),
+    /// Serializing `agent.toml` failed.
+    Encode(String),
+}
+
+impl std::fmt::Display for WriteError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            WriteError::InvalidName(n) => write!(
+                f,
+                "invalid agent name {n:?}: use 1-64 chars of a-z, 0-9, '-' or '_'"
+            ),
+            WriteError::MissingInstructions => {
+                write!(
+                    f,
+                    "instructions are required; an agent needs a system prompt"
+                )
+            }
+            WriteError::AlreadyExists(n) => write!(f, "agent {n:?} already exists"),
+            WriteError::NotFound(n) => write!(f, "no agent named {n:?}"),
+            WriteError::Io(p, e) => write!(f, "{}: {e}", p.display()),
+            WriteError::Encode(e) => write!(f, "could not encode agent.toml: {e}"),
+        }
+    }
+}
+
+impl std::error::Error for WriteError {}
+
+/// Names that are safe as a directory component AND readable in a roster.
+///
+/// Stricter than [`resolve`]'s traversal guard on purpose: `resolve` must keep
+/// reading whatever an operator already hand-created, but anything we CREATE
+/// should be conservative. Rejecting leading dots also keeps an agent from
+/// being written as a hidden folder that `discover` would skip.
+pub fn valid_agent_name(name: &str) -> bool {
+    !name.is_empty()
+        && name.len() <= 64
+        && !name.starts_with('.')
+        && !name.starts_with('-')
+        && name
+            .chars()
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-' || c == '_')
+}
+
+/// Create or update an agent folder.
+///
+/// `must_be_new` distinguishes create from update so a surface's "new agent"
+/// cannot silently overwrite an existing one that the operator forgot about.
+///
+/// Writes are additive to the folder: `skills/`, `tools/`, `subagents/` and any
+/// other authored slot are left exactly as they are, so editing an agent from a
+/// surface never destroys work done by hand on disk.
+pub fn write(
+    root: &Path,
+    name: &str,
+    spec: &AgentSpec,
+    must_be_new: bool,
+) -> Result<AgentDef, WriteError> {
+    if !valid_agent_name(name) {
+        return Err(WriteError::InvalidName(name.to_string()));
+    }
+    if spec.instructions.trim().is_empty() {
+        return Err(WriteError::MissingInstructions);
+    }
+    let dir = root.join(name);
+    let exists = dir.join("instructions.md").is_file();
+    if must_be_new && exists {
+        return Err(WriteError::AlreadyExists(name.to_string()));
+    }
+    if !must_be_new && !exists {
+        return Err(WriteError::NotFound(name.to_string()));
+    }
+
+    fs::create_dir_all(&dir).map_err(|e| WriteError::Io(dir.clone(), e.to_string()))?;
+
+    let instructions_path = dir.join("instructions.md");
+    let mut body = spec.instructions.trim_end().to_string();
+    body.push('\n');
+    fs::write(&instructions_path, body)
+        .map_err(|e| WriteError::Io(instructions_path.clone(), e.to_string()))?;
+
+    // Only emit keys the operator actually set. An agent.toml full of empty
+    // defaults reads as configuration that was chosen, when it was not.
+    let mut cfg = toml::map::Map::new();
+    if let Some(d) = spec.description.as_ref().filter(|d| !d.trim().is_empty()) {
+        cfg.insert("description".into(), toml::Value::String(d.trim().into()));
+    }
+    if let Some(m) = spec.model.as_ref().filter(|m| !m.trim().is_empty()) {
+        cfg.insert("model".into(), toml::Value::String(m.trim().into()));
+    }
+    if !spec.tools.is_empty() {
+        cfg.insert(
+            "tools".into(),
+            toml::Value::Array(
+                spec.tools
+                    .iter()
+                    .map(|t| toml::Value::String(t.clone()))
+                    .collect(),
+            ),
+        );
+    }
+    if !spec.capabilities.is_empty() {
+        cfg.insert(
+            "capabilities".into(),
+            toml::Value::Array(
+                spec.capabilities
+                    .iter()
+                    .map(|c| toml::Value::String(c.clone()))
+                    .collect(),
+            ),
+        );
+    }
+    if let Some(y) = spec.yolo {
+        cfg.insert("yolo".into(), toml::Value::Boolean(y));
+    }
+
+    let toml_path = dir.join("agent.toml");
+    if cfg.is_empty() {
+        // A bare instructions.md is a valid agent; do not leave an empty file
+        // implying configuration exists.
+        let _ = fs::remove_file(&toml_path);
+    } else {
+        let rendered = toml::to_string_pretty(&toml::Value::Table(cfg))
+            .map_err(|e| WriteError::Encode(e.to_string()))?;
+        fs::write(&toml_path, rendered)
+            .map_err(|e| WriteError::Io(toml_path.clone(), e.to_string()))?;
+    }
+
+    // Re-resolve so the caller gets exactly what the daemon will read next
+    // turn, rather than an echo of what we think we wrote.
+    resolve(root, name).map_err(|e| WriteError::Io(dir, e.to_string()))
+}
+
+/// Delete an agent folder and everything authored under it.
+pub fn remove(root: &Path, name: &str) -> Result<(), WriteError> {
+    if !valid_agent_name(name) {
+        return Err(WriteError::InvalidName(name.to_string()));
+    }
+    let dir = root.join(name);
+    if !dir.is_dir() {
+        return Err(WriteError::NotFound(name.to_string()));
+    }
+    fs::remove_dir_all(&dir).map_err(|e| WriteError::Io(dir, e.to_string()))
+}
+
+#[cfg(test)]
+mod write_tests {
+    use super::*;
+
+    fn spec(instructions: &str) -> AgentSpec {
+        AgentSpec {
+            description: Some("a test agent".into()),
+            model: Some("glm-4.5-flash".into()),
+            tools: vec!["read".into(), "bash".into()],
+            capabilities: vec!["builtin:read".into()],
+            yolo: Some(false),
+            instructions: instructions.into(),
+        }
+    }
+
+    #[test]
+    fn create_then_resolve_round_trips() {
+        let dir = tempfile::tempdir().unwrap();
+        let def = write(dir.path(), "builder", &spec("You build things."), true).unwrap();
+        assert_eq!(def.name, "builder");
+        assert_eq!(def.config.model.as_deref(), Some("glm-4.5-flash"));
+        assert_eq!(def.config.tools, vec!["read", "bash"]);
+        // and it is discoverable, which is what a surface's picker lists
+        assert!(discover(dir.path()).contains(&"builder".to_string()));
+    }
+
+    #[test]
+    fn instructions_are_required() {
+        let dir = tempfile::tempdir().unwrap();
+        let err = write(dir.path(), "empty", &spec("   "), true).unwrap_err();
+        assert!(matches!(err, WriteError::MissingInstructions));
+        assert!(
+            !dir.path().join("empty").exists(),
+            "nothing partial left behind"
+        );
+    }
+
+    #[test]
+    fn create_refuses_to_overwrite_an_existing_agent() {
+        let dir = tempfile::tempdir().unwrap();
+        write(dir.path(), "dup", &spec("first"), true).unwrap();
+        let err = write(dir.path(), "dup", &spec("second"), true).unwrap_err();
+        assert!(matches!(err, WriteError::AlreadyExists(_)));
+        // the original survives
+        let def = resolve(dir.path(), "dup").unwrap();
+        assert!(def.instructions.contains("first"));
+    }
+
+    #[test]
+    fn update_requires_the_agent_to_exist() {
+        let dir = tempfile::tempdir().unwrap();
+        let err = write(dir.path(), "ghost", &spec("x"), false).unwrap_err();
+        assert!(matches!(err, WriteError::NotFound(_)));
+    }
+
+    #[test]
+    fn update_preserves_hand_authored_slots() {
+        // Editing from a surface must never delete work done on disk.
+        let dir = tempfile::tempdir().unwrap();
+        write(dir.path(), "keeper", &spec("v1"), true).unwrap();
+        let skills = dir.path().join("keeper/skills");
+        fs::create_dir_all(&skills).unwrap();
+        fs::write(skills.join("deploy.md"), "hand written").unwrap();
+
+        write(dir.path(), "keeper", &spec("v2"), false).unwrap();
+        assert_eq!(
+            fs::read_to_string(skills.join("deploy.md")).unwrap(),
+            "hand written"
+        );
+    }
+
+    #[test]
+    fn a_name_that_could_traverse_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        for bad in [
+            "../escape",
+            "a/b",
+            "..",
+            "",
+            ".hidden",
+            "-lead",
+            "UPPER",
+            "sp ace",
+        ] {
+            assert!(
+                write(dir.path(), bad, &spec("x"), true).is_err(),
+                "expected reject: {bad:?}"
+            );
+        }
+        // and nothing was created outside the root
+        assert!(!dir.path().parent().unwrap().join("escape").exists());
+    }
+
+    #[test]
+    fn an_unset_config_writes_no_agent_toml() {
+        let dir = tempfile::tempdir().unwrap();
+        let bare = AgentSpec {
+            instructions: "Just a prompt.".into(),
+            ..Default::default()
+        };
+        write(dir.path(), "bare", &bare, true).unwrap();
+        assert!(dir.path().join("bare/instructions.md").is_file());
+        assert!(
+            !dir.path().join("bare/agent.toml").exists(),
+            "an empty agent.toml would imply configuration that was never chosen"
+        );
+        // still a valid agent
+        assert!(resolve(dir.path(), "bare").is_ok());
+    }
+
+    #[test]
+    fn remove_deletes_the_agent() {
+        let dir = tempfile::tempdir().unwrap();
+        write(dir.path(), "temp", &spec("x"), true).unwrap();
+        remove(dir.path(), "temp").unwrap();
+        assert!(!dir.path().join("temp").exists());
+        assert!(matches!(
+            remove(dir.path(), "temp").unwrap_err(),
+            WriteError::NotFound(_)
+        ));
+    }
+
+    #[test]
+    fn remove_refuses_an_unsafe_name() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(matches!(
+            remove(dir.path(), "../etc").unwrap_err(),
+            WriteError::InvalidName(_)
+        ));
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

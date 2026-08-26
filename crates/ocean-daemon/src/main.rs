@@ -748,8 +748,11 @@ fn app_router(cors: CorsLayer) -> Router<AppState> {
         .route("/v1/sessions/{id}/sync", get(session_sync))
         // Folder-as-agent classification (read-only): list + resolve agents from
         // the agents root. See docs/specs/folder-as-agent.md.
-        .route("/v1/agents", get(agents_list))
-        .route("/v1/agents/{name}", get(agent_def))
+        .route("/v1/agents", get(agents_list).post(agent_create))
+        .route(
+            "/v1/agents/{name}",
+            get(agent_def).put(agent_update).delete(agent_delete),
+        )
         .route("/v1/projects", get(projects_list).post(project_create))
         .route(
             "/v1/projects/{id}",
@@ -2743,6 +2746,87 @@ async fn agent_def(Path(name): Path<String>) -> Json<serde_json::Value> {
     match ocean_agent::agentdir::resolve(&root, &name) {
         Ok(def) => Json(json!({ "ok": true, "agent": def })),
         Err(e) => Json(json!({ "ok": false, "error": e.to_string() })),
+    }
+}
+
+/// Body for creating or updating an agent from a surface.
+#[derive(serde::Deserialize)]
+struct AgentWriteBody {
+    /// Only meaningful on create; the path supplies it on update.
+    #[serde(default)]
+    name: Option<String>,
+    #[serde(flatten)]
+    spec: ocean_agent::agentdir::AgentSpec,
+}
+
+/// Map a write refusal to the status a client should actually branch on.
+fn agent_write_status(err: &ocean_agent::agentdir::WriteError) -> StatusCode {
+    use ocean_agent::agentdir::WriteError::*;
+    match err {
+        InvalidName(_) | MissingInstructions => StatusCode::BAD_REQUEST,
+        AlreadyExists(_) => StatusCode::CONFLICT,
+        NotFound(_) => StatusCode::NOT_FOUND,
+        Io(_, _) | Encode(_) => StatusCode::INTERNAL_SERVER_ERROR,
+    }
+}
+
+/// `POST /v1/agents` — create a new agent folder.
+///
+/// Folder-as-agent was read-only until now: an operator could list and inspect
+/// agents but only author one by hand on disk, which meant a surface could
+/// never offer "new agent". Create refuses to overwrite, so a surface cannot
+/// silently clobber an agent the operator forgot about.
+async fn agent_create(Json(body): Json<AgentWriteBody>) -> (StatusCode, Json<serde_json::Value>) {
+    let Some(name) = body
+        .name
+        .as_deref()
+        .map(str::trim)
+        .filter(|n| !n.is_empty())
+    else {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "ok": false, "error": "name is required" })),
+        );
+    };
+    match ocean_agent::agentdir::write(&agents_root(), name, &body.spec, true) {
+        Ok(def) => (
+            StatusCode::CREATED,
+            Json(json!({ "ok": true, "agent": def })),
+        ),
+        Err(e) => (
+            agent_write_status(&e),
+            Json(json!({ "ok": false, "error": e.to_string() })),
+        ),
+    }
+}
+
+/// `PUT /v1/agents/{name}` — update an existing agent.
+///
+/// Additive to the folder: `skills/`, `tools/`, `subagents/` and anything else
+/// authored by hand are untouched, so editing from a surface never destroys
+/// work done on disk. The daemon hot-reads the tree, so the next turn picks the
+/// change up with no restart.
+async fn agent_update(
+    Path(name): Path<String>,
+    Json(body): Json<AgentWriteBody>,
+) -> (StatusCode, Json<serde_json::Value>) {
+    match ocean_agent::agentdir::write(&agents_root(), name.trim(), &body.spec, false) {
+        Ok(def) => (StatusCode::OK, Json(json!({ "ok": true, "agent": def }))),
+        Err(e) => (
+            agent_write_status(&e),
+            Json(json!({ "ok": false, "error": e.to_string() })),
+        ),
+    }
+}
+
+/// `DELETE /v1/agents/{name}` — remove an agent folder and its authored slots.
+async fn agent_delete(Path(name): Path<String>) -> (StatusCode, Json<serde_json::Value>) {
+    match ocean_agent::agentdir::remove(&agents_root(), name.trim()) {
+        Ok(()) => (StatusCode::OK, Json(json!({ "ok": true, "removed": name }))),
+        Err(e) => (
+            agent_write_status(&e),
+            Json(json!({ "ok": false, "error": e.to_string() })),
+        ),
     }
 }
 
