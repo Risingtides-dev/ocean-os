@@ -31,7 +31,10 @@ across those computers. The architecture does not itself authorize code changes.
       approval-default, revocation, transfer-budget, and device-loss decisions in
       the accepted [`Gate 0 decision and threat model`](docs/specs/2026-08-17-ocean-rooms-gate0-decisions-and-threat-model.md).
 - [ ] Write and independently review the exact Phase 1 implementation manifest
-      for local room-agent authorization before changing routes or schemas.
+      for local room-agent authorization before changing routes or schemas. A
+      proposed manifest is indexed at
+      [`Phase 1 room-agent authorization manifest`](docs/specs/2026-08-25-ocean-rooms-phase1-room-agent-authorization-manifest.md);
+      it is not accepted and carries no implementation authority.
 
 ## Ocean Observatory
 
