@@ -6619,3 +6619,51 @@ had never loaded rooms (surface #121). Bedrock migration 010 is not yet applied
 to production and the Railway service has no GitHub source, so repo-in-room is
 merged but not shipped.
 _________________________________________________________________________________
+
+time:      [22:45] [08-27-26]
+agent:     [claude] [opus 5]
+worktree:  loop/provider-readiness-is-a-lie
+type:      [bug-report]
+area:      [backend]
+
+Failover stopped routing turns to a provider whose credential does not work.
+Selection-time readiness proved a key was PRESENT, never that it was valid, so
+the dead DeepSeek key on this machine looked like a perfectly good alternate: a
+transient GLM blip failed over straight into a 401 and the room recorded a
+failure that read as the agent's fault. An auth rejection is not an availability
+error, so the turn cannot fail over a second time and the user just loses it.
+
+A provider that answers 401 or 403 is now quarantined for 300s and dropped from
+fallback_candidates until it is re-proven by serving a turn. The quarantine can
+only ever REMOVE candidates, never add one, and is_quarantined fails closed on a
+backwards clock. It lives on AgentRuntime rather than in a process-global,
+because that is the only layer that ever sees a provider's HTTP response — and
+because a static would make the parallel test suite flaky. Nothing is added to
+the hot path: resolve_turn_state_with_failover short-circuits on readiness().ok
+before the quarantine is consulted, so only the degraded-primary path pays the
+map lookup. The operator's explicit primary bypasses it entirely.
+
+Worth stating as a cost rather than a win: clear() only runs after a SUCCESSFUL
+dispatch and a quarantined provider is never dispatched as a fallback, so the
+only exit is the TTL. There is no half-open probe. A key rotated ten seconds
+after the 401 still hard-fails failover for the remaining ~290s, and where it
+was the only alternate the turn now dies with "all providers degraded" instead
+of succeeding. Five minutes is the worst case, deliberately taken.
+
+403 is included knowing it is ambiguous. It is often not a dead key at all —
+Anthropic returns it for org/model permission, Google for "API not enabled" —
+and the quarantine is keyed by ProviderId, so a model-scoped 403 suppresses
+every alias of that provider. Included anyway because either way this credential
+cannot serve a turn on this provider, which is the only question a failover
+target has to answer, and the TTL bounds the cost of being wrong. The doc says
+so instead of claiming certainty the status code does not carry.
+
+Review found the write half untested: commenting out all four wiring lines in
+run_turn_with_failover left the suite fully green. A #[cfg(test)]
+test_dispatch_status seam now sits where a real pre-stream provider failure
+lands — after the accepted-user durable checkpoint, before toolset resolution —
+so the scripted error arrives in the exact TurnFailure shape production emits
+and the fallback's reuse_accepted_user invariant holds for the same reason it
+holds against a live provider. Reverting each of the four lines individually now
+fails exactly one test, and a different one each time.
+_________________________________________________________________________________
