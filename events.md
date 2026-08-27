@@ -6351,3 +6351,24 @@ never overwrite it with active state.
 
 Verification: cargo test -p ocean-store (170 passed), the focused concurrency
 regression, and strict ocean-store all-target Clippy with denied warnings passed.
+_________________________________________________________________________________
+
+time:  [01:48] [08-27-26]
+agent: [codex] [gpt-5]
+worktree: [feat/rooms-phase1-agent-binding]
+type:  [bug report]
+area:  [backend]
+
+Closed four additional exact-head review findings in the accepted Rooms Phase 1
+authority foundation. Operator identity now stays unavailable on platforms that
+cannot prove equivalent owner, link, and ACL security. Authorization and status
+mutations require an open room inside their IMMEDIATE transaction and read the
+returned binding before releasing the write lock. Binding generations now use
+canonical-decimal u64 TEXT, checked Rust-side increments, overflow refusal, and
+an idempotent migration for the earlier unshipped INTEGER branch schema.
+
+Verification: cargo test -p ocean-store (173 passed), cargo test -p ocean-daemon
+(739 passed), strict all-target Clippy for both crates, cargo check --workspace,
+cargo xtask docs-check, formatting, diff hygiene, and the full cargo xtask ci
+repository gate all passed.
+_________________________________________________________________________________

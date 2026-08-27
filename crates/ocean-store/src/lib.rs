@@ -1530,7 +1530,7 @@ impl SqliteRoomStore {
                 requested_capabilities    TEXT NOT NULL,   -- JSON array, canonical order
                 room_capability_grants    TEXT NOT NULL,   -- JSON array, canonical order
                 status                    TEXT NOT NULL,   -- active|suspended|stale|revoked
-                generation                INTEGER NOT NULL,
+                generation                TEXT NOT NULL,    -- canonical decimal u64
                 decision_id               TEXT NOT NULL,
                 request_digest            TEXT NOT NULL,
                 revoked_at                TEXT,
@@ -1572,6 +1572,7 @@ impl SqliteRoomStore {
               FROM room_agent_bindings;
             "#,
         )?;
+        self.migrate_room_agent_generation_to_text()?;
         // Backfill columns on DBs created before they existed.
         // position (S2-P1) — on the `outbox` table. The column *and* its
         // index are created inside the `execute_batch` above for fresh DBs but
@@ -1633,6 +1634,162 @@ impl SqliteRoomStore {
             Err(e) => return Err(e.into()),
         }
         // position (S2-P1) — already handled first (above).
+        Ok(())
+    }
+
+    /// Rebuild the unshipped Phase 1 authority tables created by earlier
+    /// branch builds that declared `generation` as SQLite INTEGER. The public
+    /// type is `u64`, so retaining signed numeric affinity would promote past
+    /// i64::MAX to REAL and corrupt authority state. Validate every old value
+    /// first, then rebuild both FK-linked tables with canonical-decimal TEXT.
+    fn migrate_room_agent_generation_to_text(&mut self) -> Result<()> {
+        let generation_decl = {
+            let mut stmt = self
+                .conn
+                .prepare("PRAGMA table_info(room_agent_bindings)")?;
+            let columns = stmt.query_map([], |row| {
+                Ok((row.get::<_, String>(1)?, row.get::<_, String>(2)?))
+            })?;
+            let mut found = None;
+            for column in columns {
+                let (name, declared_type) = column?;
+                if name == "generation" {
+                    found = Some(declared_type);
+                    break;
+                }
+            }
+            found
+        };
+        let Some(generation_decl) = generation_decl else {
+            return Err(RoomStoreError::Encode(
+                "room_agent_bindings.generation column is missing".into(),
+            ));
+        };
+        if generation_decl.eq_ignore_ascii_case("TEXT") {
+            return Ok(());
+        }
+
+        {
+            use rusqlite::types::Value;
+
+            let mut stmt = self
+                .conn
+                .prepare("SELECT generation FROM room_agent_bindings")?;
+            let values = stmt.query_map([], |row| row.get::<_, Value>(0))?;
+            for value in values {
+                let generation = match value? {
+                    Value::Integer(value) => u64::try_from(value).map_err(|_| {
+                        RoomStoreError::Encode(format!(
+                            "invalid room-agent generation integer: {value}"
+                        ))
+                    })?,
+                    Value::Text(value) => parse_canonical_u64_text(&value)?,
+                    other => {
+                        return Err(RoomStoreError::Encode(format!(
+                            "invalid room-agent generation storage class: {other:?}"
+                        )))
+                    }
+                };
+                if generation == 0 {
+                    return Err(RoomStoreError::Encode(
+                        "room-agent generation must start at one".into(),
+                    ));
+                }
+            }
+        }
+
+        self.conn.pragma_update(None, "foreign_keys", false)?;
+        let migration = (|| -> Result<()> {
+            let tx = self
+                .conn
+                .transaction_with_behavior(TransactionBehavior::Immediate)?;
+            tx.execute_batch(
+                r#"
+                ALTER TABLE room_agent_decisions RENAME TO room_agent_decisions_integer_generation;
+                ALTER TABLE room_agent_bindings RENAME TO room_agent_bindings_integer_generation;
+
+                CREATE TABLE room_agent_bindings (
+                    room_id                   TEXT NOT NULL REFERENCES rooms(id) ON DELETE CASCADE,
+                    agent_member_id           TEXT NOT NULL,
+                    agent_package_id          TEXT NOT NULL,
+                    agent_definition_digest   TEXT NOT NULL,
+                    agent_definition_revision TEXT,
+                    display_name              TEXT NOT NULL,
+                    owner_member_id           TEXT NOT NULL,
+                    authorized_by             TEXT NOT NULL,
+                    authorized_at             TEXT NOT NULL,
+                    activation_policy         TEXT NOT NULL,
+                    context_policy            TEXT NOT NULL,
+                    memory_scope              TEXT NOT NULL,
+                    requested_capabilities    TEXT NOT NULL,
+                    room_capability_grants    TEXT NOT NULL,
+                    status                    TEXT NOT NULL,
+                    generation                TEXT NOT NULL,
+                    decision_id               TEXT NOT NULL,
+                    request_digest            TEXT NOT NULL,
+                    revoked_at                TEXT,
+                    revoked_by                TEXT,
+                    PRIMARY KEY (room_id, agent_member_id)
+                );
+
+                INSERT INTO room_agent_bindings (
+                    room_id, agent_member_id, agent_package_id, agent_definition_digest,
+                    agent_definition_revision, display_name, owner_member_id, authorized_by,
+                    authorized_at, activation_policy, context_policy, memory_scope,
+                    requested_capabilities, room_capability_grants, status, generation,
+                    decision_id, request_digest, revoked_at, revoked_by
+                )
+                SELECT room_id, agent_member_id, agent_package_id, agent_definition_digest,
+                       agent_definition_revision, display_name, owner_member_id, authorized_by,
+                       authorized_at, activation_policy, context_policy, memory_scope,
+                       requested_capabilities, room_capability_grants, status,
+                       CAST(generation AS TEXT), decision_id, request_digest,
+                       revoked_at, revoked_by
+                  FROM room_agent_bindings_integer_generation;
+
+                CREATE TABLE room_agent_decisions (
+                    room_id         TEXT NOT NULL REFERENCES rooms(id) ON DELETE CASCADE,
+                    decision_id     TEXT NOT NULL,
+                    agent_member_id TEXT NOT NULL,
+                    request_digest  TEXT NOT NULL,
+                    consumed_at     TEXT NOT NULL,
+                    PRIMARY KEY (room_id, decision_id),
+                    FOREIGN KEY (room_id, agent_member_id)
+                        REFERENCES room_agent_bindings(room_id, agent_member_id)
+                        ON DELETE CASCADE
+                );
+
+                INSERT INTO room_agent_decisions (
+                    room_id, decision_id, agent_member_id, request_digest, consumed_at
+                )
+                SELECT room_id, decision_id, agent_member_id, request_digest, consumed_at
+                  FROM room_agent_decisions_integer_generation;
+
+                DROP TABLE room_agent_decisions_integer_generation;
+                DROP TABLE room_agent_bindings_integer_generation;
+
+                CREATE UNIQUE INDEX idx_room_agent_bindings_decision
+                    ON room_agent_bindings(room_id, decision_id);
+                CREATE INDEX idx_room_agent_bindings_active
+                    ON room_agent_bindings(room_id) WHERE status = 'active';
+                "#,
+            )?;
+            tx.commit()?;
+            Ok(())
+        })();
+        let restore_foreign_keys = self.conn.pragma_update(None, "foreign_keys", true);
+        migration?;
+        restore_foreign_keys?;
+
+        let violation: Option<String> = self
+            .conn
+            .query_row("PRAGMA foreign_key_check", [], |row| row.get(0))
+            .optional()?;
+        if let Some(table) = violation {
+            return Err(RoomStoreError::Encode(format!(
+                "room-agent generation migration violated a foreign key in {table}"
+            )));
+        }
         Ok(())
     }
 
@@ -3970,13 +4127,19 @@ impl SqliteRoomStore {
                     .into(),
             ));
         }
-        if !self.room_exists(key)? {
-            return Err(RoomStoreError::UnknownRoom(key.clone()));
-        }
-
         let tx = self
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let room_open: Option<i64> = tx
+            .query_row(
+                "SELECT 1 FROM rooms WHERE id = ?1 AND closed_at IS NULL",
+                params![key.as_str()],
+                |row| row.get(0),
+            )
+            .optional()?;
+        if room_open.is_none() {
+            return Err(RoomStoreError::UnknownRoom(key.clone()));
+        }
 
         // A decision id is unique per room. If this one was already used,
         // it must have approved exactly this content or it is a replay
@@ -3998,27 +4161,40 @@ impl SqliteRoomStore {
                     decision_id: input.decision_id,
                 });
             }
-            drop(tx);
-            let existing = self
-                .room_agent_binding(key, &input.agent_member_id)?
+            let existing = tx
+                .query_row(
+                    "SELECT agent_member_id, agent_package_id, agent_definition_digest,
+                            agent_definition_revision, display_name, owner_member_id,
+                            authorized_by, authorized_at, activation_policy, context_policy,
+                            memory_scope, requested_capabilities, room_capability_grants,
+                            status, generation, decision_id, request_digest,
+                            revoked_at, revoked_by
+                       FROM room_agent_bindings
+                      WHERE room_id = ?1 AND agent_member_id = ?2",
+                    params![key.as_str(), input.agent_member_id],
+                    |row| Self::binding_from_row(key, row),
+                )
+                .optional()?
+                .transpose()?
                 .ok_or_else(|| RoomStoreError::UnknownAgentBinding {
                     room: key.clone(),
                     agent: input.agent_member_id.clone(),
                 })?;
+            tx.commit()?;
             return Ok((existing, false));
         }
 
         // A revoked identity is terminal: re-adding must mint a new
         // agent_member_id rather than resurrect the old row.
-        let existing_status: Option<String> = tx
+        let existing_authority: Option<(String, String)> = tx
             .query_row(
-                "SELECT status FROM room_agent_bindings
+                "SELECT status, generation FROM room_agent_bindings
                  WHERE room_id = ?1 AND agent_member_id = ?2",
                 params![key.as_str(), input.agent_member_id],
-                |r| r.get(0),
+                |row| Ok((row.get(0)?, row.get(1)?)),
             )
             .optional()?;
-        if let Some(status) = existing_status {
+        let generation = if let Some((status, generation)) = existing_authority {
             let from = AgentBindingStatus::parse(&status)?;
             if from == AgentBindingStatus::Revoked {
                 return Err(RoomStoreError::AgentBindingStatusConflict {
@@ -4028,7 +4204,14 @@ impl SqliteRoomStore {
                     to: "active",
                 });
             }
-        }
+            parse_canonical_u64_text(&generation)?
+                .checked_add(1)
+                .ok_or_else(|| {
+                    RoomStoreError::Encode("room-agent generation is exhausted".into())
+                })?
+        } else {
+            1
+        };
 
         let requested = canonical_caps(&input.requested_capabilities);
         let granted = canonical_caps(&input.room_capability_grants);
@@ -4050,7 +4233,7 @@ impl SqliteRoomStore {
                  authorized_at, activation_policy, context_policy, memory_scope,
                  requested_capabilities, room_capability_grants, status, generation,
                  decision_id, request_digest, revoked_at, revoked_by)
-             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,'active',1,?15,?16,NULL,NULL)
+             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,'active',?15,?16,?17,NULL,NULL)
              ON CONFLICT(room_id, agent_member_id) DO UPDATE SET
                  agent_package_id          = excluded.agent_package_id,
                  agent_definition_digest   = excluded.agent_definition_digest,
@@ -4065,7 +4248,7 @@ impl SqliteRoomStore {
                  requested_capabilities    = excluded.requested_capabilities,
                  room_capability_grants    = excluded.room_capability_grants,
                  status                    = 'active',
-                 generation                = room_agent_bindings.generation + 1,
+                 generation                = excluded.generation,
                  decision_id               = excluded.decision_id,
                  request_digest            = excluded.request_digest,
                  revoked_at                = NULL,
@@ -4085,6 +4268,7 @@ impl SqliteRoomStore {
                 input.memory_scope.as_str(),
                 requested_json,
                 granted_json,
+                write_u64_text(generation),
                 input.decision_id,
                 input.request_digest,
             ],
@@ -4101,14 +4285,26 @@ impl SqliteRoomStore {
                 ts
             ],
         )?;
-        tx.commit()?;
-
-        let binding = self
-            .room_agent_binding(key, &input.agent_member_id)?
+        let binding = tx
+            .query_row(
+                "SELECT agent_member_id, agent_package_id, agent_definition_digest,
+                        agent_definition_revision, display_name, owner_member_id,
+                        authorized_by, authorized_at, activation_policy, context_policy,
+                        memory_scope, requested_capabilities, room_capability_grants,
+                        status, generation, decision_id, request_digest,
+                        revoked_at, revoked_by
+                   FROM room_agent_bindings
+                  WHERE room_id = ?1 AND agent_member_id = ?2",
+                params![key.as_str(), input.agent_member_id],
+                |row| Self::binding_from_row(key, row),
+            )
+            .optional()?
+            .transpose()?
             .ok_or_else(|| RoomStoreError::UnknownAgentBinding {
                 room: key.clone(),
                 agent: input.agent_member_id.clone(),
             })?;
+        tx.commit()?;
         Ok((binding, true))
     }
 
@@ -4174,6 +4370,16 @@ impl SqliteRoomStore {
         let tx = self
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let room_open: Option<i64> = tx
+            .query_row(
+                "SELECT 1 FROM rooms WHERE id = ?1 AND closed_at IS NULL",
+                params![key.as_str()],
+                |row| row.get(0),
+            )
+            .optional()?;
+        if room_open.is_none() {
+            return Err(RoomStoreError::UnknownRoom(key.clone()));
+        }
         let current = tx
             .query_row(
                 "SELECT agent_member_id, agent_package_id, agent_definition_digest,
@@ -4214,9 +4420,13 @@ impl SqliteRoomStore {
         } else {
             (None, None)
         };
+        let next_generation = current
+            .generation
+            .checked_add(1)
+            .ok_or_else(|| RoomStoreError::Encode("room-agent generation is exhausted".into()))?;
         tx.execute(
             "UPDATE room_agent_bindings
-                SET status = ?3, generation = generation + 1,
+                SET status = ?3, generation = ?6,
                     revoked_at = ?4, revoked_by = ?5
               WHERE room_id = ?1 AND agent_member_id = ?2",
             params![
@@ -4224,7 +4434,8 @@ impl SqliteRoomStore {
                 agent_member_id,
                 to.as_str(),
                 revoked_at,
-                revoked_by
+                revoked_by,
+                write_u64_text(next_generation),
             ],
         )?;
         let updated = tx
@@ -4268,7 +4479,7 @@ impl SqliteRoomStore {
         let requested_json: String = r.get(11)?;
         let granted_json: String = r.get(12)?;
         let status: String = r.get(13)?;
-        let generation: i64 = r.get(14)?;
+        let generation: String = r.get(14)?;
         let decision_id: String = r.get(15)?;
         let request_digest: String = r.get(16)?;
         let revoked_at: Option<String> = r.get(17)?;
@@ -4295,7 +4506,7 @@ impl SqliteRoomStore {
                 requested_capabilities: requested,
                 room_capability_grants: granted,
                 status: AgentBindingStatus::parse(&status)?,
-                generation: generation.max(0) as u64,
+                generation: parse_canonical_u64_text(&generation)?,
                 decision_id,
                 request_digest,
                 revoked_at: revoked_at.as_deref().map(parse_ts).transpose()?,
@@ -5668,6 +5879,83 @@ mod tests {
     }
 
     #[test]
+    fn closed_rooms_reject_every_authority_mutation_without_changing_history() {
+        let (mut s, key) = room_with_agent("agent-1");
+        s.close(&key).unwrap();
+
+        let authorize_error = s
+            .authorize_room_agent(&key, auth_input("agent-1", "dec-2", "digest-2"), now())
+            .unwrap_err();
+        assert!(matches!(authorize_error, RoomStoreError::UnknownRoom(_)));
+
+        let status_error = s
+            .set_room_agent_binding_status(
+                &key,
+                "agent-1",
+                AgentBindingStatus::Revoked,
+                "operator-1",
+                now(),
+            )
+            .unwrap_err();
+        assert!(matches!(status_error, RoomStoreError::UnknownRoom(_)));
+
+        let retained = s.room_agent_binding(&key, "agent-1").unwrap().unwrap();
+        assert_eq!(retained.status, AgentBindingStatus::Active);
+        assert_eq!(retained.generation, 1);
+        assert_eq!(retained.decision_id, "dec-1");
+        let decisions: i64 = s
+            .conn
+            .query_row(
+                "SELECT count(*) FROM room_agent_decisions WHERE room_id = ?1",
+                params![key.as_str()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(decisions, 1);
+    }
+
+    #[test]
+    fn exhausted_generation_refuses_reauthorization_and_status_change_atomically() {
+        let (mut s, key) = room_with_agent("agent-1");
+        s.conn
+            .execute(
+                "UPDATE room_agent_bindings SET generation = ?3
+                 WHERE room_id = ?1 AND agent_member_id = ?2",
+                params![key.as_str(), "agent-1", write_u64_text(u64::MAX)],
+            )
+            .unwrap();
+
+        for error in [
+            s.authorize_room_agent(&key, auth_input("agent-1", "dec-2", "digest-2"), now())
+                .unwrap_err(),
+            s.set_room_agent_binding_status(
+                &key,
+                "agent-1",
+                AgentBindingStatus::Suspended,
+                "operator-1",
+                now(),
+            )
+            .unwrap_err(),
+        ] {
+            assert!(matches!(error, RoomStoreError::Encode(_)), "got {error:?}");
+        }
+
+        let retained = s.room_agent_binding(&key, "agent-1").unwrap().unwrap();
+        assert_eq!(retained.generation, u64::MAX);
+        assert_eq!(retained.status, AgentBindingStatus::Active);
+        assert_eq!(retained.decision_id, "dec-1");
+        let decisions: i64 = s
+            .conn
+            .query_row(
+                "SELECT count(*) FROM room_agent_decisions WHERE room_id = ?1",
+                params![key.as_str()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(decisions, 1, "failed reauthorization consumed a decision");
+    }
+
+    #[test]
     fn reauthorization_never_makes_an_older_decision_reusable() {
         let (mut s, key) = room_with_agent("agent-1");
         let mut next = auth_input("agent-1", "dec-2", "digest-2");
@@ -5783,7 +6071,7 @@ mod tests {
         stale_tx
             .execute(
                 "UPDATE room_agent_bindings
-                    SET status = 'stale', generation = generation + 1
+                    SET status = 'stale', generation = '3'
                   WHERE room_id = ?1 AND agent_member_id = 'agent-1'",
                 params![key.as_str()],
             )
@@ -5925,6 +6213,106 @@ mod tests {
             .authorize_room_agent(&key, auth_input("agent-2", "dec-1", "digest-1"), now())
             .unwrap_err();
         assert!(matches!(err, RoomStoreError::DecisionReplayMismatch { .. }));
+    }
+
+    #[test]
+    fn integer_generation_branch_schema_migrates_to_canonical_text() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("rooms.db");
+        let timestamp = now().to_rfc3339();
+        {
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch(
+                r#"
+                PRAGMA foreign_keys = ON;
+                CREATE TABLE rooms (
+                    id TEXT PRIMARY KEY, name TEXT NOT NULL, trigger_policy TEXT,
+                    workspace_root TEXT, created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL, closed_at TEXT
+                );
+                CREATE TABLE room_agent_bindings (
+                    room_id TEXT NOT NULL REFERENCES rooms(id) ON DELETE CASCADE,
+                    agent_member_id TEXT NOT NULL, agent_package_id TEXT NOT NULL,
+                    agent_definition_digest TEXT NOT NULL,
+                    agent_definition_revision TEXT, display_name TEXT NOT NULL,
+                    owner_member_id TEXT NOT NULL, authorized_by TEXT NOT NULL,
+                    authorized_at TEXT NOT NULL, activation_policy TEXT NOT NULL,
+                    context_policy TEXT NOT NULL, memory_scope TEXT NOT NULL,
+                    requested_capabilities TEXT NOT NULL,
+                    room_capability_grants TEXT NOT NULL, status TEXT NOT NULL,
+                    generation INTEGER NOT NULL, decision_id TEXT NOT NULL,
+                    request_digest TEXT NOT NULL, revoked_at TEXT, revoked_by TEXT,
+                    PRIMARY KEY (room_id, agent_member_id)
+                );
+                CREATE TABLE room_agent_decisions (
+                    room_id TEXT NOT NULL REFERENCES rooms(id) ON DELETE CASCADE,
+                    decision_id TEXT NOT NULL, agent_member_id TEXT NOT NULL,
+                    request_digest TEXT NOT NULL, consumed_at TEXT NOT NULL,
+                    PRIMARY KEY (room_id, decision_id),
+                    FOREIGN KEY (room_id, agent_member_id)
+                        REFERENCES room_agent_bindings(room_id, agent_member_id)
+                        ON DELETE CASCADE
+                );
+                "#,
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO rooms
+                    (id, name, trigger_policy, workspace_root, created_at, updated_at, closed_at)
+                 VALUES ('hq', 'HQ', NULL, NULL, ?1, ?1, NULL)",
+                params![timestamp],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO room_agent_bindings (
+                    room_id, agent_member_id, agent_package_id, agent_definition_digest,
+                    agent_definition_revision, display_name, owner_member_id, authorized_by,
+                    authorized_at, activation_policy, context_policy, memory_scope,
+                    requested_capabilities, room_capability_grants, status, generation,
+                    decision_id, request_digest, revoked_at, revoked_by
+                 ) VALUES (
+                    'hq', 'agent-1', 'pkg.builder', 'sha256:def-1', 'v1', 'Builder',
+                    'human-1', 'operator-1', ?1, 'explicit_only', 'invocation_only',
+                    'none', '[\"fs.read\"]', '[\"fs.read\"]', 'active', 7,
+                    'dec-1', 'digest-1', NULL, NULL
+                 )",
+                params![timestamp],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO room_agent_decisions
+                    (room_id, decision_id, agent_member_id, request_digest, consumed_at)
+                 VALUES ('hq', 'dec-1', 'agent-1', 'digest-1', ?1)",
+                params![timestamp],
+            )
+            .unwrap();
+        }
+
+        let mut s = SqliteRoomStore::open(&path).unwrap();
+        let declared_type: String = s
+            .conn
+            .query_row(
+                "SELECT type FROM pragma_table_info('room_agent_bindings')
+                 WHERE name = 'generation'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(declared_type, "TEXT");
+        let binding = s
+            .room_agent_binding(&RoomKey::new("hq"), "agent-1")
+            .unwrap()
+            .unwrap();
+        assert_eq!(binding.generation, 7);
+        let (replayed, created) = s
+            .authorize_room_agent(
+                &RoomKey::new("hq"),
+                auth_input("agent-1", "dec-1", "digest-1"),
+                now(),
+            )
+            .unwrap();
+        assert!(!created);
+        assert_eq!(replayed.generation, 7);
     }
 
     #[test]

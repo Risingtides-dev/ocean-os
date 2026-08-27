@@ -28,6 +28,7 @@
 //!    gating for an already-authorized agent. Conflating the two would let the
 //!    operator default silently disable the authority model.
 
+#[cfg(unix)]
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 
@@ -40,6 +41,7 @@ pub const OPERATOR_HEADER: &str = "x-ocean-operator";
 const KEY_FILE: &str = "operator.key";
 
 /// 32 bytes of entropy, base64url-encoded.
+#[cfg(unix)]
 const KEY_BYTES: usize = 32;
 
 /// Why an authorization attempt was refused.
@@ -271,6 +273,7 @@ fn default_allowed_origins() -> Vec<String> {
 }
 
 /// Read the key, or create it with owner-only permissions on first run.
+#[cfg(unix)]
 fn read_or_create_key(path: &Path) -> std::io::Result<String> {
     match std::fs::symlink_metadata(path) {
         Ok(_) => return read_existing_private_key(path),
@@ -285,17 +288,27 @@ fn read_or_create_key(path: &Path) -> std::io::Result<String> {
     Ok(key)
 }
 
+/// Room-agent mutation authority is unavailable on platforms where this
+/// module cannot prove descriptor ownership, link count, and owner-only ACLs.
+/// Supporting such a platform requires an equivalent native verifier; a plain
+/// regular-file check is not an authorization boundary.
+#[cfg(not(unix))]
+fn read_or_create_key(_path: &Path) -> std::io::Result<String> {
+    Err(std::io::Error::new(
+        std::io::ErrorKind::Unsupported,
+        "operator key security verification is unavailable on this platform",
+    ))
+}
+
 /// Open and validate the named key itself. On Unix `O_NOFOLLOW` closes the
 /// check/open race for symlinks; metadata comes from the opened descriptor so
 /// a rename between path inspection and read cannot substitute another file.
+#[cfg(unix)]
 fn read_existing_private_key(path: &Path) -> std::io::Result<String> {
     let mut opts = std::fs::OpenOptions::new();
     opts.read(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        opts.custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW);
-    }
+    use std::os::unix::fs::OpenOptionsExt;
+    opts.custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW);
     let mut file = opts.open(path)?;
     validate_private_key_file(&file)?;
     let mut existing = String::new();
@@ -310,33 +323,25 @@ fn read_existing_private_key(path: &Path) -> std::io::Result<String> {
     Ok(trimmed)
 }
 
+#[cfg(unix)]
 fn validate_private_key_file(file: &std::fs::File) -> std::io::Result<()> {
     let metadata = file.metadata()?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
 
-        if !metadata.is_file()
-            || metadata.nlink() != 1
-            || metadata.uid() != unsafe { libc::geteuid() }
-            || metadata.permissions().mode() & 0o7777 != 0o600
-        {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::PermissionDenied,
-                "operator key must be a single-link owner-owned mode-0600 regular file",
-            ));
-        }
-    }
-    #[cfg(not(unix))]
-    if !metadata.is_file() {
+    if !metadata.is_file()
+        || metadata.nlink() != 1
+        || metadata.uid() != unsafe { libc::geteuid() }
+        || metadata.permissions().mode() & 0o7777 != 0o600
+    {
         return Err(std::io::Error::new(
             std::io::ErrorKind::PermissionDenied,
-            "operator key must be a regular file",
+            "operator key must be a single-link owner-owned mode-0600 regular file",
         ));
     }
     Ok(())
 }
 
+#[cfg(unix)]
 fn generate_key() -> std::io::Result<String> {
     let mut bytes = [0u8; KEY_BYTES];
     getrandom::fill(&mut bytes)
@@ -348,14 +353,12 @@ fn generate_key() -> std::io::Result<String> {
 /// Create at mode 0600. The file is created with the mode already set rather
 /// than chmod'd afterwards, so there is no window in which the key is
 /// world-readable.
+#[cfg(unix)]
 fn write_owner_only(path: &Path, key: &str) -> std::io::Result<()> {
     let mut opts = std::fs::OpenOptions::new();
     opts.write(true).create_new(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        opts.mode(0o600).custom_flags(libc::O_CLOEXEC);
-    }
+    use std::os::unix::fs::OpenOptionsExt;
+    opts.mode(0o600).custom_flags(libc::O_CLOEXEC);
     let mut f = opts.open(path)?;
     validate_private_key_file(&f)?;
     f.write_all(key.as_bytes())?;
@@ -513,6 +516,7 @@ mod tests {
         assert_eq!(err, OperatorAuthError::Missing);
     }
 
+    #[cfg(unix)]
     #[test]
     fn key_file_is_created_owner_only_and_is_stable_across_loads() {
         let dir = tempfile::tempdir().unwrap();
@@ -538,6 +542,15 @@ mod tests {
             )]))
             .unwrap();
         assert_eq!(p.id(), first.id);
+    }
+
+    #[cfg(not(unix))]
+    #[test]
+    fn unsupported_platform_leaves_operator_authority_unavailable() {
+        let dir = tempfile::tempdir().unwrap();
+        let identity = OperatorIdentity::load(dir.path());
+        assert!(!identity.is_configured());
+        assert!(!operator_key_path(dir.path()).exists());
     }
 
     #[cfg(unix)]

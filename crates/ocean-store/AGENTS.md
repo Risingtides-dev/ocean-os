@@ -38,7 +38,8 @@ outbox, and the restart-safe federation core (S2 P2-A). One database file
   mismatches return `Stale` without writing, including stale clears.
 - `room_agent_bindings` — local, non-federated execution authority for one
   room-agent identity, including pinned definition digest, requested/granted
-  capability intersection inputs, status, and generation.
+  capability intersection inputs, status, and canonical-decimal u64 TEXT
+  generation.
 - `room_agent_decisions` — immutable per-room replay ledger for every consumed
   operator decision id. Re-authorization may replace the binding's current
   decision but never makes an older approval id reusable.
@@ -113,8 +114,10 @@ outbox, and the restart-safe federation core (S2 P2-A). One database file
   federated descriptors are display data, never authorization. Only an active
   binding admits; stale authority can return active only through a fresh
   replay-safe authorization decision, never through a status transition.
-  Status validation, generation bump, and mutation share one IMMEDIATE
-  transaction so a racing resume cannot overwrite stale or revoked authority.
+  Authorization/status mutations require an open room and keep validation,
+  checked generation bump, mutation, returned projection, and commit in one
+  IMMEDIATE transaction so a racing writer cannot change the authority a
+  caller believes it approved. Closed rooms retain immutable audit history.
 - **Attachments are immutable, so the discipline is refusal, not CAS.** There is
   deliberately no `version` column on `room_attachments`: nothing amends an
   attachment, so a compare-and-swap guard would be decoration, and a decorative
