@@ -6666,4 +6666,31 @@ so the scripted error arrives in the exact TurnFailure shape production emits
 and the fallback's reuse_accepted_user invariant holds for the same reason it
 holds against a live provider. Reverting each of the four lines individually now
 fails exactly one test, and a different one each time.
+time:      [17:52] [08-27-26]
+agent:     [claude] [opus 5]
+worktree:  loop/attachments-in-agent-context
+type:      [feature-request]
+area:      [backend]
+
+A convened room agent can now read the room's context files. room_attachments.rs
+had said outright that it stopped at the HTTP surface and that "agents can see
+them" meant an agent calling GET /attachments like any other client — but a
+convened turn has no tool call in its loop, so the files were decoration for the
+one participant they were usually uploaded for. New room_context.rs renders them
+as a delimited block that build_room_prompt splices between the transcript and
+"Your reply:". What gets inlined is derived from the bytes, never from
+RoomAttachment.content_type: that string is the uploader's declaration and the
+attachments module exists partly to never act on it, so deciding what to paste
+into a prompt from it would re-trust the one value nothing trusts. A binary is
+named — filename, declared type, byte_len — and stays out of the prompt. The
+16 KiB budget bounds the whole block rather than each file, so a room's file count
+cannot outweigh the transcript, and every clip is announced rather than silently
+dropped. The seam takes the rows, a byte-reading closure, and the budget, copying
+room_summary.rs, so the boundary is tested in both directions with no AppState and
+no filesystem. Bytes come through one new pub(super) reader in room_attachments.rs
+that goes via the existing blob_path, so the sha256(room key) traversal defence
+still has exactly one implementation; the download handler now shares that reader
+too. A room with no attachments produces a byte-identical prompt, and that is a
+test rather than a claim. No ContextPolicy/ContextMount — the Rooms v2 §7 model
+stays unimplemented, as the root contract requires.
 _________________________________________________________________________________

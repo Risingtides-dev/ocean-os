@@ -45,11 +45,14 @@
 //!    leaves it for a future GC sweep). An orphan row is a download that 500s
 //!    forever.
 //!
-//! This module deliberately stops at the HTTP surface. It does NOT wire
-//! attachments into agent context assembly or prompt construction: that is the
-//! Ocean Rooms v2 §7 `ContextPolicy`/`ContextMount` model, which the root
-//! `AGENTS.md` forbids implementing from the proposal alone. "Agents can see
-//! them" here means an agent calls `GET /attachments` like any other client.
+//! This module still stops at the bytes. Prompt assembly lives in
+//! `room_context.rs`, which reads through [`attachment_bytes`] — the ONE
+//! in-process surface widened past the private path helpers, so the hashed
+//! directory and the id validation keep exactly one implementation. What is
+//! deliberately still absent is the Ocean Rooms v2 §7
+//! `ContextPolicy`/`ContextMount` model the root `AGENTS.md` forbids
+//! implementing from the proposal alone: there is no per-agent selection and no
+//! declared mount, only "a room's files are the room's shared context".
 
 use axum::{
     body::Bytes,
@@ -467,19 +470,9 @@ pub(super) async fn room_download_attachment(
         Err(e) => return room_store_error_response(e).into_response(),
     };
 
-    let bytes = match std::fs::read(&path) {
-        Ok(bytes) => bytes,
-        Err(e) => {
-            tracing::warn!(room = %key, attachment = %id, error = %e,
-                "room attachment row has no readable bytes");
-            return bytes_missing_response(&key, id);
-        }
-    };
-    if bytes.len() as u64 != row.byte_len || format!("{:x}", Sha256::digest(&bytes)) != row.sha256 {
-        tracing::warn!(room = %key, attachment = %id,
-            "room attachment bytes disagree with the indexed row");
+    let Some(bytes) = read_verified_blob(&path, &key, &row) else {
         return bytes_missing_response(&key, id);
-    }
+    };
 
     let mut response = bytes.into_response();
     let headers = response.headers_mut();
@@ -584,6 +577,65 @@ fn write_blob(dir: &std::path::Path, path: &std::path::Path, body: &[u8]) -> std
             Err(e)
         }
     }
+}
+
+/// One attachment's stored bytes, checked against the row that indexes them.
+///
+/// The row is the authority and the disk is a cache, so length and hash are
+/// re-verified on every read: a truncated, swapped, or half-written file reads
+/// as ABSENT rather than being handed back as if it were the thing that was
+/// uploaded. That is O(n) with n bounded by [`MAX_ATTACHMENT_BYTES`].
+///
+/// `None` covers "unreadable" and "does not match" alike, because they mean the
+/// same thing to every caller; the two are distinguished in the log, which is
+/// where an operator needs them apart.
+fn read_verified_blob(
+    path: &std::path::Path,
+    key: &RoomKey,
+    row: &ocean_core::RoomAttachment,
+) -> Option<Vec<u8>> {
+    let bytes = match std::fs::read(path) {
+        Ok(bytes) => bytes,
+        Err(e) => {
+            tracing::warn!(room = %key, attachment = %row.id, error = %e,
+                "room attachment row has no readable bytes");
+            return None;
+        }
+    };
+    if bytes.len() as u64 != row.byte_len || format!("{:x}", Sha256::digest(&bytes)) != row.sha256 {
+        tracing::warn!(room = %key, attachment = %row.id,
+            "room attachment bytes disagree with the indexed row");
+        return None;
+    }
+    Some(bytes)
+}
+
+/// Put bytes under an attachment id the way an upload would.
+///
+/// Test-only, and for sibling modules whose fixtures need a room whose files
+/// really exist on disk — the convene tests in `persistent_rooms`. It is routed
+/// through the same `blob_path`/`write_blob` the upload handler uses, because a
+/// fixture that invented its own directory layout would keep passing after the
+/// real one moved.
+#[cfg(test)]
+pub(super) fn write_blob_for_test(root: &std::path::Path, key: &RoomKey, id: &str, bytes: &[u8]) {
+    let path = blob_path(root, key, id).expect("a test attachment id must be well-formed");
+    write_blob(&room_dir(root, key), &path, bytes).expect("test blob write");
+}
+
+/// The same verified read, addressed by room and row instead of by path.
+///
+/// This is the whole in-process surface: `room_context` assembles a convened
+/// agent's prompt out of these bytes and must not re-derive the hashed room
+/// directory or re-implement the id check, because a second derivation is a
+/// second place for the traversal defence to be got wrong. One derivation, one
+/// verification, one place to fix.
+pub(super) fn attachment_bytes(
+    root: &std::path::Path,
+    key: &RoomKey,
+    row: &ocean_core::RoomAttachment,
+) -> Option<Vec<u8>> {
+    read_verified_blob(&blob_path(root, key, &row.id)?, key, row)
 }
 
 /// The row exists but its bytes do not, or they no longer match what was

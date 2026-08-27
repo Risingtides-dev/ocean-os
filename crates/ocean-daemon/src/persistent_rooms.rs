@@ -1963,13 +1963,20 @@ pub(super) fn room_agent_session_id(room: &RoomKey, participant_id: &str) -> Age
 }
 
 /// Build the prompt handed to a woken agent: a framing header that tells it it's
-/// answering a mention in a room, the recent transcript as context, and a
-/// pointer at the triggering line. `tail` is oldest→newest.
+/// answering a mention in a room, the recent transcript as context, a pointer at
+/// the triggering line, and the room's context files. `tail` is oldest→newest.
+///
+/// `context_files` is the block from `room_context`, or `None` when the room has
+/// no attachments — and `None` must reproduce the prompt byte for byte as it was
+/// before context files existed. Every room that never uploads a file keeps the
+/// prompt it already had, so this feature cannot perturb an unrelated room's
+/// agent behavior.
 fn build_room_prompt(
     room: &RoomKey,
     agent: &RoomParticipant,
     tail: &[ocean_core::RoomMessage],
     triggered_by_seq: u64,
+    context_files: Option<&str>,
 ) -> String {
     let mut out = String::new();
     out.push_str(&format!(
@@ -1997,7 +2004,14 @@ were mentioned.\n\n",
             marker = marker,
         ));
     }
-    out.push_str("--- end transcript ---\n\nYour reply:");
+    out.push_str("--- end transcript ---\n");
+    // After the transcript, before the cue to answer: the files are background
+    // the reply should be grounded in, not the thing being replied to.
+    if let Some(block) = context_files {
+        out.push('\n');
+        out.push_str(block);
+    }
+    out.push_str("\nYour reply:");
     out
 }
 
@@ -2069,7 +2083,30 @@ fn spawn_room_agent_turn(
             .into_iter()
             .rev()
             .collect();
-        let prompt = build_room_prompt(&room, &agent, &tail, triggered_by_seq);
+        // The room's context files, on the same terms as the tail: the rows come
+        // out of `with_rooms` and the bytes are read here, synchronously, before
+        // any await below. Blob reads stop as soon as the byte budget is spent,
+        // so a room with a shelf of large files costs one read past the cut, not
+        // all of them.
+        let attachments = with_rooms(&state, |reg| reg.attachments(&room)).unwrap_or_default();
+        let context_files = crate::room_context::build_attachment_context(
+            &attachments,
+            |row| {
+                crate::room_attachments::attachment_bytes(
+                    state.room_attachments_root.as_path(),
+                    &room,
+                    row,
+                )
+            },
+            crate::room_context::ROOM_CONTEXT_BYTE_BUDGET,
+        );
+        let prompt = build_room_prompt(
+            &room,
+            &agent,
+            &tail,
+            triggered_by_seq,
+            context_files.as_deref(),
+        );
 
         // Named-agent binding (TASK-9): a room agent turn must DRIVE a resolved
         // folder-as-agent, never a default assistant. Re-resolve the participant
@@ -3197,6 +3234,83 @@ mod tests {
         let (status, body) = post_rejection_response(PostRejection::BodyTooLarge);
         assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE);
         assert_eq!(body.0["error"], "body_too_large");
+    }
+
+    fn prompt_fixture_tail() -> Vec<ocean_core::RoomMessage> {
+        vec![ocean_core::RoomMessage {
+            seq: 7,
+            author_id: "alice".into(),
+            author_kind: RoomParticipantKind::Human,
+            kind: RoomMessageKind::Message,
+            body: "@researcher what does the spec say".into(),
+            created_at: Utc::now(),
+            federated: None,
+            thread_parent_seq: None,
+            session_id: None,
+        }]
+    }
+
+    fn prompt_fixture_agent() -> RoomParticipant {
+        RoomParticipant {
+            id: "researcher".into(),
+            kind: RoomParticipantKind::Agent,
+            display_name: "Researcher".into(),
+        }
+    }
+
+    /// The no-attachment prompt must be what it was before context files
+    /// existed, to the byte. Every room that never uploads a file is entitled to
+    /// the agent behavior it already had, and a stray blank line here is a
+    /// silent change to every one of them.
+    #[test]
+    fn a_room_with_no_context_files_gets_the_prompt_it_always_had() {
+        let prompt = build_room_prompt(
+            &RoomKey::new("spec-room"),
+            &prompt_fixture_agent(),
+            &prompt_fixture_tail(),
+            7,
+            None,
+        );
+        assert!(prompt.ends_with(
+            "[#7] alice: @researcher what does the spec say  «— mention\n\
+             --- end transcript ---\n\n\
+             Your reply:"
+        ));
+        assert!(!prompt.contains("context files"));
+    }
+
+    /// And with files: its own delimited section between the transcript and the
+    /// cue to answer, so neither reads as part of the other.
+    #[test]
+    fn context_files_sit_between_the_transcript_and_the_reply_cue() {
+        let block = crate::room_context::build_attachment_context(
+            &[ocean_core::RoomAttachment {
+                id: "0".repeat(32),
+                filename: "spec.md".into(),
+                content_type: "text/markdown".into(),
+                byte_len: 9,
+                sha256: "0".repeat(64),
+                uploaded_by: "alice".into(),
+                uploaded_at: "2026-08-27T00:00:00Z".into(),
+                on_behalf_of: None,
+            }],
+            |_| Some(b"the spec\n".to_vec()),
+            crate::room_context::ROOM_CONTEXT_BYTE_BUDGET,
+        )
+        .expect("one text attachment must render a block");
+        let prompt = build_room_prompt(
+            &RoomKey::new("spec-room"),
+            &prompt_fixture_agent(),
+            &prompt_fixture_tail(),
+            7,
+            Some(&block),
+        );
+        assert!(prompt.contains(
+            "--- end transcript ---\n\n\
+             --- room context files ---\n"
+        ));
+        assert!(prompt.contains("[file] spec.md (text/markdown, 9 bytes)\nthe spec\n"));
+        assert!(prompt.ends_with("--- end context files ---\n\nYour reply:"));
     }
 
     use crate::tests::{
@@ -6411,6 +6525,174 @@ env = { FIXTURE = "1" }
         assert!(state.requests.read().await.values().any(|request| {
             request.status.session_id == Some(core_sid(room_agent_session_id(&key, "bound-agent")))
         }));
+    }
+
+    /// Index one attachment and write its bytes, the way an upload does. The
+    /// hash is real because `attachment_bytes` re-verifies it: a fixture that
+    /// recorded a plausible-looking digest would read back as missing bytes and
+    /// pass the wrong assertion.
+    fn attach_file(
+        state: &AppState,
+        key: &RoomKey,
+        id: &str,
+        filename: &str,
+        content_type: &str,
+        bytes: &[u8],
+    ) {
+        crate::room_attachments::write_blob_for_test(
+            state.room_attachments_root.as_path(),
+            key,
+            id,
+            bytes,
+        );
+        with_rooms(state, |store| {
+            store
+                .add_attachment(
+                    key,
+                    id,
+                    filename,
+                    content_type,
+                    bytes.len() as u64,
+                    &format!("{:x}", Sha256::digest(bytes)),
+                    "human",
+                    Utc::now(),
+                )
+                .expect("attachment fixture");
+        });
+    }
+
+    /// The slice, end to end: a room with files convenes an agent and the prompt
+    /// that actually reaches the runtime carries them. Without this the seam
+    /// could be perfect and still wired to nothing.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_convened_agent_reads_the_rooms_context_files() {
+        let _guard = AUTO_CONVENE_ENV_LOCK.lock().await;
+        let _env = TestEnvRestore::capture(&[
+            "OCEAN_CONFIG_DIR",
+            "OCEAN_MODEL",
+            "OCEAN_YOLO",
+            "OCEAN_AGENTS_DIR",
+        ]);
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = fake_convene_state(&tmp);
+        let agents_root = tmp.path().join("agents");
+        write_agent_fixture(&agents_root, "reader-agent", "model = \"fake-ok\"\n", None);
+        std::env::set_var("OCEAN_AGENTS_DIR", &agents_root);
+        clear_turn_captures();
+        let key = RoomKey::new("context-files");
+        create_mention_room(&state, &key);
+        join_human(&state, &key);
+        attach_file(
+            &state,
+            &key,
+            &"a".repeat(32),
+            "brief.md",
+            "text/markdown",
+            b"ship the narrow slice\n",
+        );
+        // Declared `text/plain` and unmistakably not text: what gets inlined is
+        // decided by the bytes, and this is the room-level proof of it.
+        attach_file(
+            &state,
+            &key,
+            &"b".repeat(32),
+            "logo.png",
+            "text/plain",
+            b"\x89PNG\r\n\x1a\n\x00\x00\x00\x0dIHDR",
+        );
+
+        let (join_status, _) = room_join(
+            State(state.clone()),
+            Path(key.as_str().to_string()),
+            Json(RoomJoinRequest {
+                id: "reader-agent".into(),
+                display_name: "Reader".into(),
+                kind: RoomParticipantKind::Agent,
+                owner_id: None,
+            }),
+        )
+        .await;
+        assert_eq!(join_status, StatusCode::OK);
+
+        let (post_status, _) = room_post_message(
+            State(state.clone()),
+            Path(key.as_str().to_string()),
+            Json(RoomMessageRequest {
+                author_id: "human".into(),
+                author_kind: RoomParticipantKind::Human,
+                body: "@reader-agent what are we shipping".into(),
+                thread_parent_seq: None,
+            }),
+        )
+        .await;
+        assert_eq!(post_status, StatusCode::CREATED);
+
+        let capture = wait_for_turn_capture("reader-agent")
+            .await
+            .expect("a convened turn must reach runtime dispatch");
+        assert!(capture
+            .prompt
+            .contains("[file] brief.md (text/markdown, 22 bytes)\nship the narrow slice\n"));
+        assert!(capture
+            .prompt
+            .contains("[file] logo.png (text/plain, 16 bytes) — binary, not inlined"));
+        assert!(!capture.prompt.contains("IHDR"));
+    }
+
+    /// The other half of the same guarantee: a room with no files is not paying
+    /// for the feature, not even an empty section.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_convened_agent_in_a_fileless_room_gets_no_context_section() {
+        let _guard = AUTO_CONVENE_ENV_LOCK.lock().await;
+        let _env = TestEnvRestore::capture(&[
+            "OCEAN_CONFIG_DIR",
+            "OCEAN_MODEL",
+            "OCEAN_YOLO",
+            "OCEAN_AGENTS_DIR",
+        ]);
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = fake_convene_state(&tmp);
+        let agents_root = tmp.path().join("agents");
+        write_agent_fixture(&agents_root, "bare-agent", "model = \"fake-ok\"\n", None);
+        std::env::set_var("OCEAN_AGENTS_DIR", &agents_root);
+        clear_turn_captures();
+        let key = RoomKey::new("no-context-files");
+        create_mention_room(&state, &key);
+        join_human(&state, &key);
+
+        let (join_status, _) = room_join(
+            State(state.clone()),
+            Path(key.as_str().to_string()),
+            Json(RoomJoinRequest {
+                id: "bare-agent".into(),
+                display_name: "Bare".into(),
+                kind: RoomParticipantKind::Agent,
+                owner_id: None,
+            }),
+        )
+        .await;
+        assert_eq!(join_status, StatusCode::OK);
+
+        let (post_status, _) = room_post_message(
+            State(state.clone()),
+            Path(key.as_str().to_string()),
+            Json(RoomMessageRequest {
+                author_id: "human".into(),
+                author_kind: RoomParticipantKind::Human,
+                body: "@bare-agent status".into(),
+                thread_parent_seq: None,
+            }),
+        )
+        .await;
+        assert_eq!(post_status, StatusCode::CREATED);
+
+        let capture = wait_for_turn_capture("bare-agent")
+            .await
+            .expect("a convened turn must reach runtime dispatch");
+        assert!(!capture.prompt.contains("context files"));
+        assert!(capture
+            .prompt
+            .ends_with("--- end transcript ---\n\nYour reply:"));
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

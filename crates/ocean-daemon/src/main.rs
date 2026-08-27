@@ -152,6 +152,9 @@ mod request_control;
 /// Room attachment BYTES: blob path derivation, the size cap, server-minted
 /// ids, and the upload/list/download/delete adapters over `ocean-store`'s index.
 mod room_attachments;
+/// The room's attachments rendered as a bounded, delimited block of a convened
+/// agent's prompt: text derived from the bytes, binaries named, budget announced.
+mod room_context;
 /// Restart-safe outbound Bedrock room client and per-room supervisor (S2 P2-B).
 mod room_federation;
 /// Fail-closed local operator principal for room-agent authorization mutations.
