@@ -888,6 +888,53 @@ pub(super) struct AmendArtifactRequest {
     pub(super) author_id: String,
 }
 
+enum ClientArtifactWriteError {
+    ForgedAuthor,
+    Store(ocean_store::RoomStoreError),
+}
+
+fn forged_artifact_author_response() -> (StatusCode, Json<serde_json::Value>) {
+    (
+        StatusCode::FORBIDDEN,
+        Json(json!({
+            "ok": false,
+            "code": "forged_artifact_author",
+            "error": "an agent's artifact is authored by the daemon, not by a client claiming its identity",
+        })),
+    )
+}
+
+/// A browser/client may attribute an artifact only to a human roster member.
+/// Agent and System artifacts are daemon-authored; accepting those identities
+/// from the wire lets a caller forge a durable artifact and audit line.
+///
+/// Call only while holding the same room-store guard used for the subsequent
+/// mutation, so a concurrent roster replacement cannot race authorization.
+fn enforce_client_artifact_author(
+    store: &mut ocean_store::SqliteRoomStore,
+    key: &RoomKey,
+    author_id: &str,
+) -> Result<(), ClientArtifactWriteError> {
+    let claimed_kind = store
+        .get(key)
+        .map_err(ClientArtifactWriteError::Store)?
+        .and_then(|record| {
+            record
+                .room
+                .participants
+                .iter()
+                .find(|participant| participant.id == author_id)
+                .map(|participant| participant.kind)
+        });
+    if matches!(
+        claimed_kind,
+        Some(RoomParticipantKind::Agent) | Some(RoomParticipantKind::System)
+    ) {
+        return Err(ClientArtifactWriteError::ForgedAuthor);
+    }
+    Ok(())
+}
+
 #[derive(serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(super) struct SummarizeRequest {
@@ -921,47 +968,19 @@ pub(super) async fn room_create_artifact(
     if req.title.trim().is_empty() {
         return invalid_request_response();
     }
-    // Finding B: `author_id` is caller-supplied and only roster-checked, so a
-    // hostile local caller could author an artifact AS somebody's agent. An
-    // agent's artifact is produced by the daemon's own convene path, never by a
-    // client claiming an agent's identity over the wire — the same rule
-    // `classify_local_author` already applies to messages (Agent|System are
-    // daemon-only author kinds). Enforce it here too instead of trusting the
-    // client one layer down.
-    let claimed_kind = with_rooms(&state, |store| store.get(&key))
-        .ok()
-        .and_then(|rec| {
-            rec.and_then(|rec| {
-                rec.room
-                    .participants
-                    .iter()
-                    .find(|p| p.id == req.author_id)
-                    .map(|p| p.kind)
-            })
-        });
-    if matches!(
-        claimed_kind,
-        Some(RoomParticipantKind::Agent) | Some(RoomParticipantKind::System)
-    ) {
-        return (
-            StatusCode::FORBIDDEN,
-            Json(json!({
-                "ok": false,
-                "code": "forged_artifact_author",
-                "error": "an agent's artifact is authored by the daemon, not by a client claiming its identity",
-            })),
-        );
-    }
     let result = with_rooms(&state, |store| {
-        store.create_artifact(
-            &key,
-            &req.id,
-            req.kind,
-            &req.title,
-            &req.body,
-            &req.author_id,
-            Utc::now(),
-        )
+        enforce_client_artifact_author(store, &key, &req.author_id)?;
+        store
+            .create_artifact(
+                &key,
+                &req.id,
+                req.kind,
+                &req.title,
+                &req.body,
+                &req.author_id,
+                Utc::now(),
+            )
+            .map_err(ClientArtifactWriteError::Store)
     });
     match result {
         Ok((artifact, message)) => {
@@ -973,7 +992,8 @@ pub(super) async fn room_create_artifact(
                 Json(json!({ "ok": true, "artifact": artifact })),
             )
         }
-        Err(e) => room_store_error_response(e),
+        Err(ClientArtifactWriteError::ForgedAuthor) => forged_artifact_author_response(),
+        Err(ClientArtifactWriteError::Store(e)) => room_store_error_response(e),
     }
 }
 
@@ -986,16 +1006,19 @@ pub(super) async fn room_amend_artifact(
 ) -> (StatusCode, Json<serde_json::Value>) {
     let key = RoomKey::new(key.trim());
     let result = with_rooms(&state, |store| {
-        store.amend_artifact(
-            &key,
-            artifact_id.trim(),
-            req.expected_version,
-            req.title.as_deref(),
-            req.body.as_deref(),
-            req.state,
-            &req.author_id,
-            Utc::now(),
-        )
+        enforce_client_artifact_author(store, &key, &req.author_id)?;
+        store
+            .amend_artifact(
+                &key,
+                artifact_id.trim(),
+                req.expected_version,
+                req.title.as_deref(),
+                req.body.as_deref(),
+                req.state,
+                &req.author_id,
+                Utc::now(),
+            )
+            .map_err(ClientArtifactWriteError::Store)
     });
     match result {
         Ok((artifact, message)) => {
@@ -1006,9 +1029,11 @@ pub(super) async fn room_amend_artifact(
             )
         }
         // A stale write must hand back where to re-read from, not just "409".
-        Err(ocean_store::RoomStoreError::ArtifactVersionConflict {
-            expected, actual, ..
-        }) => (
+        Err(ClientArtifactWriteError::Store(
+            ocean_store::RoomStoreError::ArtifactVersionConflict {
+                expected, actual, ..
+            },
+        )) => (
             StatusCode::CONFLICT,
             Json(json!({
                 "ok": false,
@@ -1018,7 +1043,8 @@ pub(super) async fn room_amend_artifact(
                 "error": format!("artifact is at version {actual}, not {expected}; re-read and retry"),
             })),
         ),
-        Err(e) => room_store_error_response(e),
+        Err(ClientArtifactWriteError::ForgedAuthor) => forged_artifact_author_response(),
+        Err(ClientArtifactWriteError::Store(e)) => room_store_error_response(e),
     }
 }
 
@@ -6032,6 +6058,30 @@ mod tests {
         )
         .await;
         assert_eq!(status, StatusCode::CREATED);
+
+        let (status, Json(body)) = room_amend_artifact(
+            State(state.clone()),
+            Path((key.as_str().to_string(), "real".into())),
+            Json(AmendArtifactRequest {
+                expected_version: 1,
+                title: Some("Forged rewrite".into()),
+                body: None,
+                state: None,
+                author_id: "researcher".into(),
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        assert_eq!(body["code"], json!("forged_artifact_author"));
+
+        let (status, Json(body)) = room_get_artifact(
+            State(state.clone()),
+            Path((key.as_str().to_string(), "real".into())),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["artifact"]["title"], json!("Real task"));
+        assert_eq!(body["artifact"]["version"], json!(1));
     }
 
     /// The daemon authors every audit row as ("system", System). If a client can

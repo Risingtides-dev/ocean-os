@@ -1344,8 +1344,9 @@ impl FederationSupervisor {
                 self.revoke_control(key).await;
                 return Err(IntentError::Forbidden);
             }
-            StatusCode::NOT_FOUND => return Err(IntentError::NotFound),
-            StatusCode::NOT_IMPLEMENTED => return Err(IntentError::Conflict),
+            StatusCode::NOT_FOUND
+            | StatusCode::METHOD_NOT_ALLOWED
+            | StatusCode::NOT_IMPLEMENTED => return Err(IntentError::Conflict),
             s if s == StatusCode::TOO_MANY_REQUESTS || s.is_server_error() => {
                 return Err(IntentError::Unavailable)
             }
@@ -1465,8 +1466,9 @@ impl FederationSupervisor {
                 self.revoke_control(key).await;
                 return Err(IntentError::Forbidden);
             }
-            StatusCode::NOT_FOUND => return Err(IntentError::NotFound),
-            StatusCode::NOT_IMPLEMENTED => return Err(IntentError::Conflict),
+            StatusCode::NOT_FOUND
+            | StatusCode::METHOD_NOT_ALLOWED
+            | StatusCode::NOT_IMPLEMENTED => return Err(IntentError::Conflict),
             StatusCode::CONFLICT | StatusCode::BAD_REQUEST => return Err(IntentError::Protocol),
             s if s == StatusCode::TOO_MANY_REQUESTS || s.is_server_error() => {
                 return Err(IntentError::Unavailable)
@@ -3555,6 +3557,52 @@ mod tests {
             cursor.mirrored_upstream_read_seq,
             Some(9_007_199_254_740_993)
         );
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn absent_upstream_read_cursor_route_is_unsupported_not_a_missing_local_room() {
+        let key = RoomKey::new("cursor-unsupported-room");
+        let mut store = ocean_store::SqliteRoomStore::open_in_memory().unwrap();
+        store
+            .create(key.clone(), "Cursor", None, chrono::Utc::now())
+            .unwrap();
+        store
+            .update_room_access_safe(&key, Some(RoomAccessState::Live), Some(&[]), None)
+            .unwrap();
+        store
+            .install_room_credential(&key, "bearer", "principal")
+            .unwrap();
+        let rooms = Arc::new(std::sync::Mutex::new(store));
+        let fake = FakeBedrock::new(key.as_str(), "bearer");
+        let (base, server) = start_fake_bedrock(fake.clone()).await;
+        let supervisor = FederationSupervisor::for_test(
+            &base,
+            rooms.clone(),
+            RoomWakeBus::default(),
+            RoomAccessWakeBus::default(),
+            RoomReadCursorWakeBus::default(),
+            CancellationToken::new(),
+            Duration::from_millis(25),
+        );
+
+        fake.read_cursor_status
+            .store(StatusCode::NOT_FOUND.as_u16(), Ordering::Release);
+        assert_eq!(
+            supervisor.room_get_read_cursor(&key).await,
+            Err(IntentError::Conflict),
+            "an absent Bedrock route must not lie that the local room is absent"
+        );
+
+        fake.read_cursor_status
+            .store(StatusCode::METHOD_NOT_ALLOWED.as_u16(), Ordering::Release);
+        assert_eq!(
+            supervisor.room_patch_read_cursor(&key, 8).await,
+            Err(IntentError::Conflict)
+        );
+        let cursor =
+            with_rooms_handle(&rooms, |store| store.room_read_cursor(&key, "principal")).unwrap();
+        assert_eq!(cursor.mirrored_upstream_read_seq, None);
         server.abort();
     }
 
