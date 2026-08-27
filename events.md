@@ -6290,3 +6290,24 @@ banner and guide entries and it cannot gate anything while it is red.
 Verified: cargo fmt --all --check clean, cargo clippy --workspace --all-targets
 -D warnings clean, cargo test -p ocean-daemon 704 passed, -p ocean-store 146
 passed.
+_________________________________________________________________________________
+time:      [00:33] [27-08-26]
+agent:     [codex desktop] [gpt-5]
+worktree:  [codex/fix-room-auth-protocol]
+type:      [bug report]
+area:      [backend]
+
+Closed two confirmed Rooms authority/protocol defects. Artifact create and
+amend now take one shared fail-closed gate under the same room-store lock as
+the mutation, so a client claiming an Agent or System author receives
+`403 forged_artifact_author` with no artifact or transcript change. Federated
+read-cursor GET/PATCH now treat Bedrock's absent route responses (404/405/501)
+as unsupported, allowing the public adapter to return the truthful existing
+`409 room_read_cursor_unsupported` instead of lying that the local room is
+missing.
+
+Verified all 723 daemon tests, the 74-test persistent-room slice, the existing
+read-cursor federation slice plus the new absent-route regression, workspace
+check, daemon all-target Clippy with denied warnings, docs-check, formatting,
+and diff hygiene. No daemon was restarted and no production state was changed.
+_________________________________________________________________________________
