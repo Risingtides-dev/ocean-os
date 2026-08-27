@@ -8,7 +8,7 @@
 //! participant they were most often uploaded for. This module closes that gap
 //! and nothing else: it renders a block, the convene path pastes it in.
 //!
-//! Three rules, and each of them is the reason this is a module rather than a
+//! Four rules, and each of them is the reason this is a module rather than a
 //! few lines inside `build_room_prompt`:
 //!
 //! 1. **Text is DERIVED, never declared.** `RoomAttachment::content_type` is
@@ -28,6 +28,13 @@
 //!    is missing. A prompt that silently drops half its context teaches the
 //!    agent to answer confidently from material it never saw, which is worse
 //!    than a short prompt and much harder to notice.
+//! 4. **A cap on the block is not a cap on the I/O.** They are different
+//!    quantities: a binary contributes ONE line to the block whatever its size,
+//!    so the block budget on its own would let a room of screenshots cost
+//!    hundreds of megabytes of `read` and sha256 — on a runtime worker, on every
+//!    convened turn — to print a list of names. [`ROOM_CONTEXT_READ_BUDGET`]
+//!    bounds the reading separately, and a row it refuses is NAMED rather than
+//!    skipped, under rule 3 like everything else the block cannot show.
 //!
 //! The provider-free seam is [`build_attachment_context`], modelled on
 //! `room_summary.rs`: the caller passes the rows, a byte-reading CLOSURE, and
@@ -54,6 +61,18 @@ use ocean_core::RoomAttachment;
 /// config file whole and still leaves the transcript dominant.
 pub(super) const ROOM_CONTEXT_BYTE_BUDGET: usize = 16 * 1024;
 
+/// Total bytes of blob the block may READ from disk while it is assembled.
+///
+/// A second budget because [`ROOM_CONTEXT_BYTE_BUDGET`] bounds what the block
+/// SAYS, and what a file costs to say is unrelated to what it costs to look at:
+/// a binary is one line of block whether it is 4 KiB or the 8 MiB
+/// `room_attachments` allows. Twenty screenshots would be twenty reads and
+/// twenty sha256 passes over ~160 MiB, synchronously, on every convened turn, to
+/// print twenty filenames. 1 MiB is generous against any single file a person
+/// would expect an agent to actually read and stingy against a shelf of blobs,
+/// which is the shape of both cases.
+const ROOM_CONTEXT_READ_BUDGET: usize = 1024 * 1024;
+
 /// Below this many bytes of a file, showing "some of it" is noise rather than
 /// context. Such a file is announced as not shown instead, which is information;
 /// forty bytes of a spec is not.
@@ -77,10 +96,12 @@ const BLOCK_FOOTER: &str = "--- end context files ---\n";
 /// caller splices this into a prompt and an empty section would change every
 /// existing room's prompt bytes to announce the absence of a feature.
 ///
-/// `read` is called at most once per attachment and only until the budget is
-/// spent, so a room full of large files costs one read past the boundary rather
-/// than all of them. Rows arrive in the store's order (newest first), which is
-/// also the priority order: when the budget clips, it clips the oldest files.
+/// `read` is called at most once per attachment, never for a row longer than
+/// what is left of [`ROOM_CONTEXT_READ_BUDGET`], and never once the block budget
+/// is spent — so a room full of large files costs one budget's worth of I/O,
+/// not one read per file. Rows arrive in the store's order (newest first), which
+/// is also the priority order: when either budget clips, it clips the oldest
+/// files.
 pub(super) fn build_attachment_context<F>(
     attachments: &[RoomAttachment],
     mut read: F,
@@ -99,6 +120,7 @@ where
     }
 
     let mut out = String::from(BLOCK_HEADER);
+    let mut reads = ROOM_CONTEXT_READ_BUDGET;
     for (i, attachment) in attachments.iter().enumerate() {
         // Invariant, true here on every iteration: `out` plus the footer plus
         // the notice for the files from `i` onward still fits the budget, so
@@ -112,7 +134,7 @@ where
                 .map(|remaining| not_shown_line(remaining + 1).len())
                 .unwrap_or(0);
         let available = budget.saturating_sub(out.len() + reserve);
-        match render_entry(attachment, &mut read, available) {
+        match render_entry(attachment, &mut read, available, &mut reads) {
             Some(entry) => out.push_str(&entry),
             None => {
                 out.push_str(&not_shown_line(attachments.len() - i));
@@ -130,7 +152,12 @@ where
 /// a block that shows file five but not file two, with a count that explains
 /// neither, is harder to reason about than one that says plainly where it ran
 /// out.
-fn render_entry<F>(attachment: &RoomAttachment, read: &mut F, available: usize) -> Option<String>
+fn render_entry<F>(
+    attachment: &RoomAttachment,
+    read: &mut F,
+    available: usize,
+    reads: &mut usize,
+) -> Option<String>
 where
     F: FnMut(&RoomAttachment) -> Option<Vec<u8>>,
 {
@@ -143,6 +170,21 @@ where
     if head.len() >= available {
         return None;
     }
+
+    // The second refusal, and the one the block budget above cannot make: what
+    // this file costs to READ is `byte_len`, not the line it will occupy. Charged
+    // against the row's own length rather than what comes back, because a read
+    // that fails verification has still cost the disk, and refused on it rather
+    // than on the bytes, because that is what makes the refusal free.
+    if attachment.byte_len > *reads as u64 {
+        let line = if attachment.byte_len > ROOM_CONTEXT_READ_BUDGET as u64 {
+            format!("{head} — too large to read into context\n")
+        } else {
+            format!("{head} — not read, context read budget spent\n")
+        };
+        return (line.len() <= available).then_some(line);
+    }
+    *reads -= attachment.byte_len as usize;
 
     let bytes = read(attachment);
     let Some(text) = bytes.as_deref().and_then(inlinable_text) else {
@@ -466,5 +508,92 @@ mod tests {
         assert!(block.len() <= budget);
         assert!(block.contains("… 1 more file not shown"));
         assert!(!block.contains("xxxx"));
+    }
+
+    /// The shape that made the block budget insufficient: forty blobs each cost
+    /// one line of block, so the block budget never stops the loop and every one
+    /// of them would be read and hashed on every convened turn. They are named
+    /// instead, and the disk is never touched.
+    #[test]
+    fn a_shelf_of_blobs_is_named_without_being_read() {
+        let rows: Vec<_> = (0..40)
+            .map(|i| {
+                attachment(
+                    &format!("{i:032x}"),
+                    "shot.png",
+                    "image/png",
+                    8 * 1024 * 1024,
+                )
+            })
+            .collect();
+        let mut read_bytes = 0u64;
+        let block = build_attachment_context(
+            &rows,
+            |row| {
+                read_bytes += row.byte_len;
+                None
+            },
+            ROOM_CONTEXT_BYTE_BUDGET,
+        )
+        .expect("block");
+        assert_eq!(
+            read_bytes, 0,
+            "no row over the read budget may reach the disk"
+        );
+        assert_eq!(
+            block.matches("— too large to read into context\n").count(),
+            40
+        );
+    }
+
+    /// Refusing to read is not the same as stopping: the budget is spent by what
+    /// is read, so a giant that costs nothing cannot hide the file behind it.
+    #[test]
+    fn a_refused_read_does_not_hide_the_files_behind_it() {
+        let rows = vec![
+            attachment(
+                &"f".repeat(32),
+                "dump.bin",
+                "application/octet-stream",
+                8 * 1024 * 1024,
+            ),
+            attachment(&"0".repeat(32), "note.md", "text/markdown", 11),
+        ];
+        let mut read_names: Vec<String> = Vec::new();
+        let block = build_attachment_context(
+            &rows,
+            |row| {
+                read_names.push(row.filename.clone());
+                Some(b"still here\n".to_vec())
+            },
+            ROOM_CONTEXT_BYTE_BUDGET,
+        )
+        .expect("block");
+        assert_eq!(read_names, vec!["note.md".to_string()]);
+        assert!(block.contains(
+            "[file] dump.bin (application/octet-stream, 8388608 bytes) — too large to read into context\n"
+        ));
+        assert!(
+            block.contains("[file] note.md (text/markdown, 11 bytes)\nstill here\n[end note.md]\n")
+        );
+    }
+
+    /// The read budget is a total, not a per-file ceiling — and when earlier
+    /// files spend it, the ones after say so rather than reading as absent.
+    #[test]
+    fn a_file_after_the_read_budget_is_spent_says_why_it_is_not_shown() {
+        let big = vec![b'a'; ROOM_CONTEXT_READ_BUDGET];
+        let (rows, blobs) = fixture(&[
+            ("log.txt", "text/plain", big.as_slice()),
+            ("note.md", "text/markdown", b"after the budget\n"),
+        ]);
+        // Wide enough that the BLOCK budget is not what stops anything here.
+        let block = build_attachment_context(&rows, reader(blobs), 2 * ROOM_CONTEXT_READ_BUDGET)
+            .expect("block");
+        assert!(block.contains("[end log.txt]\n"));
+        assert!(block.contains(
+            "[file] note.md (text/markdown, 17 bytes) — not read, context read budget spent\n"
+        ));
+        assert!(!block.contains("after the budget"));
     }
 }

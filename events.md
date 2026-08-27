@@ -6694,3 +6694,34 @@ too. A room with no attachments produces a byte-identical prompt, and that is a
 test rather than a claim. No ContextPolicy/ContextMount — the Rooms v2 §7 model
 stays unimplemented, as the root contract requires.
 _________________________________________________________________________________
+
+time:      [18:13] [08-27-26]
+agent:     [claude] [opus 5]
+worktree:  loop/attachments-in-agent-context
+type:      [review]
+area:      [backend]
+
+Review of the room-context slice found the 16 KiB budget bounds the rendered
+block and nothing else, so a binary attachment cost sixty bytes of budget but a
+full read plus sha256 over up to 8 MiB: a room of blobs never stopped the loop,
+and the reviewer measured forty rows of 8 MiB all read, 320 MiB, to print a
+2787-byte block — synchronously, on a runtime worker, on every convened turn.
+The two comments and the summary claiming reads stop with the budget were
+describing an intention the code did not implement. Fixed with a second and
+separate budget, ROOM_CONTEXT_READ_BUDGET (1 MiB per turn), charged on
+RoomAttachment.byte_len before the read rather than on the bytes that come back,
+which makes the refusal free; a row longer than what is left of it is NAMED the
+way every other unshowable file is, and the two reasons are distinguished
+("too large to read into context" versus "not read, context read budget spent")
+because a ten-kilobyte file called too large would read as a bug. The budget is
+a total rather than a per-file ceiling, so refusing a giant does not hide the
+small file behind it, and that is a test. Also: the attachment-list store error
+was becoming "this room has no files" silently, which is exactly the confident
+answer from unseen material the module's announce-every-clip rule exists to
+prevent, so it now warns. Left open for the operator: this slice's AGENTS.md
+edit narrowed room_attachments.rs's blanket ban on prompt assembly to the Rooms
+v2 §7 ContextPolicy/ContextMount model it named as its reason. The narrowing is
+defensible and the §7 model is genuinely unimplemented, but a builder narrowing
+the prohibition covering its own change is above the builder's level, so both
+bullets are marked NOT YET RATIFIED with the revert named.
+_________________________________________________________________________________

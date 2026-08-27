@@ -2085,10 +2085,23 @@ fn spawn_room_agent_turn(
             .collect();
         // The room's context files, on the same terms as the tail: the rows come
         // out of `with_rooms` and the bytes are read here, synchronously, before
-        // any await below. Blob reads stop as soon as the byte budget is spent,
-        // so a room with a shelf of large files costs one read past the cut, not
-        // all of them.
-        let attachments = with_rooms(&state, |reg| reg.attachments(&room)).unwrap_or_default();
+        // any await below. That I/O is bounded by `room_context`'s own read
+        // budget, NOT by the byte budget — the byte budget bounds what the block
+        // says, and a binary says one line however many megabytes it is on disk.
+        let attachments = match with_rooms(&state, |reg| reg.attachments(&room)) {
+            Ok(rows) => rows,
+            Err(e) => {
+                // Louder than the tail's `unwrap_or_default` above, because the
+                // two failures do not land the same way: an empty transcript is
+                // self-evident to the agent, while a lost attachment list reaches
+                // it as a room that simply has no files. That is the confident
+                // answer from unseen material this block exists to prevent, and
+                // the log line is the only place it is visible.
+                tracing::warn!(room = %room, error = %e,
+                    "room context files unavailable for this turn");
+                Vec::new()
+            }
+        };
         let context_files = crate::room_context::build_attachment_context(
             &attachments,
             |row| {
