@@ -6407,3 +6407,24 @@ with denied warnings, formatting, and dependency policy. Ocean-store passed
 ready for a fresh exact-head independent review; it remains an inert foundation
 with no routes, admission behavior, daemon restart, or production mutation.
 _________________________________________________________________________________
+
+time:  [02:33] [08-27-26]
+agent: [codex desktop] [gpt-5]
+worktree: [codex/rooms-phase1-deploy-record]
+type:  [handoff]
+area:  [testing]
+
+Rooms Phase 1 authority foundation PR #369 received a clean exact-head Codex
+review at f19ca75bc2, passed every GitHub lane, and merged to main as
+e4346ced6916ce575ae382aa440faa3d451c59b3. A fresh clean main clone at that
+exact merge passed `cargo build --workspace --release`.
+
+Installed and code-signed immutable TUI artifact ocean-e4346ced6916, then
+installed and restarted supervised daemon artifact ocean-daemon-e4346ced6916.
+The live daemon is running under launchd on PID 68293; `/health` returned ok
+with rev e4346ced6916 and zero persistence or GC failures. A real multi-second
+PTY launch rendered the installed Ocean TUI against the live daemon and exited
+cleanly. The user's dirty canonical checkout was not modified. This foundation
+remains deliberately inert: no Room-agent API routes or admission behavior were
+introduced by Phase 1 Stage 1.
+_________________________________________________________________________________
