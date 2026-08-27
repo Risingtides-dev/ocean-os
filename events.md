@@ -6239,3 +6239,54 @@ on main. Advertised all three rather than land a feature on a red baseline; the
 route count moves 101 -> 104 for that repair and 104 -> 108 for attachments, and
 the comment above the assertion says which is which.
 _________________________________________________________________________________
+_________________________________________________________________________________
+
+time:      [23:35] [26-08-26]
+agent:     [claude-code], [opus-5-1m]
+worktree:  feat/summarize
+type:      [feature-request]
+area:      [backend]
+
+Added POST /v1/rooms/persistent/{key}/summarize: one bounded transcript read,
+one complete_once model turn, and the result folded into the room's single
+well-known `room-summary` Note artifact — created at v1, amended in place
+forever after. A long room is unreadable and the fix is not another wall of
+chat; the summary is a durable thing the room owns, versioned by the same
+compare-and-swap every other artifact uses and announced on the SSE tail every
+client already listens to. New module `room_summary.rs` holds the logic behind
+a `complete` closure exactly as `advisor.rs` does, so all seventeen of its
+tests run against an in-memory store with zero process-global env.
+
+Two corrections to the brief that the code forced. First, paging: the store's
+`load_transcript_page` is `WHERE seq > ?2 ORDER BY seq LIMIT ?3`, so reading
+with the default cursor returns a long room's OLDEST page. Following the brief
+literally would have shipped a confident summary of a thousand-message room's
+first two hundred lines labelled "the room summary" — the exact false-success
+class this repo exists to remove. Fixed without new store code by deriving a
+tail cursor from the existing `room_latest_durable_seq`; the off-by-one is real
+(`seq` starts at 0 and `after_seq` is exclusive, so a naive saturating_sub
+drops message 0 on a short room) and has its own boundary test. Second,
+authorship: `create_artifact`/`amend_artifact` require a roster author and rooms
+start with an EMPTY roster, so the route takes `requested_by` and records the
+model in the artifact body rather than bypassing an invariant two prior
+roster-clobbering incidents put there.
+
+Also moved the forged-author gate and the room-open precondition ahead of the
+provider call rather than behind it: a soft-closed room reads fine through the
+audit view and then 404s on the write, which would mean paying for a model turn
+to earn a 404. Same response, raised earlier, and it closes a real hole — the
+audit view caps at MAX_TRANSCRIPT_LIMIT from the START of the log, so a tail
+cursor into a closed 1200-message room would have filtered to nothing and
+reported `no_messages` instead of the truth.
+
+Separately: `router_contract_source_banner_and_operator_guide_are_in_parity`
+was already RED on origin/main (a2c61c7e). The agent-CRUD merge (#370)
+registered POST /v1/agents and PUT+DELETE /v1/agents/{name} without adding them
+to `banner_routes()` or the operator guide. Verified against a pristine
+origin/main worktree before touching anything. Closed in its own commit ahead
+of the feature, because that gate is the only thing that verifies a new route's
+banner and guide entries and it cannot gate anything while it is red.
+
+Verified: cargo fmt --all --check clean, cargo clippy --workspace --all-targets
+-D warnings clean, cargo test -p ocean-daemon 704 passed, -p ocean-store 146
+passed.
