@@ -154,10 +154,13 @@ mod request_control;
 mod room_attachments;
 /// Restart-safe outbound Bedrock room client and per-room supervisor (S2 P2-B).
 mod room_federation;
+/// Fail-closed local operator principal for room-agent authorization mutations.
+/// Phase 1 lands and validates this authority before a later accepted slice
+/// wires mutation routes, so the production module is deliberately inert here.
+#[allow(dead_code)]
+mod room_operator;
 /// One-shot room-transcript summary into the room's well-known artifact.
 mod room_summary;
-/// Fail-closed local operator principal for room-agent authorization mutations.
-mod room_operator;
 /// Host fulfillment lifecycle retained for the external `ocean-slack` extension.
 mod slack_canvas_fulfillment;
 /// Ephemeral OpenAI Realtime client-secret mint (voice phases 2/3) — the

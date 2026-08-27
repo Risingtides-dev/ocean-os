@@ -28,7 +28,7 @@
 //!    gating for an already-authorized agent. Conflating the two would let the
 //!    operator default silently disable the authority model.
 
-use std::io::Write;
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 
 use axum::http::HeaderMap;
@@ -272,11 +272,10 @@ fn default_allowed_origins() -> Vec<String> {
 
 /// Read the key, or create it with owner-only permissions on first run.
 fn read_or_create_key(path: &Path) -> std::io::Result<String> {
-    if let Ok(existing) = std::fs::read_to_string(path) {
-        let trimmed = existing.trim().to_string();
-        if !trimmed.is_empty() {
-            return Ok(trimmed);
-        }
+    match std::fs::symlink_metadata(path) {
+        Ok(_) => return read_existing_private_key(path),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error),
     }
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
@@ -284,6 +283,58 @@ fn read_or_create_key(path: &Path) -> std::io::Result<String> {
     let key = generate_key()?;
     write_owner_only(path, &key)?;
     Ok(key)
+}
+
+/// Open and validate the named key itself. On Unix `O_NOFOLLOW` closes the
+/// check/open race for symlinks; metadata comes from the opened descriptor so
+/// a rename between path inspection and read cannot substitute another file.
+fn read_existing_private_key(path: &Path) -> std::io::Result<String> {
+    let mut opts = std::fs::OpenOptions::new();
+    opts.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW);
+    }
+    let mut file = opts.open(path)?;
+    validate_private_key_file(&file)?;
+    let mut existing = String::new();
+    file.read_to_string(&mut existing)?;
+    let trimmed = existing.trim().to_string();
+    if trimmed.is_empty() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "operator key is empty",
+        ));
+    }
+    Ok(trimmed)
+}
+
+fn validate_private_key_file(file: &std::fs::File) -> std::io::Result<()> {
+    let metadata = file.metadata()?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+        if !metadata.is_file()
+            || metadata.nlink() != 1
+            || metadata.uid() != unsafe { libc::geteuid() }
+            || metadata.permissions().mode() & 0o7777 != 0o600
+        {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "operator key must be a single-link owner-owned mode-0600 regular file",
+            ));
+        }
+    }
+    #[cfg(not(unix))]
+    if !metadata.is_file() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "operator key must be a regular file",
+        ));
+    }
+    Ok(())
 }
 
 fn generate_key() -> std::io::Result<String> {
@@ -299,15 +350,17 @@ fn generate_key() -> std::io::Result<String> {
 /// world-readable.
 fn write_owner_only(path: &Path, key: &str) -> std::io::Result<()> {
     let mut opts = std::fs::OpenOptions::new();
-    opts.write(true).create(true).truncate(true);
+    opts.write(true).create_new(true);
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt;
-        opts.mode(0o600);
+        opts.mode(0o600).custom_flags(libc::O_CLOEXEC);
     }
     let mut f = opts.open(path)?;
+    validate_private_key_file(&f)?;
     f.write_all(key.as_bytes())?;
     f.write_all(b"\n")?;
+    f.sync_all()?;
     Ok(())
 }
 
@@ -485,6 +538,51 @@ mod tests {
             )]))
             .unwrap();
         assert_eq!(p.id(), first.id);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn an_insecure_existing_key_fails_closed_without_being_rewritten() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = operator_key_path(dir.path());
+        std::fs::write(&path, "restored-but-exposed\n").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+
+        let identity = OperatorIdentity::load(dir.path());
+        assert!(!identity.is_configured());
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "restored-but-exposed\n",
+            "fail-closed load must not rotate or overwrite an unsafe restored key"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_symlink_or_hard_link_key_fails_closed() {
+        use std::os::unix::fs::{symlink, PermissionsExt};
+
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("target.key");
+        std::fs::write(&target, "shared-secret\n").unwrap();
+        std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o600)).unwrap();
+
+        let linked_dir = tempfile::tempdir().unwrap();
+        symlink(&target, operator_key_path(linked_dir.path())).unwrap();
+        assert!(!OperatorIdentity::load(linked_dir.path()).is_configured());
+
+        let hard_linked_dir = tempfile::tempdir().unwrap();
+        std::fs::hard_link(&target, operator_key_path(hard_linked_dir.path())).unwrap();
+        assert!(!OperatorIdentity::load(hard_linked_dir.path()).is_configured());
+    }
+
+    #[test]
+    fn a_non_file_key_path_fails_closed() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(operator_key_path(dir.path())).unwrap();
+        assert!(!OperatorIdentity::load(dir.path()).is_configured());
     }
 
     #[test]

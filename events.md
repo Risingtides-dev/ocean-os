@@ -6311,3 +6311,26 @@ read-cursor federation slice plus the new absent-route regression, workspace
 check, daemon all-target Clippy with denied warnings, docs-check, formatting,
 and diff hygiene. No daemon was restarted and no production state was changed.
 _________________________________________________________________________________
+
+time:  [01:14] [08-27-26]
+agent: [codex] [gpt-5]
+worktree: [feat/rooms-phase1-agent-binding]
+type:  [bug report]
+area:  [backend]
+
+Rebased the accepted Rooms Phase 1 room-agent authority foundation onto current
+origin/main and repaired all four blocking review findings before reopening it
+for review. Consumed authorization decisions now persist in an immutable
+per-room replay ledger, so later re-authorization cannot make an older decision
+id reusable. A stale binding cannot return active or be laundered through
+suspended without a fresh replay-safe authorization decision. Existing operator
+keys are opened without following symlinks and must be single-link regular files
+owned by the daemon user with exact mode 0600; unsafe restored keys fail closed
+without being overwritten. The store and daemon devlog ownership contracts now
+record the new foundation. This slice remains deliberately inert: it adds no
+authorization routes, admission behavior, or production deployment.
+
+Verification: cargo test -p ocean-store (169 passed), cargo test -p ocean-daemon
+(738 passed), cargo check --workspace, strict all-target Clippy for ocean-store
+and ocean-daemon, cargo xtask docs-check, format and diff checks, and the full
+cargo xtask ci repository gate all passed.

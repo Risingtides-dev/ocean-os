@@ -653,9 +653,10 @@ impl AgentBindingStatus {
 
 /// When the agent is asked to act. This is never a capability: it decides when
 /// the agent is invoked, never what it may do once invoked.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
 pub enum ActivationPolicy {
     /// The default, and the quietest: only on direct invocation.
+    #[default]
     ExplicitOnly,
     Mention,
     TaskAndThread,
@@ -682,15 +683,10 @@ impl ActivationPolicy {
     }
 }
 
-impl Default for ActivationPolicy {
-    fn default() -> Self {
-        Self::ExplicitOnly
-    }
-}
-
 /// How much room transcript a turn may read.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
 pub enum ContextPolicy {
+    #[default]
     InvocationOnly,
     RoomRecent,
     RoomHistory,
@@ -717,16 +713,11 @@ impl ContextPolicy {
     }
 }
 
-impl Default for ContextPolicy {
-    fn default() -> Self {
-        Self::InvocationOnly
-    }
-}
-
 /// Where a turn's durable memory writes land. There is deliberately no
 /// `global` variant: a room-scoped agent may never reach operator memory.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
 pub enum MemoryScope {
+    #[default]
     None,
     Room,
 }
@@ -747,12 +738,6 @@ impl MemoryScope {
                 "unknown memory scope '{other}'"
             ))),
         }
-    }
-}
-
-impl Default for MemoryScope {
-    fn default() -> Self {
-        Self::None
     }
 }
 
@@ -1560,6 +1545,31 @@ impl SqliteRoomStore {
 
             CREATE INDEX IF NOT EXISTS idx_room_agent_bindings_active
                 ON room_agent_bindings(room_id) WHERE status = 'active';
+
+            -- Immutable replay ledger. The binding row carries only the most
+            -- recent decision for inspection; every consumed decision remains
+            -- here so re-authorization can never make an older approval id
+            -- reusable for different content or a different agent.
+            CREATE TABLE IF NOT EXISTS room_agent_decisions (
+                room_id        TEXT NOT NULL REFERENCES rooms(id) ON DELETE CASCADE,
+                decision_id    TEXT NOT NULL,
+                agent_member_id TEXT NOT NULL,
+                request_digest TEXT NOT NULL,
+                consumed_at    TEXT NOT NULL,
+                PRIMARY KEY (room_id, decision_id),
+                FOREIGN KEY (room_id, agent_member_id)
+                    REFERENCES room_agent_bindings(room_id, agent_member_id)
+                    ON DELETE CASCADE
+            );
+
+            -- Upgrade a database opened by an earlier Phase 1 branch build.
+            -- Only its currently retained decision can be recovered; the
+            -- branch has not shipped, so no production decisions are lost.
+            INSERT OR IGNORE INTO room_agent_decisions (
+                room_id, decision_id, agent_member_id, request_digest, consumed_at
+            )
+            SELECT room_id, decision_id, agent_member_id, request_digest, authorized_at
+              FROM room_agent_bindings;
             "#,
         )?;
         // Backfill columns on DBs created before they existed.
@@ -3974,7 +3984,7 @@ impl SqliteRoomStore {
         // across two different agents is caught rather than creating a row.
         let prior: Option<(String, String)> = tx
             .query_row(
-                "SELECT agent_member_id, request_digest FROM room_agent_bindings
+                "SELECT agent_member_id, request_digest FROM room_agent_decisions
                  WHERE room_id = ?1 AND decision_id = ?2",
                 params![key.as_str(), input.decision_id],
                 |r| Ok((r.get(0)?, r.get(1)?)),
@@ -4030,6 +4040,9 @@ impl SqliteRoomStore {
 
         // Generation starts at 1 and bumps on every authority change; an
         // authorization over an existing (non-revoked) row is such a change.
+        let decision_id = input.decision_id.clone();
+        let agent_member_id = input.agent_member_id.clone();
+        let request_digest = input.request_digest.clone();
         tx.execute(
             "INSERT INTO room_agent_bindings (
                  room_id, agent_member_id, agent_package_id, agent_definition_digest,
@@ -4074,6 +4087,18 @@ impl SqliteRoomStore {
                 granted_json,
                 input.decision_id,
                 input.request_digest,
+            ],
+        )?;
+        tx.execute(
+            "INSERT INTO room_agent_decisions (
+                 room_id, decision_id, agent_member_id, request_digest, consumed_at
+             ) VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![
+                key.as_str(),
+                decision_id,
+                agent_member_id,
+                request_digest,
+                ts
             ],
         )?;
         tx.commit()?;
@@ -4130,9 +4155,10 @@ impl SqliteRoomStore {
     /// Move a binding to `suspended`, `stale`, or `revoked`, bumping the
     /// generation so anything planned against the old authority is refused.
     ///
-    /// `revoked` is terminal: nothing moves out of it. `stale` is reserved for
-    /// the digest check and is not an operator action, but the store does not
-    /// enforce who calls it — the route layer does.
+    /// `revoked` is terminal: nothing moves out of it. `stale` may move only to
+    /// `revoked`; returning to active authority requires `authorize_room_agent`
+    /// with a fresh replay-safe decision. This prevents a stale -> suspended ->
+    /// active sequence from bypassing digest re-authorization.
     pub fn set_room_agent_binding_status(
         &mut self,
         key: &RoomKey,
@@ -4147,7 +4173,11 @@ impl SqliteRoomStore {
                 room: key.clone(),
                 agent: agent_member_id.to_string(),
             })?;
-        if current.status == AgentBindingStatus::Revoked {
+        if current.status == AgentBindingStatus::Revoked
+            || (current.status == AgentBindingStatus::Stale
+                && to != AgentBindingStatus::Stale
+                && to != AgentBindingStatus::Revoked)
+        {
             return Err(RoomStoreError::AgentBindingStatusConflict {
                 room: key.clone(),
                 agent: agent_member_id.to_string(),
@@ -5601,6 +5631,35 @@ mod tests {
     }
 
     #[test]
+    fn reauthorization_never_makes_an_older_decision_reusable() {
+        let (mut s, key) = room_with_agent("agent-1");
+        let mut next = auth_input("agent-1", "dec-2", "digest-2");
+        next.agent_definition_digest = "sha256:def-2".into();
+        s.authorize_room_agent(&key, next, now()).unwrap();
+
+        // Replaying the original approval exactly is a no-op against the
+        // current binding; it must not roll authority back to generation 1.
+        let (current, created) = s
+            .authorize_room_agent(&key, auth_input("agent-1", "dec-1", "digest-1"), now())
+            .unwrap();
+        assert!(!created);
+        assert_eq!(current.generation, 2);
+        assert_eq!(current.decision_id, "dec-2");
+        assert_eq!(current.agent_definition_digest, "sha256:def-2");
+
+        // The consumed original id also cannot authorize another agent or
+        // different content after it stopped being the binding's latest id.
+        for input in [
+            auth_input("agent-2", "dec-1", "digest-1"),
+            auth_input("agent-1", "dec-1", "digest-changed"),
+        ] {
+            let err = s.authorize_room_agent(&key, input, now()).unwrap_err();
+            assert!(matches!(err, RoomStoreError::DecisionReplayMismatch { .. }));
+        }
+        assert!(s.room_agent_binding(&key, "agent-2").unwrap().is_none());
+    }
+
+    #[test]
     fn suspended_and_stale_refuse_admission_and_bump_generation() {
         for to in [AgentBindingStatus::Suspended, AgentBindingStatus::Stale] {
             let (mut s, key) = room_with_agent("agent-1");
@@ -5611,6 +5670,45 @@ mod tests {
             assert!(!b.status.admits(), "{to:?} must not admit");
             assert_eq!(b.generation, 2, "a status change is an authority change");
         }
+    }
+
+    #[test]
+    fn stale_binding_cannot_be_resumed_or_laundered_through_suspended() {
+        let (mut s, key) = room_with_agent("agent-1");
+        s.set_room_agent_binding_status(
+            &key,
+            "agent-1",
+            AgentBindingStatus::Stale,
+            "digest-check",
+            now(),
+        )
+        .unwrap();
+
+        for to in [AgentBindingStatus::Active, AgentBindingStatus::Suspended] {
+            let err = s
+                .set_room_agent_binding_status(&key, "agent-1", to, "operator-1", now())
+                .unwrap_err();
+            assert!(matches!(
+                err,
+                RoomStoreError::AgentBindingStatusConflict { .. }
+            ));
+        }
+        let binding = s.room_agent_binding(&key, "agent-1").unwrap().unwrap();
+        assert_eq!(binding.status, AgentBindingStatus::Stale);
+        assert_eq!(binding.generation, 2);
+
+        // Revocation remains the only status transition available without a
+        // fresh authorization decision.
+        let revoked = s
+            .set_room_agent_binding_status(
+                &key,
+                "agent-1",
+                AgentBindingStatus::Revoked,
+                "operator-1",
+                now(),
+            )
+            .unwrap();
+        assert_eq!(revoked.status, AgentBindingStatus::Revoked);
     }
 
     #[test]
@@ -5707,12 +5805,22 @@ mod tests {
             s.create(key.clone(), "HQ", None, now()).unwrap();
             s.authorize_room_agent(&key, auth_input("agent-1", "dec-1", "digest-1"), now())
                 .unwrap();
+            let mut next = auth_input("agent-1", "dec-2", "digest-2");
+            next.agent_definition_digest = "sha256:def-2".into();
+            s.authorize_room_agent(&key, next, now()).unwrap();
         }
         let mut s = SqliteRoomStore::open(&path).unwrap();
         s.migrate().unwrap();
         let b = s.room_agent_binding(&key, "agent-1").unwrap().unwrap();
         assert_eq!(b.status, AgentBindingStatus::Active);
+        assert_eq!(b.generation, 2);
+        assert_eq!(b.decision_id, "dec-2");
         assert_eq!(b.effective_capabilities(), vec!["fs.read".to_string()]);
+
+        let err = s
+            .authorize_room_agent(&key, auth_input("agent-2", "dec-1", "digest-1"), now())
+            .unwrap_err();
+        assert!(matches!(err, RoomStoreError::DecisionReplayMismatch { .. }));
     }
 
     #[test]
