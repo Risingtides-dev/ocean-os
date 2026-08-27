@@ -48,6 +48,41 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 const READ_TIMEOUT: Duration = Duration::from_secs(35);
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(15);
 const BODY_LIMIT: usize = 64 * 1024;
+/// Ceiling on a single raw frame from a room's SSE stream.
+///
+/// This is a denial-of-service bound, not a correctness one, and it is
+/// deliberately far above `BODY_LIMIT`. A frame between the two is still read
+/// to completion, recognised as unrepresentable, and stepped over at the parse
+/// level. If the raw bound tripped at `BODY_LIMIT` instead, an oversized row
+/// would kill the byte stream before its sequence was ever visible — and with
+/// no sequence there is nothing to advance past, so the room would reconnect
+/// on the same cursor forever and never receive another message.
+const SSE_EVENT_LIMIT: usize = 1024 * 1024;
+/// The largest message body this daemon will put on the federated wire.
+///
+/// The receive side cannot represent a ledger row whose JSON exceeds
+/// `BODY_LIMIT`, so the write side has to stay far enough under it that JSON
+/// escaping still fits: one source byte can cost six on the wire (`\u001f`),
+/// and the ledger envelope rides along too. 8 KiB of body is at most ~48 KiB
+/// escaped, which leaves the envelope room to spare.
+///
+/// This cap is what stops this daemon from ever *creating* the poison row that
+/// `SSE_EVENT_LIMIT` and the skip path exist to survive.
+pub(super) const OUTBOUND_MESSAGE_BODY_LIMIT: usize = 8 * 1024;
+
+// The two relationships the three constants above only work because of. Both
+// are compile-time so a future edit to any one of them fails the build rather
+// than quietly reintroducing an unreadable row.
+const _: () = {
+    // The write cap must survive the worst expansion JSON escaping can inflict
+    // — six wire bytes for one source byte — and still fit under what the
+    // receive side can parse.
+    assert!(OUTBOUND_MESSAGE_BODY_LIMIT * 6 < BODY_LIMIT);
+    // The raw frame bound must sit ABOVE the parse limit, so an oversized row
+    // still arrives complete enough for its sequence to be read and stepped
+    // over instead of killing the byte stream on the way in.
+    assert!(SSE_EVENT_LIMIT > BODY_LIMIT);
+};
 const SENDER_SCAN_INTERVAL: Duration = Duration::from_secs(2);
 const BACKOFF_MAX: Duration = Duration::from_secs(60);
 
@@ -839,6 +874,13 @@ impl FederationSupervisor {
         author_member_id: Option<&str>,
         body: &str,
     ) -> Result<RoomAccessProjection, IntentError> {
+        // The one gate every federated row passes through — HTTP posts and
+        // convened agent replies alike. A body past the cap cannot be read
+        // back by any peer, and an unreadable row on the ledger used to stop
+        // the room for everyone, so it is refused here rather than written.
+        if body.len() > OUTBOUND_MESSAGE_BODY_LIMIT {
+            return Err(IntentError::Invalid);
+        }
         let slot = self.slot_for(key).await;
         let result = slot
             .control
@@ -1880,7 +1922,7 @@ async fn run_epoch(
         _ => return EpochOutcome::Recover,
     }
 
-    let mut raw_bound = RawSseEventBound::new(BODY_LIMIT);
+    let mut raw_bound = RawSseEventBound::new(SSE_EVENT_LIMIT);
     let bounded_bytes = response.bytes_stream().map(move |chunk| match chunk {
         Ok(bytes) => raw_bound.accept(&bytes).map(|()| bytes),
         Err(_) => Err(RawSseError::Transport),
@@ -1954,29 +1996,88 @@ async fn run_epoch(
                 let Some(Ok(event)) = next else { break EpochOutcome::Recover };
                 match event.event.as_str() {
                     "room_event" => {
-                        let Ok(row) = parse_sse_json::<WireLedgerRow>(&event.data) else {
-                            break EpochOutcome::Recover;
-                        };
-                        let Ok(sequence) = parse_canonical_u64(&row.sequence) else {
-                            break EpochOutcome::Recover;
-                        };
-                        if !wire_row_scope_is_exact(&row, &key)
-                            || event.id != row.sequence
-                            || sequence < last_accepted
-                        {
-                            break EpochOutcome::Recover;
-                        }
-                        let result = if row.event_type == "message" {
-                            ingest_message_row(
-                                &inner,
-                                &client,
-                                &credential,
-                                row,
-                                &live_human_member_ids,
-                            )
-                            .await
-                        } else {
-                            advance_non_message(&inner, &key, sequence)
+                        // A row this daemon cannot represent must not become a
+                        // permanent wall.
+                        //
+                        // `Recover` means "reconnect from the durable cursor",
+                        // and the cursor still sits BEFORE this row — so a row
+                        // that fails every time is served again on every
+                        // reconnect, forever. Nothing downstream of it ever
+                        // arrives, no retry or restart clears it, and because
+                        // the row lives on the shared ledger it wedges every
+                        // daemon federated to that room at once.
+                        //
+                        // So an unreadable or invalid row is stepped over
+                        // instead. The SSE `id` carries the sequence even when
+                        // the payload does not parse, which is the whole reason
+                        // advancing is possible. The row stays durable on the
+                        // server, which is the ledger's authority; only this
+                        // local projection is missing it. Losing one message
+                        // beats losing every message after it.
+                        let (sequence, result) = match parse_sse_json::<WireLedgerRow>(&event.data) {
+                            Err(_) => {
+                                let Ok(sequence) = parse_canonical_u64(&event.id) else {
+                                    // No usable sequence means nothing to
+                                    // advance past. Reconnect and hope.
+                                    break EpochOutcome::Recover;
+                                };
+                                if sequence < last_accepted {
+                                    break EpochOutcome::Recover;
+                                }
+                                tracing::warn!(
+                                    room = %key,
+                                    sequence,
+                                    bytes = event.data.len(),
+                                    outcome = "unreadable_row_skipped",
+                                    "federation stepped past a ledger row it cannot represent"
+                                );
+                                (sequence, advance_non_message(&inner, &key, sequence))
+                            }
+                            Ok(row) => {
+                                let Ok(sequence) = parse_canonical_u64(&row.sequence) else {
+                                    break EpochOutcome::Recover;
+                                };
+                                // Scope confusion is a different failure: a row
+                                // for another room on this stream says the
+                                // connection itself is wrong, not that this row
+                                // is bad. Reconnect rather than advance.
+                                if !wire_row_scope_is_exact(&row, &key)
+                                    || event.id != row.sequence
+                                    || sequence < last_accepted
+                                {
+                                    break EpochOutcome::Recover;
+                                }
+                                let result = if row.event_type == "message" {
+                                    ingest_message_row(
+                                        &inner,
+                                        &client,
+                                        &credential,
+                                        row,
+                                        &live_human_member_ids,
+                                    )
+                                    .await
+                                } else {
+                                    advance_non_message(&inner, &key, sequence)
+                                };
+                                match result {
+                                    // A row that parses but fails validation is
+                                    // poison in exactly the same way, so it is
+                                    // stepped over too. Store and transport
+                                    // faults are NOT: those are local or
+                                    // transient, and reconnecting is the
+                                    // correct answer to both.
+                                    Err(BridgeError::Protocol) => {
+                                        tracing::warn!(
+                                            room = %key,
+                                            sequence,
+                                            outcome = "invalid_row_skipped",
+                                            "federation stepped past a ledger row that failed validation"
+                                        );
+                                        (sequence, advance_non_message(&inner, &key, sequence))
+                                    }
+                                    other => (sequence, other),
+                                }
+                            }
                         };
                         match result {
                             Ok(IngestDisposition::Committed) => {
@@ -2578,7 +2679,11 @@ async fn ingest_message_row(
                     .await
                     .map_err(|outcome| match outcome {
                         EpochOutcome::Revoked => BridgeError::Revoked,
-                        _ => BridgeError::Protocol,
+                        // Transport, NOT Protocol: the row is fine, the network
+                        // was not. The receive loop steps past a Protocol
+                        // failure, so mapping a transient fetch failure onto it
+                        // would silently drop a legitimate message.
+                        _ => BridgeError::Transport,
                     })?;
                 let mapped = author_kind_from_members(&members, &payload.author_member_id);
                 let kind = mapped.unwrap_or(RoomParticipantKind::Human);
@@ -3752,7 +3857,10 @@ mod tests {
             state.release_events_response.notified().await;
         }
         if state.oversized_incomplete_event.load(Ordering::Acquire) {
-            let raw = format!("event: room_event\ndata: {}", "x".repeat(BODY_LIMIT + 128));
+            let raw = format!(
+                "event: room_event\ndata: {}",
+                "x".repeat(SSE_EVENT_LIMIT + 128)
+            );
             return axum::response::Response::builder()
                 .status(StatusCode::OK)
                 .header(reqwest::header::CONTENT_TYPE, "text/event-stream")
@@ -6178,6 +6286,151 @@ mod tests {
         assert!(access_rx.try_recv().is_err());
         supervisor.shutdown().await;
         fake.release_events_response.notify_waiters();
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn poison_ledger_row_is_stepped_over_instead_of_wedging_the_room() {
+        // The failure this pins: a row the daemon cannot ingest used to force
+        // `Recover`, which reconnects from the durable cursor — still sitting
+        // BEFORE that row. The same row is served again, fails again, forever.
+        // Every later message in the room stops arriving, for every daemon
+        // federated to it, and no restart clears it.
+        let key = RoomKey::new("fed-poison");
+        let human = "11111111-1111-4111-8111-111111111111";
+        let mut store = ocean_store::SqliteRoomStore::open_in_memory().unwrap();
+        store
+            .create(key.clone(), "Poison", None, chrono::Utc::now())
+            .unwrap();
+        store
+            .install_room_credential(&key, "poison-bearer", human)
+            .unwrap();
+        store
+            .update_room_access_safe(&key, Some(RoomAccessState::Connecting), None, None)
+            .unwrap();
+        let rooms = Arc::new(std::sync::Mutex::new(store));
+        let fake = FakeBedrock::new(key.as_str(), "poison-bearer");
+        *fake.members.lock().await = json!({
+            "members": [{
+                "member_id": human,
+                "actor_type": "user",
+                "role_in_room": "owner",
+                "display_name": "Local Human",
+                "joined_at": "2026-07-17T00:00:00Z"
+            }]
+        });
+        let (base, server) = start_fake_bedrock(fake.clone()).await;
+        let supervisor = FederationSupervisor::for_test(
+            &base,
+            rooms.clone(),
+            RoomWakeBus::default(),
+            RoomAccessWakeBus::default(),
+            RoomReadCursorWakeBus::default(),
+            CancellationToken::new(),
+            Duration::from_millis(20),
+        );
+        supervisor.startup().await;
+        tokio::time::timeout(Duration::from_secs(60), async {
+            loop {
+                if fake.sse_tx.lock().await.is_some() {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("SSE connected");
+        let tx = fake.sse_tx.lock().await.clone().expect("SSE connected");
+
+        let good_row = |sequence: &str, client_event_id: &str| {
+            json!({
+                "id": format!("ledger-{sequence}"),
+                "sequence": sequence,
+                "event_type": "message",
+                "correlation_id": "fed-poison",
+                "virtual_path": "/rooms/fed-poison",
+                "actor_id": "principal-1",
+                "actor_member_id": human,
+                "source_id": "source-1",
+                "source_sequence": sequence,
+                "payload": {
+                    "client_event_id": client_event_id,
+                    "author_member_id": human,
+                    "body": "readable",
+                    "mention_member_ids": []
+                }
+            })
+        };
+
+        // Poison 1: too large to parse at all. Only the SSE id is legible, and
+        // that is exactly what the skip path leans on.
+        let oversized = json!({
+            "id": "ledger-1",
+            "sequence": "1",
+            "event_type": "message",
+            "correlation_id": "fed-poison",
+            "virtual_path": "/rooms/fed-poison",
+            "actor_id": "principal-1",
+            "actor_member_id": human,
+            "source_id": "source-1",
+            "source_sequence": "1",
+            "payload": {
+                "client_event_id": "client-1",
+                "author_member_id": human,
+                "body": "x".repeat(BODY_LIMIT + 4096),
+                "mention_member_ids": []
+            }
+        });
+        assert!(oversized.to_string().len() > BODY_LIMIT);
+        tx.send(Ok(Event::default()
+            .event("room_event")
+            .id("1")
+            .data(oversized.to_string())))
+            .await
+            .unwrap();
+
+        // Poison 2: small and well-formed JSON, but the payload contradicts the
+        // envelope, so ingest refuses it. Same wedge, different door.
+        let mut forged = good_row("2", "client-2");
+        forged["payload"]["author_member_id"] = json!("99999999-9999-4999-8999-999999999999");
+        tx.send(Ok(Event::default()
+            .event("room_event")
+            .id("2")
+            .data(forged.to_string())))
+            .await
+            .unwrap();
+
+        // The message that used to be unreachable behind them.
+        tx.send(Ok(Event::default()
+            .event("room_event")
+            .id("3")
+            .data(good_row("3", "client-3").to_string())))
+            .await
+            .unwrap();
+
+        tokio::time::timeout(Duration::from_secs(60), async {
+            loop {
+                let done = with_rooms_handle(&rooms, |s| {
+                    let transcript = s.get(&key).unwrap().unwrap().transcript;
+                    let access = s.room_access(&key).unwrap();
+                    transcript.len() == 1 && access.last_confirmed_global_sequence == Some(3)
+                });
+                if done {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("poison rows skipped and the later message ingested");
+
+        let transcript = with_rooms_handle(&rooms, |s| s.get(&key))
+            .unwrap()
+            .unwrap()
+            .transcript;
+        assert_eq!(transcript.len(), 1, "only the readable row lands");
+        assert_eq!(transcript[0].body, "readable");
+        supervisor.shutdown().await;
         server.abort();
     }
 

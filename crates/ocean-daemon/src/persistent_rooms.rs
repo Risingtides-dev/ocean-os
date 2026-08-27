@@ -1100,6 +1100,11 @@ pub(super) enum PostRejection {
     /// `thread_parent_seq` violated the store's one-level thread policy. The
     /// store rejected it inside the append transaction; nothing was written.
     InvalidThreadParent,
+    /// The body exceeds [`OUTBOUND_MESSAGE_BODY_LIMIT`]. Refused at the door
+    /// rather than written, because a row too large to travel the federation
+    /// wire is one no peer can read back — see the constant for why an
+    /// unreadable row is worth this much trouble to prevent.
+    BodyTooLarge,
 }
 
 /// The local post path's error: either the durable store failed, or the daemon
@@ -1129,6 +1134,7 @@ pub(super) fn post_rejection_response(
         PostRejection::ForgedAuthorKind => (StatusCode::FORBIDDEN, "forged_author_kind"),
         PostRejection::AuthorNotInRoster => (StatusCode::FORBIDDEN, "author_not_in_roster"),
         PostRejection::InvalidThreadParent => (StatusCode::BAD_REQUEST, "invalid_thread_parent"),
+        PostRejection::BodyTooLarge => (StatusCode::PAYLOAD_TOO_LARGE, "body_too_large"),
     };
     (status, Json(json!({ "ok": false, "error": code })))
 }
@@ -1189,6 +1195,27 @@ fn thread_root_author(
         .map(|m| m.author_id))
 }
 
+/// Fit a daemon-authored body inside [`OUTBOUND_MESSAGE_BODY_LIMIT`].
+///
+/// A human who writes too much gets a `413` and can split the message. Nobody
+/// is standing behind a convened agent to do that, so its reply is trimmed to
+/// the limit and marked instead of being dropped on the floor — the room still
+/// sees the answer, and the ledger still gets a row every peer can read.
+///
+/// The cut lands on a UTF-8 boundary, walked by hand because
+/// `floor_char_boundary` is still unstable, so the result is never invalid text.
+pub(super) fn clamp_room_message_body(body: &str) -> std::borrow::Cow<'_, str> {
+    const MARKER: &str = "\n\n[truncated: reply exceeded the room message limit]";
+    if body.len() <= crate::room_federation::OUTBOUND_MESSAGE_BODY_LIMIT {
+        return std::borrow::Cow::Borrowed(body);
+    }
+    let mut cut = crate::room_federation::OUTBOUND_MESSAGE_BODY_LIMIT - MARKER.len();
+    while cut > 0 && !body.is_char_boundary(cut) {
+        cut -= 1;
+    }
+    std::borrow::Cow::Owned(format!("{}{MARKER}", &body[..cut]))
+}
+
 /// `POST /v1/rooms/persistent/{key}/messages` — append a chat message to the
 /// transcript, then evaluate the room's trigger policy against any @-mentions in
 /// the body. On a positive decision that resolves to an agent participant, emit a
@@ -1201,6 +1228,12 @@ pub(super) async fn room_post_message(
     Json(req): Json<RoomMessageRequest>,
 ) -> (StatusCode, Json<serde_json::Value>) {
     let key = RoomKey::new(key.trim());
+    // Size is checked before the room is even resolved: the answer is the same
+    // for a local room and a federated one, and a local room can be federated
+    // later, so an oversized row must not reach the transcript either way.
+    if req.body.len() > crate::room_federation::OUTBOUND_MESSAGE_BODY_LIMIT {
+        return post_rejection_response(PostRejection::BodyTooLarge);
+    }
     // Classification and the Local append share one store guard. Credential
     // installation can therefore linearize only before or after this commit,
     // never between a Local check and a later append.
@@ -1925,7 +1958,8 @@ fn spawn_room_agent_turn(
         // Post the agent's reply back into the room as the agent participant.
         // The lock is taken synchronously here, after the await completed.
         if res.ok {
-            let body = res.stdout.trim();
+            let body = clamp_room_message_body(res.stdout.trim());
+            let body = body.as_ref();
             if !body.is_empty() {
                 if let Some(member_id) = federated_member_id.as_deref() {
                     if state
@@ -2893,6 +2927,47 @@ pub(super) async fn room_retry_outbox(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_short_body_is_borrowed_untouched() {
+        let body = "a normal reply";
+        assert!(matches!(
+            clamp_room_message_body(body),
+            std::borrow::Cow::Borrowed("a normal reply")
+        ));
+    }
+
+    #[test]
+    fn an_overlong_agent_reply_is_marked_rather_than_dropped() {
+        let limit = crate::room_federation::OUTBOUND_MESSAGE_BODY_LIMIT;
+        let long = "x".repeat(limit + 5_000);
+        let clamped = clamp_room_message_body(&long);
+        assert!(clamped.len() <= limit, "clamped to {} bytes", clamped.len());
+        assert!(clamped.starts_with("xxxx"), "the reply itself survives");
+        assert!(clamped.ends_with("[truncated: reply exceeded the room message limit]"));
+    }
+
+    #[test]
+    fn clamping_never_splits_a_character() {
+        // A multi-byte body whose natural cut lands mid-codepoint: the walk
+        // back to a boundary is what keeps the result valid UTF-8 at all.
+        let limit = crate::room_federation::OUTBOUND_MESSAGE_BODY_LIMIT;
+        for pad in 0..4 {
+            let body = format!("{}{}", "a".repeat(pad), "\u{1f30a}".repeat(limit));
+            let clamped = clamp_room_message_body(&body);
+            assert!(clamped.len() <= limit);
+            // Owning it as a String round-trips only if the bytes are valid.
+            assert_eq!(clamped.to_string().len(), clamped.len());
+        }
+    }
+
+    #[test]
+    fn body_too_large_is_a_413_not_a_500() {
+        let (status, body) = post_rejection_response(PostRejection::BodyTooLarge);
+        assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE);
+        assert_eq!(body.0["error"], "body_too_large");
+    }
+
     use crate::tests::{
         fake_convene_state, write_agent_fixture, TestEnvRestore, AUTO_CONVENE_ENV_LOCK,
     };
