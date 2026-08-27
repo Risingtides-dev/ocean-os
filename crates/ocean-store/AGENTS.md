@@ -25,6 +25,11 @@ access projections, the outbox, and the restart-safe federation core
   as canonical decimal u64 TEXT, `member_projection` JSON).
 - `outbox` — locally-authored unconfirmed events with full producer tuple
   (`client_event_id`, `source_id`, `source_sequence`) and stable `position`.
+- `room_attachments` — one row per room context file: server-minted
+  `attachment_id`, display-only `filename`, the uploader's DECLARED
+  `content_type`, the server-measured `byte_len` and `sha256`, `uploaded_by`,
+  `uploaded_at`, and a snapshotted `on_behalf_of`. The BYTES are NOT here: the
+  daemon owns them on disk (`ocean-daemon/src/room_attachments.rs`).
 - `room_read_cursors` and `room_read_cursor_mirrors` — per-principal local and
   upstream-mirrored read positions as canonical decimal u64 TEXT. Mirror writes
   use `RoomReadCursorMirrorCas`: callers supply the previously observed mirror;
@@ -96,6 +101,25 @@ access projections, the outbox, and the restart-safe federation core
   `Applied` returns the durable projection; `Stale` never mutates the row. Callers
   must handle newer concurrent `Some` values monotonically while reserving a
   clear for an expectation that still matches.
+- **Attachments are immutable, so the discipline is refusal, not CAS.** There is
+  deliberately no `version` column on `room_attachments`: nothing amends an
+  attachment, so a compare-and-swap guard would be decoration, and a decorative
+  invariant is worse than an absent one. What holds instead: `attachment_id` is
+  SERVER-minted so two uploads never contend for a row (which is also why there
+  is no `AttachmentAlreadyExists` — a PK collision here means the daemon minted
+  a duplicate UUID, a server fault that must surface as `Db`); the daemon writes
+  and fsyncs the blob BEFORE `add_attachment` commits, so a row never points at
+  bytes that do not exist; and `remove_attachment` treats zero rows affected as
+  `UnknownAttachment`, never a silent success. `add_attachment` and
+  `remove_attachment` each write their System transcript marker in the SAME
+  transaction as the row.
+- **A declared content type is recorded and never trusted.**
+  `room_attachments.content_type` is whatever the uploader claimed. It is stored
+  verbatim and deliberately kept OUT of the transcript marker, whose body
+  carries only the sanitized filename and a server-computed byte count — a
+  client-supplied string with a newline in it can forge a transcript line in a
+  naive renderer. `byte_len` and `sha256` are what the server measured; a
+  negative stored `byte_len` fails closed on read.
 
 ## Work Guidance
 

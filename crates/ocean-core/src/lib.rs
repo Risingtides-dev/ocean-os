@@ -589,6 +589,51 @@ pub struct RoomArtifact {
     pub version: u64,
 }
 
+/// A file attached to a room: the doc, the spec, the screenshot everybody in
+/// the room — and any agent with HTTP access — needs to look at.
+///
+/// This is METADATA only; the bytes live on disk beside `rooms.db`, keyed by a
+/// hash of the room key. The row is the authority: a download re-checks
+/// `byte_len` and `sha256` against what it read off disk, so a truncated or
+/// swapped file surfaces as a server fault instead of being served as if it
+/// were the thing that was uploaded.
+///
+/// There is no `version` here and no lifecycle enum. An artifact is amended in
+/// place, so it needs compare-and-swap; an attachment is immutable — it is
+/// present or it is removed — so a version column would be decoration, and a
+/// decorative invariant is worse than an absent one. The discipline that does
+/// carry over is refusal, not merge: [`id`](Self::id) is server-minted so two
+/// uploads can never collide, and a delete that matches nothing is a typed
+/// 404 rather than a silent success.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RoomAttachment {
+    /// Server-minted, `[0-9a-f]{32}`. NEVER client-supplied: this value is the
+    /// blob's filename on disk, so a caller that could choose it could choose
+    /// a path.
+    pub id: String,
+    /// What the uploader called the file. DISPLAY ONLY — sanitized on the way
+    /// in and never used as a path component.
+    pub filename: String,
+    /// The content type the uploader DECLARED. Recorded so a client can render
+    /// a sensible icon; never trusted, and never echoed back on a download.
+    pub content_type: String,
+    /// How many bytes were actually written, not how many were claimed.
+    pub byte_len: u64,
+    /// Hex SHA-256 of the stored bytes, computed server-side.
+    pub sha256: String,
+    /// Participant id of the uploader, roster-checked inside the write
+    /// transaction.
+    pub uploaded_by: String,
+    /// RFC3339.
+    pub uploaded_at: String,
+    /// The worker an agent uploader was acting for, snapshotted at write time.
+    /// Always `None` over HTTP today — the forged-author gate means only a
+    /// Human ever uploads over the wire — and present for the same
+    /// snapshot-not-join reason [`RoomArtifact::on_behalf_of`] is.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub on_behalf_of: Option<String>,
+}
+
 /// A participant in a [`Room`] — a human, agent, bot, tool, or system actor.
 /// Minimal identity foundation per the collaboration model (OCEAN-39): enough
 /// to attribute messages and assemble a roster. Capabilities, transport, and
