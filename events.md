@@ -5952,6 +5952,38 @@ area:      [backend]: ocean-daemon persistent rooms + operator route guide
 
 Updated `crates/ocean-daemon/src/persistent_rooms.rs` tests so merged room SSE accepts interleaved no-id `room_read_cursor` bootstrap frames while still requiring each subscriber to receive exactly the intended `room_access` update, preserving Last-Event-ID semantics for message replay. Added the missing GET/PATCH `/v1/rooms/persistent/{key}/read-cursor` entries to `crates/ocean-daemon/src/main.rs` banner discovery and `docs/OCEAN_RUNTIME_OPERATOR_GUIDE.md` quick reference, then re-ran focused daemon regressions, full `cargo test -p ocean-daemon`, strict daemon all-target clippy, and fmt/diff checks.
 
+time:      [14:52] [03-08-26]
+agent:     ocean, claude-code-fable-5, designer
+worktree:  [main]
+type:      [plan]
+area:      [docs]
+
+Revised docs/specs/2026-07-25-ocean-imessage-bridge-implementation-manifest.md
+with the pm-ratified TASK-44 activation/session-binding contract: bridge is
+installed/trusted/DISABLED by default behind three independent fail-closed
+gates (package install/trust, service enable, TUI /imessage on project/session
+binding); one stable daemon session bound to the dedicated project replaces the
+slice-1 fresh-session-per-message client (bullet marked SUPERSEDED); admitted
+inbound iMessage submits as an ordinary user PromptRequest persisted in the
+normal transcript/SSE with the reply derived idempotently from the normal
+assistant turn under the existing opaque-ID admission/reply lock; other clients
+steer the same session via ordinary session selection with daemon
+session-operation serialization as the concurrency guard; /imessage off stops
+ingress without deleting/porting the transcript. Docs-only change; slice-2 code
+must implement it before autonomous activation. Verified: cargo xtask
+docs-check PASS. Uncommitted pending pad @reviewer acknowledgement (security
+contract change).
+_________________________________________________________________________________
+
+time:      [15:13] [04-08-26]
+agent:     [ocean], [gpt-5.6-sol]
+worktree:  [main]
+type:      [bug report]
+area:      [frontend]
+
+Diagnosed the TUI's reported 52 active agents as 50 durable Observatory session-root nodes plus three running turns: FLOW treated every admitted session container as live work. Updated the projection to exclude only fixed `session`-labeled roots while preserving admitted/running turn and extension executions. Also fixed pre-first-message model selections snapping back to the daemon-global GPT model by pinning the newly created session before `SessionBound`, and exposed the separate Kimi K3 coding-plan credential row so coding-plan keys are not confused with Moonshot API keys. Focused workflow graph tests pass (7/7); TUI compile/release verification pending.
+_________________________________________________________________________________
+
 time:      [15:20] [04-08-26]
 agent:     [ocean], [gpt-5.6-sol]
 worktree:  [main]
@@ -6427,4 +6459,163 @@ PTY launch rendered the installed Ocean TUI against the live daemon and exited
 cleanly. The user's dirty canonical checkout was not modified. This foundation
 remains deliberately inert: no Room-agent API routes or admission behavior were
 introduced by Phase 1 Stage 1.
+
+time:      [04:22] [14-08-26]
+agent:     [pi] [gpt-5.6-sol]
+worktree:  [fix/tui-control-recovery]
+type:      [bug report]
+area:      [frontend]: TUI cancellation, model authority, and recovery
+
+Reproduced and fixed the TUI control-path races around pre-ACK cancellation,
+failed/cancelled queued follow-ups, model changes, provider failures, and SSE
+recovery. Cancellation now keeps exact request correlation through first-session
+binding/replay resets and daemon terminal publication follows the request
+registry exactly once, including orphan cancellation. Queue pauses have layered,
+generation-owned model/control/terminal/recovery authority so stop, sync, late
+ACKs, definite send failures, and drafts preserve FIFO without silent replay.
+Session model config now carries a persisted monotonic config_revision through
+GET/PATCH, scoped events, detail, and sync snapshots; already-admitted saves are
+serialized and HTTP/SSE reorderings reconcile fail closed. First-session model
+selection now supersedes the 04-08-26 create→PATCH approach: the selected catalog
+model is persisted atomically by POST /v1/agent/sessions at revision 1, removing
+the pre-bind lost-ack window. Verified focused race tests; ocean-tui 500/500
+(non-ignored) and ocean-daemon 685/685 suites; ocean-agent, ocean-agent-sdk, and
+ocean-core suites; workspace tests check; denied-warning Clippy; docs-check;
+release builds; isolated real-PTY cancellation/model/provider/SSE recovery,
+model-before-cancel queue ordering, and unbound first-session model pinning.
+Fresh independent adversarial reviews approved the final diff.
+_________________________________________________________________________________
+
+_________________________________________________________________________________
+
+time:      [04:34] [14-08-26]
+agent:     [pi] [gpt-5.6-sol]
+worktree:  [fix/tui-control-recovery]
+type:      [workflow]
+area:      [testing]: TUI control recovery final gate correction
+
+Correction to the immediately preceding entry: the final ocean-tui suite result
+is 496 passed, 0 failed, 4 ignored (not 500 non-ignored). Final verification also
+passed ocean-daemon 685/685, ocean-agent 205/205, ocean-agent-sdk 12/12,
+ocean-core 50/50, ocean-acp including permission ordering, workspace test check,
+all-target denied-warning Clippy for all affected crates, docs-check, rustfmt,
+diff check, and release builds. Clean isolated real-PTY reruns passed unbound
+atomic first-session model selection, model/cancel queue ordering, rapid model
+selection, provider-failure recovery, cancellation, and daemon/SSE restart and
+post-reconnect turn completion. All temporary listeners were stopped by exact
+PID.
+_________________________________________________________________________________
+
+_________________________________________________________________________________
+
+time:      [04:46] [14-08-26]
+agent:     [pi] [gpt-5.6-sol]
+worktree:  [fix/tui-control-recovery]
+type:      [workflow]
+area:      [testing]: TUI control recovery landed and installed
+
+Landed reviewed commit 591772cc on origin/main after cargo xtask ci passed the
+full local repository gate. Fast-forwarded the canonical main checkout while
+preserving its five unrelated unstaged files. Installed and ad-hoc signed the
+immutable TUI artifact ocean-591772cc36a7, installed the legacy-chromium daemon
+artifact ocean-daemon-591772cc36a7, and restarted the supervised LaunchAgent;
+/health reports rev 591772cc36a7 and PID 43421 is the sole :4780 listener. A
+final real multi-second PTY against the installed production binaries exercised
+an active sleep turn, an admitted model change, a queued follow-up, Esc
+cancellation, and explicit empty-Enter release. The first request remained the
+only request until Enter, both requests settled cancelled, the queue remained
+visibly paused, and the session authority persisted gpt-5.6-terra. No active
+requests or isolated smoke listeners remain.
+_________________________________________________________________________________
+
+_________________________________________________________________________________
+
+time:      [04:47] [14-08-26]
+agent:     [pi] [gpt-5.6-sol]
+worktree:  [fix/tui-control-recovery]
+type:      [gh actions]: CI run 31784972270
+area:      [testing]: Post-land main validation
+
+The push workflow for 591772cc completed green: cargo-deny, pinned Rust 1.88
+MSRV, Ubuntu repository/feature/release gates, and macOS
+repository/feature/release gates all passed.
+_________________________________________________________________________________
+
+_________________________________________________________________________________
+
+time:      [15:39] [24-08-26]
+agent:     [codex] [gpt-5]
+worktree:  [main]
+type:      [plan]: Ocean Rooms v2 contract-first completion program
+area:      [writing]: room authority, identity, workspace, agents, and context
+
+Audited the live local and federated Room path, then drafted the proposed Ocean
+Rooms v2 architecture and implementation manifest. The proposal freezes one
+transcript authority, authenticated principals and server-derived memberships,
+registered-project workspace bindings with honest observe/managed/confined
+modes, immutable Room-agent revisions, versioned context mounts and grants,
+additive compatibility migrations, R0-R6 delivery gates, and explicit stop
+conditions. Indexed the proposal in the root and docs devlogs, docs index, and
+roadmap. This checkpoint changes no runtime behavior and authorizes no code
+stage until the exact manifest receives operator acceptance after independent
+architecture/security review.
+_________________________________________________________________________________
+
+time:      [23:16] [26-08-26]
+agent:     [claude] [opus 5]
+worktree:  [main]
+type:      [bug-report]
+area:      [backend]
+
+Fixed a federation failure where one bad ledger row wedged a room permanently.
+A row the daemon could not ingest returned EpochOutcome::Recover, which
+reconnects from the durable cursor — still sitting before that row — so the
+same row was served and refused on every reconnect. Every later message in the
+room stopped arriving, for every daemon federated to it, and no restart cleared
+it. The receive path now steps over a row it cannot represent, using the SSE id
+for the sequence when the payload will not parse; only unparseable and
+ingest-invalid rows are skipped, while store faults, transport faults, and scope
+confusion still recover. A roster fetch failing inside ingest was mapping onto
+Protocol and is now Transport, so a flaky network cannot silently drop a real
+message. The raw frame bound moved to 1 MiB and is purely a DoS bound now,
+because at 64 KiB it killed the byte stream before the sequence was legible.
+Prevention: message bodies are capped at 8 KiB at enqueue_federated_message —
+humans get a 413, agent replies are truncated with a marker — with the cap's
+relationship to the parse limit asserted at compile time. Also repaired the
+router parity test that was already red on main: agent CRUD registered POST
+/v1/agents and PUT/DELETE /v1/agents/{name} without advertising them in GET /
+discovery or the operator guide. PR #371, merged. 691/691 daemon tests, clippy
+and fmt clean, workspace check clean.
+_________________________________________________________________________________
+
+time:      [00:04] [27-08-26]
+agent:     [claude] [opus 5]
+worktree:  [main]
+type:      [release]
+area:      [backend]
+
+Rooms feature push: attachments and summarize landed in ocean-os, repo-in-room in
+ocean-bedrock, and the agent builder UI in ocean-surface. Room attachments store
+metadata beside room_artifacts and bytes under the config dir keyed by
+sha256(room key) — the room key validates nothing, so it is as dangerous a path
+component as the id — with an 8 MiB cap, a nosniff octet-stream download that
+never echoes the declared content type, and a System transcript marker written in
+the same transaction. Summarize reads a bounded transcript tail, runs one
+complete_once turn on roles.summarize with a fast fallback, and amends the room's
+single well-known room-summary artifact in place; the forged-author and room-open
+gates moved ahead of the provider call, which also closed a case where a
+soft-closed room answered no_messages instead of 404. Repo-in-room binds a git
+remote to a room and clones it into the container at /workspace/<dir>, excluded
+from the flush so a working tree cannot put thousands of ledger rows on the room's
+event stream; the token stays in the room secret store and the recorded command
+carries the literal $GIT_TOKEN. The agent builder puts create and edit under the
+existing + agent disclosure. Also fixed along the way: GET /v1/agents/{name}
+answered 200 for a missing agent so fetch() read it as success (PR #372); the
+surface release build was failing on dead code left by the identity fix, so the
+bundle had not promoted since #117 (surface #119); the observatory routes sent
+this machine's observer token to another user's daemon (surface #120); and the
+join gate trusted a localStorage id, so it only ever closed for a browser that
+had never loaded rooms (surface #121). Bedrock migration 010 is not yet applied
+to production and the Railway service has no GitHub source, so repo-in-room is
+merged but not shipped.
 _________________________________________________________________________________
