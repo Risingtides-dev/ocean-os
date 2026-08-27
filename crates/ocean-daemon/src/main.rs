@@ -10,7 +10,7 @@ use std::{
 use anyhow::Context;
 use async_trait::async_trait;
 use axum::{
-    extract::{Path, Query, State},
+    extract::{DefaultBodyLimit, Path, Query, State},
     http::{header, HeaderMap, HeaderValue, StatusCode},
     response::{
         sse::{Event, KeepAlive, Sse},
@@ -149,6 +149,9 @@ mod project_registry;
 mod recall_registry;
 /// In-memory request and permission control records plus bounded lifecycle mutations.
 mod request_control;
+/// Room attachment BYTES: blob path derivation, the size cap, server-minted
+/// ids, and the upload/list/download/delete adapters over `ocean-store`'s index.
+mod room_attachments;
 /// Restart-safe outbound Bedrock room client and per-room supervisor (S2 P2-B).
 mod room_federation;
 /// Host fulfillment lifecycle retained for the external `ocean-slack` extension.
@@ -289,6 +292,18 @@ struct AppState {
     /// the guard is always dropped before any `await`, and every store method is
     /// synchronous, so a std `Mutex` is correct and never blocks the scheduler.
     rooms: RoomStoreHandle,
+    /// Root of the room-attachment blob tree, resolved ONCE at startup.
+    ///
+    /// `ocean-store` indexes attachments; their bytes live on disk under this
+    /// directory, one hashed subdirectory per room key (see
+    /// [`room_attachments`]). It sits beside the `rooms.db` that indexes it, so
+    /// `OCEAN_DB_PATH` moves metadata and bytes together.
+    ///
+    /// Carried on state rather than re-derived from the environment per request
+    /// for the same TASK-58 reason the runtime's config dir is injected: a test
+    /// helper hands in its own tempdir, so parallel tests never build a daemon
+    /// pointing at another test's directory.
+    room_attachments_root: Arc<std::path::PathBuf>,
     /// Bounded room-scoped wake hints for persistent transcript SSE tails. The
     /// payload is only `(room, seq)`; SQLite remains authoritative for replay,
     /// live delivery, lag recovery, ordering, and deduplication.
@@ -944,6 +959,13 @@ async fn main() -> anyhow::Result<()> {
         .with_context(|| format!("opening rooms DB at {}", rooms_db_path.display()))?;
     tracing::info!(path = %rooms_db_path.display(), "persistent rooms store ready");
 
+    // Room attachment BYTES live beside the DB that indexes them, so a moved
+    // `OCEAN_DB_PATH` carries a room's files with its metadata instead of
+    // splitting the two. Resolved once here and carried on `AppState`; the
+    // per-room subdirectories are created lazily on first upload.
+    let room_attachments_root = room_attachments::room_attachments_root();
+    tracing::info!(path = %room_attachments_root.display(), "room attachment store ready");
+
     // Persisted Longhouse title registry (OCEAN-246/272): open the durable escrow
     // store at startup so firekeeper/validator titles survive a daemon restart and
     // `claim_outcome` can ratify across turns. It lives at `titles.db` alongside
@@ -1096,6 +1118,7 @@ async fn main() -> anyhow::Result<()> {
         permissions: Arc::new(RwLock::new(HashMap::new())),
         longhouse,
         rooms,
+        room_attachments_root: Arc::new(room_attachments_root),
         room_wakes,
         room_access_wakes,
         room_read_cursor_wakes,
@@ -1540,6 +1563,10 @@ fn banner_routes() -> &'static [&'static str] {
         "GET /v1/rooms/persistent/{key}/artifacts",
         "GET /v1/rooms/persistent/{key}/artifacts/{artifact_id}",
         "POST /v1/rooms/persistent/{key}/artifacts/{artifact_id}/amend",
+        "POST /v1/rooms/persistent/{key}/attachments",
+        "GET /v1/rooms/persistent/{key}/attachments",
+        "GET /v1/rooms/persistent/{key}/attachments/{attachment_id}",
+        "DELETE /v1/rooms/persistent/{key}/attachments/{attachment_id}",
         "GET /v1/rooms/persistent/{key}/snapshot",
         "GET /v1/rooms/persistent/{key}/events",
         "GET /v1/rooms/persistent/{key}/read-cursor",
@@ -2908,6 +2935,26 @@ fn room_routes() -> Router<AppState> {
         .route(
             "/v1/rooms/persistent/{key}/artifacts/{artifact_id}/amend",
             post(persistent_rooms::room_amend_artifact),
+        )
+        // Room context files. The `DefaultBodyLimit` layer is REQUIRED, not
+        // decoration: axum-core imposes a 2 MiB default, so without it the
+        // handler's 8 MiB cap would be fiction and anything larger would die
+        // with an untyped 413 that reads like our bug. Sized cap + slack so a
+        // body just over the cap still reaches the handler and gets the typed
+        // `attachment_too_large` JSON, while a huge body is refused by the layer
+        // and never buffered.
+        .route(
+            "/v1/rooms/persistent/{key}/attachments",
+            post(room_attachments::room_upload_attachment)
+                .get(room_attachments::room_list_attachments)
+                .layer(DefaultBodyLimit::max(
+                    room_attachments::MAX_ATTACHMENT_BYTES + room_attachments::BODY_LIMIT_SLACK,
+                )),
+        )
+        .route(
+            "/v1/rooms/persistent/{key}/attachments/{attachment_id}",
+            get(room_attachments::room_download_attachment)
+                .delete(room_attachments::room_delete_attachment),
         )
         .route("/v1/rooms/persistent/{key}/snapshot", get(room_snapshot))
         // Merged SSE: room_message + room_access frames, with durable replay
@@ -14098,6 +14145,7 @@ mod tests {
             permissions: Arc::new(RwLock::new(HashMap::new())),
             longhouse: Arc::new(Mutex::new(ocean_longhouse::LonghouseRegistry::new())),
             rooms,
+            room_attachments_root: Arc::new(tmp.path().join("room-attachments")),
             room_wakes,
             room_access_wakes,
             room_read_cursor_wakes: RoomReadCursorWakeBus::default(),
@@ -15856,6 +15904,9 @@ mod tests {
             permissions: Arc::new(RwLock::new(HashMap::new())),
             longhouse: Arc::new(Mutex::new(ocean_longhouse::LonghouseRegistry::new())),
             rooms,
+            // Injected, not read from the environment — same TASK-58 rule as the
+            // runtime config dir above, so parallel tests never share a root.
+            room_attachments_root: Arc::new(tmp.path().join("room-attachments")),
             room_wakes,
             room_access_wakes,
             room_read_cursor_wakes: RoomReadCursorWakeBus::default(),
@@ -16305,6 +16356,7 @@ mod tests {
             permissions: Arc::new(RwLock::new(HashMap::new())),
             longhouse: Arc::new(Mutex::new(ocean_longhouse::LonghouseRegistry::new())),
             rooms,
+            room_attachments_root: Arc::new(tmp.path().join("room-attachments")),
             room_wakes,
             room_access_wakes,
             room_read_cursor_wakes: RoomReadCursorWakeBus::default(),
@@ -18085,6 +18137,7 @@ mod tests {
             permissions: Arc::new(RwLock::new(HashMap::new())),
             longhouse: Arc::new(Mutex::new(ocean_longhouse::LonghouseRegistry::new())),
             rooms,
+            room_attachments_root: Arc::new(dir.join("room-attachments")),
             room_wakes,
             room_access_wakes,
             room_read_cursor_wakes: RoomReadCursorWakeBus::default(),
@@ -25259,9 +25312,11 @@ mod tests {
         // /v1/agents/{name}. The routes were registered without being
         // advertised, so discovery and the operator guide both went stale and
         // this assertion is what caught it.
+        // 104 -> 108: room attachments added POST+GET /attachments and
+        // GET+DELETE /attachments/{attachment_id} — the room's context files.
         assert_eq!(
             banner.len(),
-            104,
+            108,
             "route baseline changed; review the manifest"
         );
 

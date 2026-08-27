@@ -6181,3 +6181,61 @@ per-node binding divergence is acceptable — got answered before code assumed
 answers. Under concurrent review they get answered by whoever writes the code
 that needs them, which is faster and less deliberate. The mitigation is the
 explicit-statement rule above.
+
+time:      [23:31] [26-08-26]
+agent:     [claude], [opus 5]
+worktree:  feat/attachments
+type:      [feature-request]: Context files attached to a room
+area:      [backend]: Room attachments — store index + daemon blob authority
+
+Rooms could produce artifacts and hold a transcript, but there was nowhere to put
+the thing a conversation is actually about: the spec, the screenshot, the PDF.
+Added room attachments end to end. `ocean-store` gains a `room_attachments` table
+plus `add_attachment` / `attachments` / `attachment` / `remove_attachment`, each
+writing its System transcript marker in the SAME transaction as the row, so a
+file can never exist that the room's history does not explain. The daemon gains
+`crates/ocean-daemon/src/room_attachments.rs`, which owns the bytes: upload,
+list, download, and delete at `/v1/rooms/persistent/{key}/attachments`, with an
+8 MiB cap enforced both by a mandatory `DefaultBodyLimit` layer (axum's own
+default is 2 MiB, so without it the cap would be fiction) and by a typed
+`attachment_too_large` rejection in the handler.
+
+Three decisions are worth the ink. First, the brief asked for compare-and-swap
+discipline and there is no referent for it here — an attachment is immutable, so
+a `version` column would be decoration, and a decorative invariant is worse than
+an absent one because the next reader believes it. What carries over is refusal
+instead of merge: server-minted ids so two uploads never contend for a row, bytes
+fsynced and renamed before the row commits so a row never points at nothing, and
+a delete matching zero rows as a typed 404 rather than a silent success. Second,
+the room KEY is as dangerous a path component as the attachment id — `RoomKey::new`
+performs zero validation and live keys already look like `call:xyz` — so guarding
+only the id and then joining the raw key would have reintroduced traversal one
+level up. The blob directory is `sha256(key)` in hex, always derived, never
+stored. Third, the declared content type is recorded and never acted on:
+downloads are always `application/octet-stream` with `nosniff`, and the transcript
+marker carries only the sanitized filename and a server-computed byte count. The
+daemon answers browser origins, so echoing an uploader-declared `text/html` would
+be stored XSS against ocean-surface, and a client-supplied string with a newline
+in it can forge a transcript line in a naive renderer. The cost is that images
+will not render inline from an `<img src>`; magic-byte sniffing derived from the
+bytes rather than the declaration is the follow-up slice, deliberately not this
+one.
+
+Deliberately NOT wired into agent context assembly. Ocean Rooms v2 §7 is the
+`ContextPolicy` / `ContextMount` model and the root contract forbids implementing
+it from the proposal alone, so "agents can see them" means an agent calls
+`GET /attachments` over HTTP like any other client. Said so in the module's
+ownership paragraph in `crates/ocean-daemon/AGENTS.md` so the next agent does not
+wander in. Also worth stating rather than leaving to be discovered: `uploader_id`
+and `actor_id` are caller-asserted and only roster-checked, exactly like
+`author_id` on the artifact routes. That is the existing deployment posture, not
+a regression this feature introduces, but it is now true of file bytes.
+
+Also repaired a parity break that predates this work: the agent-CRUD merge
+registered `POST /v1/agents` and `PUT`/`DELETE /v1/agents/{name}` without ever
+adding them to `banner_routes()` or the operator guide, so
+`router_contract_source_banner_and_operator_guide_are_in_parity` was already red
+on main. Advertised all three rather than land a feature on a red baseline; the
+route count moves 101 -> 104 for that repair and 104 -> 108 for attachments, and
+the comment above the assertion says which is which.
+_________________________________________________________________________________

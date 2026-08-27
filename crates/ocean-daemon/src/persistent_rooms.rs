@@ -381,6 +381,12 @@ pub(super) fn room_store_error_response(
         // An artifact attributed to someone not in the room is a lie, not a
         // server fault.
         ArtifactAuthorNotInRoster { .. } => StatusCode::FORBIDDEN,
+        // A stale link, or a second delete of something already gone. The
+        // caller is working from an out-of-date view of the room.
+        UnknownAttachment { .. } => StatusCode::NOT_FOUND,
+        // Same rule as an artifact author: a file attributed to somebody who is
+        // not in the room is a lie, not a server fault.
+        AttachmentUploaderNotInRoster { .. } => StatusCode::FORBIDDEN,
         // A durable backend can fail on I/O or (de)serialization, which the
         // in-memory registry never could. Surface those as 500s, not as a
         // misleading 4xx. Federation corruption is a fail-closed integrity
@@ -1466,7 +1472,10 @@ pub(super) struct RegisterAgentsBody {
     agent_names: Vec<String>,
 }
 
-fn invalid_request_response() -> (StatusCode, Json<serde_json::Value>) {
+/// The room family's one shape for "your request was malformed". Shared with
+/// `room_attachments.rs` so a bad key or a missing field looks identical
+/// whichever room route rejected it.
+pub(super) fn invalid_request_response() -> (StatusCode, Json<serde_json::Value>) {
     (
         StatusCode::BAD_REQUEST,
         Json(json!({"ok": false, "error": "invalid_request"})),
