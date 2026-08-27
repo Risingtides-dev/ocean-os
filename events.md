@@ -6372,3 +6372,38 @@ Verification: cargo test -p ocean-store (173 passed), cargo test -p ocean-daemon
 cargo xtask docs-check, formatting, diff hygiene, and the full cargo xtask ci
 repository gate all passed.
 _________________________________________________________________________________
+
+time:  [01:56] [08-27-26]
+agent: [codex] [gpt-5]
+worktree: [feat/rooms-phase1-agent-binding]
+type:  [bug report]
+area:  [backend]
+
+Closed the fresh exact-head replay finding in the accepted Rooms Phase 1
+authority foundation. Suspend, resume, digest-stale, revoke, and no-op status
+requests now consume the same immutable room-wide decision ledger as agent
+authorization. Exact retries return the current binding without mutation;
+decision reuse for different authority content fails closed; status changes,
+decision persistence, generation handling, and the returned projection commit
+atomically under one IMMEDIATE transaction. First-time no-op decisions are
+recorded without falsely bumping the authority generation.
+
+Verification: cargo test -p ocean-store (176 passed), including focused status
+replay, cross-operation reuse, and no-op decision coverage. Strict Clippy,
+workspace, docs, formatting, diff, and full repository gates follow before
+landing.
+_________________________________________________________________________________
+
+time:  [01:59] [08-27-26]
+agent: [codex] [gpt-5]
+worktree: [feat/rooms-phase1-agent-binding]
+type:  [handoff]
+area:  [testing]
+
+The exact room-agent replay repair passed the complete local repository gate:
+documentation/index integrity, workspace build and tests, all-target Clippy
+with denied warnings, formatting, and dependency policy. Ocean-store passed
+176 tests and ocean-daemon passed 739 tests within that gate. The branch is
+ready for a fresh exact-head independent review; it remains an inert foundation
+with no routes, admission behavior, daemon restart, or production mutation.
+_________________________________________________________________________________
