@@ -366,6 +366,14 @@ pub struct AgentRuntime {
     /// loggers); those live entirely in operator config. Empty config → zero
     /// cost, zero behavior change.
     hooks: ocean_hooks::HooksConfig,
+    /// Providers observed rejecting our credential — see
+    /// [`ocean_providers::ProviderQuarantine`] for what it buys and why it is an
+    /// owned value rather than a `static`.
+    ///
+    /// It lives on the runtime because this is the only layer that ever sees a
+    /// provider's HTTP response: the runtime records the evidence, and the
+    /// provider crate reads it back during candidate resolution.
+    provider_quarantine: Arc<ocean_providers::ProviderQuarantine>,
     /// Test-only override for the per-turn environment snapshot used by provider
     /// failover (OCEAN-275). Production always reads the real process env via
     /// [`AgentRuntime::turn_env`]; tests inject a deterministic [`ProviderEnv`]
@@ -378,6 +386,13 @@ pub struct AgentRuntime {
     /// always dispatches through `ocean_protocol::stream_simple`.
     #[cfg(test)]
     test_compact_provider: Option<TestCompactProvider>,
+    /// Test-only scripted HTTP failure per provider ([`ProviderId::as_str`] →
+    /// status), mirroring the `test_env` idiom: production always calls the real
+    /// provider. Lets a test drive [`AgentRuntime::run_turn_with_failover`]'s
+    /// real primary → alternate wiring — the quarantine writes included — off
+    /// the error shape a refused credential actually produces, with no network.
+    #[cfg(test)]
+    test_dispatch_status: HashMap<&'static str, u16>,
 }
 
 /// Debug-opaque wrapper so the `dyn Provider` test seam doesn't break
@@ -431,10 +446,13 @@ impl AgentRuntime {
             capabilities: Arc::new(CapabilityRegistry::builtin_only()),
             session_locks: Arc::new(std::sync::Mutex::new(HashMap::new())),
             hooks,
+            provider_quarantine: Arc::new(ocean_providers::ProviderQuarantine::default()),
             #[cfg(test)]
             test_env: None,
             #[cfg(test)]
             test_compact_provider: None,
+            #[cfg(test)]
+            test_dispatch_status: HashMap::new(),
         };
         runtime.migrate_legacy_sessions();
         // Bound on-disk session growth: prune session files past the TTL once
@@ -580,19 +598,28 @@ impl AgentRuntime {
     /// see at a glance whether failover has anywhere to go — an empty list while
     /// the primary is degraded is the "all providers degraded" condition. Carries
     /// no credentials, only provider/model identifiers.
+    ///
+    /// A provider currently quarantined for rejecting our credential is absent
+    /// here for the same reason a turn would not route to it: it would 401. The
+    /// operator seeing an unexpectedly short list is seeing the truth.
     pub fn fallback_providers(&self) -> Vec<String> {
         let primary = self.snapshot().provider_config.selection.provider;
         let env = self.turn_env();
-        ocean_providers::fallback_candidates(&env, &primary)
-            .into_iter()
-            .map(|cfg| {
-                format!(
-                    "{}/{}",
-                    cfg.selection.provider.as_str(),
-                    cfg.selection.model
-                )
-            })
-            .collect()
+        ocean_providers::fallback_candidates(
+            &env,
+            &primary,
+            &self.provider_quarantine,
+            Instant::now(),
+        )
+        .into_iter()
+        .map(|cfg| {
+            format!(
+                "{}/{}",
+                cfg.selection.provider.as_str(),
+                cfg.selection.model
+            )
+        })
+        .collect()
     }
 
     /// Currently-bound model and provider id, for `/model` read paths.
@@ -836,7 +863,12 @@ impl AgentRuntime {
         // rather than the bare single-provider preflight message. A ready primary
         // passes straight through untouched.
         let requested_model = turn_snapshot.provider_config.selection.model.clone();
-        let effective = match Self::resolve_turn_state_with_failover(turn_snapshot, &env) {
+        let effective = match Self::resolve_turn_state_with_failover(
+            turn_snapshot,
+            &env,
+            &self.provider_quarantine,
+            Instant::now(),
+        ) {
             Ok(state) => state,
             Err(stderr) => {
                 return PromptResponse {
@@ -931,10 +963,14 @@ impl AgentRuntime {
     /// `env` is the process-environment snapshot resolved once per turn; the
     /// fallback candidates are drawn from it so credentials line up with the
     /// primary's. Taking it as a parameter (rather than reading the process env
-    /// here) keeps the policy deterministic and unit-testable.
+    /// here) keeps the policy deterministic and unit-testable. `quarantine` and
+    /// `now` ride along for the same reason: which providers have recently
+    /// rejected us is state the caller owns, never a process-global one.
     fn resolve_turn_state_with_failover(
         requested: RuntimeState,
         env: &ProviderEnv,
+        quarantine: &ocean_providers::ProviderQuarantine,
+        now: Instant,
     ) -> Result<RuntimeState, String> {
         // Ready primary → use it as-is. This is the overwhelmingly common path
         // and adds only a readiness check (no env re-resolution).
@@ -946,7 +982,7 @@ impl AgentRuntime {
         // environment the primary used (so credentials line up).
         let primary = requested.provider_config.selection.provider.clone();
         let primary_model = requested.provider_config.selection.model.clone();
-        let alternate = ocean_providers::resolve_fallback_config(env, &primary);
+        let alternate = ocean_providers::resolve_fallback_config(env, &primary, quarantine, now);
 
         match alternate.and_then(|cfg| state_from_provider_config(cfg).ok()) {
             Some(alt_state) => {
@@ -1031,27 +1067,43 @@ impl AgentRuntime {
             }
         };
 
-        let failed_provider = state.provider_config.selection.provider.clone();
+        let attempted_provider = state.provider_config.selection.provider.clone();
         let (turn, effective_state) = match self
             .dispatch_turn(req.clone(), control.clone(), &state, false)
             .await
         {
-            Ok(ok) => (ok, state),
+            Ok(ok) => {
+                // This provider just served a turn, so any credential complaint
+                // we remembered about it is stale. Re-proving is free.
+                self.provider_quarantine.clear(&attempted_provider);
+                (ok, state)
+            }
             Err(e) => {
+                // Record an auth rejection BEFORE the eligibility gate: a 401 is
+                // deliberately not an availability error, so this turn is over
+                // either way — but the next turn must not pick this provider as
+                // its "ready" alternate on the strength of a key we just watched
+                // get refused.
+                self.note_auth_rejection(&e, &attempted_provider);
                 if !failover_eligible(&e) {
                     // Mid-stream, user-error, or non-availability — final. Unwrap
                     // any TurnFailure wrapper so the caller sees the bare error.
                     return Err(unwrap_turn_failure(e));
                 }
                 // Pre-stream availability failure: try ONE ready alternate.
-                let alternate = ocean_providers::resolve_fallback_config(env, &failed_provider)
-                    .and_then(|cfg| state_from_provider_config(cfg).ok());
+                let alternate = ocean_providers::resolve_fallback_config(
+                    env,
+                    &attempted_provider,
+                    &self.provider_quarantine,
+                    Instant::now(),
+                )
+                .and_then(|cfg| state_from_provider_config(cfg).ok());
                 let Some(alt_state) = alternate else {
                     // No alternate to try — return the original failure as-is.
                     return Err(unwrap_turn_failure(e));
                 };
                 tracing::warn!(
-                    primary_provider = failed_provider.as_str(),
+                    primary_provider = attempted_provider.as_str(),
                     fallback_provider =
                         alt_state.provider_config.selection.provider.as_str(),
                     fallback_model = %alt_state.provider_config.selection.model,
@@ -1078,10 +1130,24 @@ impl AgentRuntime {
                 // final (success or failure) — no further fan-out.
                 // The primary already persisted the accepted user row. Reuse
                 // it rather than appending the same prompt a second time.
-                let ok = self
+                let alt_provider = alt_state.provider_config.selection.provider.clone();
+                let ok = match self
                     .dispatch_turn(req.clone(), control.clone(), &alt_state, true)
                     .await
-                    .map_err(unwrap_turn_failure)?;
+                {
+                    Ok(ok) => {
+                        self.provider_quarantine.clear(&alt_provider);
+                        ok
+                    }
+                    Err(alt_err) => {
+                        // This is the sequence the quarantine exists for: the
+                        // alternate was picked on a present credential and then
+                        // refused it. The turn is lost, but the next one will not
+                        // be routed here.
+                        self.note_auth_rejection(&alt_err, &alt_provider);
+                        return Err(unwrap_turn_failure(alt_err));
+                    }
+                };
                 (ok, alt_state)
             }
         };
@@ -1097,6 +1163,27 @@ impl AgentRuntime {
         Ok(self
             .run_stop_hook_continuations(turn, &req, &control, &effective_state)
             .await)
+    }
+
+    /// Quarantine `provider` when `err` is the provider refusing our credential.
+    ///
+    /// Anything else — a 429, a 5xx, a timeout, a bad request — leaves the
+    /// quarantine untouched: those say nothing about whether the key is valid,
+    /// and suppressing a provider over a transient blip would remove the very
+    /// alternate failover needs.
+    fn note_auth_rejection(&self, err: &anyhow::Error, provider: &ProviderId) {
+        let Some(status) = auth_rejection_status(err) else {
+            return;
+        };
+        tracing::warn!(
+            provider = provider.as_str(),
+            status,
+            ttl_secs = ocean_providers::ProviderQuarantine::DEFAULT_TTL.as_secs(),
+            "provider rejected our credential; suppressing it as a failover target \
+             until the credential is re-proven"
+        );
+        self.provider_quarantine
+            .note_auth_rejected(provider, Instant::now());
     }
 
     /// Fire `Stop` hooks for a just-completed turn and run bounded continuation
@@ -2107,6 +2194,27 @@ impl AgentRuntime {
             session::save(&self.config_dir, &session)?;
         }
 
+        // Scripted provider failure, placed exactly where a real pre-stream one
+        // lands: the accepted-user row is already durable and nothing has
+        // streamed, so a fallback attempt's `reuse_accepted_user` invariant holds
+        // here the same way it does against a live provider.
+        #[cfg(test)]
+        if let Some(&status) = self
+            .test_dispatch_status
+            .get(snapshot.provider_config.selection.provider.as_str())
+        {
+            return Err(TurnFailure {
+                streamed_output: false,
+                error: anyhow::Error::new(AgentError::Provider(
+                    ocean_protocol::Error::ProviderError {
+                        status,
+                        body: "scripted provider failure".into(),
+                    },
+                )),
+            }
+            .into());
+        }
+
         let PromptControl {
             permission,
             cancel,
@@ -2477,6 +2585,46 @@ fn failover_eligible(err: &anyhow::Error) -> bool {
         // the deadline is an availability problem worth trying an alternate for.
         Some(AgentError::Timeout { .. }) => true,
         _ => false,
+    }
+}
+
+/// The HTTP status when `err` is a provider refusing our credential (401/403),
+/// otherwise `None`.
+///
+/// A 429 or a 5xx says the provider is busy or broken and a 400 says our request
+/// was wrong; none of them say anything about the credential, so none of them
+/// justify suppressing a provider. 401 is unambiguous. 403 is not always a dead
+/// key — it can be an entitlement the account lacks (a model, a region, a
+/// tier) — but either way this credential cannot serve a turn on this provider,
+/// which is the only question a failover target has to answer. The TTL bounds
+/// the cost of treating the two alike.
+///
+/// Walks the same chain [`failover_eligible`] does — `anyhow(TurnFailure)` →
+/// `anyhow(inner)` → [`AgentError::Provider`] → [`ocean_protocol::Error`] —
+/// accepting a bare (unwrapped) error too, since the alternate's failure reaches
+/// this in both shapes. `RetryExhausted` is unwrapped to its cause: a turn that
+/// spent its whole retry budget being told the key is bad is still a key that is
+/// bad.
+fn auth_rejection_status(err: &anyhow::Error) -> Option<u16> {
+    fn from_protocol(err: &ocean_protocol::Error) -> Option<u16> {
+        match err {
+            ocean_protocol::Error::ProviderError { status, .. }
+                if *status == 401 || *status == 403 =>
+            {
+                Some(*status)
+            }
+            ocean_protocol::Error::RetryExhausted { source, .. } => from_protocol(source),
+            _ => None,
+        }
+    }
+
+    let inner = match err.downcast_ref::<TurnFailure>() {
+        Some(turn) => &turn.error,
+        None => err,
+    };
+    match inner.downcast_ref::<AgentError>() {
+        Some(AgentError::Provider(perr)) => from_protocol(perr),
+        _ => None,
     }
 }
 
@@ -4999,8 +5147,10 @@ done
             capabilities: Arc::new(CapabilityRegistry::builtin_only()),
             session_locks: Arc::new(std::sync::Mutex::new(HashMap::new())),
             hooks: ocean_hooks::HooksConfig::default(),
+            provider_quarantine: Arc::new(ocean_providers::ProviderQuarantine::default()),
             test_env,
             test_compact_provider: None,
+            test_dispatch_status: HashMap::new(),
         }
     }
 
@@ -6045,6 +6195,20 @@ done
         }
     }
 
+    /// Selection-time failover on a fresh runtime: no provider has rejected us
+    /// yet. The quarantine's own effect on selection has dedicated tests below.
+    fn select_with_failover(
+        state: RuntimeState,
+        env: &ProviderEnv,
+    ) -> Result<RuntimeState, String> {
+        AgentRuntime::resolve_turn_state_with_failover(
+            state,
+            env,
+            &ocean_providers::ProviderQuarantine::default(),
+            Instant::now(),
+        )
+    }
+
     // A READY primary passes straight through selection-time failover untouched —
     // failover must never perturb the happy path.
     #[test]
@@ -6056,8 +6220,7 @@ done
         ))
         .unwrap();
         let env = provider_env(&[("ANTHROPIC_API_KEY", "sk-ant")]);
-        let out = AgentRuntime::resolve_turn_state_with_failover(ready.clone(), &env)
-            .expect("ready primary must resolve");
+        let out = select_with_failover(ready.clone(), &env).expect("ready primary must resolve");
         assert_eq!(
             out.provider_config.selection.provider,
             ProviderId::DeepSeek,
@@ -6081,8 +6244,7 @@ done
         ))
         .unwrap();
         let env = provider_env(&[("CLAUDE_CODE_ACCESS_TOKEN", "cc-bearer")]);
-        let out = AgentRuntime::resolve_turn_state_with_failover(degraded, &env)
-            .expect("a ready alternate must be selected");
+        let out = select_with_failover(degraded, &env).expect("a ready alternate must be selected");
         assert_eq!(
             out.provider_config.selection.provider,
             ProviderId::ClaudeCode,
@@ -6107,7 +6269,7 @@ done
         .unwrap();
         // No credentials for any alternate.
         let env = provider_env(&[]);
-        let err = AgentRuntime::resolve_turn_state_with_failover(degraded, &env)
+        let err = select_with_failover(degraded, &env)
             .expect_err("no ready provider anywhere must be an error");
         assert!(
             err.contains("all providers degraded"),
@@ -6136,8 +6298,433 @@ done
             ("ANTHROPIC_API_KEY", "sk-ant"),
             ("OCEAN_DEEPSEEK_API_KEY", "ds-secret"),
         ]);
-        let out = AgentRuntime::resolve_turn_state_with_failover(degraded, &env).unwrap();
+        let out = select_with_failover(degraded, &env).unwrap();
         assert_eq!(out.provider_config.selection.provider, ProviderId::DeepSeek);
+    }
+
+    // ---- Auth-rejection quarantine ---------------------------------------
+
+    fn turn_failure(status: u16) -> anyhow::Error {
+        TurnFailure {
+            streamed_output: false,
+            error: anyhow::Error::new(AgentError::Provider(ocean_protocol::Error::ProviderError {
+                status,
+                body: "nope".into(),
+            })),
+        }
+        .into()
+    }
+
+    // Only a refused credential counts, and it counts through every wrapper the
+    // failure actually arrives in.
+    #[test]
+    fn auth_rejection_status_recognizes_a_refused_credential() {
+        assert_eq!(auth_rejection_status(&turn_failure(401)), Some(401));
+        assert_eq!(auth_rejection_status(&turn_failure(403)), Some(403));
+
+        // Bare (already unwrapped) — the alternate's failure reaches the recorder
+        // in this shape too.
+        let bare: anyhow::Error =
+            anyhow::Error::new(AgentError::Provider(ocean_protocol::Error::ProviderError {
+                status: 401,
+                body: "invalid api key".into(),
+            }));
+        assert_eq!(auth_rejection_status(&bare), Some(401));
+
+        // Through RetryExhausted: spending the whole retry budget being told the
+        // key is bad still means the key is bad.
+        let exhausted: anyhow::Error = TurnFailure {
+            streamed_output: false,
+            error: anyhow::Error::new(AgentError::Provider(
+                ocean_protocol::Error::RetryExhausted {
+                    attempts: 3,
+                    source: Box::new(ocean_protocol::Error::ProviderError {
+                        status: 401,
+                        body: "invalid api key".into(),
+                    }),
+                },
+            )),
+        }
+        .into();
+        assert_eq!(auth_rejection_status(&exhausted), Some(401));
+    }
+
+    // Everything else leaves the quarantine alone. A 429 or a 5xx says nothing
+    // about the key, and suppressing a provider over a blip would delete the very
+    // alternate failover depends on.
+    #[test]
+    fn auth_rejection_status_ignores_availability_and_user_errors() {
+        for status in [400, 404, 422, 429, 500, 503] {
+            assert_eq!(
+                auth_rejection_status(&turn_failure(status)),
+                None,
+                "status {status} must not quarantine the provider"
+            );
+        }
+        let timeout: anyhow::Error = TurnFailure {
+            streamed_output: false,
+            error: anyhow::Error::new(AgentError::Timeout { secs: 300 }),
+        }
+        .into();
+        assert_eq!(auth_rejection_status(&timeout), None);
+        assert_eq!(
+            auth_rejection_status(&anyhow::anyhow!("session gone")),
+            None
+        );
+    }
+
+    // The slice, at the selection seam: a provider whose credential is PRESENT —
+    // so `readiness()` says yes — is skipped once it has refused that credential,
+    // and the turn routes to the next un-refused provider instead.
+    #[test]
+    fn selection_failover_skips_a_provider_that_refused_our_credential() {
+        let degraded = state_from_provider_config(provider_config(
+            ProviderId::Google,
+            "gemini-2.0-flash",
+            false,
+        ))
+        .unwrap();
+        // Both alternates are credentialed; the default order leads with
+        // claude-code, so it wins unless something suppresses it.
+        let env = provider_env(&[
+            ("CLAUDE_CODE_ACCESS_TOKEN", "cc-bearer"),
+            ("OCEAN_DEEPSEEK_API_KEY", "ds-secret"),
+        ]);
+        let quarantine = ocean_providers::ProviderQuarantine::default();
+        let now = Instant::now();
+
+        assert_eq!(
+            AgentRuntime::resolve_turn_state_with_failover(
+                degraded.clone(),
+                &env,
+                &quarantine,
+                now
+            )
+            .unwrap()
+            .provider_config
+            .selection
+            .provider,
+            ProviderId::ClaudeCode,
+        );
+
+        quarantine.note_auth_rejected(&ProviderId::ClaudeCode, now);
+
+        let out = AgentRuntime::resolve_turn_state_with_failover(degraded, &env, &quarantine, now)
+            .expect("the next un-refused ready provider must serve the turn");
+        assert_eq!(
+            out.provider_config.selection.provider,
+            ProviderId::DeepSeek,
+            "failover must step past the provider that refused our credential"
+        );
+    }
+
+    // When the quarantine empties the candidate list, the operator gets the
+    // existing honest signal — not a turn routed into a key we know is refused.
+    #[test]
+    fn quarantining_the_only_alternate_keeps_the_all_degraded_message() {
+        let degraded = state_from_provider_config(provider_config(
+            ProviderId::DeepSeek,
+            "deepseek-v4-pro",
+            false,
+        ))
+        .unwrap();
+        let env = provider_env(&[("CLAUDE_CODE_ACCESS_TOKEN", "cc-bearer")]);
+        let quarantine = ocean_providers::ProviderQuarantine::default();
+        let now = Instant::now();
+        quarantine.note_auth_rejected(&ProviderId::ClaudeCode, now);
+
+        let err = AgentRuntime::resolve_turn_state_with_failover(degraded, &env, &quarantine, now)
+            .expect_err("the only alternate is suppressed, so nothing is ready");
+        assert!(err.contains("all providers degraded"), "got: {err}");
+        assert!(err.contains(ocean_providers::ENV_PROVIDER_FALLBACK));
+    }
+
+    // The write side, through the runtime's own surface: observing a 401 removes
+    // the provider from the failover targets a turn would actually use; observing
+    // a 429 does not.
+    #[test]
+    fn observed_credential_refusal_removes_the_provider_from_failover_targets() {
+        let runtime = runtime_with_env(
+            temp_config_dir("quarantine-write"),
+            provider_config(ProviderId::Google, "gemini-2.0-flash", false),
+            Some(provider_env(&[("CLAUDE_CODE_ACCESS_TOKEN", "cc-bearer")])),
+        );
+        let claude_targets = || {
+            runtime
+                .fallback_providers()
+                .into_iter()
+                .filter(|t| t.starts_with("claude-code/"))
+                .count()
+        };
+        assert_eq!(claude_targets(), 1, "credentialed claude-code starts ready");
+
+        // A rate limit says nothing about the credential.
+        runtime.note_auth_rejection(&turn_failure(429), &ProviderId::ClaudeCode);
+        assert_eq!(claude_targets(), 1, "a 429 must not suppress a provider");
+
+        runtime.note_auth_rejection(&turn_failure(401), &ProviderId::ClaudeCode);
+        assert_eq!(
+            claude_targets(),
+            0,
+            "a refused credential must drop the provider from the failover targets"
+        );
+
+        // Re-proven for free by a later success.
+        runtime.provider_quarantine.clear(&ProviderId::ClaudeCode);
+        assert_eq!(claude_targets(), 1);
+    }
+
+    /// A runtime whose provider calls are scripted to fail with a given HTTP
+    /// status, so a test drives the real `run_turn_with_failover` wiring —
+    /// primary attempt, eligibility gate, alternate resolution, and the
+    /// quarantine writes — without a network.
+    fn runtime_with_scripted_dispatch(
+        config_dir: PathBuf,
+        primary: ProviderConfig,
+        env: ProviderEnv,
+        statuses: &[(ProviderId, u16)],
+    ) -> AgentRuntime {
+        let mut rt = runtime_with_env(config_dir, primary, Some(env));
+        for (provider, status) in statuses {
+            rt.test_dispatch_status.insert(provider.as_str(), *status);
+        }
+        rt
+    }
+
+    fn hello_prompt() -> PromptRequest {
+        PromptRequest {
+            prompt: "hello".into(),
+            images: None,
+            request_id: None,
+            session_id: None,
+            create_if_missing: true,
+            max_turns: None,
+            yolo: false,
+            cwd: ".".into(),
+            project_id: None,
+            client_type: None,
+            decision_token: None,
+        }
+    }
+
+    // The write side, driven the way production drives it: a real dispatch comes
+    // back 401 and the runtime records it. Nothing is seeded by hand here, so
+    // dropping the recorder call from `run_turn_with_failover` fails this test.
+    #[tokio::test]
+    async fn a_dispatch_the_provider_refuses_quarantines_that_provider() {
+        let config_dir = temp_config_dir("quarantine-write-primary");
+        let runtime = runtime_with_scripted_dispatch(
+            config_dir.clone(),
+            provider_config(ProviderId::Google, "gemini-2.0-flash", true),
+            provider_env(&[("CLAUDE_CODE_ACCESS_TOKEN", "cc-bearer")]),
+            &[(ProviderId::Google, 401)],
+        );
+        assert!(
+            !runtime
+                .provider_quarantine
+                .is_quarantined(&ProviderId::Google, Instant::now()),
+            "nothing has refused us yet"
+        );
+
+        let res = runtime
+            .prompt(hello_prompt(), PromptControl::yolo(false))
+            .await;
+
+        assert!(!res.ok, "a refused credential ends the turn");
+        assert!(res.stderr.contains("status 401"), "got: {}", res.stderr);
+        assert!(
+            runtime
+                .provider_quarantine
+                .is_quarantined(&ProviderId::Google, Instant::now()),
+            "the runtime must remember the provider that refused our credential"
+        );
+        // A 401 is deliberately not an availability error, so the ready
+        // claude-code alternate is never attempted — and must not be suppressed.
+        assert!(
+            runtime
+                .fallback_providers()
+                .iter()
+                .any(|t| t.starts_with("claude-code/")),
+            "only the provider that refused us is suppressed"
+        );
+        let _ = std::fs::remove_dir_all(config_dir);
+    }
+
+    // The sequence the slice is named for, end to end: a blipping primary picks
+    // a "ready" alternate, the alternate refuses our credential, and that
+    // alternate is gone from the failover targets the next turn would draw from.
+    #[tokio::test]
+    async fn an_alternate_that_refuses_our_credential_leaves_the_failover_targets() {
+        let config_dir = temp_config_dir("quarantine-write-alternate");
+        let runtime = runtime_with_scripted_dispatch(
+            config_dir.clone(),
+            provider_config(ProviderId::Google, "gemini-2.0-flash", true),
+            provider_env(&[("CLAUDE_CODE_ACCESS_TOKEN", "cc-bearer")]),
+            // 503 is an availability error, so the primary's failure fails over;
+            // the alternate it lands on then refuses the credential readiness
+            // said was fine.
+            &[(ProviderId::Google, 503), (ProviderId::ClaudeCode, 401)],
+        );
+        let claude_targets = || {
+            runtime
+                .fallback_providers()
+                .into_iter()
+                .filter(|t| t.starts_with("claude-code/"))
+                .count()
+        };
+        assert_eq!(claude_targets(), 1, "credentialed claude-code starts ready");
+
+        let res = runtime
+            .prompt(hello_prompt(), PromptControl::yolo(false))
+            .await;
+
+        assert!(!res.ok, "the alternate refused us, so the turn is lost");
+        assert!(
+            res.stderr.contains("status 401"),
+            "the alternate's failure is what surfaces, got: {}",
+            res.stderr
+        );
+        assert_eq!(
+            claude_targets(),
+            0,
+            "a provider we watched refuse our credential must not stay a failover target"
+        );
+        // The primary only blipped; a 503 says nothing about its credential.
+        assert!(
+            !runtime
+                .provider_quarantine
+                .is_quarantined(&ProviderId::Google, Instant::now()),
+            "an availability failure must not suppress a provider"
+        );
+        let _ = std::fs::remove_dir_all(config_dir);
+    }
+
+    // Re-proving, the cheap way: a provider that just served a turn is not
+    // suspect any more, whatever we remembered about it.
+    #[tokio::test]
+    async fn a_provider_that_serves_a_turn_is_no_longer_quarantined() {
+        let config_dir = temp_config_dir("quarantine-cleared-by-success");
+        let runtime = runtime_with_env(
+            config_dir.clone(),
+            provider_config(ProviderId::Fake, "fake-ok", false),
+            Some(provider_env(&[])),
+        );
+        runtime
+            .provider_quarantine
+            .note_auth_rejected(&ProviderId::Fake, Instant::now());
+
+        let res = runtime
+            .prompt(hello_prompt(), PromptControl::yolo(false))
+            .await;
+
+        assert!(res.ok, "the fake provider serves the turn: {}", res.stderr);
+        assert!(
+            !runtime
+                .provider_quarantine
+                .is_quarantined(&ProviderId::Fake, Instant::now()),
+            "a served turn re-proves the credential"
+        );
+        let _ = std::fs::remove_dir_all(config_dir);
+    }
+
+    // The same re-proving on the *alternate*, which is only reachable for an
+    // entry whose TTL has already lapsed — a still-quarantined provider is never
+    // picked as the alternate in the first place. So the entry has to be aged
+    // past the TTL, and read back at its own timestamp, to tell "removed" apart
+    // from "expired".
+    #[tokio::test]
+    async fn an_alternate_that_serves_a_turn_drops_its_lapsed_rejection() {
+        let config_dir = temp_config_dir("quarantine-cleared-by-alternate");
+        let mut runtime = runtime_with_scripted_dispatch(
+            config_dir.clone(),
+            provider_config(ProviderId::Google, "gemini-2.0-flash", true),
+            provider_env(&[("OCEAN_PROVIDER_FALLBACK", "fake-ok")]),
+            &[(ProviderId::Google, 503)],
+        );
+        runtime.provider_quarantine = Arc::new(ocean_providers::ProviderQuarantine::new(
+            std::time::Duration::from_millis(1),
+        ));
+        let rejected_at = Instant::now()
+            .checked_sub(std::time::Duration::from_millis(50))
+            .expect("the test process has been running for at least 50ms");
+        runtime
+            .provider_quarantine
+            .note_auth_rejected(&ProviderId::Fake, rejected_at);
+        assert!(
+            runtime
+                .provider_quarantine
+                .is_quarantined(&ProviderId::Fake, rejected_at),
+            "the entry is present at the instant it was recorded"
+        );
+        assert!(
+            !runtime
+                .provider_quarantine
+                .is_quarantined(&ProviderId::Fake, Instant::now()),
+            "and lapsed by now, so the alternate is eligible again"
+        );
+
+        let res = runtime
+            .prompt(hello_prompt(), PromptControl::yolo(false))
+            .await;
+
+        assert!(
+            res.ok,
+            "the blipping primary fails over to the fake alternate: {}",
+            res.stderr
+        );
+        assert!(res.stdout.contains("OCEAN_FAKE_OK"));
+        assert!(
+            !runtime
+                .provider_quarantine
+                .is_quarantined(&ProviderId::Fake, rejected_at),
+            "serving the turn drops the stale entry rather than leaving it to rot"
+        );
+        let _ = std::fs::remove_dir_all(config_dir);
+    }
+
+    // End to end through `prompt`: a degraded primary whose only alternate has
+    // refused our credential fails the turn with the honest all-degraded message
+    // rather than routing into a guaranteed 401. No network — the turn never
+    // reaches a provider.
+    #[tokio::test]
+    async fn prompt_will_not_route_to_a_provider_that_refused_our_credential() {
+        let runtime = runtime_with_env(
+            temp_config_dir("quarantine-prompt"),
+            provider_config(ProviderId::DeepSeek, "deepseek-v4-pro", false),
+            Some(provider_env(&[
+                ("OCEAN_PROVIDER_FALLBACK", "claude-opus-4-7"),
+                ("CLAUDE_CODE_ACCESS_TOKEN", "cc-bearer"),
+            ])),
+        );
+        runtime
+            .provider_quarantine
+            .note_auth_rejected(&ProviderId::ClaudeCode, Instant::now());
+
+        let res = runtime
+            .prompt(
+                PromptRequest {
+                    prompt: "hello".into(),
+                    images: None,
+                    request_id: None,
+                    session_id: None,
+                    create_if_missing: true,
+                    max_turns: None,
+                    yolo: false,
+                    cwd: ".".into(),
+                    project_id: None,
+                    client_type: None,
+                    decision_token: None,
+                },
+                PromptControl::yolo(false),
+            )
+            .await;
+
+        assert!(!res.ok, "the turn must not be routed to a refused provider");
+        assert!(
+            res.stderr.contains("all providers degraded"),
+            "got: {}",
+            res.stderr
+        );
     }
 
     // `failover_eligible`: a pre-stream availability failure (nothing streamed +

@@ -435,6 +435,86 @@ pub fn resolve_provider_config(env: &ProviderEnv) -> Result<ProviderConfig, Prov
 // turn lifecycle and the mid-stream-safety boundary); it only answers "given the
 // environment, what ready providers could serve this request, in what order?".
 
+/// Memory of providers that answered a turn with an auth rejection (401/403).
+///
+/// Readiness only proves a credential is *present*, never that it *works*. A key
+/// that is present and dead therefore passes [`ProviderConfig::readiness`] and
+/// becomes the chosen alternate — and because an auth rejection is not an
+/// availability error, the agent layer will not fail over a second time, so the
+/// turn dies on a provider we already knew was rejecting us.
+///
+/// This closes that hole with the cheapest possible evidence: a *memory of an
+/// observed rejection*, recorded by the caller that actually saw the HTTP
+/// response. It is not a probe — nothing here ever touches the network, so the
+/// hot path pays a map lookup and nothing else.
+///
+/// A provider is re-proven for free: the TTL lapses, or a later turn on that
+/// provider succeeds and [`clear`](Self::clear)s the entry.
+///
+/// The quarantine is an explicit **value the caller owns and passes in**, not a
+/// process-global registry. Two parallel tests naming the same [`ProviderId`]
+/// would cross-contaminate through a `static`, and this repo's tests must not
+/// mutate process-global state. `now` is a parameter for the same reason: the
+/// TTL boundary is then exercisable without sleeping or a wall clock.
+#[derive(Debug)]
+pub struct ProviderQuarantine {
+    /// Keyed by [`ProviderId::as_str`] (the enum is not `Ord`/`Hash`, and this
+    /// map is bounded by the number of provider variants, so it cannot grow).
+    rejected_at: std::sync::Mutex<BTreeMap<&'static str, std::time::Instant>>,
+    ttl: std::time::Duration,
+}
+
+impl ProviderQuarantine {
+    /// How long an observed auth rejection suppresses a provider.
+    ///
+    /// Long enough that a dead key does not get re-picked turn after turn,
+    /// short enough that rotating a key in and restarting nothing brings the
+    /// provider back on its own.
+    pub const DEFAULT_TTL: std::time::Duration = std::time::Duration::from_secs(300);
+
+    pub fn new(ttl: std::time::Duration) -> Self {
+        Self {
+            rejected_at: std::sync::Mutex::new(BTreeMap::new()),
+            ttl,
+        }
+    }
+
+    /// Record that `provider` rejected our credential at `now`.
+    pub fn note_auth_rejected(&self, provider: &ProviderId, now: std::time::Instant) {
+        self.lock().insert(provider.as_str(), now);
+    }
+
+    /// Forget any rejection for `provider` — it just served a call, so whatever
+    /// was wrong with the credential is not wrong now.
+    pub fn clear(&self, provider: &ProviderId) {
+        self.lock().remove(provider.as_str());
+    }
+
+    /// Whether `provider` rejected us within the TTL as of `now`.
+    ///
+    /// The boundary is exclusive: exactly `ttl` after the rejection the provider
+    /// is eligible again.
+    pub fn is_quarantined(&self, provider: &ProviderId, now: std::time::Instant) -> bool {
+        self.lock()
+            .get(provider.as_str())
+            .is_some_and(|at| now.duration_since(*at) < self.ttl)
+    }
+
+    /// A poisoned lock carries no secret and no invariant worth failing a turn
+    /// over — the worst case is a stale entry, so recover rather than panic.
+    fn lock(&self) -> std::sync::MutexGuard<'_, BTreeMap<&'static str, std::time::Instant>> {
+        self.rejected_at
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+}
+
+impl Default for ProviderQuarantine {
+    fn default() -> Self {
+        Self::new(Self::DEFAULT_TTL)
+    }
+}
+
 /// Env var holding the ordered fallback list (OCEAN-275), comma-separated model
 /// aliases — e.g. `claude-sonnet-4-6,gpt-5.4,deepseek-v4-pro`. Each alias is
 /// resolved through the same [`resolve_provider_config`] path as a primary
@@ -496,7 +576,10 @@ fn fallback_order(env: &ProviderEnv) -> Vec<String> {
 /// - deduped by [`ProviderId`] (first ready alias per provider wins), since two
 ///   aliases on the same degraded provider are not independent failover targets;
 /// - excludes `exclude_provider` (the primary), so we never "fail over" to the
-///   same provider that just failed.
+///   same provider that just failed;
+/// - excludes any provider `quarantine` saw reject our credential within its TTL
+///   as of `now`. Readiness proves presence, not validity, and a present-but-dead
+///   key is the one alternate guaranteed to fail — see [`ProviderQuarantine`].
 ///
 /// An alias that doesn't resolve (unknown model, missing base url) is skipped — a
 /// bad fallback entry must not break the turn (the agent layer logs the overall
@@ -505,6 +588,8 @@ fn fallback_order(env: &ProviderEnv) -> Vec<String> {
 pub fn fallback_candidates(
     env: &ProviderEnv,
     exclude_provider: &ProviderId,
+    quarantine: &ProviderQuarantine,
+    now: std::time::Instant,
 ) -> Vec<ProviderConfig> {
     let mut out: Vec<ProviderConfig> = Vec::new();
     for alias in fallback_order(env) {
@@ -532,6 +617,13 @@ pub fn fallback_candidates(
             // expected case for providers the operator hasn't configured.
             continue;
         }
+        if quarantine.is_quarantined(&provider, now) {
+            // Ready on paper — its credential is present — but we watched it
+            // reject that credential inside the TTL. Routing a turn here is
+            // routing it into a 401, which the agent layer will not fail over
+            // again, so the turn would simply die.
+            continue;
+        }
         if out.iter().any(|c| c.selection.provider == provider) {
             continue;
         }
@@ -550,8 +642,10 @@ pub fn fallback_candidates(
 pub fn resolve_fallback_config(
     env: &ProviderEnv,
     exclude_provider: &ProviderId,
+    quarantine: &ProviderQuarantine,
+    now: std::time::Instant,
 ) -> Option<ProviderConfig> {
-    fallback_candidates(env, exclude_provider)
+    fallback_candidates(env, exclude_provider, quarantine, now)
         .into_iter()
         .next()
 }
@@ -2068,6 +2162,27 @@ mod tests {
 
     // ---- Fallback / failover (OCEAN-275) ----------------------------------
 
+    /// Failover as it behaves on a fresh process: nothing has rejected us yet.
+    /// The tests below this pair assert ordering and readiness, which the
+    /// quarantine does not participate in; the quarantine has its own tests.
+    fn unquarantined_candidates(env: &ProviderEnv, exclude: &ProviderId) -> Vec<ProviderConfig> {
+        fallback_candidates(
+            env,
+            exclude,
+            &ProviderQuarantine::default(),
+            std::time::Instant::now(),
+        )
+    }
+
+    fn unquarantined_fallback(env: &ProviderEnv, exclude: &ProviderId) -> Option<ProviderConfig> {
+        resolve_fallback_config(
+            env,
+            exclude,
+            &ProviderQuarantine::default(),
+            std::time::Instant::now(),
+        )
+    }
+
     #[test]
     fn fallback_picks_a_ready_alternate_when_primary_provider_is_degraded() {
         // Primary = deepseek (its key is intentionally absent → degraded), but a
@@ -2078,7 +2193,7 @@ mod tests {
             ("OCEAN_MODEL", "deepseek-v4-pro"),
             ("CLAUDE_CODE_ACCESS_TOKEN", "cc-bearer"),
         ]);
-        let alt = resolve_fallback_config(&e, &ProviderId::DeepSeek)
+        let alt = unquarantined_fallback(&e, &ProviderId::DeepSeek)
             .expect("a ready claude-code alternate should be found");
         assert_eq!(alt.selection.provider, ProviderId::ClaudeCode);
         assert!(alt.readiness().ok);
@@ -2095,8 +2210,8 @@ mod tests {
             ("OCEAN_MODEL", "deepseek-v4-pro"),
             ("OCEAN_DEEPSEEK_API_KEY", "ds-secret"),
         ]);
-        assert!(resolve_fallback_config(&e, &ProviderId::DeepSeek).is_none());
-        assert!(fallback_candidates(&e, &ProviderId::DeepSeek).is_empty());
+        assert!(unquarantined_fallback(&e, &ProviderId::DeepSeek).is_none());
+        assert!(unquarantined_candidates(&e, &ProviderId::DeepSeek).is_empty());
     }
 
     #[test]
@@ -2108,7 +2223,7 @@ mod tests {
             ("OCEAN_MODEL", "claude-opus-4-7"),
             ("CLAUDE_CODE_ACCESS_TOKEN", "cc-bearer"),
         ]);
-        let alt = resolve_fallback_config(&e, &ProviderId::ClaudeCode);
+        let alt = unquarantined_fallback(&e, &ProviderId::ClaudeCode);
         assert!(
             alt.is_none(),
             "claude-code is the primary; it must not be its own fallback"
@@ -2126,7 +2241,7 @@ mod tests {
             ("CLAUDE_CODE_ACCESS_TOKEN", "cc-bearer"),
             ("OCEAN_DEEPSEEK_API_KEY", "ds-secret"),
         ]);
-        let candidates = fallback_candidates(&e, &ProviderId::Google);
+        let candidates = unquarantined_candidates(&e, &ProviderId::Google);
         assert_eq!(
             candidates.first().map(|c| c.selection.provider.clone()),
             Some(ProviderId::ClaudeCode),
@@ -2156,7 +2271,7 @@ mod tests {
             ("ANTHROPIC_API_KEY", "sk-ant"),
             ("OCEAN_DEEPSEEK_API_KEY", "ds-secret"),
         ]);
-        let alt = resolve_fallback_config(&e, &ProviderId::Google).unwrap();
+        let alt = unquarantined_fallback(&e, &ProviderId::Google).unwrap();
         assert_eq!(alt.selection.provider, ProviderId::DeepSeek);
         assert_eq!(alt.selection.model, "deepseek-v4-pro");
     }
@@ -2170,7 +2285,7 @@ mod tests {
             ("OCEAN_PROVIDER_FALLBACK", "  , ,"),
             ("CLAUDE_CODE_ACCESS_TOKEN", "cc-bearer"),
         ]);
-        let alt = resolve_fallback_config(&e, &ProviderId::DeepSeek).unwrap();
+        let alt = unquarantined_fallback(&e, &ProviderId::DeepSeek).unwrap();
         assert_eq!(alt.selection.provider, ProviderId::ClaudeCode);
     }
 
@@ -2183,9 +2298,136 @@ mod tests {
             ("OCEAN_PROVIDER_FALLBACK", "not-a-model, claude-opus-4-7"),
             ("CLAUDE_CODE_ACCESS_TOKEN", "cc-bearer"),
         ]);
-        let alt = resolve_fallback_config(&e, &ProviderId::Google).unwrap();
+        let alt = unquarantined_fallback(&e, &ProviderId::Google).unwrap();
         assert_eq!(alt.selection.provider, ProviderId::ClaudeCode);
     }
+
+    // ---- Auth-rejection quarantine ---------------------------------------
+
+    /// Env with two ready alternates for a degraded google primary: claude-code
+    /// (first in the default order) and deepseek (third).
+    fn two_ready_alternates() -> ProviderEnv {
+        env(&[
+            ("OCEAN_MODEL", "gemini-2.0-flash"),
+            ("CLAUDE_CODE_ACCESS_TOKEN", "cc-bearer"),
+            ("OCEAN_DEEPSEEK_API_KEY", "ds-secret"),
+        ])
+    }
+
+    // The whole point: a provider whose credential is PRESENT — so readiness
+    // says yes — is still skipped once we have watched it reject that
+    // credential. Presence was never validity.
+    #[test]
+    fn a_provider_that_rejected_our_credential_is_skipped_despite_being_ready() {
+        let e = two_ready_alternates();
+        let now = std::time::Instant::now();
+        let quarantine = ProviderQuarantine::default();
+
+        // Precondition: claude-code is the top candidate and is fully ready.
+        let top = resolve_fallback_config(&e, &ProviderId::Google, &quarantine, now).unwrap();
+        assert_eq!(top.selection.provider, ProviderId::ClaudeCode);
+        assert!(top.readiness().ok, "its credential is present");
+
+        quarantine.note_auth_rejected(&ProviderId::ClaudeCode, now);
+
+        let alt = resolve_fallback_config(&e, &ProviderId::Google, &quarantine, now)
+            .expect("the next un-rejected ready provider must still serve");
+        assert_eq!(
+            alt.selection.provider,
+            ProviderId::DeepSeek,
+            "failover must step past the provider that rejected us, not onto it"
+        );
+        let providers: Vec<_> = fallback_candidates(&e, &ProviderId::Google, &quarantine, now)
+            .into_iter()
+            .map(|c| c.selection.provider)
+            .collect();
+        assert!(!providers.contains(&ProviderId::ClaudeCode));
+    }
+
+    // A provider nobody rejected is untouched — the quarantine suppresses only
+    // what it actually observed.
+    #[test]
+    fn an_unrejected_provider_is_unaffected_by_another_providers_quarantine() {
+        let e = two_ready_alternates();
+        let now = std::time::Instant::now();
+        let quarantine = ProviderQuarantine::default();
+        quarantine.note_auth_rejected(&ProviderId::DeepSeek, now);
+
+        let alt = resolve_fallback_config(&e, &ProviderId::Google, &quarantine, now).unwrap();
+        assert_eq!(
+            alt.selection.provider,
+            ProviderId::ClaudeCode,
+            "quarantining deepseek must not disturb the claude-code candidate"
+        );
+    }
+
+    // The TTL boundary, both sides, on an injected clock — no sleeping, no wall
+    // clock, no flake.
+    #[test]
+    fn quarantine_lapses_at_the_ttl_boundary() {
+        let ttl = std::time::Duration::from_secs(60);
+        let quarantine = ProviderQuarantine::new(ttl);
+        let t0 = std::time::Instant::now();
+        quarantine.note_auth_rejected(&ProviderId::ClaudeCode, t0);
+
+        assert!(quarantine.is_quarantined(&ProviderId::ClaudeCode, t0));
+        assert!(
+            quarantine.is_quarantined(
+                &ProviderId::ClaudeCode,
+                t0 + ttl - std::time::Duration::from_millis(1)
+            ),
+            "still suppressed one millisecond before the TTL"
+        );
+        assert!(
+            !quarantine.is_quarantined(&ProviderId::ClaudeCode, t0 + ttl),
+            "exactly at the TTL the provider is eligible again"
+        );
+
+        // And the candidate list follows the same boundary.
+        let e = two_ready_alternates();
+        assert_eq!(
+            resolve_fallback_config(&e, &ProviderId::Google, &quarantine, t0)
+                .map(|c| c.selection.provider),
+            Some(ProviderId::DeepSeek)
+        );
+        assert_eq!(
+            resolve_fallback_config(&e, &ProviderId::Google, &quarantine, t0 + ttl)
+                .map(|c| c.selection.provider),
+            Some(ProviderId::ClaudeCode),
+            "a lapsed quarantine restores the provider's priority"
+        );
+    }
+
+    // Re-proving is free the other way too: a later successful call clears the
+    // entry without waiting out the TTL.
+    #[test]
+    fn a_successful_call_clears_the_quarantine() {
+        let quarantine = ProviderQuarantine::default();
+        let now = std::time::Instant::now();
+        quarantine.note_auth_rejected(&ProviderId::ClaudeCode, now);
+        assert!(quarantine.is_quarantined(&ProviderId::ClaudeCode, now));
+        quarantine.clear(&ProviderId::ClaudeCode);
+        assert!(!quarantine.is_quarantined(&ProviderId::ClaudeCode, now));
+    }
+
+    // Quarantining the only ready alternate empties the candidate list. That is
+    // correct and deliberate: the agent layer turns an empty list into the
+    // explicit "all providers degraded" error, which is a far more honest signal
+    // than routing the turn into a key we know is being rejected.
+    #[test]
+    fn quarantining_the_last_ready_alternate_empties_the_candidate_list() {
+        let e = env(&[
+            ("OCEAN_MODEL", "gemini-2.0-flash"),
+            ("CLAUDE_CODE_ACCESS_TOKEN", "cc-bearer"),
+        ]);
+        let now = std::time::Instant::now();
+        let quarantine = ProviderQuarantine::default();
+        quarantine.note_auth_rejected(&ProviderId::ClaudeCode, now);
+
+        assert!(fallback_candidates(&e, &ProviderId::Google, &quarantine, now).is_empty());
+        assert!(resolve_fallback_config(&e, &ProviderId::Google, &quarantine, now).is_none());
+    }
+
     // ---- GLM provider (Zhipu AI) -----------------------------------------
 
     #[test]
