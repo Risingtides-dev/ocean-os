@@ -2741,14 +2741,35 @@ async fn agents_list() -> Json<serde_json::Value> {
     }))
 }
 
+/// Map a resolve failure to the status a client should actually branch on.
+///
+/// This route used to answer `200 {ok:false}` for every failure, including a
+/// missing agent — which is the one case a surface asks about constantly.
+/// `fetch()` reports 200 as success, so "no such agent" arrived looking
+/// exactly like "here is your agent" and the caller read a field that was not
+/// there. The sibling routes (PUT, DELETE) already returned 404; this one was
+/// the outlier, and rooms answer a missing key with 404 too.
+fn agent_resolve_status(err: &ocean_agent::agentdir::ResolveError) -> StatusCode {
+    use ocean_agent::agentdir::ResolveError::*;
+    match err {
+        InvalidName(_) => StatusCode::BAD_REQUEST,
+        NotFound(_) => StatusCode::NOT_FOUND,
+        // A malformed agent.toml or an unreadable slot is a real fault on this
+        // machine, not a statement about the request.
+        Config(_, _) | Io(_, _) => StatusCode::INTERNAL_SERVER_ERROR,
+    }
+}
+
 /// `GET /v1/agents/{name}` — resolve one agent folder into its full definition
-/// (config, instructions, skills, tools, subagents). `ok:false` on a bad name
-/// or missing agent, so a surface can probe without a 500.
-async fn agent_def(Path(name): Path<String>) -> Json<serde_json::Value> {
+/// (config, instructions, skills, tools, subagents).
+async fn agent_def(Path(name): Path<String>) -> (StatusCode, Json<serde_json::Value>) {
     let root = agents_root();
     match ocean_agent::agentdir::resolve(&root, &name) {
-        Ok(def) => Json(json!({ "ok": true, "agent": def })),
-        Err(e) => Json(json!({ "ok": false, "error": e.to_string() })),
+        Ok(def) => (StatusCode::OK, Json(json!({ "ok": true, "agent": def }))),
+        Err(e) => (
+            agent_resolve_status(&e),
+            Json(json!({ "ok": false, "error": e.to_string() })),
+        ),
     }
 }
 
@@ -22964,6 +22985,35 @@ mod tests {
         }
     }
 
+    #[test]
+    fn resolving_a_missing_agent_is_a_404_a_surface_can_branch_on() {
+        use ocean_agent::agentdir::ResolveError;
+        // The gap this closes: every failure answered 200 {ok:false}, and
+        // `fetch()` calls 200 success — so "no such agent" arrived looking
+        // exactly like "here is your agent". PUT and DELETE already answered
+        // 404, and a missing room key does too; GET was the outlier.
+        assert_eq!(
+            agent_resolve_status(&ResolveError::NotFound("nope".into())),
+            StatusCode::NOT_FOUND
+        );
+        assert_eq!(
+            agent_resolve_status(&ResolveError::InvalidName("../escape".into())),
+            StatusCode::BAD_REQUEST
+        );
+        // A broken agent.toml is this machine's fault, not the caller's.
+        assert_eq!(
+            agent_resolve_status(&ResolveError::Config("a".into(), "bad toml".into())),
+            StatusCode::INTERNAL_SERVER_ERROR
+        );
+        assert_eq!(
+            agent_resolve_status(&ResolveError::Io(
+                std::path::PathBuf::from("/x"),
+                "denied".into()
+            )),
+            StatusCode::INTERNAL_SERVER_ERROR
+        );
+    }
+
     #[tokio::test]
     async fn agents_endpoints_list_and_resolve_from_root() {
         let _guard = AUTO_CONVENE_ENV_LOCK.lock().await;
@@ -22983,14 +23033,21 @@ mod tests {
         assert_eq!(list.0["agents"][0]["description"], json!("r"));
 
         // GET /v1/agents/researcher resolves the def
-        let def = agent_def(Path("researcher".to_string())).await;
+        let (status, def) = agent_def(Path("researcher".to_string())).await;
+        assert_eq!(status, StatusCode::OK);
         assert_eq!(def.0["ok"], json!(true));
         assert_eq!(def.0["agent"]["name"], json!("researcher"));
         assert_eq!(def.0["agent"]["instructions"], json!("be careful\n"));
 
-        // bad name -> ok:false, not a panic/500
-        let bad = agent_def(Path("../escape".to_string())).await;
+        // bad name -> a 400 the caller can branch on, not a panic/500
+        let (status, bad) = agent_def(Path("../escape".to_string())).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
         assert_eq!(bad.0["ok"], json!(false));
+
+        // missing agent -> 404, so `fetch()` reports it as a failure
+        let (status, missing) = agent_def(Path("nobody".to_string())).await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert_eq!(missing.0["ok"], json!(false));
     }
 
     // ---- OCEAN-245: opt-in Longhouse pre-turn consult turn-hook ----------------
