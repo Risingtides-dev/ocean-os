@@ -1550,7 +1550,10 @@ fn banner_routes() -> &'static [&'static str] {
         "POST /v1/sessions/{id}/compact",
         "GET /v1/sessions/{id}/sync",
         "GET /v1/agents",
+        "POST /v1/agents",
         "GET /v1/agents/{name}",
+        "PUT /v1/agents/{name}",
+        "DELETE /v1/agents/{name}",
         "GET /v1/projects",
         "POST /v1/projects",
         "GET /v1/projects/{id}",
@@ -25195,9 +25198,13 @@ mod tests {
         // parity assertion above is the real gate — it proves every
         // advertised route is actually registered — and this count is the
         // tripwire that forces a human to look when the surface grows.
+        // 101 -> 104: agent CRUD added POST /v1/agents plus PUT and DELETE
+        // /v1/agents/{name}. The routes were registered without being
+        // advertised, so discovery and the operator guide both went stale and
+        // this assertion is what caught it.
         assert_eq!(
             banner.len(),
-            101,
+            104,
             "route baseline changed; review the manifest"
         );
 

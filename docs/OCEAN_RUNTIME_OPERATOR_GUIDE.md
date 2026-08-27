@@ -580,7 +580,10 @@ GET    /v1/sessions/{id}/sync             refresh-only visible snapshot + SSE re
 
 # Folder-as-agent definitions
 GET    /v1/agents                         list discoverable agent folders
+POST   /v1/agents                         create an agent folder (agent.toml + instructions.md)
 GET    /v1/agents/{name}                  resolve one agent folder
+PUT    /v1/agents/{name}                  replace an agent folder's definition
+DELETE /v1/agents/{name}                  remove an agent folder
 
 # Projects (named directory-bound workspaces)
 GET    /v1/projects                       list registered projects
