@@ -6666,4 +6666,62 @@ so the scripted error arrives in the exact TurnFailure shape production emits
 and the fallback's reuse_accepted_user invariant holds for the same reason it
 holds against a live provider. Reverting each of the four lines individually now
 fails exactly one test, and a different one each time.
+time:      [17:52] [08-27-26]
+agent:     [claude] [opus 5]
+worktree:  loop/attachments-in-agent-context
+type:      [feature-request]
+area:      [backend]
+
+A convened room agent can now read the room's context files. room_attachments.rs
+had said outright that it stopped at the HTTP surface and that "agents can see
+them" meant an agent calling GET /attachments like any other client — but a
+convened turn has no tool call in its loop, so the files were decoration for the
+one participant they were usually uploaded for. New room_context.rs renders them
+as a delimited block that build_room_prompt splices between the transcript and
+"Your reply:". What gets inlined is derived from the bytes, never from
+RoomAttachment.content_type: that string is the uploader's declaration and the
+attachments module exists partly to never act on it, so deciding what to paste
+into a prompt from it would re-trust the one value nothing trusts. A binary is
+named — filename, declared type, byte_len — and stays out of the prompt. The
+16 KiB budget bounds the whole block rather than each file, so a room's file count
+cannot outweigh the transcript, and every clip is announced rather than silently
+dropped. The seam takes the rows, a byte-reading closure, and the budget, copying
+room_summary.rs, so the boundary is tested in both directions with no AppState and
+no filesystem. Bytes come through one new pub(super) reader in room_attachments.rs
+that goes via the existing blob_path, so the sha256(room key) traversal defence
+still has exactly one implementation; the download handler now shares that reader
+too. A room with no attachments produces a byte-identical prompt, and that is a
+test rather than a claim. No ContextPolicy/ContextMount — the Rooms v2 §7 model
+stays unimplemented, as the root contract requires.
+_________________________________________________________________________________
+
+time:      [18:13] [08-27-26]
+agent:     [claude] [opus 5]
+worktree:  loop/attachments-in-agent-context
+type:      [review]
+area:      [backend]
+
+Review of the room-context slice found the 16 KiB budget bounds the rendered
+block and nothing else, so a binary attachment cost sixty bytes of budget but a
+full read plus sha256 over up to 8 MiB: a room of blobs never stopped the loop,
+and the reviewer measured forty rows of 8 MiB all read, 320 MiB, to print a
+2787-byte block — synchronously, on a runtime worker, on every convened turn.
+The two comments and the summary claiming reads stop with the budget were
+describing an intention the code did not implement. Fixed with a second and
+separate budget, ROOM_CONTEXT_READ_BUDGET (1 MiB per turn), charged on
+RoomAttachment.byte_len before the read rather than on the bytes that come back,
+which makes the refusal free; a row longer than what is left of it is NAMED the
+way every other unshowable file is, and the two reasons are distinguished
+("too large to read into context" versus "not read, context read budget spent")
+because a ten-kilobyte file called too large would read as a bug. The budget is
+a total rather than a per-file ceiling, so refusing a giant does not hide the
+small file behind it, and that is a test. Also: the attachment-list store error
+was becoming "this room has no files" silently, which is exactly the confident
+answer from unseen material the module's announce-every-clip rule exists to
+prevent, so it now warns. Left open for the operator: this slice's AGENTS.md
+edit narrowed room_attachments.rs's blanket ban on prompt assembly to the Rooms
+v2 §7 ContextPolicy/ContextMount model it named as its reason. The narrowing is
+defensible and the §7 model is genuinely unimplemented, but a builder narrowing
+the prohibition covering its own change is above the builder's level, so both
+bullets are marked NOT YET RATIFIED with the revert named.
 _________________________________________________________________________________
