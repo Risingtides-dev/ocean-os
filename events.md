@@ -6334,3 +6334,20 @@ Verification: cargo test -p ocean-store (169 passed), cargo test -p ocean-daemon
 (738 passed), cargo check --workspace, strict all-target Clippy for ocean-store
 and ocean-daemon, cargo xtask docs-check, format and diff checks, and the full
 cargo xtask ci repository gate all passed.
+_________________________________________________________________________________
+
+time:  [01:25] [08-27-26]
+agent: [codex] [gpt-5]
+worktree: [feat/rooms-phase1-agent-binding]
+type:  [bug report]
+area:  [backend]
+
+Closed the fresh exact-head P1 concurrency finding in Phase 1 binding status
+changes. Status read, terminal/stale validation, generation bump, update, and
+returned projection now share one IMMEDIATE SQLite transaction. A deterministic
+two-connection regression holds an uncommitted digest-check transition while a
+resume races it; the resume must observe committed stale authority and fail,
+never overwrite it with active state.
+
+Verification: cargo test -p ocean-store (170 passed), the focused concurrency
+regression, and strict ocean-store all-target Clippy with denied warnings passed.

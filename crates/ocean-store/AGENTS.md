@@ -113,6 +113,8 @@ outbox, and the restart-safe federation core (S2 P2-A). One database file
   federated descriptors are display data, never authorization. Only an active
   binding admits; stale authority can return active only through a fresh
   replay-safe authorization decision, never through a status transition.
+  Status validation, generation bump, and mutation share one IMMEDIATE
+  transaction so a racing resume cannot overwrite stale or revoked authority.
 - **Attachments are immutable, so the discipline is refusal, not CAS.** There is
   deliberately no `version` column on `room_attachments`: nothing amends an
   attachment, so a compare-and-swap guard would be decoration, and a decorative

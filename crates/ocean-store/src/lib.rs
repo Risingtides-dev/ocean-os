@@ -4167,8 +4167,28 @@ impl SqliteRoomStore {
         actor: &str,
         now: DateTime<Utc>,
     ) -> Result<RoomAgentBinding> {
-        let current = self
-            .room_agent_binding(key, agent_member_id)?
+        // Status validation and mutation share one write transaction. Without
+        // IMMEDIATE here, a resume could read `suspended`, lose a race to a
+        // concurrent stale/revoke, then overwrite that terminal decision with
+        // an unconditional `active` update.
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let current = tx
+            .query_row(
+                "SELECT agent_member_id, agent_package_id, agent_definition_digest,
+                        agent_definition_revision, display_name, owner_member_id,
+                        authorized_by, authorized_at, activation_policy, context_policy,
+                        memory_scope, requested_capabilities, room_capability_grants,
+                        status, generation, decision_id, request_digest,
+                        revoked_at, revoked_by
+                   FROM room_agent_bindings
+                  WHERE room_id = ?1 AND agent_member_id = ?2",
+                params![key.as_str(), agent_member_id],
+                |row| Self::binding_from_row(key, row),
+            )
+            .optional()?
+            .transpose()?
             .ok_or_else(|| RoomStoreError::UnknownAgentBinding {
                 room: key.clone(),
                 agent: agent_member_id.to_string(),
@@ -4186,6 +4206,7 @@ impl SqliteRoomStore {
             });
         }
         if current.status == to {
+            tx.commit()?;
             return Ok(current);
         }
         let (revoked_at, revoked_by) = if to == AgentBindingStatus::Revoked {
@@ -4193,7 +4214,7 @@ impl SqliteRoomStore {
         } else {
             (None, None)
         };
-        self.conn.execute(
+        tx.execute(
             "UPDATE room_agent_bindings
                 SET status = ?3, generation = generation + 1,
                     revoked_at = ?4, revoked_by = ?5
@@ -4206,11 +4227,27 @@ impl SqliteRoomStore {
                 revoked_by
             ],
         )?;
-        self.room_agent_binding(key, agent_member_id)?
+        let updated = tx
+            .query_row(
+                "SELECT agent_member_id, agent_package_id, agent_definition_digest,
+                        agent_definition_revision, display_name, owner_member_id,
+                        authorized_by, authorized_at, activation_policy, context_policy,
+                        memory_scope, requested_capabilities, room_capability_grants,
+                        status, generation, decision_id, request_digest,
+                        revoked_at, revoked_by
+                   FROM room_agent_bindings
+                  WHERE room_id = ?1 AND agent_member_id = ?2",
+                params![key.as_str(), agent_member_id],
+                |row| Self::binding_from_row(key, row),
+            )
+            .optional()?
+            .transpose()?
             .ok_or_else(|| RoomStoreError::UnknownAgentBinding {
                 room: key.clone(),
                 agent: agent_member_id.to_string(),
-            })
+            })?;
+        tx.commit()?;
+        Ok(updated)
     }
 
     fn binding_from_row(
@@ -5709,6 +5746,73 @@ mod tests {
             )
             .unwrap();
         assert_eq!(revoked.status, AgentBindingStatus::Revoked);
+    }
+
+    #[test]
+    fn concurrent_stale_transition_wins_over_a_racing_resume() {
+        use std::{sync::mpsc, thread, time::Duration};
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("rooms.db");
+        let key = RoomKey::new("hq");
+        let mut first = SqliteRoomStore::open(&path).unwrap();
+        first.create(key.clone(), "HQ", None, now()).unwrap();
+        first
+            .authorize_room_agent(&key, auth_input("agent-1", "dec-1", "digest-1"), now())
+            .unwrap();
+        first
+            .set_room_agent_binding_status(
+                &key,
+                "agent-1",
+                AgentBindingStatus::Suspended,
+                "operator-1",
+                now(),
+            )
+            .unwrap();
+
+        let mut racer = SqliteRoomStore::open(&path).unwrap();
+        racer.conn.busy_timeout(Duration::from_secs(2)).unwrap();
+
+        // Hold an uncommitted digest-check transition. An implementation that
+        // reads status before acquiring its write transaction can observe the
+        // old Suspended row, wait here, and then overwrite Stale with Active.
+        let stale_tx = first
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .unwrap();
+        stale_tx
+            .execute(
+                "UPDATE room_agent_bindings
+                    SET status = 'stale', generation = generation + 1
+                  WHERE room_id = ?1 AND agent_member_id = 'agent-1'",
+                params![key.as_str()],
+            )
+            .unwrap();
+
+        let (started_tx, started_rx) = mpsc::sync_channel(0);
+        let race_key = key.clone();
+        let handle = thread::spawn(move || {
+            started_tx.send(()).unwrap();
+            racer.set_room_agent_binding_status(
+                &race_key,
+                "agent-1",
+                AgentBindingStatus::Active,
+                "operator-1",
+                now(),
+            )
+        });
+        started_rx.recv().unwrap();
+        thread::sleep(Duration::from_millis(100));
+        stale_tx.commit().unwrap();
+
+        let result = handle.join().unwrap();
+        assert!(matches!(
+            result,
+            Err(RoomStoreError::AgentBindingStatusConflict { .. })
+        ));
+        let final_binding = first.room_agent_binding(&key, "agent-1").unwrap().unwrap();
+        assert_eq!(final_binding.status, AgentBindingStatus::Stale);
+        assert_eq!(final_binding.generation, 3);
     }
 
     #[test]
