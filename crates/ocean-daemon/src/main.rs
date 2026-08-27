@@ -154,6 +154,8 @@ mod request_control;
 mod room_attachments;
 /// Restart-safe outbound Bedrock room client and per-room supervisor (S2 P2-B).
 mod room_federation;
+/// One-shot room-transcript summary into the room's well-known artifact.
+mod room_summary;
 /// Host fulfillment lifecycle retained for the external `ocean-slack` extension.
 mod slack_canvas_fulfillment;
 /// Ephemeral OpenAI Realtime client-secret mint (voice phases 2/3) — the
@@ -1567,6 +1569,7 @@ fn banner_routes() -> &'static [&'static str] {
         "GET /v1/rooms/persistent/{key}/attachments",
         "GET /v1/rooms/persistent/{key}/attachments/{attachment_id}",
         "DELETE /v1/rooms/persistent/{key}/attachments/{attachment_id}",
+        "POST /v1/rooms/persistent/{key}/summarize",
         "GET /v1/rooms/persistent/{key}/snapshot",
         "GET /v1/rooms/persistent/{key}/events",
         "GET /v1/rooms/persistent/{key}/read-cursor",
@@ -2955,6 +2958,12 @@ fn room_routes() -> Router<AppState> {
             "/v1/rooms/persistent/{key}/attachments/{attachment_id}",
             get(room_attachments::room_download_attachment)
                 .delete(room_attachments::room_delete_attachment),
+        )
+        // One model turn over a bounded transcript tail, folded into the room's
+        // single well-known `room-summary` artifact (create once, amend in place).
+        .route(
+            "/v1/rooms/persistent/{key}/summarize",
+            post(persistent_rooms::room_summarize),
         )
         .route("/v1/rooms/persistent/{key}/snapshot", get(room_snapshot))
         // Merged SSE: room_message + room_access frames, with durable replay
@@ -25314,9 +25323,11 @@ mod tests {
         // this assertion is what caught it.
         // 104 -> 108: room attachments added POST+GET /attachments and
         // GET+DELETE /attachments/{attachment_id} — the room's context files.
+        // 108 -> 109: on-demand transcript summary added POST
+        // /v1/rooms/persistent/{key}/summarize.
         assert_eq!(
             banner.len(),
-            108,
+            109,
             "route baseline changed; review the manifest"
         );
 

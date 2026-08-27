@@ -36,6 +36,7 @@ use super::{
 };
 use crate::request_control::register_running_request;
 use crate::room_federation::{AgentRegistrationInput, FederatedTriggerDispatch, IntentError};
+use crate::room_summary;
 use crate::yolo_settings::effective_permission_mode;
 
 /// Shared handle to the daemon's single durable room store. Every closure is
@@ -887,6 +888,25 @@ pub(super) struct AmendArtifactRequest {
     pub(super) author_id: String,
 }
 
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct SummarizeRequest {
+    /// Roster participant the summary artifact is attributed to. Required, not
+    /// optional: `create_artifact`/`amend_artifact` demand a real roster author
+    /// and rooms are created with an EMPTY roster, so there is no daemon
+    /// identity to fall back on. The requester owns the write; the model that
+    /// actually wrote the words is recorded in the artifact body.
+    pub(super) requested_by: String,
+    /// Size of the transcript window. Omitted ⇒ the store's default cap; any
+    /// value is clamped by `clamp_transcript_limit`, exactly as `/transcript` is.
+    #[serde(default)]
+    pub(super) limit: Option<usize>,
+    /// Pin an explicit window instead of the newest `limit` rows. Omitted — the
+    /// ordinary case — summarizes the tail of the room.
+    #[serde(default)]
+    pub(super) after_seq: Option<u64>,
+}
+
 /// `POST /v1/rooms/persistent/{key}/artifacts` — record something the room
 /// produced: a task, a decision, or captured knowledge.
 pub(super) async fn room_create_artifact(
@@ -1043,6 +1063,170 @@ pub(super) async fn room_list_artifacts(
             Json(json!({ "ok": true, "artifacts": artifacts })),
         ),
         Err(e) => room_store_error_response(e),
+    }
+}
+
+/// `POST /v1/rooms/persistent/{key}/summarize` — read a bounded tail of this
+/// room's transcript, run ONE model turn over it, and fold the result into the
+/// room's single well-known `room-summary` artifact.
+///
+/// A long room is unreadable, and the answer is not another wall of chat: the
+/// summary lands as a durable thing the room OWNS, versioned by the same
+/// compare-and-swap every other artifact uses and announced on the SSE tail
+/// every client already listens to. Repeated calls amend that one artifact in
+/// place rather than accumulating near-duplicate summaries.
+///
+/// This adds no provider client. The model turn goes through
+/// `AgentRuntime::complete_once` — the same fresh-context, no-session, no-tools
+/// seam the post-turn advisor runs on — and the logic lives in `room_summary.rs`
+/// behind a closure so it is testable without process-global provider env.
+pub(super) async fn room_summarize(
+    State(state): State<AppState>,
+    Path(key): Path<String>,
+    Json(req): Json<SummarizeRequest>,
+) -> (StatusCode, Json<serde_json::Value>) {
+    let trimmed_key = key.trim();
+    let requested_by = req.requested_by.trim();
+    if trimmed_key.is_empty() || requested_by.is_empty() {
+        return invalid_request_response();
+    }
+    let key = RoomKey::new(trimmed_key);
+
+    // Backpressure, the same gate every other provider-calling route takes
+    // (`agent_turn`, `POST /v1/sessions/{id}/compact`): claim a turn permit
+    // BEFORE any work and reject immediately at capacity rather than queueing,
+    // so a client looping summarize cannot fan out into unbounded concurrent
+    // provider calls. The owned permit is held for the whole handler and
+    // returned on every exit path, including a panic.
+    let _turn_permit = match state.turn_limiter.clone().try_acquire_owned() {
+        Ok(permit) => permit,
+        Err(_) => {
+            tracing::warn!(room = %key, "room summarize: at concurrency cap; rejecting with 429");
+            return (
+                StatusCode::TOO_MANY_REQUESTS,
+                Json(json!({
+                    "ok": false,
+                    "code": "at_capacity",
+                    "error": "daemon at concurrent-turn capacity; busy, try again shortly",
+                })),
+            );
+        }
+    };
+
+    // A cheap role if the operator configured one, otherwise whatever model the
+    // daemon is already bound to — the feature works with zero config rather
+    // than being dead by default.
+    let alias = room_summary::resolve_summary_alias(&state.roles, &state.runtime.current_model().1);
+    let runtime = state.runtime.clone();
+    let outcome =
+        room_summary::summarize_room(
+            &state.rooms,
+            room_summary::SummarizeInput {
+                key: key.clone(),
+                requested_by: requested_by.to_string(),
+                limit: req.limit,
+                after_seq: req.after_seq,
+                alias,
+                timeout: room_summary::ROOM_SUMMARY_TIMEOUT,
+            },
+            move |alias, system, user| async move {
+                runtime.complete_once(&alias, &system, &user).await
+            },
+        )
+        .await;
+
+    // Post-commit only: the store adapter has returned, so the artifact and the
+    // System transcript line it wrote in the same transaction are both durable
+    // before any tail is told to re-read.
+    if let room_summary::SummarizeOutcome::Wrote { message, .. } = &outcome {
+        publish_room_wake(&state, &key, message);
+    }
+    summarize_response(outcome)
+}
+
+/// Map a summarize outcome onto its HTTP shape. Pure — no `AppState`, no env —
+/// so the contract that matters here is unit-testable: a room with nothing to
+/// say, a model that returned nothing, and a model that repeated itself are all
+/// clean 200s, and a provider failure is a fixed 502 that never carries the
+/// provider's own message (which can embed response fragments).
+fn summarize_response(
+    outcome: room_summary::SummarizeOutcome,
+) -> (StatusCode, Json<serde_json::Value>) {
+    use room_summary::SummarizeOutcome::*;
+    match outcome {
+        // 200 for both create and amend so the route has ONE success shape;
+        // `created` is what tells the caller which of the two happened.
+        Wrote {
+            artifact,
+            created,
+            model,
+            messages_summarized,
+            from_seq,
+            to_seq,
+            has_more,
+            ..
+        } => (
+            StatusCode::OK,
+            Json(json!({
+                "ok": true,
+                "summarized": true,
+                "created": created,
+                "artifact": artifact,
+                "model": model,
+                "messages_summarized": messages_summarized,
+                "from_seq": from_seq,
+                "to_seq": to_seq,
+                "has_more": has_more,
+            })),
+        ),
+        // The store refused a no-op amend, which is correct: the model looked at
+        // the same conversation and said the same thing. Nothing moved, and the
+        // caller gets back the artifact that already stands.
+        Unchanged { artifact } => (
+            StatusCode::OK,
+            Json(json!({
+                "ok": true,
+                "summarized": false,
+                "code": "unchanged",
+                "artifact": artifact,
+            })),
+        ),
+        NoMessages => (
+            StatusCode::OK,
+            Json(json!({ "ok": true, "summarized": false, "code": "no_messages" })),
+        ),
+        EmptySummary => (
+            StatusCode::OK,
+            Json(json!({ "ok": true, "summarized": false, "code": "empty_summary" })),
+        ),
+        // Same rule and the same code as `room_create_artifact`.
+        ForgedAuthor => (
+            StatusCode::FORBIDDEN,
+            Json(json!({
+                "ok": false,
+                "code": "forged_artifact_author",
+                "error": "an agent's artifact is authored by the daemon, not by a client claiming its identity",
+            })),
+        ),
+        ProviderError => (
+            StatusCode::BAD_GATEWAY,
+            Json(json!({
+                "ok": false,
+                "code": "summary_provider_error",
+                "error": "the summary model call failed",
+            })),
+        ),
+        Timeout => (
+            StatusCode::GATEWAY_TIMEOUT,
+            Json(json!({
+                "ok": false,
+                "code": "summary_timeout",
+                "error": "the summary model call timed out",
+            })),
+        ),
+        // Unknown room, a soft-closed room (the write requires `room_is_open`),
+        // and a non-roster author all already have a truthful mapping.
+        Store(e) => room_store_error_response(e),
     }
 }
 
@@ -2039,7 +2223,10 @@ pub(super) struct TranscriptQuery {
 /// back an identical `TranscriptPage` shape regardless of room state. `Ok(None)`
 /// from the audit view (room never existed) is mapped back to `UnknownRoom` so the
 /// handlers preserve their 404.
-fn read_transcript_page(
+///
+/// `pub(super)` so `room_summary.rs` reads its bounded window through the SAME
+/// paging implementation rather than growing a second one.
+pub(super) fn read_transcript_page(
     reg: &ocean_store::SqliteRoomStore,
     key: &RoomKey,
     after_seq: Option<u64>,
@@ -2985,6 +3172,110 @@ mod tests {
         response::IntoResponse,
     };
     use tower::ServiceExt;
+
+    fn summary_artifact() -> ocean_core::RoomArtifact {
+        ocean_core::RoomArtifact {
+            id: room_summary::ROOM_SUMMARY_ARTIFACT_ID.to_string(),
+            kind: RoomArtifactKind::Note,
+            title: room_summary::ROOM_SUMMARY_TITLE.to_string(),
+            body: "they reverted the map change".into(),
+            state: RoomArtifactState::Open,
+            created_by: "alice".into(),
+            created_at: "2026-08-26T09:00:00Z".into(),
+            updated_by: "alice".into(),
+            updated_at: "2026-08-26T09:00:00Z".into(),
+            on_behalf_of: None,
+            version: 4,
+        }
+    }
+
+    fn summary_system_line() -> RoomMessage {
+        RoomMessage {
+            seq: 41,
+            author_id: "system".into(),
+            author_kind: RoomParticipantKind::System,
+            kind: RoomMessageKind::System,
+            body: "alice updated 'Room summary' (v4)".into(),
+            created_at: Utc::now(),
+            federated: None,
+            thread_parent_seq: None,
+            session_id: None,
+        }
+    }
+
+    /// The whole point of the route's error contract: a room with nothing to
+    /// say, a model that returned nothing, and a model that repeated itself are
+    /// ANSWERS, not faults — and a provider failure never leaks the provider's
+    /// own message into the body. Pure: no `AppState`, no env, no provider.
+    #[test]
+    fn summarize_outcomes_map_to_clean_statuses_without_leaking_provider_detail() {
+        use room_summary::SummarizeOutcome;
+
+        let (status, body) = summarize_response(SummarizeOutcome::Wrote {
+            artifact: summary_artifact(),
+            created: false,
+            model: "haiku-x".into(),
+            messages_summarized: 200,
+            from_seq: 1041,
+            to_seq: 1240,
+            has_more: false,
+            message: Box::new(summary_system_line()),
+        });
+        // 200 for an amend AND for a create: one success shape, `created` says which.
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body.0["summarized"], json!(true));
+        assert_eq!(body.0["created"], json!(false));
+        assert_eq!(body.0["model"], json!("haiku-x"));
+        assert_eq!(body.0["messages_summarized"], json!(200));
+        assert_eq!(body.0["from_seq"], json!(1041));
+        assert_eq!(body.0["to_seq"], json!(1240));
+        assert_eq!(body.0["artifact"]["version"], json!(4));
+
+        for (outcome, code) in [
+            (SummarizeOutcome::NoMessages, "no_messages"),
+            (SummarizeOutcome::EmptySummary, "empty_summary"),
+        ] {
+            let (status, body) = summarize_response(outcome);
+            assert_eq!(status, StatusCode::OK, "{code} is an answer, not a fault");
+            assert_eq!(body.0["ok"], json!(true));
+            assert_eq!(body.0["summarized"], json!(false));
+            assert_eq!(body.0["code"], json!(code));
+            assert!(body.0.get("artifact").is_none());
+        }
+
+        let (status, body) = summarize_response(SummarizeOutcome::Unchanged {
+            artifact: summary_artifact(),
+        });
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body.0["code"], json!("unchanged"));
+        assert_eq!(body.0["artifact"]["version"], json!(4));
+
+        let (status, body) = summarize_response(SummarizeOutcome::ForgedAuthor);
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        assert_eq!(body.0["code"], json!("forged_artifact_author"));
+
+        let (status, body) = summarize_response(SummarizeOutcome::ProviderError);
+        assert_eq!(status, StatusCode::BAD_GATEWAY);
+        assert_eq!(body.0["code"], json!("summary_provider_error"));
+        assert_eq!(body.0["error"], json!("the summary model call failed"));
+
+        let (status, body) = summarize_response(SummarizeOutcome::Timeout);
+        assert_eq!(status, StatusCode::GATEWAY_TIMEOUT);
+        assert_eq!(body.0["code"], json!("summary_timeout"));
+
+        // Store errors keep the mapping the rest of the room routes already use.
+        let (status, _) = summarize_response(SummarizeOutcome::Store(
+            ocean_store::RoomStoreError::UnknownRoom(RoomKey::new("gone")),
+        ));
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        let (status, _) = summarize_response(SummarizeOutcome::Store(
+            ocean_store::RoomStoreError::ArtifactAuthorNotInRoster {
+                room: RoomKey::new("room"),
+                author: "mallory".into(),
+            },
+        ));
+        assert_eq!(status, StatusCode::FORBIDDEN);
+    }
 
     #[derive(Clone)]
     struct RouteBedrock {
