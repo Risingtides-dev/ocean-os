@@ -2,19 +2,21 @@
 
 ## Purpose
 
-SQLite-backed durability for persistent rooms: rosters, transcripts, room
-access projections, the outbox, and the restart-safe federation core
-(S2 P2-A). One database file (`rooms.db`), one owning crate.
+SQLite-backed durability for persistent rooms: rosters, transcripts, local
+room-agent authority and approval decisions, room access projections, the
+outbox, and the restart-safe federation core (S2 P2-A). One database file
+(`rooms.db`), one owning crate.
 
 ## Ownership
 
 - **Scope:** `crates/ocean-store/`
 - **Parent contract:** `../AGENTS.md` — read it first
 - **Owns:** room/roster/transcript persistence, `room_access` + `outbox`
-  durability, local and mirrored room read cursors, federation credential
-  custody, producer counters, confirmed ingest, trigger-claim journal
+  durability, local room-agent authority and approval decisions, local and
+  mirrored room read cursors, federation credential custody, producer
+  counters, confirmed ingest, trigger-claim journal
 - **Does not own:** HTTP projection (daemon), federation network client,
-  agent sessions/memory, Longhouse titles
+  operator-key custody, agent sessions/memory, Longhouse titles
 
 ## Local Contracts
 
@@ -34,6 +36,14 @@ access projections, the outbox, and the restart-safe federation core
   upstream-mirrored read positions as canonical decimal u64 TEXT. Mirror writes
   use `RoomReadCursorMirrorCas`: callers supply the previously observed mirror;
   mismatches return `Stale` without writing, including stale clears.
+- `room_agent_bindings` — local, non-federated execution authority for one
+  room-agent identity, including pinned definition digest, requested/granted
+  capability intersection inputs, status, and canonical-decimal u64 TEXT
+  generation.
+- `room_agent_decisions` — immutable per-room replay ledger for every consumed
+  operator decision id across authorization and status mutations.
+  Re-authorization or a status decision may replace the binding's current
+  decision but never makes an older approval id reusable.
 - P2-A federation tables: `federation_instance` (singleton instance id),
   `room_federation` (bearer credential — PRIVATE), `room_member_bindings`
   (member→agent binding, `registration_key` PRIVATE, agent name unique per
@@ -101,6 +111,16 @@ access projections, the outbox, and the restart-safe federation core
   `Applied` returns the durable projection; `Stale` never mutates the row. Callers
   must handle newer concurrent `Some` values monotonically while reserving a
   clear for an expectation that still matches.
+- **Room-agent authority is local and fail-closed.** Participant rows and
+  federated descriptors are display data, never authorization. Only an active
+  binding admits; stale authority can return active only through a fresh
+  replay-safe authorization decision, never through a status transition.
+  Authorization and status mutations share one immutable, room-wide decision
+  namespace: exact retries are no-ops and cross-content reuse fails closed.
+  They require an open room and keep replay validation, checked generation
+  bump, mutation, returned projection, and commit in one IMMEDIATE transaction
+  so a racing writer cannot change the authority a caller believes it
+  approved. Closed rooms retain immutable audit history.
 - **Attachments are immutable, so the discipline is refusal, not CAS.** There is
   deliberately no `version` column on `room_attachments`: nothing amends an
   attachment, so a compare-and-swap guard would be decoration, and a decorative

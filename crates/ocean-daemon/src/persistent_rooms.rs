@@ -388,6 +388,15 @@ pub(super) fn room_store_error_response(
         // Same rule as an artifact author: a file attributed to somebody who is
         // not in the room is a lie, not a server fault.
         AttachmentUploaderNotInRoster { .. } => StatusCode::FORBIDDEN,
+        // Rooms Phase 1. Asking about a binding that was never authorized is a
+        // 404, not a 403: the caller is inspecting, and there is nothing there.
+        // Admission refusal on an absent binding is a separate path that never
+        // reaches this mapping.
+        UnknownAgentBinding { .. } => StatusCode::NOT_FOUND,
+        // A decision replayed against different content, and any move out of
+        // the terminal revoked state, are both "your view of authority is
+        // stale" — re-read and issue a new decision.
+        DecisionReplayMismatch { .. } | AgentBindingStatusConflict { .. } => StatusCode::CONFLICT,
         // A durable backend can fail on I/O or (de)serialization, which the
         // in-memory registry never could. Surface those as 500s, not as a
         // misleading 4xx. Federation corruption is a fail-closed integrity

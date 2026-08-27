@@ -6311,3 +6311,99 @@ read-cursor federation slice plus the new absent-route regression, workspace
 check, daemon all-target Clippy with denied warnings, docs-check, formatting,
 and diff hygiene. No daemon was restarted and no production state was changed.
 _________________________________________________________________________________
+
+time:  [01:14] [08-27-26]
+agent: [codex] [gpt-5]
+worktree: [feat/rooms-phase1-agent-binding]
+type:  [bug report]
+area:  [backend]
+
+Rebased the accepted Rooms Phase 1 room-agent authority foundation onto current
+origin/main and repaired all four blocking review findings before reopening it
+for review. Consumed authorization decisions now persist in an immutable
+per-room replay ledger, so later re-authorization cannot make an older decision
+id reusable. A stale binding cannot return active or be laundered through
+suspended without a fresh replay-safe authorization decision. Existing operator
+keys are opened without following symlinks and must be single-link regular files
+owned by the daemon user with exact mode 0600; unsafe restored keys fail closed
+without being overwritten. The store and daemon devlog ownership contracts now
+record the new foundation. This slice remains deliberately inert: it adds no
+authorization routes, admission behavior, or production deployment.
+
+Verification: cargo test -p ocean-store (169 passed), cargo test -p ocean-daemon
+(738 passed), cargo check --workspace, strict all-target Clippy for ocean-store
+and ocean-daemon, cargo xtask docs-check, format and diff checks, and the full
+cargo xtask ci repository gate all passed.
+_________________________________________________________________________________
+
+time:  [01:25] [08-27-26]
+agent: [codex] [gpt-5]
+worktree: [feat/rooms-phase1-agent-binding]
+type:  [bug report]
+area:  [backend]
+
+Closed the fresh exact-head P1 concurrency finding in Phase 1 binding status
+changes. Status read, terminal/stale validation, generation bump, update, and
+returned projection now share one IMMEDIATE SQLite transaction. A deterministic
+two-connection regression holds an uncommitted digest-check transition while a
+resume races it; the resume must observe committed stale authority and fail,
+never overwrite it with active state.
+
+Verification: cargo test -p ocean-store (170 passed), the focused concurrency
+regression, and strict ocean-store all-target Clippy with denied warnings passed.
+_________________________________________________________________________________
+
+time:  [01:48] [08-27-26]
+agent: [codex] [gpt-5]
+worktree: [feat/rooms-phase1-agent-binding]
+type:  [bug report]
+area:  [backend]
+
+Closed four additional exact-head review findings in the accepted Rooms Phase 1
+authority foundation. Operator identity now stays unavailable on platforms that
+cannot prove equivalent owner, link, and ACL security. Authorization and status
+mutations require an open room inside their IMMEDIATE transaction and read the
+returned binding before releasing the write lock. Binding generations now use
+canonical-decimal u64 TEXT, checked Rust-side increments, overflow refusal, and
+an idempotent migration for the earlier unshipped INTEGER branch schema.
+
+Verification: cargo test -p ocean-store (173 passed), cargo test -p ocean-daemon
+(739 passed), strict all-target Clippy for both crates, cargo check --workspace,
+cargo xtask docs-check, formatting, diff hygiene, and the full cargo xtask ci
+repository gate all passed.
+_________________________________________________________________________________
+
+time:  [01:56] [08-27-26]
+agent: [codex] [gpt-5]
+worktree: [feat/rooms-phase1-agent-binding]
+type:  [bug report]
+area:  [backend]
+
+Closed the fresh exact-head replay finding in the accepted Rooms Phase 1
+authority foundation. Suspend, resume, digest-stale, revoke, and no-op status
+requests now consume the same immutable room-wide decision ledger as agent
+authorization. Exact retries return the current binding without mutation;
+decision reuse for different authority content fails closed; status changes,
+decision persistence, generation handling, and the returned projection commit
+atomically under one IMMEDIATE transaction. First-time no-op decisions are
+recorded without falsely bumping the authority generation.
+
+Verification: cargo test -p ocean-store (176 passed), including focused status
+replay, cross-operation reuse, and no-op decision coverage. Strict Clippy,
+workspace, docs, formatting, diff, and full repository gates follow before
+landing.
+_________________________________________________________________________________
+
+time:  [01:59] [08-27-26]
+agent: [codex] [gpt-5]
+worktree: [feat/rooms-phase1-agent-binding]
+type:  [handoff]
+area:  [testing]
+
+The exact room-agent replay repair passed the complete local repository gate:
+documentation/index integrity, workspace build and tests, all-target Clippy
+with denied warnings, formatting, and dependency policy. Ocean-store passed
+176 tests and ocean-daemon passed 739 tests within that gate. The branch is
+ready for a fresh exact-head independent review; it remains an inert foundation
+with no routes, admission behavior, daemon restart, or production mutation.
+_________________________________________________________________________________
