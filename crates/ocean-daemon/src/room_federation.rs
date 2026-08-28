@@ -3035,6 +3035,7 @@ fn workspace_action_is_marker(event_type: &str) -> bool {
             | "room.workspace.port_exposed"
             | "room.workspace.flushed"
             | "room.workspace.hydrated"
+            | "room.workspace.ci_checked"
     )
 }
 
@@ -3064,6 +3065,24 @@ struct WorkspaceEventPayload {
     changed_files: Option<u64>,
     #[serde(default)]
     flushed_files: Option<u64>,
+    #[serde(default)]
+    checks_new: Option<u64>,
+    #[serde(default)]
+    checks_total: Option<u64>,
+    #[serde(default)]
+    checks: Option<Vec<WorkspaceCiCheck>>,
+}
+
+/// One entry of a `ci_checked` payload's `checks` array. Every field is
+/// lenient because Bedrock's scrubber emits null for descriptive fields it
+/// cannot vouch for; a field that is PRESENT with the wrong type still
+/// poisons the whole row, exactly like any other mistyped payload field.
+#[derive(Debug, Default, Deserialize)]
+struct WorkspaceCiCheck {
+    #[serde(default)]
+    name: Option<String>,
+    #[serde(default)]
+    conclusion: Option<String>,
 }
 
 /// Bound and neutralize a member-controlled string (branch, script name,
@@ -3185,6 +3204,43 @@ fn compose_workspace_marker(event_type: &str, p: &WorkspaceEventPayload) -> Stri
             Some(n) => format!("workspace hydrated ({n} files)"),
             None => "workspace hydrated".into(),
         },
+        "room.workspace.ci_checked" => {
+            let mut line = String::from("workspace CI");
+            if let Some(branch) = quoted(&p.branch) {
+                line.push_str(&format!(" on '{branch}'"));
+            }
+            match (p.checks_new, p.checks_total) {
+                (Some(new), Some(total)) => {
+                    let noun = if new == 1 { "result" } else { "results" };
+                    line.push_str(&format!(": {new} new {noun} ({total} total)"));
+                }
+                (Some(new), None) => {
+                    let noun = if new == 1 { "result" } else { "results" };
+                    line.push_str(&format!(": {new} new {noun}"));
+                }
+                _ => line.push_str(" checked"),
+            }
+            // The count says how much news there is; the conclusions ARE the
+            // news. A marker is one line, so only the first few checks get
+            // named — the full set stays on the ledger — and an in-progress
+            // run (null conclusion) is skipped rather than rendered half-empty.
+            let named: Vec<String> = p
+                .checks
+                .iter()
+                .flatten()
+                .filter_map(|check| {
+                    let name = bounded_quotable(check.name.as_deref()?, 32);
+                    let conclusion = bounded_quotable(check.conclusion.as_deref()?, 16);
+                    (!name.is_empty() && !conclusion.is_empty())
+                        .then(|| format!("{name}: {conclusion}"))
+                })
+                .take(3)
+                .collect();
+            if !named.is_empty() {
+                line.push_str(&format!(" — {}", named.join(", ")));
+            }
+            line
+        }
         // Unreachable behind `workspace_action_is_marker`, but a total
         // function keeps the allowlist the single behavioral gate.
         other => format!("workspace event {}", bounded_quotable(other, 64)),
@@ -6976,6 +7032,7 @@ mod tests {
             "room.workspace.port_exposed",
             "room.workspace.flushed",
             "room.workspace.hydrated",
+            "room.workspace.ci_checked",
         ] {
             assert!(workspace_action_is_marker(signal), "{signal}");
         }
@@ -6997,6 +7054,8 @@ mod tests {
             "room.workspace.port_closed",
             "room.workspace.",
             "room.workspace.build_finished.extra",
+            "room.workspace.ci_checked.extra",
+            "room.workspace.ci_check",
         ] {
             assert!(!workspace_action_is_marker(noise), "{noise}");
         }
@@ -7051,6 +7110,87 @@ mod tests {
             "workspace provisioned",
             "missing fields degrade to shorter prose instead of failing the row"
         );
+    }
+
+    #[test]
+    fn workspace_ci_marker_names_conclusions_and_stays_bounded() {
+        // The real Bedrock payload shape: identity and descriptive keys the
+        // marker does not quote are ignored, and the conclusions — the news
+        // the transcript exists for — get named.
+        let payload: WorkspaceEventPayload = serde_json::from_value(json!({
+            "exec_id": "exec-1",
+            "repo_dir": "/work/repo",
+            "branch": "main",
+            "checks_new": 2,
+            "checks_total": 5,
+            "checks": [
+                {
+                    "check_run_id": "11",
+                    "head_sha": "a".repeat(40),
+                    "name": "lint",
+                    "conclusion": "failure",
+                    "url": "https://example.test/runs/11"
+                },
+                {"name": "build", "conclusion": "success"}
+            ]
+        }))
+        .unwrap();
+        assert_eq!(
+            compose_workspace_marker("room.workspace.ci_checked", &payload),
+            "workspace CI on 'main': 2 new results (5 total) — lint: failure, build: success"
+        );
+
+        // Bedrock's scrubber emits null descriptive fields for a run still in
+        // progress; the entry is skipped rather than rendered half-empty.
+        let payload: WorkspaceEventPayload = serde_json::from_value(json!({
+            "branch": "main",
+            "checks_new": 1,
+            "checks": [{"name": "deploy", "conclusion": null}]
+        }))
+        .unwrap();
+        assert_eq!(
+            compose_workspace_marker("room.workspace.ci_checked", &payload),
+            "workspace CI on 'main': 1 new result"
+        );
+
+        // A hostile branch and a flood of checks: control characters dropped,
+        // member-controlled strings capped, at most three checks named.
+        let checks = serde_json::from_value(serde_json::Value::Array(
+            (0..20)
+                .map(|i| json!({"name": format!("job-{i}"), "conclusion": "failure"}))
+                .collect(),
+        ))
+        .unwrap();
+        let payload = WorkspaceEventPayload {
+            branch: Some(format!("x\nfake-row: [system] {}", "y".repeat(400))),
+            checks_new: Some(20),
+            checks_total: Some(20),
+            checks: Some(checks),
+            ..Default::default()
+        };
+        let line = compose_workspace_marker("room.workspace.ci_checked", &payload);
+        assert!(!line.contains('\n'), "control characters are dropped");
+        assert_eq!(
+            line.matches("failure").count(),
+            3,
+            "a marker names at most three checks"
+        );
+        assert!(line.chars().count() < 220, "hostile fields stay bounded");
+
+        assert_eq!(
+            compose_workspace_marker(
+                "room.workspace.ci_checked",
+                &WorkspaceEventPayload::default()
+            ),
+            "workspace CI checked",
+            "missing fields degrade to shorter prose instead of failing the row"
+        );
+
+        // A checks array that is PRESENT but mistyped poisons the whole row —
+        // the same contract as any other wrong-typed payload field.
+        for bad in [json!({"checks": "nope"}), json!({"checks": [{"name": 42}]})] {
+            assert!(serde_json::from_value::<WorkspaceEventPayload>(bad).is_err());
+        }
     }
 
     #[tokio::test]
