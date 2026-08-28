@@ -574,6 +574,28 @@ POST   /v1/rooms/persistent/{key}/invites                 bootstrap owner if Loc
 POST   /v1/rooms/persistent/invites/redeem                restart-safe redeem/self-join { code }; raw RoomAccessProjection 200
 POST   /v1/rooms/persistent/{key}/members/agents          register safe local agent descriptors { agent_names }; raw RoomAccessProjection 200
 
+# Room workspace — the membership-gated lane to the room's Bedrock container.
+# The room's Bedrock bearer NEVER leaves the daemon: a client asserts a roster participant in
+# ?actor_id= and the daemon supplies the credential and the upstream actor_member_id itself.
+# Three registrations carry seven upstream calls; WORKSPACE_ALLOWLIST in
+# crates/ocean-daemon/src/room_workspace_proxy.rs is the exposed surface, and Bedrock's own
+# gateWorkspaceAccess still runs on every forwarded call. Deliberately NOT exposed: workspace
+# provision/destroy and repo bind/unbind (all owner-only upstream — the daemon presents the
+# credential's bearer, so Bedrock's requireRoomOwner would answer for the local human no matter
+# which roster id the caller asserted), workspace/secrets, workspace/file (raw bytes), mkdir,
+# flush, hydrate, and port exposure. Binding a repo to a room stays an operator/owner act; every
+# member may read, clone, and build the binding an owner already made.
+GET    /v1/rooms/persistent/{key}/workspace               room container status (?actor_id=); Bedrock's status body and code relayed verbatim
+GET    /v1/rooms/persistent/{key}/workspace/{*leaf}       reads (?actor_id=): leaf `list` (?path=), `execs` (?limit=), `repo`
+POST   /v1/rooms/persistent/{key}/workspace/{*leaf}       commands (?actor_id=, JSON object body): leaf `exec`, `repo/clone`, `repo/build`. Any client-supplied actor_member_id is stripped and the daemon inserts its own. 403 forged_workspace_actor for a claimed Agent/System identity, 413 workspace_request_too_large over 32 KiB. The daemon waits 960s on these — above Bedrock's own 900s EXEC_TIMEOUT_MAX — so a long `npm test` or build is relayed rather than refused; reads wait 15s
+# Shared refusals on every workspace call, all fail-closed with nothing forwarded: 400
+# invalid_request (no ?actor_id= or a non-object body), 403 not_a_room_member, 403
+# room_access_revoked, 404 room_not_found, 404 workspace_route_not_allowed (a method+leaf the
+# allowlist does not name), 409 room_not_federated (the room has no Bedrock credential), 502
+# workspace_upstream_protocol (unparseable or over-large upstream reply; the relay bound is
+# 4 MiB, six times Bedrock's own 2x256 KiB exec output cap because JSON escaping can cost six
+# wire bytes per source byte), 503 workspace_unavailable.
+
 # Room media — retained independently from the retired projection API
 POST   /v1/rooms/{room_id}/livekit-token                  mint a LiveKit join token for web in-room voice/video
 

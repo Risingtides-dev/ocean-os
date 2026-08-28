@@ -164,6 +164,10 @@ mod room_federation;
 mod room_operator;
 /// One-shot room-transcript summary into the room's well-known artifact.
 mod room_summary;
+/// Membership-gated lane from a browser to a room's Bedrock workspace: an
+/// allowlist of upstream calls, a roster gate, and daemon-side actor
+/// attribution, so the room's bearer never leaves this process.
+mod room_workspace_proxy;
 /// Host fulfillment lifecycle retained for the external `ocean-slack` extension.
 mod slack_canvas_fulfillment;
 /// Ephemeral OpenAI Realtime client-secret mint (voice phases 2/3) — the
@@ -1583,6 +1587,9 @@ fn banner_routes() -> &'static [&'static str] {
         "GET /v1/rooms/persistent/{key}/read-cursor",
         "PATCH /v1/rooms/persistent/{key}/read-cursor",
         "POST /v1/rooms/persistent/{key}/outbox/retry",
+        "GET /v1/rooms/persistent/{key}/workspace",
+        "GET /v1/rooms/persistent/{key}/workspace/{*leaf}",
+        "POST /v1/rooms/persistent/{key}/workspace/{*leaf}",
         "GET /v1/sessions",
         "GET /v1/sessions/{id}",
         "POST /v1/sessions/{id}/compact",
@@ -2984,6 +2991,32 @@ fn room_routes() -> Router<AppState> {
         .route(
             "/v1/rooms/persistent/{key}/outbox/retry",
             post(room_retry_outbox),
+        )
+        // The room's Bedrock workspace, membership-gated so the room's bearer
+        // stays in this process. Three registrations, not one per upstream
+        // route: the leaf travels on the wire and `room_workspace_proxy`'s
+        // allowlist is what decides whether it becomes a call at all, so the
+        // gate is exercised by every request rather than implied by which
+        // handler got matched. Neither PUT nor DELETE is registered — the only
+        // upstream routes wanting them are repo bind and unbind, which are
+        // owner-only upstream and deliberately absent from the allowlist.
+        //
+        // `DefaultBodyLimit` for the same reason attachments needs one: the
+        // handler's own 32 KiB refusal would otherwise be preceded by axum's
+        // untyped 2 MiB rejection for anything in between. Cap + slack so a body
+        // a little over gets the typed answer and a huge one is never buffered.
+        .route(
+            "/v1/rooms/persistent/{key}/workspace",
+            get(room_workspace_proxy::room_workspace_status),
+        )
+        .route(
+            "/v1/rooms/persistent/{key}/workspace/{*leaf}",
+            get(room_workspace_proxy::room_workspace_read)
+                .post(room_workspace_proxy::room_workspace_command)
+                .layer(DefaultBodyLimit::max(
+                    room_workspace_proxy::WORKSPACE_REQUEST_LIMIT
+                        + room_workspace_proxy::BODY_LIMIT_SLACK,
+                )),
         )
         .route(
             "/v1/rooms/{room_id}/livekit-token",
@@ -25333,9 +25366,17 @@ mod tests {
         // GET+DELETE /attachments/{attachment_id} — the room's context files.
         // 108 -> 109: on-demand transcript summary added POST
         // /v1/rooms/persistent/{key}/summarize.
+        // 109 -> 112: the room workspace lane added GET /workspace plus
+        // GET+POST /workspace/{*leaf}. THREE registrations carry SEVEN upstream
+        // calls, because the leaf arrives on the wire and
+        // `room_workspace_proxy::WORKSPACE_ALLOWLIST` is what decides whether it
+        // becomes one — this count is therefore NOT the size of the Bedrock
+        // surface being exposed. That tripwire lives beside the table, in
+        // `the_allowlist_is_the_whole_reachable_surface`; both have to move
+        // together when the lane grows.
         assert_eq!(
             banner.len(),
-            109,
+            112,
             "route baseline changed; review the manifest"
         );
 
