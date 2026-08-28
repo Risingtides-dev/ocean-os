@@ -6772,3 +6772,29 @@ the comment already promises a fall back to the id that the code does not do.
 The docs say the response carries the header rather than that it always does,
 so this change writes no fresh false claim. No migration, no deploy. PR #379.
 _________________________________________________________________________________
+
+time:      [03:36] [08-28-26]
+agent:     [claude] [fable 5]
+worktree:  loop/attachment-marker-has-no-id
+type:      [merge]
+area:      [backend]
+
+Wave 6 landed the attachment-marker id. The upload and removal transcript
+markers were plain prose, so nothing could link a transcript row to its file —
+filename correlation is ambiguous under duplicate names and deletions, and the
+inline-media slice was blocked on exactly this. RoomMessage now carries
+attachment_id: Option<String> on the session_id precedent (serde default +
+skip_serializing_if, so old rows read None and None never serializes);
+ocean-store threads the column through CREATE TABLE, an introspection-driven
+ALTER beside the G1 path, and MESSAGE_ROW_COLUMNS in trailing position; a
+documented attachment_marker constructor is used only by add_attachment and
+remove_attachment so every other marker stays None. A pre-attachment-era DB
+migration test mirrors the G1 one. The id is server-minted and the marker
+still lands in the same transaction as the attachment row. Reviewer
+mutation-tested the wiring: NULLing the insert binding fails the upload and
+migration tests at their promised assertions. Wire-safe: ocean-surface's
+message decode has no deny_unknown_fields. Verified at land on 98c681f4,
+toolchain 1.97.0: 226/51/780/177 tests 0 failed, clippy -D warnings clean,
+fmt clean. Unblocks inline-media. No migration of production data, no deploy
+decision. PR #385.
+_________________________________________________________________________________
