@@ -47,6 +47,19 @@ const REVOKED_STORE_SENTINEL: &str = "room access revoked";
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 const READ_TIMEOUT: Duration = Duration::from_secs(35);
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(15);
+/// Read-stall bound for the long room-scoped lane, and the ceiling on what
+/// [`FederationSupervisor::send_room_scoped`] may be asked to wait for.
+///
+/// `READ_TIMEOUT` is a stall detector for the control plane and for the SSE
+/// stream, where bytes keep arriving and 35s of silence means a dead peer. On a
+/// workspace command nothing arrives at all until the container has finished
+/// the command AND flushed itself back to Bedrock, so silence there is the
+/// ordinary case. Bedrock runs a command for up to `EXEC_TIMEOUT_MAX_MS` — 900s
+/// (`src/compute/driver.mjs`) — so a lane cutting in under that would refuse
+/// work the upstream was still legally doing. Hence a second client rather than
+/// a longer `READ_TIMEOUT`: raising the shared one would blind the SSE stream
+/// to a peer that really has gone away.
+pub(super) const ROOM_SCOPED_READ_TIMEOUT: Duration = Duration::from_secs(1_020);
 const BODY_LIMIT: usize = 64 * 1024;
 /// Ceiling on a single raw frame from a room's SSE stream.
 ///
@@ -93,6 +106,24 @@ enum BridgeError {
     Protocol,
     Store,
     Revoked,
+}
+
+/// What one room-scoped call may spend: bytes off the wire, and seconds on the
+/// clock.
+///
+/// One type rather than two arguments because it is one policy — what a
+/// legitimate answer to THIS route costs — and only the caller that knows the
+/// route can size either half.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct RelayBudget {
+    /// Ceiling on the JSON read back. Nothing streams; a reply over this is a
+    /// protocol error rather than a truncation.
+    pub(super) body_limit: usize,
+    /// How long to wait for the answer. Must not exceed
+    /// [`ROOM_SCOPED_READ_TIMEOUT`], or this transport's own read bound cuts
+    /// the call first and the number here is a fiction. The workspace lane
+    /// checks that relationship at compile time.
+    pub(super) timeout: Duration,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -333,6 +364,9 @@ impl RawSseEventBound {
 struct FederationClient {
     base: Url,
     http: Client,
+    /// The same origin and the same hardening, differing only in how long a
+    /// silent socket is allowed to stay silent. See [`ROOM_SCOPED_READ_TIMEOUT`].
+    room_scoped_http: Client,
 }
 
 impl FederationClient {
@@ -378,7 +412,17 @@ impl FederationClient {
             .read_timeout(READ_TIMEOUT)
             .build()
             .map_err(|_| BridgeError::InvalidConfig)?;
-        Ok(Self { base, http })
+        let room_scoped_http = Client::builder()
+            .redirect(Policy::none())
+            .connect_timeout(CONNECT_TIMEOUT)
+            .read_timeout(ROOM_SCOPED_READ_TIMEOUT)
+            .build()
+            .map_err(|_| BridgeError::InvalidConfig)?;
+        Ok(Self {
+            base,
+            http,
+            room_scoped_http,
+        })
     }
 
     fn endpoint(&self, segments: &[&str]) -> Result<Url, BridgeError> {
@@ -866,6 +910,74 @@ impl FederationSupervisor {
             .entry(key.clone())
             .or_insert_with(|| Arc::new(RoomSlot::default()))
             .clone()
+    }
+
+    /// Forward one ALREADY-AUTHORIZED room-scoped call to Bedrock on that
+    /// room's own credential.
+    ///
+    /// Authorization belongs to the caller; this is transport, and the two
+    /// things it guarantees are custody and confinement. Custody: the bearer is
+    /// read out of the credential here and never leaves — not into a log, an
+    /// error, or the returned value. Confinement: the URL is built from the
+    /// credential's OWN room id, so no shape of `leaf_segments` can address
+    /// another room's compute, and `endpoint` percent-encodes every segment so
+    /// a leaf cannot climb out of the room prefix either.
+    ///
+    /// The [`RelayBudget`] is the caller's rather than `BODY_LIMIT` and
+    /// `REQUEST_TIMEOUT` because callers differ in what a legitimate answer
+    /// costs, in bytes and in seconds alike. A ledger row is bounded by what
+    /// this daemon will put on the wire and answers in one round trip; a
+    /// workspace command's answer is bounded by Bedrock's own output cap, and
+    /// arrives only once a container has run the command and flushed itself
+    /// back.
+    pub(super) async fn send_room_scoped(
+        &self,
+        credential: &RoomCredential,
+        method: reqwest::Method,
+        leaf_segments: &[&str],
+        query: &[(&str, String)],
+        body: Option<&Value>,
+        budget: RelayBudget,
+    ) -> Result<(StatusCode, Value), IntentError> {
+        let client = self.inner.client.clone().ok_or(IntentError::Unavailable)?;
+        let mut segments = vec!["api", "v1", "rooms", credential.room_id.as_str()];
+        segments.extend_from_slice(leaf_segments);
+        let url = client
+            .endpoint(&segments)
+            .map_err(|_| IntentError::Unavailable)?;
+        let mut request = client
+            .room_scoped_http
+            .request(method, url)
+            .timeout(budget.timeout)
+            .bearer_auth(&credential.bearer_token);
+        if !query.is_empty() {
+            request = request.query(query);
+        }
+        if let Some(body) = body {
+            request = request.json(body);
+        }
+        // Admitted, not unadmitted: a revoked room closes its gate, and a
+        // workspace command is exactly the kind of side effect that must not
+        // start after the close a revoke already linearized.
+        let slot = self.slot_for(&credential.room_id).await;
+        let response = match slot.control.send(request, &self.inner.shutdown).await {
+            AdmittedSend::Response(Ok(response)) => response,
+            AdmittedSend::Response(Err(_)) | AdmittedSend::Cancelled => {
+                return Err(IntentError::Unavailable)
+            }
+            AdmittedSend::Closed => return Err(IntentError::Forbidden),
+        };
+        let status = response.status();
+        // Redirects are disabled on this client, so a 3xx here is an upstream
+        // that is not the Bedrock we configured. There is no JSON to relay, and
+        // following the Location would take the bearer somewhere unvetted.
+        if status.is_informational() || status.is_redirection() {
+            return Err(IntentError::Protocol);
+        }
+        let payload: Value = read_bounded_json(response, budget.body_limit)
+            .await
+            .map_err(|_| IntentError::Protocol)?;
+        Ok((status, payload))
     }
 
     pub(super) async fn enqueue_federated_message(
