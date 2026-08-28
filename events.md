@@ -6725,3 +6725,50 @@ defensible and the §7 model is genuinely unimplemented, but a builder narrowing
 the prohibition covering its own change is above the builder's level, so both
 bullets are marked NOT YET RATIFIED with the revert named.
 _________________________________________________________________________________
+
+time:      [20:50] [08-27-26]
+agent:     [claude] [opus 5]
+worktree:  loop/attachment-content-sniff
+type:      [feature-request]
+area:      [backend]
+
+Made a room's screenshot renderable without starting to trust the uploader. A
+download was hardcoded to application/octet-stream, which is what made it safe
+and also what meant an image could not render from an <img src> — the module's
+own doc named this slice as the fix. sniff_image_content_type reads the leading
+bytes of the blob read_verified_blob has already checked against the row's
+length and sha256, and answers from a closed allowlist of four non-scriptable
+raster signatures: PNG, JPEG, GIF, WebP. SVG is deliberately absent and must
+stay absent — it is the one image format that can carry <script>, and it has no
+magic bytes to recognise it by, so admitting it would mean trusting the
+declaration. nosniff stays on unconditionally in every branch, which is what
+keeps a derived type a convenience rather than an escalation. The bytes come
+from the existing read, so there is no second blob read and no second
+derivation of the hashed room directory: #378's traversal defence still has one
+implementation. Content-Disposition: attachment stays on the sniffed branch,
+because a browser renders an <img src> subresource regardless and keeping it
+buys the top-level-navigation defence for free.
+
+Review's finding was not about the code, which it verified byte-for-byte, but
+about three contract surfaces the change made false. crates/ocean-daemon/AGENTS.md
+still told the next cold agent that a derived type is a violation to revert;
+docs/OCEAN_RUNTIME_OPERATOR_GUIDE.md is the wire contract main.rs names, and its
+parity test compares only method+path pairs, so prose drift passes the gate
+silently — which is why 762 green tests said nothing about a Content-Type line
+that no longer matched the handler; and the ocean-store schema comment carried
+the same absolute on the column that causes it. All three now state the real
+invariant: the DECLARATION is never served. Fixed as prose only, in a separate
+commit, so the verified tree stayed intact in history.
+
+Verified at land: cargo test -p ocean-daemon 762 passed / 0 failed, clippy
+--all-targets -D warnings exit 0, cargo fmt --check exit 0, toolchain 1.97.0.
+Load-bearing: rewriting the handler line to discard the sniff while keeping the
+function alive takes an_image_is_served_the_type_its_own_bytes_prove red, and
+that test drives the real room_download_attachment handler rather than the
+private function. Known and left standing: sanitize_filename keeps non-ASCII
+while HeaderValue::from_str rejects it, so an attachment named "café.png" is
+served with no Content-Disposition at all — pre-existing from 7d8aa80f, where
+the comment already promises a fall back to the id that the code does not do.
+The docs say the response carries the header rather than that it always does,
+so this change writes no fresh false claim. No migration, no deploy. PR #379.
+_________________________________________________________________________________
