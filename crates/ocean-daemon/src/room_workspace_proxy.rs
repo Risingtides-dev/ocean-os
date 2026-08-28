@@ -14,7 +14,7 @@
 //!    `(method, leaf)`. Anything it does not name is refused with a typed code
 //!    and no request leaves the daemon. Bedrock's compute surface is much wider
 //!    than what is named here — provision, destroy, repo bind, repo unbind,
-//!    file read/write/delete, mkdir, flush, hydrate, port exposure, and
+//!    file write/delete, mkdir, flush, hydrate, port exposure, and
 //!    `workspace/secrets` all exist upstream and are all absent on purpose.
 //!    Secrets in particular: even the NAME list is room configuration, and a
 //!    caller-asserted lane is not where that belongs. Provision, destroy, and
@@ -27,10 +27,13 @@
 //!    case — an allowlist row for bind would hand every roster participant the
 //!    authority to repoint the whole room's compute at an arbitrary remote.
 //!    Cloning and building what an owner already bound is a member act and
-//!    stays; choosing what the room builds is not. `workspace/file` answers
-//!    with raw bytes rather than JSON and needs the content-type discipline
-//!    `room_attachments.rs` already worked out for downloads — its own slice,
-//!    not a line in this table.
+//!    stays; choosing what the room builds is not. `workspace/file` is the one
+//!    row whose upstream 2xx is raw bytes rather than JSON; it rides this lane
+//!    as a bounded JSON PROJECTION — text-vs-binary derived from the bytes in
+//!    hand, never from Bedrock's extension-derived `content-type` — so no byte
+//!    ever reaches a browser as a document and no type is ever declared to it,
+//!    which is why the download discipline `room_attachments.rs` worked out is
+//!    not needed here. File WRITE and DELETE stay absent.
 //! 2. **The membership gate.** The caller asserts a room participant in
 //!    `?actor_id=`; that claim is checked against the roster inside the SAME
 //!    store guard that reads the credential, so a concurrent roster replacement
@@ -49,14 +52,14 @@
 //! What this module does not own: SQL (that is `ocean-store`), compute
 //! semantics (that is Bedrock, whose `gateWorkspaceAccess` still runs on every
 //! forwarded call — this lane narrows, it never substitutes), and the HTTP
-//! client (that is `room_federation.rs`, through the single `send_room_scoped`
-//! seam, whose longer-waiting client is built beside the control-plane one and
-//! hardened identically). There is no `reqwest::Client` here and there must not
-//! be one.
+//! client (that is `room_federation.rs`, through the sibling `send_room_scoped`
+//! and `send_room_scoped_raw` seams — one shared request path — whose
+//! longer-waiting client is built beside the control-plane one and hardened
+//! identically). There is no `reqwest::Client` here and there must not be one.
 //!
 //! The room key never becomes a path component locally, but it does become one
-//! upstream; `send_room_scoped` builds that path from the CREDENTIAL's room id
-//! rather than from anything on the wire, so the confinement holds even if this
+//! upstream; both seams build that path from the CREDENTIAL's room id rather
+//! than from anything on the wire, so the confinement holds even if this
 //! module were wrong about which room it is talking about.
 
 use std::{collections::HashMap, time::Duration};
@@ -72,7 +75,7 @@ use ocean_store::{RoomCredential, RoomStore};
 use serde_json::{json, Value};
 
 use crate::persistent_rooms::with_rooms;
-use crate::room_federation::{IntentError, RelayBudget, ROOM_SCOPED_READ_TIMEOUT};
+use crate::room_federation::{IntentError, RawReply, RelayBudget, ROOM_SCOPED_READ_TIMEOUT};
 use crate::AppState;
 
 /// Ceiling on a Bedrock workspace reply the daemon will relay.
@@ -111,6 +114,19 @@ pub(super) const WORKSPACE_REQUEST_LIMIT: usize = 32 * 1024;
 /// body a little over the cap still reaches the handler and gets the typed JSON
 /// rejection instead of axum's untyped 413.
 pub(super) const BODY_LIMIT_SLACK: usize = 4096;
+
+/// Ceiling on the file bytes one `workspace/file` relay will read, and the
+/// ONLY bound in the chain: Bedrock's handler buffers the whole file, the
+/// local driver `readFile`s it whole, and the runtime's `/v1/files/read`
+/// base64-encodes it whole — none of them cap anything. A file past this is
+/// therefore a legitimate workspace state rather than an upstream fault; it
+/// earns the typed `workspace_file_too_large` refusal, never the 502 a broken
+/// peer earns, and it is never truncated — a panel showing most of a file as
+/// if it were all of it would be lying. 1 MiB is generous for the source files
+/// a panel opens, and worth bounding well under the exec relay bound: the
+/// UTF-8 projection is JSON-escaped, so one file byte can cost six on the
+/// browser-facing wire.
+const WORKSPACE_FILE_LIMIT: usize = 1024 * 1024;
 
 /// Bedrock's own exec output cap, applied to stdout AND stderr separately
 /// (`EXEC_OUTPUT_CAP_BYTES` in ocean-bedrock's `src/compute/driver.mjs`).
@@ -187,6 +203,11 @@ struct WorkspaceCall {
     /// including `actor_id`, which is this daemon's parameter and means nothing
     /// to Bedrock.
     query: &'static [&'static str],
+    /// What this route's 2xx body is made of, and therefore which transport
+    /// seam carries it. Bedrock's refusals are ordinary JSON `HttpError`
+    /// bodies on EVERY route, which is what lets the raw arm still relay
+    /// `workspace_absent` and friends verbatim.
+    reply: UpstreamReply,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -202,6 +223,19 @@ impl UpstreamMethod {
             Self::Post => reqwest::Method::POST,
         }
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum UpstreamReply {
+    /// JSON: Bedrock's status and body relay verbatim.
+    Json,
+    /// Raw file bytes on a 2xx: read bounded and projected into JSON here.
+    /// Whether the content rides as text or base64 is derived from the BYTES
+    /// (`std::str::from_utf8`) — Bedrock's `content-type` on this route comes
+    /// from the file EXTENSION (`contentTypeFor`), and this daemon acts on
+    /// bytes, never declarations (`room_context.rs`: text is DERIVED, never
+    /// declared).
+    FileProjection,
 }
 
 /// The allowlist, as a table so the whole reachable surface is one screen.
@@ -222,6 +256,7 @@ const WORKSPACE_ALLOWLIST: &[(&str, &str, WorkspaceCall)] = &[
             write: false,
             attributed: false,
             query: &[],
+            reply: UpstreamReply::Json,
         },
     ),
     (
@@ -234,6 +269,23 @@ const WORKSPACE_ALLOWLIST: &[(&str, &str, WorkspaceCall)] = &[
             write: false,
             attributed: false,
             query: &["path"],
+            reply: UpstreamReply::Json,
+        },
+    ),
+    (
+        "GET",
+        "file",
+        WorkspaceCall {
+            upstream: UpstreamMethod::Get,
+            segments: &["workspace", "file"],
+            timeout: WORKSPACE_READ_TIMEOUT,
+            write: false,
+            attributed: false,
+            // `path` only: Bedrock's `inline` key steers the
+            // content-disposition of a raw download, and this lane never
+            // answers one.
+            query: &["path"],
+            reply: UpstreamReply::FileProjection,
         },
     ),
     (
@@ -246,6 +298,7 @@ const WORKSPACE_ALLOWLIST: &[(&str, &str, WorkspaceCall)] = &[
             write: false,
             attributed: false,
             query: &["limit"],
+            reply: UpstreamReply::Json,
         },
     ),
     (
@@ -258,6 +311,7 @@ const WORKSPACE_ALLOWLIST: &[(&str, &str, WorkspaceCall)] = &[
             write: false,
             attributed: false,
             query: &[],
+            reply: UpstreamReply::Json,
         },
     ),
     (
@@ -270,6 +324,7 @@ const WORKSPACE_ALLOWLIST: &[(&str, &str, WorkspaceCall)] = &[
             write: true,
             attributed: true,
             query: &[],
+            reply: UpstreamReply::Json,
         },
     ),
     // Clone and build run against the remote an owner already chose, which is
@@ -285,6 +340,7 @@ const WORKSPACE_ALLOWLIST: &[(&str, &str, WorkspaceCall)] = &[
             write: true,
             attributed: true,
             query: &[],
+            reply: UpstreamReply::Json,
         },
     ),
     (
@@ -297,6 +353,7 @@ const WORKSPACE_ALLOWLIST: &[(&str, &str, WorkspaceCall)] = &[
             write: true,
             attributed: true,
             query: &[],
+            reply: UpstreamReply::Json,
         },
     ),
 ];
@@ -499,27 +556,119 @@ async fn forward(
         .filter_map(|name| params.get(*name).map(|value| (*name, value.clone())))
         .collect();
 
+    match call.reply {
+        UpstreamReply::Json => {
+            match state
+                .room_federation
+                .send_room_scoped(
+                    &credential,
+                    call.upstream.as_reqwest(),
+                    call.segments,
+                    &query,
+                    body.as_ref(),
+                    RelayBudget {
+                        body_limit: WORKSPACE_RESPONSE_LIMIT,
+                        timeout: call.timeout,
+                    },
+                )
+                .await
+            {
+                // Bedrock's own status and typed body are relayed verbatim: its
+                // `workspace_absent` / `repo_not_cloned` / `repo_cloning` codes
+                // are the whole reason a UI can say something useful, and
+                // re-coding them here would only lose information. No upstream
+                // HEADER is relayed.
+                Ok((status, payload)) => (status, Json(payload)).into_response(),
+                Err(error) => intent_error_response(error),
+            }
+        }
+        UpstreamReply::FileProjection => {
+            let path = params.get("path").cloned().unwrap_or_default();
+            relay_file_projection(&state, &credential, &call, &query, &path).await
+        }
+    }
+}
+
+/// The raw arm of [`forward`]: read `workspace/file`'s mixed-mode answer — raw
+/// bytes on a 2xx, an ordinary JSON refusal otherwise — and turn the bytes
+/// into the JSON a browser is allowed to see.
+async fn relay_file_projection(
+    state: &AppState,
+    credential: &RoomCredential,
+    call: &WorkspaceCall,
+    query: &[(&str, String)],
+    path: &str,
+) -> Response {
     match state
         .room_federation
-        .send_room_scoped(
-            &credential,
+        .send_room_scoped_raw(
+            credential,
             call.upstream.as_reqwest(),
             call.segments,
-            &query,
-            body.as_ref(),
+            query,
             RelayBudget {
-                body_limit: WORKSPACE_RESPONSE_LIMIT,
+                body_limit: WORKSPACE_FILE_LIMIT,
                 timeout: call.timeout,
             },
         )
         .await
     {
-        // Bedrock's own status and typed body are relayed verbatim: its
-        // `workspace_absent` / `repo_not_cloned` / `repo_cloning` codes are the
-        // whole reason a UI can say something useful, and re-coding them here
-        // would only lose information. No upstream HEADER is relayed.
-        Ok((status, payload)) => (status, Json(payload)).into_response(),
+        Ok((status, RawReply::Body(bytes))) if status.is_success() => {
+            (status, Json(project_file(path, &bytes))).into_response()
+        }
+        // A refusal on this route is a JSON `HttpError` body like every other
+        // route's, and it relays verbatim for the same reason theirs do:
+        // `workspace_absent` and Bedrock's own path 400s are what let a panel
+        // say something useful.
+        Ok((status, RawReply::Body(bytes))) => match serde_json::from_slice::<Value>(&bytes) {
+            Ok(payload) => (status, Json(payload)).into_response(),
+            Err(_) => intent_error_response(IntentError::Protocol),
+        },
+        // Over the cap on a SUCCESS is the legitimate big file the bound
+        // exists for; over the cap on a refusal body is a peer this daemon
+        // does not recognise as Bedrock.
+        Ok((status, RawReply::OverCap)) if status.is_success() => (
+            StatusCode::PAYLOAD_TOO_LARGE,
+            Json(json!({
+                "ok": false,
+                "code": "workspace_file_too_large",
+                "error": "this file is larger than the 1 MiB the daemon will relay; nothing was truncated",
+            })),
+        )
+            .into_response(),
+        Ok((_, RawReply::OverCap)) => intent_error_response(IntentError::Protocol),
         Err(error) => intent_error_response(error),
+    }
+}
+
+/// What a workspace file becomes on this lane. Text-vs-binary is decided by
+/// decoding the bytes in hand, never by the extension-derived `content-type`
+/// Bedrock sent; binary rides as base64 rather than being refused, because
+/// which files a member may open is Bedrock's call and this lane only decides
+/// representation. `size` is the byte count BEFORE encoding, so a client can
+/// show it without decoding, and `path` echoes what the caller asked —
+/// Bedrock's normalized form of it lives in its own `list` rows. There is no
+/// `truncated` field on purpose: a file past the bound is refused whole, never
+/// clipped.
+fn project_file(path: &str, bytes: &[u8]) -> Value {
+    match std::str::from_utf8(bytes) {
+        Ok(text) => json!({
+            "ok": true,
+            "path": path,
+            "size": bytes.len(),
+            "encoding": "utf8",
+            "content": text,
+        }),
+        Err(_) => {
+            use base64::Engine as _;
+            json!({
+                "ok": true,
+                "path": path,
+                "size": bytes.len(),
+                "encoding": "base64",
+                "content": base64::engine::general_purpose::STANDARD.encode(bytes),
+            })
+        }
     }
 }
 
@@ -653,13 +802,7 @@ mod tests {
         }
     }
 
-    async fn record_call(
-        State(seen): State<Seen>,
-        method: Method,
-        uri: Uri,
-        headers: HeaderMap,
-        body: Bytes,
-    ) -> Json<Value> {
+    fn record(seen: &Seen, method: &Method, uri: &Uri, headers: &HeaderMap, body: &Bytes) {
         seen.calls.lock().unwrap().push(SeenCall {
             method: method.to_string(),
             path: uri.path().to_string(),
@@ -668,9 +811,78 @@ mod tests {
                 .get(axum::http::header::AUTHORIZATION)
                 .and_then(|value| value.to_str().ok())
                 .map(str::to_string),
-            body: serde_json::from_slice(&body).unwrap_or(Value::Null),
+            body: serde_json::from_slice(body).unwrap_or(Value::Null),
         });
+    }
+
+    async fn record_call(
+        State(seen): State<Seen>,
+        method: Method,
+        uri: Uri,
+        headers: HeaderMap,
+        body: Bytes,
+    ) -> Json<Value> {
+        record(&seen, &method, &uri, &headers, &body);
         Json(json!({"ok": true}))
+    }
+
+    /// What the fake's file leaf serves. The DECLARED types below contradict
+    /// the bytes on purpose — the text file claims `application/octet-stream`
+    /// and the binary one claims `text/plain` — so a projection that consults
+    /// the declaration instead of the bytes fails these tests.
+    const FILE_TEXT: &str = "# Ocean\n\nthe workspace panel opens this\n";
+    const FILE_BINARY: &[u8] = &[0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A, 0x00, 0xFF];
+
+    /// Bedrock's file route is MIXED-MODE — a 2xx is raw bytes with an
+    /// extension-derived content-type and a content-disposition, every refusal
+    /// an ordinary JSON `HttpError` body — so its stand-in is too, keyed on
+    /// the requested path.
+    async fn file_read_call(
+        State(seen): State<Seen>,
+        method: Method,
+        uri: Uri,
+        headers: HeaderMap,
+        body: Bytes,
+    ) -> Response {
+        record(&seen, &method, &uri, &headers, &body);
+        let query = uri.query().unwrap_or_default().to_string();
+        let raw = |content_type: &str, bytes: Vec<u8>| {
+            (
+                StatusCode::OK,
+                [
+                    (axum::http::header::CONTENT_TYPE, content_type.to_string()),
+                    (
+                        axum::http::header::CONTENT_DISPOSITION,
+                        "attachment; filename=\"x\"".to_string(),
+                    ),
+                ],
+                bytes,
+            )
+                .into_response()
+        };
+        if query.contains("path=readme.md") {
+            raw("application/octet-stream", FILE_TEXT.as_bytes().to_vec())
+        } else if query.contains("path=logo.png") {
+            raw("text/plain; charset=utf-8", FILE_BINARY.to_vec())
+        } else if query.contains("path=huge.bin") {
+            raw(
+                "application/octet-stream",
+                vec![b'x'; WORKSPACE_FILE_LIMIT + 1],
+            )
+        } else if query.contains("path=missing.txt") {
+            // The shape Bedrock's response boundary gives every HttpError.
+            (
+                StatusCode::CONFLICT,
+                Json(json!({
+                    "ok": false,
+                    "error": "This room has no workspace. Provision one first.",
+                    "details": {"code": "workspace_absent"},
+                })),
+            )
+                .into_response()
+        } else {
+            raw("text/plain; charset=utf-8", b"default".to_vec())
+        }
     }
 
     /// How long the deliberately slow leaf takes to answer, and the two
@@ -690,10 +902,12 @@ mod tests {
     }
 
     /// A Bedrock stand-in that answers every allowlisted leaf and records what
-    /// it was asked. It deliberately ALSO serves `workspace/secrets`,
-    /// `workspace/file`, and repo bind/unbind, so a test asserting those are
-    /// unreachable is proving the daemon's allowlist rather than an upstream
-    /// 404.
+    /// it was asked. It deliberately ALSO serves `workspace/secrets` and repo
+    /// bind/unbind, so a test asserting those are unreachable is proving the
+    /// daemon's allowlist rather than an upstream 404. The `file` leaf answers
+    /// the way the real route does — raw bytes on a 2xx, a JSON `HttpError`
+    /// body on a refusal — with declared content-types that contradict the
+    /// bytes; see [`file_read_call`].
     async fn start_fake_bedrock(seen: Seen) -> (String, JoinHandle<()>) {
         let app = Router::new()
             .route("/api/v1/rooms/{room}/workspace", get(record_call))
@@ -704,7 +918,7 @@ mod tests {
                 "/api/v1/rooms/{room}/workspace/secrets",
                 get(record_call).put(record_call),
             )
-            .route("/api/v1/rooms/{room}/workspace/file", get(record_call))
+            .route("/api/v1/rooms/{room}/workspace/file", get(file_read_call))
             .route("/api/v1/rooms/{room}/workspace/slow", get(slow_call))
             .route(
                 "/api/v1/rooms/{room}/workspace/repo",
@@ -903,7 +1117,8 @@ mod tests {
     /// `workspace/secrets` is the case that matters most: it exists upstream,
     /// the fake Bedrock here serves it, and it is still unreachable. `GET exec`
     /// and `POST list` prove the METHOD half of the key refuses too — a leaf
-    /// being allowlisted for one verb does not open it for another.
+    /// being allowlisted for one verb does not open it for another — and
+    /// `POST file` pins that opening the file READ did not open a write.
     ///
     /// Mutation: make `resolve_workspace_call` fall through to a constructed
     /// `WorkspaceCall` for unknown keys -> RED.
@@ -912,7 +1127,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let fixture = federated_room(&tmp).await;
 
-        for leaf in ["secrets", "file", "exec", "repo/../secrets"] {
+        for leaf in ["secrets", "exec", "repo/../secrets"] {
             let response = room_workspace_read(
                 State(fixture.state.clone()),
                 Path((fixture.key.as_str().to_string(), leaf.to_string())),
@@ -928,7 +1143,7 @@ mod tests {
             );
         }
 
-        for leaf in ["secrets", "list"] {
+        for leaf in ["secrets", "list", "file"] {
             let response = room_workspace_command(
                 State(fixture.state.clone()),
                 Path((fixture.key.as_str().to_string(), leaf.to_string())),
@@ -1070,6 +1285,148 @@ mod tests {
             "undeclared keys are dropped: {}",
             calls[0].query
         );
+
+        fixture.close();
+    }
+
+    /// The lane's first non-JSON upstream: a 2xx on `workspace/file` is raw
+    /// bytes, and what the browser receives is the daemon's JSON projection of
+    /// them — never the bytes as a document, never Bedrock's content-type. The
+    /// fake declares `application/octet-stream` for these bytes on purpose;
+    /// deciding text-vs-binary from that declaration instead of from the bytes
+    /// fails here.
+    ///
+    /// Mutation: relay the upstream body or content-type verbatim -> RED;
+    /// derive the encoding from the declared type -> RED.
+    #[tokio::test]
+    async fn a_text_file_is_projected_as_utf8_json_never_as_a_document() {
+        let tmp = tempfile::tempdir().unwrap();
+        let fixture = federated_room(&tmp).await;
+
+        let response = room_workspace_read(
+            State(fixture.state.clone()),
+            Path((fixture.key.as_str().to_string(), "file".to_string())),
+            query(&[
+                ("actor_id", "alice"),
+                ("path", "readme.md"),
+                // Presentation for the raw route; meaningless on this lane and
+                // it must not reach Bedrock.
+                ("inline", "1"),
+            ]),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let content_type = response
+            .headers()
+            .get(axum::http::header::CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok())
+            .unwrap_or_default()
+            .to_string();
+        assert!(
+            content_type.starts_with("application/json"),
+            "the browser gets a projection, not a typed document: {content_type}"
+        );
+        let (_, body) = body_of(response).await;
+        assert_eq!(body["ok"], json!(true));
+        assert_eq!(body["encoding"], json!("utf8"));
+        assert_eq!(body["content"], json!(FILE_TEXT));
+        assert_eq!(body["size"], json!(FILE_TEXT.len()));
+        assert_eq!(body["path"], json!("readme.md"));
+
+        let calls = fixture.seen.calls();
+        assert_eq!(calls.len(), 1);
+        let expected_authorization = format!("Bearer {BEARER}");
+        assert_eq!(calls[0].path, "/api/v1/rooms/workspace-room/workspace/file");
+        assert_eq!(
+            calls[0].authorization.as_deref(),
+            Some(expected_authorization.as_str()),
+            "the room's own credential authenticates the read"
+        );
+        assert!(
+            calls[0].query.contains("path=readme.md") && !calls[0].query.contains("inline"),
+            "`path` relays and `inline` does not: {}",
+            calls[0].query
+        );
+
+        fixture.close();
+    }
+
+    /// Binary is derived from the bytes and carried as base64 — the fake
+    /// declares these bytes `text/plain`, and believing that would put invalid
+    /// UTF-8 into a JSON string.
+    ///
+    /// Mutation: decide the encoding from the upstream content-type -> RED.
+    #[tokio::test]
+    async fn a_binary_file_is_projected_as_base64_from_the_bytes_not_the_declared_type() {
+        let tmp = tempfile::tempdir().unwrap();
+        let fixture = federated_room(&tmp).await;
+
+        let response = room_workspace_read(
+            State(fixture.state.clone()),
+            Path((fixture.key.as_str().to_string(), "file".to_string())),
+            query(&[("actor_id", "alice"), ("path", "logo.png")]),
+        )
+        .await;
+        let (status, body) = body_of(response).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["encoding"], json!("base64"));
+        assert_eq!(body["size"], json!(FILE_BINARY.len()));
+        use base64::Engine as _;
+        let decoded = base64::engine::general_purpose::STANDARD
+            .decode(body["content"].as_str().expect("base64 content"))
+            .expect("valid base64");
+        assert_eq!(decoded, FILE_BINARY, "the bytes round-trip exactly");
+
+        fixture.close();
+    }
+
+    /// Nothing upstream bounds a file read — Bedrock buffers the whole file —
+    /// so the daemon's cap is the only bound in the chain and a file past it
+    /// is a legitimate workspace state. It earns the typed refusal, never the
+    /// 502 `workspace_upstream_protocol` an actually-broken upstream earns,
+    /// and never a truncated "success".
+    ///
+    /// Mutation: read the file reply through the JSON seam, or map the raw
+    /// seam's OverCap to `IntentError::Protocol` -> RED.
+    #[tokio::test]
+    async fn a_file_over_the_cap_is_a_typed_refusal_not_an_upstream_fault() {
+        let tmp = tempfile::tempdir().unwrap();
+        let fixture = federated_room(&tmp).await;
+
+        let response = room_workspace_read(
+            State(fixture.state.clone()),
+            Path((fixture.key.as_str().to_string(), "file".to_string())),
+            query(&[("actor_id", "alice"), ("path", "huge.bin")]),
+        )
+        .await;
+        let (status, body) = body_of(response).await;
+        assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE);
+        assert_eq!(body["code"], json!("workspace_file_too_large"));
+
+        fixture.close();
+    }
+
+    /// The file route is mixed-mode: a 2xx is bytes, a refusal is Bedrock's
+    /// ordinary JSON `HttpError` body — and the refusal relays verbatim, code
+    /// and all, exactly as the JSON rows' do. `workspace_absent` is why a
+    /// panel can say "provision one first" instead of shrugging.
+    ///
+    /// Mutation: project every status, or re-code the refusal -> RED.
+    #[tokio::test]
+    async fn bedrocks_own_file_refusal_is_relayed_verbatim() {
+        let tmp = tempfile::tempdir().unwrap();
+        let fixture = federated_room(&tmp).await;
+
+        let response = room_workspace_read(
+            State(fixture.state.clone()),
+            Path((fixture.key.as_str().to_string(), "file".to_string())),
+            query(&[("actor_id", "alice"), ("path", "missing.txt")]),
+        )
+        .await;
+        let (status, body) = body_of(response).await;
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert_eq!(body["ok"], json!(false));
+        assert_eq!(body["details"]["code"], json!("workspace_absent"));
 
         fixture.close();
     }
@@ -1245,6 +1602,7 @@ mod tests {
             vec![
                 "GET  -> Get [\"workspace\"]",
                 "GET execs -> Get [\"workspace\", \"execs\"]",
+                "GET file -> Get [\"workspace\", \"file\"]",
                 "GET list -> Get [\"workspace\", \"list\"]",
                 "GET repo -> Get [\"workspace\", \"repo\"]",
                 "POST exec -> Post [\"workspace\", \"exec\"]",
@@ -1253,13 +1611,26 @@ mod tests {
             ],
             "the Bedrock surface this lane exposes changed; review the manifest"
         );
+        // `file` left this assertion deliberately: the GET row that now
+        // carries it is a bounded JSON PROJECTION, not a raw-bytes relay — the
+        // browser never receives the bytes as a document and no content-type
+        // is ever declared to it — and file WRITE and DELETE remain absent.
+        // The row must also stay a projection: an allowlist entry that relayed
+        // this route's bytes verbatim would put an uploader-controlled
+        // document on a browser origin, which is the exact thing
+        // `room_attachments.rs` exists to prevent.
+        assert!(
+            WORKSPACE_ALLOWLIST.iter().all(|(_, _, call)| {
+                call.segments.contains(&"file")
+                    == matches!(call.reply, UpstreamReply::FileProjection)
+            }),
+            "raw file bytes are relayed only as a projection, and only on the file row"
+        );
         assert!(
             !WORKSPACE_ALLOWLIST.iter().any(|(_, _, call)| {
-                call.segments.contains(&"secrets")
-                    || call.segments.contains(&"ports")
-                    || call.segments.contains(&"file")
+                call.segments.contains(&"secrets") || call.segments.contains(&"ports")
             }),
-            "secrets, port exposure, and raw file bytes are deliberately absent"
+            "secrets and port exposure are deliberately absent"
         );
     }
 
@@ -1297,6 +1668,10 @@ mod tests {
             (
                 format!("/v1/rooms/persistent/{room}/workspace/repo?actor_id=alice"),
                 "/api/v1/rooms/workspace-room/workspace/repo",
+            ),
+            (
+                format!("/v1/rooms/persistent/{room}/workspace/file?actor_id=alice&path=readme.md"),
+                "/api/v1/rooms/workspace-room/workspace/file",
             ),
         ] {
             let response = app
@@ -1356,7 +1731,7 @@ mod tests {
         assert_eq!(body["code"], json!("workspace_route_not_allowed"));
         assert_eq!(
             fixture.seen.calls().len(),
-            4,
+            5,
             "the refusal added no upstream call"
         );
 

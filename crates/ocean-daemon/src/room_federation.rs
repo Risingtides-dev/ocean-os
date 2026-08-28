@@ -116,14 +116,31 @@ enum BridgeError {
 /// route can size either half.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) struct RelayBudget {
-    /// Ceiling on the JSON read back. Nothing streams; a reply over this is a
-    /// protocol error rather than a truncation.
+    /// Ceiling on the reply read back. Nothing streams and nothing truncates;
+    /// the JSON seam treats a reply over this as a protocol error, while the
+    /// raw seam reports it as [`RawReply::OverCap`] for the caller to refuse
+    /// in its own vocabulary.
     pub(super) body_limit: usize,
     /// How long to wait for the answer. Must not exceed
     /// [`ROOM_SCOPED_READ_TIMEOUT`], or this transport's own read bound cuts
     /// the call first and the number here is a fiction. The workspace lane
     /// checks that relationship at compile time.
     pub(super) timeout: Duration,
+}
+
+/// What [`FederationSupervisor::send_room_scoped_raw`] read off the wire.
+///
+/// Over-budget is a STATE here rather than an error because on the route this
+/// seam exists for (`workspace/file`) nothing upstream bounds the body at all
+/// — Bedrock buffers whole files — so a reply past the cap is an ordinary big
+/// file the caller must refuse with its own typed code, not the
+/// [`IntentError::Protocol`] a malformed peer earns.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) enum RawReply {
+    /// The whole body, within the caller's budget.
+    Body(Vec<u8>),
+    /// The reply outgrew the budget; the bytes read so far were discarded.
+    OverCap,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -939,6 +956,68 @@ impl FederationSupervisor {
         body: Option<&Value>,
         budget: RelayBudget,
     ) -> Result<(StatusCode, Value), IntentError> {
+        let response = self
+            .send_room_scoped_response(
+                credential,
+                method,
+                leaf_segments,
+                query,
+                body,
+                budget.timeout,
+            )
+            .await?;
+        let status = response.status();
+        let payload: Value = read_bounded_json(response, budget.body_limit)
+            .await
+            .map_err(|_| IntentError::Protocol)?;
+        Ok((status, payload))
+    }
+
+    /// The raw sibling of [`Self::send_room_scoped`], for the one Bedrock room
+    /// route that answers a 2xx in bytes instead of JSON (`workspace/file`).
+    /// The request half is shared, so custody, confinement, and the admission
+    /// gate a revoke closes are identical; the two seams differ only in how
+    /// the reply is read. Refusals on that route are still ordinary JSON
+    /// bodies, which is why this returns status plus bytes and leaves parsing
+    /// to the caller — only the caller knows which statuses carry which shape.
+    pub(super) async fn send_room_scoped_raw(
+        &self,
+        credential: &RoomCredential,
+        method: reqwest::Method,
+        leaf_segments: &[&str],
+        query: &[(&str, String)],
+        budget: RelayBudget,
+    ) -> Result<(StatusCode, RawReply), IntentError> {
+        let response = self
+            .send_room_scoped_response(
+                credential,
+                method,
+                leaf_segments,
+                query,
+                None,
+                budget.timeout,
+            )
+            .await?;
+        let status = response.status();
+        match read_bounded_bytes(response, budget.body_limit).await {
+            Ok(bytes) => Ok((status, RawReply::Body(bytes))),
+            Err(BoundedReadError::OverCap) => Ok((status, RawReply::OverCap)),
+            Err(BoundedReadError::Transport) => Err(IntentError::Protocol),
+        }
+    }
+
+    /// The request half both room-scoped seams share: build, authenticate,
+    /// admit, refuse a 1xx/3xx. One function so a hardening change cannot land
+    /// on one seam and miss the other.
+    async fn send_room_scoped_response(
+        &self,
+        credential: &RoomCredential,
+        method: reqwest::Method,
+        leaf_segments: &[&str],
+        query: &[(&str, String)],
+        body: Option<&Value>,
+        timeout: Duration,
+    ) -> Result<reqwest::Response, IntentError> {
         let client = self.inner.client.clone().ok_or(IntentError::Unavailable)?;
         let mut segments = vec!["api", "v1", "rooms", credential.room_id.as_str()];
         segments.extend_from_slice(leaf_segments);
@@ -948,7 +1027,7 @@ impl FederationSupervisor {
         let mut request = client
             .room_scoped_http
             .request(method, url)
-            .timeout(budget.timeout)
+            .timeout(timeout)
             .bearer_auth(&credential.bearer_token);
         if !query.is_empty() {
             request = request.query(query);
@@ -974,10 +1053,7 @@ impl FederationSupervisor {
         if status.is_informational() || status.is_redirection() {
             return Err(IntentError::Protocol);
         }
-        let payload: Value = read_bounded_json(response, budget.body_limit)
-            .await
-            .map_err(|_| IntentError::Protocol)?;
-        Ok((status, payload))
+        Ok(response)
     }
 
     pub(super) async fn enqueue_federated_message(
@@ -2648,19 +2724,41 @@ async fn bounded_error_code(response: reqwest::Response) -> Option<String> {
         .map(|body| body.error)
 }
 
+/// Why a bounded body read stopped short. Overflow is its own variant because
+/// the two readers below disagree about what it means: on a JSON lane a body
+/// past the cap is a peer speaking something unrepresentable, while on the raw
+/// file lane it is a legitimate file the caller refuses with a typed code.
+enum BoundedReadError {
+    Transport,
+    OverCap,
+}
+
+async fn read_bounded_bytes(
+    response: reqwest::Response,
+    cap: usize,
+) -> Result<Vec<u8>, BoundedReadError> {
+    let mut stream = response.bytes_stream();
+    let mut bytes = Vec::new();
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.map_err(|_| BoundedReadError::Transport)?;
+        if bytes.len().saturating_add(chunk.len()) > cap {
+            return Err(BoundedReadError::OverCap);
+        }
+        bytes.extend_from_slice(&chunk);
+    }
+    Ok(bytes)
+}
+
 async fn read_bounded_json<T: DeserializeOwned>(
     response: reqwest::Response,
     cap: usize,
 ) -> Result<T, BridgeError> {
-    let mut stream = response.bytes_stream();
-    let mut bytes = Vec::new();
-    while let Some(chunk) = stream.next().await {
-        let chunk = chunk.map_err(|_| BridgeError::Transport)?;
-        if bytes.len().saturating_add(chunk.len()) > cap {
-            return Err(BridgeError::Protocol);
-        }
-        bytes.extend_from_slice(&chunk);
-    }
+    let bytes = read_bounded_bytes(response, cap)
+        .await
+        .map_err(|error| match error {
+            BoundedReadError::Transport => BridgeError::Transport,
+            BoundedReadError::OverCap => BridgeError::Protocol,
+        })?;
     serde_json::from_slice(&bytes).map_err(|_| BridgeError::Protocol)
 }
 

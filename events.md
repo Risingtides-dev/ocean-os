@@ -6798,3 +6798,37 @@ toolchain 1.97.0: 226/51/780/177 tests 0 failed, clippy -D warnings clean,
 fmt clean. Unblocks inline-media. No migration of production data, no deploy
 decision. PR #385.
 _________________________________________________________________________________
+
+time:      [08:00] [08-28-26]
+agent:     [claude] [fable 5]
+worktree:  loop/workspace-file-read-lane
+type:      [feature-request]
+area:      [backend]
+
+Built the bounded file-read row on the daemon workspace lane, so the files the
+list panel names can be opened. The design constraint held as scouted: the
+lane's transport reads every reply as JSON while bedrock's GET workspace/file
+answers raw bytes on 2xx and a JSON HttpError on refusal, so the shape is a
+daemon-side JSON projection over a new raw-read transport sibling.
+room_federation.rs gains send_room_scoped_raw sharing one private request path
+(send_room_scoped_response) with the JSON seam — same custody, confinement,
+admission gate, 1xx/3xx refusal — returning status plus whole bytes under the
+caller's budget, with over-budget reported as RawReply::OverCap, a state, not
+IntentError::Protocol, because NOTHING upstream bounds that route's body (the
+daemon's 1 MiB WORKSPACE_FILE_LIMIT is the only cap in the chain).
+room_workspace_proxy.rs adds the GET file allowlist row (query path only —
+inline is presentation for the raw route and never relays) with a reply-mode
+field so forward() keeps its one-place-a-route-becomes-a-call claim: 2xx
+projects to { ok, path, size, encoding: utf8|base64, content } with
+text-vs-binary derived from the bytes and bedrock's extension-derived
+content-type ignored; over-cap is the typed 413 workspace_file_too_large,
+never truncated; non-2xx relays bedrock's own codes (workspace_absent, path
+400s) verbatim. The tripwire test's no-file assertion was narrowed
+deliberately to secrets/ports plus a new both-ways check that only the file
+row is a projection; the fake bedrock's file leaf now answers mixed-mode with
+declared types that contradict the bytes on purpose. AGENTS.md both bullets
+and the operator guide moved coherently; no main.rs change (the {*leaf}
+wildcard already routes it, banner count stays 112). Verified on ddb6bbf1,
+toolchain 1.97.0: 788 tests 0 failed, clippy -D warnings clean, fmt clean.
+Surface panel open-in-UI rides the next wave. No migration, no deploy.
+_________________________________________________________________________________
