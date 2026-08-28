@@ -43,7 +43,12 @@
 //!    `Content-Disposition: attachment` also stays on in every branch: a
 //!    browser renders an `<img src>` subresource regardless of it, which is all
 //!    an inline-media surface needs, so there is no reason to also surrender
-//!    the top-level-navigation defence to buy something already in hand.
+//!    the top-level-navigation defence to buy something already in hand. "Every
+//!    branch" includes every FILENAME, which is why [`content_disposition`]
+//!    encodes the name rather than formatting it: a filename is UTF-8 and a
+//!    header parameter is not, and the naive version dropped the entire header
+//!    on the names it could not spell — losing the defence to say nothing about
+//!    a name.
 //! 3. **Bytes are written and fsynced BEFORE the row commits.** The two writes
 //!    cannot be one transaction — one is SQLite, one is the filesystem — so the
 //!    order is chosen by which residue is survivable. An orphan blob is
@@ -193,6 +198,77 @@ fn sanitize_filename(raw: &str) -> Option<String> {
         return None;
     }
     Some(cleaned)
+}
+
+/// The download's `Content-Disposition`, for any filename a row can hold.
+///
+/// [`sanitize_filename`] deliberately keeps non-ASCII characters — `café.png`
+/// is the name the uploader gave the file and the name the room should show —
+/// and formatting one straight into the parameter fails in two directions at
+/// once, so this owns both.
+///
+/// The first is a WRONG NAME. `HeaderValue` accepts `0x80..=0xff` (RFC 9110
+/// `obs-text`), so raw UTF-8 does reach the wire — but RFC 6266's `filename` is
+/// a bare quoted-string with no charset, and clients guess differently:
+/// Firefox and Chrome read those bytes as Latin-1 and save `cafÃ©.png`. So the
+/// name is carried twice, the way RFC 6266 §4.3 says to — a transliterated
+/// ASCII `filename=` for clients that only parse that, and an RFC 5987
+/// `filename*=UTF-8''…` that says what the bytes actually mean.
+///
+/// The second is a MISSING HEADER. `from_str` does refuse `0x00..=0x1f` and
+/// `0x7f`, and the caller used to drop the whole header when it did, rather
+/// than fall back to the id as its comment claimed — an outcome the module
+/// header's rule 2 cannot afford, since the derived `Content-Type` rests on
+/// `attachment` being unconditional. Every byte this builds is visible ASCII,
+/// so the value cannot fail and the header is PRESENT in every branch.
+fn content_disposition(filename: &str, id: &str) -> HeaderValue {
+    // Space is legal inside a quoted-string and common in real filenames; `"`
+    // and `\` are the two that would end or escape it.
+    let ascii: String = filename
+        .chars()
+        .map(|c| match c {
+            '"' | '\\' => '_',
+            c if c == ' ' || c.is_ascii_graphic() => c,
+            _ => '_',
+        })
+        .collect();
+    let ascii = ascii.trim();
+    if ascii.is_empty() {
+        // Only a row `sanitize_filename` never saw can land here. Fall back to
+        // the id, which is `[0-9a-f]{32}` by construction and so can never fail
+        // the way the name it replaces did.
+        return HeaderValue::from_str(&format!("attachment; filename=\"{id}\""))
+            .unwrap_or_else(|_| HeaderValue::from_static("attachment"));
+    }
+
+    if ascii == filename {
+        // Nothing was lost, so `filename*` would only repeat what is already
+        // there — and a second parameter is a second thing a client can
+        // disagree with us about.
+        return HeaderValue::from_str(&format!("attachment; filename=\"{ascii}\""))
+            .unwrap_or_else(|_| HeaderValue::from_static("attachment"));
+    }
+
+    const HEX: &[u8; 16] = b"0123456789ABCDEF";
+    let mut encoded = String::with_capacity(filename.len());
+    for b in filename.bytes() {
+        // RFC 5987 `attr-char`. Everything else — `%` itself included — is
+        // escaped, so the value cannot grow a `;` or a `"` of its own.
+        if b.is_ascii_alphanumeric() || b"!#$&+-.^_`|~".contains(&b) {
+            encoded.push(b as char);
+        } else {
+            encoded.push('%');
+            encoded.push(HEX[usize::from(b >> 4)] as char);
+            encoded.push(HEX[usize::from(b & 0x0f)] as char);
+        }
+    }
+
+    HeaderValue::from_str(&format!(
+        "attachment; filename=\"{ascii}\"; filename*=UTF-8''{encoded}"
+    ))
+    // Unreachable: every byte above is visible ASCII. A bare `attachment` still
+    // refuses the top-level render, which is the property rule 2 depends on.
+    .unwrap_or_else(|_| HeaderValue::from_static("attachment"))
 }
 
 /// Is the DECLARED content type storable? Bounded, non-empty, visible ASCII.
@@ -490,7 +566,10 @@ pub(super) async fn room_list_attachments(
 /// browser told `image/png` with `nosniff` will not render the body as anything
 /// but an image, whatever the bytes turn out to be. `attachment` stays because
 /// an `<img src>` subresource renders regardless of it — the inline case this
-/// derivation exists for is already paid for by the type alone.
+/// derivation exists for is already paid for by the type alone. Unconditional
+/// means for every filename too: [`content_disposition`] owns the encoding so
+/// that a name a header cannot spell verbatim costs the name's spelling, never
+/// the header.
 ///
 /// The row is the authority and the disk is a cache, so the stored bytes are
 /// re-checked against the row's length and hash on every read. That is O(n) with
@@ -538,15 +617,13 @@ pub(super) async fn room_download_attachment(
         header::X_CONTENT_TYPE_OPTIONS,
         HeaderValue::from_static("nosniff"),
     );
-    // The filename has already had control characters and `"` removed by
-    // `sanitize_filename` on the way in, so it cannot break out of the quoted
-    // parameter. Fall back to the id if a pre-existing row somehow holds a
-    // filename this header cannot carry.
-    if let Ok(disposition) =
-        HeaderValue::from_str(&format!("attachment; filename=\"{}\"", row.filename))
-    {
-        headers.insert(header::CONTENT_DISPOSITION, disposition);
-    }
+    // Unconditional, and `content_disposition` is what makes it so: a filename
+    // is UTF-8 and a header is not, so the encoding has to be its job rather
+    // than a `format!` that can quietly fail.
+    headers.insert(
+        header::CONTENT_DISPOSITION,
+        content_disposition(&row.filename, id),
+    );
     response
 }
 
@@ -1271,6 +1348,60 @@ mod tests {
         );
     }
 
+    /// The same round trip with a name a header cannot spell. The status was
+    /// always 200, so asserting it proves nothing — the header is the subject.
+    /// What the handler used to send was raw UTF-8 in a parameter that declares
+    /// no charset, which two of the three major browsers save as `cafÃ©.png`.
+    /// Mutation: `format!` `row.filename` into the header -> RED on the value.
+    #[tokio::test]
+    async fn a_non_ascii_filename_still_gets_a_content_disposition() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = fake_convene_state(&tmp);
+        let key = RoomKey::new("accented");
+        room_with_roster(&state, &key);
+
+        // Decomposed: `e` plus a combining acute. The accent is a code point
+        // `HeaderValue::from_str` refuses outright.
+        let filename = "cafe\u{301}.png";
+        let bytes = b"\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR....".to_vec();
+        let (status, body) =
+            upload(&state, &key, filename, "image/png", "alice", bytes.clone()).await;
+        assert_eq!(status, StatusCode::CREATED, "body: {body}");
+        let id = body["attachment"]["id"].as_str().unwrap().to_string();
+        assert_eq!(
+            body["attachment"]["filename"],
+            json!(filename),
+            "the row keeps the name the uploader gave it; only the header encodes"
+        );
+
+        let response =
+            room_download_attachment(State(state.clone()), Path((key.as_str().to_string(), id)))
+                .await;
+        let disposition = response
+            .headers()
+            .get(header::CONTENT_DISPOSITION)
+            .expect("a name this header cannot spell must cost the spelling, not the header")
+            .to_str()
+            .unwrap()
+            .to_string();
+        assert_eq!(
+            disposition, "attachment; filename=\"cafe_.png\"; filename*=UTF-8''cafe%CC%81.png",
+            "a client that ignores filename* still gets a usable .png name"
+        );
+        assert!(
+            disposition.starts_with("attachment;"),
+            "the top-level-navigation defence is the point of the header"
+        );
+
+        // The sniffed-image branch is the one that leans on it hardest.
+        assert_eq!(
+            response.headers().get(header::CONTENT_TYPE).unwrap(),
+            "image/png"
+        );
+        let served = response.into_body().collect().await.unwrap().to_bytes();
+        assert_eq!(served.as_ref(), bytes.as_slice());
+    }
+
     /// A mis-uploaded file must be removable: row gone, bytes gone, and the room
     /// able to say who removed it.
     /// Mutation: delete the `remove_file` call -> the bytes survive -> RED.
@@ -1437,6 +1568,120 @@ mod tests {
             sanitize_filename(&"x".repeat(500)).map(|f| f.len()),
             Some(MAX_FILENAME_LEN)
         );
+    }
+
+    /// `sanitize_filename` keeps non-ASCII on purpose, so the header builder is
+    /// the only thing between `café.png` and a header no client reads back as
+    /// `café.png`. Every name must produce a header, that header must be
+    /// unambiguous ASCII, and the UTF-8 name must round-trip through
+    /// `filename*`.
+    /// Mutation: drop the `filename*` parameter -> the round trip -> RED.
+    /// Mutation: `format!` the name into `filename=` -> raw obs-text, `to_str`
+    /// fails -> RED.
+    #[test]
+    fn a_filename_a_header_cannot_spell_still_produces_one() {
+        let id = "0123456789abcdef0123456789abcdef";
+
+        // The plain case is unchanged: one parameter, no encoding theatre.
+        assert_eq!(
+            content_disposition("spec.pdf", id),
+            "attachment; filename=\"spec.pdf\""
+        );
+        assert_eq!(
+            content_disposition("q3 notes.md", id),
+            "attachment; filename=\"q3 notes.md\"",
+            "a space is legal inside the quoted-string and needs no escaping"
+        );
+
+        // The canonical break: a decomposed `é` is `e` plus a combining acute.
+        // `HeaderValue` ACCEPTS those bytes — they are RFC 9110 obs-text — which
+        // is precisely why formatting is not good enough: the value reaches the
+        // wire carrying a charset it never declares, and Firefox and Chrome read
+        // it as Latin-1. `to_str` refusing it is that ambiguity, made visible.
+        let decomposed = "cafe\u{301}.png";
+        let naive = HeaderValue::from_str(&format!("attachment; filename=\"{decomposed}\""))
+            .expect("obs-text is accepted, so the naive version fails silently, not loudly");
+        assert!(
+            naive.to_str().is_err(),
+            "the naive header is not text any client can agree on"
+        );
+
+        // A byte `from_str` really does refuse. This is the arm the old
+        // `if let Ok(..)` swallowed, dropping the header entirely.
+        assert!(
+            HeaderValue::from_str("attachment; filename=\"a\u{7f}b\"").is_err(),
+            "0x7f is the boundary the omission path lived on"
+        );
+        assert_eq!(
+            content_disposition("a\u{7f}b.png", id),
+            "attachment; filename=\"a_b.png\"; filename*=UTF-8''a%7Fb.png",
+            "a refused byte must cost the byte, not the header"
+        );
+
+        let header = content_disposition(decomposed, id);
+        let value = header.to_str().expect("the header must be visible ASCII");
+        assert_eq!(
+            value, "attachment; filename=\"cafe_.png\"; filename*=UTF-8''cafe%CC%81.png",
+            "the ASCII parameter keeps the extension, the encoded one keeps the name"
+        );
+
+        // `filename*` is only worth emitting if it round-trips.
+        let encoded = value.split("filename*=UTF-8''").nth(1).unwrap();
+        assert_eq!(percent_decode(encoded), decomposed.as_bytes());
+
+        // Precomposed, a name with no ASCII at all, and one carrying a literal
+        // `%` that must not be mistaken for an escape it did not write.
+        for name in [
+            "café.png",
+            "日本語.png",
+            "√",
+            "100% café.txt",
+            "naïve v2.pdf",
+        ] {
+            let header = content_disposition(name, id);
+            let value = header.to_str().expect("visible ASCII");
+            let encoded = value
+                .split("filename*=UTF-8''")
+                .nth(1)
+                .unwrap_or_else(|| panic!("{name} must carry filename*: {value}"));
+            assert_eq!(
+                percent_decode(encoded),
+                name.as_bytes(),
+                "{name} must survive the encoding"
+            );
+        }
+
+        // A row holding a name with nothing spellable left in it at all still
+        // has to name the blob.
+        assert_eq!(
+            content_disposition("", id),
+            format!("attachment; filename=\"{id}\""),
+            "the id is the last resort the module has always promised"
+        );
+        assert_eq!(
+            content_disposition("   ", id),
+            format!("attachment; filename=\"{id}\"")
+        );
+    }
+
+    /// Undoes `content_disposition`'s RFC 5987 encoding. Test-only: nothing in
+    /// the daemon consumes this header, so a decoder in the module itself would
+    /// be dead code kept alive by its own test.
+    fn percent_decode(value: &str) -> Vec<u8> {
+        let bytes = value.as_bytes();
+        let mut out = Vec::with_capacity(bytes.len());
+        let mut i = 0;
+        while i < bytes.len() {
+            if bytes[i] == b'%' {
+                let hex = std::str::from_utf8(&bytes[i + 1..i + 3]).unwrap();
+                out.push(u8::from_str_radix(hex, 16).unwrap());
+                i += 3;
+            } else {
+                out.push(bytes[i]);
+                i += 1;
+            }
+        }
+        out
     }
 
     /// The declared type is stored, so its SHAPE is the only thing that has to
