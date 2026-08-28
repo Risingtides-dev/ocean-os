@@ -211,9 +211,11 @@ fn sanitize_filename(raw: &str) -> Option<String> {
 /// `obs-text`), so raw UTF-8 does reach the wire — but RFC 6266's `filename` is
 /// a bare quoted-string with no charset, and clients guess differently:
 /// Firefox and Chrome read those bytes as Latin-1 and save `cafÃ©.png`. So the
-/// name is carried twice, the way RFC 6266 §4.3 says to — a transliterated
-/// ASCII `filename=` for clients that only parse that, and an RFC 5987
-/// `filename*=UTF-8''…` that says what the bytes actually mean.
+/// name is carried twice, the way RFC 6266 §4.3 says to — an ASCII skeleton in
+/// `filename=` for clients that only parse that, and an RFC 5987
+/// `filename*=UTF-8''…` that says what the bytes actually mean. Skeleton, not
+/// transliteration: every non-graphic char becomes `_`, so `café.png` is
+/// `caf_.png` and `日本語.png` is `___.png`. There is no folding table here.
 ///
 /// The second is a MISSING HEADER. `from_str` does refuse `0x00..=0x1f` and
 /// `0x7f`, and the caller used to drop the whole header when it did, rather
