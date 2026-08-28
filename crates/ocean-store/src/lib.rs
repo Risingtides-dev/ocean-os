@@ -1002,6 +1002,15 @@ pub trait RoomStore {
 const G1_MESSAGE_COLUMNS: [(&str, &str); 2] =
     [("thread_parent_seq", "INTEGER"), ("session_id", "TEXT")];
 
+/// Additive `messages` column linking an attachment marker row to the
+/// `room_attachments` row it describes, through the same two paths as
+/// [`G1_MESSAGE_COLUMNS`]: fresh databases from `CREATE TABLE`, pre-existing
+/// ones through introspection-driven `ALTER TABLE ADD COLUMN` in
+/// [`SqliteRoomStore::migrate`]. Nullable with an implicit NULL default, so
+/// every pre-existing row — and every non-marker row — reads back as linked
+/// to nothing.
+const ATTACHMENT_MESSAGE_COLUMNS: [(&str, &str); 1] = [("attachment_id", "TEXT")];
+
 /// Everything an appended transcript row carries besides its room key and
 /// timestamp (G1 internal value object).
 ///
@@ -1020,6 +1029,9 @@ struct MessageDraft<'a> {
     /// thread policy inside the appending transaction before any insert.
     thread_parent_seq: Option<u64>,
     session_id: Option<&'a str>,
+    /// `Some(id)` links an attachment marker to its `room_attachments` row.
+    /// Server-minted, so carrying it keeps client input off the line.
+    attachment_id: Option<&'a str>,
 }
 
 impl<'a> MessageDraft<'a> {
@@ -1041,6 +1053,25 @@ impl<'a> MessageDraft<'a> {
             body,
             thread_parent_seq: None,
             session_id: None,
+            attachment_id: None,
+        }
+    }
+
+    /// A [`Self::marker`] that names the attachment it describes, so a client
+    /// can link the transcript row to the file (and retire a render on
+    /// removal) without correlating on filenames, which lie under duplicate
+    /// names and deletions. The id rides in this FIELD rather than the body
+    /// prose — agents read the prose and its shape is load-bearing.
+    fn attachment_marker(
+        author_id: &'a str,
+        author_kind: RoomParticipantKind,
+        kind: RoomMessageKind,
+        body: &'a str,
+        attachment_id: &'a str,
+    ) -> Self {
+        Self {
+            attachment_id: Some(attachment_id),
+            ..Self::marker(author_id, author_kind, kind, body)
         }
     }
 }
@@ -1053,7 +1084,8 @@ impl<'a> MessageDraft<'a> {
 /// silently swap `body` for `created_at` or read `session_id` as a thread
 /// parent.
 const MESSAGE_ROW_COLUMNS: &str =
-    "seq, author_id, author_kind, kind, body, created_at, federated, thread_parent_seq, session_id";
+    "seq, author_id, author_kind, kind, body, created_at, federated, thread_parent_seq, \
+     session_id, attachment_id";
 
 /// One raw `messages` row, still in stored form.
 ///
@@ -1070,6 +1102,7 @@ struct RawMessageRow {
     federated: Option<String>,
     thread_parent_seq: Option<i64>,
     session_id: Option<String>,
+    attachment_id: Option<String>,
 }
 
 impl RawMessageRow {
@@ -1085,6 +1118,7 @@ impl RawMessageRow {
             federated: row.get(6)?,
             thread_parent_seq: row.get(7)?,
             session_id: row.get(8)?,
+            attachment_id: row.get(9)?,
         })
     }
 
@@ -1111,6 +1145,7 @@ impl RawMessageRow {
             federated,
             thread_parent_seq: decode_thread_parent_seq(self.thread_parent_seq)?,
             session_id: self.session_id,
+            attachment_id: self.attachment_id,
         })
     }
 }
@@ -1331,6 +1366,7 @@ impl SqliteRoomStore {
                 federated   TEXT,                    -- JSON FederatedMessageMeta, NULL = local
                 thread_parent_seq INTEGER,           -- NULL = top-level; G1 threads
                 session_id  TEXT,                    -- NULL = unattributed; G1 agent import
+                attachment_id TEXT,                  -- NULL = not an attachment marker
                 PRIMARY KEY (room_id, seq)
             );
             "#,
@@ -1345,7 +1381,10 @@ impl SqliteRoomStore {
         // propagates.
         {
             let existing = self.message_column_names()?;
-            for (name, decl) in G1_MESSAGE_COLUMNS {
+            for (name, decl) in G1_MESSAGE_COLUMNS
+                .into_iter()
+                .chain(ATTACHMENT_MESSAGE_COLUMNS)
+            {
                 if !existing.contains(name) {
                     self.conn.execute(
                         &format!("ALTER TABLE messages ADD COLUMN {name} {decl}"),
@@ -2238,11 +2277,12 @@ impl SqliteRoomStore {
         let message = Self::insert_message_on(
             &tx,
             key,
-            MessageDraft::marker(
+            MessageDraft::attachment_marker(
                 "system",
                 RoomParticipantKind::System,
                 RoomMessageKind::System,
                 &format!("{uploader} attached '{filename}' ({byte_len} bytes)"),
+                attachment_id,
             ),
             now,
         )?;
@@ -2317,11 +2357,12 @@ impl SqliteRoomStore {
         let message = Self::insert_message_on(
             &tx,
             key,
-            MessageDraft::marker(
+            MessageDraft::attachment_marker(
                 "system",
                 RoomParticipantKind::System,
                 RoomMessageKind::System,
                 &format!("{remover} removed attachment '{}'", removed.filename),
+                attachment_id,
             ),
             now,
         )?;
@@ -2783,6 +2824,7 @@ impl SqliteRoomStore {
             body,
             thread_parent_seq,
             session_id,
+            attachment_id,
         } = draft;
         // MAX(seq)+1, recomputed from stored rows so it survives restarts.
         let next_seq: i64 = conn.query_row(
@@ -2800,8 +2842,8 @@ impl SqliteRoomStore {
             None => None,
         };
         conn.execute(
-            "INSERT INTO messages (room_id, seq, author_id, author_kind, kind, body, created_at, federated, thread_parent_seq, session_id)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, NULL, ?8, ?9)",
+            "INSERT INTO messages (room_id, seq, author_id, author_kind, kind, body, created_at, federated, thread_parent_seq, session_id, attachment_id)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, NULL, ?8, ?9, ?10)",
             params![
                 key.as_str(),
                 next_seq,
@@ -2812,6 +2854,7 @@ impl SqliteRoomStore {
                 fmt_ts(now),
                 tps,
                 session_id,
+                attachment_id,
             ],
         )?;
         Ok(RoomMessage {
@@ -2824,6 +2867,7 @@ impl SqliteRoomStore {
             federated: None,
             thread_parent_seq,
             session_id: session_id.map(|s| s.to_string()),
+            attachment_id: attachment_id.map(|s| s.to_string()),
         })
     }
 
@@ -3285,6 +3329,7 @@ impl SqliteRoomStore {
                 body,
                 thread_parent_seq,
                 session_id,
+                attachment_id: None,
             },
             now,
         )?;
@@ -3557,6 +3602,7 @@ impl SqliteRoomStore {
             federated: Some(meta.clone()),
             thread_parent_seq: None,
             session_id: None,
+            attachment_id: None,
         })
     }
 
@@ -5488,6 +5534,7 @@ impl SqliteRoomStore {
             federated: Some(meta),
             thread_parent_seq: None,
             session_id: None,
+            attachment_id: None,
         };
         Ok(IngestOutcome::Ingested(Box::new(IngestedCommit {
             message,
@@ -7322,9 +7369,26 @@ mod tests {
             "the DECLARED content type must never reach the transcript: {}",
             marker.body
         );
+        // The marker carries the row's server-minted id in a FIELD, never the
+        // prose: filename correlation shows the wrong file under duplicate
+        // names, and agents read the prose so its shape is load-bearing.
+        // Mutation: drop `attachment_id` from the INSERT in
+        // `insert_message_on` -> the stored row reads back unlinked -> RED.
+        assert_eq!(marker.attachment_id.as_deref(), Some(att.id.as_str()));
         let transcript = s.get(&key).unwrap().unwrap().transcript;
         assert_eq!(transcript.len(), before + 1);
         assert_eq!(transcript.last().unwrap().seq, marker.seq);
+        assert_eq!(
+            transcript.last().unwrap().attachment_id.as_deref(),
+            Some(att.id.as_str()),
+            "the link must survive storage, not just ride the returned value"
+        );
+        assert!(
+            transcript[..before]
+                .iter()
+                .all(|m| m.attachment_id.is_none()),
+            "join/create markers must stay unlinked"
+        );
     }
 
     /// An attached spec must outlive the process, or the room is a chat window
@@ -7394,6 +7458,9 @@ mod tests {
             "marker must name the remover and the file: {}",
             marker.body
         );
+        // The removal marker carries the same id the upload marker did — it is
+        // what lets a client retire a rendered file without guessing by name.
+        assert_eq!(marker.attachment_id.as_deref(), Some(removed.id.as_str()));
         assert_eq!(s.attachments(&key).unwrap().len(), 0);
         assert!(s
             .attachment(&key, "0123456789abcdef0123456789abcdef")
@@ -11786,6 +11853,101 @@ mod tests {
         assert_eq!(
             s.thread_replies(&key, 0).unwrap()[0].session_id.as_deref(),
             Some("sess-legacy")
+        );
+    }
+
+    #[test]
+    fn migrate_adds_attachment_id_to_pre_attachment_db_and_preserves_rows() {
+        // A database whose `messages` table predates the attachment-marker
+        // link must gain the column by schema introspection on the next open,
+        // with existing rows — markers included — reading back as linked to
+        // nothing. Same contract as the G1 columns above: no hard error, no
+        // rewrite of transcript history.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("pre-attachment.db");
+        let key = RoomKey::new("legacy-attachments");
+        {
+            // Hand-build the pre-attachment-era `messages` table: G1 columns
+            // present, `attachment_id` absent.
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch(
+                r#"
+                CREATE TABLE rooms (
+                    id             TEXT PRIMARY KEY,
+                    name           TEXT NOT NULL,
+                    trigger_policy TEXT,
+                    workspace_root TEXT,
+                    created_at     TEXT NOT NULL,
+                    updated_at     TEXT NOT NULL,
+                    closed_at      TEXT
+                );
+                CREATE TABLE messages (
+                    room_id     TEXT NOT NULL,
+                    seq         INTEGER NOT NULL,
+                    author_id   TEXT NOT NULL,
+                    author_kind TEXT NOT NULL,
+                    kind        TEXT NOT NULL,
+                    body        TEXT NOT NULL,
+                    created_at  TEXT NOT NULL,
+                    federated   TEXT,
+                    thread_parent_seq INTEGER,
+                    session_id  TEXT,
+                    PRIMARY KEY (room_id, seq)
+                );
+                "#,
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO rooms (id, name, trigger_policy, created_at, updated_at, closed_at)
+                 VALUES (?1, ?2, NULL, ?3, ?3, NULL)",
+                params![key.as_str(), "Legacy Attachments", fmt_ts(now())],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO messages (room_id, seq, author_id, author_kind, kind, body, created_at, federated)
+                 VALUES (?1, 0, 'system', 'system', 'system', 'john attached ''old.png'' (7 bytes)', ?2, NULL)",
+                params![key.as_str(), fmt_ts(now())],
+            )
+            .unwrap();
+        }
+
+        // Opening runs migrate(), which introspects and ALTERs the column in.
+        let mut s = SqliteRoomStore::open(&path).unwrap();
+        assert!(s.message_column_names().unwrap().contains("attachment_id"));
+        let transcript = s.transcript(&key, None).unwrap();
+        assert_eq!(transcript.len(), 1, "legacy rows preserved");
+        assert_eq!(transcript[0].body, "john attached 'old.png' (7 bytes)");
+        assert_eq!(
+            transcript[0].attachment_id, None,
+            "a pre-migration marker reads as unlinked, never errors"
+        );
+
+        // The migrated DB writes linked markers from here on.
+        s.add_participant(&key, human("alice", "Alice"), now())
+            .unwrap();
+        let (att, marker) = s
+            .add_attachment(
+                &key,
+                "0123456789abcdef0123456789abcdef",
+                "new.png",
+                "image/png",
+                9,
+                "aa",
+                "alice",
+                now(),
+            )
+            .unwrap();
+        assert_eq!(marker.attachment_id.as_deref(), Some(att.id.as_str()));
+
+        // Idempotent: migrate() again in-process, and a fresh open, both no-op
+        // and keep the link.
+        s.migrate().unwrap();
+        drop(s);
+        let s = SqliteRoomStore::open(&path).unwrap();
+        let transcript = s.transcript(&key, None).unwrap();
+        assert_eq!(
+            transcript.last().unwrap().attachment_id.as_deref(),
+            Some("0123456789abcdef0123456789abcdef")
         );
     }
 

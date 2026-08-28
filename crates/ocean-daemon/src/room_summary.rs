@@ -565,6 +565,7 @@ mod tests {
                 federated: None,
                 thread_parent_seq: None,
                 session_id: None,
+                attachment_id: None,
             },
             RoomMessage {
                 seq: 8,
@@ -576,6 +577,7 @@ mod tests {
                 federated: None,
                 thread_parent_seq: None,
                 session_id: None,
+                attachment_id: None,
             },
         ];
         let prompt = summary_user_prompt(&key, "Map fix", &msgs);
