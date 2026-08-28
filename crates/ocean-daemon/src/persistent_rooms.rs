@@ -3260,6 +3260,7 @@ mod tests {
             federated: None,
             thread_parent_seq: None,
             session_id: None,
+            attachment_id: None,
         }]
     }
 
@@ -3362,6 +3363,7 @@ mod tests {
             federated: None,
             thread_parent_seq: None,
             session_id: None,
+            attachment_id: None,
         }
     }
 

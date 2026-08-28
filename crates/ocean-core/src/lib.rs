@@ -762,6 +762,13 @@ pub struct RoomMessage {
     /// attribution and read-state tracking. (G1-B).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub session_id: Option<String>,
+    /// For attachment markers, the server-minted id of the attachment this
+    /// row describes — what lets a client link the transcript line to the
+    /// file itself (and retire a rendered file when the removal marker
+    /// arrives) without correlating on filenames, which lie under duplicates
+    /// and deletions. `None` for every other message.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub attachment_id: Option<String>,
 }
 
 /// A room-level event that the [`RoomTriggerPolicy`] is evaluated against
@@ -1853,6 +1860,7 @@ mod tests {
             federated: None,
             thread_parent_seq: None,
             session_id: None,
+            attachment_id: None,
         };
         let json = serde_json::to_value(&msg).unwrap();
         assert_eq!(json["seq"], 3);
@@ -1951,6 +1959,7 @@ mod tests {
             federated: None,
             thread_parent_seq: None,
             session_id: None,
+            attachment_id: None,
         };
         let json = serde_json::to_value(&msg).unwrap();
         assert_eq!(json["federated"], serde_json::Value::Null);
@@ -1971,6 +1980,36 @@ mod tests {
         let msg: RoomMessage = serde_json::from_value(old_json).unwrap();
         assert_eq!(msg.federated, None);
         assert_eq!(msg.seq, 3);
+        assert_eq!(msg.attachment_id, None);
+    }
+
+    #[test]
+    fn attachment_marker_message_roundtrips_and_none_omits_the_key() {
+        // The id is additive on the wire: absent entirely on every non-marker
+        // message (skip_serializing_if keeps old clients and federation
+        // outbound from ever seeing a new key), present verbatim on markers.
+        let mut msg = RoomMessage {
+            seq: 9,
+            author_id: "system".into(),
+            author_kind: RoomParticipantKind::System,
+            kind: RoomMessageKind::System,
+            body: "john attached 'spec.md' (12 bytes)".into(),
+            created_at: Utc::now(),
+            federated: None,
+            thread_parent_seq: None,
+            session_id: None,
+            attachment_id: None,
+        };
+        let json = serde_json::to_value(&msg).unwrap();
+        assert!(
+            json.get("attachment_id").is_none(),
+            "None must serialize as an absent key, not null"
+        );
+        msg.attachment_id = Some("0123456789abcdef0123456789abcdef".into());
+        let json = serde_json::to_value(&msg).unwrap();
+        assert_eq!(json["attachment_id"], "0123456789abcdef0123456789abcdef");
+        let roundtrip: RoomMessage = serde_json::from_value(json).unwrap();
+        assert_eq!(roundtrip, msg);
     }
 
     #[test]
@@ -1994,6 +2033,7 @@ mod tests {
             federated: Some(meta),
             thread_parent_seq: None,
             session_id: None,
+            attachment_id: None,
         };
         let json = serde_json::to_value(&msg).unwrap();
         assert_eq!(
