@@ -577,7 +577,7 @@ POST   /v1/rooms/persistent/{key}/members/agents          register safe local ag
 # Room workspace — the membership-gated lane to the room's Bedrock container.
 # The room's Bedrock bearer NEVER leaves the daemon: a client asserts a roster participant in
 # ?actor_id= and the daemon supplies the credential and the upstream actor_member_id itself.
-# Three registrations carry eight upstream calls; WORKSPACE_ALLOWLIST in
+# Three registrations carry ten upstream calls; WORKSPACE_ALLOWLIST in
 # crates/ocean-daemon/src/room_workspace_proxy.rs is the exposed surface, and Bedrock's own
 # gateWorkspaceAccess still runs on every forwarded call. Deliberately NOT exposed: workspace
 # provision/destroy and repo bind/unbind (all owner-only upstream — the daemon presents the
@@ -586,8 +586,8 @@ POST   /v1/rooms/persistent/{key}/members/agents          register safe local ag
 # flush, hydrate, and port exposure. Binding a repo to a room stays an operator/owner act; every
 # member may read, clone, and build the binding an owner already made.
 GET    /v1/rooms/persistent/{key}/workspace               room container status (?actor_id=); Bedrock's status body and code relayed verbatim
-GET    /v1/rooms/persistent/{key}/workspace/{*leaf}       reads (?actor_id=): leaf `list` (?path=), `execs` (?limit=), `repo`, `file` (?path=) — the one leaf whose upstream 2xx is raw bytes; the daemon answers a bounded JSON PROJECTION { ok, path, size, encoding: "utf8"|"base64", content } with text-vs-binary derived from the bytes, never from Bedrock's extension-derived content-type, so the browser never receives the bytes as a document. 413 workspace_file_too_large past 1 MiB — the daemon's cap is the only bound in the chain and nothing is ever truncated; Bedrock's own refusals on the leaf (workspace_absent, its path 400s) relay verbatim like every other row's
-POST   /v1/rooms/persistent/{key}/workspace/{*leaf}       commands (?actor_id=, JSON object body): leaf `exec`, `repo/clone`, `repo/build`. Any client-supplied actor_member_id is stripped and the daemon inserts its own. 403 forged_workspace_actor for a claimed Agent/System identity, 413 workspace_request_too_large over 32 KiB. The daemon waits 960s on these — above Bedrock's own 900s EXEC_TIMEOUT_MAX — so a long `npm test` or build is relayed rather than refused; reads wait 15s
+GET    /v1/rooms/persistent/{key}/workspace/{*leaf}       reads (?actor_id=): leaf `list` (?path=), `execs` (?limit=), `repo`, `repo/ci` (?limit=), `file` (?path=) — the one leaf whose upstream 2xx is raw bytes; the daemon answers a bounded JSON PROJECTION { ok, path, size, encoding: "utf8"|"base64", content } with text-vs-binary derived from the bytes, never from Bedrock's extension-derived content-type, so the browser never receives the bytes as a document. 413 workspace_file_too_large past 1 MiB — the daemon's cap is the only bound in the chain and nothing is ever truncated; Bedrock's own refusals on the leaf (workspace_absent, its path 400s) relay verbatim like every other row's
+POST   /v1/rooms/persistent/{key}/workspace/{*leaf}       commands (?actor_id=, JSON object body): leaf `exec`, `repo/clone`, `repo/build`, `repo/ci`. Any client-supplied actor_member_id is stripped and the daemon inserts its own. 403 forged_workspace_actor for a claimed Agent/System identity, 413 workspace_request_too_large over 32 KiB. The daemon waits 960s on these — above Bedrock's own 900s EXEC_TIMEOUT_MAX — so a long `npm test` or build is relayed rather than refused; reads wait 15s
 # Shared refusals on every workspace call, all fail-closed with nothing forwarded: 400
 # invalid_request (no ?actor_id= or a non-object body), 403 not_a_room_member, 403
 # room_access_revoked, 404 room_not_found, 404 workspace_route_not_allowed (a method+leaf the

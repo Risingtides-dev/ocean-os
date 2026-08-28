@@ -314,6 +314,22 @@ const WORKSPACE_ALLOWLIST: &[(&str, &str, WorkspaceCall)] = &[
             reply: UpstreamReply::Json,
         },
     ),
+    // The recorded CI state, answered out of Bedrock's own table — no
+    // container, no gh — which is why it is a read and its sibling POST below
+    // is not.
+    (
+        "GET",
+        "repo/ci",
+        WorkspaceCall {
+            upstream: UpstreamMethod::Get,
+            segments: &["workspace", "repo", "ci"],
+            timeout: WORKSPACE_READ_TIMEOUT,
+            write: false,
+            attributed: false,
+            query: &["limit"],
+            reply: UpstreamReply::Json,
+        },
+    ),
     (
         "POST",
         "exec",
@@ -349,6 +365,22 @@ const WORKSPACE_ALLOWLIST: &[(&str, &str, WorkspaceCall)] = &[
         WorkspaceCall {
             upstream: UpstreamMethod::Post,
             segments: &["workspace", "repo", "build"],
+            timeout: WORKSPACE_COMMAND_TIMEOUT,
+            write: true,
+            attributed: true,
+            query: &[],
+            reply: UpstreamReply::Json,
+        },
+    ),
+    // A CI pull reads too — but it reads by running gh INSIDE the container
+    // on the exec path, so it carries the command budget, the daemon's
+    // attribution, and the write gate like any other exec.
+    (
+        "POST",
+        "repo/ci",
+        WorkspaceCall {
+            upstream: UpstreamMethod::Post,
+            segments: &["workspace", "repo", "ci"],
             timeout: WORKSPACE_COMMAND_TIMEOUT,
             write: true,
             attributed: true,
@@ -931,6 +963,10 @@ mod tests {
             .route(
                 "/api/v1/rooms/{room}/workspace/repo/build",
                 post(record_call),
+            )
+            .route(
+                "/api/v1/rooms/{room}/workspace/repo/ci",
+                get(record_call).post(record_call),
             )
             .with_state(seen);
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -1605,8 +1641,10 @@ mod tests {
                 "GET file -> Get [\"workspace\", \"file\"]",
                 "GET list -> Get [\"workspace\", \"list\"]",
                 "GET repo -> Get [\"workspace\", \"repo\"]",
+                "GET repo/ci -> Get [\"workspace\", \"repo\", \"ci\"]",
                 "POST exec -> Post [\"workspace\", \"exec\"]",
                 "POST repo/build -> Post [\"workspace\", \"repo\", \"build\"]",
+                "POST repo/ci -> Post [\"workspace\", \"repo\", \"ci\"]",
                 "POST repo/clone -> Post [\"workspace\", \"repo\", \"clone\"]",
             ],
             "the Bedrock surface this lane exposes changed; review the manifest"
@@ -1670,6 +1708,10 @@ mod tests {
                 "/api/v1/rooms/workspace-room/workspace/repo",
             ),
             (
+                format!("/v1/rooms/persistent/{room}/workspace/repo/ci?actor_id=alice&limit=5"),
+                "/api/v1/rooms/workspace-room/workspace/repo/ci",
+            ),
+            (
                 format!("/v1/rooms/persistent/{room}/workspace/file?actor_id=alice&path=readme.md"),
                 "/api/v1/rooms/workspace-room/workspace/file",
             ),
@@ -1731,7 +1773,7 @@ mod tests {
         assert_eq!(body["code"], json!("workspace_route_not_allowed"));
         assert_eq!(
             fixture.seen.calls().len(),
-            5,
+            6,
             "the refusal added no upstream call"
         );
 
