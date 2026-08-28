@@ -1294,8 +1294,9 @@ impl SqliteRoomStore {
             --     silent success. You can only delete what is still there.
             --
             -- `content_type` is what the UPLOADER DECLARED. It is recorded so a
-            -- client can pick an icon, and it is never trusted: downloads are
-            -- always served as `application/octet-stream`, and the transcript
+            -- client can pick an icon, and it is never trusted: a download
+            -- serves `application/octet-stream` or a type derived from the
+            -- stored bytes themselves, never this string, and the transcript
             -- marker never quotes it.
             CREATE TABLE IF NOT EXISTS room_attachments (
                 room_id       TEXT NOT NULL REFERENCES rooms(id) ON DELETE CASCADE,

@@ -29,15 +29,21 @@
 //!    one move. The attachment id is server-minted AND re-validated as
 //!    `[0-9a-f]{32}` before every filesystem call, because "it was safe when we
 //!    minted it" is not a property the URL parser preserves.
-//! 2. **The declared content type is recorded and never acted on.** Downloads
-//!    are always `application/octet-stream` with `X-Content-Type-Options:
-//!    nosniff`. The daemon serves browser origins (loopback,
-//!    `chrome-extension://`, `tauri://localhost`), so echoing an
-//!    uploader-declared `text/html` back on a download is stored XSS against
-//!    ocean-surface. The cost is that an image will not render inline from a
-//!    `<img src>`; the fix for that is server-side magic-byte sniffing, which is
-//!    derived from the bytes rather than the declaration, and is a separate
-//!    slice.
+//! 2. **The DECLARED content type is recorded and never acted on.** The daemon
+//!    serves browser origins (loopback, `chrome-extension://`,
+//!    `tauri://localhost`), so echoing an uploader-declared `text/html` back on
+//!    a download is stored XSS against ocean-surface. What a download serves is
+//!    therefore either `application/octet-stream` or a type DERIVED FROM THE
+//!    BYTES by [`sniff_image_content_type`] — never the uploader's string. The
+//!    derivation is a CLOSED allowlist of non-scriptable raster image
+//!    signatures (PNG, JPEG, GIF, WebP, and deliberately never SVG), so the
+//!    worst a mis-derivation can claim is that some bytes are a PNG, and
+//!    `X-Content-Type-Options: nosniff` stays on in EVERY branch precisely so
+//!    the browser cannot then re-interpret those bytes as anything else.
+//!    `Content-Disposition: attachment` also stays on in every branch: a
+//!    browser renders an `<img src>` subresource regardless of it, which is all
+//!    an inline-media surface needs, so there is no reason to also surrender
+//!    the top-level-navigation defence to buy something already in hand.
 //! 3. **Bytes are written and fsynced BEFORE the row commits.** The two writes
 //!    cannot be one transaction — one is SQLite, one is the filesystem — so the
 //!    order is chosen by which residue is survivable. An orphan blob is
@@ -200,6 +206,44 @@ fn is_storable_content_type(value: &str) -> bool {
     !value.is_empty()
         && value.len() <= MAX_CONTENT_TYPE_LEN
         && value.bytes().all(|b| (0x20..0x7f).contains(&b))
+}
+
+/// The content type DERIVED from an attachment's leading bytes, or `None` when
+/// nothing on the allowlist matches.
+///
+/// This is the counterpart to [`is_storable_content_type`], and the split
+/// between them is the whole rule: the DECLARATION is shape-checked, stored, and
+/// never served, while this — computed from bytes the row already vouches for —
+/// is the only thing that ever reaches a `Content-Type` header.
+///
+/// The allowlist is CLOSED and holds only raster formats, which have no script
+/// surface for a browser to execute. SVG is absent on purpose and must stay
+/// absent: it is XML that can carry `<script>`, and it has no magic bytes to
+/// recognise it by in the first place, so admitting it would mean trusting
+/// either the declaration or a content heuristic — the two things this module
+/// refuses to do. Anything unrecognised falls back to `application/octet-stream`
+/// at the call site rather than being guessed at.
+///
+/// Every comparison is a `starts_with` or a bounds-checked window, so a file
+/// shorter than a signature matches nothing instead of panicking.
+fn sniff_image_content_type(bytes: &[u8]) -> Option<&'static str> {
+    if bytes.starts_with(b"\x89PNG\r\n\x1a\n") {
+        return Some("image/png");
+    }
+    if bytes.starts_with(b"\xff\xd8\xff") {
+        return Some("image/jpeg");
+    }
+    if bytes.starts_with(b"GIF87a") || bytes.starts_with(b"GIF89a") {
+        return Some("image/gif");
+    }
+    // WebP is the one signature that is not a prefix: `RIFF`, then a four-byte
+    // chunk length carrying no format information, then `WEBP`. Matching on
+    // `RIFF` alone would claim every AVI and WAV file as an image, so the
+    // eight-byte gap has to be stepped over rather than ignored.
+    if bytes.len() >= 12 && bytes.starts_with(b"RIFF") && &bytes[8..12] == b"WEBP" {
+        return Some("image/webp");
+    }
+    None
 }
 
 // ---- Wire types -------------------------------------------------------------
@@ -435,9 +479,18 @@ pub(super) async fn room_list_attachments(
 
 /// `GET /v1/rooms/persistent/{key}/attachments/{attachment_id}` — the bytes.
 ///
-/// Always `application/octet-stream` + `nosniff`, never the declared type. See
-/// the module header: the daemon answers browser origins, so reflecting an
-/// uploader-chosen `text/html` here is stored XSS against ocean-surface.
+/// Never the declared type. What goes on the wire is either
+/// `application/octet-stream` or an image type [`sniff_image_content_type`]
+/// derived from the bytes themselves. See the module header: the daemon answers
+/// browser origins, so reflecting an uploader-chosen `text/html` here is stored
+/// XSS against ocean-surface.
+///
+/// `nosniff` and `Content-Disposition: attachment` are unconditional in BOTH
+/// branches, and that is what keeps a derived type from being an escalation: a
+/// browser told `image/png` with `nosniff` will not render the body as anything
+/// but an image, whatever the bytes turn out to be. `attachment` stays because
+/// an `<img src>` subresource renders regardless of it — the inline case this
+/// derivation exists for is already paid for by the type alone.
 ///
 /// The row is the authority and the disk is a cache, so the stored bytes are
 /// re-checked against the row's length and hash on every read. That is O(n) with
@@ -474,12 +527,13 @@ pub(super) async fn room_download_attachment(
         return bytes_missing_response(&key, id);
     };
 
+    // Derived from the bytes just verified against the row — never from
+    // `row.content_type`, which is only the uploader's word for it.
+    let served_type = sniff_image_content_type(&bytes).unwrap_or("application/octet-stream");
+
     let mut response = bytes.into_response();
     let headers = response.headers_mut();
-    headers.insert(
-        header::CONTENT_TYPE,
-        HeaderValue::from_static("application/octet-stream"),
-    );
+    headers.insert(header::CONTENT_TYPE, HeaderValue::from_static(served_type));
     headers.insert(
         header::X_CONTENT_TYPE_OPTIONS,
         HeaderValue::from_static("nosniff"),
@@ -983,6 +1037,187 @@ mod tests {
                 .get(header::X_CONTENT_TYPE_OPTIONS)
                 .unwrap(),
             "nosniff"
+        );
+    }
+
+    /// The narrowing of rule 2, made executable. Every payload here is uploaded
+    /// DECLARED `application/octet-stream` and comes back as something more
+    /// specific, which only a derivation from the bytes can do — so this passing
+    /// while the declared-type test above also passes is the whole rule: the
+    /// declaration is ignored, the bytes are not.
+    /// Mutation: return `None` unconditionally from `sniff_image_content_type`
+    /// -> RED.
+    #[tokio::test]
+    async fn an_image_is_served_the_type_its_own_bytes_prove() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = fake_convene_state(&tmp);
+        let key = RoomKey::new("sniffed-images");
+        room_with_roster(&state, &key);
+
+        for (filename, bytes, expected) in [
+            (
+                "shot.png",
+                b"\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR....".to_vec(),
+                "image/png",
+            ),
+            (
+                "shot.jpg",
+                b"\xff\xd8\xff\xe0\x00\x10JFIF\x00\x01".to_vec(),
+                "image/jpeg",
+            ),
+            (
+                "shot.gif",
+                b"GIF89a\x01\x00\x01\x00\x00\x00".to_vec(),
+                "image/gif",
+            ),
+            (
+                "shot.webp",
+                b"RIFF\x1a\x00\x00\x00WEBPVP8 ....".to_vec(),
+                "image/webp",
+            ),
+        ] {
+            let (status, body) = upload(
+                &state,
+                &key,
+                filename,
+                "application/octet-stream",
+                "alice",
+                bytes.clone(),
+            )
+            .await;
+            assert_eq!(status, StatusCode::CREATED);
+            let id = body["attachment"]["id"].as_str().unwrap().to_string();
+
+            let response = room_download_attachment(
+                State(state.clone()),
+                Path((key.as_str().to_string(), id)),
+            )
+            .await;
+            assert_eq!(response.status(), StatusCode::OK);
+            assert_eq!(
+                response.headers().get(header::CONTENT_TYPE).unwrap(),
+                expected,
+                "{filename} must be served the type its own bytes prove"
+            );
+            assert_eq!(
+                response
+                    .headers()
+                    .get(header::X_CONTENT_TYPE_OPTIONS)
+                    .unwrap(),
+                "nosniff",
+                "nosniff is what keeps a derived type from being an escalation"
+            );
+            assert_eq!(
+                response
+                    .headers()
+                    .get(header::CONTENT_DISPOSITION)
+                    .unwrap()
+                    .to_str()
+                    .unwrap(),
+                format!("attachment; filename=\"{filename}\""),
+                "an <img src> renders regardless, so the navigation defence stays"
+            );
+            let served = response.into_body().collect().await.unwrap().to_bytes();
+            assert_eq!(served.as_ref(), bytes.as_slice());
+        }
+    }
+
+    /// The mirror of the declared-type test, and the reason the allowlist is
+    /// closed: DECLARING `image/png` buys nothing, because only the bytes are
+    /// consulted and none of these are on the list. SVG is the one that matters
+    /// most — it is the scriptable image format, so it must fall through here
+    /// forever.
+    /// Mutation: fall back to `row.content_type` instead of octet-stream -> RED.
+    #[tokio::test]
+    async fn bytes_that_are_not_an_image_stay_octet_stream_however_they_are_declared() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = fake_convene_state(&tmp);
+        let key = RoomKey::new("not-an-image");
+        room_with_roster(&state, &key);
+
+        for (filename, declared, bytes) in [
+            // Declared an image; the bytes are script.
+            (
+                "liar.png",
+                "image/png",
+                b"<script>alert(1)</script>".to_vec(),
+            ),
+            // Two bytes: a truncated prefix of the PNG signature, and shorter
+            // than every signature on the list.
+            ("truncated.png", "image/png", b"\x89P".to_vec()),
+            // `RIFF` with something other than `WEBP` in the gap.
+            (
+                "clip.avi",
+                "video/x-msvideo",
+                b"RIFF\x24\x00\x00\x00AVI LIST".to_vec(),
+            ),
+            // Scriptable, and signature-less: it could not be admitted even if
+            // someone wanted to.
+            (
+                "logo.svg",
+                "image/svg+xml",
+                b"<svg xmlns=\"http://www.w3.org/2000/svg\"><script/></svg>".to_vec(),
+            ),
+        ] {
+            let (status, body) =
+                upload(&state, &key, filename, declared, "alice", bytes.clone()).await;
+            assert_eq!(status, StatusCode::CREATED);
+            let id = body["attachment"]["id"].as_str().unwrap().to_string();
+
+            let response = room_download_attachment(
+                State(state.clone()),
+                Path((key.as_str().to_string(), id)),
+            )
+            .await;
+            assert_eq!(response.status(), StatusCode::OK);
+            assert_eq!(
+                response.headers().get(header::CONTENT_TYPE).unwrap(),
+                "application/octet-stream",
+                "{filename} declared {declared} is not on the allowlist"
+            );
+            assert_eq!(
+                response
+                    .headers()
+                    .get(header::X_CONTENT_TYPE_OPTIONS)
+                    .unwrap(),
+                "nosniff"
+            );
+            let served = response.into_body().collect().await.unwrap().to_bytes();
+            assert_eq!(served.as_ref(), bytes.as_slice());
+        }
+    }
+
+    /// Two ways to get a magic-byte check wrong: match too eagerly, or index
+    /// past the end of a short file. `RIFF` without `WEBP` in the gap is the
+    /// first — every WAV and AVI opens with it. An eleven-byte `RIFF` header is
+    /// the second: one byte short of the window the WebP arm reads, and the only
+    /// input in this module that can panic a handler rather than merely answer
+    /// wrongly.
+    /// Mutation: drop the `bytes.len() >= 12` guard -> the eleven-byte case
+    /// panics -> RED.
+    #[test]
+    fn the_derived_type_allowlist_is_closed_and_never_reads_past_the_end() {
+        assert_eq!(
+            sniff_image_content_type(b"GIF87a\x01\x00"),
+            Some("image/gif"),
+            "the older GIF version is on the list too"
+        );
+        assert_eq!(sniff_image_content_type(b""), None);
+        assert_eq!(sniff_image_content_type(b"RIFF"), None);
+        assert_eq!(
+            sniff_image_content_type(b"RIFF\x00\x00\x00\x00WEB"),
+            None,
+            "eleven bytes is one short of the WebP window"
+        );
+        assert_eq!(
+            sniff_image_content_type(b"RIFF\x00\x00\x00\x00WAVEfmt "),
+            None,
+            "a WAV opens with RIFF and is not an image"
+        );
+        assert_eq!(
+            sniff_image_content_type(b"\x89PN"),
+            None,
+            "a truncated signature is not a match"
         );
     }
 
