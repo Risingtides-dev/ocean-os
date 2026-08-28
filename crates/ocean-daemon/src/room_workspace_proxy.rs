@@ -1386,6 +1386,165 @@ mod tests {
         fixture.close();
     }
 
+    /// A `{"command": ...}` body padded so its SHAPED encoding — after the
+    /// daemon strips the client's actor claim and installs its own — is
+    /// exactly `target` bytes. The daemon's insert counts against the budget,
+    /// which is why the padding is computed net of it rather than net of the
+    /// wire bytes the client sent.
+    fn body_shaped_to(target: usize) -> Value {
+        let overhead = serde_json::to_vec(&json!({
+            "command": "",
+            ACTOR_MEMBER_ID: LOCAL_MEMBER,
+        }))
+        .expect("overhead encoding")
+        .len();
+        json!({"command": "x".repeat(target - overhead)})
+    }
+
+    /// The 32 KiB cap is wire contract — the operator guide names the 413 and
+    /// its code — and it bounds the shaped body, so the attribution a client
+    /// cannot control still spends the budget it can. One byte past the cap is
+    /// the typed refusal with nothing forwarded, so an oversized body never
+    /// spends the bearer; AT the cap the call forwards whole, so the bound is
+    /// a limit and not a fencepost.
+    ///
+    /// Mutation: delete the `encoded > WORKSPACE_REQUEST_LIMIT` arm from
+    /// `shape_body`, or relax `>` to `>=` -> RED.
+    #[tokio::test]
+    async fn a_body_over_the_cap_is_refused_and_a_body_at_the_cap_is_forwarded() {
+        let tmp = tempfile::tempdir().unwrap();
+        let fixture = federated_room(&tmp).await;
+
+        let response = room_workspace_command(
+            State(fixture.state.clone()),
+            Path((fixture.key.as_str().to_string(), "exec".to_string())),
+            query(&[("actor_id", "alice")]),
+            Json(body_shaped_to(WORKSPACE_REQUEST_LIMIT + 1)),
+        )
+        .await;
+        let (status, body) = body_of(response).await;
+        assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE);
+        assert_eq!(body["code"], json!("workspace_request_too_large"));
+        assert!(
+            fixture.seen.calls().is_empty(),
+            "an oversized body must not cause an upstream request"
+        );
+
+        let response = room_workspace_command(
+            State(fixture.state.clone()),
+            Path((fixture.key.as_str().to_string(), "exec".to_string())),
+            query(&[("actor_id", "alice")]),
+            Json(body_shaped_to(WORKSPACE_REQUEST_LIMIT)),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let calls = fixture.seen.calls();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(
+            serde_json::to_vec(&calls[0].body)
+                .expect("forwarded body")
+                .len(),
+            WORKSPACE_REQUEST_LIMIT,
+            "the largest legal body arrives whole"
+        );
+
+        fixture.close();
+    }
+
+    /// The documented 413 through the REAL router, on both sides of the slack.
+    ///
+    /// `BODY_LIMIT_SLACK` exists so a body a little over the cap still reaches
+    /// `shape_body` and gets the typed JSON, while the route's
+    /// `DefaultBodyLimit` — without which axum-core's 2 MiB default would make
+    /// both numbers fiction — refuses anything past cap + slack before
+    /// buffering it, with axum's own untyped 413. One request either side of
+    /// the layer's bound pins both that it is wired and the size it is wired
+    /// to; neither request may cost an upstream call.
+    ///
+    /// Mutation: drop the route's `DefaultBodyLimit` layer in `main.rs` -> RED
+    /// (the past-slack body would reach the handler and answer with the typed
+    /// code); size the layer at the bare cap without slack -> RED (the
+    /// in-slack body would get the untyped refusal instead of the typed one).
+    #[tokio::test]
+    async fn the_slack_window_gives_the_typed_413_and_the_layer_refuses_past_it() {
+        use axum::body::Body;
+        use axum::http::Request;
+        use tower::ServiceExt;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let fixture = federated_room(&tmp).await;
+        let app = crate::room_routes().with_state(fixture.state.clone());
+        let room = fixture.key.as_str();
+        let uri = format!("/v1/rooms/persistent/{room}/workspace/exec?actor_id=alice");
+
+        // Built raw rather than through `body_shaped_to`: the layer judges the
+        // WIRE length while the handler judges the shaped one, and the actor
+        // insert makes the shaped length 39 bytes larger — a body shaped to
+        // cap + 1 sits under the bare cap on the wire and would reach the
+        // handler with no slack at all. This one is cap + 14 on the wire,
+        // inside the window, and cap + 53 shaped, still past the handler's
+        // bound. The premise assert keeps it inside the window if either
+        // constant moves.
+        let in_slack = format!(
+            "{{\"command\":\"{}\"}}",
+            "x".repeat(WORKSPACE_REQUEST_LIMIT)
+        );
+        assert!(
+            in_slack.len() > WORKSPACE_REQUEST_LIMIT
+                && in_slack.len() <= WORKSPACE_REQUEST_LIMIT + BODY_LIMIT_SLACK,
+            "the in-slack body must land inside the slack window"
+        );
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(&uri)
+                    .header(axum::http::header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(in_slack))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let (status, body) = body_of(response).await;
+        assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE);
+        assert_eq!(
+            body["code"],
+            json!("workspace_request_too_large"),
+            "inside the slack the handler answers, typed"
+        );
+
+        let past_slack = format!(
+            "{{\"command\":\"{}\"}}",
+            "x".repeat(WORKSPACE_REQUEST_LIMIT + BODY_LIMIT_SLACK)
+        );
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(&uri)
+                    .header(axum::http::header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(past_slack))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let (status, body) = body_of(response).await;
+        assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE);
+        assert_eq!(
+            body,
+            Value::Null,
+            "past the slack the layer answers before the handler; a typed body here would mean the layer was not wired"
+        );
+
+        assert!(
+            fixture.seen.calls().is_empty(),
+            "neither refusal may cause an upstream request"
+        );
+
+        fixture.close();
+    }
+
     /// An unattributed caller is refused; a whitespace-only claim is the same
     /// as none, so the gate cannot be satisfied with a blank.
     #[tokio::test]
