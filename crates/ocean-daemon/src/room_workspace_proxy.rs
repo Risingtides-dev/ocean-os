@@ -13,10 +13,23 @@
 //! 1. **The allowlist.** `resolve_workspace_call` is a total function over
 //!    `(method, leaf)`. Anything it does not name is refused with a typed code
 //!    and no request leaves the daemon. Bedrock's compute surface is much wider
-//!    than what is named here — file write/delete, mkdir, flush, hydrate, port
-//!    exposure, and `workspace/secrets` all exist upstream and are all absent
-//!    on purpose. Secrets in particular: even the NAME list is room
-//!    configuration, and a caller-asserted lane is not where that belongs.
+//!    than what is named here — file write/delete, mkdir, flush, hydrate, and
+//!    port exposure all exist upstream and are all absent on purpose. Secrets
+//!    were absent too, under a recorded objection — even the NAME list is
+//!    room configuration, and a caller-asserted lane is not where that
+//!    belongs — whose first premise the identity map below has since
+//!    dissolved: the lane is no longer caller-asserted, and an owner row
+//!    forwards only for the actor that RESOLVES to the credential's own
+//!    principal. So the owner's SET now rides the lane (`secrets/set` — how
+//!    GH_TOKEN reaches a room so `gh` can authenticate its CI pulls), and it
+//!    is the set ALONE that the dissolution covers: a set answers
+//!    `{set, removed, total}`, names the owner itself just asserted, and
+//!    Bedrock deliberately has no route anywhere that returns a secret VALUE.
+//!    The objection's second premise still stands and still binds — which
+//!    secrets a room holds IS room configuration — so the member-gated name
+//!    list stays off the lane, and the manifest tripwire pins every secrets
+//!    row to the owner-gated set so a read-back cannot slip in as an ordinary
+//!    row.
 //!    The OWNER verbs — repo bind/unbind, and workspace provision/destroy —
 //!    are owner-only upstream (`requireRoomOwner`) and shape infrastructure
 //!    every other member then shares; they were excluded as wanting an
@@ -512,6 +525,32 @@ const WORKSPACE_ALLOWLIST: &[(&str, &str, WorkspaceCall)] = &[
             owner: true,
             attributed: false,
             query: &["flush"],
+            reply: UpstreamReply::Json,
+        },
+    ),
+    // The owner's secrets SET — the module doc's recorded objection, answered:
+    // set-only, owner-gated, and no value ever travels back (upstream has no
+    // route anywhere that returns one; the reply is `{set, removed, total}`,
+    // names the owner itself just asserted). The member-gated name list stays
+    // off the lane. It rides a POST leaf translating Bedrock's PUT for the
+    // same reason bind does — `cors.rs` does not advertise PUT — and carries
+    // the read budget because the upstream is a table write behind
+    // `requireLiveWorkspace`, no container run. The body (`secrets` only,
+    // NAME: value-or-null, null deletes) is validated upstream strict
+    // deny-extra, which the unconditional actor strip already respects; a
+    // host without OCEAN_ROOM_SECRET_KEY answers 501 `secrets_unconfigured`,
+    // and it relays verbatim like every other upstream refusal.
+    (
+        "POST",
+        "secrets/set",
+        WorkspaceCall {
+            upstream: UpstreamMethod::Put,
+            segments: &["workspace", "secrets"],
+            timeout: WORKSPACE_READ_TIMEOUT,
+            write: false,
+            owner: true,
+            attributed: false,
+            query: &[],
             reply: UpstreamReply::Json,
         },
     ),
@@ -1139,14 +1178,14 @@ mod tests {
     }
 
     /// A Bedrock stand-in that answers every allowlisted leaf and records what
-    /// it was asked. It deliberately ALSO serves `workspace/secrets`, so a
-    /// test asserting that is unreachable is proving the daemon's allowlist
-    /// rather than an upstream 404; the repo PUT and DELETE it serves are now
-    /// the binding verbs' real upstreams, and the workspace POST and DELETE
-    /// the lifecycle pair's. The `file` leaf answers the way the
-    /// real route does — raw bytes on a 2xx, a JSON `HttpError` body on a
-    /// refusal — with declared content-types that contradict the bytes; see
-    /// [`file_read_call`].
+    /// it was asked. It deliberately ALSO serves GET `workspace/secrets`, so a
+    /// test asserting the name list is unreachable is proving the daemon's
+    /// allowlist rather than an upstream 404; the secrets PUT beside it is the
+    /// owner set's real upstream, the repo PUT and DELETE the binding verbs',
+    /// and the workspace POST and DELETE the lifecycle pair's. The `file`
+    /// leaf answers the way the real route does — raw bytes on a 2xx, a JSON
+    /// `HttpError` body on a refusal — with declared content-types that
+    /// contradict the bytes; see [`file_read_call`].
     async fn start_fake_bedrock(seen: Seen) -> (String, JoinHandle<()>) {
         let app = Router::new()
             .route(
@@ -1360,13 +1399,15 @@ mod tests {
     }
 
     /// Refusal 3 of 3. The allowlist is what makes this a lane and not a proxy.
-    /// `workspace/secrets` is the case that matters most: it exists upstream,
-    /// the fake Bedrock here serves it, and it is still unreachable. `GET exec`
-    /// and `POST list` prove the METHOD half of the key refuses too — a leaf
-    /// being allowlisted for one verb does not open it for another — and
-    /// `POST file` pins that opening the file READ did not open a write.
-    /// `GET provision` and `GET destroy` pin the same for the lifecycle
-    /// pair: owner leaves opened for POST alone.
+    /// The bare `secrets` leaf is the case that matters most: the name list
+    /// exists upstream, the fake Bedrock here serves it, and it is still
+    /// unreachable both ways — opening the owner's `secrets/set` did not open
+    /// a read-back (`GET secrets/set` refuses too, pinning the set as
+    /// POST-only). `GET exec` and `POST list` prove the METHOD half of the
+    /// key refuses too — a leaf being allowlisted for one verb does not open
+    /// it for another — and `POST file` pins that opening the file READ did
+    /// not open a write. `GET provision` and `GET destroy` pin the same for
+    /// the lifecycle pair: owner leaves opened for POST alone.
     ///
     /// Mutation: make `resolve_workspace_call` fall through to a constructed
     /// `WorkspaceCall` for unknown keys -> RED.
@@ -1375,7 +1416,14 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let fixture = federated_room(&tmp).await;
 
-        for leaf in ["secrets", "exec", "repo/../secrets", "provision", "destroy"] {
+        for leaf in [
+            "secrets",
+            "secrets/set",
+            "exec",
+            "repo/../secrets",
+            "provision",
+            "destroy",
+        ] {
             let response = room_workspace_read(
                 State(fixture.state.clone()),
                 Path((fixture.key.as_str().to_string(), leaf.to_string())),
@@ -1941,6 +1989,75 @@ mod tests {
         fixture.close();
     }
 
+    /// The owner's secrets set forwards as the upstream PUT on the room's own
+    /// bearer, with the client's actor claim stripped and NOTHING inserted in
+    /// its place — the upstream body is strict deny-extra (`secrets` only) —
+    /// and an agent asserting the leaf is refused with nothing forwarded,
+    /// which is what makes this the owner-gated set the module doc's answered
+    /// objection permits and not a member route. The fixture value is fake on
+    /// purpose and asserted only as "what the daemon relayed", never named as
+    /// a credential; the null entry rides untouched too, because null is the
+    /// upstream's documented delete form.
+    ///
+    /// Mutation: key the row `"secrets"` instead of `"secrets/set"` -> RED
+    /// (refusal test above); drop `owner` from the row -> RED here (the agent
+    /// would forward).
+    #[tokio::test]
+    async fn an_owner_secrets_set_forwards_as_the_upstream_put_and_an_agent_is_refused() {
+        let tmp = tempfile::tempdir().unwrap();
+        let fixture = federated_room(&tmp).await;
+
+        let response = room_workspace_command(
+            State(fixture.state.clone()),
+            Path((fixture.key.as_str().to_string(), "secrets/set".to_string())),
+            query(&[("actor_id", "alice")]),
+            Json(json!({
+                "secrets": {"GH_TOKEN": "fake-fixture-value", "STALE_NAME": null},
+                // The forgery attempt again; on this row it must vanish
+                // entirely rather than be replaced.
+                "actor_member_id": "member-somebody-else",
+            })),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let calls = fixture.seen.calls();
+        assert_eq!(calls.len(), 1);
+        let call = &calls[0];
+        assert_eq!(call.method, "PUT");
+        assert_eq!(call.path, "/api/v1/rooms/workspace-room/workspace/secrets");
+        assert_eq!(
+            call.authorization.as_deref(),
+            Some(format!("Bearer {BEARER}").as_str()),
+            "the room's own credential authenticates the set"
+        );
+        assert_eq!(
+            call.body["secrets"],
+            json!({"GH_TOKEN": "fake-fixture-value", "STALE_NAME": null})
+        );
+        assert!(
+            call.body.get(ACTOR_MEMBER_ID).is_none(),
+            "a secrets body carries no actor claim, the client's or the daemon's"
+        );
+
+        let response = room_workspace_command(
+            State(fixture.state.clone()),
+            Path((fixture.key.as_str().to_string(), "secrets/set".to_string())),
+            query(&[("actor_id", "researcher")]),
+            Json(json!({"secrets": {"GH_TOKEN": "fake-fixture-value"}})),
+        )
+        .await;
+        let (status, body) = body_of(response).await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        assert_eq!(body["code"], json!("workspace_actor_unmapped"));
+        assert_eq!(
+            fixture.seen.calls().len(),
+            1,
+            "the refusal spent no bearer and added no upstream call"
+        );
+
+        fixture.close();
+    }
+
     /// An attributed route sends the actor's RESOLVED member id, and an actor
     /// with none — a Bot here, and Tool and System alike — is refused rather
     /// than silently attributed to the human, which is what this lane did
@@ -2162,6 +2279,7 @@ mod tests {
                 "POST repo/ci -> Post [\"workspace\", \"repo\", \"ci\"]",
                 "POST repo/clone -> Post [\"workspace\", \"repo\", \"clone\"]",
                 "POST repo/unbind -> Delete [\"workspace\", \"repo\"]",
+                "POST secrets/set -> Put [\"workspace\", \"secrets\"]",
             ],
             "the Bedrock surface this lane exposes changed; review the manifest"
         );
@@ -2191,11 +2309,24 @@ mod tests {
             }),
             "raw file bytes are relayed only as a projection, and only on the file row"
         );
+        // Weakened ONE-WAY when the owner's set arrived: ports stay wholly
+        // absent, and what the old blanket absence protected on secrets is now
+        // pinned by shape — every secrets row is the owner-gated upstream Put.
+        // A member-level row, or a GET that would relay the name list or a
+        // value, cannot enter this table without turning this red.
+        for (method, leaf, call) in WORKSPACE_ALLOWLIST {
+            if call.segments.contains(&"secrets") {
+                assert!(
+                    call.owner && call.upstream == UpstreamMethod::Put,
+                    "{method} {leaf}: a secrets row is the owner-gated set, and nothing else"
+                );
+            }
+        }
         assert!(
-            !WORKSPACE_ALLOWLIST.iter().any(|(_, _, call)| {
-                call.segments.contains(&"secrets") || call.segments.contains(&"ports")
-            }),
-            "secrets and port exposure are deliberately absent"
+            !WORKSPACE_ALLOWLIST
+                .iter()
+                .any(|(_, _, call)| call.segments.contains(&"ports")),
+            "port exposure is deliberately absent"
         );
     }
 
