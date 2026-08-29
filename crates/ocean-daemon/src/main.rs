@@ -215,8 +215,8 @@ use persistent_rooms::{
     resolve_named_agent, room_create, room_create_invite, room_db_path, room_events, room_get,
     room_get_read_cursor, room_join, room_leave, room_patch_read_cursor, room_post_message,
     room_redeem_invite, room_register_agents, room_retry_outbox, room_snapshot, room_transcript,
-    rooms_list_persistent, run_federated_trigger_dispatcher, with_rooms, with_rooms_handle,
-    RoomAccessWakeBus, RoomReadCursorWakeBus, RoomStoreHandle, RoomWakeBus,
+    room_update, rooms_list_persistent, run_federated_trigger_dispatcher, with_rooms,
+    with_rooms_handle, RoomAccessWakeBus, RoomReadCursorWakeBus, RoomStoreHandle, RoomWakeBus,
 };
 use project_registry::{
     canonical_git_common_dir, discover_project_worktrees, project_create, project_delete,
@@ -1566,6 +1566,7 @@ fn banner_routes() -> &'static [&'static str] {
         "GET /v1/rooms/persistent",
         "POST /v1/rooms/persistent",
         "GET /v1/rooms/persistent/{key}",
+        "PATCH /v1/rooms/persistent/{key}",
         "POST /v1/rooms/persistent/{key}/participants",
         "DELETE /v1/rooms/persistent/{key}/participants/{participant_id}",
         "POST /v1/rooms/persistent/{key}/messages",
@@ -2916,7 +2917,10 @@ fn room_routes() -> Router<AppState> {
             "/v1/rooms/persistent",
             get(rooms_list_persistent).post(room_create),
         )
-        .route("/v1/rooms/persistent/{key}", get(room_get))
+        .route(
+            "/v1/rooms/persistent/{key}",
+            get(room_get).patch(room_update),
+        )
         .route("/v1/rooms/persistent/{key}/participants", post(room_join))
         .route(
             "/v1/rooms/persistent/{key}/participants/{participant_id}",
@@ -25379,9 +25383,12 @@ mod tests {
         // lives beside the table, in
         // `the_allowlist_is_the_whole_reachable_surface`, and it alone moves
         // when the lane grows.
+        // 112 -> 113: rooms gained PATCH /v1/rooms/persistent/{key} so a
+        // room's trigger policy (and name) can change after creation instead
+        // of being create-time-only.
         assert_eq!(
             banner.len(),
-            112,
+            113,
             "route baseline changed; review the manifest"
         );
 
@@ -25741,7 +25748,7 @@ mod tests {
                 .headers()
                 .get(header::ALLOW)
                 .and_then(|value| value.to_str().ok()),
-            Some("GET,HEAD")
+            Some("GET,HEAD,PATCH")
         );
 
         let livekit_control = app

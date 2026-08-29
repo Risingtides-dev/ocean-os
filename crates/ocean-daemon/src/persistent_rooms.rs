@@ -581,6 +581,67 @@ pub(super) async fn room_create(
     }
 }
 
+/// Keep "field absent" distinguishable from an explicit `"trigger_policy":
+/// null`. Plain `Option` collapses both to `None`, but the store's update
+/// contract is `Option<Option<_>>` — absent leaves the policy alone, `null`
+/// clears it — and collapsing them would turn "don't touch my policy" into
+/// "delete it".
+fn double_option_trigger_policy<'de, D>(
+    deserializer: D,
+) -> Result<Option<Option<RoomTriggerPolicy>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Option::<RoomTriggerPolicy>::deserialize(deserializer).map(Some)
+}
+
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct RoomUpdateRequest {
+    /// New human-readable room name. Absent ⇒ unchanged.
+    #[serde(default)]
+    pub(super) name: Option<String>,
+    /// Absent ⇒ unchanged; explicit `null` ⇒ clear the policy.
+    #[serde(default, deserialize_with = "double_option_trigger_policy")]
+    pub(super) trigger_policy: Option<Option<RoomTriggerPolicy>>,
+}
+
+/// `PATCH /v1/rooms/persistent/{key}` — update a room's mutable metadata
+/// (name and/or trigger policy) after creation. Until this route existed the
+/// trigger policy was create-time-only: changing it meant a new room and a
+/// lost transcript. Body parsing mirrors the read-cursor PATCH (typed 400,
+/// never an extractor rejection), and unknown fields are rejected rather than
+/// ignored, so a typo'd field name can never read as "leave everything
+/// unchanged".
+pub(super) async fn room_update(
+    State(state): State<AppState>,
+    Path(raw_key): Path<String>,
+    body: axum::body::Bytes,
+) -> (StatusCode, Json<serde_json::Value>) {
+    let req: RoomUpdateRequest = match serde_json::from_slice(&body) {
+        Ok(r) => r,
+        Err(_) => return invalid_request_response(),
+    };
+    let trimmed = raw_key.trim();
+    if trimmed.is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "ok": false, "error": "invalid room key; must be non-empty" })),
+        );
+    }
+    let key = RoomKey::new(trimmed);
+    let result = with_rooms(&state, |reg| {
+        reg.update(&key, req.name, req.trigger_policy, Utc::now())
+    });
+    match result {
+        Ok(rec) => (
+            StatusCode::OK,
+            Json(json!({ "ok": true, "room": rec.room })),
+        ),
+        Err(e) => room_store_error_response(e),
+    }
+}
+
 /// `GET /v1/rooms/persistent` — list all persistent rooms (no transcripts).
 /// Pagination query for `GET /v1/rooms/persistent` (OCEAN-250).
 #[derive(Debug, serde::Deserialize, Default)]
@@ -3898,6 +3959,102 @@ mod tests {
         .await;
         assert_eq!(status, StatusCode::CONFLICT);
         assert_eq!(body.0["code"], json!("room_read_cursor_unsupported"));
+    }
+
+    /// The PATCH room contract in one pass: a present `trigger_policy`
+    /// replaces the stored one, an absent field leaves it untouched, and an
+    /// explicit `null` clears it — the three wire shapes the double-Option
+    /// deserializer exists to keep apart.
+    #[tokio::test]
+    async fn room_update_distinguishes_absent_null_and_present_trigger_policy() {
+        let _env = AUTO_CONVENE_ENV_LOCK.lock().await;
+        let tmp = tempfile::tempdir().unwrap();
+        let state = fake_convene_state(&tmp);
+        let key = RoomKey::new("policy-update-room");
+        with_rooms(&state, |store| {
+            store.create(key.clone(), "Policy Update", None, Utc::now())
+        })
+        .unwrap();
+
+        let (status, body) = room_update(
+            State(state.clone()),
+            Path(key.as_str().to_string()),
+            Bytes::from_static(
+                br#"{"trigger_policy":{"on_mention":true,"on_build_failure":true}}"#,
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body.0["ok"], json!(true));
+        assert_eq!(body.0["room"]["trigger_policy"]["on_mention"], json!(true));
+        assert_eq!(
+            body.0["room"]["trigger_policy"]["on_build_failure"],
+            json!(true)
+        );
+
+        let (status, body) = room_update(
+            State(state.clone()),
+            Path(key.as_str().to_string()),
+            Bytes::from_static(br#"{"name":"Renamed"}"#),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body.0["room"]["name"], json!("Renamed"));
+        assert_eq!(
+            body.0["room"]["trigger_policy"]["on_build_failure"],
+            json!(true)
+        );
+
+        let (status, body) = room_update(
+            State(state.clone()),
+            Path(key.as_str().to_string()),
+            Bytes::from_static(br#"{"trigger_policy":null}"#),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body.0["room"]["trigger_policy"], serde_json::Value::Null);
+        let stored = with_rooms(&state, |store| store.get(&key))
+            .unwrap()
+            .expect("room exists");
+        assert!(stored.room.trigger_policy.is_none());
+        assert_eq!(stored.room.name, "Renamed");
+    }
+
+    /// The failure edges: an unknown room 404s through the store's typed
+    /// mapping, and a typo'd field or malformed JSON is the same typed 400
+    /// the read-cursor PATCH answers — never a silent "nothing changed".
+    #[tokio::test]
+    async fn room_update_unknown_room_and_bad_bodies_are_typed_errors() {
+        let _env = AUTO_CONVENE_ENV_LOCK.lock().await;
+        let tmp = tempfile::tempdir().unwrap();
+        let state = fake_convene_state(&tmp);
+
+        let (status, body) = room_update(
+            State(state.clone()),
+            Path("missing-room".to_string()),
+            Bytes::from_static(br#"{"name":"New Name"}"#),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert_eq!(body.0["ok"], json!(false));
+
+        let (status, body) = room_update(
+            State(state.clone()),
+            Path("missing-room".to_string()),
+            Bytes::from_static(br#"{"trigger_polcy":{}}"#),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(body.0, json!({"ok": false, "error": "invalid_request"}));
+
+        let (status, body) = room_update(
+            State(state),
+            Path("missing-room".to_string()),
+            Bytes::from_static(b"not json"),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(body.0, json!({"ok": false, "error": "invalid_request"}));
     }
 
     /// M6 + H1 regression: the Live-room `GET .../read-cursor` response uses
