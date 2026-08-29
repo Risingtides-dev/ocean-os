@@ -2998,10 +2998,11 @@ fn room_routes() -> Router<AppState> {
         // allowlist is what decides whether it becomes a call at all, so the
         // gate is exercised by every request rather than implied by which
         // handler got matched. Neither PUT nor DELETE is registered even now
-        // that repo bind and unbind ride the lane: those owner verbs travel
-        // as POST leaves (`repo/bind`, `repo/unbind`) and the allowlist
-        // translates them to Bedrock's PUT and DELETE, because `cors.rs` does
-        // not advertise PUT and a browser PUT would die at the preflight.
+        // that repo bind/unbind and workspace provision/destroy ride the
+        // lane: the owner verbs travel as POST leaves (`repo/bind`,
+        // `repo/unbind`, `provision`, `destroy`) and the allowlist translates
+        // them to whichever verb Bedrock actually serves, because `cors.rs`
+        // does not advertise PUT and a browser PUT would die at the preflight.
         //
         // `DefaultBodyLimit` for the same reason attachments needs one: the
         // handler's own 32 KiB refusal would otherwise be preceded by axum's
@@ -25369,13 +25370,15 @@ mod tests {
         // 108 -> 109: on-demand transcript summary added POST
         // /v1/rooms/persistent/{key}/summarize.
         // 109 -> 112: the room workspace lane added GET /workspace plus
-        // GET+POST /workspace/{*leaf}. THREE registrations carry SEVEN upstream
-        // calls, because the leaf arrives on the wire and
-        // `room_workspace_proxy::WORKSPACE_ALLOWLIST` is what decides whether it
-        // becomes one — this count is therefore NOT the size of the Bedrock
-        // surface being exposed. That tripwire lives beside the table, in
-        // `the_allowlist_is_the_whole_reachable_surface`; both have to move
-        // together when the lane grows.
+        // GET+POST /workspace/{*leaf}. Those THREE registrations carry every
+        // upstream call the lane exposes (seven at the time; the allowlist
+        // has grown since without moving this count), because the leaf
+        // arrives on the wire and `room_workspace_proxy::WORKSPACE_ALLOWLIST`
+        // is what decides whether it becomes one — this count is therefore
+        // NOT the size of the Bedrock surface being exposed. That tripwire
+        // lives beside the table, in
+        // `the_allowlist_is_the_whole_reachable_surface`, and it alone moves
+        // when the lane grows.
         assert_eq!(
             banner.len(),
             112,

@@ -13,30 +13,33 @@
 //! 1. **The allowlist.** `resolve_workspace_call` is a total function over
 //!    `(method, leaf)`. Anything it does not name is refused with a typed code
 //!    and no request leaves the daemon. Bedrock's compute surface is much wider
-//!    than what is named here — provision, destroy, file write/delete, mkdir,
-//!    flush, hydrate, port exposure, and `workspace/secrets` all exist upstream
-//!    and are all absent on purpose. Secrets in particular: even the NAME list
-//!    is room configuration, and a caller-asserted lane is not where that
-//!    belongs. Provision and destroy are owner-only upstream
-//!    (`requireRoomOwner`) and shape infrastructure every other member then
-//!    shares; they want an operator path, not this one. The two repo BINDING
-//!    verbs were excluded on the same ground until the 2026-08-29 operator
-//!    ruling opened them through this lane, owner-gated by the identity map
-//!    below: they ride daemon-side POST leaves `repo/bind` and `repo/unbind`
-//!    (an upstream PUT cannot arrive as a browser PUT — `cors.rs` does not
-//!    advertise the method) and forward only for the actor that RESOLVES to
-//!    the credential's own principal, which is exactly the principal Bedrock's
-//!    `requireRoomOwner` will judge, since this daemon always presents the
-//!    CREDENTIAL's bearer. Without that gate a row for bind would hand every
-//!    roster participant the authority to repoint the whole room's compute at
-//!    an arbitrary remote. Cloning and building what an owner already bound
-//!    remains a member act. `workspace/file` is the one row whose upstream 2xx
-//!    is raw bytes rather than JSON; it rides this lane as a bounded JSON
-//!    PROJECTION — text-vs-binary derived from the bytes in hand, never from
-//!    Bedrock's extension-derived `content-type` — so no byte ever reaches a
-//!    browser as a document and no type is ever declared to it, which is why
-//!    the download discipline `room_attachments.rs` worked out is not needed
-//!    here. File WRITE and DELETE stay absent.
+//!    than what is named here — file write/delete, mkdir, flush, hydrate, port
+//!    exposure, and `workspace/secrets` all exist upstream and are all absent
+//!    on purpose. Secrets in particular: even the NAME list is room
+//!    configuration, and a caller-asserted lane is not where that belongs.
+//!    The OWNER verbs — repo bind/unbind, and workspace provision/destroy —
+//!    are owner-only upstream (`requireRoomOwner`) and shape infrastructure
+//!    every other member then shares; they were excluded as wanting an
+//!    operator path until the 2026-08-29 operator ruling opened them through
+//!    this lane, owner-gated by the identity map below: they ride daemon-side
+//!    POST leaves (`repo/bind`, `repo/unbind`, `provision`, `destroy` — an
+//!    upstream PUT cannot arrive as a browser PUT, `cors.rs` does not
+//!    advertise the method, and the workspace routes register no wire DELETE)
+//!    and forward only for the actor that RESOLVES to the credential's own
+//!    principal, which is exactly the principal Bedrock's `requireRoomOwner`
+//!    will judge, since this daemon always presents the CREDENTIAL's bearer.
+//!    Without that gate a row for bind would hand every roster participant
+//!    the authority to repoint the whole room's compute at an arbitrary
+//!    remote, and a row for destroy would let any participant retire the
+//!    container everyone else was working in. Cloning and building what an
+//!    owner already bound remains a member act. `workspace/file` is the one
+//!    row whose upstream 2xx is raw bytes rather than JSON; it rides this
+//!    lane as a bounded JSON PROJECTION — text-vs-binary derived from the
+//!    bytes in hand, never from Bedrock's extension-derived `content-type` —
+//!    so no byte ever reaches a browser as a document and no type is ever
+//!    declared to it, which is why the download discipline
+//!    `room_attachments.rs` worked out is not needed here. File WRITE and
+//!    DELETE stay absent.
 //! 2. **The membership gate.** The caller asserts a room participant in
 //!    `?actor_id=`; that claim is checked against the roster inside the SAME
 //!    store guard that reads the credential, so a concurrent roster replacement
@@ -201,17 +204,23 @@ const ACTOR_MEMBER_ID: &str = "actor_member_id";
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct WorkspaceCall {
     /// Upstream method, typed rather than converted from the daemon-side verb,
-    /// because the table is where a divergence has to be written down — and the
-    /// two owner rows carry one: `cors.rs`'s `cors_allowed_methods` does not
-    /// advertise PUT, so Bedrock's PUT bind arrives on the wire as a POST leaf,
-    /// and its DELETE unbind rides the same shape for symmetry.
+    /// because the table is where a divergence has to be written down — and
+    /// three of the four owner rows carry one: `cors.rs`'s
+    /// `cors_allowed_methods` does not advertise PUT, so Bedrock's PUT bind
+    /// arrives on the wire as a POST leaf, and its DELETE unbind and destroy
+    /// ride the same shape rather than registering a wire DELETE. Provision
+    /// is the owner verb with no divergence at all — Bedrock serves it as a
+    /// POST already — which is why the tripwire pins "translated method
+    /// implies owner" and not the iff it once could.
     upstream: UpstreamMethod,
     /// Path segments appended after `/api/v1/rooms/{room}/`.
     segments: &'static [&'static str],
     /// How long the daemon will wait for this particular call. A read answers
-    /// out of Bedrock's state; a command runs in a container first. The owner
-    /// verbs are prompt like reads — bind and unbind land in Bedrock's own
-    /// table, no container runs.
+    /// out of Bedrock's state; a command runs in a container first. The
+    /// binding owner verbs are prompt like reads — bind and unbind land in
+    /// Bedrock's own table, no container runs — while the lifecycle pair
+    /// carries the command budget: provision builds and hydrates the
+    /// container, destroy flushes it back, before either answers.
     timeout: Duration,
     /// A write verb: refuses a claimed Agent/System identity.
     write: bool,
@@ -384,8 +393,7 @@ const WORKSPACE_ALLOWLIST: &[(&str, &str, WorkspaceCall)] = &[
         },
     ),
     // Clone and build run against the remote an owner already chose, which is
-    // why they are member acts and the two binding verbs this table excludes
-    // are not.
+    // why they are member acts and the binding verbs below are owner-gated.
     (
         "POST",
         "repo/clone",
@@ -468,6 +476,42 @@ const WORKSPACE_ALLOWLIST: &[(&str, &str, WorkspaceCall)] = &[
             owner: true,
             attributed: false,
             query: &[],
+            reply: UpstreamReply::Json,
+        },
+    ),
+    // The workspace lifecycle, opened by the same ruling and gated the same
+    // way. Unlike the binding pair these run container work — provision
+    // creates the container, hydrates it from Bedrock, and restores the bound
+    // checkout; destroy flushes the workspace back to Bedrock before the
+    // driver tears it down (`?flush=0` skips the save) — so both carry the
+    // command budget a 15s bound would 503. Provision's upstream body is
+    // strict deny-extra (`spec` only), which the unconditional actor strip
+    // keeps legal; destroy's upstream DELETE reads no body at all.
+    (
+        "POST",
+        "provision",
+        WorkspaceCall {
+            upstream: UpstreamMethod::Post,
+            segments: &["workspace"],
+            timeout: WORKSPACE_COMMAND_TIMEOUT,
+            write: false,
+            owner: true,
+            attributed: false,
+            query: &[],
+            reply: UpstreamReply::Json,
+        },
+    ),
+    (
+        "POST",
+        "destroy",
+        WorkspaceCall {
+            upstream: UpstreamMethod::Delete,
+            segments: &["workspace"],
+            timeout: WORKSPACE_COMMAND_TIMEOUT,
+            write: false,
+            owner: true,
+            attributed: false,
+            query: &["flush"],
             reply: UpstreamReply::Json,
         },
     ),
@@ -1098,13 +1142,17 @@ mod tests {
     /// it was asked. It deliberately ALSO serves `workspace/secrets`, so a
     /// test asserting that is unreachable is proving the daemon's allowlist
     /// rather than an upstream 404; the repo PUT and DELETE it serves are now
-    /// the owner verbs' real upstreams. The `file` leaf answers the way the
+    /// the binding verbs' real upstreams, and the workspace POST and DELETE
+    /// the lifecycle pair's. The `file` leaf answers the way the
     /// real route does — raw bytes on a 2xx, a JSON `HttpError` body on a
     /// refusal — with declared content-types that contradict the bytes; see
     /// [`file_read_call`].
     async fn start_fake_bedrock(seen: Seen) -> (String, JoinHandle<()>) {
         let app = Router::new()
-            .route("/api/v1/rooms/{room}/workspace", get(record_call))
+            .route(
+                "/api/v1/rooms/{room}/workspace",
+                get(record_call).post(record_call).delete(record_call),
+            )
             .route("/api/v1/rooms/{room}/workspace/list", get(record_call))
             .route("/api/v1/rooms/{room}/workspace/execs", get(record_call))
             .route("/api/v1/rooms/{room}/workspace/exec", post(record_call))
@@ -1317,6 +1365,8 @@ mod tests {
     /// and `POST list` prove the METHOD half of the key refuses too — a leaf
     /// being allowlisted for one verb does not open it for another — and
     /// `POST file` pins that opening the file READ did not open a write.
+    /// `GET provision` and `GET destroy` pin the same for the lifecycle
+    /// pair: owner leaves opened for POST alone.
     ///
     /// Mutation: make `resolve_workspace_call` fall through to a constructed
     /// `WorkspaceCall` for unknown keys -> RED.
@@ -1325,7 +1375,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let fixture = federated_room(&tmp).await;
 
-        for leaf in ["secrets", "exec", "repo/../secrets"] {
+        for leaf in ["secrets", "exec", "repo/../secrets", "provision", "destroy"] {
             let response = room_workspace_read(
                 State(fixture.state.clone()),
                 Path((fixture.key.as_str().to_string(), leaf.to_string())),
@@ -1754,6 +1804,143 @@ mod tests {
         fixture.close();
     }
 
+    /// The lifecycle verbs opened with the binding pair forward as what
+    /// Bedrock actually serves — provision is the upstream POST on
+    /// `workspace`, destroy the DELETE — on the room's own bearer.
+    /// Provision's body crosses with the client's actor claim stripped and
+    /// NOTHING inserted in its place, because the upstream body is strict
+    /// deny-extra (`spec` only); destroy forwards no body at all, because the
+    /// upstream DELETE reads none, and `flush` is the one query key it
+    /// relays.
+    ///
+    /// Mutation: mark either row `attributed` -> RED (the stray key would be
+    /// asserted here before Bedrock could 400 it); forward the destroy body,
+    /// or drop `flush` from its row's query -> RED.
+    #[tokio::test]
+    async fn an_owner_provision_forwards_as_the_upstream_post_and_destroy_as_the_delete() {
+        let tmp = tempfile::tempdir().unwrap();
+        let fixture = federated_room(&tmp).await;
+        let expected_authorization = format!("Bearer {BEARER}");
+
+        let response = room_workspace_command(
+            State(fixture.state.clone()),
+            Path((fixture.key.as_str().to_string(), "provision".to_string())),
+            query(&[("actor_id", "alice")]),
+            Json(json!({
+                "spec": {"image": "default"},
+                // The forgery attempt again; on this row it must vanish
+                // entirely rather than be replaced.
+                "actor_member_id": "member-somebody-else",
+            })),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let calls = fixture.seen.calls();
+        assert_eq!(calls.len(), 1);
+        let call = &calls[0];
+        assert_eq!(call.method, "POST");
+        assert_eq!(call.path, "/api/v1/rooms/workspace-room/workspace");
+        assert_eq!(
+            call.authorization.as_deref(),
+            Some(expected_authorization.as_str()),
+            "the room's own credential authenticates the provision"
+        );
+        assert_eq!(call.body["spec"], json!({"image": "default"}));
+        assert!(
+            call.body.get(ACTOR_MEMBER_ID).is_none(),
+            "a provision body carries no actor claim, the client's or the daemon's"
+        );
+
+        let response = room_workspace_command(
+            State(fixture.state.clone()),
+            Path((fixture.key.as_str().to_string(), "destroy".to_string())),
+            query(&[("actor_id", "alice"), ("flush", "0")]),
+            Json(json!({})),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let calls = fixture.seen.calls();
+        assert_eq!(calls.len(), 2);
+        let call = &calls[1];
+        assert_eq!(call.method, "DELETE");
+        assert_eq!(call.path, "/api/v1/rooms/workspace-room/workspace");
+        assert_eq!(
+            call.authorization.as_deref(),
+            Some(expected_authorization.as_str()),
+            "the room's own credential authenticates the destroy"
+        );
+        assert!(
+            call.query.contains("flush=0") && !call.query.contains("actor_id"),
+            "`flush` relays and `actor_id` does not: {}",
+            call.query
+        );
+        assert_eq!(call.body, Value::Null, "an upstream DELETE carries no body");
+
+        fixture.close();
+    }
+
+    /// The identity map fails closed on the lifecycle pair exactly as it does
+    /// on the binding pair: an agent never federation-registered resolves to
+    /// nothing, a registered one resolves to its own member id — still not
+    /// the principal Bedrock's `requireRoomOwner` will judge — and neither
+    /// refusal forwards anything. Pinned separately from the binding test
+    /// because these rows carry the command budget: a gate that leaked here
+    /// would leak on the verb that builds infrastructure.
+    ///
+    /// Mutation: resolve an Agent to `local_human_member_id` -> RED; drop the
+    /// owner comparison -> RED.
+    #[tokio::test]
+    async fn an_agent_on_a_lifecycle_verb_is_refused_mapped_or_not() {
+        let tmp = tempfile::tempdir().unwrap();
+        let fixture = federated_room(&tmp).await;
+
+        for leaf in ["provision", "destroy"] {
+            let response = room_workspace_command(
+                State(fixture.state.clone()),
+                Path((fixture.key.as_str().to_string(), leaf.to_string())),
+                query(&[("actor_id", "researcher")]),
+                Json(json!({})),
+            )
+            .await;
+            let (status, body) = body_of(response).await;
+            assert_eq!(status, StatusCode::FORBIDDEN, "unmapped {leaf}");
+            assert_eq!(
+                body["code"],
+                json!("workspace_actor_unmapped"),
+                "unmapped {leaf}"
+            );
+        }
+
+        with_rooms(&fixture.state, |store| {
+            store
+                .bind_room_agent(&fixture.key, "member-researcher", "researcher", "reg-key")
+                .expect("binding fixture");
+        });
+        for leaf in ["provision", "destroy"] {
+            let response = room_workspace_command(
+                State(fixture.state.clone()),
+                Path((fixture.key.as_str().to_string(), leaf.to_string())),
+                query(&[("actor_id", "researcher")]),
+                Json(json!({})),
+            )
+            .await;
+            let (status, body) = body_of(response).await;
+            assert_eq!(status, StatusCode::FORBIDDEN, "mapped {leaf}");
+            assert_eq!(
+                body["code"],
+                json!("workspace_not_owner_principal"),
+                "mapped {leaf}"
+            );
+        }
+
+        assert!(
+            fixture.seen.calls().is_empty(),
+            "no refusal may spend the bearer"
+        );
+
+        fixture.close();
+    }
+
     /// An attributed route sends the actor's RESOLVED member id, and an actor
     /// with none — a Bot here, and Tool and System alike — is refused rather
     /// than silently attributed to the human, which is what this lane did
@@ -1907,21 +2094,24 @@ mod tests {
         fixture.close();
     }
 
-    /// Every command on the lane must be able to outlast Bedrock's own ceiling,
-    /// and everything that answers out of Bedrock's state — reads AND the two
-    /// owner verbs, which land in its repo table with no container run — must
-    /// not. The table is where that policy is declared, so the table is where
-    /// it is asserted.
+    /// Everything that runs container work must be able to outlast Bedrock's
+    /// own ceiling — the write verbs, and the lifecycle pair: provision
+    /// hydrates the container and restores the checkout before it answers,
+    /// destroy flushes the workspace back first. Everything that answers out
+    /// of Bedrock's state — reads AND the binding owner verbs, which land in
+    /// its repo table with no container run — must not. The table is where
+    /// that policy is declared, so the table is where it is asserted.
     ///
     /// Mutation: give a write row `WORKSPACE_READ_TIMEOUT` -> RED; give an
     /// owner row `write: true` or `attributed: true` -> RED.
     #[test]
     fn a_command_may_outlast_bedrocks_ceiling_and_a_read_may_not() {
         for (method, leaf, call) in WORKSPACE_ALLOWLIST {
-            if call.write {
+            let runs_container_work = call.write || matches!(*leaf, "provision" | "destroy");
+            if runs_container_work {
                 assert!(
                     call.timeout > BEDROCK_EXEC_TIMEOUT_MAX,
-                    "{method} {leaf} would refuse a command Bedrock was still running"
+                    "{method} {leaf} would refuse a call Bedrock was still legally serving"
                 );
             } else {
                 assert_eq!(
@@ -1964,7 +2154,9 @@ mod tests {
                 "GET list -> Get [\"workspace\", \"list\"]",
                 "GET repo -> Get [\"workspace\", \"repo\"]",
                 "GET repo/ci -> Get [\"workspace\", \"repo\", \"ci\"]",
+                "POST destroy -> Delete [\"workspace\"]",
                 "POST exec -> Post [\"workspace\", \"exec\"]",
+                "POST provision -> Post [\"workspace\"]",
                 "POST repo/bind -> Put [\"workspace\", \"repo\"]",
                 "POST repo/build -> Post [\"workspace\", \"repo\", \"build\"]",
                 "POST repo/ci -> Post [\"workspace\", \"repo\", \"ci\"]",
@@ -1973,15 +2165,14 @@ mod tests {
             ],
             "the Bedrock surface this lane exposes changed; review the manifest"
         );
-        // The binding verbs entered by the 2026-08-29 operator ruling, and the
-        // rows that carry them are the only place the upstream verb diverges
-        // from the daemon's POST — divergence and the owner gate must move
-        // together, because the divergence exists precisely so an owner verb
-        // can ride a wire method `cors.rs` advertises.
+        // The owner verbs entered by the 2026-08-29 operator ruling. Method
+        // DIVERGENCE exists only so an owner verb can ride a wire method the
+        // router registers, so a translated method must always mean an owner
+        // row. The converse stopped holding when the lifecycle pair joined:
+        // provision is owner-gated on an upstream POST, no translation needed.
         for (method, leaf, call) in WORKSPACE_ALLOWLIST {
-            assert_eq!(
-                call.owner,
-                !matches!(call.upstream, UpstreamMethod::Get | UpstreamMethod::Post),
+            assert!(
+                call.owner || matches!(call.upstream, UpstreamMethod::Get | UpstreamMethod::Post),
                 "{method} {leaf}: only an owner verb may translate the wire method"
             );
         }
