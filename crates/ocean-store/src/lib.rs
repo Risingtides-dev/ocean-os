@@ -5165,6 +5165,29 @@ impl SqliteRoomStore {
         Ok(name)
     }
 
+    /// The reverse of [`Self::resolve_room_agent`]: one local folder-agent
+    /// name to its opaque Bedrock member id. At most one row can answer —
+    /// `idx_room_member_bindings_agent` makes the agent name unique per room.
+    /// `None` when the agent was never federation-registered; callers that
+    /// need a member id treat that as fail-closed rather than attributing the
+    /// agent to anyone else. Never returns the registration key.
+    pub fn resolve_room_agent_member(
+        &self,
+        key: &RoomKey,
+        agent_name: &str,
+    ) -> Result<Option<String>> {
+        let member = self
+            .conn
+            .query_row(
+                "SELECT member_id FROM room_member_bindings
+                 WHERE room_id = ?1 AND agent_name = ?2",
+                params![key.as_str(), agent_name],
+                |r| r.get::<_, String>(0),
+            )
+            .optional()?;
+        Ok(member)
+    }
+
     /// Allocate the next producer sequence and insert one Pending outbox row
     /// in a single `IMMEDIATE` transaction (P2-A). No transcript row is
     /// written and no trigger fires — federation intents live in the outbox
@@ -10411,6 +10434,18 @@ mod tests {
             s.resolve_room_agent(&key, "m-agent-1").unwrap().as_deref(),
             Some("context-cartographer")
         );
+        // The reverse read answers the same row, and an unregistered agent
+        // resolves to nothing rather than to somebody else's member id.
+        assert_eq!(
+            s.resolve_room_agent_member(&key, "context-cartographer")
+                .unwrap()
+                .as_deref(),
+            Some("m-agent-1")
+        );
+        assert!(s
+            .resolve_room_agent_member(&key, "never-registered")
+            .unwrap()
+            .is_none());
         // Registration key is stored but only reachable via raw SQL (never a public read).
         let raw: String = s
             .conn
@@ -10452,11 +10487,23 @@ mod tests {
         assert!(s.unbind_room_agent(&key, "m-agent-1").unwrap());
         assert!(!s.unbind_room_agent(&key, "m-agent-1").unwrap());
         assert!(s.resolve_room_agent(&key, "m-agent-1").unwrap().is_none());
+        assert!(
+            s.resolve_room_agent_member(&key, "context-cartographer")
+                .unwrap()
+                .is_none(),
+            "an unbound agent must stop resolving in both directions"
+        );
         s.bind_room_agent(&key, "m-agent-1", "other-agent", "reg-key-BBB")
             .unwrap();
         assert_eq!(
             s.resolve_room_agent(&key, "m-agent-1").unwrap().as_deref(),
             Some("other-agent")
+        );
+        assert_eq!(
+            s.resolve_room_agent_member(&key, "other-agent")
+                .unwrap()
+                .as_deref(),
+            Some("m-agent-1")
         );
     }
 
