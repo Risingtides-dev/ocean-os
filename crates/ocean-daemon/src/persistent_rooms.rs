@@ -551,11 +551,46 @@ pub(super) struct RoomCreateRequest {
     pub(super) workspace_root: Option<String>,
 }
 
+/// Refuse a submitted policy that enables a trigger the daemon never fires.
+/// Mention, thread-reply, and build-failure events come from real code paths;
+/// nothing emits a schedule tick or a component event, so storing those values
+/// would accept configuration that silently never acts. Refuse the VALUE, not
+/// the field's presence: clients serialize `"on_component_event": false` into
+/// every policy body (bools have no skip-if-default on the wire), so
+/// presence-refusal would 400 every room write that sets any trigger.
+fn unwired_trigger_response(
+    policy: &RoomTriggerPolicy,
+) -> Option<(StatusCode, Json<serde_json::Value>)> {
+    let field = if policy.on_component_event {
+        "on_component_event"
+    } else if policy.on_schedule.is_some() {
+        "on_schedule"
+    } else {
+        return None;
+    };
+    Some((
+        StatusCode::BAD_REQUEST,
+        Json(json!({
+            "ok": false,
+            "code": "trigger_unwired",
+            "field": field,
+            "error": format!("{field} has no runtime yet: the daemon never fires this trigger, so the value would be stored and never act"),
+        })),
+    ))
+}
+
 /// `POST /v1/rooms/persistent` — create a persistent room.
 pub(super) async fn room_create(
     State(state): State<AppState>,
     Json(req): Json<RoomCreateRequest>,
 ) -> (StatusCode, Json<serde_json::Value>) {
+    if let Some(refusal) = req
+        .trigger_policy
+        .as_ref()
+        .and_then(unwired_trigger_response)
+    {
+        return refusal;
+    }
     let key = RoomKey::new(req.key.trim());
     // Normalize an empty/whitespace workspace_root to None so a blank field is
     // treated as "no binding" rather than a bound-to-empty-string room.
@@ -622,6 +657,16 @@ pub(super) async fn room_update(
         Ok(r) => r,
         Err(_) => return invalid_request_response(),
     };
+    // Same refusal as create: a PATCH must not become the back door that
+    // stores a trigger nothing fires. An explicit `null` (clear) is fine.
+    if let Some(refusal) = req
+        .trigger_policy
+        .as_ref()
+        .and_then(|p| p.as_ref())
+        .and_then(unwired_trigger_response)
+    {
+        return refusal;
+    }
     let trimmed = raw_key.trim();
     if trimmed.is_empty() {
         return (
@@ -4055,6 +4100,131 @@ mod tests {
         .await;
         assert_eq!(status, StatusCode::BAD_REQUEST);
         assert_eq!(body.0, json!({"ok": false, "error": "invalid_request"}));
+    }
+
+    /// The two triggers nothing fires — a cron in `on_schedule`, a `true`
+    /// `on_component_event` — are refused at create with a typed 400 naming
+    /// the field, instead of stored as configuration that silently never
+    /// acts. Refusal is by VALUE: clients serialize every bool into the
+    /// policy body, so explicit-`false` dead fields must keep passing.
+    #[tokio::test]
+    async fn room_create_refuses_unwired_trigger_values() {
+        let _env = AUTO_CONVENE_ENV_LOCK.lock().await;
+        let tmp = tempfile::tempdir().unwrap();
+        let state = fake_convene_state(&tmp);
+
+        let req = |policy: serde_json::Value| -> RoomCreateRequest {
+            serde_json::from_value(json!({
+                "key": "unwired-create",
+                "name": "Unwired",
+                "trigger_policy": policy,
+            }))
+            .expect("request deserializes")
+        };
+
+        let (status, body) = room_create(
+            State(state.clone()),
+            Json(req(
+                json!({"on_mention": true, "on_schedule": "*/5 * * * *"}),
+            )),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(body.0["ok"], json!(false));
+        assert_eq!(body.0["code"], json!("trigger_unwired"));
+        assert_eq!(body.0["field"], json!("on_schedule"));
+
+        let (status, body) = room_create(
+            State(state.clone()),
+            Json(req(json!({"on_component_event": true}))),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(body.0["code"], json!("trigger_unwired"));
+        assert_eq!(body.0["field"], json!("on_component_event"));
+
+        // Neither refusal wrote anything.
+        let stored =
+            with_rooms(&state, |store| store.get(&RoomKey::new("unwired-create"))).unwrap();
+        assert!(stored.is_none());
+
+        // The wire shape every client sends: live triggers on, dead bools
+        // explicitly false.
+        let (status, body) = room_create(
+            State(state.clone()),
+            Json(req(json!({
+                "on_mention": true,
+                "on_thread_reply": true,
+                "on_component_event": false,
+                "on_build_failure": true,
+            }))),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED);
+        assert_eq!(body.0["room"]["trigger_policy"]["on_mention"], json!(true));
+    }
+
+    /// The same refusal on PATCH: the update route must not be the back door
+    /// that stores an unwired trigger. A refused PATCH leaves the stored
+    /// policy untouched, and the normal wire shape (dead bools false) passes.
+    #[tokio::test]
+    async fn room_update_refuses_unwired_trigger_values() {
+        let _env = AUTO_CONVENE_ENV_LOCK.lock().await;
+        let tmp = tempfile::tempdir().unwrap();
+        let state = fake_convene_state(&tmp);
+        let key = RoomKey::new("unwired-update");
+        let created_policy = RoomTriggerPolicy {
+            on_mention: true,
+            ..Default::default()
+        };
+        with_rooms(&state, |store| {
+            store.create(
+                key.clone(),
+                "Unwired Update",
+                Some(created_policy.clone()),
+                Utc::now(),
+            )
+        })
+        .unwrap();
+
+        let (status, body) = room_update(
+            State(state.clone()),
+            Path(key.as_str().to_string()),
+            Bytes::from_static(br#"{"trigger_policy":{"on_schedule":"0 * * * *"}}"#),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(body.0["code"], json!("trigger_unwired"));
+        assert_eq!(body.0["field"], json!("on_schedule"));
+
+        let (status, body) = room_update(
+            State(state.clone()),
+            Path(key.as_str().to_string()),
+            Bytes::from_static(br#"{"trigger_policy":{"on_component_event":true}}"#),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(body.0["field"], json!("on_component_event"));
+
+        // Both refusals wrote nothing: the policy is still what create stored.
+        let stored = with_rooms(&state, |store| store.get(&key))
+            .unwrap()
+            .expect("room exists");
+        assert_eq!(stored.room.trigger_policy, Some(created_policy));
+
+        let (status, body) = room_update(
+            State(state),
+            Path(key.as_str().to_string()),
+            Bytes::from_static(
+                br#"{"trigger_policy":{"on_thread_reply":true,"on_component_event":false}}"#,
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            body.0["room"]["trigger_policy"]["on_thread_reply"],
+            json!(true)
+        );
     }
 
     /// M6 + H1 regression: the Live-room `GET .../read-cursor` response uses

@@ -520,8 +520,11 @@ impl std::fmt::Display for RoomKey {
 }
 
 /// How a room's agents are woken. The data-model half of the collaboration
-/// model's trigger policy (OCEAN-39); the runtime that acts on it is future
-/// work. All fields default off, so an absent/partial policy means "no
+/// model's trigger policy (OCEAN-39). The daemon fires `on_mention`,
+/// `on_thread_reply`, and `on_build_failure`; nothing emits a schedule tick
+/// or a component event yet, so the room write routes refuse values that
+/// would turn those two on rather than store configuration that silently
+/// never acts. All fields default off, so an absent/partial policy means "no
 /// automatic triggers".
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub struct RoomTriggerPolicy {
@@ -532,6 +535,8 @@ pub struct RoomTriggerPolicy {
     #[serde(default)]
     pub on_thread_reply: bool,
     /// Wake an agent when a rendered component emits an interaction event.
+    /// UNWIRED: no daemon source emits component events, so the write routes
+    /// refuse `true` (see the struct doc).
     #[serde(default)]
     pub on_component_event: bool,
     /// Wake the room's agents when a workspace build fails. Off by default,
@@ -539,6 +544,8 @@ pub struct RoomTriggerPolicy {
     #[serde(default)]
     pub on_build_failure: bool,
     /// Optional cron expression for scheduled wake-ups. `None` = no schedule.
+    /// UNWIRED: no scheduler tick exists, so the write routes refuse
+    /// `Some(_)` (see the struct doc).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub on_schedule: Option<String>,
 }
@@ -786,9 +793,12 @@ pub enum RoomTriggerEvent {
     Mention { participant_id: String },
     /// A reply landed in a thread a participant is part of.
     ThreadReply { participant_id: String },
-    /// A rendered component emitted an interaction event.
+    /// A rendered component emitted an interaction event. No daemon source
+    /// constructs this yet; the variant and its evaluation branch document
+    /// the intended semantics for whoever wires a component-event source.
     ComponentEvent { component_id: String },
-    /// A scheduled tick fired (cron-driven). Carries no payload here.
+    /// A scheduled tick fired (cron-driven). Carries no payload here. No
+    /// scheduler constructs this yet; same status as [`Self::ComponentEvent`].
     Schedule,
     /// A workspace build failed. Carries no participant: the policy convenes
     /// the room's agents, not one named target.
@@ -797,8 +807,8 @@ pub enum RoomTriggerEvent {
 
 /// The decision produced by [`evaluate_trigger_policy`]: whether a room event
 /// should auto-convene/notify, and a short human-readable reason. When
-/// `should_convene` is true the daemon emits a notification event and (in the
-/// future) queues a turn for the named participant; see the daemon wiring point.
+/// `should_convene` is true the daemon emits a notification event and queues a
+/// turn for the named participant; see the daemon wiring point.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TriggerDecision {
     /// Whether this event should wake/convene an agent.
@@ -814,11 +824,12 @@ pub struct TriggerDecision {
 /// room's optional [`RoomTriggerPolicy`] (OCEAN-65).
 ///
 /// This is the pure, testable core of trigger evaluation — no I/O, no awaits.
-/// The daemon calls it at the wiring point (after appending a transcript entry
-/// or receiving a component event) and, on a positive decision, emits a notice
-/// event. The actual auto-convene (queuing a turn for the target agent) hooks in
-/// where the daemon already spawns agent turns; until that lands the decision is
-/// observable purely as an emitted event.
+/// The daemon calls it after appending a transcript entry (mentions and thread
+/// replies) and on a workspace build failure; a positive decision emits a
+/// notice event and queues a turn for the target agent. No caller constructs
+/// [`RoomTriggerEvent::Schedule`] or [`RoomTriggerEvent::ComponentEvent`], so
+/// their branches here are documentation of intended semantics, not live
+/// behavior — the room write routes refuse policies that enable them.
 ///
 /// An absent policy (`None`) never convenes. Each policy flag gates exactly one
 /// event variant, matching the collaboration model's `TriggerPolicy`.
