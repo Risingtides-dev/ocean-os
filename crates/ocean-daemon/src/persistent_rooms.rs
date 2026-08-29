@@ -1878,7 +1878,9 @@ pub(super) async fn run_federated_trigger_dispatcher(
                 "room": dispatch.room.as_str(),
                 "target": dispatch.target_member_id.clone(),
                 "agent_name": agent_name,
-                "reason": format!("on_mention: @{} mentioned", dispatch.target_member_id),
+                // The ingest site that evaluated the policy owns the wording —
+                // a build-failure convene must not be logged as a mention.
+                "reason": dispatch.reason,
                 "triggered_by_seq": dispatch.local_seq,
                 "ledger_event_id": dispatch.ledger_event_id,
             }),
@@ -5229,6 +5231,7 @@ mod tests {
             ledger_event_id: "ledger-trigger".into(),
             local_seq: 7,
             target_member_id: member.into(),
+            reason: format!("on_mention: @{member} mentioned"),
         })
         .unwrap();
 
@@ -5347,6 +5350,7 @@ mod tests {
                 ledger_event_id: ledger.into(),
                 local_seq: 1,
                 target_member_id: member.into(),
+                reason: format!("on_mention: @{member} mentioned"),
             })
             .unwrap();
         }

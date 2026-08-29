@@ -5637,6 +5637,7 @@ fn serialize_policy(p: &RoomTriggerPolicy) -> Result<String> {
         format!("\"on_mention\":{}", p.on_mention),
         format!("\"on_thread_reply\":{}", p.on_thread_reply),
         format!("\"on_component_event\":{}", p.on_component_event),
+        format!("\"on_build_failure\":{}", p.on_build_failure),
     ];
     if let Some(cron) = &p.on_schedule {
         parts.push(format!("\"on_schedule\":{}", json_string(cron)));
@@ -5649,7 +5650,7 @@ fn decode_policy(json: Option<&str>) -> Result<Option<RoomTriggerPolicy>> {
     Ok(Some(parse_policy(json)?))
 }
 
-/// Minimal flat-object JSON parser for the four `RoomTriggerPolicy` fields. The
+/// Minimal flat-object JSON parser for the five `RoomTriggerPolicy` fields. The
 /// only writer of this column is [`serialize_policy`], so the input shape is
 /// known: a flat object of booleans plus an optional string. Kept deliberately
 /// small rather than pulling in serde_json.
@@ -5674,6 +5675,7 @@ fn parse_policy(json: &str) -> Result<RoomTriggerPolicy> {
             "on_mention" => policy.on_mention = v == "true",
             "on_thread_reply" => policy.on_thread_reply = v == "true",
             "on_component_event" => policy.on_component_event = v == "true",
+            "on_build_failure" => policy.on_build_failure = v == "true",
             "on_schedule" => policy.on_schedule = Some(unquote(v)?),
             _ => {} // forward-compat: ignore unknown fields
         }
@@ -8829,6 +8831,7 @@ mod tests {
             "R1",
             Some(RoomTriggerPolicy {
                 on_mention: true,
+                on_build_failure: true,
                 ..Default::default()
             }),
             now(),
@@ -8844,6 +8847,12 @@ mod tests {
         );
         assert!(decision.should_convene);
         assert_eq!(decision.target_participant.as_deref(), Some("ocean"));
+
+        // The hand-rolled codec must carry every flag: a field it silently
+        // drops makes that opt-in unreachable for every room ever stored.
+        let build = evaluate_trigger_policy(policy.as_ref(), &RoomTriggerEvent::BuildFailed);
+        assert!(build.should_convene);
+        assert!(build.reason.contains("on_build_failure"));
     }
 
     // ── S2-P1 federation store tests (inherent APIs, tempfile proofs) ──────
