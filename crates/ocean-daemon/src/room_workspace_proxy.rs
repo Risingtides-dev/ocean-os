@@ -2330,6 +2330,62 @@ mod tests {
         );
     }
 
+    /// The operator guide's lane section is the OTHER copy of this table, and
+    /// a hand-maintained copy has already rotted once — #391's land note
+    /// records correcting a false "NOT exposed" paragraph manually. This pins
+    /// the section between the guide's `# Room workspace` and `# Room media`
+    /// headings to the table: every named leaf must appear backticked, the
+    /// bare status route must keep its own METHOD-first quick-reference line
+    /// (the shape main.rs's banner parity parse consumes), and the spelled
+    /// call count must move with `WORKSPACE_ALLOWLIST.len()`.
+    ///
+    /// A backticked-leaf substring cannot see WHICH method line names it
+    /// (`repo/ci` rides both GET and POST), and that is fine: the manifest
+    /// above pins method+upstream exactly; this gate's only job is that the
+    /// guide cannot stop naming a call that exists.
+    ///
+    /// Mutation: delete any leaf's mention from the lane section -> RED; add
+    /// a sixteenth allowlist row without documenting it -> RED.
+    #[test]
+    fn the_operator_guide_names_every_allowlisted_call() {
+        let guide = include_str!("../../../docs/OCEAN_RUNTIME_OPERATOR_GUIDE.md");
+        let start = guide
+            .find("# Room workspace")
+            .expect("guide lost its workspace lane section");
+        let tail = &guide[start..];
+        let end = tail
+            .find("# Room media")
+            .expect("guide lost the heading that closes the workspace lane section");
+        let section = &tail[..end];
+
+        for (method, leaf, _) in WORKSPACE_ALLOWLIST {
+            if leaf.is_empty() {
+                assert!(
+                    section.lines().any(|line| {
+                        let mut parts = line.split_whitespace();
+                        parts.next() == Some(*method)
+                            && parts.next() == Some("/v1/rooms/persistent/{key}/workspace")
+                    }),
+                    "the guide's lane section lost the bare {method} status route line"
+                );
+            } else {
+                assert!(
+                    section.contains(&format!("`{leaf}`")),
+                    "the guide's lane section does not name allowlisted leaf {method} {leaf}"
+                );
+            }
+        }
+
+        let spelled = match WORKSPACE_ALLOWLIST.len() {
+            15 => "fifteen",
+            n => panic!("the lane now carries {n} calls; respell the guide's count and this match"),
+        };
+        assert!(
+            section.contains(&format!("carry {spelled} upstream calls")),
+            "the guide's lane section no longer states the call count as {spelled:?}"
+        );
+    }
+
     /// Through the REAL router, not a handler call.
     ///
     /// Every other test here invokes a handler directly, which proves the gate
