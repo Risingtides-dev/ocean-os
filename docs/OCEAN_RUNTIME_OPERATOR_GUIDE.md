@@ -577,12 +577,11 @@ POST   /v1/rooms/persistent/{key}/members/agents          register safe local ag
 # Room workspace — the membership-gated lane to the room's Bedrock container.
 # The room's Bedrock bearer NEVER leaves the daemon: a client asserts a roster participant in
 # ?actor_id= and the daemon supplies the credential and the upstream actor_member_id itself.
-# Three registrations carry twelve upstream calls; WORKSPACE_ALLOWLIST in
+# Three registrations carry fourteen upstream calls; WORKSPACE_ALLOWLIST in
 # crates/ocean-daemon/src/room_workspace_proxy.rs is the exposed surface, and Bedrock's own
-# gateWorkspaceAccess still runs on every forwarded call. Deliberately NOT exposed: workspace
-# provision/destroy (owner-only upstream and infrastructure-shaping; they keep wanting an
-# operator path), workspace/secrets, workspace file WRITE and DELETE, mkdir, flush, hydrate,
-# and port exposure.
+# gateWorkspaceAccess still runs on every forwarded call. Deliberately NOT exposed:
+# workspace/secrets, workspace file WRITE and DELETE, mkdir, flush, hydrate, and port
+# exposure.
 #
 # Workspace identity model (2026-08-29 operator ruling). ?actor_id= is a LOCAL roster id;
 # Bedrock speaks opaque member ids. On any route that needs one, the daemon DERIVES it and
@@ -592,14 +591,14 @@ POST   /v1/rooms/persistent/{key}/members/agents          register safe local ag
 # which resolves through the room_member_bindings map the daemon persisted when it registered
 # the agent with Bedrock. Everything else — Bot, Tool, System, an agent never registered —
 # resolves to nothing, and a call that needs the id is refused rather than silently attributed
-# to the human. Repo bind/unbind are owner verbs upstream (requireRoomOwner, judged against the
-# principal the PRESENTED BEARER speaks for), so the daemon forwards them only when the
-# asserted actor resolves to that principal; whether that human actually owns the room stays
-# Bedrock's call, and its 403 relays verbatim. Every member may still read, clone, and build
-# the binding an owner made.
+# to the human. Repo bind/unbind and workspace provision/destroy are owner verbs upstream
+# (requireRoomOwner, judged against the principal the PRESENTED BEARER speaks for), so the
+# daemon forwards them only when the asserted actor resolves to that principal; whether that
+# human actually owns the room stays Bedrock's call, and its 403 relays verbatim. Every member
+# may still read, clone, and build the binding an owner made.
 GET    /v1/rooms/persistent/{key}/workspace               room container status (?actor_id=); Bedrock's status body and code relayed verbatim
 GET    /v1/rooms/persistent/{key}/workspace/{*leaf}       reads (?actor_id=): leaf `list` (?path=), `execs` (?limit=), `repo`, `repo/ci` (?limit=), `file` (?path=) — the one leaf whose upstream 2xx is raw bytes; the daemon answers a bounded JSON PROJECTION { ok, path, size, encoding: "utf8"|"base64", content } with text-vs-binary derived from the bytes, never from Bedrock's extension-derived content-type, so the browser never receives the bytes as a document. 413 workspace_file_too_large past 1 MiB — the daemon's cap is the only bound in the chain and nothing is ever truncated; Bedrock's own refusals on the leaf (workspace_absent, its path 400s) relay verbatim like every other row's
-POST   /v1/rooms/persistent/{key}/workspace/{*leaf}       commands (?actor_id=, JSON object body): leaf `exec`, `repo/clone`, `repo/build`, `repo/ci`. Any client-supplied actor_member_id is stripped and the daemon inserts the actor's RESOLVED member id. 403 forged_workspace_actor for a claimed Agent/System identity, 403 workspace_actor_unmapped for an actor with no derivable member id, 413 workspace_request_too_large over 32 KiB. The daemon waits 960s on these — above Bedrock's own 900s EXEC_TIMEOUT_MAX — so a long `npm test` or build is relayed rather than refused; reads wait 15s. Owner verbs ride two more POST leaves — `repo/bind` ({ remote, branch?, dir? }, forwarded as Bedrock's PUT workspace/repo; validation is upstream and strict deny-extra) and `repo/unbind` ({} — the upstream DELETE reads no body) — because cors.rs does not advertise PUT; both forward only for the actor that resolves to the credential's principal (403 workspace_actor_unmapped / 403 workspace_not_owner_principal otherwise) and answer promptly out of Bedrock's own table, so they carry the 15s read budget
+POST   /v1/rooms/persistent/{key}/workspace/{*leaf}       commands (?actor_id=, JSON object body): leaf `exec`, `repo/clone`, `repo/build`, `repo/ci`. Any client-supplied actor_member_id is stripped and the daemon inserts the actor's RESOLVED member id. 403 forged_workspace_actor for a claimed Agent/System identity, 403 workspace_actor_unmapped for an actor with no derivable member id, 413 workspace_request_too_large over 32 KiB. The daemon waits 960s on these — above Bedrock's own 900s EXEC_TIMEOUT_MAX — so a long `npm test` or build is relayed rather than refused; reads wait 15s. Owner verbs ride two more POST leaves — `repo/bind` ({ remote, branch?, dir? }, forwarded as Bedrock's PUT workspace/repo; validation is upstream and strict deny-extra) and `repo/unbind` ({} — the upstream DELETE reads no body) — because cors.rs does not advertise PUT; the workspace lifecycle rides two more — `provision` ({ spec? }, forwarded as Bedrock's POST workspace; idempotent upstream, 409 workspace_provisioning while another claim is live) and `destroy` ({} — forwarded as the DELETE, which reads no body; ?flush=0 skips the flush-to-Bedrock save, 409 workspace_absent when there is nothing to destroy). All four forward only for the actor that resolves to the credential's principal (403 workspace_actor_unmapped / 403 workspace_not_owner_principal otherwise); bind/unbind answer promptly out of Bedrock's own table and carry the 15s read budget, while provision/destroy run container work (hydrate and checkout restore, flush) and carry the 960s command budget
 # Shared refusals on every workspace call, all fail-closed with nothing forwarded: 400
 # invalid_request (no ?actor_id= or a non-object body), 403 not_a_room_member, 403
 # room_access_revoked, 403 workspace_actor_unmapped (a route needing a member id, asserted by
