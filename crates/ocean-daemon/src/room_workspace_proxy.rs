@@ -8,46 +8,64 @@
 //! could reach them was to be handed the bearer — which is the one thing that
 //! cannot happen. This module is the lane that removes the need.
 //!
-//! It owns exactly three things and deliberately no more:
+//! It owns exactly four things and deliberately no more:
 //!
 //! 1. **The allowlist.** `resolve_workspace_call` is a total function over
 //!    `(method, leaf)`. Anything it does not name is refused with a typed code
 //!    and no request leaves the daemon. Bedrock's compute surface is much wider
-//!    than what is named here — provision, destroy, repo bind, repo unbind,
-//!    file write/delete, mkdir, flush, hydrate, port exposure, and
-//!    `workspace/secrets` all exist upstream and are all absent on purpose.
-//!    Secrets in particular: even the NAME list is room configuration, and a
-//!    caller-asserted lane is not where that belongs. Provision, destroy, and
-//!    the two repo BINDING verbs are owner-only upstream (`requireRoomOwner`)
-//!    and shape infrastructure every other member then shares; they want an
-//!    operator path, not this one. That exclusion is not a preference: this
-//!    daemon always presents the CREDENTIAL's bearer, so Bedrock evaluates its
-//!    owner check against the local human rather than against the asserted
-//!    `?actor_id=`. On a room whose local human is the owner — the ordinary
-//!    case — an allowlist row for bind would hand every roster participant the
-//!    authority to repoint the whole room's compute at an arbitrary remote.
-//!    Cloning and building what an owner already bound is a member act and
-//!    stays; choosing what the room builds is not. `workspace/file` is the one
-//!    row whose upstream 2xx is raw bytes rather than JSON; it rides this lane
-//!    as a bounded JSON PROJECTION — text-vs-binary derived from the bytes in
-//!    hand, never from Bedrock's extension-derived `content-type` — so no byte
-//!    ever reaches a browser as a document and no type is ever declared to it,
-//!    which is why the download discipline `room_attachments.rs` worked out is
-//!    not needed here. File WRITE and DELETE stay absent.
+//!    than what is named here — provision, destroy, file write/delete, mkdir,
+//!    flush, hydrate, port exposure, and `workspace/secrets` all exist upstream
+//!    and are all absent on purpose. Secrets in particular: even the NAME list
+//!    is room configuration, and a caller-asserted lane is not where that
+//!    belongs. Provision and destroy are owner-only upstream
+//!    (`requireRoomOwner`) and shape infrastructure every other member then
+//!    shares; they want an operator path, not this one. The two repo BINDING
+//!    verbs were excluded on the same ground until the 2026-08-29 operator
+//!    ruling opened them through this lane, owner-gated by the identity map
+//!    below: they ride daemon-side POST leaves `repo/bind` and `repo/unbind`
+//!    (an upstream PUT cannot arrive as a browser PUT — `cors.rs` does not
+//!    advertise the method) and forward only for the actor that RESOLVES to
+//!    the credential's own principal, which is exactly the principal Bedrock's
+//!    `requireRoomOwner` will judge, since this daemon always presents the
+//!    CREDENTIAL's bearer. Without that gate a row for bind would hand every
+//!    roster participant the authority to repoint the whole room's compute at
+//!    an arbitrary remote. Cloning and building what an owner already bound
+//!    remains a member act. `workspace/file` is the one row whose upstream 2xx
+//!    is raw bytes rather than JSON; it rides this lane as a bounded JSON
+//!    PROJECTION — text-vs-binary derived from the bytes in hand, never from
+//!    Bedrock's extension-derived `content-type` — so no byte ever reaches a
+//!    browser as a document and no type is ever declared to it, which is why
+//!    the download discipline `room_attachments.rs` worked out is not needed
+//!    here. File WRITE and DELETE stay absent.
 //! 2. **The membership gate.** The caller asserts a room participant in
 //!    `?actor_id=`; that claim is checked against the roster inside the SAME
 //!    store guard that reads the credential, so a concurrent roster replacement
 //!    cannot race the authorization. Write verbs additionally refuse an
 //!    Agent/System identity, exactly as `enforce_client_artifact_author` does —
 //!    an agent's command is run by the daemon, not by a client wearing its name.
-//! 3. **Actor attribution.** Bedrock's write routes demand `actor_member_id`
-//!    and prove the calling principal owns it. The only member id this daemon
-//!    can honestly claim is the credential's `local_human_member_id`, so that
-//!    is what gets sent. A client-supplied `actor_member_id` is STRIPPED from
-//!    every forwarded body before anything else happens, unconditionally rather
-//!    than only where it is replaced: every authored Bedrock payload is strict
-//!    deny-extra, so a claim surviving onto a row this table later adds would
-//!    turn a legal call into a 400 instead of an attribution.
+//! 3. **The identity map.** `?actor_id=` is a LOCAL roster id and Bedrock
+//!    speaks opaque member ids; on any route that needs one, the daemon
+//!    DERIVES it and never trusts one off the wire. A Human resolves to the
+//!    credential's `local_human_member_id` — this daemon serves exactly one
+//!    human principal, so every browser session on it IS that principal. An
+//!    Agent resolves through `room_member_bindings`, the map
+//!    `register_agents` persisted when Bedrock's member envelope came back —
+//!    an Agent roster id is the folder-agent name (`persistent_rooms.rs`
+//!    requires it to resolve), and that name keys the binding. Everything
+//!    else — Bot, Tool, System, an agent never federation-registered —
+//!    resolves to nothing and is refused with a typed code, never silently
+//!    attributed to the human. Owner verbs add one comparison on top: the
+//!    resolved id must BE the credential's principal, closing the gap between
+//!    who asserted the call and who Bedrock will believe made it.
+//! 4. **Actor attribution.** Bedrock's write routes demand `actor_member_id`
+//!    and prove the calling principal owns it. What gets sent is the RESOLVED
+//!    id from the map above — today always the credential's
+//!    `local_human_member_id`, because write verbs refuse every non-Human
+//!    actor before resolution. A client-supplied `actor_member_id` is STRIPPED
+//!    from every forwarded body before anything else happens, unconditionally
+//!    rather than only where it is replaced: every authored Bedrock payload is
+//!    strict deny-extra, so a claim surviving onto a row this table later adds
+//!    would turn a legal call into a 400 instead of an attribution.
 //!
 //! What this module does not own: SQL (that is `ocean-store`), compute
 //! semantics (that is Bedrock, whose `gateWorkspaceAccess` still runs on every
@@ -182,22 +200,30 @@ const ACTOR_MEMBER_ID: &str = "actor_member_id";
 /// become, and the handling it needs.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct WorkspaceCall {
-    /// Upstream method, typed. It matches the daemon-side verb on every row
-    /// this table currently carries; it stays a field rather than a conversion
-    /// because the table is where a divergence has to be written down, and
-    /// `cors.rs` makes one likely — its `cors_allowed_methods` does not
-    /// advertise PUT, so any upstream PUT this lane ever exposes has to arrive
-    /// on the wire as something else.
+    /// Upstream method, typed rather than converted from the daemon-side verb,
+    /// because the table is where a divergence has to be written down — and the
+    /// two owner rows carry one: `cors.rs`'s `cors_allowed_methods` does not
+    /// advertise PUT, so Bedrock's PUT bind arrives on the wire as a POST leaf,
+    /// and its DELETE unbind rides the same shape for symmetry.
     upstream: UpstreamMethod,
     /// Path segments appended after `/api/v1/rooms/{room}/`.
     segments: &'static [&'static str],
     /// How long the daemon will wait for this particular call. A read answers
-    /// out of Bedrock's state; a command runs in a container first.
+    /// out of Bedrock's state; a command runs in a container first. The owner
+    /// verbs are prompt like reads — bind and unbind land in Bedrock's own
+    /// table, no container runs.
     timeout: Duration,
     /// A write verb: refuses a claimed Agent/System identity.
     write: bool,
+    /// An owner verb: `requireRoomOwner` upstream is judged against the
+    /// principal the presented bearer speaks for, not the asserted actor — so
+    /// the daemon forwards only when the actor RESOLVES to that principal,
+    /// keeping a non-owner roster member from riding the owner's bearer into
+    /// an owner-only route.
+    owner: bool,
     /// Bedrock requires `actor_member_id` on this route and proves ownership of
-    /// it; the daemon supplies its own, never the client's.
+    /// it; the daemon supplies the actor's RESOLVED member id, never the
+    /// client's claim.
     attributed: bool,
     /// Query keys relayed upstream. Everything else on the wire is dropped —
     /// including `actor_id`, which is this daemon's parameter and means nothing
@@ -214,6 +240,11 @@ struct WorkspaceCall {
 enum UpstreamMethod {
     Get,
     Post,
+    Put,
+    /// Carries no body upstream: Bedrock's DELETE handlers read none, so a
+    /// daemon POST leaf mapping here still demands the lane's JSON object —
+    /// one uniform POST contract — and then forwards nothing of it.
+    Delete,
 }
 
 impl UpstreamMethod {
@@ -221,6 +252,8 @@ impl UpstreamMethod {
         match self {
             Self::Get => reqwest::Method::GET,
             Self::Post => reqwest::Method::POST,
+            Self::Put => reqwest::Method::PUT,
+            Self::Delete => reqwest::Method::DELETE,
         }
     }
 }
@@ -254,6 +287,7 @@ const WORKSPACE_ALLOWLIST: &[(&str, &str, WorkspaceCall)] = &[
             segments: &["workspace"],
             timeout: WORKSPACE_READ_TIMEOUT,
             write: false,
+            owner: false,
             attributed: false,
             query: &[],
             reply: UpstreamReply::Json,
@@ -267,6 +301,7 @@ const WORKSPACE_ALLOWLIST: &[(&str, &str, WorkspaceCall)] = &[
             segments: &["workspace", "list"],
             timeout: WORKSPACE_READ_TIMEOUT,
             write: false,
+            owner: false,
             attributed: false,
             query: &["path"],
             reply: UpstreamReply::Json,
@@ -280,6 +315,7 @@ const WORKSPACE_ALLOWLIST: &[(&str, &str, WorkspaceCall)] = &[
             segments: &["workspace", "file"],
             timeout: WORKSPACE_READ_TIMEOUT,
             write: false,
+            owner: false,
             attributed: false,
             // `path` only: Bedrock's `inline` key steers the
             // content-disposition of a raw download, and this lane never
@@ -296,6 +332,7 @@ const WORKSPACE_ALLOWLIST: &[(&str, &str, WorkspaceCall)] = &[
             segments: &["workspace", "execs"],
             timeout: WORKSPACE_READ_TIMEOUT,
             write: false,
+            owner: false,
             attributed: false,
             query: &["limit"],
             reply: UpstreamReply::Json,
@@ -309,6 +346,7 @@ const WORKSPACE_ALLOWLIST: &[(&str, &str, WorkspaceCall)] = &[
             segments: &["workspace", "repo"],
             timeout: WORKSPACE_READ_TIMEOUT,
             write: false,
+            owner: false,
             attributed: false,
             query: &[],
             reply: UpstreamReply::Json,
@@ -325,6 +363,7 @@ const WORKSPACE_ALLOWLIST: &[(&str, &str, WorkspaceCall)] = &[
             segments: &["workspace", "repo", "ci"],
             timeout: WORKSPACE_READ_TIMEOUT,
             write: false,
+            owner: false,
             attributed: false,
             query: &["limit"],
             reply: UpstreamReply::Json,
@@ -338,6 +377,7 @@ const WORKSPACE_ALLOWLIST: &[(&str, &str, WorkspaceCall)] = &[
             segments: &["workspace", "exec"],
             timeout: WORKSPACE_COMMAND_TIMEOUT,
             write: true,
+            owner: false,
             attributed: true,
             query: &[],
             reply: UpstreamReply::Json,
@@ -354,6 +394,7 @@ const WORKSPACE_ALLOWLIST: &[(&str, &str, WorkspaceCall)] = &[
             segments: &["workspace", "repo", "clone"],
             timeout: WORKSPACE_COMMAND_TIMEOUT,
             write: true,
+            owner: false,
             attributed: true,
             query: &[],
             reply: UpstreamReply::Json,
@@ -367,6 +408,7 @@ const WORKSPACE_ALLOWLIST: &[(&str, &str, WorkspaceCall)] = &[
             segments: &["workspace", "repo", "build"],
             timeout: WORKSPACE_COMMAND_TIMEOUT,
             write: true,
+            owner: false,
             attributed: true,
             query: &[],
             reply: UpstreamReply::Json,
@@ -383,7 +425,48 @@ const WORKSPACE_ALLOWLIST: &[(&str, &str, WorkspaceCall)] = &[
             segments: &["workspace", "repo", "ci"],
             timeout: WORKSPACE_COMMAND_TIMEOUT,
             write: true,
+            owner: false,
             attributed: true,
+            query: &[],
+            reply: UpstreamReply::Json,
+        },
+    ),
+    // The two owner verbs the table used to exclude, opened by the 2026-08-29
+    // operator ruling and gated on the identity map: forward only for the
+    // actor that resolves to the credential's own principal, because that is
+    // the principal Bedrock's `requireRoomOwner` judges no matter what the
+    // caller asserted. `write: false` is deliberate — the owner gate is
+    // strictly narrower than the write gate's Agent/System refusal, and it is
+    // what makes an unmapped agent and a mapped non-principal each earn their
+    // own typed code instead of one blanket forgery answer. Both answer out of
+    // Bedrock's own table — no container runs — so they carry the read budget.
+    // Bind's body (`remote`, `branch?`, `dir?`) is validated upstream by
+    // `validateRepoBinding`, strict deny-extra, which the unconditional actor
+    // strip already respects; unbind's upstream DELETE reads no body at all.
+    (
+        "POST",
+        "repo/bind",
+        WorkspaceCall {
+            upstream: UpstreamMethod::Put,
+            segments: &["workspace", "repo"],
+            timeout: WORKSPACE_READ_TIMEOUT,
+            write: false,
+            owner: true,
+            attributed: false,
+            query: &[],
+            reply: UpstreamReply::Json,
+        },
+    ),
+    (
+        "POST",
+        "repo/unbind",
+        WorkspaceCall {
+            upstream: UpstreamMethod::Delete,
+            segments: &["workspace", "repo"],
+            timeout: WORKSPACE_READ_TIMEOUT,
+            write: false,
+            owner: true,
+            attributed: false,
             query: &[],
             reply: UpstreamReply::Json,
         },
@@ -417,6 +500,13 @@ enum GateError {
     NotFederated,
     /// Access was revoked; the room's federation gate is closed.
     Revoked,
+    /// The route needs a Bedrock member id and the asserted actor resolves to
+    /// none: a Bot/Tool/System participant, or an agent that was never
+    /// federation-registered. Fail closed — never attribute them to the human.
+    UnmappedActor,
+    /// An owner verb asserted by an actor that resolves to a member id other
+    /// than the credential's principal — the one Bedrock would actually judge.
+    NotPrincipal,
     Store,
 }
 
@@ -447,6 +537,16 @@ fn gate_error_response(error: GateError) -> Response {
             StatusCode::FORBIDDEN,
             "room_access_revoked",
             "this room's federation access was revoked",
+        ),
+        GateError::UnmappedActor => (
+            StatusCode::FORBIDDEN,
+            "workspace_actor_unmapped",
+            "the asserted actor resolves to no Bedrock member id on this daemon",
+        ),
+        GateError::NotPrincipal => (
+            StatusCode::FORBIDDEN,
+            "workspace_not_owner_principal",
+            "an owner verb forwards only for the principal this room's credential speaks for",
         ),
         GateError::Store => (
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -501,9 +601,21 @@ fn intent_error_response(error: IntentError) -> Response {
         .into_response()
 }
 
-/// Roster-check the asserted actor and read the room's credential under ONE
-/// store guard, so a roster edit landing between the two cannot authorize a
-/// call the roster no longer permits.
+/// What the gate hands the transport: the bearer, and — on routes that need
+/// one — the Bedrock member id the asserted actor RESOLVES to.
+struct GatedCall {
+    credential: RoomCredential,
+    /// `Some` exactly when the row is attributed or owner-gated; those are the
+    /// routes where a member id matters, and the gate has already refused any
+    /// actor it could not derive one for. Reads carry `None` on purpose — an
+    /// unregistered agent may still look, it just cannot be spoken for.
+    actor_member_id: Option<String>,
+}
+
+/// Roster-check the asserted actor, read the room's credential, and derive the
+/// actor's Bedrock member id under ONE store guard, so a roster edit or a
+/// binding change landing between the reads cannot authorize a call the roster
+/// no longer permits or attribute it to an id the map no longer holds.
 ///
 /// The returned [`RoomCredential`] carries the bearer. It goes straight to
 /// `send_room_scoped` and nowhere else: it is never logged, never rendered into
@@ -512,8 +624,8 @@ fn gate_workspace_call(
     state: &AppState,
     key: &RoomKey,
     actor_id: &str,
-    write: bool,
-) -> Result<RoomCredential, GateError> {
+    call: &WorkspaceCall,
+) -> Result<GatedCall, GateError> {
     with_rooms(state, |store| {
         let record = match store.get(key) {
             Ok(Some(record)) => record,
@@ -527,7 +639,7 @@ fn gate_workspace_call(
             .find(|participant| participant.id == actor_id)
             .map(|participant| participant.kind)
             .ok_or(GateError::NotMember)?;
-        if write
+        if call.write
             && matches!(
                 kind,
                 RoomParticipantKind::Agent | RoomParticipantKind::System
@@ -541,10 +653,44 @@ fn gate_workspace_call(
             Err(_) => return Err(GateError::Store),
         };
         match store.room_access(key) {
-            Ok(access) if access.state == RoomAccessState::Revoked => Err(GateError::Revoked),
-            Ok(_) => Ok(credential),
-            Err(_) => Err(GateError::Store),
+            Ok(access) if access.state == RoomAccessState::Revoked => {
+                return Err(GateError::Revoked)
+            }
+            Ok(_) => {}
+            Err(_) => return Err(GateError::Store),
         }
+        // The identity map, daemon-derived only. A Human is the credential's
+        // principal — this daemon serves exactly one human principal, and
+        // every browser session on it IS that principal. An Agent roster id
+        // is its folder-agent name, which keys the binding `register_agents`
+        // wrote when Bedrock's member envelope came back. Everything else has
+        // no member id to resolve to, and a route that needs one fails closed
+        // rather than quietly wearing the human's.
+        let actor_member_id = if call.attributed || call.owner {
+            let resolved = match kind {
+                RoomParticipantKind::Human => Some(credential.local_human_member_id.clone()),
+                RoomParticipantKind::Agent => {
+                    match store.resolve_room_agent_member(key, actor_id) {
+                        Ok(member) => member,
+                        Err(_) => return Err(GateError::Store),
+                    }
+                }
+                RoomParticipantKind::Bot
+                | RoomParticipantKind::Tool
+                | RoomParticipantKind::System => None,
+            };
+            let resolved = resolved.ok_or(GateError::UnmappedActor)?;
+            if call.owner && resolved != credential.local_human_member_id {
+                return Err(GateError::NotPrincipal);
+            }
+            Some(resolved)
+        } else {
+            None
+        };
+        Ok(GatedCall {
+            credential,
+            actor_member_id,
+        })
     })
 }
 
@@ -573,14 +719,22 @@ async fn forward(
         return gate_error_response(GateError::MissingActor);
     };
 
-    let credential = match gate_workspace_call(&state, &key, actor_id, call.write) {
-        Ok(credential) => credential,
+    let gated = match gate_workspace_call(&state, &key, actor_id, &call) {
+        Ok(gated) => gated,
         Err(error) => return gate_error_response(error),
     };
+    let credential = gated.credential;
 
-    let body = match shape_body(body, &call, &credential) {
+    let body = match shape_body(body, &call, gated.actor_member_id.as_deref()) {
         Ok(body) => body,
         Err(response) => return *response,
+    };
+    // An upstream DELETE reads no body; the shaped object was still demanded
+    // and still size-checked so the POST contract stays uniform, and now it
+    // stays here.
+    let body = match call.upstream {
+        UpstreamMethod::Delete => None,
+        _ => body,
     };
     let query: Vec<(&str, String)> = call
         .query
@@ -704,12 +858,12 @@ fn project_file(path: &str, bytes: &[u8]) -> Value {
     }
 }
 
-/// Strip the client's actor claim, install the daemon's where the route needs
-/// one, and refuse a body too large to forward.
+/// Strip the client's actor claim, install the gate's RESOLVED member id where
+/// the route needs one, and refuse a body too large to forward.
 fn shape_body(
     body: Option<Value>,
     call: &WorkspaceCall,
-    credential: &RoomCredential,
+    actor_member_id: Option<&str>,
 ) -> Result<Option<Value>, Box<Response>> {
     let Some(mut body) = body else {
         return Ok(None);
@@ -728,13 +882,19 @@ fn shape_body(
         ));
     };
     // Unconditional, and before the insert rather than instead of it: on an
-    // attributed route the daemon's id must be the one that lands, and on every
+    // attributed route the RESOLVED id must be the one that lands, and on every
     // other route Bedrock rejects the key as stray.
     object.remove(ACTOR_MEMBER_ID);
     if call.attributed {
+        // The gate resolves an id for every attributed row before this runs;
+        // if that contract ever breaks, refuse rather than send a call Bedrock
+        // would mis-attribute or reject.
+        let Some(actor_member_id) = actor_member_id else {
+            return Err(Box::new(gate_error_response(GateError::UnmappedActor)));
+        };
         object.insert(
             ACTOR_MEMBER_ID.into(),
-            Value::String(credential.local_human_member_id.clone()),
+            Value::String(actor_member_id.to_string()),
         );
     }
     let encoded = serde_json::to_vec(&body)
@@ -779,8 +939,9 @@ pub(super) async fn room_workspace_read(
 }
 
 /// `POST /v1/rooms/persistent/{key}/workspace/{*leaf}` — commands and repo
-/// binding. Every allowlisted POST leaf carries a JSON object upstream, so the
-/// body is required rather than optional.
+/// binding. Every allowlisted POST leaf demands a JSON object, so the body is
+/// required rather than optional; the unbind leaf's travels no further than
+/// the daemon, because its upstream DELETE reads none.
 pub(super) async fn room_workspace_command(
     State(state): State<AppState>,
     Path((key, leaf)): Path<(String, String)>,
@@ -934,12 +1095,13 @@ mod tests {
     }
 
     /// A Bedrock stand-in that answers every allowlisted leaf and records what
-    /// it was asked. It deliberately ALSO serves `workspace/secrets` and repo
-    /// bind/unbind, so a test asserting those are unreachable is proving the
-    /// daemon's allowlist rather than an upstream 404. The `file` leaf answers
-    /// the way the real route does — raw bytes on a 2xx, a JSON `HttpError`
-    /// body on a refusal — with declared content-types that contradict the
-    /// bytes; see [`file_read_call`].
+    /// it was asked. It deliberately ALSO serves `workspace/secrets`, so a
+    /// test asserting that is unreachable is proving the daemon's allowlist
+    /// rather than an upstream 404; the repo PUT and DELETE it serves are now
+    /// the owner verbs' real upstreams. The `file` leaf answers the way the
+    /// real route does — raw bytes on a 2xx, a JSON `HttpError` body on a
+    /// refusal — with declared content-types that contradict the bytes; see
+    /// [`file_read_call`].
     async fn start_fake_bedrock(seen: Seen) -> (String, JoinHandle<()>) {
         let app = Router::new()
             .route("/api/v1/rooms/{room}/workspace", get(record_call))
@@ -1467,19 +1629,182 @@ mod tests {
         fixture.close();
     }
 
-    /// Repo BIND and UNBIND are owner-only upstream, and the daemon presents
-    /// the credential's own bearer — so Bedrock's `requireRoomOwner` would be
-    /// answered by the local human no matter which roster id the caller
-    /// asserted. A row for either would hand every participant the authority to
-    /// repoint the whole room's compute. The fake Bedrock here serves both, so
-    /// this is the daemon refusing, not an upstream 404.
+    /// The binding verbs opened by the 2026-08-29 ruling forward as what
+    /// Bedrock actually serves — bind is the upstream PUT on `workspace/repo`,
+    /// unbind the DELETE — on the room's own bearer. Bind's body crosses with
+    /// the client's actor claim stripped and NOTHING inserted in its place,
+    /// because `validateRepoBinding` upstream is strict deny-extra; unbind
+    /// forwards no body at all, because the upstream DELETE reads none.
     ///
-    /// Reading the binding, cloning it, and building it stay: those act on a
-    /// remote an owner already chose.
-    ///
-    /// Mutation: put either row back in the table -> RED.
+    /// Mutation: mark either row `attributed` -> RED (the stray key would be
+    /// asserted here before Bedrock could 400 it); forward the unbind body ->
+    /// RED.
     #[tokio::test]
-    async fn owner_only_repo_binding_is_not_on_this_lane() {
+    async fn an_owner_bind_forwards_as_the_upstream_put_and_unbind_as_the_delete() {
+        let tmp = tempfile::tempdir().unwrap();
+        let fixture = federated_room(&tmp).await;
+        let expected_authorization = format!("Bearer {BEARER}");
+
+        let response = room_workspace_command(
+            State(fixture.state.clone()),
+            Path((fixture.key.as_str().to_string(), "repo/bind".to_string())),
+            query(&[("actor_id", "alice")]),
+            Json(json!({
+                "remote": "https://github.com/example/repo.git",
+                "branch": "main",
+                // The forgery attempt again; on this row it must vanish
+                // entirely rather than be replaced.
+                "actor_member_id": "member-somebody-else",
+            })),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let calls = fixture.seen.calls();
+        assert_eq!(calls.len(), 1);
+        let call = &calls[0];
+        assert_eq!(call.method, "PUT");
+        assert_eq!(call.path, "/api/v1/rooms/workspace-room/workspace/repo");
+        assert_eq!(
+            call.authorization.as_deref(),
+            Some(expected_authorization.as_str()),
+            "the room's own credential authenticates the bind"
+        );
+        assert_eq!(
+            call.body["remote"],
+            json!("https://github.com/example/repo.git")
+        );
+        assert_eq!(call.body["branch"], json!("main"));
+        assert!(
+            call.body.get(ACTOR_MEMBER_ID).is_none(),
+            "a binding body carries no actor claim, the client's or the daemon's"
+        );
+
+        let response = room_workspace_command(
+            State(fixture.state.clone()),
+            Path((fixture.key.as_str().to_string(), "repo/unbind".to_string())),
+            query(&[("actor_id", "alice")]),
+            Json(json!({})),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let calls = fixture.seen.calls();
+        assert_eq!(calls.len(), 2);
+        let call = &calls[1];
+        assert_eq!(call.method, "DELETE");
+        assert_eq!(call.path, "/api/v1/rooms/workspace-room/workspace/repo");
+        assert_eq!(
+            call.authorization.as_deref(),
+            Some(expected_authorization.as_str()),
+            "the room's own credential authenticates the unbind"
+        );
+        assert_eq!(call.body, Value::Null, "an upstream DELETE carries no body");
+
+        fixture.close();
+    }
+
+    /// The identity map fails closed on the owner verbs, with a distinct code
+    /// for each way an actor is not the principal: an agent never
+    /// federation-registered resolves to NOTHING, and one that IS registered
+    /// resolves to its own member id — still not the id Bedrock's
+    /// `requireRoomOwner` will judge, because the daemon presents the
+    /// credential's bearer. Neither refusal forwards anything, and neither
+    /// quietly attributes the agent to the human — the exact failure the
+    /// ruling names.
+    ///
+    /// Mutation: resolve an Agent to `local_human_member_id` -> RED; drop the
+    /// owner comparison -> RED (the bound agent would forward).
+    #[tokio::test]
+    async fn an_agent_on_an_owner_verb_is_refused_mapped_or_not() {
+        let tmp = tempfile::tempdir().unwrap();
+        let fixture = federated_room(&tmp).await;
+        let bind_body = json!({"remote": "https://github.com/example/repo.git"});
+
+        let response = room_workspace_command(
+            State(fixture.state.clone()),
+            Path((fixture.key.as_str().to_string(), "repo/bind".to_string())),
+            query(&[("actor_id", "researcher")]),
+            Json(bind_body.clone()),
+        )
+        .await;
+        let (status, body) = body_of(response).await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        assert_eq!(body["code"], json!("workspace_actor_unmapped"));
+
+        with_rooms(&fixture.state, |store| {
+            store
+                .bind_room_agent(&fixture.key, "member-researcher", "researcher", "reg-key")
+                .expect("binding fixture");
+        });
+        let response = room_workspace_command(
+            State(fixture.state.clone()),
+            Path((fixture.key.as_str().to_string(), "repo/bind".to_string())),
+            query(&[("actor_id", "researcher")]),
+            Json(bind_body),
+        )
+        .await;
+        let (status, body) = body_of(response).await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        assert_eq!(body["code"], json!("workspace_not_owner_principal"));
+
+        assert!(
+            fixture.seen.calls().is_empty(),
+            "neither refusal may spend the bearer"
+        );
+
+        fixture.close();
+    }
+
+    /// An attributed route sends the actor's RESOLVED member id, and an actor
+    /// with none — a Bot here, and Tool and System alike — is refused rather
+    /// than silently attributed to the human, which is what this lane did
+    /// before the map existed.
+    ///
+    /// Mutation: fall back to `local_human_member_id` for a non-Human -> RED.
+    #[tokio::test]
+    async fn an_actor_with_no_member_id_is_refused_not_attributed_as_the_human() {
+        let tmp = tempfile::tempdir().unwrap();
+        let fixture = federated_room(&tmp).await;
+        with_rooms(&fixture.state, |store| {
+            store
+                .add_participant(
+                    &fixture.key,
+                    ocean_core::RoomParticipant {
+                        id: "webhook".into(),
+                        kind: RoomParticipantKind::Bot,
+                        display_name: "Webhook".into(),
+                    },
+                    Utc::now(),
+                )
+                .expect("roster fixture");
+        });
+
+        let response = room_workspace_command(
+            State(fixture.state.clone()),
+            Path((fixture.key.as_str().to_string(), "exec".to_string())),
+            query(&[("actor_id", "webhook")]),
+            Json(json!({"command": "npm test"})),
+        )
+        .await;
+        let (status, body) = body_of(response).await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        assert_eq!(body["code"], json!("workspace_actor_unmapped"));
+        assert!(
+            fixture.seen.calls().is_empty(),
+            "an unmappable actor must not cause an upstream request"
+        );
+
+        fixture.close();
+    }
+
+    /// What did NOT open with the binding verbs: the upstream PUT and DELETE
+    /// travel as POST leaves, so a bare `POST repo` is still no route and a
+    /// wire DELETE still dies at the router — the wildcard registers GET and
+    /// POST only, and `cors.rs` does not advertise PUT at all. Through the
+    /// real router, because that is the whole claim.
+    ///
+    /// Mutation: register DELETE on the wildcard in `main.rs` -> RED.
+    #[tokio::test]
+    async fn the_binding_verbs_ride_post_leaves_not_their_own_wire_verbs() {
         let tmp = tempfile::tempdir().unwrap();
         let fixture = federated_room(&tmp).await;
 
@@ -1494,9 +1819,6 @@ mod tests {
         assert_eq!(status, StatusCode::NOT_FOUND);
         assert_eq!(body["code"], json!("workspace_route_not_allowed"));
 
-        // Unbind has no daemon-side verb at all: the wildcard route registers
-        // GET and POST only, so axum answers the DELETE itself. Through the
-        // real router, because that is the whole claim.
         let app = crate::room_routes().with_state(fixture.state.clone());
         let response = tower::ServiceExt::oneshot(
             app,
@@ -1515,19 +1837,8 @@ mod tests {
 
         assert!(
             fixture.seen.calls().is_empty(),
-            "neither binding verb may reach Bedrock"
+            "neither wire shape may reach Bedrock"
         );
-
-        // The reads and the member acts around them still work, so the two
-        // refusals above are the exclusion and not a broken fixture.
-        let response = room_workspace_read(
-            State(fixture.state.clone()),
-            Path((fixture.key.as_str().to_string(), "repo".to_string())),
-            query(&[("actor_id", "alice")]),
-        )
-        .await;
-        assert_eq!(response.status(), StatusCode::OK);
-        assert_eq!(fixture.seen.calls().len(), 1);
 
         fixture.close();
     }
@@ -1597,10 +1908,13 @@ mod tests {
     }
 
     /// Every command on the lane must be able to outlast Bedrock's own ceiling,
-    /// and every read must not. The table is where that policy is declared, so
-    /// the table is where it is asserted.
+    /// and everything that answers out of Bedrock's state — reads AND the two
+    /// owner verbs, which land in its repo table with no container run — must
+    /// not. The table is where that policy is declared, so the table is where
+    /// it is asserted.
     ///
-    /// Mutation: give a write row `WORKSPACE_READ_TIMEOUT` -> RED.
+    /// Mutation: give a write row `WORKSPACE_READ_TIMEOUT` -> RED; give an
+    /// owner row `write: true` or `attributed: true` -> RED.
     #[test]
     fn a_command_may_outlast_bedrocks_ceiling_and_a_read_may_not() {
         for (method, leaf, call) in WORKSPACE_ALLOWLIST {
@@ -1612,7 +1926,15 @@ mod tests {
             } else {
                 assert_eq!(
                     call.timeout, WORKSPACE_READ_TIMEOUT,
-                    "{method} {leaf} is a read and should answer promptly or not at all"
+                    "{method} {leaf} answers out of Bedrock's state and should answer promptly or not at all"
+                );
+            }
+            if call.owner {
+                assert!(
+                    !call.write && !call.attributed,
+                    "{method} {leaf} is owner-gated: the principal comparison admits Humans \
+                     only, which subsumes the write gate's Agent/System refusal, and its \
+                     upstream reads no actor_member_id"
                 );
             }
             assert!(
@@ -1643,12 +1965,26 @@ mod tests {
                 "GET repo -> Get [\"workspace\", \"repo\"]",
                 "GET repo/ci -> Get [\"workspace\", \"repo\", \"ci\"]",
                 "POST exec -> Post [\"workspace\", \"exec\"]",
+                "POST repo/bind -> Put [\"workspace\", \"repo\"]",
                 "POST repo/build -> Post [\"workspace\", \"repo\", \"build\"]",
                 "POST repo/ci -> Post [\"workspace\", \"repo\", \"ci\"]",
                 "POST repo/clone -> Post [\"workspace\", \"repo\", \"clone\"]",
+                "POST repo/unbind -> Delete [\"workspace\", \"repo\"]",
             ],
             "the Bedrock surface this lane exposes changed; review the manifest"
         );
+        // The binding verbs entered by the 2026-08-29 operator ruling, and the
+        // rows that carry them are the only place the upstream verb diverges
+        // from the daemon's POST — divergence and the owner gate must move
+        // together, because the divergence exists precisely so an owner verb
+        // can ride a wire method `cors.rs` advertises.
+        for (method, leaf, call) in WORKSPACE_ALLOWLIST {
+            assert_eq!(
+                call.owner,
+                !matches!(call.upstream, UpstreamMethod::Get | UpstreamMethod::Post),
+                "{method} {leaf}: only an owner verb may translate the wire method"
+            );
+        }
         // `file` left this assertion deliberately: the GET row that now
         // carries it is a bounded JSON PROJECTION, not a raw-bytes relay — the
         // browser never receives the bytes as a document and no content-type

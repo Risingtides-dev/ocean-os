@@ -6832,3 +6832,41 @@ wildcard already routes it, banner count stays 112). Verified on ddb6bbf1,
 toolchain 1.97.0: 788 tests 0 failed, clippy -D warnings clean, fmt clean.
 Surface panel open-in-UI rides the next wave. No migration, no deploy.
 _________________________________________________________________________________
+time:      [12:07] [08-29-26]
+agent:     [claude] [fable 5]
+worktree:  loop/local-roster-bedrock-identity-map
+type:      [feature-request]
+area:      [backend]
+
+Mapped local roster ids to Bedrock member ids and opened the owner-gated repo
+bind/unbind verbs through the workspace lane, per the 2026-08-29 operator
+ruling (daemon-derived, fail-closed, never trust a browser-supplied member
+id). ocean-store gains resolve_room_agent_member — the reverse read of the
+room_member_bindings row register_agents already persists, unique per (room,
+agent_name) by the existing index, no migration. gate_workspace_call now
+derives the actor's member id inside the SAME store guard as the roster and
+credential reads: Human -> the credential's local_human_member_id (this
+daemon serves exactly one human principal; every browser session on it IS
+that principal), Agent -> the binding keyed by its folder-agent roster id,
+Bot/Tool/System or an unregistered agent -> nothing, refused 403
+workspace_actor_unmapped on any route needing an id — closing the quiet hole
+where a Bot on exec was silently attributed to the human. Attributed routes
+now send the RESOLVED id (behaviorally identical for Humans). The two owner
+verbs ride daemon POST leaves repo/bind and repo/unbind translated to
+Bedrock's PUT/DELETE on workspace/repo — POST because cors.rs does not
+advertise PUT — and forward only when the actor resolves to the credential's
+principal (403 workspace_not_owner_principal for a mapped agent); they are
+deliberately write:false so the unmapped and mapped refusals stay distinct,
+carry the 15s read budget (no container runs), bind's body stays strict
+deny-extra with the unconditional actor strip, and unbind forwards no body.
+No main.rs route change (banner stays 112); the allowlist tripwire grew
+10 -> 12 deliberately. The scout scoped room_federation.rs and
+persistent_rooms.rs but neither needed a line: send_room_scoped already
+takes any method and an optional body, and register_agents already writes
+the map. AGENTS.md bullet rewritten (identity map recorded, ruling recorded,
+revert list extended) and the operator guide gained the workspace identity
+model block plus the two new leaves and refusal codes. Verified on 93455352,
+toolchain 1.97.0: ocean-daemon 792 passed, ocean-store 177 passed, clippy -D
+warnings clean both crates, fmt clean. Pure code, no migration, no deploy;
+revert is the merge commit.
+_________________________________________________________________________________

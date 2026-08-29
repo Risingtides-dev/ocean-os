@@ -2997,9 +2997,11 @@ fn room_routes() -> Router<AppState> {
         // route: the leaf travels on the wire and `room_workspace_proxy`'s
         // allowlist is what decides whether it becomes a call at all, so the
         // gate is exercised by every request rather than implied by which
-        // handler got matched. Neither PUT nor DELETE is registered — the only
-        // upstream routes wanting them are repo bind and unbind, which are
-        // owner-only upstream and deliberately absent from the allowlist.
+        // handler got matched. Neither PUT nor DELETE is registered even now
+        // that repo bind and unbind ride the lane: those owner verbs travel
+        // as POST leaves (`repo/bind`, `repo/unbind`) and the allowlist
+        // translates them to Bedrock's PUT and DELETE, because `cors.rs` does
+        // not advertise PUT and a browser PUT would die at the preflight.
         //
         // `DefaultBodyLimit` for the same reason attachments needs one: the
         // handler's own 32 KiB refusal would otherwise be preceded by axum's
