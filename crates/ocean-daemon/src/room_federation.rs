@@ -3024,8 +3024,12 @@ const WORKSPACE_MARKER_SOURCE_ID: &str = "workspace";
 /// - `*_started` (clone, build) would double every operation into a
 ///   started/finished pair; the finished row carries the outcome, and a
 ///   started row with no finished row is legible on the ledger, not here.
-/// - `repo_bound` / `repo_unbound` / `secrets_updated` / `port_closed` are
-///   configuration bookkeeping, not activity anyone waits on.
+/// - `repo_bound` / `secrets_updated` / `port_closed` are configuration
+///   bookkeeping, not activity anyone waits on. `repo_unbound` used to sit
+///   with them — until Bedrock's unbind started deleting the checkout, which
+///   made it a destructive OUTCOME by this list's own standard. Its failure
+///   mode is worse than silence: `rm_failed` leaves a live checkout the next
+///   flush re-ingests as room files, and nobody learns that from the ledger.
 ///
 /// Everything not listed here — including future actions Bedrock grows —
 /// advances the cursor exactly as before this allowlist existed.
@@ -3036,6 +3040,7 @@ fn workspace_action_is_marker(event_type: &str) -> bool {
             | "room.workspace.destroyed"
             | "room.workspace.repo_cloned"
             | "room.workspace.repo_clone_failed"
+            | "room.workspace.repo_unbound"
             | "room.workspace.build_finished"
             | "room.workspace.build_failed"
             | "room.workspace.port_exposed"
@@ -3071,6 +3076,10 @@ struct WorkspaceEventPayload {
     changed_files: Option<u64>,
     #[serde(default)]
     flushed_files: Option<u64>,
+    #[serde(default)]
+    checkout_removed: Option<bool>,
+    #[serde(default)]
+    checkout_removed_reason: Option<String>,
     #[serde(default)]
     checks_new: Option<u64>,
     #[serde(default)]
@@ -3171,6 +3180,24 @@ fn compose_workspace_marker(event_type: &str, p: &WorkspaceEventPayload) -> Stri
             }
             if let Some(code) = p.exit_code {
                 line.push_str(&format!(" (exit {code})"));
+            }
+            line
+        }
+        "room.workspace.repo_unbound" => {
+            let mut line = String::from("workspace repo unbound");
+            if let Some(branch) = quoted(&p.branch) {
+                line.push_str(&format!(": '{branch}'"));
+            }
+            match p.checkout_removed {
+                Some(true) => line.push_str(" — checkout removed"),
+                // `no_container` means nothing existed to remove, so the
+                // plain sentence is the honest rendering. Any other false
+                // left a live checkout the next flush re-ingests as room
+                // files — the alarm this marker exists to raise.
+                Some(false) if p.checkout_removed_reason.as_deref() != Some("no_container") => {
+                    line.push_str(" — checkout removal failed")
+                }
+                _ => {}
             }
             line
         }
@@ -7086,6 +7113,7 @@ mod tests {
             "room.workspace.destroyed",
             "room.workspace.repo_cloned",
             "room.workspace.repo_clone_failed",
+            "room.workspace.repo_unbound",
             "room.workspace.build_finished",
             "room.workspace.build_failed",
             "room.workspace.port_exposed",
@@ -7108,7 +7136,6 @@ mod tests {
             "room.workspace.repo_clone_started",
             "room.workspace.build_started",
             "room.workspace.repo_bound",
-            "room.workspace.repo_unbound",
             "room.workspace.secrets_updated",
             "room.workspace.port_closed",
             "room.workspace.",
@@ -7167,6 +7194,60 @@ mod tests {
                 &WorkspaceEventPayload::default()
             ),
             "workspace provisioned",
+            "missing fields degrade to shorter prose instead of failing the row"
+        );
+    }
+
+    #[test]
+    fn workspace_repo_unbound_marker_reports_checkout_outcome() {
+        // The real Bedrock payload shape: scrubbed identity strings the
+        // marker never quotes ride along and are ignored; the boolean is
+        // the news.
+        let payload: WorkspaceEventPayload = serde_json::from_value(json!({
+            "remote": "https://example.test/repo.git",
+            "repo_dir": "repo",
+            "branch": "main",
+            "checkout_removed": true,
+            "exec_id": "exec-1"
+        }))
+        .unwrap();
+        assert_eq!(
+            compose_workspace_marker("room.workspace.repo_unbound", &payload),
+            "workspace repo unbound: 'main' — checkout removed"
+        );
+
+        // rm_failed leaves a live checkout the next flush re-ingests as
+        // room files — the one unbind outcome a member must actually see.
+        let payload: WorkspaceEventPayload = serde_json::from_value(json!({
+            "branch": "main",
+            "checkout_removed": false,
+            "checkout_removed_reason": "rm_failed"
+        }))
+        .unwrap();
+        assert_eq!(
+            compose_workspace_marker("room.workspace.repo_unbound", &payload),
+            "workspace repo unbound: 'main' — checkout removal failed"
+        );
+
+        // no_container is not a failure: there was nothing to remove, and
+        // claiming either removal or trouble would lie about state.
+        let payload: WorkspaceEventPayload = serde_json::from_value(json!({
+            "branch": "main",
+            "checkout_removed": false,
+            "checkout_removed_reason": "no_container"
+        }))
+        .unwrap();
+        assert_eq!(
+            compose_workspace_marker("room.workspace.repo_unbound", &payload),
+            "workspace repo unbound: 'main'"
+        );
+
+        assert_eq!(
+            compose_workspace_marker(
+                "room.workspace.repo_unbound",
+                &WorkspaceEventPayload::default()
+            ),
+            "workspace repo unbound",
             "missing fields degrade to shorter prose instead of failing the row"
         );
     }
