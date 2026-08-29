@@ -6870,3 +6870,31 @@ toolchain 1.97.0: ocean-daemon 792 passed, ocean-store 177 passed, clippy -D
 warnings clean both crates, fmt clean. Pure code, no migration, no deploy;
 revert is the merge commit.
 _________________________________________________________________________________
+time:      [13:45] [08-29-26]
+agent:     [claude] [fable 5]
+worktree:  loop/workspace-provision-destroy-through-the-lane
+type:      [merge]
+area:      [backend]
+
+Landed wave 17's two ocean-os slices. PR #391: owner-gated workspace
+provision and destroy ride the daemon lane — POST leaf provision -> upstream
+POST /workspace (strict deny-extra body relayed, actor strip keeps it legal)
+and POST leaf destroy -> upstream DELETE /workspace (body discarded, flush
+the one relayed query key), both gated by the #390 identity map (403
+workspace_not_owner_principal / workspace_actor_unmapped, GET refused 404,
+no refusal spends the bearer), both on WORKSPACE_COMMAND_TIMEOUT because
+destroy flushes the container before teardown. Manifest 12 -> 14, tripwire
+weakened one-way (translated method implies owner), route count stays 112,
+operator guide's false "Deliberately NOT exposed" paragraph corrected. PR
+#392: a failed build convenes the room's agent, opt-in per room via
+RoomTriggerPolicy.on_build_failure (serde default, off everywhere today) —
+ingest_workspace_row fills trigger targets for room.workspace.build_failed
+only and gains the dispatch loop the claims lacked (without it every convene
+was claimed-and-stranded), FederatedTriggerDispatch carries an honest
+reason, and the ocean-store policy codec learned the field it was silently
+dropping (declared scope breach, proven necessary by revert). Opt-in is
+create-time-only until room-trigger-policy-update-route lands. Gates re-run
+at land after rebase: 53 + 796 + 177 tests 0 failed, clippy -D warnings
+all three crates, fmt clean. A daemon deploy is needed before browsers
+benefit from provision/destroy; no migration, no credential.
+_________________________________________________________________________________
