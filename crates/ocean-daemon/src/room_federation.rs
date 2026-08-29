@@ -244,6 +244,10 @@ pub(super) struct FederatedTriggerDispatch {
     pub(super) ledger_event_id: String,
     pub(super) local_seq: u64,
     pub(super) target_member_id: String,
+    /// The evaluator's wording for WHY this convene fired, quoted verbatim
+    /// into the dispatcher's `room_trigger` payload — a build-failure convene
+    /// must not log itself as a mention.
+    pub(super) reason: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -2976,6 +2980,7 @@ async fn ingest_message_row(
             publish_room_wake_on(&inner.room_wakes, &credential.room_id, &commit.message);
             publish_room_access_wake_on(&inner.access_wakes, &credential.room_id);
             for target_member_id in commit.claimed_trigger_targets {
+                let reason = format!("on_mention: @{target_member_id} mentioned");
                 if inner
                     .trigger_tx
                     .send(FederatedTriggerDispatch {
@@ -2983,6 +2988,7 @@ async fn ingest_message_row(
                         ledger_event_id: event.ledger_event_id.clone(),
                         local_seq: commit.message.seq,
                         target_member_id,
+                        reason,
                     })
                     .is_err()
                 {
@@ -3266,10 +3272,16 @@ fn compose_workspace_marker(event_type: &str, p: &WorkspaceEventPayload) -> Stri
 ///   row, so a replayed row rebuilds byte-identical meta and lands in the
 ///   store's Duplicate arm instead of its corruption arm.
 ///
-/// `trigger_targets` stays empty on purpose: the marker reaching agents
-/// through the transcript on their NEXT convened turn is the point of this
-/// lane; convening an agent BECAUSE a build failed is trigger policy, a
-/// separate decision.
+/// `trigger_targets` is filled for exactly one row kind: `build_failed`, and
+/// only in a room whose trigger policy opts in via `on_build_failure` (ruled
+/// 2026-08-29: a build failure is a trigger event on the existing convene
+/// path, not a new mechanism). Targets are the roster's Agent members; the
+/// store's claim site keeps only the locally-bound ones and consumes each
+/// (row, target) pair once, and the dispatcher re-validates ownership and
+/// binding before queuing a turn — so a replayed row or a foreign agent can
+/// never be convened from here. Every other workspace row keeps empty
+/// targets: the marker reaching agents through the transcript on their NEXT
+/// convened turn is the point of this lane.
 fn ingest_workspace_row(
     inner: &Arc<SupervisorInner>,
     key: &RoomKey,
@@ -3282,6 +3294,28 @@ fn ingest_workspace_row(
     let payload: WorkspaceEventPayload =
         serde_json::from_value(row.payload).map_err(|_| BridgeError::Protocol)?;
     let body = compose_workspace_marker(&row.event_type, &payload);
+    // Only a failed build consults the policy; a green build and a CI result
+    // stay pure markers. The over-broad roster read is deliberate — the store
+    // and the dispatcher both re-filter (see the doc above).
+    let (trigger_targets, trigger_reason) = if row.event_type == "room.workspace.build_failed" {
+        let policy = with_rooms_handle(&inner.rooms, |store| store.trigger_policy(key))
+            .map_err(|_| BridgeError::Store)?;
+        let decision = evaluate_trigger_policy(policy.as_ref(), &RoomTriggerEvent::BuildFailed);
+        let targets = if decision.should_convene {
+            with_rooms_handle(&inner.rooms, |store| store.room_access(key))
+                .map_err(|_| BridgeError::Store)?
+                .members
+                .into_iter()
+                .filter(|member| member.actor_type == FederatedActorType::Agent)
+                .map(|member| member.member_id)
+                .collect()
+        } else {
+            Vec::new()
+        };
+        (targets, decision.reason)
+    } else {
+        (Vec::new(), String::new())
+    };
     let non_empty = |value: Option<String>| value.filter(|v| !v.is_empty());
     let event = ConfirmedEvent {
         ledger_event_id: row.id.clone(),
@@ -3301,7 +3335,7 @@ fn ingest_workspace_row(
         author_kind: RoomParticipantKind::System,
         kind: RoomMessageKind::System,
         body,
-        trigger_targets: Vec::new(),
+        trigger_targets,
     };
     let outcome = with_rooms_handle(&inner.rooms, |store| {
         store.ingest_confirmed_event(key, &event, chrono::Utc::now())
@@ -3315,6 +3349,24 @@ fn ingest_workspace_row(
             // of polling for it.
             publish_room_wake_on(&inner.room_wakes, key, &commit.message);
             publish_room_access_wake_on(&inner.access_wakes, key);
+            // Same dispatch loop as the message path: a claim recorded in the
+            // store without a matching send here would consume the row's
+            // one convene and wake nobody.
+            for target_member_id in commit.claimed_trigger_targets {
+                if inner
+                    .trigger_tx
+                    .send(FederatedTriggerDispatch {
+                        room: key.clone(),
+                        ledger_event_id: event.ledger_event_id.clone(),
+                        local_seq: commit.message.seq,
+                        target_member_id,
+                        reason: trigger_reason.clone(),
+                    })
+                    .is_err()
+                {
+                    tracing::warn!(room = %key, outcome = "dispatch_receiver_closed", "federated trigger suppressed");
+                }
+            }
             Ok(IngestDisposition::Committed)
         }
     }
@@ -6495,6 +6547,13 @@ mod tests {
 
     fn test_supervisor_inner(rooms: RoomStoreHandle) -> Arc<SupervisorInner> {
         let (trigger_tx, _) = mpsc::unbounded_channel();
+        test_supervisor_inner_with_trigger(rooms, trigger_tx)
+    }
+
+    fn test_supervisor_inner_with_trigger(
+        rooms: RoomStoreHandle,
+        trigger_tx: mpsc::UnboundedSender<FederatedTriggerDispatch>,
+    ) -> Arc<SupervisorInner> {
         Arc::new(SupervisorInner {
             client: None,
             owner_token: None,
@@ -7283,6 +7342,174 @@ mod tests {
             ingest_workspace_row(&inner, &key, bad),
             Err(BridgeError::Protocol)
         ));
+    }
+
+    fn workspace_trigger_row(
+        key: &RoomKey,
+        id: &str,
+        sequence: &str,
+        event_type: &str,
+    ) -> WireLedgerRow {
+        WireLedgerRow {
+            id: id.into(),
+            sequence: sequence.into(),
+            event_type: event_type.into(),
+            correlation_id: key.as_str().into(),
+            virtual_path: format!("/rooms/{}", key.as_str()),
+            actor_id: Some("principal-1".into()),
+            actor_member_id: None,
+            source_id: None,
+            source_sequence: None,
+            payload: json!({"script": "ci", "exit_code": 2, "duration_ms": 1500}),
+        }
+    }
+
+    #[tokio::test]
+    async fn build_failed_marker_convenes_bound_agent_once_when_policy_opts_in() {
+        let key = RoomKey::new("workspace-build-trigger");
+        let human = "11111111-1111-4111-8111-111111111111";
+        let agent = "33333333-3333-4333-8333-333333333333";
+        let mut store = ocean_store::SqliteRoomStore::open_in_memory().unwrap();
+        store
+            .create(
+                key.clone(),
+                "Workspace",
+                Some(ocean_core::RoomTriggerPolicy {
+                    on_build_failure: true,
+                    ..Default::default()
+                }),
+                chrono::Utc::now(),
+            )
+            .unwrap();
+        store
+            .install_room_credential(&key, "workspace-bearer", human)
+            .unwrap();
+        store.bind_room_agent(&key, agent, "sage", "key").unwrap();
+        store
+            .update_room_access_safe(
+                &key,
+                Some(RoomAccessState::Live),
+                Some(&[
+                    p2c_projected_member(human, FederatedActorType::User, None),
+                    p2c_projected_member(agent, FederatedActorType::Agent, Some(human)),
+                ]),
+                None,
+            )
+            .unwrap();
+        let rooms = Arc::new(std::sync::Mutex::new(store));
+        let (trigger_tx, mut trigger_rx) = mpsc::unbounded_channel();
+        let inner = test_supervisor_inner_with_trigger(rooms, trigger_tx);
+
+        // The opt-in gates the ROW KIND, not the lane: a green build and a CI
+        // result stay pure markers even with on_build_failure enabled.
+        for (id, sequence, event_type) in [
+            ("ledger-ok", "1", "room.workspace.build_finished"),
+            ("ledger-ci", "2", "room.workspace.ci_checked"),
+        ] {
+            let outcome = ingest_workspace_row(
+                &inner,
+                &key,
+                workspace_trigger_row(&key, id, sequence, event_type),
+            )
+            .unwrap();
+            assert_eq!(outcome, IngestDisposition::Committed);
+            assert!(
+                trigger_rx.try_recv().is_err(),
+                "{event_type} must not convene"
+            );
+        }
+
+        let outcome = ingest_workspace_row(
+            &inner,
+            &key,
+            workspace_trigger_row(&key, "ledger-fail", "3", "room.workspace.build_failed"),
+        )
+        .unwrap();
+        assert_eq!(outcome, IngestDisposition::Committed);
+        let dispatch = trigger_rx
+            .try_recv()
+            .expect("build failure convenes the bound agent");
+        assert_eq!(dispatch.target_member_id, agent);
+        assert_eq!(dispatch.ledger_event_id, "ledger-fail");
+        assert_eq!(dispatch.reason, "on_build_failure: workspace build failed");
+        assert!(
+            trigger_rx.try_recv().is_err(),
+            "only the bound Agent member is dispatched — never the human"
+        );
+
+        // SSE replay of the same row: the store's consume-once claim leaves
+        // nothing to dispatch on top of the usual no-row/no-cursor noop.
+        let outcome = ingest_workspace_row(
+            &inner,
+            &key,
+            workspace_trigger_row(&key, "ledger-fail", "3", "room.workspace.build_failed"),
+        )
+        .unwrap();
+        assert_eq!(outcome, IngestDisposition::Duplicate);
+        assert!(
+            trigger_rx.try_recv().is_err(),
+            "a replayed row must not double-convene"
+        );
+    }
+
+    #[tokio::test]
+    async fn build_failed_marker_convenes_nobody_without_the_opt_in() {
+        // Pins today's default. Two rooms that must behave byte-identically to
+        // before on_build_failure existed: no policy at all, and a policy with
+        // another flag on but this one off.
+        for (suffix, policy) in [
+            ("absent", None),
+            (
+                "off",
+                Some(ocean_core::RoomTriggerPolicy {
+                    on_mention: true,
+                    ..Default::default()
+                }),
+            ),
+        ] {
+            let key = RoomKey::new(format!("workspace-no-optin-{suffix}"));
+            let human = "11111111-1111-4111-8111-111111111111";
+            let agent = "33333333-3333-4333-8333-333333333333";
+            let mut store = ocean_store::SqliteRoomStore::open_in_memory().unwrap();
+            store
+                .create(key.clone(), "Workspace", policy, chrono::Utc::now())
+                .unwrap();
+            store
+                .install_room_credential(&key, "workspace-bearer", human)
+                .unwrap();
+            store.bind_room_agent(&key, agent, "sage", "key").unwrap();
+            store
+                .update_room_access_safe(
+                    &key,
+                    Some(RoomAccessState::Live),
+                    Some(&[
+                        p2c_projected_member(human, FederatedActorType::User, None),
+                        p2c_projected_member(agent, FederatedActorType::Agent, Some(human)),
+                    ]),
+                    None,
+                )
+                .unwrap();
+            let rooms = Arc::new(std::sync::Mutex::new(store));
+            let (trigger_tx, mut trigger_rx) = mpsc::unbounded_channel();
+            let inner = test_supervisor_inner_with_trigger(rooms.clone(), trigger_tx);
+
+            let outcome = ingest_workspace_row(
+                &inner,
+                &key,
+                workspace_trigger_row(&key, "ledger-fail", "1", "room.workspace.build_failed"),
+            )
+            .unwrap();
+            assert_eq!(outcome, IngestDisposition::Committed);
+            assert!(
+                trigger_rx.try_recv().is_err(),
+                "policy {suffix} must convene nobody"
+            );
+            let transcript = with_rooms_handle(&rooms, |s| s.get(&key))
+                .unwrap()
+                .unwrap()
+                .transcript;
+            assert_eq!(transcript.len(), 1, "the marker itself still lands");
+        }
     }
 
     #[tokio::test]

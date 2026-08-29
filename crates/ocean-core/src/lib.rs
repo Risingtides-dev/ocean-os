@@ -534,6 +534,10 @@ pub struct RoomTriggerPolicy {
     /// Wake an agent when a rendered component emits an interaction event.
     #[serde(default)]
     pub on_component_event: bool,
+    /// Wake the room's agents when a workspace build fails. Off by default,
+    /// so every policy stored before this field existed keeps its behavior.
+    #[serde(default)]
+    pub on_build_failure: bool,
     /// Optional cron expression for scheduled wake-ups. `None` = no schedule.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub on_schedule: Option<String>,
@@ -786,6 +790,9 @@ pub enum RoomTriggerEvent {
     ComponentEvent { component_id: String },
     /// A scheduled tick fired (cron-driven). Carries no payload here.
     Schedule,
+    /// A workspace build failed. Carries no participant: the policy convenes
+    /// the room's agents, not one named target.
+    BuildFailed,
 }
 
 /// The decision produced by [`evaluate_trigger_policy`]: whether a room event
@@ -854,6 +861,11 @@ pub fn evaluate_trigger_policy(
                 "on_schedule: cron '{}' fired",
                 policy.on_schedule.as_deref().unwrap_or("")
             ),
+        },
+        RoomTriggerEvent::BuildFailed if policy.on_build_failure => TriggerDecision {
+            should_convene: true,
+            target_participant: None,
+            reason: "on_build_failure: workspace build failed".into(),
         },
         _ => TriggerDecision {
             should_convene: false,
@@ -1689,7 +1701,7 @@ mod tests {
     #[test]
     fn trigger_policy_flag_does_not_fire_a_different_event_variant() {
         // Each flag gates ONE variant. With only `on_mention` enabled, none of
-        // the other three variants may convene — even though their own flags
+        // the other four variants may convene — even though their own flags
         // would have matched them, those flags are off here.
         let policy = RoomTriggerPolicy {
             on_mention: true,
@@ -1703,6 +1715,7 @@ mod tests {
                 component_id: "map-1".into(),
             },
             RoomTriggerEvent::Schedule,
+            RoomTriggerEvent::BuildFailed,
         ] {
             let decision = evaluate_trigger_policy(Some(&policy), &event);
             assert!(
@@ -1747,6 +1760,7 @@ mod tests {
             on_mention: true,
             on_thread_reply: true,
             on_component_event: true,
+            on_build_failure: true,
             on_schedule: Some("*/5 * * * *".into()),
         };
 
@@ -1784,6 +1798,48 @@ mod tests {
         assert!(schedule.should_convene);
         assert!(schedule.target_participant.is_none());
         assert!(schedule.reason.contains("*/5 * * * *"));
+
+        let build = evaluate_trigger_policy(Some(&policy), &RoomTriggerEvent::BuildFailed);
+        assert!(build.should_convene);
+        assert!(build.target_participant.is_none());
+        assert!(build.reason.contains("on_build_failure"));
+    }
+
+    #[test]
+    fn trigger_policy_fires_on_build_failure() {
+        let policy = RoomTriggerPolicy {
+            on_build_failure: true,
+            ..Default::default()
+        };
+        let decision = evaluate_trigger_policy(Some(&policy), &RoomTriggerEvent::BuildFailed);
+        assert!(decision.should_convene);
+        // Build failures wake the room's agents, not one named participant.
+        assert!(decision.target_participant.is_none());
+        assert_eq!(decision.reason, "on_build_failure: workspace build failed");
+    }
+
+    #[test]
+    fn trigger_policy_build_failure_field_is_optional_on_the_wire() {
+        // Every policy stored before `on_build_failure` existed — and the
+        // surface's mirror of this struct — omits the field; it must
+        // deserialize to off, and the event tag must stay snake_case.
+        let stored: RoomTriggerPolicy =
+            serde_json::from_value(serde_json::json!({"on_mention": true})).unwrap();
+        assert!(stored.on_mention);
+        assert!(!stored.on_build_failure);
+
+        let policy = RoomTriggerPolicy {
+            on_build_failure: true,
+            ..Default::default()
+        };
+        let roundtrip: RoomTriggerPolicy =
+            serde_json::from_value(serde_json::to_value(&policy).unwrap()).unwrap();
+        assert_eq!(roundtrip, policy);
+
+        assert_eq!(
+            serde_json::to_value(RoomTriggerEvent::BuildFailed).unwrap(),
+            serde_json::json!({"type": "build_failed"})
+        );
     }
 
     #[test]
@@ -1794,6 +1850,7 @@ mod tests {
         assert!(!policy.on_mention);
         assert!(!policy.on_thread_reply);
         assert!(!policy.on_component_event);
+        assert!(!policy.on_build_failure);
         assert!(policy.on_schedule.is_none());
 
         for event in [
@@ -1807,6 +1864,7 @@ mod tests {
                 component_id: "c".into(),
             },
             RoomTriggerEvent::Schedule,
+            RoomTriggerEvent::BuildFailed,
         ] {
             let decision = evaluate_trigger_policy(Some(&policy), &event);
             assert!(
