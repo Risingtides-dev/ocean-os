@@ -7150,3 +7150,55 @@ ocean-daemon tests 0 failed, clippy -D warnings clean, fmt clean, docs-check
 PASS. A follow-up ocean-surface slice deletes `newly_joined_key` and reads
 `room_key` instead. No migration, no deploy step.
 _________________________________________________________________________________
+
+time:      [18:48] [08-30-26]
+agent:     [claude] [opus 5]
+worktree:  loop/os-workspace-markers-narrate-endings-but-not-beginnings
+type:      [bug-report]
+area:      [backend]
+
+`room.workspace.port_exposed` was an allowlisted transcript marker and
+`room.workspace.port_closed` was not, so the transcript told the room a port was
+serving and nothing ever said otherwise. The port read as live permanently — to
+humans scrolling back and to every convened agent fed the transcript. Promoted
+`port_closed` into `workspace_action_is_marker` and gave it a
+`compose_workspace_marker` arm mirroring `port_exposed` ("workspace port {port}
+closed", degrading to "workspace port closed" when the field is absent). Bedrock
+genuinely sends the field — `src/server.mjs:2779` at ocean-bedrock origin/master
+emits the event with `port` — so the pair names the SAME integer, which is all a
+reader has to match a retraction to its exposure by. Note what the transcript
+does NOT carry: Bedrock attaches `preview_url` to the exposure's ledger row and
+its 201 body, but `WorkspaceEventPayload` does not deserialize that field and no
+marker has ever rendered it (`grep -rn preview_url` over ocean-os is empty), so
+the reader sees a port number, never a link. No `bounded_quotable` on the new arm
+on purpose: `port` is a typed `u64`, so there is no upstream string to
+neutralize, and adding a quote call would imply one.
+
+Recorded a limit this marker cannot fix from the daemon side.
+`handleWorkspacePortClose` runs `computeCall(() => unexposePort(...))` under a
+`.catch` that only logs, then deletes the port row and emits `port_closed`
+regardless — so a failed teardown produces "workspace port 8787 closed" while the
+preview route may still be serving, the inverse of the bug fixed here. That is
+exactly the case `repo_unbound` renders explicitly from `checkout_removed` /
+`checkout_removed_reason`, and the close payload carries no equivalent, so the
+allowlist doc comment, the compose arm and the daemon AGENTS.md line all now say
+the marker reports the port's RECORDED state rather than proof the route is torn
+down. Carrying a close outcome is a Bedrock change; FOLLOW-UP SLICE (ocean-bedrock,
+`src/server.mjs`): emit `port_closed` with a `route_removed` / `route_removed_reason`
+pair the way unbind already does, then teach this arm to render it.
+
+The doc comment bullet that listed `port_closed` beside `repo_bound` /
+`secrets_updated` as configuration bookkeeping now explains why it left, the same
+way the `repo_unbound` sentence beside it does. `repo_bound`, `secrets_updated`
+and the `*_started` pair stay exactly where they are. The allowlist test asserted
+`port_closed` in its NOISE list, so the slice was red until that string moved to
+the signal list; a new
+`workspace_port_markers_pair_an_exposure_with_its_retraction` covers the
+port-present and port-absent arms, and its fixture carries `preview_url` against
+an exact-equality assertion so the "transcript names the port, never the link"
+claim is pinned by a test rather than by prose. Also brought the daemon
+AGENTS.md allowlist enumeration current — it had missed `repo_unbound` and
+`execs_purged` from the two prior promotions. Gate: 818 ocean-daemon tests 0
+failed, clippy -D warnings clean, fmt clean, toolchain 1.97.0. One source file
+plus two records. No migration, no deploy step.
+_________________________________________________________________________________
