@@ -1393,6 +1393,82 @@ pub(super) async fn room_leave(
     }
 }
 
+/// Sweep a deleted folder-as-agent out of every local room roster. Returns the
+/// number of rooms the agent was removed from.
+///
+/// A roster row of kind Agent carries the system's invariant that its id IS a
+/// resolvable agent folder: `room_join` refuses anything else with a typed 400,
+/// and the wake path fail-closes on a vanished folder. So `agent_delete` calls
+/// this AFTER the folder removal succeeds — otherwise every room that held the
+/// agent keeps a ghost member that renders in rosters, answers every mention
+/// with "not bound" noise, and can only be cured by a manual per-room leave.
+/// Removal goes through `remove_participant_with_message`, so each swept room
+/// gets the same ParticipantLeft marker an explicit leave writes.
+///
+/// The kind filter is load-bearing: ids are unique within a room, but a Human
+/// in some other room may share the deleted agent's name and must survive.
+/// Per-room failures are logged and skipped rather than failing the delete —
+/// the folder is already gone (the fs delete is not transactional with the
+/// store), and a half-swept roster still beats a wholly ghosted one. Federated
+/// rooms keep bedrock-authoritative membership, so a roster sync may rewrite a
+/// swept row back there; that residual is filed, not handled here.
+pub(super) fn sweep_agent_from_local_rosters(state: &AppState, agent_id: &str) -> usize {
+    let swept = with_rooms(state, |reg| {
+        // Page to the end: `list()` caps at DEFAULT_LIST_LIMIT (OCEAN-250), and
+        // a daemon past that many open rooms would silently keep its ghosts.
+        // Scan and remove under the one lock hold so a concurrent join cannot
+        // interleave; everything here is synchronous, so the guard never
+        // crosses an await.
+        let mut ghosted: Vec<RoomKey> = Vec::new();
+        let mut cursor: Option<String> = None;
+        loop {
+            let page = match reg.list_page(cursor.as_deref(), Some(ocean_store::MAX_LIST_LIMIT)) {
+                Ok(page) => page,
+                Err(e) => {
+                    tracing::warn!(agent = agent_id, error = %e,
+                        "agent-delete roster sweep could not list rooms");
+                    break;
+                }
+            };
+            ghosted.extend(
+                page.rooms
+                    .iter()
+                    .filter(|room| {
+                        room.participants.iter().any(|p| {
+                            matches!(p.kind, RoomParticipantKind::Agent) && p.id == agent_id
+                        })
+                    })
+                    .map(|room| room.id.clone()),
+            );
+            if !page.has_more {
+                break;
+            }
+            match page.next_cursor {
+                Some(next) => cursor = Some(next),
+                None => break,
+            }
+        }
+        let mut removed = Vec::new();
+        for key in ghosted {
+            match reg.remove_participant_with_message(&key, agent_id, Utc::now()) {
+                Ok((_rec, message)) => removed.push((key, message)),
+                Err(e) => {
+                    tracing::warn!(agent = agent_id, room = %key, error = %e,
+                        "agent-delete roster sweep skipped a room");
+                }
+            }
+        }
+        removed
+    });
+    // Wake hints only after `with_rooms` returns: the transactions have
+    // committed and the lock is released — the same post-commit rule as
+    // `room_leave`.
+    for (key, message) in &swept {
+        publish_room_wake(state, key, message);
+    }
+    swept.len()
+}
+
 #[derive(serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(super) struct RoomMessageRequest {
