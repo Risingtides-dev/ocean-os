@@ -21,7 +21,7 @@ use ocean_core::{
     evaluate_trigger_policy, FederatedActorType, FederatedRoomMemberProjection, FederatedRoomRole,
     InviteResponse, MemberPresence, PublicAgentDescriptor, RoomAccessProjection, RoomAccessState,
     RoomKey, RoomMessageKind, RoomOutboxItem, RoomParticipantKind, RoomReadCursorProjection,
-    RoomTriggerEvent,
+    RoomRedeemResponse, RoomTriggerEvent,
 };
 use ocean_store::{ConfirmedEvent, IngestOutcome, PendingRedemption, RoomCredential, RoomStore};
 use reqwest::{redirect::Policy, Client, StatusCode, Url};
@@ -1318,7 +1318,7 @@ impl FederationSupervisor {
     pub(super) async fn redeem_invite(
         &self,
         code: &str,
-    ) -> Result<RoomAccessProjection, IntentError> {
+    ) -> Result<RoomRedeemResponse, IntentError> {
         let code = code.trim();
         if code.is_empty() {
             return Err(IntentError::Invalid);
@@ -1340,10 +1340,14 @@ impl FederationSupervisor {
         self.recover_pending(pending).await
     }
 
+    /// The room key is only ever derivable here — it comes off the redeemed
+    /// invite's scope, and the caller holds nothing but an opaque code — so it
+    /// leaves with the projection rather than being dropped for the redeemer
+    /// to reconstruct by diffing its own room list.
     async fn recover_pending(
         &self,
         pending: PendingRedemption,
-    ) -> Result<RoomAccessProjection, IntentError> {
+    ) -> Result<RoomRedeemResponse, IntentError> {
         let client = self.inner.client.clone().ok_or(IntentError::Unavailable)?;
         let url = client
             .endpoint(&["api", "v1", "invites", "redeem"])
@@ -1462,8 +1466,12 @@ impl FederationSupervisor {
         })?;
         publish_room_access_wake_on(&self.inner.access_wakes, &key);
         self.start_room(key.clone()).await;
-        with_rooms_handle(&self.inner.rooms, |store| store.room_access(&key))
-            .map_err(|_| IntentError::Store)
+        let access = with_rooms_handle(&self.inner.rooms, |store| store.room_access(&key))
+            .map_err(|_| IntentError::Store)?;
+        Ok(RoomRedeemResponse {
+            access,
+            room_key: key.as_str().into(),
+        })
     }
 
     fn remove_pending(&self, pending: &PendingRedemption) -> Result<(), IntentError> {
@@ -6225,10 +6233,21 @@ mod tests {
         let (base, server) = start_control_bedrock(fake.clone()).await;
         let supervisor = test_control_supervisor(&base, rooms.clone());
 
-        supervisor
+        let redeemed = supervisor
             .redeem_invite("  share-code  ")
             .await
             .expect("restart-safe redeem succeeds");
+        assert_eq!(
+            redeemed.room_key,
+            key.as_str(),
+            "the reply must name the room the invite's scope resolved to"
+        );
+        let wire = serde_json::to_value(&redeemed).unwrap();
+        assert_eq!(wire["room_key"], key.as_str());
+        assert!(
+            wire["state"].is_string() && wire.get("access").is_none(),
+            "the projection stays at the top level of the redeem reply"
+        );
         let calls = fake.calls.lock().await.clone();
         let redeem = calls.iter().find(|call| call.path == "redeem").unwrap();
         let redeem_body: Value = serde_json::from_slice(&redeem.body).unwrap();

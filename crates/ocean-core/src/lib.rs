@@ -1074,6 +1074,34 @@ pub struct InviteResponse {
     pub room_name: String,
 }
 
+/// Response from `POST .../invites/redeem` — the access the redeemer landed
+/// in, and the room it landed in.
+///
+/// The projection is FLATTENED rather than nested, so this reply's top level
+/// is the bare `RoomAccessProjection` it has always been, plus one key. A
+/// consumer written against the old shape settles success on a top-level
+/// `state`; nesting under `access` would break exactly that.
+///
+/// The key rides here and not on `RoomAccessProjection` because the projection
+/// is also broadcast per-room over SSE, where the subscriber already asked by
+/// key and a repeat of it is noise. A field on the projection would also have
+/// to be filled identically by every producer of one, including the two behind
+/// the access tail's whole-projection dedupe — a disagreement there is a
+/// spurious frame to every open browser.
+///
+/// The room's NAME is deliberately absent: the redeem path creates the room
+/// with `name == key`, so a name would either duplicate `room_key` or, on the
+/// already-a-member arm, be whatever local name that daemon already had.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RoomRedeemResponse {
+    #[serde(flatten)]
+    pub access: RoomAccessProjection,
+    /// The room the invite's scope resolved to. Required, so a redeemer never
+    /// has to guess which room it just joined — the diff-the-room-list
+    /// workaround it replaces cannot answer under a concurrent create.
+    pub room_key: String,
+}
+
 /// Response payload for `POST /v1/requests`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct RequestCreateResponse {
@@ -2150,6 +2178,67 @@ mod tests {
         assert_eq!(json["self_member_id"], "mem-you");
         let roundtrip: RoomAccessProjection = serde_json::from_value(json).unwrap();
         assert_eq!(roundtrip, proj);
+    }
+
+    #[test]
+    fn room_redeem_response_keeps_the_projection_at_the_top_level() {
+        // Compatibility here runs one direction only, and that asymmetry is
+        // the design. New daemon -> old surface holds: `state` stays where a
+        // reader that predates `room_key` looks for it, and the extra key is
+        // tolerated because that reader's mirror struct carries no
+        // `deny_unknown_fields`. Old daemon -> new reader deliberately does
+        // NOT hold — see the sibling test — because a caller that asked which
+        // room it joined is better served by a decode failure than by a
+        // silently absent answer.
+        let redeemed = RoomRedeemResponse {
+            access: RoomAccessProjection {
+                state: RoomAccessState::Connecting,
+                last_confirmed_global_sequence: Some(3),
+                members: vec![],
+                self_member_id: Some("mem-you".into()),
+                outbox: vec![],
+            },
+            room_key: "warroom".into(),
+        };
+        let json = serde_json::to_value(&redeemed).unwrap();
+        assert_eq!(json["state"], "connecting");
+        assert_eq!(json["last_confirmed_global_sequence"], 3);
+        assert_eq!(json["self_member_id"], "mem-you");
+        assert_eq!(json["room_key"], "warroom");
+        assert!(
+            json.get("access").is_none(),
+            "the projection MUST flatten; nesting it breaks success detection"
+        );
+        let roundtrip: RoomRedeemResponse = serde_json::from_value(json).unwrap();
+        assert_eq!(roundtrip, redeemed);
+    }
+
+    #[test]
+    fn room_redeem_response_adds_only_the_key_and_requires_it() {
+        // Flatten must not defeat the projection's own skips: a Local redeem
+        // reply is still the exact `{"state":"local"}` document plus the key,
+        // which is the same guarantee
+        // `room_access_local_projection_skips_empty_vecs` holds for the bare
+        // projection.
+        let local = RoomRedeemResponse {
+            access: RoomAccessProjection {
+                state: RoomAccessState::Local,
+                last_confirmed_global_sequence: None,
+                members: vec![],
+                self_member_id: None,
+                outbox: vec![],
+            },
+            room_key: "solo".into(),
+        };
+        assert_eq!(
+            serde_json::to_value(&local).unwrap(),
+            serde_json::json!({"state": "local", "room_key": "solo"})
+        );
+        assert!(
+            serde_json::from_value::<RoomRedeemResponse>(serde_json::json!({"state": "live"}))
+                .is_err(),
+            "a reply with no room_key is not a redeem answer and must not decode as one"
+        );
     }
 
     #[test]

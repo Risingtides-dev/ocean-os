@@ -572,7 +572,7 @@ GET    /v1/rooms/persistent/{key}/read-cursor             fetch the daemon-owned
 PATCH  /v1/rooms/persistent/{key}/read-cursor             advance the daemon-owned read cursor { read_seq }; Local/Live only, monotonic, publishes room_read_cursor wake on success
 POST   /v1/rooms/persistent/{key}/outbox/retry            retry a locally-authored federated event awaiting Bedrock confirmation { client_event_id }; 202 on success, 403 revoked, 404 unknown room/item, 409 pending/local, 400 malformed body, 500 sanitized store error
 POST   /v1/rooms/persistent/{key}/invites                 bootstrap owner if Local, then mint invite { recipient_name?, ttl_minutes? }; raw InviteResponse 201
-POST   /v1/rooms/persistent/invites/redeem                restart-safe redeem/self-join { code }; raw RoomAccessProjection 200
+POST   /v1/rooms/persistent/invites/redeem                restart-safe redeem/self-join { code }; raw RoomRedeemResponse 200 — the RoomAccessProjection's own fields at the TOP level (unchanged, so a client that only checks `state` is unaffected) plus `room_key`, the room the invite's scope resolved to. Only the daemon can know that key; without it a redeemer has to diff its room list before and after, which cannot answer under a concurrent create. No room_name: this path creates the room with name == key
 POST   /v1/rooms/persistent/{key}/members/agents          register safe local agent descriptors { agent_names }; raw RoomAccessProjection 200
 DELETE /v1/rooms/persistent/{key}/members/{member_id}     remove one federated member via Bedrock; refreshed RoomAccessProjection 200, Bedrock's owner-or-self 403 surfaces as federation_forbidden with the credential intact
 
