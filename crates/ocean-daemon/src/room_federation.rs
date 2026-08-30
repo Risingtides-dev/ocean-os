@@ -1982,13 +1982,19 @@ impl FederationSupervisor {
             return 0;
         };
         // Collect (credential, member id) targets in one synchronous lock
-        // hold — the store guard must never cross an await. Credentialed
-        // rooms ARE the federated set (a revoke deletes the credential), and
-        // the per-room binding resolve narrows to rooms that actually
-        // registered this agent.
+        // hold — the store guard must never cross an await. A credential row
+        // outlives revoke (`revoke_room` persists Revoked and keeps the
+        // row), and the in-memory admission gate that enforces a revoke is
+        // rebuilt open after a restart — so the durable access state is the
+        // only filter that survives the process, the same fail-closed check
+        // `register_agents` makes. The per-room binding resolve then narrows
+        // to rooms that actually registered this agent.
         let targets = with_rooms_handle(&self.inner.rooms, |store| {
             let mut targets = Vec::new();
             for credential in store.list_credentialed_rooms()? {
+                if store.room_access(&credential.room_id)?.state == RoomAccessState::Revoked {
+                    continue;
+                }
                 if let Some(member_id) =
                     store.resolve_room_agent_member(&credential.room_id, agent_name)?
                 {
@@ -6622,6 +6628,39 @@ mod tests {
         assert!(with_rooms_handle(&rooms, |s| s.room_credential(&key))
             .unwrap()
             .is_some());
+    }
+
+    #[tokio::test]
+    async fn agent_delete_sweep_never_dials_a_revoked_room() {
+        let key = RoomKey::new("sweep-revoked-room");
+        let (rooms, fake, server, supervisor, _member) =
+            sweep_fixture(&key, "sweep-revoked-bearer").await;
+        // Durable revoke with the credential row left in place — the exact
+        // shape `revoke_room` persists, and what a restarted daemon wakes up
+        // to: the closed in-memory gate is gone, so only this state can
+        // still say no. The fixture's slot gate is open, which makes the
+        // test fail if the enumeration ever leans on the gate alone.
+        with_rooms_handle(&rooms, |s| {
+            s.update_room_access_safe(&key, Some(RoomAccessState::Revoked), None, None)
+        })
+        .unwrap();
+
+        assert_eq!(
+            supervisor.sweep_agent_from_federated_rosters("sage").await,
+            0
+        );
+        let calls = fake.calls.lock().await.clone();
+        assert!(
+            !calls.iter().any(|call| call.path.starts_with("members/")),
+            "a Revoked room's stale bearer is never dialed"
+        );
+        assert!(
+            with_rooms_handle(&rooms, |s| s.resolve_room_agent_member(&key, "sage"))
+                .unwrap()
+                .is_some(),
+            "nothing confirmed, so the binding is retained"
+        );
+        server.abort();
     }
 
     #[tokio::test]
