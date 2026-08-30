@@ -110,3 +110,52 @@ jobs:
 
       - name: Check licenses + advisories
         run: cargo deny check
+
+  # A code PR must carry its events.md ledger entry in the same diff. Ledger
+  # discipline slipped three consecutive waves in the automated loop that
+  # works this repo, and the land phase had to append the missing entries
+  # afterwards from disposable worktrees — a machine check beats a fourth
+  # reminder. Mirrors the ocean-bedrock guard (its PR #50) and the
+  # ocean-surface one (its PR #157). Like `check`, `msrv` and `deny` here,
+  # deliberately NOT a required status check: red is information, not a lock.
+  ledger:
+    name: events.md entry
+    # Only a PR has a base to diff against; on push-to-main the entry either
+    # merged with the code or the moment to catch it is gone.
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          # The three-dot diff below resolves the merge-base with the base
+          # branch, which a shallow checkout cannot see.
+          fetch-depth: 0
+
+      - name: Require an events.md entry alongside code changes
+        # Three-dot = merge-base diff: only what this PR adds, not what main
+        # gained since the branch was cut. GITHUB_BASE_REF is runner-set on
+        # pull_request events, so no token and no extra permissions.
+        #
+        # The guarded set is this check's own judgment of what ships behavior
+        # in THIS repo: crates/ is the workspace, xtask/ is the gate every
+        # contract check runs through, and integrations/ plugins/ scripts/
+        # ops/ deploy/ packaging/ .github/ change how it builds, ships or
+        # extends. Left out: docs/ (the devlog chain itself), .ocean/, .cargo/
+        # and the root manifests — none of which has ever shipped behavior
+        # alone here — and events.md, which is the thing being required.
+        run: |
+          changed="$(git diff --name-only "origin/${GITHUB_BASE_REF}...HEAD")"
+          guarded="$(printf '%s\n' "$changed" \
+            | grep -E '^(crates|xtask|integrations|plugins|scripts|ops|deploy|packaging|\.github)/' || true)"
+          if [ -n "$guarded" ] && ! printf '%s\n' "$changed" | grep -qFx 'events.md'; then
+            echo "This PR changes code but carries no events.md ledger entry:"
+            printf '%s\n' "$guarded" | sed 's/^/  /'
+            echo ""
+            echo "Append an entry to the repo-root events.md in this PR:"
+            echo "time [HH:MM] [MM-DD-YY] (24-hour), agent, worktree (branch"
+            echo "when not on main), type, area, then one plain-prose"
+            echo "paragraph on what changed and why."
+            exit 1
+          fi

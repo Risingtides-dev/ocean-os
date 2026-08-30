@@ -2147,8 +2147,14 @@ mod tests {
 
     #[test]
     fn room_access_self_member_id_serde_compat() {
-        // Old-daemon payloads carry no `self_member_id` key → `None`; `None`
-        // never serializes, so deployed surfaces never see an unknown key.
+        // Compatibility runs BOTH directions, and each direction holds for a
+        // different reason — the older comment here claimed one mechanism for
+        // both. Old daemon -> new surface: the payload carries no
+        // `self_member_id`, so it deserializes to `None`. New daemon -> old
+        // surface: for a federated room the key IS emitted (the second half of
+        // this test proves it), and an older surface tolerates it only because
+        // its mirror struct carries no `deny_unknown_fields`. The `None` case
+        // skipping serialization is a nicety, not the guarantee.
         let old: RoomAccessProjection =
             serde_json::from_value(serde_json::json!({"state": "live"})).unwrap();
         assert_eq!(old.self_member_id, None);
