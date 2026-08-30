@@ -6949,3 +6949,31 @@ origin/main: 811 daemon tests 0 failed, clippy -D warnings clean, fmt
 clean. Effectiveness in non-owned rooms also needs bedrock #46 deployed
 (human railway up); daemon deploy is automatic post-wave. No migration.
 _________________________________________________________________________________
+time:      [03:03] [08-30-26]
+agent:     [claude] [fable 5]
+worktree:  loop/os-federated-member-remove-route
+type:      [feature-request]
+area:      [backend]
+
+Federated member removal is now reachable over HTTP (#402): DELETE
+/v1/rooms/persistent/{key}/members/{member_id}. New supervisor fn
+remove_member reuses register_agents' fail-closed preflight (missing room,
+missing credential, durably Revoked -- all refused before any dial), dials
+bedrock under the room's own credential, and on 2xx runs a
+generation-guarded unbind plus an immediate roster refresh so the 200
+already carries the updated RoomAccessProjection. The load-bearing stance:
+a 401/403 on the DELETE maps to Forbidden WITHOUT revoke_control -- that
+refusal is bedrock's owner-or-self policy speaking, not a credential
+event, matching the sweep rather than register_agents (whose refused
+roster ops ARE credential events; fetch_roster_control's revoke-on-403 is
+unchanged for the same reason). Review mutation-tested both claims: a
+revoke-on-403 sabotage and a mock-roster-pruning strip each fail a named
+test. One disclosed excursion: the router parity gate pins banner count
+and the operator guide's quick reference, so banner_routes went 113 -> 114
+and the guide gained one route line -- the slice cannot go green without
+it. Gate re-run at land after a no-op rebase onto origin/main: 816 daemon
+tests 0 failed, clippy -D warnings clean, fmt clean, toolchain 1.97.0.
+Production effect waits on a human bedrock deploy (railway up) -- bedrock
+#46's removeMember policy is merged but NOT deployed and its Railway
+service has no GitHub source, so merging deploys nothing. No migration.
+_________________________________________________________________________________
