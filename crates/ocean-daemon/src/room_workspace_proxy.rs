@@ -45,7 +45,13 @@
 //!    the authority to repoint the whole room's compute at an arbitrary
 //!    remote, and a row for destroy would let any participant retire the
 //!    container everyone else was working in. Cloning and building what an
-//!    owner already bound remains a member act. `workspace/file` is the one
+//!    owner already bound remains a member act. The exec ledger's take-back
+//!    rides the same gate: `execs/purge` blanks stored exec tails — the
+//!    recovery for a token that leaked BEFORE the write-time scrub could
+//!    know it was a secret, or was rotated after a leak — and it is
+//!    owner-only for Bedrock's own reason, with no admin bypass: the tails
+//!    are the room's output, and only the room's owner decides they cannot
+//!    be un-published. `workspace/file` is the one
 //!    row whose upstream 2xx is raw bytes rather than JSON; it rides this
 //!    lane as a bounded JSON PROJECTION — text-vs-binary derived from the
 //!    bytes in hand, never from Bedrock's extension-derived `content-type` —
@@ -546,6 +552,33 @@ const WORKSPACE_ALLOWLIST: &[(&str, &str, WorkspaceCall)] = &[
         WorkspaceCall {
             upstream: UpstreamMethod::Put,
             segments: &["workspace", "secrets"],
+            timeout: WORKSPACE_READ_TIMEOUT,
+            write: false,
+            owner: true,
+            attributed: false,
+            query: &[],
+            reply: UpstreamReply::Json,
+        },
+    ),
+    // The exec ledger's take-back. Bedrock's write-time scrub redacts only
+    // the values the room held when a tail was STORED, so a token that
+    // leaked before it was stored — or was rotated after a leak — sits in
+    // stored exec tails until this call blanks them. Owner-gated for
+    // Bedrock's own reason (`requireRoomOwner`, no admin bypass): the tails
+    // are the room's output, and only the room's owner decides they cannot
+    // be un-published. The body (`exec_id` only, optional; omitted means
+    // purge-all) is validated upstream strict deny-extra — malformed 400,
+    // well-formed but absent 404, still-running 409 `exec_running` — and
+    // the handler reads NO `actor_member_id`, which the unconditional actor
+    // strip respects. The reply `{purged, exec_id}` and the audit event
+    // carry counts and ids, never content. A prompt table write like the
+    // binding pair — no container runs — so it carries the read budget.
+    (
+        "POST",
+        "execs/purge",
+        WorkspaceCall {
+            upstream: UpstreamMethod::Post,
+            segments: &["workspace", "execs", "purge"],
             timeout: WORKSPACE_READ_TIMEOUT,
             write: false,
             owner: true,
@@ -1182,7 +1215,8 @@ mod tests {
     /// test asserting the name list is unreachable is proving the daemon's
     /// allowlist rather than an upstream 404; the secrets PUT beside it is the
     /// owner set's real upstream, the repo PUT and DELETE the binding verbs',
-    /// and the workspace POST and DELETE the lifecycle pair's. The `file`
+    /// the workspace POST and DELETE the lifecycle pair's, and the
+    /// `execs/purge` POST the take-back's. The `file`
     /// leaf answers the way the real route does — raw bytes on a 2xx, a JSON
     /// `HttpError` body on a refusal — with declared content-types that
     /// contradict the bytes; see [`file_read_call`].
@@ -1194,6 +1228,10 @@ mod tests {
             )
             .route("/api/v1/rooms/{room}/workspace/list", get(record_call))
             .route("/api/v1/rooms/{room}/workspace/execs", get(record_call))
+            .route(
+                "/api/v1/rooms/{room}/workspace/execs/purge",
+                post(record_call),
+            )
             .route("/api/v1/rooms/{room}/workspace/exec", post(record_call))
             .route(
                 "/api/v1/rooms/{room}/workspace/secrets",
@@ -1407,7 +1445,8 @@ mod tests {
     /// key refuses too — a leaf being allowlisted for one verb does not open
     /// it for another — and `POST file` pins that opening the file READ did
     /// not open a write. `GET provision` and `GET destroy` pin the same for
-    /// the lifecycle pair: owner leaves opened for POST alone.
+    /// the lifecycle pair, and `GET execs/purge` for the take-back: owner
+    /// leaves opened for POST alone.
     ///
     /// Mutation: make `resolve_workspace_call` fall through to a constructed
     /// `WorkspaceCall` for unknown keys -> RED.
@@ -1423,6 +1462,7 @@ mod tests {
             "repo/../secrets",
             "provision",
             "destroy",
+            "execs/purge",
         ] {
             let response = room_workspace_read(
                 State(fixture.state.clone()),
@@ -2058,6 +2098,75 @@ mod tests {
         fixture.close();
     }
 
+    /// The exec ledger's take-back. The owner's purge forwards as the
+    /// upstream POST with the body relayed verbatim — Bedrock's handler is
+    /// strict deny-extra and reads no `actor_member_id`, so the daemon's
+    /// only edit is stripping the client's claim, never replacing it — and
+    /// an actor that does not resolve to the credential's principal is
+    /// refused before the bearer is spent.
+    ///
+    /// Mutation: give the row `attributed: true` -> RED (an injected
+    /// actor_member_id turns a legal purge into an upstream 400); drop the
+    /// owner gate -> RED.
+    #[tokio::test]
+    async fn an_owner_execs_purge_forwards_as_the_upstream_post_and_an_agent_is_refused() {
+        let tmp = tempfile::tempdir().unwrap();
+        let fixture = federated_room(&tmp).await;
+
+        let response = room_workspace_command(
+            State(fixture.state.clone()),
+            Path((fixture.key.as_str().to_string(), "execs/purge".to_string())),
+            query(&[("actor_id", "alice")]),
+            Json(json!({
+                "exec_id": "3f9d3c6a-8f0f-4d5c-9a34-1f2ab8f0c9d1",
+                // The forgery attempt again; the upstream reads no actor
+                // claim, so it must vanish rather than be replaced.
+                "actor_member_id": "member-somebody-else",
+            })),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let calls = fixture.seen.calls();
+        assert_eq!(calls.len(), 1);
+        let call = &calls[0];
+        assert_eq!(call.method, "POST");
+        assert_eq!(
+            call.path,
+            "/api/v1/rooms/workspace-room/workspace/execs/purge"
+        );
+        assert_eq!(
+            call.authorization.as_deref(),
+            Some(format!("Bearer {BEARER}").as_str()),
+            "the room's own credential authenticates the purge"
+        );
+        assert_eq!(
+            call.body["exec_id"],
+            json!("3f9d3c6a-8f0f-4d5c-9a34-1f2ab8f0c9d1")
+        );
+        assert!(
+            call.body.get(ACTOR_MEMBER_ID).is_none(),
+            "a purge body carries no actor claim, the client's or the daemon's"
+        );
+
+        let response = room_workspace_command(
+            State(fixture.state.clone()),
+            Path((fixture.key.as_str().to_string(), "execs/purge".to_string())),
+            query(&[("actor_id", "researcher")]),
+            Json(json!({})),
+        )
+        .await;
+        let (status, body) = body_of(response).await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        assert_eq!(body["code"], json!("workspace_actor_unmapped"));
+        assert_eq!(
+            fixture.seen.calls().len(),
+            1,
+            "the refusal spent no bearer and added no upstream call"
+        );
+
+        fixture.close();
+    }
+
     /// An attributed route sends the actor's RESOLVED member id, and an actor
     /// with none — a Bot here, and Tool and System alike — is refused rather
     /// than silently attributed to the human, which is what this lane did
@@ -2273,6 +2382,7 @@ mod tests {
                 "GET repo/ci -> Get [\"workspace\", \"repo\", \"ci\"]",
                 "POST destroy -> Delete [\"workspace\"]",
                 "POST exec -> Post [\"workspace\", \"exec\"]",
+                "POST execs/purge -> Post [\"workspace\", \"execs\", \"purge\"]",
                 "POST provision -> Post [\"workspace\"]",
                 "POST repo/bind -> Put [\"workspace\", \"repo\"]",
                 "POST repo/build -> Post [\"workspace\", \"repo\", \"build\"]",
@@ -2345,7 +2455,7 @@ mod tests {
     /// guide cannot stop naming a call that exists.
     ///
     /// Mutation: delete any leaf's mention from the lane section -> RED; add
-    /// a sixteenth allowlist row without documenting it -> RED.
+    /// a seventeenth allowlist row without documenting it -> RED.
     #[test]
     fn the_operator_guide_names_every_allowlisted_call() {
         let guide = include_str!("../../../docs/OCEAN_RUNTIME_OPERATOR_GUIDE.md");
@@ -2377,7 +2487,7 @@ mod tests {
         }
 
         let spelled = match WORKSPACE_ALLOWLIST.len() {
-            15 => "fifteen",
+            16 => "sixteen",
             n => panic!("the lane now carries {n} calls; respell the guide's count and this match"),
         };
         assert!(
