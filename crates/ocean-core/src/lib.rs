@@ -1062,21 +1062,7 @@ pub struct RoomReadCursorUpdateRequest {
     pub read_seq: u64,
 }
 
-// ── Invite intent types (P1 — types + serialization; routes deferred) ──
-
-/// `POST /v1/rooms/persistent/{key}/invites` — request body (Surface
-/// `Serialize` only). The daemon owns its own `Deserialize` twin with
-/// `ttl_minutes` defaulting to 1440.
-#[derive(Debug, Clone, Serialize)]
-pub struct CreateInviteRequest {
-    /// Optional human-readable recipient hint (not enforced).
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub recipient_name: Option<String>,
-    /// TTL in minutes. Surface sends explicit; daemon Deserialize twin defaults
-    /// to 1440 and validates 1..10080.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub ttl_minutes: Option<u32>,
-}
+// ── Invite types — response shape only; the daemon owns request bodies ─
 
 /// Response from `POST .../invites` — the invite code the owner shares
 /// out-of-band.
@@ -1086,13 +1072,6 @@ pub struct InviteResponse {
     pub expires_at: String,
     pub room_key: String,
     pub room_name: String,
-}
-
-/// `POST /v1/rooms/persistent/invites/redeem` — request body.
-/// Code in BODY only.
-#[derive(Debug, Clone, Serialize)]
-pub struct RedeemInviteRequest {
-    pub code: String,
 }
 
 /// Response payload for `POST /v1/requests`.
@@ -2361,24 +2340,6 @@ mod tests {
     }
 
     #[test]
-    fn invite_request_serialization() {
-        let req = CreateInviteRequest {
-            recipient_name: Some("Bob".into()),
-            ttl_minutes: Some(60),
-        };
-        let json = serde_json::to_value(&req).unwrap();
-        assert_eq!(json["recipient_name"], "Bob");
-        assert_eq!(json["ttl_minutes"], 60);
-
-        let min = CreateInviteRequest {
-            recipient_name: None,
-            ttl_minutes: None,
-        };
-        let min_json = serde_json::to_value(&min).unwrap();
-        assert_eq!(min_json, serde_json::json!({}));
-    }
-
-    #[test]
     fn invite_response_roundtrips() {
         let resp = InviteResponse {
             code: "abc123".into(),
@@ -2390,15 +2351,6 @@ mod tests {
         assert_eq!(json["code"], "abc123");
         let roundtrip: InviteResponse = serde_json::from_value(json).unwrap();
         assert_eq!(roundtrip, resp);
-    }
-
-    #[test]
-    fn redeem_invite_request_serialization() {
-        let req = RedeemInviteRequest {
-            code: "abc123".into(),
-        };
-        let json = serde_json::to_value(&req).unwrap();
-        assert_eq!(json, serde_json::json!({"code": "abc123"}));
     }
 
     // ── required-field rejection — missing metadata/projection fields fail ─
