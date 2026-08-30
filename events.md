@@ -7057,3 +7057,24 @@ unmoved; the guide's create and amend rows gained the 400. Gate: 54 core + 179
 store + 817 daemon tests 0 failed, clippy -D warnings clean, fmt clean,
 toolchain 1.97.0. No migration, no deploy step.
 _________________________________________________________________________________
+
+time:      [13:42] [08-30-26]
+agent:     [claude] [opus 5]
+worktree:  loop/os-artifact-amend-can-blank-a-title
+type:      [review]
+area:      [docs]
+
+Review pass on the blank-title refusal, docs only, no code touched. The guide's
+create row had been widened to read "400 invalid_request on a blank id or a
+blank (whitespace-only) title — refused in the STORE", and the id half of that
+is false: `create_artifact` validates no artifact_id at all, so a blank or
+untrimmed id is caught only by the route. Advertising a route-only guard as
+store-enforced in the file operators read to learn where refusals live is the
+exact shape this change existed to remove, so the "refused in the store" clause
+now attaches to the title alone and the id is marked route-only. The store's own
+AGENTS.md also carried no artifact invariant at all, which the root contract's
+devlog pass requires for a change of this kind; it now states the refusal, why
+it sits ahead of the CAS rather than after it, why an absent title still means
+untouched, and — the boundary the guide got wrong — that `artifact_id` is not
+checked in the store.
+_________________________________________________________________________________
