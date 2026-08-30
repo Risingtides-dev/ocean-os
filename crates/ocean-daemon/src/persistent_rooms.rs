@@ -1945,9 +1945,9 @@ pub(super) async fn room_redeem_invite(
         return invalid_request_response();
     }
     match state.room_federation.redeem_invite(&body.code).await {
-        Ok(access) => (
+        Ok(redeemed) => (
             StatusCode::OK,
-            Json(serde_json::to_value(access).expect("RoomAccessProjection serializes")),
+            Json(serde_json::to_value(redeemed).expect("RoomRedeemResponse serializes")),
         ),
         Err(error) => intent_error_response(error),
     }

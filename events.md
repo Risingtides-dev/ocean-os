@@ -7110,3 +7110,43 @@ clippy -D warnings clean, fmt clean, and `cargo check --all-targets` clean
 across the workspace — test targets included, which is where a deleted type's
 last reference would hide. No migration, no deploy step.
 _________________________________________________________________________________
+
+time:      [16:54] [08-30-26]
+agent:     [claude] [opus 5]
+worktree:  loop/os-redeem-answers-without-the-room-key
+type:      [feature-request]
+area:      [backend]
+
+`POST /v1/rooms/persistent/invites/redeem` now answers with which room was
+joined. It always knew: `recover_pending` derives the key from the redeemed
+invite's scope, creates the room with it, and then threw it away, returning a
+bare `RoomAccessProjection` that names no room. The redeemer holds only an
+opaque code, so ocean-surface#159 shipped the only workaround available to it —
+snapshot the room-list keys before the request, diff them after, and refuse to
+guess when exactly-one-new does not hold, which degrades a concurrent create to
+"it's in your list somewhere". New `RoomRedeemResponse` in ocean-core carries
+the projection under `#[serde(flatten)]` plus `room_key`, and `redeem_invite` /
+`recover_pending` / `room_redeem_invite` return and serialize it. Flatten, not
+a nested `access` object, because the surface's lenient `RedeemBody` settles
+success on a top-level `state` and nesting would break exactly that; a new
+response type, not a field on `RoomAccessProjection`, because that projection
+is built as a struct literal in four files (29 sites, one of them ocean-store,
+outside this slice) and is also the per-room SSE frame, where the subscriber
+already asked by key and where `run_room_access_tail` dedupes whole
+projections — a field two producers filled differently would flap and push a
+spurious access frame to every open browser. `room_name` is deliberately out:
+this path creates the room with `name == key`, so it would duplicate `room_key`
+on a fresh join and be a stale local name on the already-a-member arm. Tests:
+two in ocean-core proving `room_key` lands at the TOP level with `state` beside
+it, that a Local reply is still exactly `{"state":"local"}` plus the key, and
+that a payload without `room_key` fails to decode — a redeemer that asked which
+room it joined is better served by a decode error than a silent blank; plus an
+assertion in `p2c_redeem_is_restart_safe_and_self_join_is_bodyless` that the
+returned key is the one the invite scope resolved to. The operator guide's
+redeem line said "raw RoomAccessProjection 200" and is now true again; the
+guide/router parity gate keys on route registration and this slice registers
+none, so the 114-route baseline is untouched. Gate: 817 ocean-core +
+ocean-daemon tests 0 failed, clippy -D warnings clean, fmt clean, docs-check
+PASS. A follow-up ocean-surface slice deletes `newly_joined_key` and reads
+`room_key` instead. No migration, no deploy step.
+_________________________________________________________________________________

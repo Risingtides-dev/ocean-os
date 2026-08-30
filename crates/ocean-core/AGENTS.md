@@ -33,7 +33,12 @@ This crate owns shared protocol types used across Ocean clients, daemon, runtime
 - `FederatedMessageMeta`, `FederatedRoomMemberProjection`, `FederatedActorType`,
   `FederatedRoomRole`, `MemberPresence` (`live` | `unavailable`; no `stale`),
   `PublicAgentDescriptor`, `RoomOutboxItem`, `OutboxItemState`,
-  `RoomAccessProjection`, `RoomAccessState`, `InviteResponse` are owned here.
+  `RoomAccessProjection`, `RoomAccessState`, `InviteResponse`,
+  `RoomRedeemResponse` are owned here. `RoomRedeemResponse` is the redeem 200
+  and `#[serde(flatten)]`s the projection beside a required `room_key`, so that
+  reply's top level stays the projection's own keys plus the one new key; the
+  key is not a projection field because the projection is also the per-room SSE
+  frame.
 - Invite request bodies are not mirrored here. `POST .../invites` and
   `POST .../invites/redeem` are deserialized by the daemon's own
   `CreateInviteBody`/`RedeemInviteBody` under `deny_unknown_fields`, which is
