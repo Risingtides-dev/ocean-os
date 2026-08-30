@@ -4247,6 +4247,7 @@ mod tests {
                 derived_presence: Some(MemberPresence::Live),
                 local_binding_available: None,
             }],
+            self_member_id: None,
             outbox: vec![],
         };
         lease_lost_transition(Ok(projection), |members| {

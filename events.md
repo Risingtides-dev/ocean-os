@@ -6977,3 +6977,29 @@ Production effect waits on a human bedrock deploy (railway up) -- bedrock
 #46's removeMember policy is merged but NOT deployed and its Railway
 service has no GitHub source, so merging deploys nothing. No migration.
 _________________________________________________________________________________
+time:      [04:49] [08-30-26]
+agent:     [claude] [fable 5]
+worktree:  loop/os-access-projection-carries-self-member
+type:      [feature-request]
+area:      [backend]
+
+RoomAccessProjection now says which federated roster row is you: new
+room-level `self_member_id` (Option<String>, skip-when-None) so the
+surface can suppress remove on your own row (self-removal is Leave) and
+badge the rows bedrock's owner-or-self policy will allow, without a
+dial-and-403 probe per attempt. Populated in the single production point
+SqliteRoomStore::room_access via a targeted SELECT of
+room_federation.local_human_member_id -- the bearer sharing that row
+never enters the query, keeping it out of every projection path. Derived
+at read time, never persisted into member_projection JSON; None for
+local rooms, revoked credentials, and old-daemon payloads (serde default
+on decode, skip on encode, so deployed surfaces see no unknown key --
+their mirror has no deny_unknown_fields). 21 mechanical
+`self_member_id: None` literal touches across core/store/daemon tests
+(the exact-JSON {"state":"local"} assertion stays exact); two new tests
+pin credential->projection wiring plus serde compat both directions.
+One-line contract parity in OCEAN_ECOSYSTEM_CONTRACT.md. Unblocks
+surface-roster-marks-your-own-rows next wave. Gate: 54 core + 816 daemon
++ 178 store tests 0 failed, clippy -D warnings clean, fmt clean,
+toolchain 1.97.0. No migration, no deploy step.
+_________________________________________________________________________________
