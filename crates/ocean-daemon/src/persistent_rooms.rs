@@ -7278,6 +7278,7 @@ env = { FIXTURE = "1" }
             state: RoomAccessState::Local,
             last_confirmed_global_sequence: None,
             members: vec![],
+            self_member_id: None,
             outbox: vec![],
         }
     }
@@ -7533,6 +7534,7 @@ env = { FIXTURE = "1" }
                 state: RoomAccessState::Live,
                 last_confirmed_global_sequence: Some(1),
                 members: vec![],
+                self_member_id: None,
                 outbox: vec![RoomOutboxItem {
                     client_event_id: "evt-1".into(),
                     source_id: "src".into(),
@@ -7723,6 +7725,7 @@ env = { FIXTURE = "1" }
             state: RoomAccessState::Live,
             last_confirmed_global_sequence: Some(1),
             members: vec![],
+            self_member_id: None,
             outbox: vec![RoomOutboxItem {
                 client_event_id: client_event_id.into(),
                 source_id: "src".into(),
@@ -7845,6 +7848,7 @@ env = { FIXTURE = "1" }
             state: RoomAccessState::Live,
             last_confirmed_global_sequence: Some(1),
             members: vec![],
+            self_member_id: None,
             outbox: vec![RoomOutboxItem {
                 client_event_id: "evt-both".into(),
                 source_id: "src".into(),
@@ -7983,6 +7987,7 @@ env = { FIXTURE = "1" }
             state: RoomAccessState::Live,
             last_confirmed_global_sequence: Some(0),
             members: vec![],
+            self_member_id: None,
             outbox: vec![],
         };
         seed_access(&state, &key, initial.clone());
@@ -7999,6 +8004,7 @@ env = { FIXTURE = "1" }
                         state: RoomAccessState::Live,
                         last_confirmed_global_sequence: Some(42),
                         members: vec![],
+                        self_member_id: None,
                         outbox: vec![],
                     },
                 )
@@ -8099,6 +8105,7 @@ env = { FIXTURE = "1" }
                 state: RoomAccessState::Live,
                 last_confirmed_global_sequence: Some(1),
                 members: vec![],
+                self_member_id: None,
                 outbox: vec![RoomOutboxItem {
                     client_event_id: "evt-pending".into(),
                     source_id: "src".into(),
@@ -8180,6 +8187,7 @@ env = { FIXTURE = "1" }
                 state: RoomAccessState::Revoked,
                 last_confirmed_global_sequence: Some(1),
                 members: vec![],
+                self_member_id: None,
                 outbox: vec![RoomOutboxItem {
                     client_event_id: "evt-rev".into(),
                     source_id: "src".into(),
@@ -8352,6 +8360,7 @@ env = { FIXTURE = "1" }
             state: RoomAccessState::Live,
             last_confirmed_global_sequence: Some(1),
             members: vec![],
+            self_member_id: None,
             outbox: vec![RoomOutboxItem {
                 client_event_id: "evt-env".into(),
                 source_id: "src".into(),
@@ -8421,6 +8430,7 @@ env = { FIXTURE = "1" }
                     state: RoomAccessState::Revoked,
                     last_confirmed_global_sequence: Some(1),
                     members: vec![],
+                    self_member_id: None,
                     outbox: vec![RoomOutboxItem {
                         client_event_id: "evt-403".into(),
                         source_id: "s".into(),

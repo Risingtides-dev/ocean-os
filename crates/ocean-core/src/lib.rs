@@ -1020,6 +1020,14 @@ pub struct RoomAccessProjection {
     /// Federated members (daemon-projected, including remote peers).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub members: Vec<FederatedRoomMemberProjection>,
+    /// Which `members` row is this daemon's own human membership. The surface
+    /// needs it to suppress remove on your own row (self-removal is Leave) and
+    /// to badge the rows Bedrock's owner-or-self policy lets you remove —
+    /// without a dial-and-403 probe per attempt. Derived at read time from the
+    /// private credential row (never persisted into member JSON); `None` for
+    /// local rooms and daemons that predate the field.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub self_member_id: Option<String>,
     /// Pending outbox items not yet confirmed.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub outbox: Vec<RoomOutboxItem>,
@@ -2128,10 +2136,33 @@ mod tests {
             state: RoomAccessState::Local,
             last_confirmed_global_sequence: None,
             members: vec![],
+            self_member_id: None,
             outbox: vec![],
         };
         let json = serde_json::to_value(&proj).unwrap();
         assert_eq!(json, serde_json::json!({"state": "local"}));
+        let roundtrip: RoomAccessProjection = serde_json::from_value(json).unwrap();
+        assert_eq!(roundtrip, proj);
+    }
+
+    #[test]
+    fn room_access_self_member_id_serde_compat() {
+        // Old-daemon payloads carry no `self_member_id` key → `None`; `None`
+        // never serializes, so deployed surfaces never see an unknown key.
+        let old: RoomAccessProjection =
+            serde_json::from_value(serde_json::json!({"state": "live"})).unwrap();
+        assert_eq!(old.self_member_id, None);
+        let none_json = serde_json::to_value(&old).unwrap();
+        assert!(none_json.get("self_member_id").is_none());
+        let proj = RoomAccessProjection {
+            state: RoomAccessState::Live,
+            last_confirmed_global_sequence: Some(3),
+            members: vec![],
+            self_member_id: Some("mem-you".into()),
+            outbox: vec![],
+        };
+        let json = serde_json::to_value(&proj).unwrap();
+        assert_eq!(json["self_member_id"], "mem-you");
         let roundtrip: RoomAccessProjection = serde_json::from_value(json).unwrap();
         assert_eq!(roundtrip, proj);
     }
@@ -2153,6 +2184,7 @@ mod tests {
             state: RoomAccessState::Live,
             last_confirmed_global_sequence: Some(5),
             members: vec![member],
+            self_member_id: None,
             outbox: vec![],
         };
         let json = serde_json::to_value(&proj).unwrap();
@@ -2192,6 +2224,7 @@ mod tests {
             state: RoomAccessState::Live,
             last_confirmed_global_sequence: Some(5),
             members: vec![member],
+            self_member_id: None,
             outbox: vec![],
         };
         let json = serde_json::to_value(&proj).unwrap();

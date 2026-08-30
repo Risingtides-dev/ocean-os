@@ -3468,6 +3468,7 @@ impl SqliteRoomStore {
                 state: RoomAccessState::Local,
                 last_confirmed_global_sequence: None,
                 members: Vec::new(),
+                self_member_id: None,
                 outbox: Vec::new(),
             });
         };
@@ -3481,10 +3482,24 @@ impl SqliteRoomStore {
         let members: Vec<FederatedRoomMemberProjection> = serde_json::from_str(&member_json)
             .map_err(|e| RoomStoreError::Encode(format!("bad member projection: {e}")))?;
         let outbox = self.load_outbox_for_room(key)?;
+        // Derived at read time, never persisted into member_projection JSON:
+        // the credential row is the daemon's authoritative "which member am I"
+        // answer. Targeted single-column read — the bearer in the same row is
+        // PRIVATE and must stay out of every projection path. No credential
+        // row (e.g. revoked) degrades gracefully to `None`.
+        let self_member_id: Option<String> = self
+            .conn
+            .query_row(
+                "SELECT local_human_member_id FROM room_federation WHERE room_id = ?1",
+                params![key.as_str()],
+                |r| r.get(0),
+            )
+            .optional()?;
         Ok(RoomAccessProjection {
             state,
             last_confirmed_global_sequence: confirmed_sequence,
             members,
+            self_member_id,
             outbox,
         })
     }
@@ -9150,6 +9165,7 @@ mod tests {
             state: RoomAccessState::Live,
             last_confirmed_global_sequence: Some(u64::MAX),
             members: vec![member_proj("m1", "Alice")],
+            self_member_id: None,
             outbox: vec![RoomOutboxItem {
                 client_event_id: "evt-max".into(),
                 source_id: "src-max".into(),
@@ -9787,6 +9803,7 @@ mod tests {
             state: RoomAccessState::Live,
             last_confirmed_global_sequence: None,
             members: vec![],
+            self_member_id: None,
             outbox: vec![
                 outbox_item("a", OutboxItemState::Pending),
                 outbox_item("b", OutboxItemState::Failed),
@@ -9799,6 +9816,7 @@ mod tests {
             state: RoomAccessState::Live,
             last_confirmed_global_sequence: None,
             members: vec![],
+            self_member_id: None,
             outbox: vec![
                 outbox_item("c", OutboxItemState::Pending),
                 outbox_item("a", OutboxItemState::Pending),
@@ -9832,6 +9850,7 @@ mod tests {
             state: RoomAccessState::Live,
             last_confirmed_global_sequence: Some(7),
             members: vec![member_proj("m-a", "A"), member_proj("m-b", "B")],
+            self_member_id: None,
             outbox: vec![
                 RoomOutboxItem {
                     client_event_id: "evt-pending".into(),
@@ -10026,6 +10045,7 @@ mod tests {
             state: RoomAccessState::Local,
             last_confirmed_global_sequence: None,
             members: vec![],
+            self_member_id: None,
             outbox: vec![],
         };
         let err = s.replace_room_access(&key, &proj).unwrap_err();
@@ -10108,6 +10128,7 @@ mod tests {
             state: RoomAccessState::Live,
             last_confirmed_global_sequence: None,
             members: vec![],
+            self_member_id: None,
             outbox: vec![outbox_item("evt-pending", OutboxItemState::Pending)],
         };
         s.replace_room_access(&key, &proj).unwrap();
@@ -10137,6 +10158,7 @@ mod tests {
             state: RoomAccessState::Live,
             last_confirmed_global_sequence: None,
             members: vec![],
+            self_member_id: None,
             outbox: vec![
                 outbox_item("ob-1", OutboxItemState::Pending),
                 outbox_item("ob-2", OutboxItemState::Failed),
@@ -10368,6 +10390,27 @@ mod tests {
         assert!(s.revoke_room_credential(&key).unwrap());
         assert!(!s.revoke_room_credential(&key).unwrap());
         assert!(s.room_credential(&key).unwrap().is_none());
+    }
+
+    #[test]
+    fn room_access_carries_self_member_id_from_credential() {
+        let (mut s, key) = fed_store_with_room("r-self");
+        // Local room (no access row): no federation, no self.
+        assert_eq!(s.room_access(&key).unwrap().self_member_id, None);
+        // Federated: the credential row's member id surfaces on the projection.
+        seed_access_row(&s, &key, "live");
+        s.install_room_credential(&key, "self-secret-bearer", "m-self")
+            .unwrap();
+        let proj = s.room_access(&key).unwrap();
+        assert_eq!(proj.self_member_id, Some("m-self".into()));
+        // The targeted read surfaces the member id and nothing else from the
+        // credential row — the bearer sharing that row stays private.
+        let proj_json = serde_json::to_string(&proj).unwrap();
+        assert!(proj_json.contains("m-self"));
+        assert!(!proj_json.contains("self-secret-bearer"));
+        // Access row without a credential (e.g. after revoke) degrades to None.
+        assert!(s.revoke_room_credential(&key).unwrap());
+        assert_eq!(s.room_access(&key).unwrap().self_member_id, None);
     }
 
     #[test]
