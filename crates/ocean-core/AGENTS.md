@@ -33,8 +33,12 @@ This crate owns shared protocol types used across Ocean clients, daemon, runtime
 - `FederatedMessageMeta`, `FederatedRoomMemberProjection`, `FederatedActorType`,
   `FederatedRoomRole`, `MemberPresence` (`live` | `unavailable`; no `stale`),
   `PublicAgentDescriptor`, `RoomOutboxItem`, `OutboxItemState`,
-  `RoomAccessProjection`, `RoomAccessState`, `CreateInviteRequest` (`Serialize`
-  only), `InviteResponse`, `RedeemInviteRequest` are owned here.
+  `RoomAccessProjection`, `RoomAccessState`, `InviteResponse` are owned here.
+- Invite request bodies are not mirrored here. `POST .../invites` and
+  `POST .../invites/redeem` are deserialized by the daemon's own
+  `CreateInviteBody`/`RedeemInviteBody` under `deny_unknown_fields`, which is
+  the only shape a request is ever checked against; a `Serialize`-only twin in
+  this crate is a second contract nothing validates and it will drift.
 - Every new struct field is required unless individually `#[serde(default)]` or
   `skip_serializing_if`. No `Room`, `RoomParticipant`, `RoomMessageKind`, or
   `RoomTriggerPolicy` changes. Do not remove `Serialize`/`Deserialize` from

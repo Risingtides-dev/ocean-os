@@ -7078,3 +7078,35 @@ it sits ahead of the CAS rather than after it, why an absent title still means
 untouched, and — the boundary the guide got wrong — that `artifact_id` is not
 checked in the store.
 _________________________________________________________________________________
+
+time:      [14:49] [08-30-26]
+agent:     [claude] [opus 5]
+worktree:  loop/os-core-invite-types-are-a-contract-nobody-signed
+type:      [refactor]
+area:      [backend]
+
+Deleted `CreateInviteRequest` and `RedeemInviteRequest` from ocean-core. Both
+sat under a heading that said "P1 — types + serialization; routes deferred"
+while both routes had long since shipped: `/v1/rooms/persistent/{key}/invites`
+and `/v1/rooms/persistent/invites/redeem` are in the daemon router, handled by
+`room_create_invite` and `room_redeem_invite`. The types were `Serialize`-only
+and documented as "Surface `Serialize` only", but ocean-surface has no
+ocean-core dependency at all and no invite code of any kind; the only other
+invite surface is ocean-bedrock's Node `/api/v1/invites` family, which takes
+`room_id` in the body — a shape the deleted stub did not match either. A
+workspace `git grep` found exactly five references — the two definitions, two
+AGENTS.md clauses, and their own serde tests. A `Serialize`-only request type
+whose only serializer is its own test asserts nothing about any wire; worse, it
+was a second invite contract sitting beside the daemon's real one, free to
+drift from the `CreateInviteBody`/`RedeemInviteBody` pair that actually
+deserializes those requests under `deny_unknown_fields`. Delete rather than
+re-document, because re-documenting would have left the drift and only made it
+better-worded. `InviteResponse` is untouched and deliberately so: it is
+`Serialize + Deserialize`, `room_create_invite` serializes it into the 201, and
+its roundtrip test proves a live wire shape. The heading now says what is
+actually there, and ocean-core's AGENTS.md drops the two names and states why
+invite request bodies are the daemon's alone. Gate: 52 core tests 0 failed,
+clippy -D warnings clean, fmt clean, and `cargo check --all-targets` clean
+across the workspace — test targets included, which is where a deleted type's
+last reference would hide. No migration, no deploy step.
+_________________________________________________________________________________
