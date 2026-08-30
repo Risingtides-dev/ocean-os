@@ -2889,10 +2889,25 @@ async fn agent_update(
     }
 }
 
-/// `DELETE /v1/agents/{name}` — remove an agent folder and its authored slots.
-async fn agent_delete(Path(name): Path<String>) -> (StatusCode, Json<serde_json::Value>) {
-    match ocean_agent::agentdir::remove(&agents_root(), name.trim()) {
-        Ok(()) => (StatusCode::OK, Json(json!({ "ok": true, "removed": name }))),
+/// `DELETE /v1/agents/{name}` — remove an agent folder and its authored slots,
+/// then sweep the agent out of every local room roster it sat in (see
+/// `sweep_agent_from_local_rosters` for why a row must not outlive its
+/// folder). The sweep runs only after the fs remove succeeds: a refused
+/// delete — NotFound, InvalidName — must touch nothing. `rooms_left` is
+/// additive next to the pre-existing `removed` shape the surface reads.
+async fn agent_delete(
+    State(state): State<AppState>,
+    Path(name): Path<String>,
+) -> (StatusCode, Json<serde_json::Value>) {
+    let name = name.trim().to_string();
+    match ocean_agent::agentdir::remove(&agents_root(), &name) {
+        Ok(()) => {
+            let rooms_left = persistent_rooms::sweep_agent_from_local_rosters(&state, &name);
+            (
+                StatusCode::OK,
+                Json(json!({ "ok": true, "removed": name, "rooms_left": rooms_left })),
+            )
+        }
         Err(e) => (
             agent_write_status(&e),
             Json(json!({ "ok": false, "error": e.to_string() })),
@@ -16739,6 +16754,176 @@ mod tests {
         );
 
         std::env::remove_var("OCEAN_YOLO");
+    }
+
+    /// Deleting an agent folder must also sweep the agent out of every local
+    /// room roster — a row of kind Agent whose folder is gone is a permanent
+    /// ghost (`room_join` refuses unresolvable agents, the wake path
+    /// fail-closes), visible in the roster and curable only by a manual
+    /// per-room leave. The kind filter must hold: a Human elsewhere sharing
+    /// the deleted agent's id survives.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn deleting_an_agent_sweeps_it_from_local_rosters() {
+        let _guard = AUTO_CONVENE_ENV_LOCK.lock().await;
+        let _env = TestEnvRestore::capture(&[
+            "OCEAN_CONFIG_DIR",
+            "OCEAN_MODEL",
+            "OCEAN_YOLO",
+            "OCEAN_AGENTS_DIR",
+        ]);
+        let tmp = tempfile::tempdir().unwrap();
+        let state = fake_convene_state(&tmp);
+        let agents_root = tmp.path().join("agents");
+        write_agent_fixture(&agents_root, "helper", "", None);
+        std::env::set_var("OCEAN_AGENTS_DIR", &agents_root);
+
+        // One room holding the agent, one holding a HUMAN namesake.
+        let swept = RoomKey::new("swept-room");
+        let namesake = RoomKey::new("namesake-room");
+        with_rooms(&state, |reg| {
+            reg.create(swept.clone(), "Swept Room", None, Utc::now())
+                .unwrap();
+            reg.add_participant(
+                &swept,
+                RoomParticipant {
+                    id: "helper".into(),
+                    kind: RoomParticipantKind::Agent,
+                    display_name: "Helper".into(),
+                },
+                Utc::now(),
+            )
+            .unwrap();
+            reg.add_participant(
+                &swept,
+                RoomParticipant {
+                    id: "john".into(),
+                    kind: RoomParticipantKind::Human,
+                    display_name: "John".into(),
+                },
+                Utc::now(),
+            )
+            .unwrap();
+            reg.create(namesake.clone(), "Namesake Room", None, Utc::now())
+                .unwrap();
+            reg.add_participant(
+                &namesake,
+                RoomParticipant {
+                    id: "helper".into(),
+                    kind: RoomParticipantKind::Human,
+                    display_name: "Helper The Human".into(),
+                },
+                Utc::now(),
+            )
+            .unwrap();
+        });
+
+        // Subscribe before the delete so the sweep's post-commit wake hint —
+        // what keeps live roster tails honest — is observable.
+        let mut wake_rx = state.room_wakes.test_subscribe();
+
+        let (status, body) = agent_delete(State(state.clone()), Path("helper".to_string())).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body.0["ok"], true);
+        assert_eq!(body.0["removed"], "helper");
+        assert_eq!(
+            body.0["rooms_left"], 1,
+            "exactly the one room holding the AGENT is swept"
+        );
+        assert!(
+            !agents_root.join("helper").exists(),
+            "the folder delete must still happen"
+        );
+
+        let room = with_rooms(&state, |reg| reg.get(&swept)).unwrap().unwrap();
+        assert!(
+            !room.room.participants.iter().any(|p| p.id == "helper"),
+            "the ghost roster row must be gone"
+        );
+        assert!(
+            room.room.participants.iter().any(|p| p.id == "john"),
+            "other participants are untouched"
+        );
+        let transcript = with_rooms(&state, |reg| reg.transcript(&swept, None)).unwrap();
+        let left = transcript.last().unwrap();
+        assert_eq!(left.kind, RoomMessageKind::ParticipantLeft);
+        assert_eq!(left.author_id, "helper");
+        assert_eq!(left.author_kind, RoomParticipantKind::Agent);
+        assert!(
+            wake_rx.try_recv().is_ok(),
+            "the sweep must publish a wake hint so live tails re-page"
+        );
+
+        // The human namesake in the other room survives with no stray marker.
+        let room = with_rooms(&state, |reg| reg.get(&namesake))
+            .unwrap()
+            .unwrap();
+        assert!(
+            room.room
+                .participants
+                .iter()
+                .any(|p| p.id == "helper" && matches!(p.kind, RoomParticipantKind::Human)),
+            "a Human sharing the deleted agent's id must survive"
+        );
+        let transcript = with_rooms(&state, |reg| reg.transcript(&namesake, None)).unwrap();
+        assert!(
+            !transcript
+                .iter()
+                .any(|m| m.kind == RoomMessageKind::ParticipantLeft),
+            "the namesake's room gains no ParticipantLeft marker"
+        );
+    }
+
+    /// A refused delete must touch nothing: the sweep runs only after the fs
+    /// remove succeeds, so a 404 for a never-created folder leaves even a
+    /// legacy phantom roster row (predating the join gate) exactly where it
+    /// was.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn deleting_a_missing_agent_mutates_no_roster() {
+        let _guard = AUTO_CONVENE_ENV_LOCK.lock().await;
+        let _env = TestEnvRestore::capture(&[
+            "OCEAN_CONFIG_DIR",
+            "OCEAN_MODEL",
+            "OCEAN_YOLO",
+            "OCEAN_AGENTS_DIR",
+        ]);
+        let tmp = tempfile::tempdir().unwrap();
+        let state = fake_convene_state(&tmp);
+        std::env::set_var("OCEAN_AGENTS_DIR", tmp.path().join("agents"));
+
+        let key = RoomKey::new("phantom-room");
+        with_rooms(&state, |reg| {
+            reg.create(key.clone(), "Phantom Room", None, Utc::now())
+                .unwrap();
+            // Store-direct add: legacy rosters hold Agent rows the join gate
+            // would refuse today.
+            reg.add_participant(
+                &key,
+                RoomParticipant {
+                    id: "phantom".into(),
+                    kind: RoomParticipantKind::Agent,
+                    display_name: "Phantom".into(),
+                },
+                Utc::now(),
+            )
+            .unwrap();
+        });
+
+        let (status, body) = agent_delete(State(state.clone()), Path("phantom".to_string())).await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert_eq!(body.0["ok"], false);
+
+        let room = with_rooms(&state, |reg| reg.get(&key)).unwrap().unwrap();
+        assert!(
+            room.room.participants.iter().any(|p| p.id == "phantom"),
+            "a refused delete must leave the roster untouched"
+        );
+        let transcript = with_rooms(&state, |reg| reg.transcript(&key, None)).unwrap();
+        assert!(
+            !transcript
+                .iter()
+                .any(|m| m.kind == RoomMessageKind::ParticipantLeft),
+            "no stray ParticipantLeft marker on a refused delete"
+        );
     }
 
     /// OCEAN-260: a room bound to a workspace (`workspace_root`) makes its
