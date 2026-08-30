@@ -214,9 +214,10 @@ use model_roles::{load_model_roles, resolve_advisor_alias, resolve_turn_model};
 use persistent_rooms::{
     resolve_named_agent, room_create, room_create_invite, room_db_path, room_events, room_get,
     room_get_read_cursor, room_join, room_leave, room_patch_read_cursor, room_post_message,
-    room_redeem_invite, room_register_agents, room_retry_outbox, room_snapshot, room_transcript,
-    room_update, rooms_list_persistent, run_federated_trigger_dispatcher, with_rooms,
-    with_rooms_handle, RoomAccessWakeBus, RoomReadCursorWakeBus, RoomStoreHandle, RoomWakeBus,
+    room_redeem_invite, room_register_agents, room_remove_member, room_retry_outbox, room_snapshot,
+    room_transcript, room_update, rooms_list_persistent, run_federated_trigger_dispatcher,
+    with_rooms, with_rooms_handle, RoomAccessWakeBus, RoomReadCursorWakeBus, RoomStoreHandle,
+    RoomWakeBus,
 };
 use project_registry::{
     canonical_git_common_dir, discover_project_worktrees, project_create, project_delete,
@@ -1573,6 +1574,7 @@ fn banner_routes() -> &'static [&'static str] {
         "POST /v1/rooms/persistent/{key}/invites",
         "POST /v1/rooms/persistent/invites/redeem",
         "POST /v1/rooms/persistent/{key}/members/agents",
+        "DELETE /v1/rooms/persistent/{key}/members/{member_id}",
         "GET /v1/rooms/persistent/{key}/transcript",
         "POST /v1/rooms/persistent/{key}/artifacts",
         "GET /v1/rooms/persistent/{key}/artifacts",
@@ -2971,6 +2973,10 @@ fn room_routes() -> Router<AppState> {
         .route(
             "/v1/rooms/persistent/{key}/members/agents",
             post(room_register_agents),
+        )
+        .route(
+            "/v1/rooms/persistent/{key}/members/{member_id}",
+            axum::routing::delete(room_remove_member),
         )
         .route(
             "/v1/rooms/persistent/{key}/transcript",
@@ -25586,9 +25592,12 @@ mod tests {
         // 112 -> 113: rooms gained PATCH /v1/rooms/persistent/{key} so a
         // room's trigger policy (and name) can change after creation instead
         // of being create-time-only.
+        // 113 -> 114: federated member removal added DELETE
+        // /v1/rooms/persistent/{key}/members/{member_id}, the HTTP surface
+        // for the capability the agent-delete sweep already exercised.
         assert_eq!(
             banner.len(),
-            113,
+            114,
             "route baseline changed; review the manifest"
         );
 

@@ -1960,6 +1960,120 @@ impl FederationSupervisor {
         Ok(members)
     }
 
+    /// Remove one member from a federated room's bedrock roster, on explicit
+    /// request — the single-member counterpart of
+    /// `sweep_agent_from_federated_rosters`, and it shares that sweep's policy
+    /// stance rather than `register_agents`': bedrock's 401/403 here is the
+    /// owner-or-self removal policy answering "not yours to remove", NOT a
+    /// credential event, so it surfaces as `Forbidden` WITHOUT revoking
+    /// control — severing a healthy room's federation over a refused removal
+    /// would trade a denied request for real data loss.
+    pub(super) async fn remove_member(
+        &self,
+        key: &RoomKey,
+        member_id: &str,
+    ) -> Result<RoomAccessProjection, IntentError> {
+        let slot = self.slot_for(key).await;
+        let (credential, access) = with_rooms_handle(&self.inner.rooms, |store| {
+            if store.get(key)?.is_none() {
+                return Err(ocean_store::RoomStoreError::UnknownRoom(key.clone()));
+            }
+            Ok::<_, ocean_store::RoomStoreError>((
+                store.room_credential(key)?,
+                store.room_access(key)?,
+            ))
+        })
+        .map_err(|error| match error {
+            ocean_store::RoomStoreError::UnknownRoom(_) => IntentError::NotFound,
+            _ => IntentError::Store,
+        })?;
+        let credential = credential.ok_or(IntentError::Conflict)?;
+        if access.state == RoomAccessState::Revoked {
+            return Err(IntentError::Forbidden);
+        }
+        let client = self.inner.client.clone().ok_or(IntentError::Unavailable)?;
+        let url = client
+            .endpoint(&["api", "v1", "rooms", key.as_str(), "members", member_id])
+            .map_err(|_| IntentError::Unavailable)?;
+        let generation = slot.generation.load(Ordering::Acquire);
+        let response = match slot
+            .control
+            .send(
+                client
+                    .http
+                    .delete(url)
+                    .timeout(REQUEST_TIMEOUT)
+                    .bearer_auth(&credential.bearer_token),
+                &self.inner.shutdown,
+            )
+            .await
+        {
+            AdmittedSend::Response(Ok(response)) => response,
+            AdmittedSend::Response(Err(_)) | AdmittedSend::Cancelled => {
+                return Err(IntentError::Unavailable)
+            }
+            AdmittedSend::Closed => return Err(IntentError::Forbidden),
+        };
+        match response.status() {
+            status if status.is_success() => {}
+            StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN => return Err(IntentError::Forbidden),
+            StatusCode::NOT_FOUND => return Err(IntentError::NotFound),
+            StatusCode::CONFLICT => return Err(IntentError::Conflict),
+            status if status == StatusCode::TOO_MANY_REQUESTS || status.is_server_error() => {
+                return Err(IntentError::Unavailable)
+            }
+            _ => return Err(IntentError::Protocol),
+        }
+        // Forget the local agent binding only after bedrock confirmed, and
+        // only under the epoch that sent the request — the sweep's rule. A
+        // human or non-locally-bound member simply has nothing to unbind.
+        slot.control
+            .mutate(|| {
+                if slot.generation.load(Ordering::Acquire) != generation {
+                    return false;
+                }
+                with_rooms_handle(&self.inner.rooms, |store| {
+                    store.unbind_room_agent(key, member_id)
+                })
+                .unwrap_or(false)
+            })
+            .await;
+        // Refresh the projection now rather than at the next heartbeat, so
+        // the caller's response already shows the member gone.
+        let members = self
+            .fetch_roster_control(&slot, &client, &credential, generation)
+            .await?;
+        let projection = slot
+            .control
+            .mutate(|| {
+                if slot.generation.load(Ordering::Acquire) != generation {
+                    return Err(GuardedMutationError::Generation);
+                }
+                let result = with_rooms_handle(&self.inner.rooms, |store| {
+                    if store.get(key)?.is_none() {
+                        return Err(ocean_store::RoomStoreError::UnknownRoom(key.clone()));
+                    }
+                    store.update_room_access_safe(key, None, Some(&members), None)
+                });
+                match result {
+                    Ok(projection) => Ok(projection),
+                    Err(ocean_store::RoomStoreError::UnknownRoom(_)) => {
+                        Err(GuardedMutationError::NotFound)
+                    }
+                    Err(_) => Err(GuardedMutationError::Store),
+                }
+            })
+            .await
+            .ok_or(IntentError::Forbidden)?
+            .map_err(|error| match error {
+                GuardedMutationError::Generation => IntentError::Forbidden,
+                GuardedMutationError::NotFound => IntentError::NotFound,
+                GuardedMutationError::Store => IntentError::Store,
+            })?;
+        publish_room_access_wake_on(&self.inner.access_wakes, key);
+        Ok(projection)
+    }
+
     /// Push an agent-folder delete into every federated room the agent was
     /// registered in — the half of the delete that
     /// `sweep_agent_from_local_rosters` cannot do: bedrock owns a federated
@@ -5069,6 +5183,12 @@ mod tests {
         if !status.is_success() {
             return control_error(status);
         }
+        // A confirmed removal must vanish from the roster this fake serves,
+        // or the caller's post-removal roster refresh would test nothing.
+        let mut roster = state.roster.lock().await;
+        if let Some(members) = roster["members"].as_array_mut() {
+            members.retain(|entry| entry["member_id"].as_str() != Some(member.as_str()));
+        }
         (status, Json(json!({"removed":[member]}))).into_response()
     }
 
@@ -6659,6 +6779,156 @@ mod tests {
                 .unwrap()
                 .is_some(),
             "nothing confirmed, so the binding is retained"
+        );
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn remove_member_removes_unbinds_and_refreshes_roster() {
+        let key = RoomKey::new("remove-room");
+        let (rooms, fake, server, supervisor, member) = sweep_fixture(&key, "remove-bearer").await;
+
+        let projection = supervisor.remove_member(&key, &member).await.unwrap();
+        assert!(
+            projection
+                .members
+                .iter()
+                .all(|projected| projected.member_id != member),
+            "the returned projection already shows the member gone"
+        );
+        let calls = fake.calls.lock().await.clone();
+        let removal = calls
+            .iter()
+            .find(|call| call.path == format!("members/{member}"))
+            .expect("the DELETE dialed bedrock");
+        assert_eq!(
+            removal.authorization.as_deref(),
+            Some("Bearer remove-bearer"),
+            "removal rides the room's own credential"
+        );
+        assert!(
+            with_rooms_handle(&rooms, |s| s.resolve_room_agent_member(&key, "sage"))
+                .unwrap()
+                .is_none(),
+            "confirmed removal unbinds the local agent binding"
+        );
+        assert!(with_rooms_handle(&rooms, |s| s.room_credential(&key))
+            .unwrap()
+            .is_some());
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn remove_member_policy_403_is_forbidden_and_never_revokes_control() {
+        let key = RoomKey::new("remove-denied-room");
+        let (rooms, fake, server, supervisor, member) =
+            sweep_fixture(&key, "remove-denied-bearer").await;
+        fake.member_remove_status.store(403, Ordering::Release);
+
+        assert_eq!(
+            supervisor.remove_member(&key, &member).await.unwrap_err(),
+            IntentError::Forbidden
+        );
+        // The register path's revoke-on-403 must not leak in here: credential
+        // intact, access not Revoked, binding retained for a later retry...
+        assert!(with_rooms_handle(&rooms, |s| s.room_credential(&key))
+            .unwrap()
+            .is_some());
+        assert_ne!(
+            with_rooms_handle(&rooms, |s| s.room_access(&key))
+                .unwrap()
+                .state,
+            RoomAccessState::Revoked
+        );
+        assert!(
+            with_rooms_handle(&rooms, |s| s.resolve_room_agent_member(&key, "sage"))
+                .unwrap()
+                .is_some()
+        );
+        // ...and the admission gate still admits: once bedrock allows the
+        // removal, the same supervisor's retry goes through.
+        fake.member_remove_status.store(200, Ordering::Release);
+        supervisor.remove_member(&key, &member).await.unwrap();
+        assert!(
+            with_rooms_handle(&rooms, |s| s.resolve_room_agent_member(&key, "sage"))
+                .unwrap()
+                .is_none()
+        );
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn remove_member_maps_bedrock_refusals_without_unbinding() {
+        let key = RoomKey::new("remove-mapped-room");
+        let (rooms, fake, server, supervisor, member) =
+            sweep_fixture(&key, "remove-mapped-bearer").await;
+        for (status, expected) in [
+            (404u16, IntentError::NotFound),
+            (409, IntentError::Conflict),
+            (429, IntentError::Unavailable),
+            (500, IntentError::Unavailable),
+            (418, IntentError::Protocol),
+        ] {
+            fake.member_remove_status.store(status, Ordering::Release);
+            assert_eq!(
+                supervisor.remove_member(&key, &member).await.unwrap_err(),
+                expected,
+                "bedrock {status}"
+            );
+            assert!(
+                with_rooms_handle(&rooms, |s| s.resolve_room_agent_member(&key, "sage"))
+                    .unwrap()
+                    .is_some(),
+                "an unconfirmed removal must not unbind (bedrock {status})"
+            );
+        }
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn remove_member_preflight_fails_closed_before_any_dial() {
+        let key = RoomKey::new("remove-preflight-room");
+        let (rooms, fake, server, supervisor, member) =
+            sweep_fixture(&key, "remove-preflight-bearer").await;
+        let dialed = fake.calls.lock().await.len();
+
+        let missing = RoomKey::new("remove-missing-room");
+        assert_eq!(
+            supervisor
+                .remove_member(&missing, &member)
+                .await
+                .unwrap_err(),
+            IntentError::NotFound
+        );
+        let uncredentialed = RoomKey::new("remove-uncredentialed-room");
+        with_rooms_handle(&rooms, |s| {
+            s.create(
+                uncredentialed.clone(),
+                "Uncredentialed",
+                None,
+                chrono::Utc::now(),
+            )
+        })
+        .unwrap();
+        assert_eq!(
+            supervisor
+                .remove_member(&uncredentialed, &member)
+                .await
+                .unwrap_err(),
+            IntentError::Conflict
+        );
+        with_rooms_handle(&rooms, |s| {
+            s.update_room_access_safe(&key, Some(RoomAccessState::Revoked), None, None)
+        })
+        .unwrap();
+        assert_eq!(
+            supervisor.remove_member(&key, &member).await.unwrap_err(),
+            IntentError::Forbidden
+        );
+        assert_eq!(
+            fake.calls.lock().await.len(),
+            dialed,
+            "no preflight failure may reach the network"
         );
         server.abort();
     }

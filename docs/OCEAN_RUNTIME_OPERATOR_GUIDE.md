@@ -574,6 +574,7 @@ POST   /v1/rooms/persistent/{key}/outbox/retry            retry a locally-author
 POST   /v1/rooms/persistent/{key}/invites                 bootstrap owner if Local, then mint invite { recipient_name?, ttl_minutes? }; raw InviteResponse 201
 POST   /v1/rooms/persistent/invites/redeem                restart-safe redeem/self-join { code }; raw RoomAccessProjection 200
 POST   /v1/rooms/persistent/{key}/members/agents          register safe local agent descriptors { agent_names }; raw RoomAccessProjection 200
+DELETE /v1/rooms/persistent/{key}/members/{member_id}     remove one federated member via Bedrock; refreshed RoomAccessProjection 200, Bedrock's owner-or-self 403 surfaces as federation_forbidden with the credential intact
 
 # Room workspace — the membership-gated lane to the room's Bedrock container.
 # The room's Bedrock bearer NEVER leaves the daemon: a client asserts a roster participant in

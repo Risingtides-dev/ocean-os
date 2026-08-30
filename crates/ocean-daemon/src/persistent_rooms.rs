@@ -2008,6 +2008,24 @@ pub(super) async fn room_register_agents(
     }
 }
 
+pub(super) async fn room_remove_member(
+    State(state): State<AppState>,
+    Path((key, member_id)): Path<(String, String)>,
+) -> (StatusCode, Json<serde_json::Value>) {
+    let member_id = member_id.trim();
+    if member_id.is_empty() {
+        return invalid_request_response();
+    }
+    let key = RoomKey::new(key.trim());
+    match state.room_federation.remove_member(&key, member_id).await {
+        Ok(access) => (
+            StatusCode::OK,
+            Json(serde_json::to_value(access).expect("RoomAccessProjection serializes")),
+        ),
+        Err(error) => intent_error_response(error),
+    }
+}
+
 pub(super) async fn run_federated_trigger_dispatcher(
     state: AppState,
     mut receiver: mpsc::UnboundedReceiver<FederatedTriggerDispatch>,
@@ -5583,6 +5601,63 @@ mod tests {
         let (status, Json(body)) = intent_error_response(IntentError::Conflict);
         assert_eq!(status, StatusCode::CONFLICT);
         assert_eq!(body["error"], "federation_conflict");
+    }
+
+    #[tokio::test]
+    async fn member_remove_rejects_blank_ids_and_maps_intent_errors() {
+        let _env = AUTO_CONVENE_ENV_LOCK.lock().await;
+        let tmp = tempfile::tempdir().unwrap();
+        let _restore = TestEnvRestore::capture(&["OCEAN_CONFIG_DIR", "OCEAN_MODEL", "OCEAN_YOLO"]);
+        let state = fake_convene_state(&tmp);
+
+        let (status, Json(body)) =
+            room_remove_member(State(state.clone()), Path(("room".into(), "   ".into()))).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(body["error"], "invalid_request");
+
+        // Through the mounted route, so a router mis-mount cannot hide
+        // behind the handler's own 404: the body must be the typed error.
+        let response = crate::room_routes()
+            .with_state(state.clone())
+            .oneshot(
+                axum::http::Request::delete(
+                    "/v1/rooms/persistent/missing-room/members/some-member",
+                )
+                .body(Body::empty())
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        let body: serde_json::Value = serde_json::from_slice(
+            &axum::body::to_bytes(response.into_body(), 64 * 1024)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(body["error"], "room_not_found");
+
+        let key = RoomKey::new("member-remove-room");
+        with_rooms(&state, |store| {
+            store.create(key.clone(), "Member Remove", None, Utc::now())
+        })
+        .unwrap();
+        let (status, Json(body)) = room_remove_member(
+            State(state.clone()),
+            Path((key.as_str().into(), "member-1".into())),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert_eq!(body["error"], "federation_conflict");
+
+        with_rooms(&state, |store| {
+            store.install_room_credential(&key, "bearer", "11111111-1111-4111-8111-111111111111")
+        })
+        .unwrap();
+        let (status, Json(body)) =
+            room_remove_member(State(state), Path((key.as_str().into(), "member-1".into()))).await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(body["error"], "federation_unavailable");
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
