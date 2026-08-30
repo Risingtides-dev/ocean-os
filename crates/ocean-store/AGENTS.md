@@ -133,6 +133,18 @@ outbox, and the restart-safe federation core (S2 P2-A). One database file
   `UnknownAttachment`, never a silent success. `add_attachment` and
   `remove_attachment` each write their System transcript marker in the SAME
   transaction as the row.
+- **An artifact title is refused blank, never stored blank.** `create_artifact`
+  and `amend_artifact` both raise `ArtifactTitleBlank` on a whitespace-only
+  title before any read, UPDATE, or transcript insert, so a refusal writes
+  nothing and mints no System line — erasing a title is unrecoverable and the
+  minted line would report the loss as an ordinary update (`bob updated '' (v2)`).
+  Amend checks it AHEAD of the CAS: a malformed request is not a stale view, and
+  winning the compare-and-swap would not make an untitled artifact acceptable. An
+  ABSENT title still means untouched, which is how `room_summary`'s upsert amends
+  a body alone. The guard lives here rather than on the route because
+  `upsert_summary_artifact` reaches the store without passing one. A blank
+  `artifact_id` is NOT checked here — that refusal is route-only in
+  `persistent_rooms.rs`.
 - **A declared content type is recorded and never trusted.**
   `room_attachments.content_type` is whatever the uploader claimed. It is stored
   verbatim and deliberately kept OUT of the transcript marker, whose body
