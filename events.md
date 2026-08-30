@@ -7003,3 +7003,26 @@ surface-roster-marks-your-own-rows next wave. Gate: 54 core + 816 daemon
 + 178 store tests 0 failed, clippy -D warnings clean, fmt clean,
 toolchain 1.97.0. No migration, no deploy step.
 _________________________________________________________________________________
+
+time:      [11:47] [08-30-26]
+agent:     [claude] [opus 5]
+worktree:  loop/os-ci-events-ledger-guard
+type:      [gh-actions]
+area:      [infra]
+
+Added a ledger job to CI so a PR that changes code must carry its events.md
+entry in the same diff, and corrected a serde-compat comment in ocean-core that
+misattributed the mechanism it documents. The ledger half mirrors the bedrock
+guard (its PR #50) and the surface one (its PR #157), with the guarded set
+re-derived for this repo: crates/ is the workspace, xtask/ is the gate every
+contract check runs through, and integrations/ plugins/ scripts/ ops/ deploy/
+packaging/ .github/ change how it builds, ships or extends; docs/ stays
+unguarded because the devlog chain lives there. The comment half fixes a claim
+recorded as a known nit when self_member_id landed: compatibility runs both
+directions and each holds for a different reason — an old daemon simply omits
+the key, while a new daemon DOES emit it for a federated room and an older
+surface tolerates that only because its mirror struct carries no
+deny_unknown_fields. The comment had credited the None-skips-serialization
+nicety for both directions, which the second half of the very test it annotates
+disproves.
+_________________________________________________________________________________
