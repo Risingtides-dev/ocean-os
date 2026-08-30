@@ -6924,3 +6924,28 @@ re-run at land after rebase onto origin/main: 807 daemon tests 0 failed,
 clippy -D warnings, fmt clean. Daemon deploy needed before the sweep is
 live; no migration, no credential.
 _________________________________________________________________________________
+time:      [02:15] [08-30-26]
+agent:     [claude] [fable 5]
+worktree:  loop/os-agent-delete-reaches-federated-rooms
+type:      [bug-report]
+area:      [backend]
+
+Agent delete now reaches federated rooms (#401): after the local roster
+sweep, agent_delete spawns a detached federated sweep that resolves the
+agent's bedrock member id through the identity map and dials bedrock's
+DELETE .../members/{memberId} per credentialed room, best-effort -- a
+bedrock that is down never blocks the folder delete, and a 403 (member
+removing a non-owned target) is a logged skip, deliberately NOT the
+registration path's revoke_control-on-403, which would sever a room's
+federation over a policy refusal. The refine pass closed the one gate the
+review found open: target enumeration reads the durable access state inside
+the same synchronous lock hold and skips RoomAccessState::Revoked rooms --
+the credential row outlives revoke and the in-memory admission gate is
+rebuilt open after a restart, so the durable state is the only filter that
+survives the process. Pinned by agent_delete_sweep_never_dials_a_revoked_
+room (post-restart shape: Revoked via update_room_access_safe with the
+slot gate left open). Gate re-run at land after a no-op rebase onto
+origin/main: 811 daemon tests 0 failed, clippy -D warnings clean, fmt
+clean. Effectiveness in non-owned rooms also needs bedrock #46 deployed
+(human railway up); daemon deploy is automatic post-wave. No migration.
+_________________________________________________________________________________
