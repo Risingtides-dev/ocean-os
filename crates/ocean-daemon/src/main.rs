@@ -2895,6 +2895,12 @@ async fn agent_update(
 /// folder). The sweep runs only after the fs remove succeeds: a refused
 /// delete — NotFound, InvalidName — must touch nothing. `rooms_left` is
 /// additive next to the pre-existing `removed` shape the surface reads.
+///
+/// Federated rooms need a second, upstream sweep: bedrock owns their
+/// membership, and the next roster sync would rewrite a locally swept row
+/// straight back. That one runs detached — it is best-effort HTTP against N
+/// rooms at up to a request timeout each, and this response must not hang on
+/// it — so its per-room outcomes land in the log, not the body.
 async fn agent_delete(
     State(state): State<AppState>,
     Path(name): Path<String>,
@@ -2903,6 +2909,15 @@ async fn agent_delete(
     match ocean_agent::agentdir::remove(&agents_root(), &name) {
         Ok(()) => {
             let rooms_left = persistent_rooms::sweep_agent_from_local_rosters(&state, &name);
+            let federation = state.room_federation.clone();
+            let agent = name.clone();
+            tokio::spawn(async move {
+                let removed = federation.sweep_agent_from_federated_rosters(&agent).await;
+                if removed > 0 {
+                    tracing::info!(agent = %agent, rooms = removed,
+                        "agent delete propagated to federated rooms");
+                }
+            });
             (
                 StatusCode::OK,
                 Json(json!({ "ok": true, "removed": name, "rooms_left": rooms_left })),

@@ -1960,6 +1960,115 @@ impl FederationSupervisor {
         Ok(members)
     }
 
+    /// Push an agent-folder delete into every federated room the agent was
+    /// registered in — the half of the delete that
+    /// `sweep_agent_from_local_rosters` cannot do: bedrock owns a federated
+    /// room's membership, so a locally swept row is rewritten by the next
+    /// roster sync unless bedrock itself removes the member.
+    ///
+    /// Best-effort is load-bearing. The folder is already gone when this
+    /// runs, so a room the sweep cannot reach keeps its ghost until a retry
+    /// or a manual remove — but no per-room failure may surface as an error.
+    /// In particular a 403 here is bedrock's owner-or-self removal policy
+    /// answering "not yours to remove", NOT a credential event: the
+    /// registration path's revoke-on-403 must not be copied, because
+    /// severing a healthy room's federation over a cleanup it merely wasn't
+    /// allowed to do would trade a cosmetic ghost for real data loss.
+    ///
+    /// Returns how many rooms bedrock confirmed removed, for the caller's
+    /// completion log.
+    pub(super) async fn sweep_agent_from_federated_rosters(&self, agent_name: &str) -> usize {
+        let Some(client) = self.inner.client.clone() else {
+            return 0;
+        };
+        // Collect (credential, member id) targets in one synchronous lock
+        // hold — the store guard must never cross an await. Credentialed
+        // rooms ARE the federated set (a revoke deletes the credential), and
+        // the per-room binding resolve narrows to rooms that actually
+        // registered this agent.
+        let targets = with_rooms_handle(&self.inner.rooms, |store| {
+            let mut targets = Vec::new();
+            for credential in store.list_credentialed_rooms()? {
+                if let Some(member_id) =
+                    store.resolve_room_agent_member(&credential.room_id, agent_name)?
+                {
+                    targets.push((credential, member_id));
+                }
+            }
+            Ok::<_, ocean_store::RoomStoreError>(targets)
+        });
+        let targets = match targets {
+            Ok(targets) => targets,
+            Err(error) => {
+                tracing::warn!(agent = agent_name, error = %error,
+                    "agent-delete federated sweep could not enumerate rooms");
+                return 0;
+            }
+        };
+        let mut removed = 0;
+        for (credential, member_id) in targets {
+            let key = credential.room_id.clone();
+            let Ok(url) =
+                client.endpoint(&["api", "v1", "rooms", key.as_str(), "members", &member_id])
+            else {
+                continue;
+            };
+            let slot = self.slot_for(&key).await;
+            let generation = slot.generation.load(Ordering::Acquire);
+            let response = match slot
+                .control
+                .send(
+                    client
+                        .http
+                        .delete(url)
+                        .timeout(REQUEST_TIMEOUT)
+                        .bearer_auth(&credential.bearer_token),
+                    &self.inner.shutdown,
+                )
+                .await
+            {
+                AdmittedSend::Response(Ok(response)) => response,
+                AdmittedSend::Response(Err(error)) => {
+                    tracing::warn!(agent = agent_name, room = %key, error = %error,
+                        "agent-delete federated sweep skipped an unreachable room");
+                    continue;
+                }
+                // Shutdown, or a revoke already closed this room's gate:
+                // either way the room is no longer ours to clean.
+                AdmittedSend::Cancelled | AdmittedSend::Closed => continue,
+            };
+            let status = response.status();
+            if !status.is_success() {
+                tracing::warn!(agent = agent_name, room = %key, status = %status,
+                    "agent-delete federated sweep skipped a room that refused the removal");
+                continue;
+            }
+            // Forget the binding only after bedrock confirmed, and only if
+            // the epoch that sent the request is still current — a revoke
+            // between send and confirm means this member id is no longer
+            // ours to forget. No local projection surgery: the next
+            // heartbeat roster refresh rewrites members from bedrock's
+            // answer, which no longer contains the agent.
+            let unbound = slot
+                .control
+                .mutate(|| {
+                    if slot.generation.load(Ordering::Acquire) != generation {
+                        return false;
+                    }
+                    with_rooms_handle(&self.inner.rooms, |store| {
+                        store.unbind_room_agent(&key, &member_id)
+                    })
+                    .unwrap_or(false)
+                })
+                .await
+                .unwrap_or(false);
+            if unbound {
+                removed += 1;
+            }
+        }
+        removed
+    }
+
     async fn revoke_control(&self, key: &RoomKey) {
         let slot = self.slot_for(key).await;
         slot.control.close().await;
@@ -4694,6 +4803,7 @@ mod tests {
         redeem_status: Arc<AtomicU16>,
         self_status: Arc<AtomicU16>,
         agents_status: Arc<AtomicU16>,
+        member_remove_status: Arc<AtomicU16>,
         redeem_active: Arc<AtomicUsize>,
         redeem_peak: Arc<AtomicUsize>,
         hold_redeem: Arc<AtomicBool>,
@@ -4717,6 +4827,7 @@ mod tests {
                 redeem_status: Arc::new(AtomicU16::new(201)),
                 self_status: Arc::new(AtomicU16::new(201)),
                 agents_status: Arc::new(AtomicU16::new(201)),
+                member_remove_status: Arc::new(AtomicU16::new(200)),
                 redeem_active: Arc::new(AtomicUsize::new(0)),
                 redeem_peak: Arc::new(AtomicUsize::new(0)),
                 hold_redeem: Arc::new(AtomicBool::new(false)),
@@ -4933,6 +5044,28 @@ mod tests {
         Json(state.roster.lock().await.clone()).into_response()
     }
 
+    /// DELETE members/{id}, the route the agent-delete federated sweep
+    /// dials. Records the target member id in the call path so tests can
+    /// prove which member was addressed.
+    async fn control_member_remove(
+        State(state): State<ControlBedrock>,
+        Path((room, member)): Path<(String, String)>,
+        headers: HeaderMap,
+    ) -> axum::response::Response {
+        state
+            .record(&format!("members/{member}"), &headers, &Bytes::new())
+            .await;
+        if room != *state.room {
+            return control_error(StatusCode::BAD_REQUEST);
+        }
+        let status =
+            StatusCode::from_u16(state.member_remove_status.load(Ordering::Acquire)).unwrap();
+        if !status.is_success() {
+            return control_error(status);
+        }
+        (status, Json(json!({"removed":[member]}))).into_response()
+    }
+
     async fn start_control_bedrock(state: ControlBedrock) -> (String, JoinHandle<()>) {
         let app = Router::new()
             .route("/api/v1/rooms/{room}/register", post(control_register))
@@ -4941,6 +5074,10 @@ mod tests {
             .route("/api/v1/rooms/{room}/members/self", post(control_self_join))
             .route("/api/v1/rooms/{room}/members/agents", post(control_agents))
             .route("/api/v1/rooms/{room}/members", get(control_members))
+            .route(
+                "/api/v1/rooms/{room}/members/{member}",
+                axum::routing::delete(control_member_remove),
+            )
             .with_state(state);
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
@@ -6335,6 +6472,156 @@ mod tests {
                 subagent_names: vec![],
             },
         }
+    }
+
+    /// One registered federated room ready for the agent-delete sweep:
+    /// returns the store handle, the fake, its server handle, the
+    /// supervisor, and the bound bedrock member id for "sage".
+    async fn sweep_fixture(
+        key: &RoomKey,
+        bearer: &str,
+    ) -> (
+        RoomStoreHandle,
+        ControlBedrock,
+        JoinHandle<()>,
+        FederationSupervisor,
+        String,
+    ) {
+        let human = "22222222-2222-4222-8222-222222222222";
+        let mut store = ocean_store::SqliteRoomStore::open_in_memory().unwrap();
+        store
+            .create(key.clone(), "Sweep", None, chrono::Utc::now())
+            .unwrap();
+        store.install_room_credential(key, bearer, human).unwrap();
+        store
+            .update_room_access_safe(key, Some(RoomAccessState::Connecting), None, None)
+            .unwrap();
+        let rooms: RoomStoreHandle = Arc::new(std::sync::Mutex::new(store));
+        let fake = ControlBedrock::new(key.as_str());
+        let (base, server) = start_control_bedrock(fake.clone()).await;
+        let supervisor = test_control_supervisor(&base, rooms.clone());
+        supervisor
+            .register_agents(key, vec![p2c_agent_input("sage", "sweep-key")])
+            .await
+            .unwrap();
+        let member = with_rooms_handle(&rooms, |s| s.resolve_room_agent_member(key, "sage"))
+            .unwrap()
+            .expect("registration bound a member id");
+        (rooms, fake, server, supervisor, member)
+    }
+
+    #[tokio::test]
+    async fn agent_delete_sweep_removes_unbinds_and_skips_unbound_rooms() {
+        let key = RoomKey::new("sweep-room");
+        let (rooms, fake, server, supervisor, member) = sweep_fixture(&key, "sweep-bearer").await;
+        // A second credentialed room that never registered the agent must
+        // not be dialed at all — the binding resolve is the target filter.
+        let other = RoomKey::new("sweep-room-unbound");
+        with_rooms_handle(&rooms, |s| {
+            s.create(other.clone(), "Unbound", None, chrono::Utc::now())?;
+            s.install_room_credential(
+                &other,
+                "other-bearer",
+                "33333333-3333-4333-8333-000000000099",
+            )
+        })
+        .unwrap();
+
+        assert_eq!(
+            supervisor.sweep_agent_from_federated_rosters("sage").await,
+            1
+        );
+        let calls = fake.calls.lock().await.clone();
+        let removals: Vec<_> = calls
+            .iter()
+            .filter(|call| call.path.starts_with("members/"))
+            .collect();
+        assert_eq!(removals.len(), 1, "only the bound room is dialed");
+        assert_eq!(removals[0].path, format!("members/{member}"));
+        assert_eq!(
+            removals[0].authorization.as_deref(),
+            Some("Bearer sweep-bearer"),
+            "removal rides the room's own credential"
+        );
+        assert!(
+            with_rooms_handle(&rooms, |s| s.resolve_room_agent_member(&key, "sage"))
+                .unwrap()
+                .is_none(),
+            "confirmed removal unbinds the member"
+        );
+        assert!(with_rooms_handle(&rooms, |s| s.room_credential(&key))
+            .unwrap()
+            .is_some());
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn agent_delete_sweep_policy_403_skips_without_revoking_control() {
+        let key = RoomKey::new("sweep-denied-room");
+        let (rooms, fake, server, supervisor, _member) =
+            sweep_fixture(&key, "sweep-denied-bearer").await;
+        fake.member_remove_status.store(403, Ordering::Release);
+
+        assert_eq!(
+            supervisor.sweep_agent_from_federated_rosters("sage").await,
+            0
+        );
+        // Nothing confirmed, so nothing forgotten — a later sweep can retry.
+        assert!(
+            with_rooms_handle(&rooms, |s| s.resolve_room_agent_member(&key, "sage"))
+                .unwrap()
+                .is_some()
+        );
+        // A policy denial is not a credential event: credential intact,
+        // access not Revoked...
+        assert!(with_rooms_handle(&rooms, |s| s.room_credential(&key))
+            .unwrap()
+            .is_some());
+        assert_ne!(
+            with_rooms_handle(&rooms, |s| s.room_access(&key))
+                .unwrap()
+                .state,
+            RoomAccessState::Revoked
+        );
+        // ...and the admission gate still admits: once bedrock allows the
+        // removal, the retried sweep goes through. A revoked gate would have
+        // answered Closed and removed nothing.
+        fake.member_remove_status.store(200, Ordering::Release);
+        assert_eq!(
+            supervisor.sweep_agent_from_federated_rosters("sage").await,
+            1
+        );
+        assert!(
+            with_rooms_handle(&rooms, |s| s.resolve_room_agent_member(&key, "sage"))
+                .unwrap()
+                .is_none()
+        );
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn agent_delete_sweep_connection_failure_keeps_binding_and_credential() {
+        let key = RoomKey::new("sweep-dark-room");
+        let (rooms, _fake, server, supervisor, _member) =
+            sweep_fixture(&key, "sweep-dark-bearer").await;
+        // Take the peer down for real: abort and await so the listener is
+        // closed before the sweep dials, making the refusal deterministic.
+        server.abort();
+        let _ = server.await;
+
+        assert_eq!(
+            supervisor.sweep_agent_from_federated_rosters("sage").await,
+            0
+        );
+        assert!(
+            with_rooms_handle(&rooms, |s| s.resolve_room_agent_member(&key, "sage"))
+                .unwrap()
+                .is_some(),
+            "an unreachable room keeps its binding for a later retry"
+        );
+        assert!(with_rooms_handle(&rooms, |s| s.room_credential(&key))
+            .unwrap()
+            .is_some());
     }
 
     #[tokio::test]
