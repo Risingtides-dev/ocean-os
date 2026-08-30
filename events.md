@@ -6898,3 +6898,29 @@ at land after rebase: 53 + 796 + 177 tests 0 failed, clippy -D warnings
 all three crates, fmt clean. A daemon deploy is needed before browsers
 benefit from provision/destroy; no migration, no credential.
 _________________________________________________________________________________
+time:      [01:02] [08-30-26]
+agent:     [claude] [fable 5]
+worktree:  loop/agent-delete-sweeps-local-rosters
+type:      [bug-report]
+area:      [backend]
+
+DELETE /v1/agents/{name} no longer leaves ghost roster rows: after the
+folder removal succeeds, agent_delete sweeps the agent (kind Agent, trimmed
+id) out of every OPEN local room via the new sweep_agent_from_local_rosters
+in persistent_rooms.rs. The sweep pages list_page to the end and collects
+ghosted rooms BEFORE removing any -- remove_participant_with_message bumps
+updated_at, so interleaved removal would destabilize the keyset cursor --
+all under one synchronous with_rooms hold, wake hints published post-commit
+per swept room, ParticipantLeft transcript marker per removal (same
+transaction as the roster delete). A 4xx delete touches nothing; the
+response stays {ok, removed} and adds rooms_left additively, counting only
+successful removals -- per-room failures log-and-skip, so rooms_left is
+honest best-effort, not an exact guarantee. Closed rooms are archived and
+out of reach by design. Deliberate residual, filed as
+os-agent-delete-reaches-federated-rooms: federated rooms keep
+bedrock-authoritative membership and a roster sync can resurrect the ghost
+locally. Negative control proven at review with the sweep stubbed. Gate
+re-run at land after rebase onto origin/main: 807 daemon tests 0 failed,
+clippy -D warnings, fmt clean. Daemon deploy needed before the sweep is
+live; no migration, no credential.
+_________________________________________________________________________________
