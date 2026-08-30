@@ -378,6 +378,9 @@ pub(super) fn room_store_error_response(
         ArtifactAlreadyExists { .. } => StatusCode::CONFLICT,
         // Nothing to change is a client mistake, not a conflict to retry.
         ArtifactUnchanged { .. } => StatusCode::BAD_REQUEST,
+        // A write that would leave the artifact untitled. Malformed, and no
+        // version the caller could re-read would make it well formed.
+        ArtifactTitleBlank { .. } => StatusCode::BAD_REQUEST,
         ParticipantRecordImmutable { .. } => StatusCode::CONFLICT,
         // An artifact attributed to someone not in the room is a lie, not a
         // server fault.
@@ -1158,6 +1161,14 @@ pub(super) async fn room_amend_artifact(
                 "error": format!("artifact is at version {actual}, not {expected}; re-read and retry"),
             })),
         ),
+        // Create refuses a blank title with a bare `invalid_request` 400; an
+        // amend that would blank an existing one is the same client mistake and
+        // must not be answerable by a different shape depending on which layer
+        // caught it. The store is what actually refused — the route no longer
+        // needs its own copy of the check.
+        Err(ClientArtifactWriteError::Store(ocean_store::RoomStoreError::ArtifactTitleBlank {
+            ..
+        })) => invalid_request_response(),
         Err(ClientArtifactWriteError::ForgedAuthor) => forged_artifact_author_response(),
         Err(ClientArtifactWriteError::Store(e)) => room_store_error_response(e),
     }
@@ -6702,6 +6713,115 @@ mod tests {
         assert_eq!(status, StatusCode::OK);
         assert_eq!(body["artifact"]["title"], json!("Real task"));
         assert_eq!(body["artifact"]["version"], json!(1));
+    }
+
+    /// Create refuses a blank title; amend used to pass one straight through to
+    /// the store, which erased the title and then minted a System line calling
+    /// the erasure an update. Both halves answer the same bare 400 now, so a
+    /// caller cannot tell which layer refused — and the amend's refusal is the
+    /// store's, not a second route-side copy of the check.
+    /// Mutation: delete the ArtifactTitleBlank arm in `room_amend_artifact` ->
+    /// the store's typed error falls through to `room_store_error_response`,
+    /// which answers 400 carrying the Display text instead of `invalid_request`
+    /// -> RED. Delete the store guard -> the amend returns 200 -> RED.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_amend_cannot_blank_an_artifact_title_over_http() {
+        let _guard = AUTO_CONVENE_ENV_LOCK.lock().await;
+        let _env = TestEnvRestore::capture(&["OCEAN_CONFIG_DIR", "OCEAN_MODEL", "OCEAN_YOLO"]);
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = fake_convene_state(&tmp);
+        let key = RoomKey::new("blank-title");
+        create_plain_room(&state, &key);
+        join_participant(&state, &key, "alice", RoomParticipantKind::Human, "Alice");
+
+        // The shape create answers with, captured from the live route so the
+        // comparison below cannot drift out of date.
+        let (create_status, Json(create_refusal)) = room_create_artifact(
+            State(state.clone()),
+            Path(key.as_str().to_string()),
+            Json(CreateArtifactRequest {
+                id: "t1".into(),
+                kind: RoomArtifactKind::Task,
+                title: "   ".into(),
+                body: String::new(),
+                author_id: "alice".into(),
+            }),
+        )
+        .await;
+        assert_eq!(create_status, StatusCode::BAD_REQUEST);
+
+        let (status, _) = room_create_artifact(
+            State(state.clone()),
+            Path(key.as_str().to_string()),
+            Json(CreateArtifactRequest {
+                id: "t1".into(),
+                kind: RoomArtifactKind::Task,
+                title: "Ship it".into(),
+                body: String::new(),
+                author_id: "alice".into(),
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED);
+        let before = with_rooms(&state, |store| store.get(&key))
+            .expect("room")
+            .expect("room exists")
+            .transcript
+            .len();
+
+        for blank in ["", "   "] {
+            let (status, Json(body)) = room_amend_artifact(
+                State(state.clone()),
+                Path((key.as_str().to_string(), "t1".into())),
+                Json(AmendArtifactRequest {
+                    expected_version: 1,
+                    title: Some(blank.into()),
+                    body: Some("a body the caller meant to keep".into()),
+                    state: None,
+                    author_id: "alice".into(),
+                }),
+            )
+            .await;
+            assert_eq!(status, create_status, "amend must refuse as create does");
+            assert_eq!(body, create_refusal, "and in the same shape, to the byte");
+        }
+
+        let (status, Json(body)) = room_get_artifact(
+            State(state.clone()),
+            Path((key.as_str().to_string(), "t1".into())),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["artifact"]["title"], json!("Ship it"));
+        assert_eq!(body["artifact"]["body"], json!(""));
+        assert_eq!(body["artifact"]["version"], json!(1));
+        assert_eq!(
+            with_rooms(&state, |store| store.get(&key))
+                .expect("room")
+                .expect("room exists")
+                .transcript
+                .len(),
+            before,
+            "a refused amend must not mint a transcript line"
+        );
+
+        // An amend that leaves the title alone is untouched by the guard — this
+        // is the shape `room_summary`'s body-only upsert issues.
+        let (status, Json(body)) = room_amend_artifact(
+            State(state.clone()),
+            Path((key.as_str().to_string(), "t1".into())),
+            Json(AmendArtifactRequest {
+                expected_version: 1,
+                title: None,
+                body: Some("new body".into()),
+                state: None,
+                author_id: "alice".into(),
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["artifact"]["title"], json!("Ship it"));
+        assert_eq!(body["artifact"]["version"], json!(2));
     }
 
     /// The daemon authors every audit row as ("system", System). If a client can

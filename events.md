@@ -7026,3 +7026,34 @@ deny_unknown_fields. The comment had credited the None-skips-serialization
 nicety for both directions, which the second half of the very test it annotates
 disproves.
 _________________________________________________________________________________
+
+time:      [12:51] [08-30-26]
+agent:     [claude] [opus 5]
+worktree:  loop/os-artifact-amend-can-blank-a-title
+type:      [bug-report]
+area:      [backend]
+
+An amend carrying an empty title erased a room artifact's title permanently and
+then minted the System line `alice updated '' (v2)`, so the room's own durable
+record reported the loss as an ordinary update. Create refused a blank title at
+the route; amend validated nothing and passed `title.as_deref()` straight to the
+store, which did `title.unwrap_or(&cur_title)` and wrote. This was recorded as a
+follow-up when artifacts-ui landed and stayed open: the only guard anywhere was
+in the ocean-surface editor, on the client side of the wire, in another repo.
+The refusal now lives in the STORE — a new typed `ArtifactTitleBlank` beside
+`ArtifactUnchanged`, raised before the read, the UPDATE and the transcript
+insert, so nothing is written and no line is minted. Create got the same branch
+rather than staying route-only, because `room_summary`'s upsert reaches the
+store without passing a route at all and the choke point is the whole point.
+`title: None` is untouched, which is what keeps that body-only summarize amend
+working. The amend route maps the error to the same bare `invalid_request` 400
+create answers, so a caller cannot tell which layer refused; the route test
+captures create's refusal from the live route and compares amend's to it byte
+for byte rather than hard-coding the shape. Both guards were mutation-checked:
+deleting the store branch returns 200 with `title: ""` and the lying transcript
+line, deleting the route arm leaks the store's Display text into the body. No
+route added, so the operator-guide parity count and quick-reference pins are
+unmoved; the guide's create and amend rows gained the 400. Gate: 54 core + 179
+store + 817 daemon tests 0 failed, clippy -D warnings clean, fmt clean,
+toolchain 1.97.0. No migration, no deploy step.
+_________________________________________________________________________________

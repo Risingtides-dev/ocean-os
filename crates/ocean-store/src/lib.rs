@@ -234,6 +234,13 @@ pub enum RoomStoreError {
     /// records an update that did not happen and invalidates every other
     /// writer's `expected_version`, which is a denial-of-honest-writes lever.
     ArtifactUnchanged { room: RoomKey, artifact: String },
+    /// A write that would leave an artifact with no title. An artifact is the
+    /// room's record of what it produced, and its title is how the room refers
+    /// to it; blanking one is unrecoverable — the previous title is not kept
+    /// anywhere — and the System line the write mints then reads
+    /// `alice updated '' (v2)`, so the transcript records the loss as an
+    /// ordinary update.
+    ArtifactTitleBlank { room: RoomKey, artifact: String },
     /// An artifact with that id already exists in this room. A client naming
     /// collision is the most ordinary error this endpoint sees; it must not
     /// surface as a server fault.
@@ -348,6 +355,10 @@ impl std::fmt::Display for RoomStoreError {
             Self::ArtifactUnchanged { room, artifact } => write!(
                 f,
                 "room '{room}': amend of '{artifact}' would change nothing"
+            ),
+            Self::ArtifactTitleBlank { room, artifact } => write!(
+                f,
+                "room '{room}': artifact '{artifact}' cannot be left untitled"
             ),
             Self::ArtifactAlreadyExists { room, artifact } => {
                 write!(f, "room '{room}' already has an artifact '{artifact}'")
@@ -1985,6 +1996,16 @@ impl SqliteRoomStore {
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
         Self::require_roster_author_on(&tx, key, author)?;
+        // The route guards this too, but a guard that lives only on the route is
+        // the shape this refusal exists to remove: the store is the one choke
+        // point every writer goes through, and `room_summary`'s upsert reaches
+        // it without passing the route at all.
+        if title.trim().is_empty() {
+            return Err(RoomStoreError::ArtifactTitleBlank {
+                room: key.clone(),
+                artifact: artifact_id.to_string(),
+            });
+        }
         // A duplicate id is a client naming collision, not a server fault.
         // Without this the INSERT trips the PK constraint and surfaces as a 500.
         let taken: Option<String> = tx
@@ -2063,6 +2084,20 @@ impl SqliteRoomStore {
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
         Self::require_roster_author_on(&tx, key, author)?;
+        // An amend that carries a blank title would erase the one thing the room
+        // uses to name this artifact, permanently — the old title survives
+        // nowhere — and the System line minted below would report the erasure as
+        // `alice updated '' (v2)`. Refused here rather than after the CAS check
+        // because it is the request that is malformed, not the caller's view of
+        // the version: winning the compare-and-swap would not make an untitled
+        // artifact acceptable. `None` is untouched, which is what keeps
+        // `room_summary`'s body-only amend working.
+        if title.is_some_and(|t| t.trim().is_empty()) {
+            return Err(RoomStoreError::ArtifactTitleBlank {
+                room: key.clone(),
+                artifact: artifact_id.to_string(),
+            });
+        }
 
         let current: Option<(i64, String, String, String)> = tx
             .query_row(
@@ -7257,6 +7292,106 @@ mod tests {
             .amend_artifact(&key, "t1", 1, Some("Ship it now"), None, None, "bob", now())
             .unwrap();
         assert_eq!(a2.version, 2);
+    }
+
+    /// Blanking a title is permanent: the previous one is kept nowhere, so the
+    /// room loses the only name it has for what it produced — and the System
+    /// line the write mints reports the loss as an ordinary update
+    /// (`alice updated '' (v2)`), which makes the transcript agree with the
+    /// erasure instead of exposing it. The only guard this ever had lived in the
+    /// ocean-surface editor, on the client side of the wire, in another repo.
+    /// Mutation: delete either `ArtifactTitleBlank` branch -> the write lands,
+    /// the title is gone and the transcript grows a line naming nothing -> RED.
+    #[test]
+    fn a_blank_title_can_neither_create_nor_erase_an_artifact() {
+        let (mut s, key) = artifact_room();
+
+        // Create: the route guards this, but the store is where every writer
+        // passes, so the refusal has to hold without a route in front of it.
+        let err = s
+            .create_artifact(
+                &key,
+                "t1",
+                RoomArtifactKind::Task,
+                "   ",
+                "b",
+                "alice",
+                now(),
+            )
+            .unwrap_err();
+        assert!(matches!(err, RoomStoreError::ArtifactTitleBlank { .. }));
+        assert!(
+            s.artifact(&key, "t1").unwrap().is_none(),
+            "a refused create must not leave an artifact behind"
+        );
+
+        let (a, _) = s
+            .create_artifact(
+                &key,
+                "t1",
+                RoomArtifactKind::Task,
+                "Ship it",
+                "b",
+                "alice",
+                now(),
+            )
+            .unwrap();
+        let before = s.get(&key).unwrap().unwrap().transcript.len();
+
+        for blank in ["", "   ", "\t\n"] {
+            let err = s
+                .amend_artifact(&key, "t1", a.version, Some(blank), None, None, "bob", now())
+                .unwrap_err();
+            assert!(
+                matches!(err, RoomStoreError::ArtifactTitleBlank { .. }),
+                "amend with title {blank:?} must be refused"
+            );
+        }
+
+        // A blank title rides in alongside a body the caller does want written.
+        // Refusing the title must refuse the whole amend, not apply the half of
+        // it that happens to be well formed.
+        let err = s
+            .amend_artifact(
+                &key,
+                "t1",
+                a.version,
+                Some(""),
+                Some("a body the caller meant to keep"),
+                None,
+                "bob",
+                now(),
+            )
+            .unwrap_err();
+        assert!(matches!(err, RoomStoreError::ArtifactTitleBlank { .. }));
+
+        let after = s.artifact(&key, "t1").unwrap().unwrap();
+        assert_eq!(after.title, "Ship it", "the title must survive the refusal");
+        assert_eq!(after.body, "b", "a refused amend must write nothing at all");
+        assert_eq!(
+            after.version, 1,
+            "a refused amend must not burn the version"
+        );
+        assert_eq!(after.updated_by, "alice");
+        assert_eq!(
+            s.get(&key).unwrap().unwrap().transcript.len(),
+            before,
+            "a refused amend must not mint a transcript line"
+        );
+
+        // `None` is untouched — this is the body-only amend `room_summary`'s
+        // upsert issues on every summarize, and it must keep working.
+        let (a2, _) = s
+            .amend_artifact(&key, "t1", 1, None, Some("new body"), None, "bob", now())
+            .unwrap();
+        assert_eq!(a2.version, 2);
+        assert_eq!(a2.title, "Ship it");
+
+        // And a real retitle still lands.
+        let (a3, _) = s
+            .amend_artifact(&key, "t1", 2, Some("Ship it now"), None, None, "bob", now())
+            .unwrap();
+        assert_eq!(a3.title, "Ship it now");
     }
 
     /// A duplicate id is a client naming collision (409), never a server fault
