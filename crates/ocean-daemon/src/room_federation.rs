@@ -3266,12 +3266,21 @@ const WORKSPACE_MARKER_SOURCE_ID: &str = "workspace";
 /// - `*_started` (clone, build) would double every operation into a
 ///   started/finished pair; the finished row carries the outcome, and a
 ///   started row with no finished row is legible on the ledger, not here.
-/// - `repo_bound` / `secrets_updated` / `port_closed` are configuration
-///   bookkeeping, not activity anyone waits on. `repo_unbound` used to sit
-///   with them — until Bedrock's unbind started deleting the checkout, which
-///   made it a destructive OUTCOME by this list's own standard. Its failure
-///   mode is worse than silence: `rm_failed` leaves a live checkout the next
-///   flush re-ingests as room files, and nobody learns that from the ledger.
+/// - `repo_bound` / `secrets_updated` are configuration bookkeeping, not
+///   activity anyone waits on. `repo_unbound` used to sit with them — until
+///   Bedrock's unbind started deleting the checkout, which made it a
+///   destructive OUTCOME by this list's own standard. Its failure mode is
+///   worse than silence: `rm_failed` leaves a live checkout the next flush
+///   re-ingests as room files, and nobody learns that from the ledger.
+///   `port_closed` left for the same reason: `port_exposed` told the room a
+///   port was serving, nothing else ever says otherwise, and silence here
+///   leaves humans and every convened agent reading a port back as live long
+///   after it is gone. Where that precedent does NOT reach: `repo_unbound`
+///   renders its own outcome from `checkout_removed`, and a close payload
+///   carries no outcome at all — Bedrock logs a failed `unexposePort` and
+///   emits the row regardless — so this marker reports the port's RECORDED
+///   state, never proof the route stopped serving. Carrying that flag is a
+///   Bedrock change; until it lands, the daemon cannot narrow the claim.
 ///
 /// Everything not listed here — including future actions Bedrock grows —
 /// advances the cursor exactly as before this allowlist existed.
@@ -3286,6 +3295,7 @@ fn workspace_action_is_marker(event_type: &str) -> bool {
             | "room.workspace.build_finished"
             | "room.workspace.build_failed"
             | "room.workspace.port_exposed"
+            | "room.workspace.port_closed"
             | "room.workspace.flushed"
             | "room.workspace.hydrated"
             | "room.workspace.ci_checked"
@@ -3475,6 +3485,13 @@ fn compose_workspace_marker(event_type: &str, p: &WorkspaceEventPayload) -> Stri
         "room.workspace.port_exposed" => match p.port {
             Some(port) => format!("workspace port {port} exposed"),
             None => "workspace port exposed".into(),
+        },
+        // Reports the recorded close, not a torn-down route: Bedrock drops
+        // the port row and emits this event even when the driver's unexpose
+        // threw, and the payload does not distinguish the two.
+        "room.workspace.port_closed" => match p.port {
+            Some(port) => format!("workspace port {port} closed"),
+            None => "workspace port closed".into(),
         },
         "room.workspace.flushed" => match p.changed_files {
             Some(n) => format!("workspace flushed ({n} files changed)"),
@@ -7760,6 +7777,7 @@ mod tests {
             "room.workspace.build_finished",
             "room.workspace.build_failed",
             "room.workspace.port_exposed",
+            "room.workspace.port_closed",
             "room.workspace.flushed",
             "room.workspace.hydrated",
             "room.workspace.ci_checked",
@@ -7781,7 +7799,6 @@ mod tests {
             "room.workspace.build_started",
             "room.workspace.repo_bound",
             "room.workspace.secrets_updated",
-            "room.workspace.port_closed",
             "room.workspace.",
             "room.workspace.build_finished.extra",
             "room.workspace.ci_checked.extra",
@@ -7892,6 +7909,37 @@ mod tests {
                 &WorkspaceEventPayload::default()
             ),
             "workspace repo unbound",
+            "missing fields degrade to shorter prose instead of failing the row"
+        );
+    }
+
+    #[test]
+    fn workspace_port_markers_pair_an_exposure_with_its_retraction() {
+        // The real Bedrock payload shape: `preview_url` rides the ledger row
+        // for an exposure, but this struct does not deserialize it, so the
+        // transcript names the port and never the link — the port integer is
+        // the whole of what a reader has to match the pair by.
+        let payload: WorkspaceEventPayload = serde_json::from_value(json!({
+            "port": 8787,
+            "preview_url": "https://8787-room.example.dev",
+            "exec_id": "exec-1"
+        }))
+        .unwrap();
+        assert_eq!(
+            compose_workspace_marker("room.workspace.port_exposed", &payload),
+            "workspace port 8787 exposed"
+        );
+        assert_eq!(
+            compose_workspace_marker("room.workspace.port_closed", &payload),
+            "workspace port 8787 closed"
+        );
+
+        assert_eq!(
+            compose_workspace_marker(
+                "room.workspace.port_closed",
+                &WorkspaceEventPayload::default()
+            ),
+            "workspace port closed",
             "missing fields degrade to shorter prose instead of failing the row"
         );
     }
