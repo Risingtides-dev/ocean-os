@@ -4,7 +4,12 @@
 //! data. Every executable room-agent turn passes through [`admit_room_agent`]
 //! before transcript, attachment, request, or runtime work.
 
-use std::collections::{BTreeSet, HashMap};
+use std::{
+    collections::{BTreeMap, BTreeSet, HashMap},
+    fs::File,
+    io::Read,
+    path::{Path as FsPath, PathBuf},
+};
 
 use axum::{
     extract::{rejection::JsonRejection, Path, State},
@@ -183,27 +188,29 @@ pub(super) fn resolve_package(package_id: &str) -> Result<ResolvedPackage, ApiEr
     if package_id.is_empty() {
         return Err(ApiError::bad_request("invalid_agent_package_id"));
     }
+    let snapshot = capture_package_snapshot(&super::agents_root(), package_id)?;
+    resolve_captured_package(package_id, snapshot)
+}
+
+#[derive(Debug)]
+struct PackageSnapshot {
+    root: PathBuf,
+    files: BTreeMap<String, Vec<u8>>,
+}
+
+fn resolve_captured_package(
+    package_id: &str,
+    snapshot: PackageSnapshot,
+) -> Result<ResolvedPackage, ApiError> {
     let definition =
-        ocean_agent::agentdir::resolve(&super::agents_root(), package_id).map_err(|error| {
-            match error {
-                ocean_agent::agentdir::ResolveError::InvalidName(_) => {
-                    ApiError::bad_request("invalid_agent_package_id")
-                }
-                ocean_agent::agentdir::ResolveError::NotFound(_) => {
-                    ApiError::not_found("agent_package_not_found")
-                }
-                ocean_agent::agentdir::ResolveError::Config(_, _)
-                | ocean_agent::agentdir::ResolveError::Io(_, _) => {
-                    ApiError::conflict("agent_package_unavailable")
-                }
-            }
-        })?;
+        ocean_agent::agentdir::resolve_snapshot(&snapshot.root, package_id, &snapshot.files)
+            .map_err(map_package_resolve_error)?;
 
     let mut tools = definition.effective_tools();
     canonicalize(&mut tools)?;
     let mut declared = definition.config.capabilities.clone();
     canonicalize(&mut declared)?;
-    let definition_digest = digest_package_tree(&definition.root)?;
+    let definition_digest = digest_package_files(&snapshot.files);
 
     // Empty legacy allowlists request nothing in a room. Room authority never
     // interprets an omitted declaration as the process-wide registry.
@@ -233,51 +240,24 @@ pub(super) fn resolve_package(package_id: &str) -> Result<ResolvedPackage, ApiEr
     })
 }
 
-/// Digest every steering/executable byte in a package under deterministic
-/// relative paths. This includes skill bodies, tool-file contents, and nested
-/// subagent definitions rather than trusting the top-level TOML declarations
-/// to describe all code that can run. Absolute root metadata is never hashed.
-fn digest_package_tree(root: &std::path::Path) -> Result<String, ApiError> {
-    fn collect(
-        root: &std::path::Path,
-        dir: &std::path::Path,
-        files: &mut Vec<(String, Vec<u8>)>,
-    ) -> Result<(), ApiError> {
-        let mut entries = std::fs::read_dir(dir)
-            .map_err(|_| ApiError::conflict("agent_package_unavailable"))?
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(|_| ApiError::conflict("agent_package_unavailable"))?;
-        entries.sort_by_key(std::fs::DirEntry::file_name);
-        for entry in entries {
-            let path = entry.path();
-            let metadata = std::fs::symlink_metadata(&path)
-                .map_err(|_| ApiError::conflict("agent_package_unavailable"))?;
-            if metadata.file_type().is_symlink() {
-                return Err(ApiError::conflict("agent_package_symlink_refused"));
-            }
-            if metadata.is_dir() {
-                collect(root, &path, files)?;
-            } else if metadata.is_file() {
-                let relative = path
-                    .strip_prefix(root)
-                    .map_err(|_| ApiError::internal("definition_digest_failed"))?;
-                let relative = relative
-                    .to_str()
-                    .ok_or_else(|| ApiError::conflict("agent_package_path_unavailable"))?
-                    .replace(std::path::MAIN_SEPARATOR, "/");
-                let bytes = std::fs::read(&path)
-                    .map_err(|_| ApiError::conflict("agent_package_unavailable"))?;
-                files.push((relative, bytes));
-            } else {
-                return Err(ApiError::conflict("agent_package_entry_refused"));
-            }
+fn map_package_resolve_error(error: ocean_agent::agentdir::ResolveError) -> ApiError {
+    match error {
+        ocean_agent::agentdir::ResolveError::InvalidName(_) => {
+            ApiError::bad_request("invalid_agent_package_id")
         }
-        Ok(())
+        ocean_agent::agentdir::ResolveError::NotFound(_) => {
+            ApiError::not_found("agent_package_not_found")
+        }
+        ocean_agent::agentdir::ResolveError::Config(_, _)
+        | ocean_agent::agentdir::ResolveError::Io(_, _) => {
+            ApiError::conflict("agent_package_unavailable")
+        }
     }
+}
 
-    let mut files = Vec::new();
-    collect(root, root, &mut files)?;
-    files.sort_by(|left, right| left.0.cmp(&right.0));
+/// Hash exactly the already-captured bytes that the runtime profile parser saw.
+/// No path is reopened between parsing and identity derivation.
+fn digest_package_files(files: &BTreeMap<String, Vec<u8>>) -> String {
     let mut digest = Sha256::new();
     digest.update(DEFINITION_DIGEST_DOMAIN);
     for (relative, bytes) in files {
@@ -286,7 +266,230 @@ fn digest_package_tree(root: &std::path::Path) -> Result<String, ApiError> {
         digest.update((bytes.len() as u64).to_be_bytes());
         digest.update(bytes);
     }
-    Ok(format!("sha256:{:x}", digest.finalize()))
+    format!("sha256:{:x}", digest.finalize())
+}
+
+fn capture_package_snapshot(
+    agents_root: &FsPath,
+    package_id: &str,
+) -> Result<PackageSnapshot, ApiError> {
+    capture_package_snapshot_with(agents_root, package_id, &mut |_| {})
+}
+
+fn capture_package_snapshot_with(
+    agents_root: &FsPath,
+    package_id: &str,
+    before_entry_open: &mut impl FnMut(&str),
+) -> Result<PackageSnapshot, ApiError> {
+    if package_id.is_empty()
+        || package_id.contains('/')
+        || package_id.contains('\\')
+        || package_id.contains("..")
+    {
+        return Err(ApiError::bad_request("invalid_agent_package_id"));
+    }
+    let agents = open_snapshot_root(agents_root)?;
+    let package = open_snapshot_directory_at(&agents, package_id, true)?;
+    let mut files = BTreeMap::new();
+    collect_snapshot_files(&package, "", &mut files, before_entry_open)?;
+    Ok(PackageSnapshot {
+        root: agents_root.join(package_id),
+        files,
+    })
+}
+
+#[cfg(unix)]
+fn open_snapshot_root(path: &FsPath) -> Result<File, ApiError> {
+    use std::os::unix::fs::OpenOptionsExt as _;
+
+    std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_DIRECTORY | libc::O_CLOEXEC)
+        .open(path)
+        .map_err(|error| {
+            if error.kind() == std::io::ErrorKind::NotFound {
+                ApiError::not_found("agent_package_not_found")
+            } else {
+                ApiError::conflict("agent_package_unavailable")
+            }
+        })
+}
+
+#[cfg(not(unix))]
+fn open_snapshot_root(_path: &FsPath) -> Result<File, ApiError> {
+    Err(ApiError::conflict("agent_package_snapshot_unsupported"))
+}
+
+#[cfg(unix)]
+fn open_snapshot_directory_at(
+    parent: &File,
+    name: &str,
+    package_root: bool,
+) -> Result<File, ApiError> {
+    open_snapshot_at(parent, name, libc::O_RDONLY | libc::O_DIRECTORY)
+        .map_err(|error| map_snapshot_open_error(error, package_root))
+}
+
+#[cfg(unix)]
+fn open_snapshot_entry_at(parent: &File, name: &str) -> Result<File, ApiError> {
+    open_snapshot_at(parent, name, libc::O_RDONLY | libc::O_NONBLOCK)
+        .map_err(|error| map_snapshot_open_error(error, false))
+}
+
+#[cfg(unix)]
+fn open_snapshot_at(parent: &File, name: &str, flags: libc::c_int) -> std::io::Result<File> {
+    use std::ffi::CString;
+    use std::os::fd::{AsRawFd as _, FromRawFd as _};
+
+    let name = CString::new(name).map_err(|_| std::io::Error::from_raw_os_error(libc::EINVAL))?;
+    // SAFETY: `parent` is a retained directory descriptor, `name` is one
+    // NUL-terminated component, and a successful descriptor is transferred
+    // exactly once into `File`.
+    let descriptor = unsafe {
+        libc::openat(
+            parent.as_raw_fd(),
+            name.as_ptr(),
+            flags | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+        )
+    };
+    if descriptor < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    // SAFETY: `openat` returned a fresh owned descriptor.
+    Ok(unsafe { File::from_raw_fd(descriptor) })
+}
+
+#[cfg(unix)]
+fn map_snapshot_open_error(error: std::io::Error, package_root: bool) -> ApiError {
+    match error.raw_os_error() {
+        Some(libc::ELOOP) | Some(libc::ENOTDIR) => {
+            ApiError::conflict("agent_package_symlink_refused")
+        }
+        Some(libc::ENOENT) if package_root => ApiError::not_found("agent_package_not_found"),
+        _ => ApiError::conflict("agent_package_unavailable"),
+    }
+}
+
+#[cfg(unix)]
+struct SnapshotDirectoryStream(*mut libc::DIR);
+
+#[cfg(unix)]
+impl Drop for SnapshotDirectoryStream {
+    fn drop(&mut self) {
+        // SAFETY: this guard exclusively owns the stream returned by fdopendir.
+        unsafe { libc::closedir(self.0) };
+    }
+}
+
+#[cfg(unix)]
+fn snapshot_directory_names(directory: &File) -> Result<Vec<String>, ApiError> {
+    use std::ffi::CStr;
+    use std::os::fd::AsRawFd as _;
+
+    let duplicate = unsafe { libc::fcntl(directory.as_raw_fd(), libc::F_DUPFD_CLOEXEC, 0) };
+    if duplicate < 0 {
+        return Err(ApiError::conflict("agent_package_unavailable"));
+    }
+    // SAFETY: `duplicate` is a fresh readable directory descriptor and
+    // fdopendir takes ownership on success.
+    let raw = unsafe { libc::fdopendir(duplicate) };
+    if raw.is_null() {
+        // SAFETY: fdopendir did not take ownership on failure.
+        unsafe { libc::close(duplicate) };
+        return Err(ApiError::conflict("agent_package_unavailable"));
+    }
+    let stream = SnapshotDirectoryStream(raw);
+    let mut names = Vec::new();
+    loop {
+        #[cfg(target_os = "macos")]
+        let errno = unsafe { libc::__error() };
+        #[cfg(target_os = "linux")]
+        let errno = unsafe { libc::__errno_location() };
+        #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+        let errno: *mut libc::c_int = std::ptr::null_mut();
+        if !errno.is_null() {
+            // SAFETY: libc exposes this thread's errno slot.
+            unsafe { *errno = 0 };
+        }
+        // SAFETY: `stream` owns a valid DIR pointer for this loop.
+        let entry = unsafe { libc::readdir(stream.0) };
+        if entry.is_null() {
+            if !errno.is_null() && unsafe { *errno } != 0 {
+                return Err(ApiError::conflict("agent_package_unavailable"));
+            }
+            break;
+        }
+        // SAFETY: d_name is NUL-terminated for the lifetime of this row.
+        let bytes = unsafe { CStr::from_ptr((*entry).d_name.as_ptr()) }.to_bytes();
+        if matches!(bytes, b"." | b"..") {
+            continue;
+        }
+        let name = std::str::from_utf8(bytes)
+            .map_err(|_| ApiError::conflict("agent_package_path_unavailable"))?;
+        if name.is_empty()
+            || name.contains('/')
+            || name.contains('\\')
+            || name.chars().any(char::is_control)
+        {
+            return Err(ApiError::conflict("agent_package_path_unavailable"));
+        }
+        names.push(name.to_string());
+    }
+    names.sort();
+    Ok(names)
+}
+
+#[cfg(not(unix))]
+fn snapshot_directory_names(_directory: &File) -> Result<Vec<String>, ApiError> {
+    Err(ApiError::conflict("agent_package_snapshot_unsupported"))
+}
+
+#[cfg(not(unix))]
+fn open_snapshot_entry_at(_parent: &File, _name: &str) -> Result<File, ApiError> {
+    Err(ApiError::conflict("agent_package_snapshot_unsupported"))
+}
+
+#[cfg(not(unix))]
+fn open_snapshot_directory_at(
+    _parent: &File,
+    _name: &str,
+    _package_root: bool,
+) -> Result<File, ApiError> {
+    Err(ApiError::conflict("agent_package_snapshot_unsupported"))
+}
+
+fn collect_snapshot_files(
+    directory: &File,
+    parent_relative: &str,
+    files: &mut BTreeMap<String, Vec<u8>>,
+    before_entry_open: &mut impl FnMut(&str),
+) -> Result<(), ApiError> {
+    for name in snapshot_directory_names(directory)? {
+        let relative = if parent_relative.is_empty() {
+            name.clone()
+        } else {
+            format!("{parent_relative}/{name}")
+        };
+        before_entry_open(&relative);
+        let mut entry = open_snapshot_entry_at(directory, &name)?;
+        let metadata = entry
+            .metadata()
+            .map_err(|_| ApiError::conflict("agent_package_unavailable"))?;
+        if metadata.is_dir() {
+            collect_snapshot_files(&entry, &relative, files, before_entry_open)?;
+        } else if metadata.is_file() {
+            let mut bytes = Vec::new();
+            entry
+                .read_to_end(&mut bytes)
+                .map_err(|_| ApiError::conflict("agent_package_unavailable"))?;
+            if files.insert(relative, bytes).is_some() {
+                return Err(ApiError::conflict("agent_package_path_unavailable"));
+            }
+        } else {
+            return Err(ApiError::conflict("agent_package_entry_refused"));
+        }
+    }
+    Ok(())
 }
 
 fn canonicalize(values: &mut Vec<String>) -> Result<(), ApiError> {
@@ -1339,7 +1542,7 @@ impl ApiError {
         self.code
     }
 
-    fn response(self) -> (StatusCode, Json<Value>) {
+    pub(super) fn response(self) -> (StatusCode, Json<Value>) {
         (self.status, Json(json!({"ok": false, "error": self.code})))
     }
 }
@@ -1391,23 +1594,108 @@ mod tests {
     fn package_digest_covers_nested_executable_and_steering_bytes() {
         let first = tempfile::tempdir().unwrap();
         let second = tempfile::tempdir().unwrap();
-        for root in [first.path(), second.path()] {
+        for agents_root in [first.path(), second.path()] {
+            let root = agents_root.join("builder");
             std::fs::create_dir_all(root.join("skills/reviewer")).unwrap();
             std::fs::create_dir_all(root.join("tools")).unwrap();
             std::fs::create_dir_all(root.join("subagents/worker")).unwrap();
-            std::fs::write(root.join("agent.toml"), "name = 'builder'\n").unwrap();
+            std::fs::write(root.join("agent.toml"), "description = 'Builder'\n").unwrap();
             std::fs::write(root.join("skills/reviewer/SKILL.md"), "review v1\n").unwrap();
             std::fs::write(root.join("tools/check.sh"), "check v1\n").unwrap();
             std::fs::write(root.join("subagents/worker/instructions.md"), "work v1\n").unwrap();
         }
-        let original = digest_package_tree(first.path()).unwrap();
-        assert_eq!(original, digest_package_tree(second.path()).unwrap());
+        let original = capture_package_snapshot(first.path(), "builder").unwrap();
+        let duplicate = capture_package_snapshot(second.path(), "builder").unwrap();
+        let original_digest = digest_package_files(&original.files);
+        assert_eq!(original_digest, digest_package_files(&duplicate.files));
         std::fs::write(
-            first.path().join("subagents/worker/instructions.md"),
+            first
+                .path()
+                .join("builder/subagents/worker/instructions.md"),
             "work v2\n",
         )
         .unwrap();
-        assert_ne!(original, digest_package_tree(first.path()).unwrap());
+        let changed = capture_package_snapshot(first.path(), "builder").unwrap();
+        assert_ne!(original_digest, digest_package_files(&changed.files));
+    }
+
+    #[test]
+    fn parsed_runtime_profile_and_digest_share_one_captured_snapshot() {
+        let agents = tempfile::tempdir().unwrap();
+        let root = agents.path().join("builder");
+        std::fs::create_dir(&root).unwrap();
+        std::fs::write(
+            root.join("agent.toml"),
+            "model = 'captured-model'\ntools = ['read']\n",
+        )
+        .unwrap();
+        std::fs::write(root.join("instructions.md"), "captured instructions\n").unwrap();
+
+        let snapshot = capture_package_snapshot(agents.path(), "builder").unwrap();
+        let approved_digest = digest_package_files(&snapshot.files);
+        std::fs::write(
+            root.join("agent.toml"),
+            "model = 'replacement-model'\ntools = ['bash']\n",
+        )
+        .unwrap();
+        std::fs::write(root.join("instructions.md"), "replacement instructions\n").unwrap();
+
+        let admitted = resolve_captured_package("builder", snapshot).unwrap();
+        assert_eq!(admitted.definition_digest, approved_digest);
+        assert_eq!(admitted.model.as_deref(), Some("captured-model"));
+        assert_eq!(
+            admitted.instructions_layer.as_deref(),
+            Some("captured instructions")
+        );
+        assert_eq!(admitted.tool_allowlist, vec!["read"]);
+
+        let replacement = capture_package_snapshot(agents.path(), "builder").unwrap();
+        assert_ne!(approved_digest, digest_package_files(&replacement.files));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn package_snapshot_refuses_root_and_nested_symlinks() {
+        use std::os::unix::fs::symlink;
+
+        let temp = tempfile::tempdir().unwrap();
+        let real = temp.path().join("real");
+        std::fs::create_dir(&real).unwrap();
+        std::fs::write(real.join("instructions.md"), "outside\n").unwrap();
+        symlink(&real, temp.path().join("linked")).unwrap();
+        let error = capture_package_snapshot(temp.path(), "linked").unwrap_err();
+        assert_eq!(error.code(), "agent_package_symlink_refused");
+
+        let nested = temp.path().join("nested");
+        std::fs::create_dir(&nested).unwrap();
+        std::fs::write(nested.join("instructions.md"), "inside\n").unwrap();
+        symlink(real.join("instructions.md"), nested.join("escape.md")).unwrap();
+        let error = capture_package_snapshot(temp.path(), "nested").unwrap_err();
+        assert_eq!(error.code(), "agent_package_symlink_refused");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn package_snapshot_refuses_file_swapped_to_symlink_before_open() {
+        use std::os::unix::fs::symlink;
+
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("builder");
+        std::fs::create_dir(&root).unwrap();
+        std::fs::write(root.join("instructions.md"), "approved\n").unwrap();
+        let outside = temp.path().join("outside.md");
+        std::fs::write(&outside, "attacker\n").unwrap();
+        let mut swapped = false;
+        let error = capture_package_snapshot_with(temp.path(), "builder", &mut |relative| {
+            if !swapped && relative == "instructions.md" {
+                std::fs::remove_file(root.join("instructions.md")).unwrap();
+                symlink(&outside, root.join("instructions.md")).unwrap();
+                swapped = true;
+            }
+        })
+        .unwrap_err();
+        assert!(swapped);
+        assert_eq!(error.code(), "agent_package_symlink_refused");
     }
 
     #[test]

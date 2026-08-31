@@ -31,6 +31,11 @@ This crate owns Ocean's agent session/history layer and project prompt loading. 
   legacy `yolo_pref` is a best-effort downgrade mirror, while current boolean
   reads derive from the authoritative mode so the two cannot disagree live.
 - Project instruction discovery must respect the repo devlog chain: repo-root `AGENTS.md` is the root contract; `.ocean/AGENTS.md` is only a child doc for `.ocean/` runtime artifacts.
+- `agentdir::resolve_snapshot` parses folder-agent runtime fields only from the
+  caller-owned immutable relative-path byte map and never reopens the live
+  tree. Filesystem authority remains with the caller: security-sensitive
+  consumers must capture through confined handles and derive package identity
+  from the same map they pass to the parser.
 - `AgentRuntime::config_dir()` is the read-only daemon authority captured at construction; daemon-owned adapters must use it instead of re-reading process-global config environment during requests.
 - Do not add new instruction sources without tests proving ancestor/nested cwd behavior.
 - Project ownership resolution must compare canonical roots after the cheap exact
