@@ -7301,3 +7301,40 @@ them yet. Gate: fmt clean, clippy
 `-p ocean-daemon --all-targets -D warnings` clean, 821 tests 0 failed, toolchain
 1.97.0. Test-and-docs only — no deploy, no migration.
 _________________________________________________________________________________
+
+time:      [00:56] [08-31-26]
+agent:     [claude] [opus 5]
+worktree:  loop/os-port-closed-marker-ignores-the-route-removed-flag
+type:      [feature-request]
+area:      [backend]
+
+The `port_closed` marker told a room a port had closed and never whether the
+route actually came down, because Bedrock's `withdrawPreviewRoute` is
+best-effort and emits the event either way. ocean-bedrock #65 fixed the wire
+half — `route_removed` / `route_removed_reason` ride the close payload — and
+the daemon has been dropping both keys since, `WorkspaceEventPayload` having no
+`deny_unknown_fields`. Typing `route_removed` and rendering it off the
+`repo_unbound` precedent closes that: the bare sentence still means only that
+the port row was dropped, "— route removed" means the driver's `unexposePort`
+returned, "— route removal failed" warns the URL may still be serving what the
+room just read as gone. A producer predating #65 sends neither key and keeps
+the bare sentence, which is the honest claim when nothing vouched for the
+route.
+
+Departed from the brief on one point, and the gate is why: it asked for
+`route_removed_reason` to be typed alongside the boolean, but the marker
+deliberately never quotes it, so `-D warnings` failed the build on a dead
+field. Rather than `#[allow(dead_code)]` past the check that caught it, the
+reason stays untyped and ignored like `preview_url` — `unexpose_failed` is its
+only value and adds nothing the boolean does not already say, and quoting it
+would bet a transcript on a fixed token staying fixed rather than becoming
+relayed driver text. The tests pin that: a mistyped `route_removed` still
+poisons the row, while any shape of reason is accepted and never rendered.
+
+Bedrock #65 is landed on master but NOT deployed (`railway up` is owed), and
+production Bedrock is at 9efef97, which predates it — so rooms do not see the
+new sentences yet. The wire shape is settled either way, which is why this was
+safe to build ahead of the deploy, and the absent-field case is the live path
+until it ships. Gate: fmt clean, clippy `-p ocean-daemon --all-targets -D
+warnings` clean, 822 tests 0 failed, toolchain 1.97.0. No deploy, no migration.
+_________________________________________________________________________________

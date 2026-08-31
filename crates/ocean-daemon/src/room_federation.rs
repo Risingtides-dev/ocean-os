@@ -3307,14 +3307,18 @@ const WORKSPACE_MARKER_SOURCE_ID: &str = "workspace";
 ///   `port_closed` left for the same reason: `port_exposed` told the room a
 ///   port was serving, nothing else ever says otherwise, and silence here
 ///   leaves humans and every convened agent reading a port back as live long
-///   after it is gone. Where that precedent does NOT reach: `repo_unbound`
-///   renders its own outcome from `checkout_removed`, while this marker still
-///   reports the port's RECORDED state and never proof the route stopped
-///   serving — Bedrock emits the row even when the driver's `unexposePort`
-///   threw. The flag that would let the daemon narrow that claim now exists
-///   upstream (`route_removed` / `route_removed_reason`, ocean-bedrock #65);
-///   `WorkspaceEventPayload` ignores unknown fields, so reading and rendering
-///   it is a daemon follow-on, no longer a Bedrock one.
+///   after it is gone. It renders its own outcome the way `repo_unbound`
+///   does, from Bedrock's `route_removed` (ocean-bedrock #65): the bare
+///   sentence claims only that the port row was dropped, `— route removed`
+///   adds that the driver's `unexposePort` returned, and `— route removal
+///   failed` warns that the URL may still be serving. A producer that sends
+///   neither key degrades to the bare sentence, which is the honest claim
+///   when nothing vouched for the route either way. Bedrock's companion
+///   `route_removed_reason` is deliberately left untyped, ignored like any
+///   other unknown payload key: `unexpose_failed` is its only value and adds
+///   nothing to the sentence the boolean already carries, while quoting it
+///   would bet a transcript on a fixed token staying fixed rather than
+///   becoming relayed driver text.
 ///
 /// `flush_write` and `file_write` read like omissions from this list and are
 /// not. They are `appendAudit` action strings passed to
@@ -3372,6 +3376,8 @@ struct WorkspaceEventPayload {
     duration_ms: Option<u64>,
     #[serde(default)]
     port: Option<u64>,
+    #[serde(default)]
+    route_removed: Option<bool>,
     #[serde(default)]
     hydrated_files: Option<u64>,
     #[serde(default)]
@@ -3535,13 +3541,23 @@ fn compose_workspace_marker(event_type: &str, p: &WorkspaceEventPayload) -> Stri
             Some(port) => format!("workspace port {port} exposed"),
             None => "workspace port exposed".into(),
         },
-        // Reports the recorded close, not a torn-down route: Bedrock drops
-        // the port row and emits this event even when the driver's unexpose
-        // threw, and the payload does not distinguish the two.
-        "room.workspace.port_closed" => match p.port {
-            Some(port) => format!("workspace port {port} closed"),
-            None => "workspace port closed".into(),
-        },
+        "room.workspace.port_closed" => {
+            let mut line = match p.port {
+                Some(port) => format!("workspace port {port} closed"),
+                None => "workspace port closed".into(),
+            };
+            match p.route_removed {
+                Some(true) => line.push_str(" — route removed"),
+                // No benign false exists upstream the way `no_container`
+                // exempts an unbind: every false today is `unexpose_failed`,
+                // a URL still serving what the room just read as gone. A
+                // later benign token types `route_removed_reason` and guards
+                // this arm on it, the way `repo_unbound` already does.
+                Some(false) => line.push_str(" — route removal failed"),
+                _ => {}
+            }
+            line
+        }
         "room.workspace.flushed" => match p.changed_files {
             Some(n) => format!("workspace flushed ({n} files changed)"),
             None => "workspace flushed".into(),
@@ -8135,6 +8151,73 @@ mod tests {
             ),
             "workspace port closed",
             "missing fields degrade to shorter prose instead of failing the row"
+        );
+    }
+
+    #[test]
+    fn workspace_port_closed_marker_reports_the_route_outcome() {
+        // The real Bedrock payload shape for a clean close: `withdrawPreviewRoute`
+        // returns the bare `{route_removed: true}`, spread into both the 200 body
+        // and the event, so no reason key rides along.
+        let payload: WorkspaceEventPayload = serde_json::from_value(json!({
+            "port": 8787,
+            "route_removed": true,
+            "exec_id": "exec-1"
+        }))
+        .unwrap();
+        assert_eq!(
+            compose_workspace_marker("room.workspace.port_closed", &payload),
+            "workspace port 8787 closed — route removed"
+        );
+
+        // A swallowed unexpose leaves the URL serving what the room now reads
+        // as gone — the one close outcome a member must actually see. Its
+        // reason rides the payload and is ignored, never quoted: the marker
+        // is built from the boolean alone.
+        let payload: WorkspaceEventPayload = serde_json::from_value(json!({
+            "port": 8787,
+            "route_removed": false,
+            "route_removed_reason": "unexpose_failed"
+        }))
+        .unwrap();
+        assert_eq!(
+            compose_workspace_marker("room.workspace.port_closed", &payload),
+            "workspace port 8787 closed — route removal failed"
+        );
+
+        // The live path until Bedrock's #65 is deployed: an older producer
+        // sends neither key, and the marker must claim nothing about a route
+        // nobody vouched for.
+        let payload: WorkspaceEventPayload = serde_json::from_value(json!({
+            "port": 8787,
+            "preview_url": "https://8787-room.example.dev"
+        }))
+        .unwrap();
+        assert_eq!(
+            compose_workspace_marker("room.workspace.port_closed", &payload),
+            "workspace port 8787 closed"
+        );
+
+        // A `route_removed` that is PRESENT but mistyped poisons the whole
+        // row — the same contract as any other wrong-typed payload field.
+        for bad in [
+            json!({"port": 8787, "route_removed": "yes"}),
+            json!({"port": 8787, "route_removed": 1}),
+        ] {
+            assert!(serde_json::from_value::<WorkspaceEventPayload>(bad).is_err());
+        }
+
+        // The reason is not typed at all, so no shape of it can poison a row
+        // the boolean alone renders.
+        let payload: WorkspaceEventPayload = serde_json::from_value(json!({
+            "port": 8787,
+            "route_removed": false,
+            "route_removed_reason": {"unexpected": "shape"}
+        }))
+        .unwrap();
+        assert_eq!(
+            compose_workspace_marker("room.workspace.port_closed", &payload),
+            "workspace port 8787 closed — route removal failed"
         );
     }
 
