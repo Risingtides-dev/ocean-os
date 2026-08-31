@@ -622,6 +622,16 @@ fn unwired_trigger_response(
 /// from that client — which also disables the thread-reply row in a federated
 /// room — so it cannot wedge the form.
 ///
+/// Both of those ocean-surface facts are a MANUAL pin, conditional on it and on
+/// nothing else: they were read at `rooms_workspace.rs` (`policy_with_toggle`
+/// clones the stored policy and flips one field; `trigger_row_is_editable`
+/// blocks the row) and hold there today, but no automated cross-repo check
+/// exists and nothing in ocean-os reads ocean-surface, so a client that stops
+/// cloning the stored policy turns "unreachable" into a 400 nobody re-derived.
+/// What does NOT depend on the pin is the direction below: switching the flag
+/// off is accepted in every access state, so no client can be locked out of
+/// clearing it however its write is composed.
+///
 /// Switching the flag OFF stays allowed in every access state. It is the only
 /// way a room that federated while the flag was set can ever be cleaned up,
 /// and the daemon must not be the thing blocking that.
@@ -768,6 +778,17 @@ pub(super) async fn room_update(
         // point: a room federating between the access read and the update it
         // gates would otherwise land the flag the read had just cleared.
         if let Some(requested) = req.trigger_policy.as_ref().and_then(|p| p.as_ref()) {
+            // Establish the room is WRITABLE before refusing a write to it.
+            // `trigger_policy` and `room_access` both answer for any room the
+            // store still holds, soft-closed included, while `update` writes
+            // only an open one — so without this gate a closed federated room
+            // asking for the flag would learn its federation state from a typed
+            // 400 where the contract has always been a flat 404. Same gate
+            // `room_post_message` opens with, and under the same guard as the
+            // write, so it cannot be raced by a close in between.
+            if reg.get(&key)?.is_none() {
+                return Err(ocean_store::RoomStoreError::UnknownRoom(key.clone()).into());
+            }
             let stored = reg.trigger_policy(&key)?;
             let access = reg.room_access(&key)?.state;
             if dead_thread_reply_transition(stored.as_ref(), requested, access) {
@@ -4545,6 +4566,51 @@ mod tests {
             .unwrap()
             .expect("room exists");
         assert_eq!(stored.room.trigger_policy, Some(created_policy));
+    }
+
+    /// The refusal answers only for rooms that can be WRITTEN. `trigger_policy`
+    /// and `room_access` read any room the store still holds, soft-closed
+    /// included, while `update` writes only an open one — so the check had to be
+    /// gated or it would have answered for a room no PATCH can reach, changing a
+    /// documented 404 into a typed 400 that also discloses the closed room's
+    /// federation state. Same room as the refusal test above, closed first.
+    #[tokio::test]
+    async fn room_update_404s_a_closed_room_rather_than_refusing_its_dead_trigger() {
+        let _env = AUTO_CONVENE_ENV_LOCK.lock().await;
+        let tmp = tempfile::tempdir().unwrap();
+        let state = fake_convene_state(&tmp);
+        let key = RoomKey::new("thread-reply-closed");
+        with_rooms(&state, |store| {
+            store.create(
+                key.clone(),
+                "Thread Reply Closed",
+                Some(RoomTriggerPolicy {
+                    on_mention: true,
+                    ..Default::default()
+                }),
+                Utc::now(),
+            )?;
+            store.update_room_access_safe(&key, Some(RoomAccessState::Live), None, None)?;
+            store.install_room_credential(&key, "test-bearer", "member-a")?;
+            store.close(&key)?;
+            Ok::<_, ocean_store::RoomStoreError>(())
+        })
+        .unwrap();
+
+        // Exactly the body the open federated room is refused for.
+        let (status, body) = room_update(
+            State(state.clone()),
+            Path(key.as_str().to_string()),
+            Bytes::from_static(
+                br#"{"trigger_policy":{"on_mention":true,"on_thread_reply":true,"on_component_event":false}}"#,
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert_eq!(body.0["ok"], json!(false));
+        // Not `trigger_unwired`: a closed room is answered as absent, and is
+        // told nothing about whether it had federated.
+        assert_eq!(body.0["code"], json!(serde_json::Value::Null));
     }
 
     /// The property the refusal turns on, and the reason it is a TRANSITION

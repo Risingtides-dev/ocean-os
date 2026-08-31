@@ -8083,5 +8083,22 @@ Mutation-checked earlier in the slice: neutering the predicate to `false` fails
 3 of the 4 thread_reply tests, and dropping the `!stored.is_some_and(...)`
 clause (the naive value rule) fails the accept test 400 != 200 plus the
 predicate table.
+
+Two reviewer notes taken at land. The refusal was being evaluated before the
+store's OPEN-room gate: `trigger_policy` and `room_access` answer for any room
+the store still holds, soft-closed included, while `update` writes only an open
+one -- so a soft-closed federated room PATCHed with the flag on returned 400
+`trigger_unwired` where the contract has always been a flat 404, and was told
+its federation state in the bargain. The check now opens with the same
+`reg.get(&key)?.is_none()` gate `room_post_message` uses, under the same guard
+as the write so a close cannot race in between. Reproduced before and after:
+removing that gate turns the new
+`room_update_404s_a_closed_room_rather_than_refusing_its_dead_trigger` red with
+left 400 / right 404. And the predicate's doc stated ocean-surface internals as
+present-tense fact; it now carries this crate's convention for a cross-repo
+claim -- the guarantee is conditional on a manual pin and on nothing else, since
+no automated cross-repo check exists -- plus the half that does NOT depend on
+the pin, which is that the off direction is accepted in every access state, so
+no client can be locked out of clearing the flag however its write is composed.
 _________________________________________________________________________________
 
