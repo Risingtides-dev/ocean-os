@@ -245,12 +245,15 @@ struct WorkspaceCall {
     upstream: UpstreamMethod,
     /// Path segments appended after `/api/v1/rooms/{room}/`.
     segments: &'static [&'static str],
-    /// How long the daemon will wait for this particular call. A read answers
-    /// out of Bedrock's state; a command runs in a container first. The
+    /// How long the daemon will wait for this particular call. The split is
+    /// not "does it touch the container" — a file read does — but what an
+    /// abandoned call leaves behind, which the budget test states in full. The
     /// binding owner verbs are prompt like reads — bind and unbind land in
     /// Bedrock's own table, no container runs — while the lifecycle pair
     /// carries the command budget: provision builds and hydrates the
-    /// container, destroy flushes it back, before either answers.
+    /// container, destroy flushes it back, before either answers. The ports
+    /// pair carries it too, because an expose the daemon abandons is still a
+    /// port published and a marker in the room.
     timeout: Duration,
     /// A write verb: refuses a claimed Agent/System identity.
     write: bool,
@@ -631,10 +634,17 @@ const WORKSPACE_ALLOWLIST: &[(&str, &str, WorkspaceCall)] = &[
     // are owner verbs, because the preview URL expose returns is a routing
     // label rather than a credential — whatever the room serves on that port
     // is served to anyone holding it — and publishing a room's compute to the
-    // open internet is the owner's call to make. Neither runs container work:
-    // expose is one Cloudflare route registration and close withdraws it, so
-    // both carry the read budget. Expose's upstream body is strict deny-extra
-    // (`port` only), which the unconditional actor strip keeps legal. Close
+    // open internet is the owner's call to make. BOTH run container work, and
+    // that is why they carry the COMMAND budget: each handler drives the
+    // compute driver (`exposePort`/`unexposePort`), which for the cloudflare
+    // driver is a fetch to the room-runtime Worker on a 60s budget of its own,
+    // and upstream only checks that the workspace ROW says ready — so a first
+    // expose after an idle stop pays for a cold container start inside it. At
+    // 15s the daemon would abort while Bedrock went on to register the route,
+    // record the port and emit `room.workspace.port_exposed`: the caller reads
+    // a failure, never receives the `preview_url`, and the port is published
+    // regardless. Expose's upstream body is strict deny-extra (`port` only),
+    // which the unconditional actor strip keeps legal. Close
     // names its port in the BODY and the daemon moves it into the PATH, which
     // is what `path_from_body` is for; the upstream DELETE then reads no body
     // at all, so nothing of the shaped object travels.
@@ -644,7 +654,7 @@ const WORKSPACE_ALLOWLIST: &[(&str, &str, WorkspaceCall)] = &[
         WorkspaceCall {
             upstream: UpstreamMethod::Post,
             segments: &["workspace", "ports"],
-            timeout: WORKSPACE_READ_TIMEOUT,
+            timeout: WORKSPACE_COMMAND_TIMEOUT,
             write: false,
             owner: true,
             attributed: false,
@@ -659,7 +669,7 @@ const WORKSPACE_ALLOWLIST: &[(&str, &str, WorkspaceCall)] = &[
         WorkspaceCall {
             upstream: UpstreamMethod::Delete,
             segments: &["workspace", "ports"],
-            timeout: WORKSPACE_READ_TIMEOUT,
+            timeout: WORKSPACE_COMMAND_TIMEOUT,
             write: false,
             owner: true,
             attributed: false,
@@ -2632,20 +2642,33 @@ mod tests {
         fixture.close();
     }
 
-    /// Everything that runs container work must be able to outlast Bedrock's
-    /// own ceiling — the write verbs, and the lifecycle pair: provision
-    /// hydrates the container and restores the checkout before it answers,
-    /// destroy flushes the workspace back first. Everything that answers out
-    /// of Bedrock's state — reads AND the binding owner verbs, which land in
-    /// its repo table with no container run — must not. The table is where
-    /// that policy is declared, so the table is where it is asserted.
+    /// Which rows may outlast Bedrock's own ceiling. The write verbs, the
+    /// lifecycle pair (provision hydrates the container and restores the
+    /// checkout before it answers, destroy flushes the workspace back first),
+    /// and the ports pair, whose handlers drive the compute driver on a 60s
+    /// budget of its own before recording a row and emitting a room marker.
     ///
-    /// Mutation: give a write row `WORKSPACE_READ_TIMEOUT` -> RED; give an
-    /// owner row `write: true` or `attributed: true` -> RED.
+    /// The line is NOT "reaches the container", which would be the obvious
+    /// reading and is wrong: `GET list` and `GET file` reach it too — upstream
+    /// they are `computeDriver.listFiles`/`readFile` on that same 60s budget —
+    /// and they stay on the read budget deliberately. The line is what an
+    /// abort LEAVES BEHIND. A read that the daemon gives up on wrote nothing,
+    /// recorded nothing and emitted nothing, so the retry is free and the
+    /// caller's error is honest. An expose the daemon gives up on has already
+    /// published the port, written the row and put `port_exposed` in the
+    /// transcript, and the caller was told it failed — a divergence no retry
+    /// repairs, which is what buys the ports rows the longer budget.
+    ///
+    /// The table is where that policy is declared, so the table is where it is
+    /// asserted.
+    ///
+    /// Mutation: give a write or a ports row `WORKSPACE_READ_TIMEOUT` -> RED;
+    /// give an owner row `write: true` or `attributed: true` -> RED.
     #[test]
     fn a_command_may_outlast_bedrocks_ceiling_and_a_read_may_not() {
         for (method, leaf, call) in WORKSPACE_ALLOWLIST {
-            let runs_container_work = call.write || matches!(*leaf, "provision" | "destroy");
+            let runs_container_work =
+                call.write || matches!(*leaf, "provision" | "destroy" | "ports" | "ports/close");
             if runs_container_work {
                 assert!(
                     call.timeout > BEDROCK_EXEC_TIMEOUT_MAX,
@@ -2654,7 +2677,8 @@ mod tests {
             } else {
                 assert_eq!(
                     call.timeout, WORKSPACE_READ_TIMEOUT,
-                    "{method} {leaf} answers out of Bedrock's state and should answer promptly or not at all"
+                    "{method} {leaf} leaves nothing behind when it is abandoned, \
+                     so it should answer promptly or not at all"
                 );
             }
             if call.owner {

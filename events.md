@@ -7827,3 +7827,63 @@ join `bounded_prose` and the primitive is used for the compare-back. The doc now
 claims that and no more. Gate re-run after both edits: 828 passed / 0 failed,
 clippy -D warnings exit 0, fmt --check exit 0.
 _________________________________________________________________________________
+time:      [11:28] [08-31-26]
+agent:     [claude] [opus 5]
+worktree:  loop/ports-lane-exists-only-in-bedrock-and-nothing-in-ocean-can-reach-it
+type:      [feature-request]
+area:      [backend]
+
+Bedrock has served POST workspace/ports and DELETE workspace/ports/{port} since
+the container work landed and nothing in Ocean could reach either: the daemon's
+WORKSPACE_ALLOWLIST named neither leaf, so a room could run a dev server in its
+container with no way to let anyone look at it. Two rows close that, and both
+are gated TIGHTER than upstream -- Bedrock takes member write, this lane takes
+the owner, because the preview token Bedrock mints is in its own words "a
+routing label, not a credential: whatever the room serves on that port is served
+to anyone holding the URL". Narrowing is this lane's stated licence, but an
+unwritten narrowing reads as a mis-set flag later, so it is written in the
+module doc, the AGENTS.md bullet and the operator guide, and pinned by
+`the_allowlist_is_the_whole_reachable_surface`. Close is the first row whose
+UPSTREAM path carries a caller's value, so WorkspaceCall gained `path_from_body`:
+the row names the body key and forward() re-proves it as an integer in
+1..=65535, after the full gate and before any path is built. Bedrock's
+validatePort still owns the 1024 floor and the reserved list.
+
+Review caught two things and both are fixed here rather than in a follow-up.
+The budget was wrong: both rows shipped on the 15s read budget on the strength
+of a comment claiming "neither runs container work", and both upstream handlers
+in fact call computeCall(computeDriver.exposePort/unexposePort) -- for the
+cloudflare driver a fetch to the room-runtime Worker on a 60s budget of its own
+(src/compute/drivers/cloudflare.mjs:34), on a workspace row that only says
+'ready', so a first expose after an idle container stop pays a cold start inside
+it. At 15s the daemon aborts while Bedrock registers the route, records the port
+and emits room.workspace.port_exposed: the caller reads a failure for a port
+that IS published and never gets its preview_url. Both rows now carry
+WORKSPACE_COMMAND_TIMEOUT and are named in `runs_container_work`, so the budget
+test pins the right number instead of the wrong one. And the devlog pass was
+skipped -- crates/ocean-daemon/AGENTS.md:121, the module's own authority bullet,
+still said "Also absent: ... and port exposure" about a lane that now exposes
+ports. That clause is rewritten, its two stale call counts corrected (twelve ->
+eighteen; the twelve was already stale at sixteen before this slice), and its
+secrets half fixed too -- it claimed workspace/secrets was absent when the
+owner-gated secrets/set write has been on the lane.
+
+One correction the review got wrong, recorded because the loop should learn it:
+it held that "every other read-budget row on this lane genuinely stays in
+Bedrock's tables". It does not. GET list and GET file are
+computeDriver.listFiles/readFile upstream (src/server.mjs:2742, :2752) on the
+same 60s driver budget, and the bare GET status calls computeDriver.status. So
+the real line is NOT "reaches the container" -- it is what an abandoned call
+LEAVES BEHIND. A read the daemon gives up on wrote nothing, recorded nothing and
+emitted nothing, so the retry is free and the error is honest; an expose it
+gives up on has already published a port and put a marker in the transcript.
+The ports rows moved on that reasoning and the read rows were deliberately left
+alone; the test docstring now says this so the next reader does not re-derive
+the reviewer's version.
+
+Gate green: 830 passed / 0 failed, clippy -D warnings exit 0, fmt --check exit 0,
+toolchain 1.97.0. Both fixes proven by mutation: reverting either ports row to
+the read budget, or dropping the ports leaves from `runs_container_work`, turns
+the budget test RED. No deploy, no migration -- the daemon lands to main and the
+Bedrock side was already shipped.
+_________________________________________________________________________________
