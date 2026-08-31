@@ -12977,7 +12977,7 @@ mod tests {
             .find("room_agent_authority::admit_room_agent(")
             .expect("authority admission must stay before the convene footprint");
         let spawned_turn = body
-            .find("\n            let _ = spawn_room_agent_turn(")
+            .find("if let Err(error) = spawn_room_agent_turn(")
             .expect("room-agent turn spawn must stay in the handler");
         let footprint = body
             .find("Some(RoomTurnFootprint {")
@@ -16800,9 +16800,10 @@ mod tests {
         // Room with an agent participant `helper` and an on_mention policy.
         let key = RoomKey::new("convene-room");
         with_rooms(&state, |reg| {
-            reg.create(
+            reg.create_in_workspace(
                 key.clone(),
                 "Convene Room",
+                Some(tmp.path().to_string_lossy().into_owned()),
                 Some(RoomTriggerPolicy {
                     on_mention: true,
                     ..Default::default()
@@ -16854,7 +16855,8 @@ mod tests {
         .await;
         assert_eq!(status, StatusCode::CREATED);
         let returned_message = &body.0["message"];
-        assert_eq!(returned_message["seq"], 3);
+        assert_eq!(returned_message["seq"], 4);
+        let returned_seq = returned_message["seq"].as_u64().unwrap();
         assert_eq!(returned_message["author_id"], "john");
         assert_eq!(returned_message["author_kind"], "human");
         assert_eq!(
@@ -16898,7 +16900,7 @@ mod tests {
                         "room": "convene-room",
                         "target": "helper",
                         "reason": "on_mention: @helper mentioned",
-                        "triggered_by_seq": 3,
+                        "triggered_by_seq": returned_seq,
                     })
                 );
                 assert_eq!(scope, None, "room triggers remain globally scoped");
@@ -16924,11 +16926,11 @@ mod tests {
         // The spawned turn may already have replied, but the authority, author,
         // admission, and legacy audit rows remain densely ordered.
         let immediate = with_rooms(&state, |reg| reg.transcript(&key, None)).unwrap();
-        assert!(immediate.len() >= 6);
+        assert!(immediate.len() >= 7);
         let returned: ocean_core::RoomMessage =
             serde_json::from_value(returned_message.clone()).unwrap();
         assert_eq!(
-            returned, immediate[3],
+            returned, immediate[4],
             "the response message is the exact persisted author row"
         );
         assert_eq!(immediate[0].seq, 0);
@@ -16939,18 +16941,27 @@ mod tests {
         assert_eq!(immediate[2].seq, 2);
         assert_eq!(immediate[2].author_id, "system");
         assert_eq!(immediate[2].kind, RoomMessageKind::System);
+        assert!(immediate[2]
+            .body
+            .contains("\"type\":\"room.agent.bootstrap\""));
         assert_eq!(immediate[3].seq, 3);
-        assert_eq!(immediate[3].author_id, "john");
-        assert_eq!(immediate[3].kind, RoomMessageKind::Message);
+        assert_eq!(immediate[3].author_id, "system");
+        assert_eq!(immediate[3].kind, RoomMessageKind::System);
+        assert!(immediate[3]
+            .body
+            .contains("\"type\":\"room.agent.authority\""));
         assert_eq!(immediate[4].seq, 4);
-        assert_eq!(immediate[4].author_id, "system");
-        assert!(immediate[4].body.contains("\"outcome\":\"admitted\""));
+        assert_eq!(immediate[4].author_id, "john");
+        assert_eq!(immediate[4].kind, RoomMessageKind::Message);
         assert_eq!(immediate[5].seq, 5);
         assert_eq!(immediate[5].author_id, "system");
-        assert_eq!(immediate[5].author_kind, RoomParticipantKind::System);
-        assert_eq!(immediate[5].kind, RoomMessageKind::System);
+        assert!(immediate[5].body.contains("\"outcome\":\"admitted\""));
+        assert_eq!(immediate[6].seq, 6);
+        assert_eq!(immediate[6].author_id, "system");
+        assert_eq!(immediate[6].author_kind, RoomParticipantKind::System);
+        assert_eq!(immediate[6].kind, RoomMessageKind::System);
         assert_eq!(
-            immediate[5].body,
+            immediate[6].body,
             "auto-convene: helper (on_mention: @helper mentioned)"
         );
 
@@ -16969,7 +16980,7 @@ mod tests {
             reply.body
         );
         assert!(
-            reply.seq > 3,
+            reply.seq > returned_seq,
             "the spawned turn reply must follow the synchronous audit row"
         );
 
@@ -17308,12 +17319,11 @@ mod tests {
         std::env::remove_var("OCEAN_YOLO");
     }
 
-    /// OCEAN-260 backward-compat: a room with NO workspace binding (every room
-    /// created before this feature) convenes exactly as before — the turn falls
-    /// back to the daemon's launch dir and the session resolves no owning project.
-    /// This pins that unbound rooms are not silently swept into some project.
+    /// Phase 1 workspace isolation: a Room with no workspace binding may retain
+    /// its transcript and authority rows, but it cannot start an agent session.
+    /// In particular, it never inherits the daemon's own launch directory.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn unbound_room_convene_falls_back_with_no_project() {
+    async fn unbound_room_convene_fails_closed_without_session_or_reply() {
         let _guard = AUTO_CONVENE_ENV_LOCK.lock().await;
         let _env = TestEnvRestore::capture(&[
             "OCEAN_CONFIG_DIR",
@@ -17326,6 +17336,7 @@ mod tests {
         let agents_root = tmp.path().join("agents");
         write_agent_fixture(&agents_root, "helper", "", None);
         std::env::set_var("OCEAN_AGENTS_DIR", &agents_root);
+        let (_replay, mut trigger_rx) = state.agent_events.subscribe_with_replay(None);
 
         // Plain `create` (no workspace_root) — the legacy path.
         let key = RoomKey::new("unbound-convene-room");
@@ -17371,7 +17382,7 @@ mod tests {
             ocean_store::ContextPolicy::InvocationOnly,
         );
 
-        let (status, _body) = room_post_message(
+        let (status, body) = room_post_message(
             State(state.clone()),
             Path("unbound-convene-room".to_string()),
             Json(RoomMessageRequest {
@@ -17383,42 +17394,41 @@ mod tests {
         )
         .await;
         assert_eq!(status, StatusCode::CREATED);
+        assert_eq!(body.0["message"]["author_id"], "john");
 
         let expected_sid = core_sid(persistent_rooms::authorized_room_agent_session_id(
             &key, "helper", generation,
         ));
-        let _reply = wait_for_message(&state, &key, |m| {
-            m.author_id == "helper" && matches!(m.author_kind, RoomParticipantKind::Agent)
-        })
-        .await
-        .expect("the woken agent must post a reply back into the room");
-
-        // No workspace binding ⇒ the turn falls back to the daemon's launch dir
-        // (its workspace anchor), exactly as before OCEAN-260 — NOT the bound
-        // path. The session binds to that launch-dir workspace.
-        let launch_ws = state
-            .runtime
-            .workspace_root_for(&std::env::current_dir().unwrap())
-            .to_string_lossy()
-            .into_owned();
-        let detail = wait_for_session(&state, expected_sid)
-            .await
-            .expect("the convened session must exist");
-        assert_eq!(
-            detail.workspace_root.as_deref(),
-            Some(launch_ws.as_str()),
-            "an unbound room's turn must fall back to the daemon launch dir"
-        );
-        // And no project is registered there in this temp config, so the reverse
-        // map yields no project — the legacy "room agent has no project" posture.
         assert!(
-            state
-                .runtime
-                .project_for_workspace(&launch_ws)
-                .expect("project lookup must not error")
-                .is_none(),
-            "an unbound room's session must not resolve an owning project"
+            state.runtime.session_detail(expected_sid).is_err(),
+            "an unbound Room must not create an agent session"
         );
+        assert!(
+            state.requests.read().await.is_empty(),
+            "an unbound Room must not register an agent request"
+        );
+        let transcript = with_rooms(&state, |reg| reg.transcript(&key, None)).unwrap();
+        assert!(
+            transcript
+                .iter()
+                .all(|message| message.author_id != "helper"
+                    || !matches!(message.kind, RoomMessageKind::Message)),
+            "an unbound Room must not receive an agent reply"
+        );
+        assert!(
+            transcript.iter().any(|message| {
+                message.body.contains("\"outcome\":\"refused\"")
+                    && message
+                        .body
+                        .contains("\"reason_code\":\"workspace_unavailable\"")
+            }),
+            "the workspace refusal must be durable and content-minimal"
+        );
+        while let Ok(event) = trigger_rx.try_recv() {
+            if let AgentTurnEvent::Extension { extension, .. } = event.event {
+                assert_ne!(extension, "room_trigger", "no convene footprint may escape");
+            }
+        }
 
         std::env::remove_var("OCEAN_YOLO");
     }

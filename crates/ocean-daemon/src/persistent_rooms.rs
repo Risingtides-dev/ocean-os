@@ -5929,9 +5929,10 @@ mod tests {
 
         let key = RoomKey::new("g3-thread-dispatch");
         with_rooms(&state, |store| {
-            store.create(
+            store.create_in_workspace(
                 key.clone(),
                 "G3 Thread Dispatch",
+                Some(tmp.path().to_string_lossy().into_owned()),
                 Some(RoomTriggerPolicy {
                     on_mention: true,
                     on_thread_reply: true,
@@ -6644,7 +6645,13 @@ mod tests {
         let human = "11111111-1111-4111-8111-111111111111";
         let member = "33333333-3333-4333-8333-333333333333";
         with_rooms(&state, |store| {
-            store.create(key.clone(), "Dispatch", None, Utc::now())?;
+            store.create_in_workspace(
+                key.clone(),
+                "Dispatch",
+                Some(tmp.path().to_string_lossy().into_owned()),
+                None,
+                Utc::now(),
+            )?;
             store.install_room_credential(&key, "private-bearer", human)?;
             store.bind_room_agent(&key, member, "bound-agent", "registration-key")?;
             store.update_room_access_safe(

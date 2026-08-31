@@ -8160,3 +8160,25 @@ the pin, which is that the off direction is accepted in every access state, so
 no client can be locked out of clearing the flag however its write is composed.
 _________________________________________________________________________________
 
+time:      [14:59] [31-08-26]
+agent:     [codex] [gpt-5.6-sol]
+worktree:  [codex/rooms-phase1-integration-20260831]
+type:      [bug report]
+area:      [testing]
+
+Reconciled the Rooms Phase 1 branch with current origin/main and repaired five
+stale daemon tests without reopening the workspace security boundary. Fixtures
+that exercise a real local or federated agent turn now bind an explicit existing
+workspace; the legacy unbound-Room test now proves there is no request, session,
+agent reply, or convene event and that the fixed workspace_unavailable refusal
+is durable. The mention-order characterization includes the new Local owner
+bootstrap audit, and its source-order guard follows the checked spawn call's
+current error-handling shape.
+
+Verification: `cargo test -p ocean-daemon --bin ocean-daemon --
+--test-threads=1` passed 850 tests with zero failures after merging origin/main
+at `8320a975a23d03f7e98982ff81d8f793f100b4c6`; `cargo fmt --all` and
+`git diff --check` passed. The existing daemon devlog already states the exact
+explicit-workspace/fail-closed contract, so no contract text changed. No push,
+merge to main, install, restart, database mutation, or deployment was performed.
+_________________________________________________________________________________
