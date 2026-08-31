@@ -1,6 +1,6 @@
 # Ocean Rooms — Phase 1 implementation manifest: local room-agent authorization
 
-**Status:** operator-accepted 2026-08-25 for **concurrent implementation and review**
+**Status:** operator-accepted 2026-08-25; implementation landed 2026-08-31 through Ocean OS PR #425 and Ocean Surface PR #177 after exact-candidate review and green local/GitHub gates. Stage 2 remains closed.
 
 > **Deviation from Gate 0, recorded deliberately.** Gate 0 and the ROADMAP call
 > for independent review *before* implementation. The operator has ruled that
