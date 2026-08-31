@@ -162,6 +162,72 @@ impl std::fmt::Display for PrincipalId {
 }
 
 // ===========================================================================
+// Session partitions
+// ===========================================================================
+
+/// The durable partition used by ordinary operator memory rows.
+///
+/// This is also the additive SQLite default, so rows written before partitions
+/// existed remain in the same logical namespace without a data rewrite.
+const OPERATOR_PARTITION: &str = "operator:v1";
+
+/// Stable owner inside every room partition. The partition carries the exact
+/// room identity; this shared owner makes room memory room-wide instead of
+/// accidentally creating one silo per admitted agent.
+const ROOM_PARTITION_OWNER: &str = "room:v1";
+
+/// Return the only owner principal accepted for a room-memory handle.
+///
+/// Admission code should use this rather than an agent member id. The value is
+/// intentionally the same across rooms because the independently constrained
+/// partition carries the room identity.
+pub fn room_memory_owner() -> PrincipalId {
+    PrincipalId::new(ROOM_PARTITION_OWNER)
+}
+
+/// An opaque, store-authorized room memory scope.
+///
+/// The fields and constructor are deliberately private: model-facing memory
+/// tools may carry this value, but cannot manufacture a different room by
+/// concatenating a caller-controlled key. Only [`SqliteMemoryStore::trusted_room_scope`]
+/// can mint one at the trusted admission/store boundary.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RoomMemoryScope {
+    partition: String,
+}
+
+/// The memory authority attached to one agent session.
+///
+/// `Room` contains an opaque capability rather than a raw string. This keeps
+/// room selection at the trusted admission boundary while ordinary tool calls
+/// receive only a fixed partition. The type intentionally has no serde
+/// implementation, so a request payload cannot deserialize itself into room
+/// memory authority.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SessionMemoryScope {
+    /// Existing operator/global memory.
+    Operator,
+    /// Memory is unavailable for this session. Every scoped operation fails
+    /// closed and leaves the database untouched.
+    Disabled,
+    /// Memory isolated to one exact persistent Room key.
+    Room(RoomMemoryScope),
+}
+
+impl SessionMemoryScope {
+    /// Stable partition principal used for persistence and audit. `None` means
+    /// memory is disabled. This is observable but not accepted as authority by
+    /// any constructor, so reading it cannot be used to forge another scope.
+    pub fn partition_principal(&self) -> Option<&str> {
+        match self {
+            Self::Operator => Some(OPERATOR_PARTITION),
+            Self::Disabled => None,
+            Self::Room(room) => Some(&room.partition),
+        }
+    }
+}
+
+// ===========================================================================
 // The memory row
 // ===========================================================================
 
@@ -203,6 +269,8 @@ pub enum MemoryError {
     Encode(String),
     /// Caller input was invalid (empty id, unknown enum, duplicate id, …).
     BadInput(String),
+    /// This session was admitted without memory authority.
+    Disabled,
 }
 
 impl std::fmt::Display for MemoryError {
@@ -211,6 +279,7 @@ impl std::fmt::Display for MemoryError {
             MemoryError::Db(s) => write!(f, "memory db error: {s}"),
             MemoryError::Encode(s) => write!(f, "memory encode error: {s}"),
             MemoryError::BadInput(s) => write!(f, "memory bad input: {s}"),
+            MemoryError::Disabled => f.write_str("memory is disabled for this session"),
         }
     }
 }
@@ -315,6 +384,47 @@ impl SqliteMemoryStore {
         Self::open(":memory:")
     }
 
+    /// Mint an opaque room-memory scope from an already-authorized persistent
+    /// Room key.
+    ///
+    /// This method is the trusted constructor: callers must invoke it only
+    /// after room-agent admission has resolved the authoritative [`RoomKey`]
+    /// equivalent. The exact string is preserved and length-prefixed by UTF-8
+    /// bytes, preventing ambiguous principals such as `a:bc` and `a:b:c`.
+    /// Model-facing tools receive the returned value, never a raw key-to-scope
+    /// constructor.
+    pub fn trusted_room_scope(&self, room_key: &str) -> Result<SessionMemoryScope> {
+        if room_key.trim().is_empty() {
+            return Err(MemoryError::BadInput(
+                "room memory key cannot be empty".into(),
+            ));
+        }
+        let partition = format!("room:v1:{}:{room_key}", room_key.len());
+        Ok(SessionMemoryScope::Room(RoomMemoryScope { partition }))
+    }
+
+    /// Borrow this database through one fixed session scope and owner.
+    ///
+    /// The returned handle is the only API room tools should receive. Its
+    /// fields are private, and every SQL operation injects both the fixed
+    /// partition and fixed owner instead of accepting either from tool input.
+    pub fn scoped<'a>(
+        &'a mut self,
+        scope: &SessionMemoryScope,
+        owner: &PrincipalId,
+    ) -> Result<ScopedMemoryStore<'a>> {
+        if matches!(scope, SessionMemoryScope::Room(_)) && owner.0 != ROOM_PARTITION_OWNER {
+            return Err(MemoryError::BadInput(
+                "room memory must use the stable room-wide owner".into(),
+            ));
+        }
+        Ok(ScopedMemoryStore {
+            store: self,
+            scope: scope.clone(),
+            owner: owner.clone(),
+        })
+    }
+
     /// Idempotent schema bootstrap.
     fn migrate(conn: &Connection) -> Result<()> {
         conn.execute_batch(
@@ -330,12 +440,38 @@ impl SqliteMemoryStore {
                 written_at  INTEGER NOT NULL,
                 updated_at  INTEGER NOT NULL,
                 deleted_at  INTEGER,
-                history     TEXT NOT NULL DEFAULT '[]'
+                history     TEXT NOT NULL DEFAULT '[]',
+                partition   TEXT NOT NULL DEFAULT 'operator:v1'
             );
             CREATE INDEX IF NOT EXISTS idx_memories_owner_seq
                 ON memories(owner, seq DESC);
             CREATE INDEX IF NOT EXISTS idx_memories_owner_live
                 ON memories(owner) WHERE deleted_at IS NULL;",
+        )?;
+
+        // SQLite's additive-column migration changes only the table metadata;
+        // existing rows are not rewritten and read the stable operator default.
+        // Keep this separate from CREATE TABLE because IF NOT EXISTS does not
+        // add columns to databases created by older Ocean versions.
+        let has_partition = {
+            let mut stmt = conn.prepare("PRAGMA table_info(memories)")?;
+            let names = stmt.query_map([], |row| row.get::<_, String>(1))?;
+            names
+                .collect::<std::result::Result<Vec<_>, _>>()?
+                .iter()
+                .any(|name| name == "partition")
+        };
+        if !has_partition {
+            conn.execute(
+                "ALTER TABLE memories ADD COLUMN partition TEXT NOT NULL DEFAULT 'operator:v1'",
+                [],
+            )?;
+        }
+        conn.execute_batch(
+            "CREATE INDEX IF NOT EXISTS idx_memories_partition_owner_seq
+                ON memories(partition, owner, seq DESC);
+             CREATE INDEX IF NOT EXISTS idx_memories_partition_owner_live
+                ON memories(partition, owner) WHERE deleted_at IS NULL;",
         )?;
         Ok(())
     }
@@ -486,6 +622,236 @@ impl MemoryStore for SqliteMemoryStore {
             |r| r.get(0),
         )?;
         Ok(n.max(0) as u64)
+    }
+}
+
+// ===========================================================================
+// Capability-safe scoped store
+// ===========================================================================
+
+/// A borrow of [`SqliteMemoryStore`] fixed to one session partition and owner.
+///
+/// This is the store boundary for room-facing memory tools. Neither the room
+/// key/partition nor the owner can be supplied per operation, and all queries
+/// constrain both values in SQL. The legacy [`MemoryStore`] implementation on
+/// [`SqliteMemoryStore`] remains unchanged for existing ordinary callers.
+pub struct ScopedMemoryStore<'a> {
+    store: &'a mut SqliteMemoryStore,
+    scope: SessionMemoryScope,
+    owner: PrincipalId,
+}
+
+impl ScopedMemoryStore<'_> {
+    /// The fixed owner for this capability handle.
+    pub fn owner(&self) -> &PrincipalId {
+        &self.owner
+    }
+
+    /// The fixed session memory scope for this capability handle.
+    pub fn scope(&self) -> &SessionMemoryScope {
+        &self.scope
+    }
+
+    fn partition(&self) -> Result<&str> {
+        self.scope
+            .partition_principal()
+            .ok_or(MemoryError::Disabled)
+    }
+
+    /// Insert into this handle's fixed partition and owner.
+    ///
+    /// `mem.owner` must agree with the capability owner; the SQL insert uses
+    /// the captured owner regardless. Sequence numbers are monotonic within
+    /// `(partition, owner)`, so activity in another room cannot influence the
+    /// visible ordering of this one.
+    pub fn put(&mut self, mut mem: Memory) -> Result<Memory> {
+        let partition = self.partition()?.to_owned();
+        if mem.id.0.trim().is_empty() {
+            return Err(MemoryError::BadInput("memory id cannot be empty".into()));
+        }
+        if mem.owner.0.trim().is_empty() {
+            return Err(MemoryError::BadInput("memory owner cannot be empty".into()));
+        }
+        if mem.owner != self.owner {
+            return Err(MemoryError::BadInput(
+                "memory owner does not match scoped authority".into(),
+            ));
+        }
+
+        let body = serde_json::to_string(&mem.body)?;
+        let provenance = serde_json::to_string(&mem.provenance)?;
+        let history = serde_json::to_string(&mem.history)?;
+        let trust = trust_to_str(mem.trust);
+        let tx = self
+            .store
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let next_seq: u64 = tx
+            .query_row(
+                "SELECT COALESCE(MAX(seq), 0) + 1
+                 FROM memories
+                 WHERE partition = ?1 AND owner = ?2",
+                params![partition, self.owner.0],
+                |row| row.get::<_, i64>(0),
+            )
+            .map(|value| value.max(0) as u64)?;
+        mem.seq = next_seq;
+        let inserted = tx.execute(
+            "INSERT INTO memories
+                (id, partition, scope, owner, kind, body, provenance, trust, seq,
+                 written_at, updated_at, history)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+            params![
+                mem.id.0,
+                partition,
+                mem.scope.as_str(),
+                self.owner.0,
+                mem.kind.as_str(),
+                body,
+                provenance,
+                trust,
+                next_seq as i64,
+                mem.written_at,
+                mem.updated_at,
+                history,
+            ],
+        );
+        if let Err(error) = inserted {
+            if matches!(
+                error,
+                rusqlite::Error::SqliteFailure(
+                    rusqlite::ffi::Error {
+                        code: rusqlite::ErrorCode::ConstraintViolation,
+                        ..
+                    },
+                    _
+                )
+            ) {
+                return Err(MemoryError::BadInput("memory id is unavailable".into()));
+            }
+            return Err(error.into());
+        }
+        tx.commit()?;
+        Ok(mem)
+    }
+
+    /// Read one live row only when both partition and owner match this handle.
+    pub fn get(&self, id: &MemoryId) -> Result<Option<Memory>> {
+        let partition = self.partition()?;
+        let memory = self
+            .store
+            .conn
+            .query_row(
+                "SELECT id, scope, owner, kind, body, provenance, trust, seq,
+                        written_at, updated_at, history
+                 FROM memories
+                 WHERE id = ?1 AND partition = ?2 AND owner = ?3
+                       AND deleted_at IS NULL",
+                params![id.0, partition, self.owner.0],
+                decode_row,
+            )
+            .optional()?;
+        Ok(memory)
+    }
+
+    /// List a bounded newest-first page inside the fixed partition and owner.
+    pub fn list_page(&self, after_seq: Option<u64>, limit: Option<usize>) -> Result<MemoryPage> {
+        let partition = self.partition()?;
+        let limit = clamp_page_limit(limit);
+        let rows: Vec<Memory> = match after_seq {
+            Some(sequence) => {
+                let mut stmt = self.store.conn.prepare(
+                    "SELECT id, scope, owner, kind, body, provenance, trust, seq,
+                            written_at, updated_at, history
+                     FROM memories
+                     WHERE partition = ?1 AND owner = ?2
+                           AND deleted_at IS NULL AND seq < ?3
+                     ORDER BY seq DESC LIMIT ?4",
+                )?;
+                let mapped = stmt.query_map(
+                    params![partition, self.owner.0, sequence as i64, (limit + 1) as i64],
+                    decode_row,
+                )?;
+                mapped.collect::<std::result::Result<Vec<_>, _>>()?
+            }
+            None => {
+                let mut stmt = self.store.conn.prepare(
+                    "SELECT id, scope, owner, kind, body, provenance, trust, seq,
+                            written_at, updated_at, history
+                     FROM memories
+                     WHERE partition = ?1 AND owner = ?2 AND deleted_at IS NULL
+                     ORDER BY seq DESC LIMIT ?3",
+                )?;
+                let mapped = stmt.query_map(
+                    params![partition, self.owner.0, (limit + 1) as i64],
+                    decode_row,
+                )?;
+                mapped.collect::<std::result::Result<Vec<_>, _>>()?
+            }
+        };
+
+        let has_more = rows.len() > limit;
+        let mut memories = rows;
+        if has_more {
+            memories.truncate(limit);
+        }
+        let next_seq = memories.last().map(|memory| memory.seq);
+        Ok(MemoryPage {
+            memories,
+            next_seq,
+            has_more,
+        })
+    }
+
+    /// Soft-delete only a row in the fixed partition and owner. The result is
+    /// intentionally idempotent and does not disclose whether a guessed id
+    /// exists in another partition.
+    pub fn delete(&mut self, id: &MemoryId, now: i64) -> Result<()> {
+        let partition = self.partition()?.to_owned();
+        self.store.conn.execute(
+            "UPDATE memories
+             SET deleted_at = ?1
+             WHERE id = ?2 AND partition = ?3 AND owner = ?4
+                   AND deleted_at IS NULL",
+            params![now, id.0, partition, self.owner.0],
+        )?;
+        Ok(())
+    }
+
+    /// Count live rows only inside the fixed partition and owner.
+    pub fn count(&self) -> Result<u64> {
+        let partition = self.partition()?;
+        let count: i64 = self.store.conn.query_row(
+            "SELECT COUNT(*)
+             FROM memories
+             WHERE partition = ?1 AND owner = ?2 AND deleted_at IS NULL",
+            params![partition, self.owner.0],
+            |row| row.get(0),
+        )?;
+        Ok(count.max(0) as u64)
+    }
+
+    /// Deterministic newest-first substring search inside the fixed partition
+    /// and owner. An empty query returns the newest rows.
+    ///
+    /// Search is performed by SQLite so the partition and owner predicates are
+    /// inseparable from the content match; callers never scan an unscoped page.
+    pub fn search(&self, query: &str, limit: Option<usize>) -> Result<Vec<Memory>> {
+        let partition = self.partition()?;
+        let limit = clamp_page_limit(limit);
+        let mut stmt = self.store.conn.prepare(
+            "SELECT id, scope, owner, kind, body, provenance, trust, seq,
+                    written_at, updated_at, history
+             FROM memories
+             WHERE partition = ?1 AND owner = ?2 AND deleted_at IS NULL
+                   AND (?3 = '' OR instr(lower(body), lower(?3)) > 0)
+             ORDER BY seq DESC LIMIT ?4",
+        )?;
+        let mapped = stmt.query_map(
+            params![partition, self.owner.0, query, limit as i64],
+            decode_row,
+        )?;
+        Ok(mapped.collect::<std::result::Result<Vec<_>, _>>()?)
     }
 }
 
@@ -701,6 +1067,296 @@ mod tests {
         // Re-open: migrate must not error on the existing schema, data survives.
         let store = SqliteMemoryStore::open(path).unwrap();
         assert_eq!(store.count(&PrincipalId::new("a")).unwrap(), 1);
+    }
+
+    #[test]
+    fn operator_scope_preserves_existing_global_rows() {
+        let mut store = SqliteMemoryStore::open_in_memory().unwrap();
+        let original = sample_memory("operator", "global preference");
+        let stored = MemoryStore::put(&mut store, original.clone()).unwrap();
+
+        // The legacy API and row serde shape remain unchanged.
+        let legacy = MemoryStore::get(&store, &stored.id)
+            .unwrap()
+            .expect("legacy global row");
+        assert_eq!(legacy.body, original.body);
+        assert_eq!(legacy.scope, MemoryScope::Operator);
+
+        // The capability-safe operator handle maps old rows into the additive
+        // operator partition without rewriting them.
+        let owner = PrincipalId::new("operator");
+        let mut scoped = store.scoped(&SessionMemoryScope::Operator, &owner).unwrap();
+        assert_eq!(scoped.get(&stored.id).unwrap(), Some(legacy));
+        assert_eq!(scoped.count().unwrap(), 1);
+        assert_eq!(scoped.search("GLOBAL", Some(8)).unwrap().len(), 1);
+
+        let second = scoped
+            .put(sample_memory("operator", "another global fact"))
+            .unwrap();
+        assert_eq!(second.seq, stored.seq + 1);
+    }
+
+    #[test]
+    fn room_partition_uses_exact_utf8_byte_length() {
+        let store = SqliteMemoryStore::open_in_memory().unwrap();
+        let key = "røom/潮";
+        let scope = store.trusted_room_scope(key).unwrap();
+        assert_eq!(
+            scope.partition_principal(),
+            Some(format!("room:v1:{}:{key}", key.len()).as_str())
+        );
+        assert!(store.trusted_room_scope("   ").is_err());
+    }
+
+    #[test]
+    fn room_partitions_cannot_cross_read_write_delete_list_count_or_search() {
+        let mut store = SqliteMemoryStore::open_in_memory().unwrap();
+        let owner = room_memory_owner();
+        let room_a = store.trusted_room_scope("room:a").unwrap();
+        let room_b = store.trusted_room_scope("room:a:extra").unwrap();
+
+        let global = MemoryStore::put(
+            &mut store,
+            sample_memory(ROOM_PARTITION_OWNER, "global-only-secret"),
+        )
+        .unwrap();
+        let a = {
+            let mut scoped = store.scoped(&room_a, &owner).unwrap();
+            scoped
+                .put(sample_memory(ROOM_PARTITION_OWNER, "alpha-room-only"))
+                .unwrap()
+        };
+        let b = {
+            let mut scoped = store.scoped(&room_b, &owner).unwrap();
+            scoped
+                .put(sample_memory(ROOM_PARTITION_OWNER, "beta-room-secret"))
+                .unwrap()
+        };
+
+        {
+            let mut scoped_a = store.scoped(&room_a, &owner).unwrap();
+            assert_eq!(scoped_a.get(&global.id).unwrap(), None);
+            assert_eq!(scoped_a.get(&b.id).unwrap(), None);
+            assert_eq!(scoped_a.count().unwrap(), 1);
+            assert_eq!(
+                scoped_a
+                    .list_page(None, Some(100))
+                    .unwrap()
+                    .memories
+                    .iter()
+                    .map(|memory| &memory.id)
+                    .collect::<Vec<_>>(),
+                vec![&a.id]
+            );
+            assert!(scoped_a
+                .search("beta-room-secret", Some(100))
+                .unwrap()
+                .is_empty());
+            assert!(scoped_a
+                .search("global-only-secret", Some(100))
+                .unwrap()
+                .is_empty());
+
+            // Guessed ids in other partitions are neither deleted nor usable
+            // as a write target. The duplicate error is deliberately generic.
+            scoped_a.delete(&b.id, 1_780_000_100).unwrap();
+            scoped_a.delete(&global.id, 1_780_000_100).unwrap();
+            let mut collision = sample_memory(ROOM_PARTITION_OWNER, "overwrite");
+            collision.id = b.id.clone();
+            assert!(matches!(
+                scoped_a.put(collision),
+                Err(MemoryError::BadInput(message)) if message == "memory id is unavailable"
+            ));
+        }
+
+        assert!(store
+            .scoped(&room_b, &owner)
+            .unwrap()
+            .get(&b.id)
+            .unwrap()
+            .is_some());
+        assert!(MemoryStore::get(&store, &global.id).unwrap().is_some());
+    }
+
+    #[test]
+    fn room_scope_enforces_one_room_wide_owner() {
+        let mut store = SqliteMemoryStore::open_in_memory().unwrap();
+        let room = store.trusted_room_scope("shared-room").unwrap();
+        let error = match store.scoped(&room, &PrincipalId::new("agent-member-7")) {
+            Ok(_) => panic!("per-agent room owner must be rejected"),
+            Err(error) => error,
+        };
+        assert!(matches!(error, MemoryError::BadInput(_)));
+
+        let owner = room_memory_owner();
+        let scoped = store.scoped(&room, &owner).unwrap();
+        assert_eq!(scoped.owner(), &owner);
+    }
+
+    #[test]
+    fn owners_cannot_cross_within_the_same_partition() {
+        let mut store = SqliteMemoryStore::open_in_memory().unwrap();
+        let scope = SessionMemoryScope::Operator;
+        let alice = PrincipalId::new("alice");
+        let bob = PrincipalId::new("bob");
+        let alice_memory = {
+            let mut scoped = store.scoped(&scope, &alice).unwrap();
+            scoped.put(sample_memory("alice", "alice secret")).unwrap()
+        };
+
+        {
+            let mut scoped = store.scoped(&scope, &bob).unwrap();
+            assert_eq!(scoped.get(&alice_memory.id).unwrap(), None);
+            assert_eq!(scoped.count().unwrap(), 0);
+            assert!(scoped.list_page(None, None).unwrap().memories.is_empty());
+            assert!(scoped.search("alice secret", None).unwrap().is_empty());
+            scoped.delete(&alice_memory.id, 1_780_000_111).unwrap();
+            assert!(matches!(
+                scoped.put(sample_memory("alice", "wrong owner")),
+                Err(MemoryError::BadInput(_))
+            ));
+        }
+
+        assert!(store
+            .scoped(&scope, &alice)
+            .unwrap()
+            .get(&alice_memory.id)
+            .unwrap()
+            .is_some());
+    }
+
+    #[test]
+    fn disabled_scope_refuses_every_operation_and_is_inert() {
+        let mut store = SqliteMemoryStore::open_in_memory().unwrap();
+        let owner = PrincipalId::new("operator");
+        let baseline = MemoryStore::put(&mut store, sample_memory("operator", "baseline")).unwrap();
+        {
+            let mut disabled = store.scoped(&SessionMemoryScope::Disabled, &owner).unwrap();
+            assert!(matches!(
+                disabled.get(&baseline.id),
+                Err(MemoryError::Disabled)
+            ));
+            assert!(matches!(disabled.count(), Err(MemoryError::Disabled)));
+            assert!(matches!(
+                disabled.list_page(None, None),
+                Err(MemoryError::Disabled)
+            ));
+            assert!(matches!(
+                disabled.search("baseline", None),
+                Err(MemoryError::Disabled)
+            ));
+            assert!(matches!(
+                disabled.delete(&baseline.id, 1_780_000_222),
+                Err(MemoryError::Disabled)
+            ));
+            assert!(matches!(
+                disabled.put(sample_memory("operator", "must not persist")),
+                Err(MemoryError::Disabled)
+            ));
+        }
+        assert_eq!(MemoryStore::count(&store, &owner).unwrap(), 1);
+        assert!(MemoryStore::get(&store, &baseline.id).unwrap().is_some());
+    }
+
+    #[test]
+    fn legacy_database_migrates_additively_and_reopens() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let path = tmp.path();
+        let legacy = sample_memory("operator", "pre-partition row");
+        {
+            let conn = Connection::open(path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE memories (
+                    id          TEXT PRIMARY KEY,
+                    scope       TEXT NOT NULL,
+                    owner       TEXT NOT NULL,
+                    kind        TEXT NOT NULL,
+                    body        TEXT NOT NULL,
+                    provenance  TEXT NOT NULL,
+                    trust       TEXT NOT NULL,
+                    seq         INTEGER NOT NULL,
+                    written_at  INTEGER NOT NULL,
+                    updated_at  INTEGER NOT NULL,
+                    deleted_at  INTEGER,
+                    history     TEXT NOT NULL DEFAULT '[]'
+                );",
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO memories
+                    (id, scope, owner, kind, body, provenance, trust, seq,
+                     written_at, updated_at, history)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+                params![
+                    legacy.id.0,
+                    legacy.scope.as_str(),
+                    legacy.owner.0,
+                    legacy.kind.as_str(),
+                    serde_json::to_string(&legacy.body).unwrap(),
+                    serde_json::to_string(&legacy.provenance).unwrap(),
+                    trust_to_str(legacy.trust),
+                    1_i64,
+                    legacy.written_at,
+                    legacy.updated_at,
+                    serde_json::to_string(&legacy.history).unwrap(),
+                ],
+            )
+            .unwrap();
+        }
+
+        let room_row = {
+            let mut store = SqliteMemoryStore::open(path).unwrap();
+            let migrated = MemoryStore::get(&store, &legacy.id)
+                .unwrap()
+                .expect("legacy row survives migration");
+            assert_eq!(migrated.body, legacy.body);
+            assert_eq!(migrated.owner, legacy.owner);
+            let partition: String = store
+                .conn
+                .query_row(
+                    "SELECT partition FROM memories WHERE id = ?1",
+                    params![legacy.id.0],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(partition, OPERATOR_PARTITION);
+            for index in [
+                "idx_memories_partition_owner_seq",
+                "idx_memories_partition_owner_live",
+            ] {
+                let present: i64 = store
+                    .conn
+                    .query_row(
+                        "SELECT COUNT(*) FROM sqlite_master
+                         WHERE type = 'index' AND name = ?1",
+                        params![index],
+                        |row| row.get(0),
+                    )
+                    .unwrap();
+                assert_eq!(present, 1, "missing additive index {index}");
+            }
+
+            let room = store.trusted_room_scope("persisted-room").unwrap();
+            let owner = room_memory_owner();
+            store
+                .scoped(&room, &owner)
+                .unwrap()
+                .put(sample_memory(ROOM_PARTITION_OWNER, "room survives reopen"))
+                .unwrap()
+        };
+
+        let mut reopened = SqliteMemoryStore::open(path).unwrap();
+        assert!(MemoryStore::get(&reopened, &legacy.id).unwrap().is_some());
+        let room = reopened.trusted_room_scope("persisted-room").unwrap();
+        let owner = room_memory_owner();
+        assert_eq!(
+            reopened
+                .scoped(&room, &owner)
+                .unwrap()
+                .get(&room_row.id)
+                .unwrap(),
+            Some(room_row)
+        );
     }
 
     #[test]
