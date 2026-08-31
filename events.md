@@ -7679,3 +7679,59 @@ read beats a rewrite nobody reviewed; the checker then reported 514 entries,
 every one closed. Recorded because "the instrument has never fired" and "the
 failure never happens" look identical until the first time it does.
 _________________________________________________________________________________
+
+time:      [07:41] [08-31-26]
+agent:     [claude] [opus 5]
+worktree:  loop/os-yolo-wire-flag-test-is-flaky-under-the-parallel-runner
+type:      [bug-report]
+area:      [testing]
+
+ocean-os#415 changed four files, none of them Rust, and `check (ubuntu-latest)`
+went red on `tests::resolve_request_yolo_ignores_wire_flag` -- 822 passed, 1
+failed -- while macos-latest, MSRV and every local run stayed green. The test
+did not lose a race with itself. It lost one to
+`room_router_retires_track0_gets_and_keeps_persistent_and_livekit_routes`,
+which called `fake_convene_state` with no `AUTO_CONVENE_ENV_LOCK`. That helper
+sets `OCEAN_CONFIG_DIR` to its own tempdir; `resolve_request_yolo` reads the
+persisted operator pref out of whatever that variable points at, so the
+persisted-default assertion at main.rs:15675 read another test's empty tempdir
+and got `false`.
+
+I re-walked all fifty call sites of `fake_convene_state`/`fake_convene_file_state`
+with a script rather than trusting the report: forty-nine hold the lock, that
+one did not. It now takes `AUTO_CONVENE_ENV_LOCK` plus a `TestEnvRestore`, bound
+in the test body so the guard outlives the state it built -- deliberately NOT
+copying `route_contract_state`, whose guards drop before the AppState it returns
+is ever used.
+
+The mechanism is proved, not assumed. Running only the unlocked writer and the
+victim reader on two threads: pre-fix 30 of 30 runs failed at main.rs:15675 with
+the CI message verbatim, post-fix 0 of 30. Then 30 consecutive full runs of
+`cargo test -p ocean-daemon --bin ocean-daemon` under the DEFAULT parallel
+runner -- never `--test-threads=1`, which hides exactly this -- 825 passing
+every time.
+
+A second writer turned up that the report had not flagged:
+`ocean_yolo_env_defaults_off_and_opts_in_explicitly` writes `OCEAN_YOLO` holding
+only `YOLO_ENV_LOCK`, while `fake_convene_state` writes it holding only
+`AUTO_CONVENE_ENV_LOCK`. The two lock domains are disjoint, so neither writer is
+serialised against the other. It now takes both, in the repo-wide
+`YOLO_ENV_LOCK` -> `AUTO_CONVENE_ENV_LOCK` order its seven siblings already use.
+Honest limit: I could not make that one fail on demand in seventy targeted runs,
+so it is a by-construction fix, not a reproduced one.
+
+The locks were deliberately not merged. `resolve_request_yolo_ignores_wire_flag`
+holds both and tokio's mutex is not reentrant, so aliasing them would deadlock
+it instantly. The other half of the original brief -- giving `resolve_request_yolo`
+an injectable config dir -- is not reachable from this scope: it lives in the
+`yolo_settings` module, not main.rs. The lock is the in-scope answer; the
+injectable-config-dir version, and turning the helpers' "caller must hold the
+lock" doc comment into a compile-time proof across all fifty call sites, are
+both still worth doing separately.
+
+Gate green: 825 passed, clippy -D warnings exit 0, fmt clean, docs-check PASS,
+toolchain 1.97.0. Also recorded the lock discipline and its acquisition order in
+`crates/ocean-daemon/AGENTS.md`, which had never written it down -- the comment
+on `fake_convene_state` was the only statement of the rule and comments do not
+enforce. No deploy, no migration.
+_________________________________________________________________________________
