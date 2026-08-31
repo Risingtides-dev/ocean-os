@@ -854,6 +854,19 @@ pub struct RoomAgentAdmissionAuditInput {
     pub reason_code: String,
 }
 
+/// The durable result of committing one federated room-agent output under an
+/// exact admitted authority generation.
+///
+/// Both values are inserted by the same `IMMEDIATE` transaction: `outbox`
+/// owns delivery authority and `audit` is the content-minimal correlation fact
+/// that proves which admission and generation allocated that exact producer
+/// tuple.
+#[derive(Debug, Clone)]
+pub struct AuthorizedRoomAgentOutboxCommit {
+    pub outbox: RoomOutboxItem,
+    pub audit: RoomMessage,
+}
+
 /// Content-minimal durable audit fact for room-agent authority changes.
 ///
 /// These facts intentionally omit capability payloads, prompts, package source,
@@ -3479,32 +3492,13 @@ impl SqliteRoomStore {
         Ok(msg)
     }
 
-    /// Append a locally executed room-agent reply and a generation-attribution
-    /// fact in the same transaction.
-    ///
-    /// The audit's `admission_id` mechanically joins the earlier admission
-    /// decision to this concrete `message_seq`; consumers never have to infer
-    /// authority from chronology. A generation/status change after admission
-    /// refuses the write, which is the final checkpoint backstop.
-    #[allow(clippy::too_many_arguments)]
-    pub fn append_authorized_agent_reply(
-        &mut self,
+    fn authorized_room_agent_binding_on(
+        conn: &Connection,
         key: &RoomKey,
         agent_member_id: &str,
         expected_generation: u64,
-        admission_id: &str,
-        body: &str,
-        now: DateTime<Utc>,
-        thread_parent_seq: Option<u64>,
-        session_id: &str,
-    ) -> std::result::Result<(RoomMessage, RoomMessage), ThreadAppendError> {
-        if !self.room_is_open(key)? {
-            return Err(RoomStoreError::UnknownRoom(key.clone()).into());
-        }
-        let tx = self
-            .conn
-            .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let binding = tx
+    ) -> Result<RoomAgentBinding> {
+        let binding = conn
             .query_row(
                 "SELECT agent_member_id, agent_package_id, agent_definition_digest,
                         agent_definition_revision, display_name, owner_member_id,
@@ -3530,9 +3524,39 @@ impl SqliteRoomStore {
                 agent: agent_member_id.to_string(),
                 from: binding.status.as_str(),
                 to: "admitted_generation",
-            }
-            .into());
+            });
         }
+        Ok(binding)
+    }
+
+    /// Append a locally executed room-agent reply and a generation-attribution
+    /// fact in the same transaction.
+    ///
+    /// The audit's `admission_id` mechanically joins the earlier admission
+    /// decision to this concrete `message_seq`; consumers never have to infer
+    /// authority from chronology. A generation/status change after admission
+    /// refuses the write, which is the final checkpoint backstop.
+    #[allow(clippy::too_many_arguments)]
+    pub fn append_authorized_agent_reply(
+        &mut self,
+        key: &RoomKey,
+        agent_member_id: &str,
+        expected_generation: u64,
+        admission_id: &str,
+        body: &str,
+        now: DateTime<Utc>,
+        thread_parent_seq: Option<u64>,
+        session_id: &str,
+    ) -> std::result::Result<(RoomMessage, RoomMessage), ThreadAppendError> {
+        if !self.room_is_open(key)? {
+            return Err(RoomStoreError::UnknownRoom(key.clone()).into());
+        }
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let binding =
+            Self::authorized_room_agent_binding_on(&tx, key, agent_member_id, expected_generation)
+                .map_err(ThreadAppendError::Store)?;
         if let Some(parent_seq) = thread_parent_seq {
             Self::validate_thread_parent_on(&tx, key, parent_seq)?;
         }
@@ -3579,6 +3603,77 @@ impl SqliteRoomStore {
         Self::touch_on(&tx, key, now)?;
         tx.commit()?;
         Ok((reply, audit))
+    }
+
+    /// Record a failed local room-agent turn only while its admitted authority
+    /// generation is still active.
+    ///
+    /// The caller supplies no provider/runtime error text. The human-facing row
+    /// uses a fixed reason code, and the adjacent audit carries the exact
+    /// admission, package, generation, and session correlation without prompt,
+    /// response, stderr, or capability content.
+    pub fn append_authorized_agent_failure(
+        &mut self,
+        key: &RoomKey,
+        agent_member_id: &str,
+        expected_generation: u64,
+        admission_id: &str,
+        now: DateTime<Utc>,
+        session_id: &str,
+    ) -> Result<(RoomMessage, RoomMessage)> {
+        if !self.room_is_open(key)? {
+            return Err(RoomStoreError::UnknownRoom(key.clone()));
+        }
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let binding =
+            Self::authorized_room_agent_binding_on(&tx, key, agent_member_id, expected_generation)?;
+        let failure_body = format!("auto-convene failed for {agent_member_id}: turn_failed");
+        let failure = Self::insert_message_on(
+            &tx,
+            key,
+            MessageDraft {
+                author_id: "system",
+                author_kind: RoomParticipantKind::System,
+                kind: RoomMessageKind::System,
+                body: &failure_body,
+                thread_parent_seq: None,
+                session_id: None,
+                attachment_id: None,
+            },
+            now,
+        )?;
+        let audit_body = serde_json::to_string(&serde_json::json!({
+            "type": "room.agent.output",
+            "room_id": key.as_str(),
+            "admission_id": admission_id,
+            "agent_member_id": agent_member_id,
+            "agent_package_id": binding.agent_package_id,
+            "generation": expected_generation.to_string(),
+            "failure_seq": failure.seq.to_string(),
+            "session_id": session_id,
+            "outcome": "failed",
+            "reason_code": "turn_failed",
+        }))
+        .map_err(|error| RoomStoreError::Encode(error.to_string()))?;
+        let audit = Self::insert_message_on(
+            &tx,
+            key,
+            MessageDraft {
+                author_id: "system",
+                author_kind: RoomParticipantKind::System,
+                kind: RoomMessageKind::System,
+                body: &audit_body,
+                thread_parent_seq: None,
+                session_id: None,
+                attachment_id: None,
+            },
+            now,
+        )?;
+        Self::touch_on(&tx, key, now)?;
+        tx.commit()?;
+        Ok((failure, audit))
     }
 
     /// Enforce the G1 one-level thread policy for `parent_seq` in `key`.
@@ -5742,6 +5837,63 @@ impl SqliteRoomStore {
     /// starting at 1; exhausting `u64::MAX` fails closed rather than reusing
     /// a value. Concurrent callers on the same DB file are serialized by the
     /// `IMMEDIATE` write lock, so no sequence is ever allocated twice.
+    #[allow(clippy::too_many_arguments)]
+    fn allocate_outbox_pending_on(
+        conn: &Connection,
+        key: &RoomKey,
+        author_member_id: &str,
+        client_event_id: &str,
+        event_type: &str,
+        payload: serde_json::Value,
+        mention_member_ids: Vec<String>,
+    ) -> Result<RoomOutboxItem> {
+        let instance_id = Self::federation_instance_id_on(conn)?;
+        let cur: Option<String> = conn
+            .query_row(
+                "SELECT next_sequence FROM producer_counters
+                 WHERE room_id = ?1 AND author_member_id = ?2",
+                params![key.as_str(), author_member_id],
+                |r| r.get(0),
+            )
+            .optional()?;
+        let next = match cur {
+            None => 1u64,
+            Some(t) => parse_canonical_u64_text(&t)?,
+        };
+        let after = next.checked_add(1).ok_or_else(|| {
+            RoomStoreError::FederationCorruption("producer counter exhausted at u64::MAX".into())
+        })?;
+        conn.execute(
+            "INSERT INTO producer_counters (room_id, author_member_id, next_sequence)
+             VALUES (?1, ?2, ?3)
+             ON CONFLICT(room_id, author_member_id) DO UPDATE SET
+               next_sequence = excluded.next_sequence",
+            params![key.as_str(), author_member_id, write_u64_text(after)],
+        )?;
+        let pos: i64 = conn.query_row(
+            "SELECT COALESCE(MAX(position) + 1, 0) FROM outbox WHERE room_id = ?1",
+            params![key.as_str()],
+            |r| r.get(0),
+        )?;
+        let item = RoomOutboxItem {
+            client_event_id: client_event_id.to_string(),
+            source_id: format!(
+                "room:{}:member:{}:producer:{}",
+                key.as_str(),
+                author_member_id,
+                instance_id
+            ),
+            source_sequence: next,
+            author_member_id: author_member_id.to_string(),
+            event_type: event_type.to_string(),
+            payload,
+            mention_member_ids,
+            state: OutboxItemState::Pending,
+        };
+        Self::insert_outbox_item_on(conn, key, &item, pos as usize)?;
+        Ok(item)
+    }
+
     pub fn allocate_outbox_pending(
         &mut self,
         key: &RoomKey,
@@ -5769,52 +5921,95 @@ impl SqliteRoomStore {
         if room_exists.is_none() {
             return Err(RoomStoreError::UnknownRoom(key.clone()));
         }
-        let instance_id = Self::federation_instance_id_on(&tx)?;
-        let cur: Option<String> = tx
-            .query_row(
-                "SELECT next_sequence FROM producer_counters
-                 WHERE room_id = ?1 AND author_member_id = ?2",
-                params![key.as_str(), author_member_id],
-                |r| r.get(0),
-            )
-            .optional()?;
-        let next = match cur {
-            None => 1u64,
-            Some(t) => parse_canonical_u64_text(&t)?,
-        };
-        let after = next.checked_add(1).ok_or_else(|| {
-            RoomStoreError::FederationCorruption("producer counter exhausted at u64::MAX".into())
-        })?;
-        tx.execute(
-            "INSERT INTO producer_counters (room_id, author_member_id, next_sequence)
-             VALUES (?1, ?2, ?3)
-             ON CONFLICT(room_id, author_member_id) DO UPDATE SET
-               next_sequence = excluded.next_sequence",
-            params![key.as_str(), author_member_id, write_u64_text(after)],
-        )?;
-        let pos: i64 = tx.query_row(
-            "SELECT COALESCE(MAX(position) + 1, 0) FROM outbox WHERE room_id = ?1",
-            params![key.as_str()],
-            |r| r.get(0),
-        )?;
-        let item = RoomOutboxItem {
-            client_event_id: client_event_id.to_string(),
-            source_id: format!(
-                "room:{}:member:{}:producer:{}",
-                key.as_str(),
-                author_member_id,
-                instance_id
-            ),
-            source_sequence: next,
-            author_member_id: author_member_id.to_string(),
-            event_type: event_type.to_string(),
+        let item = Self::allocate_outbox_pending_on(
+            &tx,
+            key,
+            author_member_id,
+            client_event_id,
+            event_type,
             payload,
             mention_member_ids,
-            state: OutboxItemState::Pending,
-        };
-        Self::insert_outbox_item_on(&tx, key, &item, pos as usize)?;
+        )?;
         tx.commit()?;
         Ok(item)
+    }
+
+    /// Atomically allocate a federated room-agent output and its exact
+    /// generation/admission audit correlation.
+    ///
+    /// The binding check, producer counter advance, Pending outbox insert, audit
+    /// transcript insert, and room timestamp touch share one `IMMEDIATE`
+    /// transaction. A racing suspend/revoke/re-authorization therefore orders
+    /// wholly before this commit (and refuses it) or wholly after it; there is
+    /// no checked-then-enqueued gap.
+    #[allow(clippy::too_many_arguments)]
+    pub fn allocate_authorized_agent_outbox(
+        &mut self,
+        key: &RoomKey,
+        agent_member_id: &str,
+        expected_generation: u64,
+        admission_id: &str,
+        client_event_id: &str,
+        body: &str,
+        mention_member_ids: Vec<String>,
+        now: DateTime<Utc>,
+    ) -> Result<AuthorizedRoomAgentOutboxCommit> {
+        if agent_member_id.trim().is_empty()
+            || admission_id.trim().is_empty()
+            || client_event_id.trim().is_empty()
+        {
+            return Err(RoomStoreError::Encode(
+                "authorized output identity is required".into(),
+            ));
+        }
+        if !self.room_is_open(key)? {
+            return Err(RoomStoreError::UnknownRoom(key.clone()));
+        }
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let binding =
+            Self::authorized_room_agent_binding_on(&tx, key, agent_member_id, expected_generation)?;
+        let outbox = Self::allocate_outbox_pending_on(
+            &tx,
+            key,
+            agent_member_id,
+            client_event_id,
+            "message",
+            serde_json::json!({"body": body}),
+            mention_member_ids,
+        )?;
+        let audit_body = serde_json::to_string(&serde_json::json!({
+            "type": "room.agent.output",
+            "room_id": key.as_str(),
+            "admission_id": admission_id,
+            "agent_member_id": agent_member_id,
+            "agent_package_id": binding.agent_package_id,
+            "generation": expected_generation.to_string(),
+            "client_event_id": outbox.client_event_id,
+            "source_id": outbox.source_id,
+            "source_sequence": outbox.source_sequence.to_string(),
+            "outcome": "enqueued_remote",
+            "reason_code": "bedrock_delivery_pending",
+        }))
+        .map_err(|error| RoomStoreError::Encode(error.to_string()))?;
+        let audit = Self::insert_message_on(
+            &tx,
+            key,
+            MessageDraft {
+                author_id: "system",
+                author_kind: RoomParticipantKind::System,
+                kind: RoomMessageKind::System,
+                body: &audit_body,
+                thread_parent_seq: None,
+                session_id: None,
+                attachment_id: None,
+            },
+            now,
+        )?;
+        Self::touch_on(&tx, key, now)?;
+        tx.commit()?;
+        Ok(AuthorizedRoomAgentOutboxCommit { outbox, audit })
     }
 
     /// List the room's Pending outbox rows in stable producer order (P2-A) —
@@ -7002,6 +7197,113 @@ mod tests {
             ThreadAppendError::Store(RoomStoreError::AgentBindingStatusConflict { .. })
         ));
         assert_eq!(s.transcript(&key, None).unwrap().len(), before);
+    }
+
+    #[test]
+    fn authorized_remote_output_allocates_outbox_and_exact_audit_atomically() {
+        let (mut s, key) = room_with_agent("agent-1");
+        let before = s.transcript(&key, None).unwrap().len();
+        let committed = s
+            .allocate_authorized_agent_outbox(
+                &key,
+                "agent-1",
+                1,
+                "admission-remote-1",
+                "client-event-1",
+                "remote answer",
+                vec!["human-1".into()],
+                now(),
+            )
+            .unwrap();
+        assert_eq!(committed.outbox.author_member_id, "agent-1");
+        assert_eq!(committed.outbox.source_sequence, 1);
+        assert_eq!(
+            s.pending_outbox(&key).unwrap(),
+            vec![committed.outbox.clone()]
+        );
+        let audit: serde_json::Value = serde_json::from_str(&committed.audit.body).unwrap();
+        assert_eq!(audit["type"], "room.agent.output");
+        assert_eq!(audit["admission_id"], "admission-remote-1");
+        assert_eq!(audit["generation"], "1");
+        assert_eq!(audit["client_event_id"], "client-event-1");
+        assert_eq!(
+            audit["source_sequence"],
+            committed.outbox.source_sequence.to_string()
+        );
+        assert_eq!(s.transcript(&key, None).unwrap().len(), before + 1);
+
+        s.set_room_agent_binding_status(
+            &key,
+            "agent-1",
+            status_input(AgentBindingStatus::Suspended, "dec-2", "suspend-2"),
+            now(),
+        )
+        .unwrap();
+        let outbox_before = s.pending_outbox(&key).unwrap();
+        let transcript_before = s.transcript(&key, None).unwrap();
+        let error = s
+            .allocate_authorized_agent_outbox(
+                &key,
+                "agent-1",
+                1,
+                "admission-remote-1",
+                "client-event-late",
+                "late answer",
+                Vec::new(),
+                now(),
+            )
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            RoomStoreError::AgentBindingStatusConflict { .. }
+        ));
+        assert_eq!(s.pending_outbox(&key).unwrap(), outbox_before);
+        assert_eq!(s.transcript(&key, None).unwrap(), transcript_before);
+    }
+
+    #[test]
+    fn failed_turn_is_generation_checked_and_never_accepts_stderr_content() {
+        let (mut s, key) = room_with_agent("agent-1");
+        let (failure, audit) = s
+            .append_authorized_agent_failure(
+                &key,
+                "agent-1",
+                1,
+                "admission-failure-1",
+                now(),
+                "session-generation-1",
+            )
+            .unwrap();
+        assert_eq!(failure.body, "auto-convene failed for agent-1: turn_failed");
+        assert!(!failure.body.contains("provider-secret"));
+        let audit: serde_json::Value = serde_json::from_str(&audit.body).unwrap();
+        assert_eq!(audit["outcome"], "failed");
+        assert_eq!(audit["reason_code"], "turn_failed");
+        assert_eq!(audit["generation"], "1");
+
+        s.set_room_agent_binding_status(
+            &key,
+            "agent-1",
+            status_input(AgentBindingStatus::Suspended, "dec-2", "suspend-2"),
+            now(),
+        )
+        .unwrap();
+        let before = s.transcript(&key, None).unwrap();
+        let error = s
+            .append_authorized_agent_failure(
+                &key,
+                "agent-1",
+                1,
+                "admission-failure-1",
+                now(),
+                "session-generation-1",
+            )
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            RoomStoreError::AgentBindingStatusConflict { .. }
+        ));
+        assert_eq!(s.transcript(&key, None).unwrap(), before);
     }
 
     #[test]
