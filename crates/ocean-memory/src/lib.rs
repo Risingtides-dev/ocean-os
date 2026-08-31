@@ -176,6 +176,13 @@ const OPERATOR_PARTITION: &str = "operator:v1";
 /// accidentally creating one silo per admitted agent.
 const ROOM_PARTITION_OWNER: &str = "room:v1";
 
+/// Archive table used by the explicit legacy rollback preparation.
+///
+/// Older Ocean binaries ignore this table and continue to read the restored
+/// single-id `memories` table. A later upgrade rehydrates these room rows and
+/// removes the archive in the same migration transaction.
+const ROOM_ROLLBACK_ARCHIVE: &str = "memories_room_partition_archive_v1";
+
 /// Return the only owner principal accepted for a room-memory handle.
 ///
 /// Admission code should use this rather than an agent member id. The value is
@@ -390,6 +397,15 @@ pub struct SqliteMemoryStore {
     conn: Connection,
 }
 
+/// Counts produced by [`SqliteMemoryStore::prepare_legacy_rollback`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LegacyRollbackReport {
+    /// Operator rows retained in the legacy `memories` table.
+    pub operator_rows: u64,
+    /// Room rows moved to the private rollback archive.
+    pub archived_room_rows: u64,
+}
+
 impl SqliteMemoryStore {
     /// Open (or create) a store at `path`. Runs [`Self::migrate`] idempotently.
     /// `open(":memory:")` yields a fresh in-memory db for tests.
@@ -445,6 +461,94 @@ impl SqliteMemoryStore {
             store: self,
             scope: scope.clone(),
             owner: owner.clone(),
+        })
+    }
+
+    /// Prepare this database for opening with a pre-partition Ocean binary.
+    ///
+    /// This is an explicit operator rollback operation, not an automatic
+    /// startup migration. It transactionally archives every non-operator row,
+    /// rebuilds `memories` with the historical globally-unique `id` primary
+    /// key and no `partition` column, and preserves all operator rows. The
+    /// caller must close this store immediately after success; the current
+    /// process must not continue using partition-aware memory operations.
+    ///
+    /// A subsequent open by this version migrates the legacy table forward,
+    /// restores the archived room rows, and removes the archive. This makes a
+    /// rollback rehearsal reversible without exposing room rows to the legacy
+    /// API or discarding them.
+    pub fn prepare_legacy_rollback(&mut self) -> Result<LegacyRollbackReport> {
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        tx.execute_batch(&format!(
+            "CREATE TABLE IF NOT EXISTS {ROOM_ROLLBACK_ARCHIVE} (
+                id          TEXT NOT NULL,
+                scope       TEXT NOT NULL,
+                owner       TEXT NOT NULL,
+                kind        TEXT NOT NULL,
+                body        TEXT NOT NULL,
+                provenance  TEXT NOT NULL,
+                trust       TEXT NOT NULL,
+                seq         INTEGER NOT NULL,
+                written_at  INTEGER NOT NULL,
+                updated_at  INTEGER NOT NULL,
+                deleted_at  INTEGER,
+                history     TEXT NOT NULL DEFAULT '[]',
+                partition   TEXT NOT NULL,
+                PRIMARY KEY (partition, owner, id)
+             );
+             INSERT OR IGNORE INTO {ROOM_ROLLBACK_ARCHIVE}
+                (id, scope, owner, kind, body, provenance, trust, seq,
+                 written_at, updated_at, deleted_at, history, partition)
+             SELECT id, scope, owner, kind, body, provenance, trust, seq,
+                    written_at, updated_at, deleted_at, history, partition
+             FROM memories
+             WHERE partition <> 'operator:v1';"
+        ))?;
+
+        let operator_rows: i64 = tx.query_row(
+            "SELECT COUNT(*) FROM memories WHERE partition = ?1",
+            params![OPERATOR_PARTITION],
+            |row| row.get(0),
+        )?;
+        let archived_room_rows: i64 = tx.query_row(
+            &format!("SELECT COUNT(*) FROM {ROOM_ROLLBACK_ARCHIVE}"),
+            [],
+            |row| row.get(0),
+        )?;
+
+        tx.execute_batch(
+            "DROP TABLE IF EXISTS memories_legacy_rollback;
+             CREATE TABLE memories_legacy_rollback (
+                id          TEXT PRIMARY KEY,
+                scope       TEXT NOT NULL,
+                owner       TEXT NOT NULL,
+                kind        TEXT NOT NULL,
+                body        TEXT NOT NULL,
+                provenance  TEXT NOT NULL,
+                trust       TEXT NOT NULL,
+                seq         INTEGER NOT NULL,
+                written_at  INTEGER NOT NULL,
+                updated_at  INTEGER NOT NULL,
+                deleted_at  INTEGER,
+                history     TEXT NOT NULL DEFAULT '[]'
+             );
+             INSERT INTO memories_legacy_rollback
+                (id, scope, owner, kind, body, provenance, trust, seq,
+                 written_at, updated_at, deleted_at, history)
+             SELECT id, scope, owner, kind, body, provenance, trust, seq,
+                    written_at, updated_at, deleted_at, history
+             FROM memories
+             WHERE partition = 'operator:v1';
+             DROP TABLE memories;
+             ALTER TABLE memories_legacy_rollback RENAME TO memories;",
+        )?;
+        tx.commit()?;
+
+        Ok(LegacyRollbackReport {
+            operator_rows: operator_rows.max(0) as u64,
+            archived_room_rows: archived_room_rows.max(0) as u64,
         })
     }
 
@@ -541,6 +645,49 @@ impl SqliteMemoryStore {
             )?;
             tx.commit()?;
         }
+
+        let rollback_archive_exists: bool = conn.query_row(
+            "SELECT EXISTS(
+                SELECT 1 FROM sqlite_master
+                WHERE type = 'table' AND name = ?1
+             )",
+            params![ROOM_ROLLBACK_ARCHIVE],
+            |row| row.get(0),
+        )?;
+        if rollback_archive_exists {
+            let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            tx.execute_batch(&format!(
+                "INSERT INTO memories
+                    (id, scope, owner, kind, body, provenance, trust, seq,
+                     written_at, updated_at, deleted_at, history, partition)
+                 SELECT id, scope, owner, kind, body, provenance, trust, seq,
+                        written_at, updated_at, deleted_at, history, partition
+                 FROM {ROOM_ROLLBACK_ARCHIVE};
+                 DROP TABLE {ROOM_ROLLBACK_ARCHIVE};"
+            ))?;
+            tx.commit()?;
+        }
+
+        // The legacy API addresses operator rows by id without an owner
+        // parameter. Preserve its historical global-id invariant even though
+        // Room partitions deliberately allow the same logical id. Detect a
+        // database written by an invalid intermediate build before installing
+        // the partial unique index, and fail without changing its rows.
+        let duplicate_operator_id: Option<String> = conn
+            .query_row(
+                "SELECT id FROM memories
+                 WHERE partition = ?1
+                 GROUP BY id HAVING COUNT(*) > 1
+                 LIMIT 1",
+                params![OPERATOR_PARTITION],
+                |row| row.get(0),
+            )
+            .optional()?;
+        if let Some(id) = duplicate_operator_id {
+            return Err(MemoryError::BadInput(format!(
+                "operator memory id {id} exists for multiple owners"
+            )));
+        }
         conn.execute_batch(
             "CREATE INDEX IF NOT EXISTS idx_memories_owner_seq
                 ON memories(owner, seq DESC);
@@ -549,7 +696,9 @@ impl SqliteMemoryStore {
              CREATE INDEX IF NOT EXISTS idx_memories_partition_owner_seq
                 ON memories(partition, owner, seq DESC);
              CREATE INDEX IF NOT EXISTS idx_memories_partition_owner_live
-                ON memories(partition, owner) WHERE deleted_at IS NULL;",
+                ON memories(partition, owner) WHERE deleted_at IS NULL;
+             CREATE UNIQUE INDEX IF NOT EXISTS idx_memories_operator_id
+                ON memories(id) WHERE partition = 'operator:v1';",
         )?;
         Ok(())
     }
@@ -563,15 +712,16 @@ impl MemoryStore for SqliteMemoryStore {
         if mem.owner.0.trim().is_empty() {
             return Err(MemoryError::BadInput("memory owner cannot be empty".into()));
         }
-        // Logical ids are unique only inside the legacy operator partition and
-        // owner. A matching id in a Room partition is unrelated and must not
-        // block or reveal this insert.
+        // The legacy operator API addresses rows by id without an owner
+        // parameter, so ids remain globally unique inside that partition. A
+        // matching id in a Room partition is unrelated and must not block or
+        // reveal this insert.
         let exists: bool = self
             .conn
             .query_row(
                 "SELECT 1 FROM memories
-                 WHERE partition = ?1 AND owner = ?2 AND id = ?3",
-                params![OPERATOR_PARTITION, mem.owner.0, mem.id.0],
+                 WHERE partition = ?1 AND id = ?2",
+                params![OPERATOR_PARTITION, mem.id.0],
                 |_| Ok(true),
             )
             .optional()?
@@ -1444,6 +1594,67 @@ mod tests {
     }
 
     #[test]
+    fn operator_ids_remain_globally_unique_across_owners() {
+        let mut store = SqliteMemoryStore::open_in_memory().unwrap();
+        let logical_id = MemoryId("operator-global-id".into());
+        let scope = SessionMemoryScope::Operator;
+        let alice = PrincipalId::new("alice");
+        let bob = PrincipalId::new("bob");
+
+        let mut alice_memory = sample_memory("alice", "alice value");
+        alice_memory.id = logical_id.clone();
+        store
+            .scoped(&scope, &alice)
+            .unwrap()
+            .put(alice_memory)
+            .unwrap();
+
+        let mut bob_memory = sample_memory("bob", "bob value");
+        bob_memory.id = logical_id.clone();
+        assert!(matches!(
+            store.scoped(&scope, &bob).unwrap().put(bob_memory.clone()),
+            Err(MemoryError::BadInput(_))
+        ));
+        assert!(matches!(
+            MemoryStore::put(&mut store, bob_memory),
+            Err(MemoryError::BadInput(_))
+        ));
+
+        let legacy = MemoryStore::get(&store, &logical_id)
+            .unwrap()
+            .expect("one unambiguous operator row");
+        assert_eq!(legacy.owner, alice);
+        MemoryStore::delete(&mut store, &logical_id, 1_780_000_444).unwrap();
+        assert_eq!(MemoryStore::get(&store, &logical_id).unwrap(), None);
+        assert_eq!(
+            store
+                .scoped(&scope, &bob)
+                .unwrap()
+                .get(&logical_id)
+                .unwrap(),
+            None
+        );
+
+        // Room keys use a different store-bound partition and may still reuse
+        // the same logical id without observing the operator collision.
+        let room = room_scope(&store, "operator-id-room");
+        let room_owner = room_memory_owner();
+        let mut room_memory = sample_memory(ROOM_PARTITION_OWNER, "room value");
+        room_memory.id = logical_id.clone();
+        store
+            .scoped(&room, &room_owner)
+            .unwrap()
+            .put(room_memory)
+            .unwrap();
+        assert!(store
+            .scoped(&room, &room_owner)
+            .unwrap()
+            .get(&logical_id)
+            .unwrap()
+            .is_some());
+    }
+
+    #[test]
     fn disabled_scope_refuses_every_operation_and_is_inert() {
         let mut store = SqliteMemoryStore::open_in_memory().unwrap();
         let owner = PrincipalId::new("operator");
@@ -1684,6 +1895,156 @@ mod tests {
                 .body,
             original.body
         );
+    }
+
+    #[test]
+    fn legacy_rollback_archives_rooms_and_round_trips_through_old_schema() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let path = tmp.path();
+        let logical_id = MemoryId("rollback-shared-id".into());
+        let room_owner = room_memory_owner();
+
+        {
+            let mut store = SqliteMemoryStore::open(path).unwrap();
+            let mut operator = sample_memory("operator", "operator survives rollback");
+            operator.id = logical_id.clone();
+            MemoryStore::put(&mut store, operator).unwrap();
+            for (key, note) in [("rollback-a", "room a"), ("rollback-b", "room b")] {
+                let room = room_scope(&store, key);
+                let mut memory = sample_memory(ROOM_PARTITION_OWNER, note);
+                memory.id = logical_id.clone();
+                store
+                    .scoped(&room, &room_owner)
+                    .unwrap()
+                    .put(memory)
+                    .unwrap();
+            }
+
+            let report = store.prepare_legacy_rollback().unwrap();
+            assert_eq!(
+                report,
+                LegacyRollbackReport {
+                    operator_rows: 1,
+                    archived_room_rows: 2,
+                }
+            );
+        }
+
+        // Emulate a pre-partition binary: it sees the historical schema and
+        // exactly the operator row; the private archive is unreachable through
+        // its table and query contract.
+        {
+            let conn = Connection::open(path).unwrap();
+            let columns = {
+                let mut stmt = conn.prepare("PRAGMA table_info(memories)").unwrap();
+                stmt.query_map([], |row| row.get::<_, String>(1))
+                    .unwrap()
+                    .collect::<std::result::Result<Vec<_>, _>>()
+                    .unwrap()
+            };
+            assert!(!columns.iter().any(|column| column == "partition"));
+            let operator_note: String = conn
+                .query_row(
+                    "SELECT body FROM memories WHERE id = ?1",
+                    params![logical_id.0],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert!(operator_note.contains("operator survives rollback"));
+            let visible_rows: i64 = conn
+                .query_row("SELECT COUNT(*) FROM memories", [], |row| row.get(0))
+                .unwrap();
+            assert_eq!(visible_rows, 1);
+            let archived_rows: i64 = conn
+                .query_row(
+                    &format!("SELECT COUNT(*) FROM {ROOM_ROLLBACK_ARCHIVE}"),
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(archived_rows, 2);
+        }
+
+        // Upgrading again restores the archived Room rows and removes the
+        // rollback-only table without changing operator memory.
+        let mut reopened = SqliteMemoryStore::open(path).unwrap();
+        assert!(MemoryStore::get(&reopened, &logical_id).unwrap().is_some());
+        for (key, expected) in [("rollback-a", "room a"), ("rollback-b", "room b")] {
+            let room = room_scope(&reopened, key);
+            let memory = reopened
+                .scoped(&room, &room_owner)
+                .unwrap()
+                .get(&logical_id)
+                .unwrap()
+                .expect("room row restored after re-upgrade");
+            assert_eq!(memory.body, serde_json::json!({ "note": expected }));
+        }
+        let archive_exists: bool = reopened
+            .conn
+            .query_row(
+                "SELECT EXISTS(
+                    SELECT 1 FROM sqlite_master
+                    WHERE type = 'table' AND name = ?1
+                 )",
+                params![ROOM_ROLLBACK_ARCHIVE],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(!archive_exists);
+    }
+
+    #[test]
+    fn migration_refuses_ambiguous_operator_ids_without_changing_rows() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let path = tmp.path();
+        {
+            let conn = Connection::open(path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE memories (
+                    id TEXT NOT NULL, scope TEXT NOT NULL, owner TEXT NOT NULL,
+                    kind TEXT NOT NULL, body TEXT NOT NULL, provenance TEXT NOT NULL,
+                    trust TEXT NOT NULL, seq INTEGER NOT NULL, written_at INTEGER NOT NULL,
+                    updated_at INTEGER NOT NULL, deleted_at INTEGER,
+                    history TEXT NOT NULL DEFAULT '[]',
+                    partition TEXT NOT NULL DEFAULT 'operator:v1',
+                    PRIMARY KEY (partition, owner, id)
+                 );",
+            )
+            .unwrap();
+            for owner in ["alice", "bob"] {
+                let memory = sample_memory(owner, owner);
+                conn.execute(
+                    "INSERT INTO memories
+                        (id, scope, owner, kind, body, provenance, trust, seq,
+                         written_at, updated_at, history, partition)
+                     VALUES ('ambiguous', ?1, ?2, ?3, ?4, ?5, ?6, 1, ?7, ?8, ?9, ?10)",
+                    params![
+                        memory.scope.as_str(),
+                        memory.owner.0,
+                        memory.kind.as_str(),
+                        serde_json::to_string(&memory.body).unwrap(),
+                        serde_json::to_string(&memory.provenance).unwrap(),
+                        trust_to_str(memory.trust),
+                        memory.written_at,
+                        memory.updated_at,
+                        serde_json::to_string(&memory.history).unwrap(),
+                        OPERATOR_PARTITION,
+                    ],
+                )
+                .unwrap();
+            }
+        }
+
+        assert!(matches!(
+            SqliteMemoryStore::open(path),
+            Err(MemoryError::BadInput(message))
+                if message.contains("multiple owners")
+        ));
+        let conn = Connection::open(path).unwrap();
+        let rows: i64 = conn
+            .query_row("SELECT COUNT(*) FROM memories", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(rows, 2, "failed migration must preserve ambiguous rows");
     }
 
     #[test]
