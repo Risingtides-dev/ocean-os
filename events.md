@@ -7420,3 +7420,22 @@ Gate: fmt clean, clippy `-p ocean-core`/`-p ocean-store`/`-p ocean-daemon`
 ocean-daemon 824 passed 0 failed, toolchain 1.97.0. Ships paired with the
 surface half that exposes the toggle. No deploy, no migration.
 _________________________________________________________________________________
+
+time:      [03:22] [08-31-26]
+agent:     [claude] [opus 5]
+worktree:  loop/os-docs-trigger-policy-sweep
+type:      [docs]
+area:      [docs]
+
+Post-merge sweep after #413. The ecosystem contract enumerates the
+flag-to-event mapping and declares it one-for-one, then listed only four pairs:
+it never picked up `on_build_failure` <-> `BuildFailed` (stale since that flag
+landed) and would not have picked up `on_ci_failure` <-> `CiFailure` either.
+Both are added, along with the reason the two workspace flags are separate
+rather than one widened flag, and the fact that `ComponentEvent`/`Schedule` are
+the pair the write routes refuse -- which the doc asserted nowhere despite the
+struct doc in `ocean-core` carrying it. Checked the operator guide rather than
+assuming: it names `trigger_policy?` in the create/PATCH bodies at :557/:559
+and enumerates no flags, so it did not go stale and was left alone. Docs only,
+no code, no deploy, no migration.
+_________________________________________________________________________________
