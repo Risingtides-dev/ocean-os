@@ -7202,3 +7202,40 @@ AGENTS.md allowlist enumeration current — it had missed `repo_unbound` and
 failed, clippy -D warnings clean, fmt clean, toolchain 1.97.0. One source file
 plus two records. No migration, no deploy step.
 _________________________________________________________________________________
+
+time:      [21:23] [08-30-26]
+agent:     [claude] [opus 5]
+worktree:  loop/os-invite-response-carries-the-onboard-link
+type:      [feature-request]
+area:      [backend]
+
+The mint reply now carries Bedrock's onboarding link beside the invite code, so
+the surface has something to render other than a bare 32-character string the
+invitee has to be told what to do with. Bedrock already publishes
+`/api/v1/invites/{code}/onboard` on its service index and routes it BEFORE the
+global authenticate layer, so the composed link is public by design — that is the
+whole point, an invitee has no credential yet. `create_invite` already holds a
+federation bridge in `client` and already calls `client.room_endpoint(...)` two
+lines earlier, so composition is one expression at the return site; the code is
+percent-encoded into a single path segment, which means an upstream code cannot
+grow the URL a segment. `onboard_url` is `skip_serializing_if` and
+`InviteResponse` has no `deny_unknown_fields`, so an older reader is untouched.
+
+A loopback `OCEAN_FEDERATION_URL` composes NO link and the field stays absent —
+a dev daemon would otherwise hand an invitee a `127.0.0.1` bearer URL that
+resolves to the invitee's own machine. That guard is loopback-only on purpose: a
+LAN-only Bedrock is a legitimate deployment, so the operator guide now says
+plainly that loopback is the only suppressed base and any other origin composes
+a link that resolves wherever that origin resolves.
+
+Honest statement of coverage, because the test name used to overclaim it. The
+e2e pins the SUPPRESSION — deleting the loopback guard makes it fail with a
+`127.0.0.1` link inside a real 201 body — but not the composition: `FederationClient::new`
+refuses http for a non-loopback host, so an in-process fake Bedrock must bind
+127.0.0.1 and can never present a composable base. Composition is unit-covered
+only, and a hardcoded `None` at the wiring site still passes the suite. Said here
+rather than only in a review thread. Gate: fmt clean, ocean-core + ocean-daemon
+820 tests 0 failed, clippy --all-targets -D warnings clean on both, workspace
+check clean, toolchain 1.97.0. Inert until the ocean-surface half consumes the
+field. No migration, no deploy step.
+_________________________________________________________________________________
