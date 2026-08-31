@@ -8206,3 +8206,24 @@ attribution after the live binding advances to N+1. `cargo fmt --all`,
 review remain required before this repair is accepted. No push, merge to main,
 install, restart, database mutation, or deployment was performed.
 _________________________________________________________________________________
+
+time:      [15:41] [31-08-26]
+agent:     [codex] [gpt-5.6-sol]
+worktree:  [codex/rooms-phase1-integration-20260831]
+type:      [bug report]
+area:      [testing]
+
+The first full daemon run exposed nine existing Room-turn fixtures that stored
+macOS temporary directories through the noncanonical `/var` alias. Production
+correctly refused those values under the new boundary. The shared fixtures and
+the three direct local/federated Room fixtures now persist canonical test
+workspaces, while the production test proves relative, missing, noncanonical,
+and symlink-retargeted paths cannot become execution authority.
+
+Verification after the fixture repair: all 91 `persistent_rooms` tests passed;
+the two affected end-to-end daemon tests passed individually; and a quiet full
+daemon rerun passed 852 tests with zero failures in 125.02 seconds. Formatting,
+docs-check, ledger validation, and `git diff --check` also passed. Fresh exact-SHA
+independent review and workspace release gates remain required. No push, merge
+to main, install, restart, database mutation, or deployment was performed.
+_________________________________________________________________________________
