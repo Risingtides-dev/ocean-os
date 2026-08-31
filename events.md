@@ -8227,3 +8227,26 @@ docs-check, ledger validation, and `git diff --check` also passed. Fresh exact-S
 independent review and workspace release gates remain required. No push, merge
 to main, install, restart, database mutation, or deployment was performed.
 _________________________________________________________________________________
+
+time:      [15:56] [31-08-26]
+agent:     [codex] [gpt-5.6-sol]
+worktree:  [codex/rooms-phase1-integration-20260831]
+type:      [handoff]
+area:      [review]
+
+Independent delta review accepted exact backend candidate
+`1458258fb0fb252cdb9bf0c4de06cc66f683419b`: the canonical workspace boundary
+and immutable admission-era refusal attribution close both prior P1 blockers,
+and the six-file repair introduced no new correctness or security blocker. The
+separately reviewed Surface candidate remains accepted at
+`5f838b352dfb6dd76ad620318ef2c78c2fc7579f`.
+
+Exact backend verification passed: full daemon 852/852, denied-warning daemon
+Clippy, `cargo xtask ci`, `cargo xtask ci --compatibility`, and
+`cargo +1.88.0 xtask ci --msrv`. The MSRV feature checks retained two known
+non-denied dead-code warnings in `room_workspace_proxy.rs`; the lane passed.
+The additive copy-only migration, rollback, old-daemon open, and re-upgrade
+rehearsal remains valid because the final repair changed no schema. No push,
+merge to main, install, restart, live database mutation, or deployment was
+performed; upstream landing is the next release boundary.
+_________________________________________________________________________________
