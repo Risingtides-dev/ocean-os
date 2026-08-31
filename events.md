@@ -7239,3 +7239,65 @@ rather than only in a review thread. Gate: fmt clean, ocean-core + ocean-daemon
 check clean, toolchain 1.97.0. Inert until the ocean-surface half consumes the
 field. No migration, no deploy step.
 _________________________________________________________________________________
+
+time:      [23:06] [08-30-26]
+agent:     [claude] [opus 5]
+worktree:  loop/os-marker-allowlist-noise-list-asserts-a-phantom-event
+type:      [refactor]
+area:      [testing]
+
+`workspace_action_is_marker` is a strict allowlist that drops what it does not
+recognise, and drops it silently — "everything not listed here, including
+future actions Bedrock grows, advances the cursor exactly as before this
+allowlist existed." That makes its test the only thing standing between
+"Bedrock grows an event type" and "the daemon ignores it forever, silently." It
+could not do that job, because the old noise list mixed three incompatible
+kinds of string with nothing marking which was which: real Bedrock room events,
+an audit-rail action, a pure invention, and synthetic shape probes. That
+undifferentiated soup is exactly how the invention survived.
+
+Re-derived the emitted set from ocean-bedrock `origin/master` @ 9efef97 by the
+only rule that decides it: an event type is real if and only if it is the
+`action` of an `emitWorkspaceEvent` call in `src/server.mjs`. That is 22 types
+— note `build_finished`/`build_failed` are one call site's ternary, so a literal
+grep for the names misses them. The classification turns out to be COMPLETE: 13
+admitted plus 9 deliberate noise is exactly 22, and nothing Bedrock emits is
+unclassified. Behaviour is unchanged; the 13-arm `matches!` was already correct
+and was not touched.
+
+Two defects, both in the noise list and both mirrored in the doc comment.
+`room.workspace.mkdir` was a PHANTOM — it appears nowhere in ocean-bedrock, not
+as an emitted action, not as an audit action, not anywhere in `src/` — and the
+doc comment quoted it as fact. Dropped from both. `flush_write` and `file_write`
+are real strings but are NOT room events: they are `appendAudit` actions passed
+to `writeDurableFileFromBuffer`. Worth being precise about the mechanism, since
+the obvious reading is wrong — `emitWorkspaceEvent` is itself a wrapper around
+`appendAudit`, so it is the same ledger, not a separate rail. What separates
+them is that the wrapper stamps `correlation_id` and the room-scoped `path`, and
+the room SSE stream is that ledger FILTERED on exactly those two fields
+(`src/server.mjs:3840`). A write-path audit row carries neither, so it can never
+reach this matcher. They are kept in a third, explicitly-named list rather than
+deleted, so meeting them upstream reads as "already accounted for" instead of as
+an omission someone should fix by widening the allowlist.
+
+The test is now built around one pinned const carrying that provenance and that
+rule, and asserts every member is classified exactly ONCE (admitted XOR
+deliberate noise) with the two partitions EXHAUSTING the pinned set in both
+directions. Verified the pin actually bites: adding a hypothetical 23rd event
+fails with "must be classified exactly once", so a new Bedrock event becomes a
+test decision instead of silence — once someone re-derives the pin. Nothing in
+ocean-os reads ocean-bedrock and no cross-repo check exists, so that
+re-derivation stays a manual step, and it is the step whose absence let `mkdir`
+live here. Synthetic negatives moved to their own test
+(`workspace_marker_matcher_rejects_near_miss_shapes`) because they pin the
+matcher's edges — prefix, empty leaf, suffixed leaf — not Bedrock's inventory.
+
+The `port_closed` caveat is kept, but its ownership moved while this branch sat:
+ocean-bedrock #65 landed `route_removed` / `route_removed_reason` on the close
+payload, so the flag now exists upstream and reading it is a daemon follow-on
+rather than a Bedrock one. The marker still reports the port's RECORDED state,
+because `WorkspaceEventPayload` ignores unknown fields and nothing here renders
+them yet. Gate: fmt clean, clippy
+`-p ocean-daemon --all-targets -D warnings` clean, 821 tests 0 failed, toolchain
+1.97.0. Test-and-docs only — no deploy, no migration.
+_________________________________________________________________________________
