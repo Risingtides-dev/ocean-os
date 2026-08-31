@@ -8007,3 +8007,28 @@ passed; `cargo clippy -p ocean-agent -p ocean-daemon -p ocean-store
 live database, install, restart, or deployment was performed. Stage 2
 contributed-folder authority remains closed.
 _________________________________________________________________________________
+time:      [14:13] [31-08-26]
+agent:     [codex] [gpt-5.6-sol]
+worktree:  [codex/rooms-phase1-integration-20260831]
+type:      [workflow]
+area:      [testing]
+
+Rehearsed the Rooms Phase 1 forward, downgrade, and re-upgrade paths against
+consistent temporary backups of the operator's real `rooms.db` and
+`memory.sqlite`; the live daemon and both live databases were left untouched.
+The source shape was 3 Rooms, 7 participants, 4 legacy Agent labels, 79 legacy
+memories, and zero bindings, decisions, or implicit owners. Current code opened
+the copies with all 79 memories in `operator:v1`, no Room memory rows, no
+implicit binding backfill, and clean SQLite integrity.
+
+On the temporary copy only, one synthetic Room row exercised the downgrade
+rail. `ocean-memory-rollback --offline-confirm` restored the legacy 12-column
+operator table with 79 rows and archived the one Room row outside that table.
+The installed `996d3400b99b` daemon then opened the downgraded copy successfully,
+ignored the additive empty Room-authority tables, and left both the archive and
+Room counts intact. Reopening with current code restored the partitioned table,
+rehydrated the exact Room row under its length-prefixed partition plus stable
+room-wide owner, removed the archive table, and passed `PRAGMA integrity_check`.
+The live database SHA-256 values were identical before and after the rehearsal,
+and the supervised live daemon remained healthy at revision `996d3400b99b`.
+_________________________________________________________________________________
