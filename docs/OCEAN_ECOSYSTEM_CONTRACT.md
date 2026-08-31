@@ -173,8 +173,14 @@ store-assigned monotonic `seq` so clients can request `after_seq` tails.
 `evaluate_trigger_policy(policy, event) -> TriggerDecision` in `ocean-core`. The
 optional `RoomTriggerPolicy` gates each `RoomTriggerEvent` variant one-for-one:
 `on_mention` ↔ `Mention`, `on_thread_reply` ↔ `ThreadReply`,
-`on_component_event` ↔ `ComponentEvent`, `on_schedule` (cron) ↔ `Schedule`. An
-absent policy (`None`) never convenes. A positive `TriggerDecision`
+`on_component_event` ↔ `ComponentEvent`, `on_schedule` (cron) ↔ `Schedule`,
+`on_build_failure` ↔ `BuildFailed`, and `on_ci_failure` ↔ `CiFailure`. The two
+workspace flags are independent rather than one widened flag, so a room that
+opted in to build failures before CI triggers existed convenes on exactly what
+it opted in to. `ComponentEvent` and `Schedule` have no daemon source, so the
+room write routes refuse values that would turn those two on rather than store
+configuration that silently never acts. An absent policy (`None`) never
+convenes. A positive `TriggerDecision`
 (`should_convene: true`, optional `target_participant`, human-readable `reason`)
 is the seed for auto-convene; the daemon evaluates it at the transcript/
 component-event wiring point.
