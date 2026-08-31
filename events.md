@@ -8335,3 +8335,21 @@ reviewer's own mutations: widened prefix -> the pin fails naming both values,
 emptied sha -> the provenance test fails, prefix edited with no action moved ->
 `--check` exits 1 saying the sets agree but the bytes do not.
 _________________________________________________________________________________
+
+time:      [16:08] [31-08-26]
+agent:     [codex] [gpt-5.6-sol]
+worktree:  [codex/rooms-phase1-integration-20260831]
+type:      [handoff]
+area:      [testing]
+
+Reconciled the accepted Rooms Phase 1 backend candidate with `origin/main` at
+`7ba7061c`, retaining the upstream Bedrock event-set provenance guard. The only
+manual repair restored the append-only ledger separator dropped by the union
+merge driver; all 532 entries validate as closed. On combined code at
+`cedd559c1048b2c1dfdca34713e2de8f6ab80ac1`, `cargo xtask ci`,
+`cargo xtask ci --compatibility`, and `cargo +1.88.0 xtask ci --msrv` all pass.
+The MSRV lane retains the two known non-denied dead-code warnings in
+`room_workspace_proxy.rs`. A fresh exact-SHA delta review remains required. No
+push, merge to main, install, restart, live database mutation, or deployment was
+performed.
+_________________________________________________________________________________
