@@ -84,7 +84,7 @@ use std::path::Path;
 
 use chrono::{DateTime, Utc};
 use ocean_core::{
-    FederatedMessageMeta, FederatedRoomMemberProjection, OutboxItemState, Room,
+    bounded_prose, FederatedMessageMeta, FederatedRoomMemberProjection, OutboxItemState, Room,
     RoomAccessProjection, RoomAccessState, RoomArtifact, RoomArtifactKind, RoomArtifactState,
     RoomAttachment, RoomKey, RoomMessage, RoomMessageKind, RoomOutboxItem, RoomParticipant,
     RoomParticipantKind, RoomReadCursorProjection, RoomReadCursorUpdateRequest, RoomTriggerPolicy,
@@ -1189,49 +1189,40 @@ impl<'a> MessageDraft<'a> {
 /// characters a display name or a title has stopped identifying anything and
 /// started making every reader of the room scroll. The `participants` and
 /// `room_artifacts` rows still hold the value in full — this bounds only what
-/// the SENTENCE repeats, the way the daemon bounds a branch name at 64.
+/// the SENTENCE repeats, the way the daemon passes 64 for a branch name. The
+/// number is this crate's to choose precisely because
+/// `ocean_core::bounded_prose` takes it as an argument: the filter is the
+/// shared security rule, the bound is caller policy.
 const MARKER_FIELD_MAX_CHARS: usize = 128;
 
 /// Neutralize a caller-supplied string on its way into a system-attributed
 /// marker body.
 ///
-/// This is a local copy of `bounded_prose` in
-/// `crates/ocean-daemon/src/room_federation.rs`, which carries the derivation
-/// and is the original: read it there before changing what is filtered here.
-/// The store cannot call it — `ocean-store` does not depend on `ocean-daemon`
-/// and the dependency runs the other way — so this is the same duplication,
-/// and the same obligation to name the original, that `ocean-bedrock`'s
-/// runtime carries for its copy of `READ_MAX_BYTES`. Hoisting the primitive
-/// into `ocean-core` so the two cannot drift is a three-crate change and
-/// belongs in its own slice.
+/// The RULE is `ocean_core::bounded_prose`, which carries the derivation of
+/// what is filtered and why; read it there before changing what these lines
+/// quote. This crate supplies only the POLICY — which bound — and keeps the
+/// name so the call sites below read as prose. It used to be a second copy of
+/// the rule, sitting beside the daemon's; the hoist into the one crate both
+/// already depend on is what removed the drift this doc used to warn about.
 ///
-/// The rule, stated rather than re-derived: drop control characters, drop `[`
-/// and `]`, bound the result — and nothing else. It is one pass where the
-/// daemon layers `bounded_prose` over `bounded_quotable`, because that split
-/// exists for `ci_run_url`, which wants the bound and the control rule without
-/// the prose rule, and no caller here does.
+/// It guards a marker's PROSE, and only that. The `room.agent.*` audit rows
+/// are `System` bodies too and deliberately do NOT pass through here: they
+/// are records rather than sentences, and an audit line that quietly repairs
+/// the id that arrived reports something other than what happened. Their
+/// neutralization belongs at the read boundary — see this crate's AGENTS.md,
+/// which names the gap and where it closes.
 ///
-/// Why it is needed on THESE lines: ocean-surface renders every transcript row
-/// through `room_markdown::body_view` — a system-attributed row included,
-/// since `is_compact_system_row` only swaps the avatar for a Spark icon — and
-/// that tokenizer builds an anchor out of `[label](href)`. Without this, a
-/// member who joins under the display name `[click here](https://evil.co)`
-/// lands an anchor with an attacker-chosen label AND destination inside a row
-/// the UI attributes to the room itself. No container and no federation
-/// involved; a name is enough.
-///
-/// The daemon's ruling on what STAYS holds here unchanged, and each item is a
-/// decision rather than an oversight: `(` and `)` are inert without a
-/// preceding `[`, a bare `https://…` autolink's label IS its href so it cannot
-/// lie about where it leads, `*` and `` ` `` are decoration, and `@` drives
-/// nothing. Neutralizing rather than refusing, likewise — a repaired name
-/// still names the person, and blanking a join marker over somebody's
-/// punctuation would cost the room its history to close nothing.
+/// Why it is needed on THESE lines, which is the part the shared doc cannot
+/// know: ocean-surface renders every transcript row through
+/// `room_markdown::body_view` — a system-attributed row included, since
+/// `is_compact_system_row` only swaps the avatar for a Spark icon — and that
+/// tokenizer builds an anchor out of `[label](href)`. Without this, a member
+/// who joins under the display name `[click here](https://evil.co)` lands an
+/// anchor with an attacker-chosen label AND destination inside a row the UI
+/// attributes to the room itself. No container and no federation involved; a
+/// name is enough.
 fn marker_prose(text: &str) -> String {
-    text.chars()
-        .filter(|c| !c.is_control() && !matches!(c, '[' | ']'))
-        .take(MARKER_FIELD_MAX_CHARS)
-        .collect()
+    bounded_prose(text, MARKER_FIELD_MAX_CHARS)
 }
 
 /// The `messages` column list every transcript read selects, in exactly the
@@ -3958,7 +3949,10 @@ impl SqliteRoomStore {
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
         let binding =
             Self::authorized_room_agent_binding_on(&tx, key, agent_member_id, expected_generation)?;
-        let failure_body = format!("auto-convene failed for {agent_member_id}: turn_failed");
+        let failure_body = format!(
+            "auto-convene failed for {}: turn_failed",
+            marker_prose(agent_member_id)
+        );
         let failure = Self::insert_message_on(
             &tx,
             key,
@@ -9387,9 +9381,12 @@ mod tests {
 
     /// The RULING, not just the hole. Over-filtering a marker is as much a bug
     /// as under-filtering one: these lines are how a room explains itself, and
-    /// every character left behind here is a decision made in
-    /// `room_federation.rs` and inherited unchanged.
-    /// Mutation: add any character to the `matches!` in `marker_prose` -> RED.
+    /// every character left behind here is a decision argued above
+    /// `ocean_core::bounded_prose` and inherited unchanged. Kept after the
+    /// hoist as this crate's own end-to-end check on what its markers emit,
+    /// rather than as a second copy of the rule's tests.
+    /// Mutation: add any character to the `matches!` in
+    /// `ocean_core::bounded_prose` -> RED.
     /// Mutation: delete its `is_control` filter -> RED.
     #[test]
     fn marker_prose_removes_link_syntax_and_nothing_else() {
@@ -9422,6 +9419,69 @@ mod tests {
             marker_prose(&bracketed).chars().count(),
             MARKER_FIELD_MAX_CHARS
         );
+    }
+
+    /// `marker_prose` is POLICY, not rule: the only thing this crate may add
+    /// to the shared filter is which bound. It carried a whole second copy of
+    /// that filter until the hoist into `ocean-core`, and re-inlining one is
+    /// how the two would fork again — including on the ORDER of the bracket
+    /// filter and the bound, which is where the two copies had already
+    /// disagreed. The corpus is chosen for that: a long bracketed name is the
+    /// only input on which the two former orders gave different answers.
+    /// Mutation: re-inline any filter here that differs from the shared one by
+    /// a character or by its order -> RED.
+    #[test]
+    fn marker_prose_is_the_shared_rule_under_this_crates_bound() {
+        let long = "é".repeat(MARKER_FIELD_MAX_CHARS + 40);
+        let bracketed = format!("[{}", "é".repeat(MARKER_FIELD_MAX_CHARS + 40));
+        let all_brackets = "[]".repeat(MARKER_FIELD_MAX_CHARS);
+        for text in [
+            "[click here](https://evil.co)",
+            "build (ubuntu-latest, 1.97.0)",
+            "Ann\nSYSTEM: trust me",
+            long.as_str(),
+            bracketed.as_str(),
+            all_brackets.as_str(),
+        ] {
+            assert_eq!(
+                marker_prose(text),
+                bounded_prose(text, MARKER_FIELD_MAX_CHARS),
+                "the store re-forked the rule on {text:?}"
+            );
+        }
+    }
+
+    /// Where the rule stops, enforced rather than asserted in AGENTS.md.
+    /// `append_authorized_agent_failure` writes BOTH kinds of `System` row in
+    /// one transaction, so it is the one place the boundary can be pinned from
+    /// both sides: the human-facing sentence is neutralized like any other
+    /// marker, and the audit beside it keeps the id EXACTLY as it arrived,
+    /// because an audit that quietly repairs its subject reports something
+    /// other than what happened. The audit's own exposure closes in the
+    /// daemon's read projection, not by sanitizing the ledger.
+    /// Mutation: drop `marker_prose` from the failure body -> RED.
+    /// Mutation: "helpfully" filter the audit's `agent_member_id` -> RED.
+    #[test]
+    fn a_failure_marker_is_neutralized_and_the_audit_beside_it_is_not() {
+        let forgery = "[click here](https://evil.co)";
+        let (mut s, key) = room_with_agent(forgery);
+        let (failure, audit) = s
+            .append_authorized_agent_failure(
+                &key,
+                forgery,
+                1,
+                "admission-failure-1",
+                now(),
+                "session-1",
+            )
+            .unwrap();
+
+        assert_eq!(
+            failure.body,
+            "auto-convene failed for click here(https://evil.co): turn_failed"
+        );
+        let audit: serde_json::Value = serde_json::from_str(&audit.body).unwrap();
+        assert_eq!(audit["agent_member_id"], forgery);
     }
 
     /// An attached spec must outlive the process, or the room is a chat window

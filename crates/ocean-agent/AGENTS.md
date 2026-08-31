@@ -46,6 +46,13 @@ This crate owns Ocean's agent session/history layer and project prompt loading. 
 - Spawned agent loops must remain owned by the parent turn future. Dropping the parent must abort the child; Tokio's default detached-on-`JoinHandle`-drop behavior is unsafe for side-effecting tools.
 - Pre-stream provider failover must pin one session id and hold one per-session turn lock across the complete primary/fallback transaction, reusing the primary attempt's durable accepted-user row; never allow an intervening turn, append the operator prompt twice, or orphan an acceptance-only session.
 - Track-0 room prompt guidance is retired; prompt assembly must not infer a closed room role from agent-turn input.
+- `rooms::RoomRegistry` is the dormant in-memory twin of
+  `ocean_store::SqliteRoomStore` and owes its markers the same filter: a
+  join/leave body quotes a caller-supplied display name through
+  `ocean_core::bounded_prose` under this module's `MARKER_FIELD_MAX_CHARS`,
+  which matches the store's deliberately. Having no live caller is not a
+  filter — it is why the twin kept an unbounded `format!` for a release
+  after the durable side was fixed.
 - Desktop Surface guidance is exclusively `surface-tauri` and uses the shared
   Leptos component contract; do not add parallel desktop prompt families.
 - Persisted history search reads only display-projected user/assistant transcript text; it must never inspect tool payloads/raw provider messages or invoke providers/embeddings. Preflight cumulative raw session-file size against the 64 MiB request budget, then enforce the same cumulative bound while reading so concurrent replacement/growth cannot bypass it.

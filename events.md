@@ -8402,3 +8402,127 @@ immutable release at `6872181a6f4f535498e3a816020cb197f0ee65dd3c39aafdba57119be4
 and `7846b1c95e915c7899bff104368503ee1aadb78cfa68653f41af84ad24d5d223`.
 Stage 2 contributed folders remains closed pending its own accepted manifest.
 _________________________________________________________________________________
+
+time:      [19:03] [31-08-26]
+agent:     [claude] [opus 5]
+worktree:  loop/os-bounded-prose-is-about-to-exist-in-two-crates-with-no-shared-home
+type:      [refactor]
+area:      [backend]
+
+Hoisted the marker quoting rule into `ocean-core` as `bounded_quotable` and
+`bounded_prose`, with the whole derivation travelling with the code, and pointed
+`ocean-daemon`'s workspace markers and `ocean-store`'s `marker_prose` at the one
+definition. The fork was real, not pending: `ocean-store` carried a full second
+copy of the filter, its own doc named the daemon as the original and asked for
+this slice by name, and the dependency runs daemon -> store so the store could
+never call it. `ocean-core` is the only crate both already depend on; that, and
+the fact that the alternative is two copies of a security rule whose correctness
+lives in a comment, is why a text primitive now sits in a wire-types crate, and
+it is recorded in `crates/ocean-core/AGENTS.md`.
+
+The two copies had ALREADY diverged in two ways, and both are ruled on rather
+than papered over. The bound: the daemon takes `max_chars` (callers pass 16, 32,
+64) while the store hard-coded 128. The filter is the shared rule and the bound
+is caller policy, so `MARKER_FIELD_MAX_CHARS` stays in the store and
+`marker_prose` is now a one-line wrapper supplying it. The ORDER, which the
+backlog did not know about: the store filtered brackets BEFORE truncating, the
+daemon after — so a bracket spent a character of budget in one crate and not the
+other. The store's order won, because it is the one that was argued (a test
+comment there pinned "the bound applies to what is emitted"), where the daemon's
+was only a side effect of writing prose as a composition over the primitive and
+no comment ever defended it. Consequence: every existing test in both crates
+passes UNCHANGED, which is the evidence that this reading was the settled one.
+
+The trap held. `ci_run_url` still compares back against `bounded_quotable` and
+never `bounded_prose` — the compare-back is an equality test, so a rendering
+rule folded into it would silently change which run URLs the gate accepts —
+and `the_prose_rule_did_not_narrow_the_run_url_gate` was run first after the
+move and passed untouched. Anti-drift is now structural plus pinned:
+`bounded_prose_is_the_primitive_plus_bracket_syntax` in ocean-core goes red if
+either filter grows without the other,
+`bounded_quotable_drops_control_characters_and_keeps_bracket_syntax` goes red if
+the prose rule is folded down into the gate's primitive, and
+`marker_prose_is_the_shared_rule_under_this_crates_bound` in ocean-store goes red
+if that crate ever re-inlines a filter of its own. All three AGENTS.md pointers
+plus the store's stale "naive renderer" clause now name the new home.
+
+Gate: `cargo test -p ocean-core -p ocean-store -p ocean-daemon` 62 + 195 + 854
+green, `cargo clippy ... --all-targets -- -D warnings` clean, `cargo fmt --check`
+clean, `cargo check --workspace` clean. No deploy and no migration; this lands
+to main like any other code change.
+_________________________________________________________________________________
+
+time:      [19:30] [31-08-26]
+agent:     [claude] [opus 5]
+worktree:  loop/os-bounded-prose-is-about-to-exist-in-two-crates-with-no-shared-home
+type:      [review]
+area:      [backend]
+
+Refine pass on the marker-prose hoist, against two review findings. The first
+was the sharper one: this slice's whole subject is a security rule whose
+correctness lives in prose, and it wrote a NEW piece of prose into
+`crates/ocean-store/AGENTS.md` that was false -- "Every caller-supplied string a
+marker quotes goes through `marker_prose`". Auditing every `System` body this
+crate writes found not one counterexample but seven. Six are `room.agent.*`
+audit rows whose body is a `serde_json` object interpolating the ids that
+arrived (`bootstrap_local_room_agent`, both `room.agent.output` writers, the
+failure audit, admission, authority); serde escapes control characters but not
+`[` or `]`. The seventh was ordinary prose that had simply been missed:
+`append_authorized_agent_failure` built `"auto-convene failed for
+{agent_member_id}: turn_failed"` with no filter at all.
+
+The seventh is fixed. The six are ruled the OTHER way, deliberately, and that
+ruling is the substance of this pass. An audit row is a record, not a sentence.
+An audit line that quietly repairs `owner_member_id` reports the attempt as
+something other than what was made, and sanitizing a ledger to fix a rendering
+bug fixes it in the wrong crate while destroying the evidence on the way. The
+right layer already exists on one side: `ocean-daemon`'s `room_history_text`
+replaces every `room.agent.*` body with `[room agent bootstrap audit]` before an
+AGENT sees it. The gap is that
+`GET /v1/rooms/persistent/{key}/transcript` hands a human client the same body
+raw and ocean-surface renders it through `room_markdown::body_view`, so a
+bootstrap `owner_member_id` of `[click here](https://evil.co)` -- free-form,
+shape-checked nowhere on that path -- still forges a link in the room's own
+voice. That is now filed as its own slice against
+`crates/ocean-daemon/src/persistent_rooms.rs`, out of this slice's file scope,
+and the AGENTS.md bullet says so in the same breath as the exception rather than
+claiming a closure that does not exist.
+
+The boundary is enforced, not merely written down, which was the whole point of
+the finding. `append_authorized_agent_failure` writes both kinds of row in one
+transaction, so
+`a_failure_marker_is_neutralized_and_the_audit_beside_it_is_not` pins it from
+both sides: RED if the human-facing sentence loses `marker_prose`, and RED if
+someone later "helpfully" filters the audit's `agent_member_id`. Both mutations
+were applied and both failed as claimed.
+
+The second finding was a named instruction this slice had silently dropped:
+fold in `RoomRegistry`, the dormant in-memory twin, whose join/leave markers
+had no filter at all. Done -- `ocean-agent` already depended on `ocean-core`,
+so the hoist is exactly what made it two calls plus a bound, with
+`join_and_leave_markers_neutralize_link_syntax` covering forged link syntax, a
+forged row break, and the emitted-sentence bound. Dropping either call goes RED.
+Being dormant is not a filter; it is why the twin kept an unbounded `format!`
+for a release after the durable side was fixed. Also corrected one number the
+hoist had invented: `marker_prose`'s doc claimed "the fourteen call sites
+below" where there were twelve, which is the same species of defect as the false
+absolute, one order of magnitude smaller.
+
+Gate: `cargo test -p ocean-core -p ocean-store -p ocean-agent -p ocean-daemon`
+62 + 196 + 239 + 854 green, `cargo clippy ... --all-targets -- -D warnings`
+exit 0, `cargo fmt --check` exit 0, `cargo check --workspace` exit 0. No deploy
+and no migration.
+
+Two land-time corrections from the review notes, both to prose this commit
+itself wrote. The `agent:` field on these two entries read
+`[claude-code], [claude-opus-5]`, matching neither the schema nor any of the
+~8400 lines already here (`[claude] [opus 5]` is the established form, 38 uses)
+-- cosmetic, except that this file is grep-parsed by agents. And the new clause
+in `crates/ocean-daemon/AGENTS.md` enumerated the caps as "16 for a conclusion,
+32 for a check name, 64 for a branch or the total-function fallback", which
+reads as a per-field table and is not one: the `quoted` closure at
+`room_federation.rs:3718` puts `driver`, `script` and `exec_id` through the
+same 64 -- three fields the very next clause names by provenance. A positive
+enumeration missing half its members is the same defect as the false absolute
+this slice exists to fix.
+_________________________________________________________________________________
