@@ -8182,3 +8182,27 @@ at `8320a975a23d03f7e98982ff81d8f793f100b4c6`; `cargo fmt --all` and
 explicit-workspace/fail-closed contract, so no contract text changed. No push,
 merge to main, install, restart, database mutation, or deployment was performed.
 _________________________________________________________________________________
+
+time:      [15:24] [31-08-26]
+agent:     [codex] [gpt-5.6-sol]
+worktree:  [codex/rooms-phase1-integration-20260831]
+type:      [bug report]
+area:      [backend]
+
+Closed the two blockers from the independent Rooms Phase 1 review. Room create
+now accepts a nonblank workspace only when it canonicalizes to an existing
+absolute directory and stores that canonical value; execution revalidates the
+persisted boundary, so legacy relative/noncanonical paths, missing directories,
+and symlink-replaced paths fail closed instead of inheriting daemon cwd. Post-admission
+outcome audits now use the immutable admission generation, decision, operator,
+package, and digest rather than re-reading a possibly newer binding. Synchronous
+audit failures are surfaced, and detached federated failures emit a fixed-code
+warning instead of being silently discarded.
+
+Focused verification passed for canonical Room workspace creation/execution
+validation and for an admission at generation N retaining its original
+attribution after the live binding advances to N+1. `cargo fmt --all`,
+`git diff --check`, the full daemon suite, workspace gates, and fresh exact-SHA
+review remain required before this repair is accepted. No push, merge to main,
+install, restart, database mutation, or deployment was performed.
+_________________________________________________________________________________

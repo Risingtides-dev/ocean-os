@@ -127,6 +127,7 @@ pub(super) struct RoomAgentAdmission {
     pub(super) package: ResolvedPackage,
     pub(super) generation: u64,
     pub(super) decision_id: String,
+    pub(super) operator_principal_id: String,
     pub(super) context_policy: ContextPolicy,
     pub(super) effective_capabilities: Vec<String>,
     pub(super) room_memory: Option<ocean_agent::AdmittedRoomMemory>,
@@ -1478,6 +1479,7 @@ pub(super) async fn admit_room_agent(
         package,
         generation: binding.generation,
         decision_id: binding.decision_id.clone(),
+        operator_principal_id: binding.authorized_by.clone(),
         context_policy: binding.context_policy,
         effective_capabilities,
         room_memory: None,
@@ -1544,22 +1546,32 @@ pub(super) fn append_remote_output_outcome(
     admission: &RoomAgentAdmission,
     outcome: &str,
     reason_code: &str,
-) {
-    let current = with_rooms(state, |store| {
-        store.room_agent_binding(&admission.room, &admission.agent_member_id)
+) -> Result<(), ApiError> {
+    // This outcome belongs to the immutable admission snapshot even when an
+    // authority mutation has already advanced the live binding to N+1. Never
+    // re-read current authority here: combining an old admission id/package
+    // with a newer generation, decision, or operator would forge attribution.
+    let message = with_rooms(state, |store| {
+        store.append_room_agent_admission_audit(
+            &admission.room,
+            RoomAgentAdmissionAuditInput {
+                admission_id: admission.admission_id.clone(),
+                agent_member_id: admission.agent_member_id.clone(),
+                agent_package_id: admission.package.package_id.clone(),
+                approved_definition_digest: Some(admission.package.definition_digest.clone()),
+                observed_definition_digest: admission.package.definition_digest.clone(),
+                generation: Some(admission.generation),
+                operator_principal_id: Some(admission.operator_principal_id.clone()),
+                decision_id: Some(admission.decision_id.clone()),
+                outcome: outcome.to_string(),
+                reason_code: reason_code.to_string(),
+            },
+            Utc::now(),
+        )
     })
-    .ok()
-    .flatten();
-    let _ = append_admission_audit(
-        state,
-        &admission.room,
-        &admission.admission_id,
-        &admission.package,
-        &admission.agent_member_id,
-        current.as_ref(),
-        outcome,
-        reason_code,
-    );
+    .map_err(ApiError::from)?;
+    publish_room_wake(state, &admission.room, &message);
+    Ok(())
 }
 
 pub(super) fn admission_generation_is_current(

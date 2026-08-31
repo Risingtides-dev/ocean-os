@@ -16133,6 +16133,13 @@ mod tests {
         binding.generation
     }
 
+    pub(super) fn canonical_test_workspace(path: &std::path::Path) -> String {
+        std::fs::canonicalize(path)
+            .expect("test workspace must canonicalize")
+            .to_string_lossy()
+            .into_owned()
+    }
+
     /// Build an `AppState` whose runtime is pinned to the Fake provider (so a
     /// turn runs synchronously and deterministically with no live LLM) and whose
     /// room store is a fresh in-memory SQLite DB. Returns the state plus the
@@ -16803,7 +16810,7 @@ mod tests {
             reg.create_in_workspace(
                 key.clone(),
                 "Convene Room",
-                Some(tmp.path().to_string_lossy().into_owned()),
+                Some(canonical_test_workspace(tmp.path())),
                 Some(RoomTriggerPolicy {
                     on_mention: true,
                     ..Default::default()
@@ -17199,7 +17206,7 @@ mod tests {
         // session's workspace anchor is exactly this path (no git-toplevel shift),
         // making the project lookup an exact match.
         let ws_dir = tempfile::tempdir().unwrap();
-        let ws = ws_dir.path().to_string_lossy().into_owned();
+        let ws = canonical_test_workspace(ws_dir.path());
 
         // Register a project claiming that directory (writes projects.json under
         // the temp OCEAN_CONFIG_DIR the runtime reads).
@@ -17431,6 +17438,103 @@ mod tests {
         }
 
         std::env::remove_var("OCEAN_YOLO");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn post_admission_refusal_keeps_the_admitted_generation_attribution() {
+        let _guard = AUTO_CONVENE_ENV_LOCK.lock().await;
+        let _env = TestEnvRestore::capture(&[
+            "OCEAN_CONFIG_DIR",
+            "OCEAN_MODEL",
+            "OCEAN_YOLO",
+            "OCEAN_AGENTS_DIR",
+        ]);
+        let tmp = tempfile::tempdir().unwrap();
+        let state = fake_convene_state(&tmp);
+        let agents_root = tmp.path().join("agents");
+        write_agent_fixture(&agents_root, "helper", "", None);
+        std::env::set_var("OCEAN_AGENTS_DIR", &agents_root);
+
+        let key = RoomKey::new("immutable-admission-audit");
+        with_rooms(&state, |store| {
+            store.create(key.clone(), "Immutable Audit", None, Utc::now())?;
+            store.add_participant(
+                &key,
+                RoomParticipant {
+                    id: "john".into(),
+                    kind: RoomParticipantKind::Human,
+                    display_name: "John".into(),
+                },
+                Utc::now(),
+            )?;
+            store.add_agent_participant_with_owner(
+                &key,
+                RoomParticipant {
+                    id: "helper".into(),
+                    kind: RoomParticipantKind::Agent,
+                    display_name: "Helper".into(),
+                },
+                "john",
+                Utc::now(),
+            )?;
+            Ok::<_, ocean_store::RoomStoreError>(())
+        })
+        .unwrap();
+        let generation = authorize_room_agent_fixture(
+            &state,
+            &key,
+            "helper",
+            ocean_store::ActivationPolicy::ExplicitOnly,
+            ocean_store::ContextPolicy::InvocationOnly,
+        );
+        let admission = room_agent_authority::admit_room_agent(
+            &state,
+            &key,
+            "helper",
+            "helper",
+            room_agent_authority::AdmissionTrigger::Explicit,
+        )
+        .await
+        .unwrap();
+        let admitted_decision = admission.decision_id.clone();
+        let admitted_operator = admission.operator_principal_id.clone();
+        assert_eq!(admission.generation, generation);
+
+        let (newer, applied, _audit) = with_rooms(&state, |store| {
+            store.set_room_agent_binding_status(
+                &key,
+                "helper",
+                ocean_store::SetAgentBindingStatusInput {
+                    status: ocean_store::AgentBindingStatus::Suspended,
+                    actor: "newer-operator".into(),
+                    decision_id: "newer-decision".into(),
+                    request_digest: "newer-request".into(),
+                },
+                Utc::now(),
+            )
+        })
+        .unwrap();
+        assert!(applied);
+        assert_eq!(newer.generation, generation + 1);
+
+        room_agent_authority::append_remote_output_outcome(
+            &state,
+            &admission,
+            "refused",
+            "authority_changed_before_remote_enqueue",
+        )
+        .unwrap();
+        let transcript = with_rooms(&state, |store| store.transcript(&key, None)).unwrap();
+        let audit: serde_json::Value =
+            serde_json::from_str(&transcript.last().unwrap().body).unwrap();
+        assert_eq!(audit["type"], "room.agent.admission");
+        assert_eq!(audit["admission_id"], admission.admission_id);
+        assert_eq!(audit["generation"], generation.to_string());
+        assert_eq!(audit["decision_id"], admitted_decision);
+        assert_eq!(audit["operator_principal_id"], admitted_operator);
+        assert_ne!(audit["generation"], newer.generation.to_string());
+        assert_ne!(audit["decision_id"], "newer-decision");
+        assert_ne!(audit["operator_principal_id"], "newer-operator");
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

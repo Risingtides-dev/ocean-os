@@ -706,6 +706,48 @@ pub(super) struct RoomCreateRequest {
     pub(super) workspace_root: Option<String>,
 }
 
+fn canonical_submitted_workspace_root(
+    workspace_root: Option<String>,
+) -> Result<Option<String>, ()> {
+    let Some(workspace_root) = workspace_root
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+    else {
+        return Ok(None);
+    };
+    let path = std::path::Path::new(&workspace_root);
+    if !path.is_absolute() {
+        return Err(());
+    }
+    let canonical = std::fs::canonicalize(path).map_err(|_| ())?;
+    if !canonical.is_dir() {
+        return Err(());
+    }
+    canonical
+        .to_str()
+        .map(|value| Some(value.to_string()))
+        .ok_or(())
+}
+
+fn persisted_room_workspace(workspace_root: &str) -> Option<String> {
+    let stored = std::path::Path::new(workspace_root);
+    if !stored.is_absolute() {
+        return None;
+    }
+    let canonical = std::fs::canonicalize(stored).ok()?;
+    if canonical != stored || !canonical.is_dir() {
+        return None;
+    }
+    canonical.to_str().map(str::to_string)
+}
+
+fn invalid_workspace_root_response() -> (StatusCode, Json<serde_json::Value>) {
+    (
+        StatusCode::BAD_REQUEST,
+        Json(json!({"ok": false, "error": "invalid_workspace_root"})),
+    )
+}
+
 /// The frozen refusal body for a trigger value the daemon will not store: a
 /// stable machine `code` and the exact field the caller has to change. Both
 /// refusals below share it so the shape can only ever be written once.
@@ -840,12 +882,13 @@ pub(super) async fn room_create(
         return refusal;
     }
     let key = RoomKey::new(req.key.trim());
-    // Normalize an empty/whitespace workspace_root to None so a blank field is
-    // treated as "no binding" rather than a bound-to-empty-string room.
-    let workspace_root = req
-        .workspace_root
-        .map(|w| w.trim().to_string())
-        .filter(|w| !w.is_empty());
+    // Blank remains explicitly unbound. A non-blank binding must resolve now
+    // to one canonical absolute directory, so neither a relative path nor a
+    // later process cwd can become execution authority.
+    let workspace_root = match canonical_submitted_workspace_root(req.workspace_root) {
+        Ok(workspace_root) => workspace_root,
+        Err(()) => return invalid_workspace_root_response(),
+    };
     let result = with_rooms(&state, |reg| {
         reg.create_in_workspace(
             key,
@@ -2841,14 +2884,14 @@ async fn spawn_room_agent_turn(
             .flatten()
             .and_then(|record| record.room.workspace_root)
     });
-    let Some(cwd) = room_workspace.filter(|workspace| std::path::Path::new(workspace).is_dir())
-    else {
+    let Some(cwd) = room_workspace.as_deref().and_then(persisted_room_workspace) else {
         room_agent_authority::append_remote_output_outcome(
             &state,
             &admission,
             "refused",
             "workspace_unavailable",
-        );
+        )
+        .map_err(RoomTurnStartError::Authority)?;
         return Err(RoomTurnStartError::WorkspaceUnavailable);
     };
     let project_id = state
@@ -2871,7 +2914,8 @@ async fn spawn_room_agent_turn(
                     &admission,
                     "refused",
                     "room_history_unavailable",
-                );
+                )
+                .map_err(RoomTurnStartError::Authority)?;
                 return Err(RoomTurnStartError::RoomHistoryUnavailable);
             }
         }
@@ -3027,9 +3071,13 @@ async fn spawn_room_agent_turn(
                         } else {
                             "authority_changed_before_remote_enqueue"
                         };
-                        room_agent_authority::append_remote_output_outcome(
+                        if let Err(error) = room_agent_authority::append_remote_output_outcome(
                             &state, &admission, "refused", reason,
-                        );
+                        ) {
+                            tracing::warn!(room = %room, agent = %agent.id,
+                                reason = error.code(),
+                                "failed to persist federated room-agent refusal audit");
+                        }
                         tracing::warn!(room = %room, outcome = "agent_reply_enqueue_failed",
                             "federated agent reply enqueue failed");
                     }
@@ -4218,8 +4266,9 @@ mod tests {
     }
 
     use crate::tests::{
-        authorize_room_agent_fixture, authorize_room_agent_package_fixture, fake_convene_state,
-        write_agent_fixture, TestEnvRestore, AUTO_CONVENE_ENV_LOCK,
+        authorize_room_agent_fixture, authorize_room_agent_package_fixture,
+        canonical_test_workspace, fake_convene_state, write_agent_fixture, TestEnvRestore,
+        AUTO_CONVENE_ENV_LOCK,
     };
     use axum::{
         body::{Body, Bytes},
@@ -4962,6 +5011,74 @@ mod tests {
             body.0["room"]["trigger_policy"]["on_ci_failure"],
             json!(true)
         );
+    }
+
+    #[tokio::test]
+    async fn room_create_requires_a_canonicalizable_absolute_workspace() {
+        let _env = AUTO_CONVENE_ENV_LOCK.lock().await;
+        let tmp = tempfile::tempdir().unwrap();
+        let state = fake_convene_state(&tmp);
+        let request = |key: &str, workspace_root: String| RoomCreateRequest {
+            key: key.to_string(),
+            name: "Workspace Boundary".into(),
+            trigger_policy: None,
+            workspace_root: Some(workspace_root),
+        };
+
+        for (key, workspace_root) in [
+            ("relative-workspace", ".".to_string()),
+            (
+                "missing-workspace",
+                tmp.path().join("missing").to_string_lossy().into_owned(),
+            ),
+        ] {
+            let (status, body) =
+                room_create(State(state.clone()), Json(request(key, workspace_root))).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST);
+            assert_eq!(
+                body.0,
+                json!({"ok": false, "error": "invalid_workspace_root"})
+            );
+            assert!(with_rooms(&state, |store| store.get(&RoomKey::new(key)))
+                .unwrap()
+                .is_none());
+        }
+
+        let workspace = tmp.path().join("workspace");
+        std::fs::create_dir(&workspace).unwrap();
+        let noncanonical = workspace.join("..").join("workspace");
+        let expected = std::fs::canonicalize(&workspace)
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
+        let (status, body) = room_create(
+            State(state.clone()),
+            Json(request(
+                "canonical-workspace",
+                noncanonical.to_string_lossy().into_owned(),
+            )),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED);
+        assert_eq!(body.0["room"]["workspace_root"], expected);
+
+        assert!(persisted_room_workspace(".").is_none());
+        assert!(persisted_room_workspace(noncanonical.to_str().unwrap()).is_none());
+        assert_eq!(
+            persisted_room_workspace(&expected).as_deref(),
+            Some(expected.as_str())
+        );
+
+        #[cfg(unix)]
+        {
+            let moved = tmp.path().join("workspace-moved");
+            std::fs::rename(&workspace, &moved).unwrap();
+            std::os::unix::fs::symlink(&moved, &workspace).unwrap();
+            assert!(
+                persisted_room_workspace(&expected).is_none(),
+                "a symlink replacement must not silently retarget the Room"
+            );
+        }
     }
 
     /// The same refusal on PATCH: the update route must not be the back door
@@ -5932,7 +6049,7 @@ mod tests {
             store.create_in_workspace(
                 key.clone(),
                 "G3 Thread Dispatch",
-                Some(tmp.path().to_string_lossy().into_owned()),
+                Some(canonical_test_workspace(tmp.path())),
                 Some(RoomTriggerPolicy {
                     on_mention: true,
                     on_thread_reply: true,
@@ -6648,7 +6765,7 @@ mod tests {
             store.create_in_workspace(
                 key.clone(),
                 "Dispatch",
-                Some(tmp.path().to_string_lossy().into_owned()),
+                Some(canonical_test_workspace(tmp.path())),
                 None,
                 Utc::now(),
             )?;
@@ -6854,12 +6971,12 @@ mod tests {
     }
 
     fn create_mention_room(state: &AppState, key: &RoomKey) {
-        let workspace = state
-            .room_attachments_root
-            .parent()
-            .expect("test attachment root has a tempdir parent")
-            .to_string_lossy()
-            .into_owned();
+        let workspace = canonical_test_workspace(
+            state
+                .room_attachments_root
+                .parent()
+                .expect("test attachment root has a tempdir parent"),
+        );
         with_rooms(state, |store| {
             store
                 .create_in_workspace(
