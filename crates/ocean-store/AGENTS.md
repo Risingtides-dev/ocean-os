@@ -156,6 +156,14 @@ outbox, and the restart-safe federation core (S2 P2-A). One database file
   `UnknownAttachment`, never a silent success. `add_attachment` and
   `remove_attachment` each write their System transcript marker in the SAME
   transaction as the row.
+- **Every caller-supplied string a marker quotes goes through
+  `marker_prose`.** That is `ocean_core::bounded_prose` under this crate's
+  `MARKER_FIELD_MAX_CHARS`, and the split is deliberate: the filter is a
+  security rule shared with `ocean-daemon`'s workspace markers and lives in
+  `ocean-core` because the dependency runs daemon -> store and neither crate
+  can call the other; the bound is this crate's policy. Read the derivation
+  there before widening what these lines drop, and do not re-inline a filter
+  here — a second copy is exactly the drift the hoist removed.
 - **An artifact title is refused blank, never stored blank.** `create_artifact`
   and `amend_artifact` both raise `ArtifactTitleBlank` on a whitespace-only
   title before any read, UPDATE, or transcript insert, so a refusal writes
@@ -171,10 +179,14 @@ outbox, and the restart-safe federation core (S2 P2-A). One database file
 - **A declared content type is recorded and never trusted.**
   `room_attachments.content_type` is whatever the uploader claimed. It is stored
   verbatim and deliberately kept OUT of the transcript marker, whose body
-  carries only the sanitized filename and a server-computed byte count — a
-  client-supplied string with a newline in it can forge a transcript line in a
-  naive renderer. `byte_len` and `sha256` are what the server measured; a
-  negative stored `byte_len` fails closed on read.
+  carries only the sanitized filename and a server-computed byte count —
+  sanitized meaning `marker_prose`, above. A client-supplied string can
+  otherwise forge a transcript line twice over: a newline forges a row in
+  anything that splits on lines, and `[label](href)` forges an anchor in
+  ocean-surface, which puts system rows through a markdown tokenizer and is
+  not the naive renderer this bullet used to name. `byte_len` and `sha256`
+  are what the server measured; a negative stored `byte_len` fails closed on
+  read.
 
 ## Work Guidance
 

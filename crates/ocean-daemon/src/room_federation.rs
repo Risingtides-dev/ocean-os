@@ -18,10 +18,11 @@ use std::{
 
 use eventsource_stream::Eventsource;
 use ocean_core::{
-    evaluate_trigger_policy, FederatedActorType, FederatedRoomMemberProjection, FederatedRoomRole,
-    InviteResponse, MemberPresence, PublicAgentDescriptor, RoomAccessProjection, RoomAccessState,
-    RoomKey, RoomMessageKind, RoomOutboxItem, RoomParticipantKind, RoomReadCursorProjection,
-    RoomRedeemResponse, RoomTriggerEvent,
+    bounded_prose, bounded_quotable, evaluate_trigger_policy, FederatedActorType,
+    FederatedRoomMemberProjection, FederatedRoomRole, InviteResponse, MemberPresence,
+    PublicAgentDescriptor, RoomAccessProjection, RoomAccessState, RoomKey, RoomMessageKind,
+    RoomOutboxItem, RoomParticipantKind, RoomReadCursorProjection, RoomRedeemResponse,
+    RoomTriggerEvent,
 };
 use ocean_store::{ConfirmedEvent, IngestOutcome, PendingRedemption, RoomCredential, RoomStore};
 use reqwest::{redirect::Policy, Client, StatusCode, Url};
@@ -3549,81 +3550,6 @@ struct WorkspaceCiCheck {
     head_sha: Option<String>,
     #[serde(default)]
     url: Option<String>,
-}
-
-/// Bound an upstream-controlled string and drop its control characters.
-///
-/// Same threat as the attachment marker in `ocean-store`: transcripts are
-/// rendered by clients and read by agents, and an upstream string carrying a
-/// newline could forge an entire fake transcript row. Control characters are
-/// dropped rather than escaped, and the result is hard-capped so a
-/// pathological branch name cannot balloon the marker.
-///
-/// This is the PRIMITIVE, not the whole quoting rule. It handles the two
-/// things that are wrong with a string in any renderer — the row break and
-/// the flood — and deliberately nothing that depends on how one particular
-/// client draws a line. Prose goes through [`bounded_prose`] instead;
-/// [`ci_run_url`] compares back against this function precisely because it
-/// wants the primitive and not the prose rule.
-fn bounded_quotable(text: &str, max_chars: usize) -> String {
-    text.chars()
-        .filter(|c| !c.is_control())
-        .take(max_chars)
-        .collect()
-}
-
-/// Neutralize an upstream-controlled string for a marker's PROSE, on top of
-/// [`bounded_quotable`]'s bound and control-character rule.
-///
-/// The renderer is NOT naive, and this file used to say it was. ocean-surface
-/// puts every transcript row through `room_markdown::body_view` — a
-/// system-attributed row included, since `is_compact_system_row` only swaps
-/// the avatar for a Spark icon — and that tokenizer builds an anchor out of
-/// `[label](href)`. Markdown metacharacters are not control characters, so a
-/// CI check named `[click here](https://evil.co)` fits under the 32-char cap
-/// and lands as a link with an attacker-chosen label AND destination, inside a
-/// row the UI attributes to the room itself, composed from a string the room's
-/// own container produced. `scheme_allowed` holds it to http/https, so the
-/// reachable end of that is phishing rather than script execution — which is
-/// still a room lying to its members in the room's own voice.
-///
-/// The rule, then: an upstream string may not carry a character that
-/// manufactures a DESTINATION the marker did not author. That is `[` and `]`,
-/// and each thing left behind is a ruling rather than an oversight:
-///
-/// - `(` and `)` are inert without a preceding `[…]` — the tokenizer's link
-///   arm is entered on `[` alone — and GitHub names matrix jobs
-///   `build (ubuntu-latest, 1.97.0)`. Dropping them would mangle the
-///   commonest real check name to close a door that is already locked.
-/// - A bare `https://…` still autolinks, and that is ACCEPTED: an autolink's
-///   label IS its href, so it cannot lie about where it leads, and the same
-///   posture already governs member messages. It is also load-bearing here —
-///   #416's run URL is emitted bare (`": {url}"`) and reaches the reader
-///   through exactly that path, which is the fact that makes neutralizing
-///   bracket syntax free.
-/// - `*` and `` ` `` are decoration: they change how a word looks, never
-///   where it goes.
-/// - `@` highlights only when the id resolves against the room's live roster,
-///   and the span drives nothing else — no notification, no navigation. A
-///   decoration naming a member who really is in the room is not a
-///   destination.
-///
-/// Neutralizing rather than refusing is the deliberate opposite of
-/// [`ci_run_url`], which omits a URL it would have to repair because a
-/// repaired URL points somewhere its producer never named. A name is not a
-/// pointer: a repaired name still identifies, and the cap above already
-/// repairs it by truncating. Refusing a check name for a bracket would blank
-/// the marker over a naming convention nobody chose adversarially.
-///
-/// The two lanes still reach the same place: no finished marker line carries
-/// bracket syntax, because the only other upstream strings on one are URLs —
-/// a run's and a preview's — and [`ci_run_url`] refuses those for its own
-/// reason.
-fn bounded_prose(text: &str, max_chars: usize) -> String {
-    bounded_quotable(text, max_chars)
-        .chars()
-        .filter(|c| !matches!(c, '[' | ']'))
-        .collect()
 }
 
 /// A short commit id for prose, accepted only when the upstream value
@@ -9277,8 +9203,9 @@ mod tests {
     /// [`ci_run_url`] compares its input back against [`bounded_quotable`],
     /// so folding the prose rule into that primitive would silently narrow
     /// which run URLs ever reach a line — a rendering decision quietly
-    /// becoming a security decision. The two are layered instead, and this
-    /// test guards the layering.
+    /// becoming a security decision. The two are kept apart instead (both now
+    /// in `ocean-core`, one home for both crates that quote upstream strings),
+    /// and this test guards the split from the side that owns the gate.
     ///
     /// It cannot catch that fold for TODAY's prose rule: brackets are refused
     /// by [`ci_run_url`]'s own clause, so folding them into the primitive is

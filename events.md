@@ -8402,3 +8402,52 @@ immutable release at `6872181a6f4f535498e3a816020cb197f0ee65dd3c39aafdba57119be4
 and `7846b1c95e915c7899bff104368503ee1aadb78cfa68653f41af84ad24d5d223`.
 Stage 2 contributed folders remains closed pending its own accepted manifest.
 _________________________________________________________________________________
+
+time:      [19:03] [31-08-26]
+agent:     [claude-code], [claude-opus-5]
+worktree:  loop/os-bounded-prose-is-about-to-exist-in-two-crates-with-no-shared-home
+type:      [refactor]
+area:      [backend]
+
+Hoisted the marker quoting rule into `ocean-core` as `bounded_quotable` and
+`bounded_prose`, with the whole derivation travelling with the code, and pointed
+`ocean-daemon`'s workspace markers and `ocean-store`'s `marker_prose` at the one
+definition. The fork was real, not pending: `ocean-store` carried a full second
+copy of the filter, its own doc named the daemon as the original and asked for
+this slice by name, and the dependency runs daemon -> store so the store could
+never call it. `ocean-core` is the only crate both already depend on; that, and
+the fact that the alternative is two copies of a security rule whose correctness
+lives in a comment, is why a text primitive now sits in a wire-types crate, and
+it is recorded in `crates/ocean-core/AGENTS.md`.
+
+The two copies had ALREADY diverged in two ways, and both are ruled on rather
+than papered over. The bound: the daemon takes `max_chars` (callers pass 16, 32,
+64) while the store hard-coded 128. The filter is the shared rule and the bound
+is caller policy, so `MARKER_FIELD_MAX_CHARS` stays in the store and
+`marker_prose` is now a one-line wrapper supplying it. The ORDER, which the
+backlog did not know about: the store filtered brackets BEFORE truncating, the
+daemon after — so a bracket spent a character of budget in one crate and not the
+other. The store's order won, because it is the one that was argued (a test
+comment there pinned "the bound applies to what is emitted"), where the daemon's
+was only a side effect of writing prose as a composition over the primitive and
+no comment ever defended it. Consequence: every existing test in both crates
+passes UNCHANGED, which is the evidence that this reading was the settled one.
+
+The trap held. `ci_run_url` still compares back against `bounded_quotable` and
+never `bounded_prose` — the compare-back is an equality test, so a rendering
+rule folded into it would silently change which run URLs the gate accepts —
+and `the_prose_rule_did_not_narrow_the_run_url_gate` was run first after the
+move and passed untouched. Anti-drift is now structural plus pinned:
+`bounded_prose_is_the_primitive_plus_bracket_syntax` in ocean-core goes red if
+either filter grows without the other,
+`bounded_quotable_drops_control_characters_and_keeps_bracket_syntax` goes red if
+the prose rule is folded down into the gate's primitive, and
+`marker_prose_is_the_shared_rule_under_this_crates_bound` in ocean-store goes red
+if that crate ever re-inlines a filter of its own. All three AGENTS.md pointers
+plus the store's stale "naive renderer" clause now name the new home.
+
+Gate: `cargo test -p ocean-core -p ocean-store -p ocean-daemon` 62 + 195 + 854
+green, `cargo clippy ... --all-targets -- -D warnings` clean, `cargo fmt --check`
+clean, `cargo check --workspace` clean. No deploy and no migration; this lands
+to main like any other code change.
+_________________________________________________________________________________

@@ -15,6 +15,18 @@ This crate owns shared protocol types used across Ocean clients, daemon, runtime
 - Treat public type changes as cross-crate contract changes.
 - Preserve serde compatibility unless the breaking change is intentional and documented.
 - Keep protocol types free of daemon/runtime implementation details.
+- This crate is not ONLY types. `bounded_quotable` and `bounded_prose` —
+  the rule for quoting an upstream string into a transcript marker — live
+  here because `ocean-daemon` (workspace markers) and `ocean-store`
+  (join/leave/artifact/attachment markers) both need it, the dependency
+  runs daemon -> store so neither can call the other, and this is the only
+  crate both already depend on. The alternative was two copies of a
+  security rule whose correctness lives entirely in a doc comment, and the
+  two had already drifted before the hoist. The FILTER is shared and its
+  derivation travels with it; the `max_chars` bound is caller policy, and
+  the bracket filter runs BEFORE the bound so a dropped character does not
+  spend a caller's cap. `bounded_quotable` is the primitive the daemon's
+  `ci_run_url` compares back against — never widen it into the prose rule.
 - Session synchronization uses a bounded `SessionSyncSnapshot` plus opaque
   boot-local `SessionEventFence`; it carries the persisted monotonic
   legacy-default-zero model `config_revision`, excludes raw messages, tool
