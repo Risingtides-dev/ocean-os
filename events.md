@@ -7583,4 +7583,43 @@ deletions, all rules and blanks. The repair was done here rather than deferred
 because the job is non-blocking, so a red check would not have stopped a merge,
 it would only have been red from birth. No Rust changed, no deploy, no
 migration.
+time:      [05:05] [08-31-26]
+agent:     [claude] [opus 5]
+worktree:  loop/os-ci-marker-run-url
+type:      [feature-request]
+area:      [backend]
+
+#413 made a red `ci_checked` convene the room's agents, and a convened agent's
+entire input is the one transcript line that woke it -- which read "workspace
+CI on 'main': 1 new result -- build: failure" and stopped there. The human side
+was never short: ocean-surface's repo panel decodes the whole check and links
+every run through `check_href`. The agent had no route to anything.
+`WorkspaceCiCheck` decoded two of Bedrock's ten projected keys, so `head_sha`
+and `url` were arriving and being thrown away on the exact signal that now
+wakes agents. Both are decoded now and the arm ends with ONE route -- the FIRST
+RED check's, not the first check's, since nobody was woken for a green one and
+three URLs would wreck the line the three-check cap exists to protect: `--
+first failure 'build' @ 3f2a1b0c9d8e: <url>`. Every part degrades on its own,
+and a check with neither commit nor URL grows no tail. The six keys still
+dropped are now a ruling in the struct doc rather than a silent omission.
+
+The URL is the attacker-shaped field: it is `gh` stdout read inside the room's
+own container, so it is the container's word and not GitHub's. It is gated the
+way ocean-surface already gates the same string before making it an anchor
+(`room_repo::check_href` -> `room_markdown::scheme_allowed`), restated here
+because the two repos cannot share code -- http/https only, no whitespace, no
+backslash, no percent-encoded control or space, non-empty authority with no
+userinfo. One deliberate difference from every other quoted payload string:
+`bounded_quotable` repairs by dropping and truncating, and a repaired URL is a
+DIFFERENT URL, so its output is compared back and any URL that changed under it
+is omitted rather than emitted pointing somewhere its producer never named.
+`head_sha` reuses the existing `short_sha`, hexdigit validation and all.
+
+Factored the four red conclusions into one `conclusion_is_red` read by both the
+marker's tail and `ci_checks_are_red`, and a test asserts the two agree across
+all nine conclusions -- an agent woken by a conclusion must find that
+conclusion's run on the line that woke it, which only holds while the trigger
+and the line cannot drift. `on_ci_failure`'s dispatch reason string is
+untouched. Gate green: 825 passed, clippy -D warnings clean, fmt clean. No
+deploy, no migration.
 _________________________________________________________________________________
