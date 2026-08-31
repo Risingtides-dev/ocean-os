@@ -7544,3 +7544,43 @@ assuming: it names `trigger_policy?` in the create/PATCH bodies at :557/:559
 and enumerates no flags, so it did not go stale and was left alone. Docs only,
 no code, no deploy, no migration.
 _________________________________________________________________________________
+
+time:      [14:20] [31-08-26]
+agent:     [claude-code], [claude-opus-5]
+worktree:  loop/os-ledger-checker
+type:      [gh actions]: Port the ledger checker to the repo with no instrument
+area:      [infra]: events.md union merge driver
+
+This repo runs the `union` merge driver on events.md and, alone among the three
+Ocean repos, had nothing watching it fold. The driver keeps a line both sides
+added only once, so each extra parallel append eats the `___` rule the two
+entries share and the second `time:` header lands under the first entry's
+prose: two entries fuse with no conflict and nothing a merge check can see.
+Measured before this branch, 58 of 511 entries here were open, against
+ocean-surface's 22 of 247 and ocean-bedrock's 0 of 88 -- twice either sibling's
+entry volume, no instrument. Open is the shape the driver leaves, but it is not
+proof the driver did it, and at least 17 of the 58 predate any parallel merge:
+one is line 9, this file's own fenced schema template, and sixteen are followed
+immediately by an entry carrying the same `worktree:`, which a parallel fold
+cannot produce -- fourteen of those are a single run at lines 1293-1391, one
+author narrating phases of `feat/ocean-tui-shell-rebuild` in sequence and
+writing no trailing rule. The check asks whether an entry closes, never how it
+came to be open, so the repair holds either way and only the attribution needed
+narrowing. `scripts/check-ledger.mjs` is a port of ocean-bedrock's (its PR #62,
+commit 09bb1bb) with every executable line byte-identical, so a fix to either
+copy crosses as a patch; only the usage text differs, since this repo
+has no node manifest and the invocation is `node scripts/check-ledger.mjs
+events.md`. The existing `ledger:` job was extended rather than duplicated: its
+`if: pull_request` moved off the job onto the diff step so the parse check also
+runs on push-to-main, and node is pinned at 22 instead of inherited from the
+runner image. `scripts/check-ledger.test.mjs` (`node --test`) makes pure over
+the text the assertions bedrock makes through a real union merge, including one
+that pins a false positive rather than a feature -- this file's fenced schema
+header carries a `time:` line, so the template parses as entry #1, which
+bedrock's header-less ledger could never surface. A separate commit carries
+nothing but the `--fix` output that closed those 58: 105 insertions, 0
+deletions, all rules and blanks. The repair was done here rather than deferred
+because the job is non-blocking, so a red check would not have stopped a merge,
+it would only have been red from birth. No Rust changed, no deploy, no
+migration.
+_________________________________________________________________________________
