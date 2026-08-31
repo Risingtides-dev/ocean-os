@@ -7974,3 +7974,68 @@ scripts/check-ledger.mjs events.md`. The full `cargo xtask ci` repository gate
 also passed: docs/index integrity, workspace build and tests, Clippy with denied
 warnings, format, and dependency policy.
 _________________________________________________________________________________
+time:      [13:04] [08-31-26]
+agent:     [claude] [opus 5]
+worktree:  loop/os-port-exposed-url
+type:      [feature-request]
+area:      [backend]
+
+`room.workspace.port_exposed` told the room a port was serving and never said
+where. Bedrock has always put `preview_url` on that ledger row
+(`emitWorkspaceEvent(... preview_url: exposed.url)` in
+`handleWorkspacePortExpose`, server.mjs:2897 on bedrock master today), but
+`WorkspaceEventPayload` decoded eighteen keys and not that one, so serde
+dropped it and the marker read "workspace port 8787 exposed" — a fact a human
+can act on from the ports panel and a convened agent cannot act on at all. The
+transcript is fed to every convened agent, and this file had already ruled on
+the identical shape one struct below: `WorkspaceCiCheck` decodes `url` because
+"a convened agent has no panel to click — the marker is its entire input".
+`preview_url` is now decoded and the exposure marker ends in it, emitted bare
+(`": {url}"`) like the CI run URL so ocean-surface's tokenizer autolinks it,
+where an autolink's label IS its href.
+
+No second URL rule was invented: the address goes through `ci_run_url`
+unchanged — compare-back against `bounded_quotable`, no whitespace, no
+backslash, no brackets (the `[label](href)` re-entry attack), no percent-encoded
+control or space, http(s) only, non-empty authority without `@` — so a URL the
+gate refuses is DROPPED and the row degrades to the sentence it carried before
+this key existed, never to a repaired address pointing somewhere Bedrock never
+minted. The gate's 256-char bound is justified upstream by a CI field cap that
+does not govern a preview URL; the doc now says why it holds anyway. `port_closed`
+stays bare, and NOT because a URL was weighed and refused there: Bedrock's close
+row has never carried one. `handleWorkspacePortClose` emits the port plus
+`withdrawPreviewRoute`'s `route_removed` marker and nothing else, and emitted the
+port alone before ocean-bedrock #65. The arm would still drop a URL a future
+producer added, since naming an address the room just withdrew reads as still
+serving — but that is a rule held in reserve, not an asymmetry anyone had to
+choose. (Read off ocean-bedrock `origin/master`; the sibling checkout on this
+machine is 133 commits stale and an ocean-os `json!` fixture is not evidence
+about what Bedrock emits — AGENTS.md says outright that nothing in ocean-os
+reads ocean-bedrock and no cross-repo check exists.)
+
+The tail is also an ACCESS ruling, now written down where it changes. The daemon
+previously put a preview address in exactly one place, the 201 body of the
+owner's own expose call: `room_workspace_proxy.rs` gates BOTH ports verbs at
+owner on MERIT — its own bullet spends a paragraph on publishing a room's
+compute to the open internet being an owner act — and registers no ports LIST
+leaf. The transcript is durable and every member and every convened agent reads
+it, so this marker publishes the address room-wide, permanently. That is the
+point rather than an oversight: the token is a routing label and
+not a credential in Bedrock's own handler's words, so the port is already served
+to anyone holding the URL, and an agent that cannot read the address cannot use
+the port the owner published for it. The owner gate keeps the ACT of exposing
+narrow, not the address once it exists.
+
+The trap here was prose, not mechanism: `workspace_port_markers_pair_an_exposure_with_its_retraction`
+already carried a `preview_url` fixture and a comment ARGUING the old behaviour
+was correct. That comment is rewritten to state the new ruling and to say why
+the fixture keeps feeding a `preview_url` payload to the CLOSE as well — a shape
+Bedrock does not send, kept so the bare close is proved a property of the arm
+rather than an accident of an absent field. New coverage in
+`workspace_port_exposed_marker_omits_a_url_it_cannot_vouch_for`: an absent key,
+eight refusal shapes (schemeless, ftp, embedded space, embedded newline,
+bracket-forgery, `@`-authority, `%0d`, over-length) each degrading silently, and
+a mistyped `preview_url` poisoning the whole row like every other typed field.
+Gate on 1.97.0: ocean-daemon 831 passed / 0 failed, clippy -D warnings exit 0,
+fmt --check exit 0.
+_________________________________________________________________________________
