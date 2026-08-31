@@ -120,9 +120,13 @@ jobs:
   # deliberately NOT a required status check: red is information, not a lock.
   ledger:
     name: events.md entry
-    # Only a PR has a base to diff against; on push-to-main the entry either
-    # merged with the code or the moment to catch it is gone.
-    if: github.event_name == 'pull_request'
+    # No event condition on the job. Only the diff step below needs a base
+    # branch to compare against; the parse check after it needs none and is
+    # just as meaningful on push-to-main, because a merge folds a separator
+    # exactly the way a rebase does. One job rather than two so both checks
+    # share a checkout — the full history the diff wants costs a couple of
+    # seconds on a repo this size, and paying it on push is cheaper than a
+    # second job with its own checkout and node.
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
@@ -133,7 +137,21 @@ jobs:
           # branch, which a shallow checkout cannot see.
           fetch-depth: 0
 
+      # scripts/check-ledger.mjs imports only node: builtins, and this repo has
+      # no node manifest for `npm ci` to read even if it needed one — but with
+      # no install step it also has no node it can name. Pinned at 22 to match
+      # the sibling repos rather than inherited from whatever the runner image
+      # ships this month, since a floating runtime under a gate is how a gate
+      # starts failing for reasons that have nothing to do with the ledger.
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
       - name: Require an events.md entry alongside code changes
+        # Only a PR has a base to diff against; on push-to-main the entry
+        # either merged with the code or the moment to catch it is gone.
+        if: github.event_name == 'pull_request'
         # Three-dot = merge-base diff: only what this PR adds, not what main
         # gained since the branch was cut. GITHUB_BASE_REF is runner-set on
         # pull_request events, so no token and no extra permissions.
@@ -159,3 +177,28 @@ jobs:
             echo "paragraph on what changed and why."
             exit 1
           fi
+
+      # The checker is a verbatim port of ocean-bedrock's, and bedrock proves it
+      # against a real union merge in a git harness this repo has no manifest
+      # for. These are the same assertions made pure over the text, so a port
+      # that drifted here fails before it can call a folded ledger clean.
+      - name: Test the ledger checker
+        run: node --test scripts/check-ledger.test.mjs
+
+      # The diff step proves an entry EXISTS; this one proves the ledger it was
+      # appended to is still readable. The union merge driver keeps a line both
+      # sides added only once, so each extra parallel append eats the `___` rule
+      # the two entries share and the second entry's `time:` header lands
+      # directly under the first entry's prose: two entries fuse, with no
+      # conflict and nothing a merge check can see. 58 of the 511 entries here
+      # were open when this landed, which is the shape the driver leaves — but
+      # the driver is not the only way to get it: at least 17 of the 58 predate
+      # any parallel merge and are entries simply written without their rule.
+      # The check asks whether an entry closes, not how it came to be open.
+      # Exit 1 names the open entries by line, 2 means the check could not run
+      # at all — an unreadable path, or a ledger that lost its contents.
+      #
+      # Never `--fix` here. The repair is a non-append tail edit, and CI
+      # rewriting the ledger nobody reviewed is worse than the fold.
+      - name: The ledger still parses
+        run: node scripts/check-ledger.mjs events.md

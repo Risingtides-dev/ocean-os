@@ -23,6 +23,7 @@ New entries use 24-hour. Reviewers: flag am/pm on new entries only, and point
 here rather than at a rule that lived outside the repo.
 
 ---
+_________________________________________________________________________________
 
 time:      [04:25pm] [16-06-26]
 agent:     [ocean-acp], [unknown-model]
@@ -965,6 +966,8 @@ type:      testing
 area:      testing
 
 OCEAN-370 (P2): closed two daemon-level Longhouse test gaps in crates/ocean-daemon/src/main.rs (test module only, no runtime changes). GAP 1: extended the `prep_with()` test helper to accept a workflows param (was skills-only, sops/workflows hardcoded empty) and added `render_longhouse_prep_renders_workflows_alongside_skills`, which pins that workflows render in the same `- {name} — {description}` bullet shape as skills (main.rs:9316-9324) — mirrors the prepare.rs unit-level expectation. GAP 2: added async `workflows_prepare_returns_matching_workflows_from_cwd`, which plants docs/orchestrator/workflows/test.md (YAML frontmatter name+description) in a tempdir, POSTs /v1/workflows/prepare through the real longhouse_routes() table with that cwd + a matching prompt (TTL=0 + cache clear for a cold scan), and asserts the planted workflow surfaces on the wire — the on-disk counterpart to the empty-tmpdir wiring test. Updated the three other `prep_with` callers for the new signature. Full local gate green on toolchain 1.96.0: cargo test -p ocean-daemon (229 passed), cargo clippy -p ocean-daemon -- -D warnings clean, cargo fmt --all -- --check clean.
+_________________________________________________________________________________
+
 time:      [3:06P] [06-24-26]
 agent:     [claude] [opus 4.8]
 worktree:  fix/ocean-368-sse-keepalive
@@ -982,6 +985,8 @@ share one contract. Since axum's KeepAlive does not expose its interval, added a
 single-const wiring is what makes both rails provably equal. Full local gate green on toolchain
 1.96.0: cargo build -p ocean-daemon, cargo test -p ocean-daemon (228 passed), cargo clippy
 -p ocean-daemon -- -D warnings, cargo fmt --all -- --check.
+_________________________________________________________________________________
+
 time:      [02:18pm] [06-24-26]
 agent:     [claude] [opus 4.8]
 worktree:  fix/ocean-369-known-models
@@ -1051,6 +1056,8 @@ the bridge with its own wildcard-free classifier, pinning the current relayed/fi
 split and double-guarding the compile-time exhaustiveness. Full local gate green on
 toolchain 1.96.0: cargo build -p ocean-daemon, cargo test -p ocean-daemon,
 cargo clippy -p ocean-daemon -- -D warnings, cargo fmt --all -- --check.
+_________________________________________________________________________________
+
 time:      [04:12pm] [06-24-26]
 agent:     [claude] [opus 4.8]
 worktree:  feat/ocean-372-sse-lag-metrics
@@ -1297,6 +1304,8 @@ type:      [feature-request]
 area:      [frontend]
 
 Ocean-TUI Phase 2 landed on branch: harvested CTRL's session rail + PTY into the new shell. New modules shell/sessions.rs (Ocean-only discovery, stripped from CTRL — reads ~/.config/ocean-rs/sessions), shell/pty.rs (portable-pty+vt100+tui-term, lifted from CTRL term.rs), shell/components/session_rail.rs + pty_pane.rs. app.rs rewired to two-pane layout: left session rail, right main (native chat default, swaps to embedded PTY running `ocean --project X --session ID` when a rail session is opened). Tab cycles pane focus. Verified with a live discovery test: the exact rail code found 29 real ocean-os-bound sessions with real titles. Builds clean, clippy -D clean, 69 tests pass. NOTE: CTRL repo untouched — only read from. Editor + file-tree harvest queued next per John (keep, don't rebuild — CTRL already has working ones). Native resume-into-chat still deferred (needs daemon history replay).
+_________________________________________________________________________________
+
 time:      [evening] [07-03-26]
 agent:     [claude] [sonnet 5]
 worktree:  feat/ocean-tui-shell-rebuild
@@ -1304,6 +1313,8 @@ type:      [feature-request]
 area:      [frontend]
 
 Ocean-TUI Phase 3 landed: harvested CTRL's editor, file tree, AND graph into the shell (John: keep all three, don't rebuild). New pure modules shell/{highlight,git,editor,tree,graph}.rs lifted from CTRL (editor's crate::git/highlight paths rewired to crate::shell::). New components file_tree.rs (Tree wrapper), editor.rs (syntect-highlighted EditorTab + debounced re-highlight + Ctrl-S save + cursor), graph.rs (ProjectGraph on a ratatui Canvas, braille nodes/edges, zoom/pan/select). app.rs rewired to full workbench: left rail (F1 sessions / F2 files), main view (F3 chat / F4 editor / F5 graph / F6 term), Ctrl-Q quit (Ctrl-C freed to reach the PTY as SIGINT), Enter-on-file opens editor, Enter-on-session opens PTY. Deps added: syntect, ignore (CTRL versions). Verified: builds clean, clippy -D clean, 71 tests pass; live graph scan of ocean-tui crate = 27 nodes/24 edges. CTRL repo still untouched. Editor is a real buffer editor now; git gutter marks wired but not yet painted (Mark type present). Next candidates: paint git gutter, native session resume-into-chat, oh-my-pi roles/advisor (Phase 4, daemon-side).
+_________________________________________________________________________________
+
 time:      [night] [07-03-26]
 agent:     [claude] [sonnet 5]
 worktree:  feat/ocean-tui-shell-rebuild
@@ -1311,6 +1322,8 @@ type:      [feature-request]
 area:      [frontend]
 
 Ocean-TUI: closed the two Phase-3 gaps. (1) Git gutter — EditorTab::load_git pulls per-line marks from `git diff HEAD` on open; editor paints colored ▎/▁ (added/modified/deleted) in the gutter. (2) Native session resume — rail Enter now resumes a session INTO the chat (was PTY-only): loads the full transcript from the session's on-disk JSON (sessions::load_transcript, strips [TUI]/[ACP] prefixes), binds future turns to the parsed AgentSessionId, and subscribes its live event stream; 't' still opens the PTY escape hatch. Daemon needs no change — it already resumes by id (monolith did this; unknown_session_id errors test). Verified against real data: transcript loader pulled 8 real messages from the newest ocean-os session ("hey"→"hey. what are we working on?"…). Builds clean, clippy -D clean, 71 tests. Next: oh-my-pi roles/advisor (Phase 4, daemon-side).
+_________________________________________________________________________________
+
 time:      [night] [07-03-26]
 agent:     [claude] [fable 5 + opus agents]
 worktree:  feat/ocean-tui-shell-rebuild
@@ -1318,6 +1331,8 @@ type:      [feature-request]
 area:      [backend]
 
 Ocean-TUI Phase 4 landed: oh-my-pi-style model roles + advisor observer, built by two parallel opus agents on disjoint crates, integrated + verified by orchestrator. DAEMON: AgentTurnRequest gains additive `role` field; DaemonConfig reads a [roles] table from ocean.toml (role name → model alias) with role_model/advisor_model resolvers; agent_turn resolves role→alias via pure resolve_effective_model_id (explicit model_id always wins, unknown role warns + falls back) feeding the existing per-turn model-override seam; new AgentRuntime::complete_once makes one fresh-context provider call. Advisor observer: when [roles].advisor is configured, a fire-and-forget post-turn task reviews the exchange on its OWN context and emits Extension{extension:"advisor", payload:{note,severity,model}, scope:session} — suppresses empty/NOTHING, severity heuristic blocker/concern/info, never blocks the operator turn. Zero [roles] config = zero behavior change. TUI: chat renders advisor notes as amber cards (⚑ advisor (severity) · model, colored │ gutter; blocker=red, concern=amber, info=blue-gray). Verified: workspace clippy clean, 467 tests green (241 daemon + 103 agent + 75 tui + 48 sdk). Config example: [roles] advisor = "anthropic/claude-sonnet-4".
+_________________________________________________________________________________
+
 time:      [late] [07-03-26]
 agent:     [claude] [fable 5]
 worktree:  feat/ocean-tui-shell-rebuild
@@ -1325,6 +1340,8 @@ type:      [refactor]
 area:      [design]
 
 Course-correct on John's call: the harvest had moved CTRL's ORGANS but not its SKIN — every pane was generic bordered ratatui with default colors, when the intent was ocean-tui living inside CTRL's beautiful framing. Reskinned the whole shell in CTRL's visual system: theme.rs harvested verbatim (Tokyo Night + depth-fill palette), new shell/panel.rs generalizing CTRL's panel chrome (slate bed, left light-edge + right shadow columns, ◆ TITLE row with right pill, hairline underline, footer row) so every pane wears it. Session rail now renders CTRL-style for real: OC badge pill on BADGE_OCEAN_BG, green live dot, cyan accent bar on selection, expand-on-select resume preview on the highlight bed, footer tally. Files pane: blue dirs with ▸/▾ carets, accent bar. Chat: ◆ OCEAN panel with model pill, ❯ prompts in cyan, themed tool glyphs, advisor cards on theme colors, composer as highlight-bed row with accent bar + block cursor. Editor: void BG bed, BG_DARK gutter rail w/ themed git marks, cursor pos footer. Terminal + graph: dark-void beds with panel chrome, themed constellation colors. App frame: BG_DARK void behind everything, ◇ OCEAN status bar with lit active-pane hints. clippy -D clean, 75 tests green.
+_________________________________________________________________________________
+
 time:      [late] [07-03-26]
 agent:     [claude] [fable 5]
 worktree:  feat/ocean-tui-shell-rebuild
@@ -1332,6 +1349,8 @@ type:      [refactor]
 area:      [design]
 
 Second course-correct on John's call: KILL THE TABS. Read CTRL's actual ui() (main.rs:1844) this time instead of a summary and rebuilt app.rs to its exact frame: title row / body / status row; body = [SESSIONS rail left][splitter][CENTER][splitter][FILE TREE right] — all panels always visible, 1-col edge splitters, deep BG chrome painted first. Center = working surface (chat default; editor when a file opens; graph as a toggle — same swap CTRL does editor↔graph). Terminal DOCKS at the bottom of center (TERM_H=14) when a session is hydrated, exactly like CTRL's Dock::Bottom. Tab cycles focus across visible panes; ⌃⌥1-6 are focus jumps not view switches. Also restored the OCEAN splash loader into the shell startup (was legacy-path only). clippy -D clean, 75 tests green.
+_________________________________________________________________________________
+
 time:      [late] [07-03-26]
 agent:     [claude] [fable 5]
 worktree:  feat/ocean-tui-shell-rebuild
@@ -1339,6 +1358,8 @@ type:      [feature-request]
 area:      [frontend]
 
 Full-bake pass on the shell after John's "stop half baking" call — closed every gap between the shell and legacy-PM/CTRL in one push. (1) MOUSE: EnableMouseCapture in tui init; clicks focus the pane under the cursor, click-selected-row opens (rail resume / tree activate), wheel scrolls rail/tree/chat — CTRL behavior. (2) PERMISSIONS + OCEAN-185 tokens restored (was a real security regression: shell sent decision_token None): every turn mints mint_decision_token, the turn's first PermissionRequest claims it (request_id→token map), chat renders approval cards (⚠ tool/reason, ⌃Y allow / ⌃N deny, resolves to ✓/✗ on the daemon's decision event), decision POST replays the token. New client surface: spawn_global_event_stream (/v1/events SSE → Action::OceanEvent) + permission_decision POST. (3) CHAT: markdown-lite rendering (fences on dark bed, headings, bullets, inline code), ⌃J multi-line composer that grows to 5 lines, wheel/PgUp scrollback with "N lines back" footer + snap-to-tail on send. (4) Breadcrumb row in center (chat›session / editor›relpath / graph), CTRL's crumb row. Editor gains crumb(). 77 tests green (2 new: permission card lifecycle, md fence toggling), clippy -D clean.
+_________________________________________________________________________________
+
 time:      [late] [07-03-26]
 agent:     [claude] [fable 5]
 worktree:  feat/ocean-tui-shell-rebuild
@@ -1346,6 +1367,8 @@ type:      [refactor]
 area:      [design]
 
 CTRL's UPPER model adopted, per John (the actual original ask): the title bar is now the primary control surface — clickable icon toggles at top-right exactly like CTRL's draw_title (⊞ sessions rail · ❯ chat · ✎ editor · ⟠ graph · ⊟ terminal · ◨ file tree), each lit in its color when active, with hit rects checked before pane routing. Rails and the terminal dock TOGGLE visibility (collapse to 0 like CTRL's sess_w/tree_w); terminal button spawns a plain shell at the project root on first press (CTRL's ensure_terminal). Project label left, live status pill center. Hotkeys demoted to secondary — the app is fully mouse-drivable. Lesson recorded three corrections deep: John's "get rid of the lower tab model, use the upper tab model from CTRL" meant THIS from the start. 77 tests green, clippy -D clean.
+_________________________________________________________________________________
+
 time:      [late] [07-03-26]
 agent:     [claude] [fable 5 + 5 scout agents]
 worktree:  feat/ocean-tui-shell-rebuild
@@ -1353,6 +1376,8 @@ type:      [plan]
 area:      [research]
 
 OMP → Ocean port map complete: 5 parallel agents read oh-my-pi's actual source (tools layer, Rust crates, agent runtime, terminal UI, config/routing) and the synthesis landed at docs/specs/2026-07-03-omp-port-map.md. Organizing principle per John: harness PROFILES keyed on client_type (tui=full IDE harness, web=lean, voice=minimal) — features attach to profiles, never global. Proposed crates: ocean-hashline, ocean-ast, ocean-walker, ocean-search, ocean-minimizer, ocean-iso + extensions to daemon/agent/context/tui/acp. Headline findings: pi-walker/pi-iso/pi-ast/pi-uu-grep are MIT lift-as-is (pi-walker hand-rolls getattrlistbulk on macOS; pi-iso does APFS clonefile CoW isolation); pi-shell forks and splits (25k-LOC output minimizer first); TTSR decoded (abort→truncate messages→hidden rule injection→regenerate); compaction is promote→prune→shake→summarize with protection matchers; session store is a branching tree (enables checkpoint/rewind); three-tier rule delivery (inline/indexed rule:///TTSR) maps onto OKF; append-only native-scrollback rendering is the streaming-stability architecture for the TUI. 8 build waves W0-W7, W0 = the HarnessProfile seam. This doc is the standing backlog — features never need re-naming.
+_________________________________________________________________________________
+
 time:      [late] [07-03-26]
 agent:     [claude] [opus 4.8 + 3 opus agents]
 worktree:  feat/ocean-tui-shell-rebuild
@@ -1360,6 +1385,8 @@ type:      [feature-request]
 area:      [backend]
 
 OMP port W0+W1 foundation landed, 3 parallel opus agents on disjoint crates, integrated clean. W0: crates/ocean-daemon/src/harness_profile.rs — HarnessProfile{Tui,Web,Voice,Cli,Acp} resolved from client_type in agent_turn, HarnessCapabilities{lsp,hashline_edits,stream_rules,rich_context,memory,artifacts,minimizer} bundle per profile (Tui/Acp=all, Web=memory+artifacts, Voice=memory, Cli=hashline+minimizer+artifacts; unknown→Cli conservative). Seam only — logs, doesn't gate yet. W1 crown jewel: crates/ocean-hashline/ — faithful Rust port of OMP's hashline (twox-hash xxHash32&0xFFFF 4-hex file tag over trailing-ws-stripped LF; Patch::parse [path#HASH] + SWAP/DEL/INS.PRE|POST|HEAD|TAIL with +-sigil bodies; apply+stale MismatchError{hash_recognized}; SnapshotStore LRU realpath-keyed w/ seen_lines; Recovery 3 ordered zero-fuzz strategies; NoopLoopGuard). 54 tests, block/file ops parse-rejected (need ocean-ast, later wave). TUI: shell/slash.rs — real / command palette (fuzzy, ↑↓/⏎, /clear+/help wired, rest status-stubbed). Workspace clippy clean, all tests green. NEXT (orchestrator owns): wire ocean-hashline into read/edit tools with session-scoped snapshot store, gated on profile.capabilities().hashline_edits.
+_________________________________________________________________________________
+
 time:      [early] [07-04-26]
 agent:     [claude] [opus 4.8]
 worktree:  feat/ocean-tui-shell-rebuild
@@ -1367,6 +1394,8 @@ type:      [feature-request]
 area:      [backend]
 
 W1 hashline WIRED end-to-end through the real tool path (the delicate integration, done by orchestrator not a fanned agent). SessionContext gains `hashline: bool`; ReadTool::for_cwd_with_snapshots emits a `[path#HASH]` tag + records a session snapshot; new tools/hashline_edit.rs applies patches with 3-strategy recovery + stale rejection; BuiltinProvider holds a session-keyed SnapshotStore map (shared read↔edit across turns) and injects the hashline read + hashline_edit tool only when ctx.hashline. Plumbed via PromptControl::with_hashline_edits (default false — every legacy caller unchanged) set in the daemon agent_turn from harness_caps.hashline_edits — so ONLY tui/acp/cli profiles get it; web/voice keep the plain read contract untouched. ocean-runtime now deps ocean-hashline. Verified: new tests/hashline_wiring.rs drives read→tag→hashline_edit→file-rewritten + stale-tag-rejected + profile-gate-off (no tag, no edit tool); workspace clippy -D clean, all touched-crate tests green (runtime 103+2, agent 248, daemon, hashline 61, longhouse). NOTE: branch stays PR-gated to main (John's drive-test + Codex review) — not merged; daemon deploys from main only.
+_________________________________________________________________________________
+
 time:      [morning] [07-04-26]
 agent:     [claude] [fable 5 + opus agent]
 worktree:  feat/ocean-tui-shell-rebuild
@@ -1374,6 +1403,8 @@ type:      [feature-request]
 area:      [frontend]
 
 W2 part 1 landed: shell/markdown.rs — streaming markdown renderer with OMP's prefix-freeze (fence-aware block splitting, frozen blocks served from a content-hash cache, only the growing tail re-renders; CacheStats proven by test: streaming a tail keeps misses==1). Syntect code fences on the dark bed, headings/lists/quotes/inline styles; `_` deliberately not italic so snake_case survives. Chat: assistant text streams through it; tool cards get args summaries + collapsed 3-line tail window + ⌃O global expand toggle. 107 tui tests green, clippy -D clean. Skipped for later: read-coalescing, phase-locked spinners.
+_________________________________________________________________________________
+
 time:      [midday] [07-04-26]
 agent:     [claude] [fable 5 + 3 opus agents]
 worktree:  feat/ocean-tui-shell-rebuild
@@ -1381,6 +1412,8 @@ type:      [feature-request]
 area:      [backend]
 
 W2 complete + W3 opened, 3 parallel opus lanes integrated clean (workspace: 1412 tests, 0 failed, clippy -D clean). W2 TUI: shell/diff.rs — edit/write/hashline_edit tool calls render as diff cards (similar line diff, word-level REVERSED runs on paired lines ≥0.5 ratio, hashline patches rendered natively, 12-row truncation on the ⌃O toggle); shell/history.rs — persisted prompt history (~/.config/ocean-rs/tui_history, cap 200, JSON-lines, non-fatal I/O) with ↑/↓ recall + draft restore, ⌃R fuzzy overlay reusing the palette scorer, ⌃U/⌃K/⌃Y kill ring (permission-allow beats yank, tested). W3a: ocean-runtime artifacts.rs — session ArtifactStore (8MiB/64-entry evict-oldest) + SpillingTool decorator at the REGISTRY level (catches MCP tools too): >24KB tool output keeps a 16KB line-bounded head + '[output truncated… read artifact://<id>]' notice, full bytes retrievable via read artifact:// (decorator-bypassed, no circular spill); gated on harness_caps.artifacts via PromptControl.artifact_spill (hashline pattern). W3b: NEW crates/ocean-ast — pi-ast summarize_code port (MIT attributed): 9 grammars (rust/ts/tsx/js/py/go/bash/toml/json, tree-sitter 0.26.9), elidable-span forest + BFS unfold to a 120-line budget, min_body_lines 4, panic-free passthrough on parse failure, 24 tests. Remaining W3 for next cycle: BM25 tool discovery, ocean-minimizer, prune/shake compaction, wiring ocean-ast summarization into read.
+_________________________________________________________________________________
+
 time:      [midday] [07-05-26]
 agent:     [claude] [fable 5]
 worktree:  feat/ocean-tui-shell-rebuild
@@ -1388,6 +1421,8 @@ type:      [bug-report]
 area:      [frontend]
 
 First self-driven TUI verification pass (new definition-of-done: drive the real binary in a tmux PTY, inspect frames). REPRODUCED John's "text coming in" bug live: submitted a turn on a session whose SSE stream had died — daemon ran it, reply streamed into the void, chat showed nothing. ROOT CAUSE: reqwest client's 120s TOTAL timeout applies to SSE bodies → every stream was guaranteed dead after 2 minutes, and the client never reconnected (submit_turn didn't resubscribe). FIXED: per-request ~infinite timeout on SSE; agent stream is now a self-healing reconnect loop with Last-Event-ID replay (OCEAN-129) + replay=1 on the mint path only (OCEAN-305 race; resume loads from disk so no replay → no duplicates); global /v1/events stream got the same loop; App now holds the stream JoinHandle, aborts superseded streams on session switch, and DROPS agent events whose session_id ≠ bound session (stale-stream pollution guard). RE-VERIFIED live in tmux: same scenario now streams (thinking pill + reply + 'stream connected'). Punch list from the drive (not yet fixed): keyboard trap — ⌃⌥1/2/3 dead in legacy-encoding terminals (ctrl-3 IS ESC) so editor/dock can strand a keyboard-only user (mouse title buttons rescue, verified via injected SGR click); palette pane-focus commands are status stubs and the palette only opens from chat; doubled splitter columns (▏▏▏) vs CTRL's single edge; palette descriptions truncate; [TUI] prefix leaks in single-line resumed history; hydrating 't' runs the release `ocean` (legacy) inside the dock — post-merge that recurses the workbench. 133 tui tests green, clippy -D clean.
+_________________________________________________________________________________
+
 time:      [03:18pm] [05-07-26]
 agent:     [pi] [gpt-5.5] [Daemon session API engineer]
 worktree:  feat/ocean-tui-shell-rebuild
@@ -2090,6 +2125,7 @@ verified: mint 502s clean without a key, append round-trips + shows as
 "[voice handoff] ..." in session turns. NOTE: no OpenAI platform API key is
 configured anywhere yet - realtime voice needs one (openai api_key block in
 ~/.config/ocean-rs/auth.json or OPENAI_API_KEY in the daemon env).
+_________________________________________________________________________________
 
 time:      [6:50PM] [07-09-26]
 agent:     [claude] [fable 5]
@@ -2232,6 +2268,8 @@ type:      [feature-request]
 area:      [backend]
 
 Completed voice phase 4: the daemon now owns the xAI speech credential. Added POST /v1/voice/stt (raw audio bytes -> multipart grok-stt relay -> {text}) and POST /v1/voice/tts ({text,voice?} -> grok-tts -> audio bytes) in a new voice_speech module (pure body builders + normalizers unit-tested; shared LazyLock bounded client, connect 10s / request 60s). Credential resolves per-request via ocean-providers resolve_xai_api_key (env XAI_API_KEY -> auth.json xai block), so key rotation needs no restart; errors never carry the key. Empty transcripts stay valid empty text, mirroring the legacy proxy contract for silence utterances. Also drove the realtime upstream-body test from DEFAULT_REALTIME_MODEL instead of a stale hardcoded id. The surface proxy's /api/stt and /api/tts forward here as of the paired ocean-surface landing; the proxy no longer reads any xAI key.
+_________________________________________________________________________________
+
 time:      [05:23am] [10-07-26]
 agent:     [omp] [openai-codex/gpt-5.6-sol]
 worktree:  feat/ocean-tui-shell-rebuild
@@ -2268,6 +2306,8 @@ POST /v1/voice/stt, POST /v1/voice/tts, and POST /v1/voice/realtime/client-secre
 and added the paragraph noting the surface /api/stt|/api/tts forwards to the daemon
 and that provider keys (xAI, OpenAI) resolve only inside ocean-os. Map edit only;
 no code touched.
+_________________________________________________________________________________
+
 time:      [08:25pm] [07-10-26]
 agent:     [claude] [fable-5]
 worktree:  fix/immediate-provider-halt
@@ -2524,6 +2564,8 @@ area:      [automations]
 Fixed stale daemon build provenance discovered during deployment closeout. `crates/ocean-daemon/build.rs` watched only `.git/HEAD`; on a normal branch that file stays `ref: refs/heads/main`, so docs-only commits advanced main without rerunning the build script and repeated release builds kept the old `OCEAN_BUILD_REV`. The build script now asks Git for absolute paths and watches the worktree HEAD, resolved symbolic branch ref, and packed-refs, with a compatibility fallback. Detached HEAD safely omits the symbolic ref; linked worktrees resolve their worktree HEAD plus common ref storage. Revision/dirty/unknown stamping semantics are unchanged.
 
 Verification: emitted Cargo directives named the real `.git/HEAD`, `.git/refs/heads/main`, and `.git/packed-refs`; dirty pre-commit output reported `e3c181219352-dirty` honestly. `cargo check -p ocean-daemon`, strict daemon Clippy, all 294 daemon tests, format/diff checks, main/branch-linked/detached path inspection, and fresh independent review passed. The supervised binary is rebuilt from the committed fix after this ledger entry so `/health` can again track exact main.
+_________________________________________________________________________________
+
 time:      [05:35am] [11-07-26]
 agent:     [pi], [claude-fable-5], [orchestrator]
 worktree:  [main]
@@ -2932,6 +2974,7 @@ refactor mission; corrected stale operator, render-protocol, session-binding, de
 route/CORS/metrics, model-inventory, and TUI component-tray claims. Verified docs/index
 integrity plus executable daemon router and CORS contracts; fresh semantic review drove the
 remaining source-backed corrections before closeout.
+_________________________________________________________________________________
 
 time:      [06:12pm] [14-07-26]
 agent:     [pi], [gpt-5.6-sol], [orchestrator]
@@ -3130,6 +3173,7 @@ type:  [bug report]: Correct Longhouse shipped-versus-target claims
 area:  [writing]: Source-backed orchestration boundary and historical archive
 
 A late semantic review of merged PR #278 found that active Longhouse docs still described planned controls as shipped, including a hard deadline timer, aggregate token ceiling, domain/subsidiarity routing, validator veto, session rebinding, and revoke-driven cancellation. Replaced the stale orchestration design with a concise source-backed current reference, retained the former design under the opt-in archive, corrected HTTP/capability/standalone model behavior and skill ranking, and preserved extension-owned general subagent orchestration. `cargo test -p ocean-longhouse` passed with 113 tests and one ignored; `cargo xtask docs-check`, `git diff --check`, and fresh semantic review passed.
+_________________________________________________________________________________
 
 time:      [11:53pm] [14-07-26]
 agent:     [pi], [gpt-5.6-sol], [orchestrator]
@@ -3213,6 +3257,8 @@ type:      [refactor]: extract daemon request and permission control records int
 area:      [backend]: ocean-daemon Phase 2C control-plane registry
 
 Added direct characterization for status-only snapshots and token secrecy, exact identity/cancellation/timestamp initialization, live duplicate replacement, missing-handle detachment, matching and mismatched waiter consumption, exact permission/finish transitions, terminal helpers, session merging, and handle ownership. Then moved the two private registry aliases, request/permission records, terminal helpers, snapshots, registration/attachment mechanics, waiter cancellation, and status transitions into the 238-line private `src/request_control.rs`. `AppState`, permission policy and orchestration, decision-token verification, HTTP/event mapping, active-turn projection, GC scheduling/failure accounting, shutdown draining, and turn execution remain in composition with unchanged lock/await ordering. Focused request/permission/finish/decision/GC tests, all 122 runtime tests plus integrations, all 155 agent tests, five router contracts, all 329 daemon tests serialized, workspace-test compilation, both supported feature checks, formatting, docs, and diff gates passed in a dedicated target. Two fresh security/concurrency reviews found no unresolved medium-or-higher issue; the first strengthened characterization before commit, and the second verified moved bodies against `133a18b`. The dirty primary checkout remained untouched.
+_________________________________________________________________________________
+
 time:      [current]
 agent:     [claude], [ocean-tui]
 worktree:  [main]
@@ -3333,6 +3379,8 @@ Verification:
 - `cargo xtask docs-check` passed (26 packages, 113 active Markdown files, 122 local links)
 - `git diff --check` passed
 - fresh source-backed documentation review found no factual, classification, or ownership-boundary issue
+_________________________________________________________________________________
+
 time:      [07:19pm] [15-07-26]
 agent:     [pi], [gpt-5.6-sol], [orchestrator]
 worktree:  [pi/daemon-persistent-rooms-20260715]
@@ -3388,6 +3436,8 @@ type:      [feature]: add bounded Longhouse preparation inspection
 area:      [backend]: explained deterministic consult ranking
 
 Added serializable explained skill/workflow ranking inspection as a projection of the existing scorer, relevance floor, de-duplication, and tie-break path, retaining the exact ordinary `TurnPrep` internally. Mounted read-only `POST /v1/longhouse/inspect` with the prepare request/cwd/cache/top-N behavior, consult-enabled state, indexed/candidate counts, and path-redacted compact selected evidence; the wire response returns only contributing terms, not the raw prompt, session, cwd, source paths, or bodies. Kept ordinary automatic preparation on its original lightweight allocation path and updated route contracts and operator/Longhouse documentation without changing prompt injection or ranking policy.
+_________________________________________________________________________________
+
 time:      [07:54pm] [15-07-26]
 agent:     [pi], [gpt-5.6-sol], [orchestrator]
 worktree:  [/tmp/ocean-daemon-phase2c-next]
@@ -3427,6 +3477,7 @@ type:      [docs]: publish persistent-room checkpoint
 area:      [backend]: ocean-daemon Phase 2C durable rooms
 
 PR #293 merged the reviewed persistent-room extraction as `92e03bf` after hosted run `29463198497` passed macOS, Ubuntu, pinned Rust 1.88 MSRV, and cargo-deny. Updated the living mission, code-health plan, and extraction manifest from ready-for-publication to published. The inherited best-effort audit interleaving residual remains documented, and live daemon deployment/supervision remains outside this workstream.
+_________________________________________________________________________________
 
 time:      [09:22pm] [15-07-26]
 agent:     [codex], [gpt-5.6], [reviewer]
@@ -3560,6 +3611,8 @@ type:      [gh actions]: publish Longhouse turn preparation extraction
 area:      [backend]: ocean-daemon Phase 2C advisory turn seam
 
 PR #299 merged the reviewed Longhouse turn-preparation extraction as `9095d5a` after hosted run `29475103379` passed macOS, Ubuntu, pinned Rust 1.88 MSRV, and cargo-deny. Updated the living mission, code-health plan, and extraction manifest from ready-for-publication to published, corrected the final rustfmt-expanded module size from the pre-format 239-line estimate to the actual 246 lines, and advanced the next bounded wave to separately manifested Longhouse governance. Delegated loader path logs, unsanitized advisory text, uncancelled timed-out work/cache-lock amplification, and the librarian symlink-retarget finding remain separate; live daemon deployment/supervision remains outside this workstream.
+_________________________________________________________________________________
+
 time:      [00:14] [16-07-26]
 agent:     [codex], [gpt-5], [primary]
 worktree:  [main]
@@ -3697,6 +3750,8 @@ area:      [ocean-protocol]: Anthropic history serialization and prompt caching
 Fixed Fable 5 and other Anthropic/Claude Code high-thinking turns failing after a cross-provider model switch with `thinking.signature: Field required`. Anthropic wire encoding now preserves only non-empty signed thinking blocks, drops unsigned or empty-signature reasoning without exposing it as visible text, omits messages emptied by that filtering, and places rolling cache breakpoints against the converted provider-valid history. The shared persisted history schema remains compatible.
 
 Verification: all 132 ocean-protocol tests passed; `cargo check --workspace`, formatting, and diff checks passed. Focused regression coverage exercises unsigned and empty signatures, thinking-only messages, signed replay, chain-of-thought non-leakage, and converted-history cache indexing. A fresh final reviewer approved the change with no findings.
+_________________________________________________________________________________
+
 time:      [02:05] [07-16-26]
 agent:     [claude] [fable-5]
 worktree:  main
@@ -3914,6 +3969,8 @@ type:      [bug report]: Restore operator-specified Realtime 2.1 model
 area:      [backend]: OpenAI Realtime voice model
 
 Corrected Ocean's Realtime default to the exact operator-provided model ID `gpt-realtime-2.1`. The prior change to `gpt-realtime` was an erroneous override based on a mismatched docs catalog page despite the operator supplying the current Agents SDK example. The owning daemon contract and upstream mint-body regression now pin `gpt-realtime-2.1`; explicit surface overrides remain supported. Verification: all 11 voice_realtime tests, workspace check, denied-warning daemon Clippy, docs-check, and diff-check pass.
+_________________________________________________________________________________
+
 time:      [21:27] [16-07-26]
 agent:     [claude] [fable 5]
 worktree:  [detached @ origin/main (5b9e23a8)]
@@ -4060,6 +4117,8 @@ type:      [merge]
 area:      [backend]
 
 Shipped S2 P2-B to main: pushed 435c7260 (c8bdd024..435c7260 ff) via ref from thoth's worktree — canonical checkout deliberately untouched, it carries the Observatory lane's unpushed commits + dirty tree. 435c7260 is thoth's approved c84e4f99 rebased onto the Observatory docs delta (9 blobs byte-identical, events.md append byte-identical, ledger separator restored), parity-approved by codex. Slice: outbound Bedrock room supervisor per gate2-s2-p2b-freeze-v2.2 — origin-only client, epoch-locked per-room receiver/sender, lease-derived presence, fail-closed store authority, admission-linearized revoke, raw SSE byte cap. Gates: federation 22/22, persistent_rooms 39/39, store 88/88, clippy -D, fmt, diff-check. Next: P2-C (intents/message split/trigger dispatch) closes the two-machine bridge; config-rpc + Observatory lanes rebase onto this main.
+_________________________________________________________________________________
+
 time:      [04:26] [07-17-26]
 agent:     [claude] [fable 5]
 worktree:  feat/session-config-rpc
@@ -4264,6 +4323,7 @@ type:      [handoff]
 area:      [backend]
 
 Consolidated the Ocean Observatory backend after ending the multi-writer Crew run. Rebased the 12-task implementation stack onto current origin/main, rebuilt ocean-daemon composition from the current P2-C/session-config main instead of preserving stale worker conflict resolutions, restored room federation alongside the Observatory, and mapped the new SessionConfigChanged event safely out of the metadata bridge. The daemon now opens the SQLite/WAL Observatory store, runs restart interruption recovery, appends daemon/runtime lifecycle facts, exposes authenticated snapshot/live/replay routes, and records graceful shutdown without blocking runtime authority. Closed the first-party credential gap: daemon startup now atomically mints a mode-0600, boot-bound `.ocean/observatory-token`, rotates it every ten minutes with thirty-minute overlap, and never distributes the HMAC signing secret or injects credentials into arbitrary subprocess environments. Hardened the environment-dependent Longhouse inspection test to preserve its two planted-candidate invariant without assuming empty operator home-skill roots. Verification: ocean-observatory 49/49 tests, ocean-daemon 479/479 tests, workspace check, daemon/observatory Clippy -D warnings, docs-check (28 packages / 157 active Markdown files / 133 links), format, and diff-check pass. Removed the worker's accidentally tracked `.wrangler/cache/wrangler-account.json` and ignored `.wrangler/` as local Cloudflare state. Next authority: implement Ocean Floor in ocean-surface against these real read-only routes; the Claude Design export is visual reference only.
+_________________________________________________________________________________
 
 time:      [16:59] [17-07-26]
 agent:     [pi] [unknown] [thoth]
@@ -4330,6 +4390,7 @@ type:      [feature-request]
 area:      [backend]
 
 Corrective pass over the initial compact commit (c144c344), left uncommitted for review. CompactResponse now reports elided_messages. compact_session gained the missing production wiring: provider readiness preflight (fail closed), full credential options (base_url, auth method, codex account header, stable session_id for prompt caching), thinking-strip history shaping via the shared route predicate, a trailing user instruction for providers requiring user-last requests, and a 300-second wall-clock bound matching the turn budget. The protected window is computed before any model call (a fully-protected transcript is an ok no-op with zero provider spend), is bounded by 20 messages and 20% of context with always-keep-last, and never begins on an orphan tool result. Daemon handler now returns 429 at capacity, 404 only for genuine absence, sanitized 500 for unreadable storage, and 200 otherwise; the route baseline is 86 and the operator guide quick reference documents the route. Added six ocean-agent tests (split bounds, orphan pairing, scripted-provider happy path with on-disk verification, unknown session, corrupt-never-wiped, short-session no-op without model call, provider-error leaves transcript untouched) and two daemon route tests (404 unknown, 429 at capacity).
+_________________________________________________________________________________
 
 time:  [09:12] [18-07-26]
 agent: [codex] [gpt-5]
@@ -4451,6 +4512,7 @@ Operator accepted Phase 1 of docs/specs/2026-07-19-cross-device-approval-and-att
 - Removed the two public GitHub links to the now-private repo (`README.md`, `docs/OCEAN_PROJECT_MAP.md`), marked Bedrock as private/optional in `OCEAN.md`, and added a visibility statement to the project map: no public Ocean feature may hard-require Bedrock.
 - `skills/ocean-coworker-onboarding/` flagged for relocation to the private Bedrock repo in a later slice (no secrets present; it is internal onboarding for a private service).
 - Verified: `cargo xtask docs-check` PASS; no remaining `github.com/Risingtides-dev/ocean-bedrock` references in active docs.
+_________________________________________________________________________________
 
 time:  [03:01pm] [19-07-26]
 agent: ocean-tauri, codex
@@ -4477,6 +4539,8 @@ area:      [backend]: unwired traversal and bounded scan cache
 Ported the pinned MIT `can1357/oh-my-pi` `crates/pi-walker` implementation at `03c48d073bd4849726cc14750b5aecfa310bdf26` into standalone `crates/ocean-walker`, then completed the bounded M1 corrective review pass. Preserved ordinary traversal behavior while adding exact native owned-path identity, clearly named lossy display projections, explicit fresh/cache provenance, post-scan cache age, one absolute lexical cache/invalidation namespace, generation-linearized invalidation/publication, a strict concurrent cache bound, pre-return heartbeat checks, and capped dedicated-pool construction with explicit serial fallback. Added deterministic barrier tests for cache races, failure/bound/provenance tests, pre-cancelled fresh/empty/cached coverage, a Linux/Unix invalid-byte path collision regression, direct Windows API features, and security/adoption docs. The crate is a workspace member outside `default-members` and has no typed-search, runtime grep/glob, daemon, agent, or capability wiring.
 
 Verification: 51 tests passed with three explicit performance ignores on current Rust and pinned Rust 1.88; denied-warning all-target Clippy, workspace test compilation, Windows GNU all-target cross-check, docs-check, formatting, and diff checks passed. Three fresh review lanes drove cache/path/Windows/security corrections; final acceptance found no medium-or-higher issues in the standalone unwired boundary.
+_________________________________________________________________________________
+
 time:      [08:32] [19-07-26]
 agent:     [claude] [fable 5]
 worktree:  lane-c-landing
@@ -4599,6 +4663,8 @@ Verification:
 - `cargo xtask docs-check` (29 packages, 131 active Markdown files, 144 local links)
 - `cargo fmt --all -- --check`
 - `git diff --check`
+_________________________________________________________________________________
+
 time:      [19:15] [19-07-26]
 agent:     [claude] [fable 5]
 worktree:  task-57-save-dir-fsync (fable builder sub, fable landed)
@@ -4634,6 +4700,8 @@ area:      [backend]: bounded trusted-root byte and filesystem search
 Implemented standalone `crates/ocean-search` over `ocean-walker` from pinned MIT Oh My Pi search mechanisms at `03c48d073bd4849726cc14750b5aecfa310bdf26`. The unwired Rust 2021/MSRV 1.88 library provides typed content/count/files output, Rust regex/literal/attributed fallback, explicit multiline, strict OR globs and native type filters, exact native path identity, opened-handle leaf validation, fixed cap-plus-one reads with oversized and binary skips, finite request/result ceilings, cooperative heartbeat, and deterministic path-window commit. Independent review drove pre-commit staging budgets, regex compiler bounds, truthful matching-record/per-file truncation, after-context preservation, later-window stop, consistent explicit-root policy, and read-error accounting. Added focused black-box/adapted donor coverage plus license, notice, README, local contract, canonical workspace/index/roadmap/project-map/OMP-map documentation. No runtime grep/glob, daemon, agent, TUI, capability/profile/tool schema, session, PCRE2, N-API/TypeScript, cache, prefix-search, or confinement wiring was added; runtime adoption remains a separate descriptor/handle-relative authorization checkpoint.
 
 Verification: 22 tests passed on current Rust and pinned Rust 1.88; denied-warning all-target Clippy, workspace test compilation, current-toolchain Windows GNU all-target cross-check, `cargo deny check`, docs-check, formatting, and diff checks passed. Three fresh final review lanes accepted the corrected standalone boundary with no medium-or-higher findings; Windows compiled but was not runtime-tested on this macOS host.
+_________________________________________________________________________________
+
 time:      [04:38] [20-07-26]
 agent:     [claude] [fable 5]
 worktree:  fix/flaky-at-mention-trigger-test
@@ -4740,6 +4808,8 @@ type:      [bug-report]
 area:      [testing]
 
 Fixed a real CI flake in ocean-walker that failed PR #324 on a crate that PR does not touch. wait_for_nonzero_cache_age busy-waited a flat 1ms and the test then asserted cache_age_ms > 0; because that field has millisecond resolution, on a loaded runner the cache write and the subsequent read can land in the same millisecond bucket and the age rounds to zero. The helper now sleeps past a full tick and confirms the OBSERVABLE SystemTime clock advanced at least 2ms rather than trusting a duration — the assertion and the wait now measure the same thing. Previously-failing test stress-run 8x locally, 51 walker tests green, clippy zero, fmt clean. Filed separately from TASK-21 rather than bundled, so the daemon fix and this test fix stay independently reviewable.
+_________________________________________________________________________________
+
 time:      [06:05] [20-07-26]
 agent:     [claude] [fable 5]
 worktree:  fix/task21-bound-detached-prep
@@ -4763,6 +4833,8 @@ type:      [bug-report]
 area:      [testing]
 
 Closed the walker cache flake's second mode (pad TASK-24): #325 fixed the age-bucket race, but today's #326 run failed the backend==Cached assert instead — SCAN_CACHE is process-global with a 1s default TTL and 16-entry cap, so parallel walker tests can evict the primed entry and any >1s runner stall expires it; either way the test observed Fresh with zero product regression. The stale-cache observation now re-establishes its precondition (invalidate_path + remove created.txt) and retries bounded (5 attempts), requiring Cached AND nonzero age — which also closes the residual Instant-vs-SystemTime clock mismatch in the #325 helper by retrying instead of failing on a zero-age edge. A genuine cache regression still fails all five attempts. 51 walker tests green, 8x stress on the target test, clippy zero, fmt clean. Merging via gh pr merge --auto per the new watchers-notify-never-authorize practice.
+_________________________________________________________________________________
+
 time:      [13:55] [20-07-26]
 agent:     [claude] [fable 5]
 worktree:  fix/task23-daemon-supervision-guard
@@ -4770,6 +4842,8 @@ type:      [feature-request]
 area:      [backend]
 
 Implemented the daemon-side supervision invariant (pad TASK-23, from the 07-20 orphan evidence): long-lived TUIs keep old autostart code in memory, so the orphan race cannot be closed client-side. At boot, before binding, the daemon probes launchctl for dev.risingtides.ocean-daemon in the caller's GUI domain — if the job exists (running OR registered-idle, since launchd can kickstart onto the port at any moment) and this process is not the one it launched, the daemon prints a clear line and exits 0: on a supervised box a second daemon is an intentional no-op, not an error. OCEAN_UNSUPERVISED=1 is the explicit escape hatch; probe failures fail OPEN so a broken launchctl can't brick a dev box; non-macOS is a no-op. Verdict logic is a pure function exhaustively unit-tested (no job / own pid / foreign pid / idle job / override), launchctl pid parsing pinned incl. lookalike keys. Guard is main()-only so the 523-test daemon suite is untouched by construction; startup tests 17/17, clippy zero, fmt clean. CI is the full gate; merge only after all four rows report green, verified in a separate command.
+_________________________________________________________________________________
+
 time:      [03:05] [20-07-26]
 agent:     [claude] [fable 5]
 worktree:  [detached deploy worktree; ledger append only]
@@ -4777,6 +4851,8 @@ type:      [release]
 area:      [infra]
 
 TASK-15 closed end to end. #321 merged (f91a6acc): machine-neutral plist template (killed three fossilized smathdaddy-box paths that would have broken any reinstall), launcher published to ~/.local/libexec/ocean-daemon/launch.sh, installer renders the plist and accepts clean detached worktrees at origin/main content. Cutover run succeeded but exposed a supervision SPLIT-BRAIN: during the installer's bootout window an ocean TUI process spawned its own daemon (dirty-stamped first build), won the port, and left launchd crashlooping on EADDRINUSE — the source of the stubborn -dirty health rev. Evicted the orphan in an idle window; launchd took over within its 10s respawn. Final proof: pid 56968, ppid 1 (launchd), /health rev f91a6accc810 CLEAN, serving through the libexec artifact chain. Supervision is now fully checkout-independent with honest provenance. Filed TASK-20: the TUI's spawn-if-down fallback must defer to the launchd job or this race recurs every maintenance window.
+_________________________________________________________________________________
+
 time:      [04:22] [20-07-26]
 agent:     [claude] [fable 5]
 worktree:  [detached; ledger append only]
@@ -4824,6 +4900,8 @@ type:      [bug-report]
 area:      [backend]
 
 Fixed the landed P2 codex flagged on #330: SessionContext derived Default, so code_intelligence defaulted false and every SessionContext::default() caller silently lost the lsp tool — the exact opposite of the field's documented contract (the field itself entered #330 via an over-broad git add -A sweeping a sibling lane's edit; process note recorded, explicit-path staging from here). Manual Default impl now keeps code_intelligence true while harness gates (hashline/artifacts) stay opt-in as daemon-granted capabilities. Codex's P1 on the same PR was stale — it reviewed an intermediate commit; merged code compiles green on all four rows. runtime+lsp+plugin suites 237 green, clippy zero, fmt clean.
+_________________________________________________________________________________
+
 time:      [19:15] [20-07-26]
 agent:     [claude] [fable 5]
 worktree:  fix/task27-p2c-deadline
@@ -4831,6 +4909,8 @@ type:      [bug-report]
 area:      [testing]
 
 Third shared-CI-tax flake closed (pad TASK-27, failed #331's ubuntu row from a diff touching only ocean-runtime): p2c_startup_attempts_every_pending_row_beyond_128 gave 5s for 129 sequential redeem round-trips — sub-second solo, starved on a saturated runner. Deadline raised to 60s with rationale pinned in-comment; the poll loop is progress-guaranteed so the generous budget costs nothing when healthy. Test green, fmt clean.
+_________________________________________________________________________________
+
 time:      [01:21] [20-07-26]
 agent:     [ocean] [gpt-5.6]
 worktree:  feat/voice-conversation-project-tools
@@ -4875,6 +4955,8 @@ organization-neutral profiles, conventions, generic transport, and references;
 private risingtides-agents owns Rising Tides production assistants, couriers,
 Slack intake, internal skills, and factory workflows. Updated the canonical
 project map and active extension/Crew path references. No runtime behavior changed.
+_________________________________________________________________________________
+
 time:      [00:17] [21-07-26]
 agent:     [pi] [unknown-model]
 worktree:  [main]
@@ -4904,6 +4986,8 @@ type:      legal/docs
 area:      public launch licensing and attribution
 
 Applied the operator-approved public launch posture: Ocean OS code and project-authored non-brand documentation/assets are MIT OR Apache-2.0, copyright © 2026 Rising Tides, while Ocean names and logos remain outside the open-source grants under a nominative-use trademark policy. Added root license texts, scope, contribution terms, human credits, and expanded donor notices for Pi, Oh My Pi, inertia-tui's 3D terminal graph mathematics, and RTK. Corrected the pinned RTK minimizer provenance from MIT to Apache-2.0 and bundled that license with the standalone minimizer crate. Updated Cargo package metadata and README discoverability; no runtime behavior changed.
+_________________________________________________________________________________
+
 time:      [23:55] [20-07-26]
 agent:     [claude] [fable 5]
 worktree:  feat/task30-nofollow-relative-root
@@ -4960,6 +5044,8 @@ type:      [docs]
 area:      [docs]
 
 Refreshed the Ocean Surface architecture page as one bounded honesty/freshness slice. Corrected the canonical Leptos/Tauri/legacy-GPUI boundary, documented proxy-forwarded daemon-owned STT/TTS, and made the transcript-only POST /v1/agent/voice contract explicit without implying microphone capture, daemon STT, wake word, TTS, or a completed voice UX. Verified the live proxy health response, local file page, HTML parse, diff hygiene, and docs-check; no media assets were fabricated.
+_________________________________________________________________________________
+
 time:      [04:28] [21-07-26]
 agent:     [claude] [fable 5]
 worktree:  [detached @ origin/main (ca29a36a); ledger append only]
@@ -5011,6 +5097,8 @@ immediately acquirable, keeps both lanes live at once, and frees only A when A's
 lease drops. Verified as a real regression guard by mutating `session_lock` to
 key every session to one nil id — the new test fails under that mutation and
 passes once reverted.
+_________________________________________________________________________________
+
 time:      [14:02] [24-07-26]
 agent:     [claude] [opus 5]
 worktree:  test/task31-browser-wait-for-pid-flake
@@ -5031,6 +5119,8 @@ Widened it too. Note this crate went default-off behind `legacy-chromium` in
 feature — the flake is dormant on default CI rather than gone. Verified with
 `cargo test -p ocean-browser --features legacy-chromium`: 12 passed,
 including `cancelled_browser_launch_does_not_orphan_spawned_process`.
+_________________________________________________________________________________
+
 time:      [13:54] [24-07-26]
 agent:     [claude] [opus 5]
 worktree:  deps/ratatui-0.30-lru-advisory
@@ -5053,6 +5143,8 @@ errors as `io::Error`, so callers are unaffected), and vt100 0.16 moved
 that underflow. ocean-tui's 409 tests, the full local `cargo xtask ci` gate, and
 `cargo deny check` are all green, and ratatui 0.30's MSRV is exactly our
 1.88 CI floor.
+_________________________________________________________________________________
+
 time:      [13:58] [24-07-26]
 agent:     [claude] [opus 5]
 worktree:  feat/tui-cd-slash-command
@@ -5530,6 +5622,8 @@ type:  [bug report]: Keep LiveKit server SDK on rustls
 area:  [backend]: Call dependency transport
 
 Recovered the focused LiveKit feature correction from the divergent Mini main. `livekit-api` now uses rustls native roots, removing `native-tls`, `hyper-tls`, and `openssl-sys` from the supported workspace graph. All 160 ocean-call tests, workspace test compilation, compatibility feature Clippy lanes, release all-target compilation, docs-check, and dependency-tree assertions pass.
+_________________________________________________________________________________
+
 time:      [23:50] [27-07-26]
 agent:     [pi] [gpt-5.4] [worker]
 worktree:  [feat/extensions-stage-a2a]
@@ -5571,6 +5665,8 @@ type:  [workflow]: Recover dated harness-footprint social assets
 area:  [design]: Public evidence and measurement graphics
 
 Recovered the 2026-07-18 local harness-footprint measurement as two editable SVG/PNG social graphics with AI-generated text-free backplates. Review prep verified all arithmetic, dimensions, visible text, and absence of personal/local identifiers. The daemon-accounting graphic now names its OpenCode 1.17.15 baseline instead of making an unsupported standalone comparison, and the README binds the assets to the public-evidence policy and reproducible Chrome SVG rendering.
+_________________________________________________________________________________
+
 time:      [00:40] [28-07-26]
 agent:     [pi], [gpt-5.4], [worker]
 worktree:  [feat/extensions-stage-a2a]
@@ -5619,6 +5715,8 @@ removing its duplicate stale assertions that publish=false workspace roots must
 appear as third-party packages. Binary-section headers, cargo-about version,
 full NOTICE evidence, exact twelve-file payload, legal-file identity, npm/Bun
 installation, and dependency-free wrapper checks remain unchanged.
+_________________________________________________________________________________
+
 time:      [01:08] [28-07-26]
 agent:     [api] [gpt-5.4] [worker]
 worktree:  [feat/extensions-stage-a2a]
@@ -5913,6 +6011,8 @@ outcome-unknown copy. Added focused lifecycle regression coverage and restored
 the pre-existing rustfmt drift in ocean-providers so the repository formatting
 gate can pass. The full 459-test TUI suite, TUI check/release build, workspace
 check, docs-check, and independent review all passed.
+_________________________________________________________________________________
+
 time:      [19:25] [07-30-26]
 agent:     [claude] [pm]
 worktree:  feat/rooms-g1-integrity
@@ -5951,6 +6051,7 @@ type:      [bug report]: close persistent-room SSE/bootstrap and route-parity re
 area:      [backend]: ocean-daemon persistent rooms + operator route guide
 
 Updated `crates/ocean-daemon/src/persistent_rooms.rs` tests so merged room SSE accepts interleaved no-id `room_read_cursor` bootstrap frames while still requiring each subscriber to receive exactly the intended `room_access` update, preserving Last-Event-ID semantics for message replay. Added the missing GET/PATCH `/v1/rooms/persistent/{key}/read-cursor` entries to `crates/ocean-daemon/src/main.rs` banner discovery and `docs/OCEAN_RUNTIME_OPERATOR_GUIDE.md` quick reference, then re-ran focused daemon regressions, full `cargo test -p ocean-daemon`, strict daemon all-target clippy, and fmt/diff checks.
+_________________________________________________________________________________
 
 time:      [14:52] [03-08-26]
 agent:     ocean, claude-code-fable-5, designer
@@ -6213,6 +6314,7 @@ per-node binding divergence is acceptable — got answered before code assumed
 answers. Under concurrent review they get answered by whoever writes the code
 that needs them, which is faster and less deliberate. The mitigation is the
 explicit-statement rule above.
+_________________________________________________________________________________
 
 time:      [23:31] [26-08-26]
 agent:     [claude], [opus 5]
@@ -6459,6 +6561,7 @@ PTY launch rendered the installed Ocean TUI against the live daemon and exited
 cleanly. The user's dirty canonical checkout was not modified. This foundation
 remains deliberately inert: no Room-agent API routes or admission behavior were
 introduced by Phase 1 Stage 1.
+_________________________________________________________________________________
 
 time:      [04:22] [14-08-26]
 agent:     [pi] [gpt-5.6-sol]
@@ -6666,6 +6769,8 @@ so the scripted error arrives in the exact TurnFailure shape production emits
 and the fallback's reuse_accepted_user invariant holds for the same reason it
 holds against a live provider. Reverting each of the four lines individually now
 fails exactly one test, and a different one each time.
+_________________________________________________________________________________
+
 time:      [17:52] [08-27-26]
 agent:     [claude] [opus 5]
 worktree:  loop/attachments-in-agent-context
@@ -7438,4 +7543,44 @@ struct doc in `ocean-core` carrying it. Checked the operator guide rather than
 assuming: it names `trigger_policy?` in the create/PATCH bodies at :557/:559
 and enumerates no flags, so it did not go stale and was left alone. Docs only,
 no code, no deploy, no migration.
+_________________________________________________________________________________
+
+time:      [14:20] [31-08-26]
+agent:     [claude-code], [claude-opus-5]
+worktree:  loop/os-ledger-checker
+type:      [gh actions]: Port the ledger checker to the repo with no instrument
+area:      [infra]: events.md union merge driver
+
+This repo runs the `union` merge driver on events.md and, alone among the three
+Ocean repos, had nothing watching it fold. The driver keeps a line both sides
+added only once, so each extra parallel append eats the `___` rule the two
+entries share and the second `time:` header lands under the first entry's
+prose: two entries fuse with no conflict and nothing a merge check can see.
+Measured before this branch, 58 of 511 entries here were open, against
+ocean-surface's 22 of 247 and ocean-bedrock's 0 of 88 -- twice either sibling's
+entry volume, no instrument. Open is the shape the driver leaves, but it is not
+proof the driver did it, and at least 17 of the 58 predate any parallel merge:
+one is line 9, this file's own fenced schema template, and sixteen are followed
+immediately by an entry carrying the same `worktree:`, which a parallel fold
+cannot produce -- fourteen of those are a single run at lines 1293-1391, one
+author narrating phases of `feat/ocean-tui-shell-rebuild` in sequence and
+writing no trailing rule. The check asks whether an entry closes, never how it
+came to be open, so the repair holds either way and only the attribution needed
+narrowing. `scripts/check-ledger.mjs` is a port of ocean-bedrock's (its PR #62,
+commit 09bb1bb) with every executable line byte-identical, so a fix to either
+copy crosses as a patch; only the usage text differs, since this repo
+has no node manifest and the invocation is `node scripts/check-ledger.mjs
+events.md`. The existing `ledger:` job was extended rather than duplicated: its
+`if: pull_request` moved off the job onto the diff step so the parse check also
+runs on push-to-main, and node is pinned at 22 instead of inherited from the
+runner image. `scripts/check-ledger.test.mjs` (`node --test`) makes pure over
+the text the assertions bedrock makes through a real union merge, including one
+that pins a false positive rather than a feature -- this file's fenced schema
+header carries a `time:` line, so the template parses as entry #1, which
+bedrock's header-less ledger could never surface. A separate commit carries
+nothing but the `--fix` output that closed those 58: 105 insertions, 0
+deletions, all rules and blanks. The repair was done here rather than deferred
+because the job is non-blocking, so a red check would not have stopped a merge,
+it would only have been red from birth. No Rust changed, no deploy, no
+migration.
 _________________________________________________________________________________
