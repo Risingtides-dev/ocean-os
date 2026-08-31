@@ -7371,3 +7371,52 @@ decorative: adding `file.workspace_write` to the allowlist fails
 clippy `-p ocean-daemon --all-targets -D warnings` clean, 822 tests 0 failed,
 toolchain 1.97.0. Docs and one test literal only -- no deploy, no migration.
 _________________________________________________________________________________
+
+time:      [02:55] [08-31-26]
+agent:     [claude] [opus 5]
+worktree:  loop/os-ci-failure-convenes-nobody
+type:      [feature-request]
+area:      [backend]
+
+A room whose workspace build goes red auto-summons its agents; the same room,
+on the same commit, sat silent when CI went red -- even though CI results are
+already first-class here, deduped in `room_ci_checks`, landing on the
+transcript as `workspace CI` markers and rendered by the repo panel. A red
+check convened nobody. Added `on_ci_failure` to `RoomTriggerPolicy` with a
+`CiFailure` event and its own arm in `evaluate_trigger_policy`, and wired
+`ingest_workspace_row` to fire it. Deliberately a NEW flag rather than a
+widening of `on_build_failure`: widening changes what a stored `true` means for
+every room that already opted in, which is the class of change this codebase
+refuses elsewhere. The two flags are proved independent in both directions.
+
+The one genuinely new judgement is that `ci_checked` is a SINGLE event type
+carrying green and red alike, so unlike `build_failed` the decision has to read
+the payload. That lives in `ci_checks_are_red`, a pure total function beside
+`compose_workspace_marker`: red is `failure`/`timed_out`/`action_required`/
+`startup_failure`; `success`/`skipped`/`neutral`/`cancelled`/`stale`, a null
+conclusion, an empty `checks` array and an absent one all convene nobody.
+Bedrock lists only completed runs, so a null conclusion is defensive rather
+than normal. No second dedupe was built: Bedrock already sends only unseen
+checks plus re-runs whose conclusion CHANGED and emits nothing when there is no
+news, so a timer-polling member does not re-convene on the same red check while
+a green-to-red re-run still arrives.
+
+The trap worth recording: `ocean-store` HAND-ROLLS the policy JSON to avoid a
+serde_json dependency, and a flag added to core and the daemon but not to BOTH
+`serialize_policy` and `parse_policy` is written as nothing and read back as
+`false` forever, with every non-round-tripping test still green. Both were
+updated and the hazard is now written into the daemon AGENTS.md. Proved the
+guards are load-bearing rather than decorative by mutation: deleting the
+`serialize_policy` line fails `trigger_policy_round_trips_and_evaluates` and
+the route test `room_update_distinguishes_absent_null_and_present_trigger_policy`;
+removing the payload gate fails the new integration test on the green case.
+Also corrected an AGENTS.md clause that was ALREADY stale on origin/main --
+it claimed workspace markers carry "empty trigger targets", which stopped being
+true when `on_build_failure` landed.
+
+Gate: fmt clean, clippy `-p ocean-core`/`-p ocean-store`/`-p ocean-daemon`
+`--all-targets -D warnings` clean, `cargo check --workspace --tests` clean
+(a shared enum fans out across crates), ocean-core 58 / ocean-store 179 /
+ocean-daemon 824 passed 0 failed, toolchain 1.97.0. Ships paired with the
+surface half that exposes the toggle. No deploy, no migration.
+_________________________________________________________________________________
