@@ -3469,6 +3469,12 @@ fn workspace_action_is_marker(event_type: &str) -> bool {
 /// willing to quote into a transcript marker. Everything else in the payload
 /// is ignored; a payload whose fields exist but carry the wrong type is
 /// malformed and stepped past like any other poison row.
+///
+/// `preview_url` is decoded on the ruling [`WorkspaceCiCheck`]'s `url` makes
+/// one struct below, and for the same reason a URL is ever worth the width of
+/// a marker line: a transcript is fed to every convened agent, and an agent
+/// has no port list to open. "workspace port 8787 exposed" tells it something
+/// is serving and withholds the one thing it would need to reach it.
 #[derive(Debug, Default, Deserialize)]
 struct WorkspaceEventPayload {
     #[serde(default)]
@@ -3485,6 +3491,8 @@ struct WorkspaceEventPayload {
     duration_ms: Option<u64>,
     #[serde(default)]
     port: Option<u64>,
+    #[serde(default)]
+    preview_url: Option<String>,
     #[serde(default)]
     route_removed: Option<bool>,
     #[serde(default)]
@@ -3599,8 +3607,9 @@ fn bounded_quotable(text: &str, max_chars: usize) -> String {
 /// the marker over a naming convention nobody chose adversarially.
 ///
 /// The two lanes still reach the same place: no finished marker line carries
-/// bracket syntax, because the only other upstream string on one is a run URL
-/// and [`ci_run_url`] refuses those for its own reason.
+/// bracket syntax, because the only other upstream strings on one are URLs —
+/// a run's and a preview's — and [`ci_run_url`] refuses those for its own
+/// reason.
 fn bounded_prose(text: &str, max_chars: usize) -> String {
     bounded_quotable(text, max_chars)
         .chars()
@@ -3621,6 +3630,12 @@ fn short_sha(text: &str) -> Option<String> {
 /// Bedrock caps every projected CI string at 256 characters before anything
 /// durable sees it (`CI_FIELD_MAX_LENGTH`, room-ci.mjs), so a longer URL did
 /// not come from a healthy producer and this lane does not pretend it did.
+///
+/// A preview URL is not capped upstream at all, and inherits this bound
+/// anyway: the room-runtime Worker mints one against a driver domain from a
+/// port and a 16-hex token Bedrock derives as `sha256(room:port)`, so 256 is
+/// already an order of magnitude past the longest honest answer and the same
+/// reading holds.
 const CI_RUN_URL_MAX_CHARS: usize = 256;
 
 /// The run URL a check may carry, accepted only when it is plainly an http(s)
@@ -3647,6 +3662,15 @@ const CI_RUN_URL_MAX_CHARS: usize = 256;
 /// expected to grow, and inheriting it here would let a rendering decision
 /// silently change which URLs this gate accepts. Anything this lane wants
 /// from the prose rule it states below, in its own words.
+///
+/// `port_exposed`'s `preview_url` shares this gate rather than growing a
+/// second one. Its provenance is better — it is minted by Bedrock-operated
+/// infrastructure, where a run URL is `gh` stdout from inside the room's
+/// container — but the
+/// destination it lands in is the same transcript line read by the same
+/// renderers, and two URL rules in one file is two things to keep right. The
+/// name stayed `ci_run_url` because the CI lane is where every clause above
+/// was argued; nothing in it is CI-specific.
 fn ci_run_url(text: &str) -> Option<String> {
     if bounded_quotable(text, CI_RUN_URL_MAX_CHARS) != text {
         return None;
@@ -3743,10 +3767,18 @@ fn fmt_duration_ms(ms: u64) -> String {
 ///   function that quotes an unfiltered string is one allowlist edit away
 ///   from being wrong.
 ///
-/// Two upstream strings are NOT quoted through the prose filter and do not
-/// need to be: `head_sha` must survive [`short_sha`]'s hex test, and a
-/// check's `url` must survive [`ci_run_url`]'s. Both refuse rather than
-/// repair, so neither can carry a metacharacter through.
+/// Three upstream strings are NOT quoted through the prose filter and do not
+/// need to be: `head_sha` must survive [`short_sha`]'s hex test, and both a
+/// check's `url` and an exposure's `preview_url` must survive
+/// [`ci_run_url`]'s. All refuse rather than repair, so none can carry a
+/// metacharacter through. `preview_url` is DRIVER, the same standing as
+/// `driver` above, but the label is coarser than it looks: only the LOCAL
+/// driver mints the address itself (`${previewBase}:${port}`). The cloudflare
+/// driver — the one production runs — relays `result.url` from the room-runtime
+/// Worker and checks only that it is truthy, so the minting hand is one hop
+/// further out than DRIVER suggests. Bedrock-operated either way, and filtered
+/// regardless, because this lane never trusts a payload string however it got
+/// here — which is what makes the coarseness affordable rather than a hole.
 fn compose_workspace_marker(event_type: &str, p: &WorkspaceEventPayload) -> String {
     let quoted = |value: &Option<String>| {
         value
@@ -3835,10 +3867,42 @@ fn compose_workspace_marker(event_type: &str, p: &WorkspaceEventPayload) -> Stri
             }
             line
         }
-        "room.workspace.port_exposed" => match p.port {
-            Some(port) => format!("workspace port {port} exposed"),
-            None => "workspace port exposed".into(),
-        },
+        "room.workspace.port_exposed" => {
+            let mut line = match p.port {
+                Some(port) => format!("workspace port {port} exposed"),
+                None => "workspace port exposed".into(),
+            };
+            // A URL the gate refuses is DROPPED, and the line degrades to the
+            // sentence it carried before this key was decoded — the same trade
+            // the CI tail makes, and for the same reason: a marker that names
+            // no address is thin, one that names a repaired address is wrong.
+            // `port_closed` names no address because Bedrock's close row has
+            // none to name: `handleWorkspacePortClose` emits the port plus
+            // `withdrawPreviewRoute`'s `route_removed` marker and nothing
+            // else, and before ocean-bedrock #65 it emitted the port alone.
+            // There is no asymmetry to choose here, only one to hold if a
+            // producer ever grows the key — this arm would still drop it,
+            // because naming an address the room just withdrew reads as
+            // still serving.
+            //
+            // RULING, since decoding this key widens who can reach a live
+            // preview: until now the daemon put a preview address in exactly
+            // one place, the 201 body of the owner's own expose call, because
+            // `room_workspace_proxy.rs` gates BOTH ports verbs at owner on
+            // merit and registers no ports LIST leaf at all. A transcript is
+            // durable and every member and every convened agent reads it, so
+            // this publishes the address room-wide and permanently. That is
+            // deliberate and is what the key is decoded FOR: the token is a
+            // routing label rather than a credential in Bedrock's own words,
+            // so the port is already served to anyone holding the URL, and an
+            // agent that cannot read the address cannot use the port the
+            // owner published for it. What the owner gate keeps narrow is the
+            // ACT of exposing, not the address once it exists.
+            if let Some(url) = p.preview_url.as_deref().and_then(ci_run_url) {
+                line.push_str(&format!(": {url}"));
+            }
+            line
+        }
         "room.workspace.port_closed" => {
             let mut line = match p.port {
                 Some(port) => format!("workspace port {port} closed"),
@@ -8639,10 +8703,16 @@ mod tests {
 
     #[test]
     fn workspace_port_markers_pair_an_exposure_with_its_retraction() {
-        // The real Bedrock payload shape: `preview_url` rides the ledger row
-        // for an exposure, but this struct does not deserialize it, so the
-        // transcript names the port and never the link — the port integer is
-        // the whole of what a reader has to match the pair by.
+        // `preview_url` rides Bedrock's exposure row and the exposure marker
+        // ENDS in it — a port integer alone tells a convened agent that
+        // something is serving and never where, which is the shape of claim
+        // this file already ruled against for a red run. The same payload is
+        // then fed to the retraction, which is NOT a shape Bedrock sends:
+        // its close row carries the port and `route_removed` only. Composing
+        // the close from a payload that does carry the key is the point —
+        // it proves the bare close is a property of the arm rather than an
+        // accident of an absent field, so the pair stays matched on the port
+        // and only the exposure ever carries a link.
         let payload: WorkspaceEventPayload = serde_json::from_value(json!({
             "port": 8787,
             "preview_url": "https://8787-room.example.dev",
@@ -8651,7 +8721,7 @@ mod tests {
         .unwrap();
         assert_eq!(
             compose_workspace_marker("room.workspace.port_exposed", &payload),
-            "workspace port 8787 exposed"
+            "workspace port 8787 exposed: https://8787-room.example.dev"
         );
         assert_eq!(
             compose_workspace_marker("room.workspace.port_closed", &payload),
@@ -8666,6 +8736,59 @@ mod tests {
             "workspace port closed",
             "missing fields degrade to shorter prose instead of failing the row"
         );
+    }
+
+    #[test]
+    fn workspace_port_exposed_marker_omits_a_url_it_cannot_vouch_for() {
+        // The live path until every producer stamps the key, and the shape any
+        // future one that cannot vouch for a URL should send: no `preview_url`
+        // degrades to the sentence the marker carried before it was decoded,
+        // never to an empty tail.
+        let payload: WorkspaceEventPayload = serde_json::from_value(json!({
+            "port": 8787
+        }))
+        .unwrap();
+        assert_eq!(
+            compose_workspace_marker("room.workspace.port_exposed", &payload),
+            "workspace port 8787 exposed"
+        );
+
+        // Every refusal `ci_run_url` makes degrades the same silent way, on
+        // its own stated ground: a URL that needed repair points somewhere its
+        // producer never named, so the row claims less rather than claiming
+        // wrong. The bracket case is the one whose absence would otherwise
+        // render as an anchor the room appears to have authored itself.
+        for refused in [
+            json!({"port": 8787, "preview_url": "8787-room.example.dev"}),
+            json!({"port": 8787, "preview_url": "ftp://8787-room.example.dev"}),
+            json!({"port": 8787, "preview_url": "https://8787-room.example.dev /x"}),
+            json!({"port": 8787, "preview_url": "https://8787-room.example.dev\n/x"}),
+            json!({"port": 8787, "preview_url": "https://ex.test/[a](https://evil.co)"}),
+            json!({"port": 8787, "preview_url": "https://8787-room.example.dev@evil.co/"}),
+            json!({"port": 8787, "preview_url": "https://8787-room.example.dev/a%0db"}),
+            json!({
+                "port": 8787,
+                "preview_url":
+                    format!("https://example.test/{}", "x".repeat(CI_RUN_URL_MAX_CHARS))
+            }),
+        ] {
+            let payload: WorkspaceEventPayload =
+                serde_json::from_value(refused.clone()).expect("a string field still decodes");
+            assert_eq!(
+                compose_workspace_marker("room.workspace.port_exposed", &payload),
+                "workspace port 8787 exposed",
+                "{refused} reached the marker"
+            );
+        }
+
+        // A `preview_url` that is PRESENT but mistyped poisons the whole row —
+        // the same contract as any other wrong-typed payload field.
+        for bad in [
+            json!({"port": 8787, "preview_url": 8787}),
+            json!({"port": 8787, "preview_url": ["https://8787-room.example.dev"]}),
+        ] {
+            assert!(serde_json::from_value::<WorkspaceEventPayload>(bad).is_err());
+        }
     }
 
     #[test]

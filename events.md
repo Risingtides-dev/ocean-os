@@ -8032,3 +8032,131 @@ room-wide owner, removed the archive table, and passed `PRAGMA integrity_check`.
 The live database SHA-256 values were identical before and after the rehearsal,
 and the supervised live daemon remained healthy at revision `996d3400b99b`.
 _________________________________________________________________________________
+time:      [13:04] [08-31-26]
+agent:     [claude] [opus 5]
+worktree:  loop/os-port-exposed-url
+type:      [feature-request]
+area:      [backend]
+
+`room.workspace.port_exposed` told the room a port was serving and never said
+where. Bedrock has always put `preview_url` on that ledger row
+(`emitWorkspaceEvent(... preview_url: exposed.url)` in
+`handleWorkspacePortExpose`, server.mjs:2897 on bedrock master today), but
+`WorkspaceEventPayload` decoded eighteen keys and not that one, so serde
+dropped it and the marker read "workspace port 8787 exposed" — a fact a human
+can act on from the ports panel and a convened agent cannot act on at all. The
+transcript is fed to every convened agent, and this file had already ruled on
+the identical shape one struct below: `WorkspaceCiCheck` decodes `url` because
+"a convened agent has no panel to click — the marker is its entire input".
+`preview_url` is now decoded and the exposure marker ends in it, emitted bare
+(`": {url}"`) like the CI run URL so ocean-surface's tokenizer autolinks it,
+where an autolink's label IS its href.
+
+No second URL rule was invented: the address goes through `ci_run_url`
+unchanged — compare-back against `bounded_quotable`, no whitespace, no
+backslash, no brackets (the `[label](href)` re-entry attack), no percent-encoded
+control or space, http(s) only, non-empty authority without `@` — so a URL the
+gate refuses is DROPPED and the row degrades to the sentence it carried before
+this key existed, never to a repaired address pointing somewhere Bedrock never
+minted. The gate's 256-char bound is justified upstream by a CI field cap that
+does not govern a preview URL; the doc now says why it holds anyway. `port_closed`
+stays bare, and NOT because a URL was weighed and refused there: Bedrock's close
+row has never carried one. `handleWorkspacePortClose` emits the port plus
+`withdrawPreviewRoute`'s `route_removed` marker and nothing else, and emitted the
+port alone before ocean-bedrock #65. The arm would still drop a URL a future
+producer added, since naming an address the room just withdrew reads as still
+serving — but that is a rule held in reserve, not an asymmetry anyone had to
+choose. (Read off ocean-bedrock `origin/master`; the sibling checkout on this
+machine is 133 commits stale and an ocean-os `json!` fixture is not evidence
+about what Bedrock emits — AGENTS.md says outright that nothing in ocean-os
+reads ocean-bedrock and no cross-repo check exists.)
+
+The tail is also an ACCESS ruling, now written down where it changes. The daemon
+previously put a preview address in exactly one place, the 201 body of the
+owner's own expose call: `room_workspace_proxy.rs` gates BOTH ports verbs at
+owner on MERIT — its own bullet spends a paragraph on publishing a room's
+compute to the open internet being an owner act — and registers no ports LIST
+leaf. The transcript is durable and every member and every convened agent reads
+it, so this marker publishes the address room-wide, permanently. That is the
+point rather than an oversight: the token is a routing label and
+not a credential in Bedrock's own handler's words, so the port is already served
+to anyone holding the URL, and an agent that cannot read the address cannot use
+the port the owner published for it. The owner gate keeps the ACT of exposing
+narrow, not the address once it exists.
+
+The trap here was prose, not mechanism: `workspace_port_markers_pair_an_exposure_with_its_retraction`
+already carried a `preview_url` fixture and a comment ARGUING the old behaviour
+was correct. That comment is rewritten to state the new ruling and to say why
+the fixture keeps feeding a `preview_url` payload to the CLOSE as well — a shape
+Bedrock does not send, kept so the bare close is proved a property of the arm
+rather than an accident of an absent field. New coverage in
+`workspace_port_exposed_marker_omits_a_url_it_cannot_vouch_for`: an absent key,
+eight refusal shapes (schemeless, ftp, embedded space, embedded newline,
+bracket-forgery, `@`-authority, `%0d`, over-length) each degrading silently, and
+a mistyped `preview_url` poisoning the whole row like every other typed field.
+Gate on 1.97.0: ocean-daemon 831 passed / 0 failed, clippy -D warnings exit 0,
+fmt --check exit 0.
+_________________________________________________________________________________
+time:      [13:19] [08-31-26]
+agent:     [claude] [opus 5]
+worktree:  loop/os-thread-reply-refusal-as-recorded-would-wedge-every-policy-write
+type:      [bug report]
+area:      [backend]
+
+`unwired_trigger_response` had just been widened to refuse `on_thread_reply`
+alongside the schedule and component-event flags, and as recorded that refusal
+was on the VALUE. ocean-surface builds a policy PATCH by cloning the room's
+stored policy and flipping one field, so a federated room already holding
+`on_thread_reply: true` re-sends `true` on every unrelated toggle — a value
+refusal would have 400'd all of them and bricked the trigger panel for exactly
+the rooms the rule exists to protect. What is dead is the flag in a non-`Local`
+room (`RoomTriggerEvent::ThreadReply` is built on one path, the local post from
+the thread root's author, and a federated inbound message carries no thread
+parent), so `dead_thread_reply_transition` now refuses the TRANSITION — stored
+false-or-absent → requested true, in a room whose access state is not `Local` —
+and the update route reads access under the same store guard that writes the
+policy. Switching the flag OFF stays legal in every state, since that is the
+only way a room that federated while set can ever be cleaned up. The refusal
+body was factored into `trigger_unwired_response` so both refusals emit one
+shape.
+
+Refinement pass on the reviewer's two findings. The amended doc claimed the
+mention, build-failure and CI-failure events "come from real code paths in
+every room", which is false for two of the three: `BuildFailed` and `CiFailure`
+are constructed only in the federation SSE ingest rail
+(`room_federation.rs:3954-3956`), so both are dead in a `Local` room — the same
+asymmetry the paragraph under it introduces, pointing the other way. The
+sentence now says where each event actually comes from and why the direction
+decides the gate: a room is created `Local` and only federates later, so a
+failure flag set locally is anticipatory rather than inert, while thread-reply
+is live in `Local` and dead the moment a room leaves it. Second finding was
+this entry's own absence — CI's `ledger` job fails any diff touching `crates/`
+without one. This entry closes with the rule plus the blank line the ledger
+already puts between a rule and the next header: `origin/main` gained an entry
+after this branch was cut, and with the file ending on a bare rule the union
+driver eats one of the two rules and fuses that entry into this one — the fold
+`scripts/check-ledger.mjs` exists to catch. Gate on 1.97.0: ocean-daemon 833
+passed / 0 failed, clippy -D warnings exit 0, fmt --check exit 0.
+Mutation-checked earlier in the slice: neutering the predicate to `false` fails
+3 of the 4 thread_reply tests, and dropping the `!stored.is_some_and(...)`
+clause (the naive value rule) fails the accept test 400 != 200 plus the
+predicate table.
+
+Two reviewer notes taken at land. The refusal was being evaluated before the
+store's OPEN-room gate: `trigger_policy` and `room_access` answer for any room
+the store still holds, soft-closed included, while `update` writes only an open
+one -- so a soft-closed federated room PATCHed with the flag on returned 400
+`trigger_unwired` where the contract has always been a flat 404, and was told
+its federation state in the bargain. The check now opens with the same
+`reg.get(&key)?.is_none()` gate `room_post_message` uses, under the same guard
+as the write so a close cannot race in between. Reproduced before and after:
+removing that gate turns the new
+`room_update_404s_a_closed_room_rather_than_refusing_its_dead_trigger` red with
+left 400 / right 404. And the predicate's doc stated ocean-surface internals as
+present-tense fact; it now carries this crate's convention for a cross-repo
+claim -- the guarantee is conditional on a manual pin and on nothing else, since
+no automated cross-repo check exists -- plus the half that does NOT depend on
+the pin, which is that the off direction is accepted in every access state, so
+no client can be locked out of clearing the flag however its write is composed.
+_________________________________________________________________________________
+
