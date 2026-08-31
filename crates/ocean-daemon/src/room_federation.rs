@@ -3560,8 +3560,9 @@ const CI_RUN_URL_MAX_CHARS: usize = 256;
 /// from the prose rule it states below, in its own words.
 ///
 /// `port_exposed`'s `preview_url` shares this gate rather than growing a
-/// second one. Its provenance is better — Bedrock's compute driver mints it,
-/// where a run URL is `gh` stdout from inside the room's container — but the
+/// second one. Its provenance is better — it is minted by Bedrock-operated
+/// infrastructure, where a run URL is `gh` stdout from inside the room's
+/// container — but the
 /// destination it lands in is the same transcript line read by the same
 /// renderers, and two URL rules in one file is two things to keep right. The
 /// name stayed `ci_run_url` because the CI lane is where every clause above
@@ -3666,9 +3667,14 @@ fn fmt_duration_ms(ms: u64) -> String {
 /// need to be: `head_sha` must survive [`short_sha`]'s hex test, and both a
 /// check's `url` and an exposure's `preview_url` must survive
 /// [`ci_run_url`]'s. All refuse rather than repair, so none can carry a
-/// metacharacter through. `preview_url` is the driver's own minted address
-/// — DRIVER, the same standing as `driver` above — and is filtered anyway,
-/// because this lane never trusts a payload string, however it got here.
+/// metacharacter through. `preview_url` is DRIVER, the same standing as
+/// `driver` above, but the label is coarser than it looks: only the LOCAL
+/// driver mints the address itself (`${previewBase}:${port}`). The cloudflare
+/// driver — the one production runs — relays `result.url` from the room-runtime
+/// Worker and checks only that it is truthy, so the minting hand is one hop
+/// further out than DRIVER suggests. Bedrock-operated either way, and filtered
+/// regardless, because this lane never trusts a payload string however it got
+/// here — which is what makes the coarseness affordable rather than a hole.
 fn compose_workspace_marker(event_type: &str, p: &WorkspaceEventPayload) -> String {
     let quoted = |value: &Option<String>| {
         value
