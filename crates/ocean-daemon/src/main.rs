@@ -149,6 +149,7 @@ mod project_registry;
 mod recall_registry;
 /// In-memory request and permission control records plus bounded lifecycle mutations.
 mod request_control;
+mod room_agent_authority;
 /// Room attachment BYTES: blob path derivation, the size cap, server-minted
 /// ids, and the upload/list/download/delete adapters over `ocean-store`'s index.
 mod room_attachments;
@@ -307,6 +308,8 @@ struct AppState {
     /// the guard is always dropped before any `await`, and every store method is
     /// synchronous, so a std `Mutex` is correct and never blocks the scheduler.
     rooms: RoomStoreHandle,
+    /// Fail-closed local principal for room-agent authority mutations.
+    room_operator: Arc<room_operator::OperatorIdentity>,
     /// Root of the room-attachment blob tree, resolved ONCE at startup.
     ///
     /// `ocean-store` indexes attachments; their bytes live on disk under this
@@ -999,6 +1002,7 @@ async fn main() -> anyhow::Result<()> {
     tracing::info!(path = %titles_db_path.display(), "persisted longhouse title registry ready");
 
     let config_dir = ocean_agent::config_dir_from_env();
+    let room_operator = Arc::new(room_operator::OperatorIdentity::load(&config_dir));
     let roles = load_model_roles(&config_dir);
 
     // The lifecycle dispatcher exists before reconciliation so daemon_started is
@@ -1133,6 +1137,7 @@ async fn main() -> anyhow::Result<()> {
         permissions: Arc::new(RwLock::new(HashMap::new())),
         longhouse,
         rooms,
+        room_operator,
         room_attachments_root: Arc::new(room_attachments_root),
         room_wakes,
         room_access_wakes,
@@ -1575,6 +1580,16 @@ fn banner_routes() -> &'static [&'static str] {
         "POST /v1/rooms/persistent/invites/redeem",
         "POST /v1/rooms/persistent/{key}/members/agents",
         "DELETE /v1/rooms/persistent/{key}/members/{member_id}",
+        "GET /v1/rooms/persistent/{key}/agents",
+        "POST /v1/rooms/persistent/{key}/agents",
+        "POST /v1/rooms/persistent/{key}/agents/bootstrap",
+        "GET /v1/rooms/persistent/{key}/agents/preview/{agent_package_id}",
+        "GET /v1/rooms/persistent/{key}/agents/{agent_member_id}",
+        "DELETE /v1/rooms/persistent/{key}/agents/{agent_member_id}",
+        "POST /v1/rooms/persistent/{key}/agents/{agent_member_id}/reauthorize",
+        "POST /v1/rooms/persistent/{key}/agents/{agent_member_id}/suspend",
+        "POST /v1/rooms/persistent/{key}/agents/{agent_member_id}/resume",
+        "POST /v1/rooms/persistent/{key}/agents/{agent_member_id}/invoke",
         "GET /v1/rooms/persistent/{key}/transcript",
         "POST /v1/rooms/persistent/{key}/artifacts",
         "GET /v1/rooms/persistent/{key}/artifacts",
@@ -2977,6 +2992,40 @@ fn room_routes() -> Router<AppState> {
         .route(
             "/v1/rooms/persistent/{key}/members/{member_id}",
             axum::routing::delete(room_remove_member),
+        )
+        .route(
+            "/v1/rooms/persistent/{key}/agents",
+            get(room_agent_authority::room_agent_bindings)
+                .post(room_agent_authority::room_agent_authorize),
+        )
+        .route(
+            "/v1/rooms/persistent/{key}/agents/bootstrap",
+            post(room_agent_authority::room_agent_bootstrap),
+        )
+        .route(
+            "/v1/rooms/persistent/{key}/agents/preview/{agent_package_id}",
+            get(room_agent_authority::room_agent_preview),
+        )
+        .route(
+            "/v1/rooms/persistent/{key}/agents/{agent_member_id}",
+            get(room_agent_authority::room_agent_binding)
+                .delete(room_agent_authority::room_agent_revoke),
+        )
+        .route(
+            "/v1/rooms/persistent/{key}/agents/{agent_member_id}/reauthorize",
+            post(room_agent_authority::room_agent_reauthorize),
+        )
+        .route(
+            "/v1/rooms/persistent/{key}/agents/{agent_member_id}/suspend",
+            post(room_agent_authority::room_agent_suspend),
+        )
+        .route(
+            "/v1/rooms/persistent/{key}/agents/{agent_member_id}/resume",
+            post(room_agent_authority::room_agent_resume),
+        )
+        .route(
+            "/v1/rooms/persistent/{key}/agents/{agent_member_id}/invoke",
+            post(persistent_rooms::room_agent_invoke),
         )
         .route(
             "/v1/rooms/persistent/{key}/transcript",
@@ -9593,6 +9642,7 @@ mod tests {
             cancel: CancellationToken::new(),
             handle: None,
             decision_token: None,
+            room_agent_authority: None,
         }
     }
 
@@ -9633,6 +9683,7 @@ mod tests {
             cancel: CancellationToken::new(),
             handle: None,
             decision_token: None,
+            room_agent_authority: None,
         }
     }
 
@@ -12901,9 +12952,9 @@ mod tests {
     /// The runtime assertions prove the emitted payload and final transcript;
     /// this source-order characterization closes the otherwise-unobservable
     /// synchronous seam between the committed author row, its wake publication,
-    /// `AgentEventBus::emit`, the committed audit append+wake, and the non-awaited
-    /// spawn. It is intentionally updated to read the owning private module when
-    /// the production body moves mechanically.
+    /// the fail-closed authority gate, and the generation-bound spawn. The
+    /// legacy event/audit footprint now belongs to the spawn only after checked
+    /// request registration and its durable allow audit.
     #[test]
     fn room_post_message_source_preserves_persist_event_audit_spawn_order() {
         let source = include_str!("persistent_rooms.rs");
@@ -12922,26 +12973,27 @@ mod tests {
         let published_author = body
             .find("\n    publish_room_wake(&state, &key, &msg);")
             .expect("author wake must follow its committed append");
-        let emitted_event = body
-            .find("\n            state.agent_events.emit(")
-            .expect("room_trigger event emission must stay in the handler");
-        let audit_section = body
-            .find("// Audit line inside the room")
-            .expect("auto-convene audit section must stay identifiable");
-        let appended_audit = audit_section
-            + body[audit_section..]
-                .find("\n            let _ = append_room_message(")
-                .expect("auto-convene audit append+wake must stay in the handler");
+        let admitted = body
+            .find("room_agent_authority::admit_room_agent(")
+            .expect("authority admission must stay before the convene footprint");
         let spawned_turn = body
-            .find("\n            spawn_room_agent_turn(state.clone()")
+            .find("if let Err(error) = spawn_room_agent_turn(")
             .expect("room-agent turn spawn must stay in the handler");
+        let footprint = body
+            .find("Some(RoomTurnFootprint {")
+            .expect("legacy footprint must be delegated to checked spawn");
 
         assert!(
             persisted_author < published_author
-                && published_author < emitted_event
-                && emitted_event < appended_audit
-                && appended_audit < spawned_turn,
-            "required order is persisted author row → author wake → emitted event → audit row+wake → spawn"
+                && published_author < admitted
+                && admitted < spawned_turn
+                && spawned_turn < footprint,
+            "required order is persisted author row → author wake → admission → checked spawn carrying footprint"
+        );
+        assert!(
+            !body[..spawned_turn].contains("state.agent_events.emit(")
+                && !body[..spawned_turn].contains("append_room_message("),
+            "no convene footprint may precede admission and checked registration"
         );
     }
 
@@ -13029,6 +13081,38 @@ mod tests {
             content_type,
             String::from_utf8(bytes.to_vec()).unwrap(),
         )
+    }
+
+    async fn operator_room_http_request(
+        app: Router,
+        method: axum::http::Method,
+        uri: &str,
+        body: Option<serde_json::Value>,
+        headers: &[(&str, &str)],
+    ) -> (StatusCode, serde_json::Value) {
+        use http_body_util::BodyExt;
+        use tower::ServiceExt as _;
+
+        let mut builder = axum::http::Request::builder()
+            .method(method)
+            .uri(uri)
+            .header(axum::http::header::CONTENT_TYPE, "application/json");
+        for (name, value) in headers {
+            builder = builder.header(*name, *value);
+        }
+        let response = app
+            .oneshot(
+                builder
+                    .body(axum::body::Body::from(
+                        body.map(|value| value.to_string()).unwrap_or_default(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let status = response.status();
+        let bytes = response.into_body().collect().await.unwrap().to_bytes();
+        (status, serde_json::from_slice(&bytes).unwrap())
     }
 
     fn persistent_room_http_json(raw: &str) -> serde_json::Value {
@@ -14238,6 +14322,10 @@ mod tests {
             permissions: Arc::new(RwLock::new(HashMap::new())),
             longhouse: Arc::new(Mutex::new(ocean_longhouse::LonghouseRegistry::new())),
             rooms,
+            room_operator: Arc::new(room_operator::OperatorIdentity::for_test(
+                Some("test-room-operator"),
+                vec!["http://127.0.0.1:8790".into()],
+            )),
             room_attachments_root: Arc::new(tmp.path().join("room-attachments")),
             room_wakes,
             room_access_wakes,
@@ -15954,6 +16042,104 @@ mod tests {
         }
     }
 
+    /// Install the durable authority row that a room-agent runtime fixture
+    /// needs. Tests call this only after the package and room roster exist, so
+    /// the production path remains fail closed and no compatibility label is
+    /// mistaken for executable authority.
+    pub(super) fn authorize_room_agent_fixture(
+        state: &AppState,
+        room: &RoomKey,
+        agent_member_id: &str,
+        activation_policy: ocean_store::ActivationPolicy,
+        context_policy: ocean_store::ContextPolicy,
+    ) -> u64 {
+        authorize_room_agent_package_fixture(
+            state,
+            room,
+            agent_member_id,
+            agent_member_id,
+            activation_policy,
+            context_policy,
+        )
+    }
+
+    pub(super) fn authorize_room_agent_package_fixture(
+        state: &AppState,
+        room: &RoomKey,
+        agent_member_id: &str,
+        package_id: &str,
+        activation_policy: ocean_store::ActivationPolicy,
+        context_policy: ocean_store::ContextPolicy,
+    ) -> u64 {
+        let package = crate::room_agent_authority::resolve_package(package_id)
+            .expect("room-agent package fixture");
+        let decision_id = uuid::Uuid::new_v4().to_string();
+        let (binding, created, _audit) = with_rooms(state, |store| {
+            let access = store.room_access(room)?;
+            let owner_member_id = if access.state == ocean_core::RoomAccessState::Local {
+                let owner_member_id = store
+                    .agent_owners(room)?
+                    .into_iter()
+                    .find_map(|(agent, owner, present)| {
+                        (agent == agent_member_id && present).then_some(owner)
+                    })
+                    .expect("local authority fixture requires a live recorded owner");
+                let participant = store
+                    .get(room)?
+                    .expect("local authority fixture room")
+                    .room
+                    .participants
+                    .into_iter()
+                    .find(|participant| participant.id == agent_member_id)
+                    .expect("local authority fixture agent participant");
+                store.bootstrap_local_room_agent(
+                    room,
+                    &owner_member_id,
+                    participant,
+                    &package.package_id,
+                    "fixture-operator",
+                    Utc::now(),
+                )?;
+                owner_member_id
+            } else {
+                store
+                    .room_credential(room)?
+                    .expect("federated authority fixture credential")
+                    .local_human_member_id
+            };
+            store.authorize_room_agent(
+                room,
+                ocean_store::AuthorizeAgentInput {
+                    agent_member_id: agent_member_id.to_string(),
+                    agent_package_id: package.package_id,
+                    agent_definition_digest: package.definition_digest,
+                    agent_definition_revision: package.definition_revision,
+                    display_name: package.display_name,
+                    owner_member_id,
+                    authorized_by: "fixture-operator".into(),
+                    activation_policy,
+                    context_policy,
+                    memory_scope: ocean_store::MemoryScope::None,
+                    requested_capabilities: package.requested_capabilities,
+                    room_capability_grants: Vec::new(),
+                    request_digest: format!("fixture:{decision_id}"),
+                    decision_id,
+                },
+                Utc::now(),
+            )
+        })
+        .expect("room-agent authority fixture");
+        assert!(created, "fixture authority must be a fresh binding");
+        binding.generation
+    }
+
+    pub(super) fn canonical_test_workspace(path: &std::path::Path) -> String {
+        std::fs::canonicalize(path)
+            .expect("test workspace must canonicalize")
+            .to_string_lossy()
+            .into_owned()
+    }
+
     /// Build an `AppState` whose runtime is pinned to the Fake provider (so a
     /// turn runs synchronously and deterministically with no live LLM) and whose
     /// room store is a fresh in-memory SQLite DB. Returns the state plus the
@@ -16002,6 +16188,10 @@ mod tests {
             permissions: Arc::new(RwLock::new(HashMap::new())),
             longhouse: Arc::new(Mutex::new(ocean_longhouse::LonghouseRegistry::new())),
             rooms,
+            room_operator: Arc::new(room_operator::OperatorIdentity::for_test(
+                Some("test-room-operator"),
+                vec!["http://127.0.0.1:8790".into()],
+            )),
             // Injected, not read from the environment — same TASK-58 rule as the
             // runtime config dir above, so parallel tests never share a root.
             room_attachments_root: Arc::new(tmp.path().join("room-attachments")),
@@ -16454,6 +16644,10 @@ mod tests {
             permissions: Arc::new(RwLock::new(HashMap::new())),
             longhouse: Arc::new(Mutex::new(ocean_longhouse::LonghouseRegistry::new())),
             rooms,
+            room_operator: Arc::new(room_operator::OperatorIdentity::for_test(
+                Some("test-room-operator"),
+                vec!["http://127.0.0.1:8790".into()],
+            )),
             room_attachments_root: Arc::new(tmp.path().join("room-attachments")),
             room_wakes,
             room_access_wakes,
@@ -16613,23 +16807,14 @@ mod tests {
         // Room with an agent participant `helper` and an on_mention policy.
         let key = RoomKey::new("convene-room");
         with_rooms(&state, |reg| {
-            reg.create(
+            reg.create_in_workspace(
                 key.clone(),
                 "Convene Room",
+                Some(canonical_test_workspace(tmp.path())),
                 Some(RoomTriggerPolicy {
                     on_mention: true,
                     ..Default::default()
                 }),
-                Utc::now(),
-            )
-            .unwrap();
-            reg.add_participant(
-                &key,
-                RoomParticipant {
-                    id: "helper".into(),
-                    kind: RoomParticipantKind::Agent,
-                    display_name: "Helper".into(),
-                },
                 Utc::now(),
             )
             .unwrap();
@@ -16643,7 +16828,25 @@ mod tests {
                 Utc::now(),
             )
             .unwrap();
+            reg.add_agent_participant_with_owner(
+                &key,
+                RoomParticipant {
+                    id: "helper".into(),
+                    kind: RoomParticipantKind::Agent,
+                    display_name: "Helper".into(),
+                },
+                "john",
+                Utc::now(),
+            )
+            .unwrap();
         });
+        let generation = authorize_room_agent_fixture(
+            &state,
+            &key,
+            "helper",
+            ocean_store::ActivationPolicy::Mention,
+            ocean_store::ContextPolicy::InvocationOnly,
+        );
 
         // A human @-mentions the agent → should convene + queue a turn.
         let (status, body) = room_post_message(
@@ -16659,7 +16862,8 @@ mod tests {
         .await;
         assert_eq!(status, StatusCode::CREATED);
         let returned_message = &body.0["message"];
-        assert_eq!(returned_message["seq"], 2);
+        assert_eq!(returned_message["seq"], 4);
+        let returned_seq = returned_message["seq"].as_u64().unwrap();
         assert_eq!(returned_message["author_id"], "john");
         assert_eq!(returned_message["author_kind"], "human");
         assert_eq!(
@@ -16681,9 +16885,15 @@ mod tests {
             "mention of an agent must fire exactly one trigger"
         );
 
-        let envelope = trigger_rx
-            .try_recv()
-            .expect("resolved Agent mention must emit room_trigger");
+        let envelope = loop {
+            let envelope = trigger_rx
+                .try_recv()
+                .expect("resolved Agent mention must emit room_trigger");
+            if matches!(envelope.event, AgentTurnEvent::Extension { ref extension, .. } if extension == "room_trigger")
+            {
+                break envelope;
+            }
+        };
         match envelope.event {
             AgentTurnEvent::Extension {
                 extension,
@@ -16697,7 +16907,7 @@ mod tests {
                         "room": "convene-room",
                         "target": "helper",
                         "reason": "on_mention: @helper mentioned",
-                        "triggered_by_seq": 2,
+                        "triggered_by_seq": returned_seq,
                     })
                 );
                 assert_eq!(scope, None, "room triggers remain globally scoped");
@@ -16719,31 +16929,46 @@ mod tests {
             }
         }
 
-        // The event is followed synchronously by the audit append. The spawned
-        // turn may already have replied, but these first three persisted rows
-        // must stay densely ordered: join → author row → auto-convene audit.
+        // Admission is durably recorded before the legacy convene footprint.
+        // The spawned turn may already have replied, but the authority, author,
+        // admission, and legacy audit rows remain densely ordered.
         let immediate = with_rooms(&state, |reg| reg.transcript(&key, None)).unwrap();
-        assert!(immediate.len() >= 4);
+        assert!(immediate.len() >= 7);
         let returned: ocean_core::RoomMessage =
             serde_json::from_value(returned_message.clone()).unwrap();
         assert_eq!(
-            returned, immediate[2],
+            returned, immediate[4],
             "the response message is the exact persisted author row"
         );
         assert_eq!(immediate[0].seq, 0);
         assert_eq!(immediate[0].kind, RoomMessageKind::ParticipantJoined);
         assert_eq!(immediate[1].seq, 1);
-        assert_eq!(immediate[1].author_id, "john");
+        assert_eq!(immediate[1].author_id, "helper");
         assert_eq!(immediate[1].kind, RoomMessageKind::ParticipantJoined);
         assert_eq!(immediate[2].seq, 2);
-        assert_eq!(immediate[2].author_id, "john");
-        assert_eq!(immediate[2].kind, RoomMessageKind::Message);
+        assert_eq!(immediate[2].author_id, "system");
+        assert_eq!(immediate[2].kind, RoomMessageKind::System);
+        assert!(immediate[2]
+            .body
+            .contains("\"type\":\"room.agent.bootstrap\""));
         assert_eq!(immediate[3].seq, 3);
         assert_eq!(immediate[3].author_id, "system");
-        assert_eq!(immediate[3].author_kind, RoomParticipantKind::System);
         assert_eq!(immediate[3].kind, RoomMessageKind::System);
+        assert!(immediate[3]
+            .body
+            .contains("\"type\":\"room.agent.authority\""));
+        assert_eq!(immediate[4].seq, 4);
+        assert_eq!(immediate[4].author_id, "john");
+        assert_eq!(immediate[4].kind, RoomMessageKind::Message);
+        assert_eq!(immediate[5].seq, 5);
+        assert_eq!(immediate[5].author_id, "system");
+        assert!(immediate[5].body.contains("\"outcome\":\"admitted\""));
+        assert_eq!(immediate[6].seq, 6);
+        assert_eq!(immediate[6].author_id, "system");
+        assert_eq!(immediate[6].author_kind, RoomParticipantKind::System);
+        assert_eq!(immediate[6].kind, RoomMessageKind::System);
         assert_eq!(
-            immediate[3].body,
+            immediate[6].body,
             "auto-convene: helper (on_mention: @helper mentioned)"
         );
 
@@ -16762,12 +16987,14 @@ mod tests {
             reply.body
         );
         assert!(
-            reply.seq > 2,
+            reply.seq > returned_seq,
             "the spawned turn reply must follow the synchronous audit row"
         );
 
         // A session was queued/registered for the deterministic room+agent id.
-        let expected_sid = core_sid(room_agent_session_id(&key, "helper"));
+        let expected_sid = core_sid(persistent_rooms::authorized_room_agent_session_id(
+            &key, "helper", generation,
+        ));
         let registered = state
             .requests
             .read()
@@ -16979,7 +17206,7 @@ mod tests {
         // session's workspace anchor is exactly this path (no git-toplevel shift),
         // making the project lookup an exact match.
         let ws_dir = tempfile::tempdir().unwrap();
-        let ws = ws_dir.path().to_string_lossy().into_owned();
+        let ws = canonical_test_workspace(ws_dir.path());
 
         // Register a project claiming that directory (writes projects.json under
         // the temp OCEAN_CONFIG_DIR the runtime reads).
@@ -17016,16 +17243,6 @@ mod tests {
             reg.add_participant(
                 &key,
                 RoomParticipant {
-                    id: "helper".into(),
-                    kind: RoomParticipantKind::Agent,
-                    display_name: "Helper".into(),
-                },
-                Utc::now(),
-            )
-            .unwrap();
-            reg.add_participant(
-                &key,
-                RoomParticipant {
                     id: "john".into(),
                     kind: RoomParticipantKind::Human,
                     display_name: "John".into(),
@@ -17033,7 +17250,26 @@ mod tests {
                 Utc::now(),
             )
             .unwrap();
+            reg.add_agent_participant_with_owner(
+                &key,
+                RoomParticipant {
+                    id: "helper".into(),
+                    kind: RoomParticipantKind::Agent,
+                    display_name: "Helper".into(),
+                },
+                "john",
+                Utc::now(),
+            )
+            .unwrap();
         });
+
+        let generation = authorize_room_agent_fixture(
+            &state,
+            &key,
+            "helper",
+            ocean_store::ActivationPolicy::Mention,
+            ocean_store::ContextPolicy::InvocationOnly,
+        );
 
         // Mention the agent → convene a turn that runs in the room's workspace.
         let (status, _body) = room_post_message(
@@ -17050,7 +17286,9 @@ mod tests {
         assert_eq!(status, StatusCode::CREATED);
 
         // Wait for the convened reply so the turn has run and the session exists.
-        let expected_sid = core_sid(room_agent_session_id(&key, "helper"));
+        let expected_sid = core_sid(persistent_rooms::authorized_room_agent_session_id(
+            &key, "helper", generation,
+        ));
         let _reply = wait_for_message(&state, &key, |m| {
             m.author_id == "helper" && matches!(m.author_kind, RoomParticipantKind::Agent)
         })
@@ -17088,12 +17326,11 @@ mod tests {
         std::env::remove_var("OCEAN_YOLO");
     }
 
-    /// OCEAN-260 backward-compat: a room with NO workspace binding (every room
-    /// created before this feature) convenes exactly as before — the turn falls
-    /// back to the daemon's launch dir and the session resolves no owning project.
-    /// This pins that unbound rooms are not silently swept into some project.
+    /// Phase 1 workspace isolation: a Room with no workspace binding may retain
+    /// its transcript and authority rows, but it cannot start an agent session.
+    /// In particular, it never inherits the daemon's own launch directory.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn unbound_room_convene_falls_back_with_no_project() {
+    async fn unbound_room_convene_fails_closed_without_session_or_reply() {
         let _guard = AUTO_CONVENE_ENV_LOCK.lock().await;
         let _env = TestEnvRestore::capture(&[
             "OCEAN_CONFIG_DIR",
@@ -17106,6 +17343,7 @@ mod tests {
         let agents_root = tmp.path().join("agents");
         write_agent_fixture(&agents_root, "helper", "", None);
         std::env::set_var("OCEAN_AGENTS_DIR", &agents_root);
+        let (_replay, mut trigger_rx) = state.agent_events.subscribe_with_replay(None);
 
         // Plain `create` (no workspace_root) — the legacy path.
         let key = RoomKey::new("unbound-convene-room");
@@ -17123,16 +17361,6 @@ mod tests {
             reg.add_participant(
                 &key,
                 RoomParticipant {
-                    id: "helper".into(),
-                    kind: RoomParticipantKind::Agent,
-                    display_name: "Helper".into(),
-                },
-                Utc::now(),
-            )
-            .unwrap();
-            reg.add_participant(
-                &key,
-                RoomParticipant {
                     id: "john".into(),
                     kind: RoomParticipantKind::Human,
                     display_name: "John".into(),
@@ -17140,9 +17368,28 @@ mod tests {
                 Utc::now(),
             )
             .unwrap();
+            reg.add_agent_participant_with_owner(
+                &key,
+                RoomParticipant {
+                    id: "helper".into(),
+                    kind: RoomParticipantKind::Agent,
+                    display_name: "Helper".into(),
+                },
+                "john",
+                Utc::now(),
+            )
+            .unwrap();
         });
 
-        let (status, _body) = room_post_message(
+        let generation = authorize_room_agent_fixture(
+            &state,
+            &key,
+            "helper",
+            ocean_store::ActivationPolicy::Mention,
+            ocean_store::ContextPolicy::InvocationOnly,
+        );
+
+        let (status, body) = room_post_message(
             State(state.clone()),
             Path("unbound-convene-room".to_string()),
             Json(RoomMessageRequest {
@@ -17154,42 +17401,140 @@ mod tests {
         )
         .await;
         assert_eq!(status, StatusCode::CREATED);
+        assert_eq!(body.0["message"]["author_id"], "john");
 
-        let expected_sid = core_sid(room_agent_session_id(&key, "helper"));
-        let _reply = wait_for_message(&state, &key, |m| {
-            m.author_id == "helper" && matches!(m.author_kind, RoomParticipantKind::Agent)
-        })
-        .await
-        .expect("the woken agent must post a reply back into the room");
-
-        // No workspace binding ⇒ the turn falls back to the daemon's launch dir
-        // (its workspace anchor), exactly as before OCEAN-260 — NOT the bound
-        // path. The session binds to that launch-dir workspace.
-        let launch_ws = state
-            .runtime
-            .workspace_root_for(&std::env::current_dir().unwrap())
-            .to_string_lossy()
-            .into_owned();
-        let detail = wait_for_session(&state, expected_sid)
-            .await
-            .expect("the convened session must exist");
-        assert_eq!(
-            detail.workspace_root.as_deref(),
-            Some(launch_ws.as_str()),
-            "an unbound room's turn must fall back to the daemon launch dir"
-        );
-        // And no project is registered there in this temp config, so the reverse
-        // map yields no project — the legacy "room agent has no project" posture.
+        let expected_sid = core_sid(persistent_rooms::authorized_room_agent_session_id(
+            &key, "helper", generation,
+        ));
         assert!(
-            state
-                .runtime
-                .project_for_workspace(&launch_ws)
-                .expect("project lookup must not error")
-                .is_none(),
-            "an unbound room's session must not resolve an owning project"
+            state.runtime.session_detail(expected_sid).is_err(),
+            "an unbound Room must not create an agent session"
         );
+        assert!(
+            state.requests.read().await.is_empty(),
+            "an unbound Room must not register an agent request"
+        );
+        let transcript = with_rooms(&state, |reg| reg.transcript(&key, None)).unwrap();
+        assert!(
+            transcript
+                .iter()
+                .all(|message| message.author_id != "helper"
+                    || !matches!(message.kind, RoomMessageKind::Message)),
+            "an unbound Room must not receive an agent reply"
+        );
+        assert!(
+            transcript.iter().any(|message| {
+                message.body.contains("\"outcome\":\"refused\"")
+                    && message
+                        .body
+                        .contains("\"reason_code\":\"workspace_unavailable\"")
+            }),
+            "the workspace refusal must be durable and content-minimal"
+        );
+        while let Ok(event) = trigger_rx.try_recv() {
+            if let AgentTurnEvent::Extension { extension, .. } = event.event {
+                assert_ne!(extension, "room_trigger", "no convene footprint may escape");
+            }
+        }
 
         std::env::remove_var("OCEAN_YOLO");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn post_admission_refusal_keeps_the_admitted_generation_attribution() {
+        let _guard = AUTO_CONVENE_ENV_LOCK.lock().await;
+        let _env = TestEnvRestore::capture(&[
+            "OCEAN_CONFIG_DIR",
+            "OCEAN_MODEL",
+            "OCEAN_YOLO",
+            "OCEAN_AGENTS_DIR",
+        ]);
+        let tmp = tempfile::tempdir().unwrap();
+        let state = fake_convene_state(&tmp);
+        let agents_root = tmp.path().join("agents");
+        write_agent_fixture(&agents_root, "helper", "", None);
+        std::env::set_var("OCEAN_AGENTS_DIR", &agents_root);
+
+        let key = RoomKey::new("immutable-admission-audit");
+        with_rooms(&state, |store| {
+            store.create(key.clone(), "Immutable Audit", None, Utc::now())?;
+            store.add_participant(
+                &key,
+                RoomParticipant {
+                    id: "john".into(),
+                    kind: RoomParticipantKind::Human,
+                    display_name: "John".into(),
+                },
+                Utc::now(),
+            )?;
+            store.add_agent_participant_with_owner(
+                &key,
+                RoomParticipant {
+                    id: "helper".into(),
+                    kind: RoomParticipantKind::Agent,
+                    display_name: "Helper".into(),
+                },
+                "john",
+                Utc::now(),
+            )?;
+            Ok::<_, ocean_store::RoomStoreError>(())
+        })
+        .unwrap();
+        let generation = authorize_room_agent_fixture(
+            &state,
+            &key,
+            "helper",
+            ocean_store::ActivationPolicy::ExplicitOnly,
+            ocean_store::ContextPolicy::InvocationOnly,
+        );
+        let admission = room_agent_authority::admit_room_agent(
+            &state,
+            &key,
+            "helper",
+            "helper",
+            room_agent_authority::AdmissionTrigger::Explicit,
+        )
+        .await
+        .unwrap();
+        let admitted_decision = admission.decision_id.clone();
+        let admitted_operator = admission.operator_principal_id.clone();
+        assert_eq!(admission.generation, generation);
+
+        let (newer, applied, _audit) = with_rooms(&state, |store| {
+            store.set_room_agent_binding_status(
+                &key,
+                "helper",
+                ocean_store::SetAgentBindingStatusInput {
+                    status: ocean_store::AgentBindingStatus::Suspended,
+                    actor: "newer-operator".into(),
+                    decision_id: "newer-decision".into(),
+                    request_digest: "newer-request".into(),
+                },
+                Utc::now(),
+            )
+        })
+        .unwrap();
+        assert!(applied);
+        assert_eq!(newer.generation, generation + 1);
+
+        room_agent_authority::append_remote_output_outcome(
+            &state,
+            &admission,
+            "refused",
+            "authority_changed_before_remote_enqueue",
+        )
+        .unwrap();
+        let transcript = with_rooms(&state, |store| store.transcript(&key, None)).unwrap();
+        let audit: serde_json::Value =
+            serde_json::from_str(&transcript.last().unwrap().body).unwrap();
+        assert_eq!(audit["type"], "room.agent.admission");
+        assert_eq!(audit["admission_id"], admission.admission_id);
+        assert_eq!(audit["generation"], generation.to_string());
+        assert_eq!(audit["decision_id"], admitted_decision);
+        assert_eq!(audit["operator_principal_id"], admitted_operator);
+        assert_ne!(audit["generation"], newer.generation.to_string());
+        assert_ne!(audit["decision_id"], "newer-decision");
+        assert_ne!(audit["operator_principal_id"], "newer-operator");
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -18405,6 +18750,10 @@ mod tests {
             permissions: Arc::new(RwLock::new(HashMap::new())),
             longhouse: Arc::new(Mutex::new(ocean_longhouse::LonghouseRegistry::new())),
             rooms,
+            room_operator: Arc::new(room_operator::OperatorIdentity::for_test(
+                Some("test-room-operator"),
+                vec!["http://127.0.0.1:8790".into()],
+            )),
             room_attachments_root: Arc::new(dir.join("room-attachments")),
             room_wakes,
             room_access_wakes,
@@ -25256,6 +25605,310 @@ mod tests {
     // Room route retirement + retained-contract guards
     // -------------------------------------------------
 
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn local_room_agent_bootstrap_is_authenticated_previewable_and_non_authorizing() {
+        let _guard = AUTO_CONVENE_ENV_LOCK.lock().await;
+        let _env = TestEnvRestore::capture(&[
+            "OCEAN_CONFIG_DIR",
+            "OCEAN_MODEL",
+            "OCEAN_YOLO",
+            "OCEAN_AGENTS_DIR",
+        ]);
+        let tmp = tempfile::tempdir().unwrap();
+        let agents_root = tmp.path().join("agents");
+        write_agent_fixture(&agents_root, "builder", "description = 'Builder'\n", None);
+        std::env::set_var("OCEAN_AGENTS_DIR", &agents_root);
+        let state = fake_convene_state(&tmp);
+        let key = RoomKey::new("bootstrap-route");
+        with_rooms(&state, |store| {
+            store.create(key.clone(), "Bootstrap Route", None, Utc::now())?;
+            store.add_participant(
+                &key,
+                RoomParticipant {
+                    id: "human-1".into(),
+                    kind: RoomParticipantKind::Human,
+                    display_name: "Human One".into(),
+                },
+                Utc::now(),
+            )?;
+            store.add_participant(
+                &key,
+                RoomParticipant {
+                    id: "human-2".into(),
+                    kind: RoomParticipantKind::Human,
+                    display_name: "Human Two".into(),
+                },
+                Utc::now(),
+            )?;
+            Ok::<_, ocean_store::RoomStoreError>(())
+        })
+        .unwrap();
+        let app = room_routes().with_state(state.clone());
+        let path = "/v1/rooms/persistent/bootstrap-route/agents/bootstrap";
+        let bootstrap_body = json!({
+            "owner_member_id": "human-1",
+            "agent_package_id": "builder",
+        });
+
+        let (status, body) = operator_room_http_request(
+            app.clone(),
+            axum::http::Method::POST,
+            path,
+            Some(bootstrap_body.clone()),
+            &[],
+        )
+        .await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(body["error"], "operator_credential_missing");
+
+        let (status, body) = operator_room_http_request(
+            app.clone(),
+            axum::http::Method::POST,
+            path,
+            Some(bootstrap_body.clone()),
+            &[
+                ("x-ocean-operator", "test-room-operator"),
+                ("cookie", "ambient=1"),
+            ],
+        )
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        assert_eq!(body["error"], "ambient_credential_rejected");
+
+        let operator = &[("x-ocean-operator", "test-room-operator")];
+        let (status, body) = operator_room_http_request(
+            app.clone(),
+            axum::http::Method::POST,
+            path,
+            Some(bootstrap_body.clone()),
+            operator,
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED);
+        assert_eq!(body["ok"], true);
+        assert_eq!(body["created"], true);
+        assert_eq!(body["room_id"], "bootstrap-route");
+        assert_eq!(body["owner_member_id"], "human-1");
+        assert_eq!(body["agent_member_id"], "builder");
+        assert_eq!(body["agent_package_id"], "builder");
+        assert_eq!(body["owner_eligible"], true);
+        assert_eq!(body["package_preview"]["binding"], serde_json::Value::Null);
+        assert!(body["room"]["participants"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|participant| participant["id"] == "builder"));
+        for field in [
+            "package_id",
+            "display_name",
+            "definition_digest",
+            "definition_revision",
+            "requested_capabilities",
+            "grantable_capabilities",
+            "unavailable_capabilities",
+            "agent_member_id",
+            "owner_member_id",
+            "owner_eligible",
+            "binding",
+        ] {
+            assert!(body["package_preview"].get(field).is_some(), "{field}");
+        }
+        assert!(
+            with_rooms(&state, |store| store.room_agent_binding(&key, "builder"))
+                .unwrap()
+                .is_none()
+        );
+        let after_first = with_rooms(&state, |store| store.transcript(&key, None)).unwrap();
+        let bootstrap_audits = after_first
+            .iter()
+            .filter(|row| row.body.contains("\"type\":\"room.agent.bootstrap\""))
+            .collect::<Vec<_>>();
+        assert_eq!(bootstrap_audits.len(), 1);
+        assert!(bootstrap_audits[0].body.contains("operator_principal_id"));
+        assert!(!bootstrap_audits[0].body.contains("test-room-operator"));
+
+        let (status, replay) = operator_room_http_request(
+            app.clone(),
+            axum::http::Method::POST,
+            path,
+            Some(bootstrap_body),
+            operator,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(replay["created"], false);
+        assert_eq!(
+            with_rooms(&state, |store| store.transcript(&key, None)).unwrap(),
+            after_first,
+            "exact replay must write no marker or audit"
+        );
+
+        let (status, preview) = operator_room_http_request(
+            app.clone(),
+            axum::http::Method::GET,
+            "/v1/rooms/persistent/bootstrap-route/agents/preview/builder",
+            None,
+            &[],
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(preview["owner_member_id"], "human-1");
+        assert_eq!(preview["owner_eligible"], true);
+        assert_eq!(preview["binding"], serde_json::Value::Null);
+        let (status, bindings) = operator_room_http_request(
+            app.clone(),
+            axum::http::Method::GET,
+            "/v1/rooms/persistent/bootstrap-route/agents",
+            None,
+            &[],
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(bindings["owner_member_id"], "human-1");
+        assert_eq!(bindings["owner_eligible"], true);
+        assert_eq!(bindings["bindings"], json!([]));
+
+        let (status, body) = operator_room_http_request(
+            app.clone(),
+            axum::http::Method::POST,
+            path,
+            Some(json!({
+                "owner_member_id": "human-2",
+                "agent_package_id": "builder",
+            })),
+            operator,
+        )
+        .await;
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert_eq!(body["error"], "room_owner_conflict");
+
+        let decision_id = Uuid::new_v4().to_string();
+        let (status, authorized) = operator_room_http_request(
+            app.clone(),
+            axum::http::Method::POST,
+            "/v1/rooms/persistent/bootstrap-route/agents",
+            Some(json!({
+                "agent_member_id": "builder",
+                "agent_package_id": "builder",
+                "owner_member_id": "human-1",
+                "decision_id": decision_id,
+                "activation_policy": "explicit_only",
+                "context_policy": "invocation_only",
+                "memory_scope": "none",
+                "room_capability_grants": [],
+            })),
+            operator,
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED);
+        assert_eq!(authorized["binding"]["status"], "active");
+
+        let (status, reauthorized) = operator_room_http_request(
+            app.clone(),
+            axum::http::Method::POST,
+            "/v1/rooms/persistent/bootstrap-route/agents/builder/reauthorize",
+            Some(json!({
+                "decision_id": Uuid::new_v4().to_string(),
+                "activation_policy": "explicit_only",
+                "context_policy": "invocation_only",
+                "memory_scope": "room",
+                "room_capability_grants": [],
+            })),
+            operator,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(reauthorized["binding"]["memory_scope"], "room");
+        let invocation = with_rooms(&state, |store| {
+            store.append_message(
+                &key,
+                "human-1",
+                RoomParticipantKind::Human,
+                RoomMessageKind::Message,
+                "explicit invocation",
+                Utc::now(),
+            )
+        })
+        .unwrap();
+        let (status, unavailable) = operator_room_http_request(
+            app.clone(),
+            axum::http::Method::POST,
+            "/v1/rooms/persistent/bootstrap-route/agents/builder/invoke",
+            Some(json!({
+                "invoked_by": "human-1",
+                "message_seq": invocation.seq,
+            })),
+            &[],
+        )
+        .await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(unavailable["error"], "room_memory_unavailable");
+
+        let (status, _) = operator_room_http_request(
+            app.clone(),
+            axum::http::Method::POST,
+            "/v1/rooms/persistent/bootstrap-route/agents/builder/reauthorize",
+            Some(json!({
+                "decision_id": Uuid::new_v4().to_string(),
+                "activation_policy": "explicit_only",
+                "context_policy": "invocation_only",
+                "memory_scope": "none",
+                "room_capability_grants": [],
+            })),
+            operator,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let (status, unavailable) = operator_room_http_request(
+            app.clone(),
+            axum::http::Method::POST,
+            "/v1/rooms/persistent/bootstrap-route/agents/builder/invoke",
+            Some(json!({
+                "invoked_by": "human-1",
+                "message_seq": invocation.seq,
+            })),
+            &[],
+        )
+        .await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(unavailable["error"], "workspace_unavailable");
+
+        let federated = RoomKey::new("bootstrap-federated");
+        with_rooms(&state, |store| {
+            store.create(federated.clone(), "Federated", None, Utc::now())?;
+            store.add_participant(
+                &federated,
+                RoomParticipant {
+                    id: "human-1".into(),
+                    kind: RoomParticipantKind::Human,
+                    display_name: "Human One".into(),
+                },
+                Utc::now(),
+            )?;
+            store.install_room_credential(&federated, "private-bearer", "human-1")?;
+            Ok::<_, ocean_store::RoomStoreError>(())
+        })
+        .unwrap();
+        let (status, body) = operator_room_http_request(
+            app,
+            axum::http::Method::POST,
+            "/v1/rooms/persistent/bootstrap-federated/agents/bootstrap",
+            Some(json!({
+                "owner_member_id": "human-1",
+                "agent_package_id": "builder",
+            })),
+            operator,
+        )
+        .await;
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert_eq!(body["error"], "local_room_required");
+        assert!(
+            with_rooms(&state, |store| store.local_room_owner(&federated))
+                .unwrap()
+                .is_none()
+        );
+    }
+
     #[tokio::test]
     async fn room_router_retires_track0_gets_and_keeps_persistent_and_livekit_routes() {
         use axum::{body::Body, http::Request};
@@ -25602,9 +26255,14 @@ mod tests {
         // 113 -> 114: federated member removal added DELETE
         // /v1/rooms/persistent/{key}/members/{member_id}, the HTTP surface
         // for the capability the agent-delete sweep already exercised.
+        // 114 -> 123: Rooms Phase 1 adds binding list/detail/preview,
+        // authorize/reauthorize/suspend/resume/revoke, and explicit invoke.
+        // 123 -> 124: Local-room agent bootstrap establishes the durable Room
+        // owner role and package-derived Agent roster tuple without authorizing
+        // execution or consuming a decision.
         assert_eq!(
             banner.len(),
-            114,
+            124,
             "route baseline changed; review the manifest"
         );
 

@@ -33,9 +33,9 @@ across those computers. The architecture does not itself authorize code changes.
 - [x] Write the exact Phase 1 implementation manifest for local room-agent
       authorization: [`Phase 1 room-agent authorization manifest`](docs/specs/2026-08-25-ocean-rooms-phase1-room-agent-authorization-manifest.md),
       operator-accepted 2026-08-25 for concurrent implementation and review.
-      Independent review has NOT run; by operator ruling it proceeds alongside
-      implementation, and the manifest's open questions are closed by the PRs
-      that depend on them.
+      Independent backend and Surface candidate reviews are accepted; upstream
+      landing remains pending, and the manifest's open questions stay closed by
+      the PRs that depend on them.
 - [ ] Implement Phase 1 against that manifest and close its §15 open questions
       in the PRs that depend on them. Stage 2 (contributed folders) does not
       open until the §12 tests are green.

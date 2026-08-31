@@ -2,7 +2,7 @@ use std::{collections::HashMap, sync::Arc};
 
 use chrono::{DateTime, Utc};
 use ocean_core::{
-    PermissionId, PermissionStatus, PromptRequest, RequestId, RequestState, RequestStatus,
+    PermissionId, PermissionStatus, PromptRequest, RequestId, RequestState, RequestStatus, RoomKey,
     SessionId,
 };
 use ocean_runtime::PermissionDecision as AgentPermissionDecision;
@@ -27,6 +27,21 @@ pub(super) struct RequestControl {
     /// turn record owns the secret; the enforcement read is on the waiter.
     #[allow(dead_code)]
     pub(super) decision_token: Option<String>,
+    /// Immutable room-agent authority that admitted this request. Ordinary
+    /// requests remain `None`; mutations use this metadata to cancel only
+    /// superseded generations for the exact room/member pair.
+    pub(super) room_agent_authority: Option<RoomAgentRequestAuthority>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct RoomAgentRequestAuthority {
+    pub(super) room: RoomKey,
+    pub(super) agent_member_id: String,
+    pub(super) generation: u64,
+    pub(super) admission_id: String,
+    pub(super) decision_id: String,
+    pub(super) approved_definition_digest: String,
+    pub(super) session_id: SessionId,
 }
 
 pub(super) struct PermissionWaiter {
@@ -95,11 +110,165 @@ pub(super) async fn pending_permissions_snapshot(
     pending
 }
 
+#[cfg(test)]
+#[allow(clippy::items_after_test_module)]
+mod room_agent_tests {
+    use super::*;
+    use std::collections::HashMap;
+
+    fn request(request_id: RequestId, session_id: SessionId) -> PromptRequest {
+        PromptRequest {
+            prompt: String::new(),
+            images: None,
+            request_id: Some(request_id),
+            session_id: Some(session_id),
+            create_if_missing: true,
+            max_turns: None,
+            yolo: false,
+            cwd: "/tmp".into(),
+            project_id: None,
+            client_type: Some("room".into()),
+            decision_token: None,
+        }
+    }
+
+    fn authority(session_id: SessionId) -> RoomAgentRequestAuthority {
+        RoomAgentRequestAuthority {
+            room: RoomKey::new("room-a"),
+            agent_member_id: "agent-a".into(),
+            generation: 7,
+            admission_id: "admission-a".into(),
+            decision_id: "decision-a".into(),
+            approved_definition_digest: "sha256:a".into(),
+            session_id,
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn room_registration_linearizes_validation_audit_and_visibility() {
+        let requests: RequestRegistry = Arc::new(RwLock::new(HashMap::new()));
+        let request_id = RequestId::new_v4();
+        let session_id = SessionId::new_v4();
+        let (entered_tx, entered_rx) = std::sync::mpsc::sync_channel(0);
+        let (release_tx, release_rx) = std::sync::mpsc::sync_channel(0);
+        let registration_requests = requests.clone();
+        let registration = tokio::spawn(async move {
+            let mut prompt = request(request_id, session_id);
+            register_room_agent_request_checked(
+                &registration_requests,
+                &mut prompt,
+                "room admission",
+                authority(session_id),
+                move || {
+                    entered_tx.send(()).unwrap();
+                    release_rx.recv().unwrap();
+                    Ok::<_, ()>(())
+                },
+            )
+            .await
+        });
+        entered_rx.recv().unwrap();
+
+        let mutation_requests = requests.clone();
+        let mutation = tokio::spawn(async move {
+            let registry = mutation_requests.write().await;
+            registry
+                .get(&request_id)
+                .map(|control| control.status.state)
+        });
+        tokio::task::yield_now().await;
+        assert!(
+            !mutation.is_finished(),
+            "mutation must wait on admission gate"
+        );
+        release_tx.send(()).unwrap();
+        registration.await.unwrap().unwrap();
+        assert_eq!(mutation.await.unwrap(), Some(RequestState::Running));
+        let registry = requests.read().await;
+        let stored = registry[&request_id]
+            .room_agent_authority
+            .as_ref()
+            .expect("authority metadata");
+        assert_eq!(stored.generation, 7);
+        assert_eq!(stored.admission_id, "admission-a");
+    }
+
+    #[tokio::test]
+    async fn failed_admission_audit_removes_queued_request() {
+        let requests: RequestRegistry = Arc::new(RwLock::new(HashMap::new()));
+        let request_id = RequestId::new_v4();
+        let session_id = SessionId::new_v4();
+        let mut prompt = request(request_id, session_id);
+        let result = register_room_agent_request_checked(
+            &requests,
+            &mut prompt,
+            "room admission",
+            authority(session_id),
+            || Err::<(), _>("audit failed"),
+        )
+        .await;
+        assert_eq!(result.unwrap_err(), "audit failed");
+        assert!(requests.read().await.is_empty());
+    }
+}
+
 pub(super) async fn register_running_request(
     requests: &RequestRegistry,
     req: &mut PromptRequest,
     message: impl Into<String>,
     state_value: RequestState,
+) -> (RequestId, CancellationToken) {
+    register_request(requests, req, message, state_value, None).await
+}
+
+pub(super) async fn register_room_agent_request_checked<E>(
+    requests: &RequestRegistry,
+    req: &mut PromptRequest,
+    message: impl Into<String>,
+    authority: RoomAgentRequestAuthority,
+    validate_and_audit: impl FnOnce() -> Result<(), E>,
+) -> Result<(RequestId, CancellationToken), E> {
+    let request_id = req.request_id.unwrap_or_else(RequestId::new_v4);
+    req.request_id = Some(request_id);
+    let cancel = CancellationToken::new();
+    let now = Utc::now();
+    let mut registry = requests.write().await;
+    registry.insert(
+        request_id,
+        RequestControl {
+            status: RequestStatus {
+                request_id,
+                session_id: req.session_id,
+                state: RequestState::Queued,
+                permission_id: None,
+                message: Some(message.into()),
+                started_at: Some(now),
+                updated_at: Some(now),
+                finished_at: None,
+            },
+            cancel: cancel.clone(),
+            handle: None,
+            decision_token: req.decision_token.clone(),
+            room_agent_authority: Some(authority),
+        },
+    );
+    if let Err(error) = validate_and_audit() {
+        registry.remove(&request_id);
+        return Err(error);
+    }
+    if let Some(control) = registry.get_mut(&request_id) {
+        control.status.state = RequestState::Running;
+        control.status.updated_at = Some(Utc::now());
+    }
+    Ok((request_id, cancel))
+}
+
+async fn register_request(
+    requests: &RequestRegistry,
+    req: &mut PromptRequest,
+    message: impl Into<String>,
+    state_value: RequestState,
+    room_agent_authority: Option<RoomAgentRequestAuthority>,
 ) -> (RequestId, CancellationToken) {
     let request_id = req.request_id.unwrap_or_else(RequestId::new_v4);
     req.request_id = Some(request_id);
@@ -126,6 +295,7 @@ pub(super) async fn register_running_request(
             // copied into every PermissionWaiter; it is NEVER emitted on the
             // public /v1/events SSE.
             decision_token: req.decision_token.clone(),
+            room_agent_authority,
         },
     );
 

@@ -244,10 +244,22 @@ pub(super) struct FederatedTriggerDispatch {
     pub(super) ledger_event_id: String,
     pub(super) local_seq: u64,
     pub(super) target_member_id: String,
+    /// Exact durable source classification. Message ingestion can prove
+    /// mentions from the confirmed payload; workspace failure events remain
+    /// unknown to Phase 1 admission and therefore fail closed.
+    pub(super) trigger_kind: FederatedTriggerKind,
     /// The evaluator's wording for WHY this convene fired, quoted verbatim
     /// into the dispatcher's `room_trigger` payload — a build-failure convene
     /// must not log itself as a mention.
     pub(super) reason: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[allow(dead_code)] // ThreadReply is reserved for a confirmed federated thread source.
+pub(super) enum FederatedTriggerKind {
+    Mention,
+    ThreadReply,
+    Unknown,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1152,6 +1164,97 @@ impl FederationSupervisor {
             }
             _ => IntentError::Store,
         })?;
+        publish_room_access_wake_on(&self.inner.access_wakes, key);
+        self.wake_sender(key).await;
+        Ok(projection)
+    }
+
+    /// Commit one admitted federated room-agent reply under the exact binding
+    /// generation that authorized its turn.
+    ///
+    /// The generation check, producer allocation, Pending outbox row, and
+    /// admission-correlated audit share one SQLite `IMMEDIATE` transaction.
+    /// Wake publication happens only after that transaction returns committed.
+    pub(super) async fn enqueue_authorized_federated_agent_message(
+        &self,
+        key: &RoomKey,
+        agent_member_id: &str,
+        expected_generation: u64,
+        admission_id: &str,
+        body: &str,
+    ) -> Result<RoomAccessProjection, IntentError> {
+        if body.len() > OUTBOUND_MESSAGE_BODY_LIMIT {
+            return Err(IntentError::Invalid);
+        }
+        let slot = self.slot_for(key).await;
+        let result = slot
+            .control
+            .mutate(|| {
+                with_rooms_handle(&self.inner.rooms, |store| {
+                    if store.get(key)?.is_none() {
+                        return Err(ocean_store::RoomStoreError::UnknownRoom(key.clone()));
+                    }
+                    let credential = store.room_credential(key)?.ok_or_else(|| {
+                        ocean_store::RoomStoreError::RoomNotFederated(key.clone())
+                    })?;
+                    let access = store.room_access(key)?;
+                    if access.state == RoomAccessState::Revoked {
+                        return Err(ocean_store::RoomStoreError::FederationCorruption(
+                            REVOKED_STORE_SENTINEL.into(),
+                        ));
+                    }
+                    if !access.members.iter().any(|member| {
+                        member.member_id == agent_member_id
+                            && member.actor_type == FederatedActorType::Agent
+                            && member.owner_member_id.as_deref()
+                                == Some(credential.local_human_member_id.as_str())
+                            && member.local_binding_available == Some(true)
+                    }) {
+                        return Err(ocean_store::RoomStoreError::UnknownAgentBinding {
+                            room: key.clone(),
+                            agent: agent_member_id.to_string(),
+                        });
+                    }
+                    let member_ids: HashSet<_> = access
+                        .members
+                        .iter()
+                        .map(|member| member.member_id.as_str())
+                        .collect();
+                    let mentions = crate::persistent_rooms::parse_mentions(body)
+                        .into_iter()
+                        .filter(|id| member_ids.contains(id.as_str()))
+                        .collect();
+                    let client_event_id = uuid::Uuid::new_v4().to_string();
+                    let commit = store.allocate_authorized_agent_outbox(
+                        key,
+                        agent_member_id,
+                        expected_generation,
+                        admission_id,
+                        &client_event_id,
+                        body,
+                        mentions,
+                        chrono::Utc::now(),
+                    )?;
+                    Ok((store.room_access(key)?, commit.audit))
+                })
+            })
+            .await
+            .ok_or(IntentError::Forbidden)?;
+        let (projection, audit) = result.map_err(|error| match error {
+            ocean_store::RoomStoreError::UnknownRoom(_) => IntentError::NotFound,
+            ocean_store::RoomStoreError::RoomNotFederated(_) => IntentError::Conflict,
+            ocean_store::RoomStoreError::UnknownAgentBinding { .. }
+            | ocean_store::RoomStoreError::AgentBindingStatusConflict { .. } => {
+                IntentError::Forbidden
+            }
+            ocean_store::RoomStoreError::FederationCorruption(ref message)
+                if message == REVOKED_STORE_SENTINEL =>
+            {
+                IntentError::Forbidden
+            }
+            _ => IntentError::Store,
+        })?;
+        publish_room_wake_on(&self.inner.room_wakes, key, &audit);
         publish_room_access_wake_on(&self.inner.access_wakes, key);
         self.wake_sender(key).await;
         Ok(projection)
@@ -3255,6 +3358,7 @@ async fn ingest_message_row(
                         ledger_event_id: event.ledger_event_id.clone(),
                         local_seq: commit.message.seq,
                         target_member_id,
+                        trigger_kind: FederatedTriggerKind::Mention,
                         reason,
                     })
                     .is_err()
@@ -4093,6 +4197,7 @@ fn ingest_workspace_row(
                         ledger_event_id: event.ledger_event_id.clone(),
                         local_seq: commit.message.seq,
                         target_member_id,
+                        trigger_kind: FederatedTriggerKind::Unknown,
                         reason: trigger_reason.clone(),
                     })
                     .is_err()

@@ -34,6 +34,44 @@ pub fn build_system_prompt(cwd: Option<&str>, client_type: Option<&str>) -> Stri
     )
 }
 
+/// Build the ordinary prompt while deliberately omitting operator-global
+/// memory guidance and auto-recalled facts. Room-scoped turns use this boundary
+/// when their durable memory scope is `none`.
+pub fn build_system_prompt_without_memory(cwd: Option<&str>, client_type: Option<&str>) -> String {
+    build_system_prompt_from(cwd, client_type, assistants_root().as_deref(), None)
+}
+
+/// Build a prompt whose memory guidance is fixed to one admitted Room.
+///
+/// Unlike the ordinary prompt, this never auto-loads operator-global facts.
+/// The matching retain/recall tools carry their opaque store-issued partition
+/// through `PromptControl`.
+pub fn build_system_prompt_with_room_memory(
+    cwd: Option<&str>,
+    client_type: Option<&str>,
+) -> String {
+    let mut prompt = build_system_prompt_without_memory(cwd, client_type);
+    append_room_memory_context(&mut prompt);
+    prompt
+}
+
+fn append_room_memory_context(prompt: &mut String) {
+    prompt.push_str(
+        "\n## Room memory\n\
+         `recall {query?, limit?}` and `retain {text, kind?}` operate only on this Room's shared memory partition. They cannot read the operator's global memory or another Room. Call `recall` only when the request depends on a prior Room decision or fact not already present in the supplied Room context; retain only stable Room knowledge, never ephemeral task state.\n",
+    );
+}
+
+/// Advertise durable transcript retrieval only for a turn carrying the opaque
+/// admitted Room-history handle. Invocation-only and recent-context turns do
+/// not call this function and remain byte-compatible.
+pub(crate) fn append_room_history_context(prompt: &mut String) {
+    prompt.push_str(
+        "\n## Room history\n\
+         `room_history {before_seq?, limit?}` reads a bounded newest-first page of this Room's durable transcript. Use the returned `next_before_seq` to page backward only when older Room discussion is needed. The tool is fixed to this admitted Room, agent, and authority generation; it cannot read another Room, operator memory, or files.\n",
+    );
+}
+
 /// Inner form of [`build_system_prompt`] that resolves any file-loaded
 /// surface profile against an explicit `assistants_root` instead of the
 /// process-global one. This is the isolation seam (OCEAN-285): tests pass a
@@ -528,7 +566,10 @@ fn load_project_prompt(start: &Path) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{build_system_prompt_from, load_surface_profile_from, surface_dir, surface_flag};
+    use super::{
+        append_room_history_context, append_room_memory_context, build_system_prompt_from,
+        load_surface_profile_from, surface_dir, surface_flag,
+    };
     use ocean_context::{ClaimStatus, Provenance};
     use ocean_memory::{
         Memory, MemoryId, MemoryKind, MemoryScope, MemoryStore, PrincipalId, SqliteMemoryStore,
@@ -1063,6 +1104,43 @@ mod tests {
 
         assert!(!prompt.contains("## Memory"));
         assert!(!prompt.contains("## What you already know"));
+    }
+
+    #[test]
+    fn room_memory_prompt_never_injects_operator_facts() {
+        let root = empty_assistants_root();
+        let memory_dir = TempDir::new().expect("memory tempdir");
+        let memory_db = memory_dir.path().join("memory.sqlite");
+        seed_memory(
+            &memory_db,
+            "operator-only secret must not enter a Room",
+            MemoryKind::Fact,
+        );
+
+        let mut prompt = build_system_prompt_from(None, Some("tui"), Some(root.path()), None);
+        append_room_memory_context(&mut prompt);
+
+        assert!(prompt.contains("## Room memory"));
+        assert!(prompt.contains("only on this Room's shared memory partition"));
+        assert!(prompt.contains("cannot read the operator's global memory"));
+        assert!(!prompt.contains("operator-only secret"));
+        assert!(!prompt.contains("## What you already know"));
+    }
+
+    #[test]
+    fn room_history_guidance_is_explicit_and_opt_in() {
+        let root = empty_assistants_root();
+        let ordinary = build_system_prompt_from(None, Some("tui"), Some(root.path()), None);
+        assert!(!ordinary.contains("## Room history"));
+        assert!(!ordinary.contains("next_before_seq"));
+
+        let mut history = ordinary.clone();
+        append_room_history_context(&mut history);
+        assert!(history.starts_with(&ordinary));
+        assert!(history.contains("## Room history"));
+        assert!(history.contains("room_history {before_seq?, limit?}"));
+        assert!(history.contains("fixed to this admitted Room, agent, and authority generation"));
+        assert!(history.contains("cannot read another Room, operator memory, or files"));
     }
 
     #[test]

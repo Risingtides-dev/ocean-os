@@ -554,7 +554,7 @@ POST   /v1/permissions/{id}/decision      allow/deny a mutating-tool request
 
 # Rooms — persistent lifecycle (SQLite-backed; survives restarts)
 GET    /v1/rooms/persistent               list persistent rooms
-POST   /v1/rooms/persistent               create a room { key, name, trigger_policy? }
+POST   /v1/rooms/persistent               create a room { key, name, trigger_policy?, workspace_root? }; blank workspace_root is unbound, while a nonblank value must resolve to an existing absolute directory and is persisted canonically (400 invalid_workspace_root otherwise). Agent execution revalidates the stored canonical directory and returns 503 workspace_unavailable instead of inheriting daemon cwd when it is missing, symlink-replaced, relative, or noncanonical.
 GET    /v1/rooms/persistent/{key}         room + transcript
 PATCH  /v1/rooms/persistent/{key}         update mutable metadata { name?, trigger_policy? }; an absent field is unchanged, trigger_policy: null clears the policy, an unknown field is a 400; 200 { room }, 404 unknown/closed room
 POST   /v1/rooms/persistent/{key}/participants            join { id, display_name, kind? }
@@ -579,6 +579,16 @@ POST   /v1/rooms/persistent/{key}/invites                 bootstrap owner if Loc
 POST   /v1/rooms/persistent/invites/redeem                restart-safe redeem/self-join { code }; raw RoomRedeemResponse 200 — the RoomAccessProjection's own fields at the TOP level (unchanged, so a client that only checks `state` is unaffected) plus `room_key`, the room the invite's scope resolved to. Only the daemon can know that key; without it a redeemer has to diff its room list before and after, which cannot answer under a concurrent create. No room_name: this path creates the room with name == key
 POST   /v1/rooms/persistent/{key}/members/agents          register safe local agent descriptors { agent_names }; raw RoomAccessProjection 200
 DELETE /v1/rooms/persistent/{key}/members/{member_id}     remove one federated member via Bedrock; refreshed RoomAccessProjection 200, Bedrock's owner-or-self 403 surfaces as federation_forbidden with the credential intact
+GET    /v1/rooms/persistent/{key}/agents                  inspect durable room-agent bindings; no operator credential is returned
+POST   /v1/rooms/persistent/{key}/agents                  authorize one exact room member/package/digest under X-Ocean-Operator; missing header or unavailable operator key is 503
+POST   /v1/rooms/persistent/{key}/agents/bootstrap        under X-Ocean-Operator, atomically establish/verify the Local Room owner plus package-derived Agent roster tuple; does not authorize execution or consume a decision
+GET    /v1/rooms/persistent/{key}/agents/preview/{agent_package_id}  non-authorizing package/digest/capability preview; returns daemon-derived grantable/unavailable capabilities and any existing member/binding
+GET    /v1/rooms/persistent/{key}/agents/{agent_member_id}  inspect one binding
+DELETE /v1/rooms/persistent/{key}/agents/{agent_member_id}  terminal revoke under X-Ocean-Operator + replay decision
+POST   /v1/rooms/persistent/{key}/agents/{agent_member_id}/reauthorize  approve the current full package digest and bump authority generation
+POST   /v1/rooms/persistent/{key}/agents/{agent_member_id}/suspend  suspend and cancel older-generation in-flight turns
+POST   /v1/rooms/persistent/{key}/agents/{agent_member_id}/resume  resume under a new authority generation
+POST   /v1/rooms/persistent/{key}/agents/{agent_member_id}/invoke  explicit-only turn from an authoritative same-room message { invoked_by, message_seq, decision_token? }; 202 returns admission/request/generation/session attribution
 
 # Room workspace — the membership-gated lane to the room's Bedrock container.
 # The room's Bedrock bearer NEVER leaves the daemon: a client asserts a roster participant in

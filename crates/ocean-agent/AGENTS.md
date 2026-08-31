@@ -31,6 +31,11 @@ This crate owns Ocean's agent session/history layer and project prompt loading. 
   legacy `yolo_pref` is a best-effort downgrade mirror, while current boolean
   reads derive from the authoritative mode so the two cannot disagree live.
 - Project instruction discovery must respect the repo devlog chain: repo-root `AGENTS.md` is the root contract; `.ocean/AGENTS.md` is only a child doc for `.ocean/` runtime artifacts.
+- `agentdir::resolve_snapshot` parses folder-agent runtime fields only from the
+  caller-owned immutable relative-path byte map and never reopens the live
+  tree. Filesystem authority remains with the caller: security-sensitive
+  consumers must capture through confined handles and derive package identity
+  from the same map they pass to the parser.
 - `AgentRuntime::config_dir()` is the read-only daemon authority captured at construction; daemon-owned adapters must use it instead of re-reading process-global config environment during requests.
 - Do not add new instruction sources without tests proving ancestor/nested cwd behavior.
 - Project ownership resolution must compare canonical roots after the cheap exact
@@ -45,6 +50,16 @@ This crate owns Ocean's agent session/history layer and project prompt loading. 
   Leptos component contract; do not add parallel desktop prompt families.
 - Persisted history search reads only display-projected user/assistant transcript text; it must never inspect tool payloads/raw provider messages or invoke providers/embeddings. Preflight cumulative raw session-file size against the 64 MiB request budget, then enforce the same cumulative bound while reading so concurrent replacement/growth cannot bypass it.
 - `PromptControl::without_tools()` is the fail-closed no-capabilities boundary. Empty or unmatched folder-agent allowlists intentionally remain fail-open and must never represent a no-tools posture.
+- Per-turn memory authority is one exclusive `PromptMemory` mode: ordinary operator memory, disabled memory, or one opaque admitted-Room handle. The process-wide memory factory backs both the ordinary provider and Room issuance; only `AgentRuntime::admit_room_memory(&impl RoomMemoryAdmission)` may mint the latter, and `AdmittedRoomMemory` exposes no raw room key, partition, owner setter, or serde path. Room turns remove every registry `retain`/`recall`, apply the immutable ambient capability intersection, then append only the fixed room-scoped pair; `without_tools()` remains stronger and appends nothing. Room prompt assembly injects no operator facts and names only the Room namespace.
+- Durable Room transcript retrieval uses the separate opaque, non-Serde
+  `AdmittedRoomHistory` authority. Only `AgentRuntime::admit_room_history` may
+  mint it from final typed admission evidence plus a daemon-owned
+  `RoomHistorySource`; the fixed Room/agent/generation scope reaches that
+  source on every bounded backwards page and never enters tool arguments.
+  `room_history` is reserved against ambient providers, appended only after
+  the immutable capability intersection, advertised only when the handle is
+  present, removes ordinary operator memory when attached, and is removed by
+  `without_tools()`.
 - `PromptControl` receives exactly two effective harness-profile booleans from the daemon: `hashline_edits` and `artifact_spill`. Direct/legacy callers default both off; do not add declarative profile fields here until production runtime composition actually consumes them.
 - History shaping preserves stored thinking only when the selected route is exact
   `kimi`/`kimi-k3` (Moonshot requires same-model `reasoning_content` replay) or

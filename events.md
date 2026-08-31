@@ -7974,6 +7974,64 @@ scripts/check-ledger.mjs events.md`. The full `cargo xtask ci` repository gate
 also passed: docs/index integrity, workspace build and tests, Clippy with denied
 warnings, format, and dependency policy.
 _________________________________________________________________________________
+time:      [14:05] [31-08-26]
+agent:     [codex] [gpt-5.6-sol]
+worktree:  [codex/rooms-phase1-integration-20260831]
+type:      [feature-request]
+area:      [backend]
+
+Integrated the accepted Ocean Rooms Phase 1 local room-agent authorization
+contract on the green `01708527aef976fb98eecec4b428c09b85573a9d` baseline.
+The daemon now owns credential-free package preview and binding inspection,
+operator-authenticated authorize/reauthorize/suspend/resume/revoke routes,
+server-derived owner eligibility, deterministic package digests, immutable
+generation-bound admission, explicit transcript-backed invoke, cancellation of
+superseded generations, context-policy shaping, and exact-generation output and
+audit persistence. The Phase 1 ambient capability ceiling remains empty; no
+filesystem, shell, network, browser, MCP, or subprocess authority is admitted.
+
+Completed the memory boundary instead of relabeling global memory. The agent
+runtime now has one exclusive per-turn memory mode: operator, disabled, or an
+opaque admitted-Room handle minted from the private non-Serde
+`RoomAgentAdmission`. Room `retain`/`recall` use the store-fixed exact Room
+partition and stable room-wide owner, are appended only after the ambient
+capability intersection, and inject no operator facts into the Room prompt.
+Memory-factory failure is an audited 503 and never downgrades to operator memory
+or `none`.
+
+Verification at this checkpoint: ocean-agent 230 passed, ocean-daemon 839
+passed, ocean-store 187 passed; targeted Room memory isolation and prompt tests
+passed; `cargo clippy -p ocean-agent -p ocean-daemon -p ocean-store
+--all-targets -- -D warnings`; `cargo check -p ocean-agent -p ocean-daemon`;
+`cargo fmt --all`; and `git diff --check`. No push, merge, migration against a
+live database, install, restart, or deployment was performed. Stage 2
+contributed-folder authority remains closed.
+_________________________________________________________________________________
+time:      [14:13] [31-08-26]
+agent:     [codex] [gpt-5.6-sol]
+worktree:  [codex/rooms-phase1-integration-20260831]
+type:      [workflow]
+area:      [testing]
+
+Rehearsed the Rooms Phase 1 forward, downgrade, and re-upgrade paths against
+consistent temporary backups of the operator's real `rooms.db` and
+`memory.sqlite`; the live daemon and both live databases were left untouched.
+The source shape was 3 Rooms, 7 participants, 4 legacy Agent labels, 79 legacy
+memories, and zero bindings, decisions, or implicit owners. Current code opened
+the copies with all 79 memories in `operator:v1`, no Room memory rows, no
+implicit binding backfill, and clean SQLite integrity.
+
+On the temporary copy only, one synthetic Room row exercised the downgrade
+rail. `ocean-memory-rollback --offline-confirm` restored the legacy 12-column
+operator table with 79 rows and archived the one Room row outside that table.
+The installed `996d3400b99b` daemon then opened the downgraded copy successfully,
+ignored the additive empty Room-authority tables, and left both the archive and
+Room counts intact. Reopening with current code restored the partitioned table,
+rehydrated the exact Room row under its length-prefixed partition plus stable
+room-wide owner, removed the archive table, and passed `PRAGMA integrity_check`.
+The live database SHA-256 values were identical before and after the rehearsal,
+and the supervised live daemon remained healthy at revision `996d3400b99b`.
+_________________________________________________________________________________
 time:      [13:04] [08-31-26]
 agent:     [claude] [opus 5]
 worktree:  loop/os-port-exposed-url
@@ -8102,6 +8160,97 @@ the pin, which is that the off direction is accepted in every access state, so
 no client can be locked out of clearing the flag however its write is composed.
 _________________________________________________________________________________
 
+time:      [14:59] [31-08-26]
+agent:     [codex] [gpt-5.6-sol]
+worktree:  [codex/rooms-phase1-integration-20260831]
+type:      [bug report]
+area:      [testing]
+
+Reconciled the Rooms Phase 1 branch with current origin/main and repaired five
+stale daemon tests without reopening the workspace security boundary. Fixtures
+that exercise a real local or federated agent turn now bind an explicit existing
+workspace; the legacy unbound-Room test now proves there is no request, session,
+agent reply, or convene event and that the fixed workspace_unavailable refusal
+is durable. The mention-order characterization includes the new Local owner
+bootstrap audit, and its source-order guard follows the checked spawn call's
+current error-handling shape.
+
+Verification: `cargo test -p ocean-daemon --bin ocean-daemon --
+--test-threads=1` passed 850 tests with zero failures after merging origin/main
+at `8320a975a23d03f7e98982ff81d8f793f100b4c6`; `cargo fmt --all` and
+`git diff --check` passed. The existing daemon devlog already states the exact
+explicit-workspace/fail-closed contract, so no contract text changed. No push,
+merge to main, install, restart, database mutation, or deployment was performed.
+_________________________________________________________________________________
+
+time:      [15:24] [31-08-26]
+agent:     [codex] [gpt-5.6-sol]
+worktree:  [codex/rooms-phase1-integration-20260831]
+type:      [bug report]
+area:      [backend]
+
+Closed the two blockers from the independent Rooms Phase 1 review. Room create
+now accepts a nonblank workspace only when it canonicalizes to an existing
+absolute directory and stores that canonical value; execution revalidates the
+persisted boundary, so legacy relative/noncanonical paths, missing directories,
+and symlink-replaced paths fail closed instead of inheriting daemon cwd. Post-admission
+outcome audits now use the immutable admission generation, decision, operator,
+package, and digest rather than re-reading a possibly newer binding. Synchronous
+audit failures are surfaced, and detached federated failures emit a fixed-code
+warning instead of being silently discarded.
+
+Focused verification passed for canonical Room workspace creation/execution
+validation and for an admission at generation N retaining its original
+attribution after the live binding advances to N+1. `cargo fmt --all`,
+`git diff --check`, the full daemon suite, workspace gates, and fresh exact-SHA
+review remain required before this repair is accepted. No push, merge to main,
+install, restart, database mutation, or deployment was performed.
+_________________________________________________________________________________
+
+time:      [15:41] [31-08-26]
+agent:     [codex] [gpt-5.6-sol]
+worktree:  [codex/rooms-phase1-integration-20260831]
+type:      [bug report]
+area:      [testing]
+
+The first full daemon run exposed nine existing Room-turn fixtures that stored
+macOS temporary directories through the noncanonical `/var` alias. Production
+correctly refused those values under the new boundary. The shared fixtures and
+the three direct local/federated Room fixtures now persist canonical test
+workspaces, while the production test proves relative, missing, noncanonical,
+and symlink-retargeted paths cannot become execution authority.
+
+Verification after the fixture repair: all 91 `persistent_rooms` tests passed;
+the two affected end-to-end daemon tests passed individually; and a quiet full
+daemon rerun passed 852 tests with zero failures in 125.02 seconds. Formatting,
+docs-check, ledger validation, and `git diff --check` also passed. Fresh exact-SHA
+independent review and workspace release gates remain required. No push, merge
+to main, install, restart, database mutation, or deployment was performed.
+_________________________________________________________________________________
+
+time:      [15:56] [31-08-26]
+agent:     [codex] [gpt-5.6-sol]
+worktree:  [codex/rooms-phase1-integration-20260831]
+type:      [handoff]
+area:      [review]
+
+Independent delta review accepted exact backend candidate
+`1458258fb0fb252cdb9bf0c4de06cc66f683419b`: the canonical workspace boundary
+and immutable admission-era refusal attribution close both prior P1 blockers,
+and the six-file repair introduced no new correctness or security blocker. The
+separately reviewed Surface candidate remains accepted at
+`5f838b352dfb6dd76ad620318ef2c78c2fc7579f`.
+
+Exact backend verification passed: full daemon 852/852, denied-warning daemon
+Clippy, `cargo xtask ci`, `cargo xtask ci --compatibility`, and
+`cargo +1.88.0 xtask ci --msrv`. The MSRV feature checks retained two known
+non-denied dead-code warnings in `room_workspace_proxy.rs`; the lane passed.
+The additive copy-only migration, rollback, old-daemon open, and re-upgrade
+rehearsal remains valid because the final repair changed no schema. No push,
+merge to main, install, restart, live database mutation, or deployment was
+performed; upstream landing is the next release boundary.
+_________________________________________________________________________________
+
 time:      [14:58] [08-31-26]
 agent:     [claude] [opus 5]
 worktree:  loop/os-vendors-bedrock-events
@@ -8185,4 +8334,22 @@ under the gate that runs every build. Proved each bites by re-running the
 reviewer's own mutations: widened prefix -> the pin fails naming both values,
 emptied sha -> the provenance test fails, prefix edited with no action moved ->
 `--check` exits 1 saying the sets agree but the bytes do not.
+_________________________________________________________________________________
+
+time:      [16:08] [31-08-26]
+agent:     [codex] [gpt-5.6-sol]
+worktree:  [codex/rooms-phase1-integration-20260831]
+type:      [handoff]
+area:      [testing]
+
+Reconciled the accepted Rooms Phase 1 backend candidate with `origin/main` at
+`7ba7061c`, retaining the upstream Bedrock event-set provenance guard. The only
+manual repair restored the append-only ledger separator dropped by the union
+merge driver; all 532 entries validate as closed. On combined code at
+`cedd559c1048b2c1dfdca34713e2de8f6ab80ac1`, `cargo xtask ci`,
+`cargo xtask ci --compatibility`, and `cargo +1.88.0 xtask ci --msrv` all pass.
+The MSRV lane retains the two known non-denied dead-code warnings in
+`room_workspace_proxy.rs`. A fresh exact-SHA delta review remains required. No
+push, merge to main, install, restart, live database mutation, or deployment was
+performed.
 _________________________________________________________________________________

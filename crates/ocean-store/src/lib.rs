@@ -105,6 +105,38 @@ pub struct RoomRecord {
     pub transcript: Vec<RoomMessage>,
 }
 
+/// Server-derived owner authority for one Local room.
+///
+/// `eligible` is live roster truth: the durable owner row can survive a Human
+/// leaving, but it cannot authorize a mutation until that exact member is
+/// present again as a Human.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LocalRoomOwnerRole {
+    pub member_id: String,
+    pub eligible: bool,
+}
+
+/// Result of the operator-authenticated Local room-agent bootstrap mutation.
+///
+/// `participant_message` is present only when the transaction inserted the
+/// Agent participant for the first time. Exact replay returns no marker, which
+/// lets the daemon publish the join wake exactly once.
+#[derive(Debug, Clone)]
+pub struct LocalRoomAgentBootstrap {
+    pub room: Room,
+    pub created: bool,
+    pub participant_message: Option<RoomMessage>,
+    pub audit_message: Option<RoomMessage>,
+}
+
+/// Newest-first durable transcript page returned only after exact room-agent
+/// authority validation in the same SQLite read transaction.
+#[derive(Debug, Clone, PartialEq)]
+pub struct AuthorizedRoomHistoryPage {
+    pub messages: Vec<RoomMessage>,
+    pub has_more: bool,
+}
+
 /// Default number of transcript rows returned when a caller does not specify a
 /// limit (OCEAN-249). Transcript reads used to be unbounded — a long-lived call
 /// room would re-read its entire log on every hydration (O(n) per poll, O(n²)
@@ -204,6 +236,14 @@ pub enum RoomStoreError {
     UnknownRoom(RoomKey),
     /// A room with this key already exists (on create).
     AlreadyExists(RoomKey),
+    /// A Local-only authority mutation was attempted for a federated room.
+    RoomNotLocal(RoomKey),
+    /// A Local room already has a different durable owner role.
+    LocalRoomOwnerConflict {
+        room: RoomKey,
+        existing_owner: String,
+        offered_owner: String,
+    },
     /// No participant with the given id is in the room (on remove).
     UnknownParticipant { room: RoomKey, participant: String },
     /// The room exists but has no federation access projection row (P2-A).
@@ -308,6 +348,15 @@ impl std::fmt::Display for RoomStoreError {
             Self::BadKey(k) => write!(f, "invalid room key '{k}'; must be non-empty"),
             Self::UnknownRoom(k) => write!(f, "no room with key '{k}'"),
             Self::AlreadyExists(k) => write!(f, "room '{k}' already exists"),
+            Self::RoomNotLocal(k) => write!(f, "room '{k}' is not local"),
+            Self::LocalRoomOwnerConflict {
+                room,
+                existing_owner,
+                offered_owner,
+            } => write!(
+                f,
+                "room '{room}' owner is '{existing_owner}', not '{offered_owner}'"
+            ),
             Self::UnknownParticipant { room, participant } => {
                 write!(f, "room '{room}' has no participant '{participant}'")
             }
@@ -838,6 +887,53 @@ pub struct SetAgentBindingStatusInput {
     pub request_digest: String,
 }
 
+/// Content-minimal admission decision supplied by the daemon after resolving
+/// the package and trigger. Capability sets and prompt content are deliberately
+/// absent from this value and therefore cannot leak into the room transcript.
+pub struct RoomAgentAdmissionAuditInput {
+    pub admission_id: String,
+    pub agent_member_id: String,
+    pub agent_package_id: String,
+    pub approved_definition_digest: Option<String>,
+    pub observed_definition_digest: String,
+    pub generation: Option<u64>,
+    pub operator_principal_id: Option<String>,
+    pub decision_id: Option<String>,
+    pub outcome: String,
+    pub reason_code: String,
+}
+
+/// The durable result of committing one federated room-agent output under an
+/// exact admitted authority generation.
+///
+/// Both values are inserted by the same `IMMEDIATE` transaction: `outbox`
+/// owns delivery authority and `audit` is the content-minimal correlation fact
+/// that proves which admission and generation allocated that exact producer
+/// tuple.
+#[derive(Debug, Clone)]
+pub struct AuthorizedRoomAgentOutboxCommit {
+    pub outbox: RoomOutboxItem,
+    pub audit: RoomMessage,
+}
+
+/// Content-minimal durable audit fact for room-agent authority changes.
+///
+/// These facts intentionally omit capability payloads, prompts, package source,
+/// and the operator credential. The principal id is a one-way fingerprint.
+struct RoomAgentAuthorityAudit<'a> {
+    action: &'static str,
+    agent_member_id: &'a str,
+    agent_package_id: &'a str,
+    previous_definition_digest: Option<&'a str>,
+    agent_definition_digest: &'a str,
+    generation: u64,
+    operator_principal_id: &'a str,
+    decision_id: &'a str,
+    admission_id: Option<&'a str>,
+    outcome: &'a str,
+    reason_code: &'a str,
+}
+
 /// Sort + dedupe so a capability list has one canonical form. Two approvals
 /// listing the same capabilities in different orders must produce the same
 /// stored value, or replay comparison becomes order-sensitive.
@@ -1298,6 +1394,23 @@ impl SqliteRoomStore {
                 position     INTEGER NOT NULL,       -- preserves roster order
                 PRIMARY KEY (room_id, id)
             );
+
+            -- Durable Local-room membership authority. This is deliberately
+            -- separate from `room_agent_owners`: the latter says which Human
+            -- owns an Agent, not which Human owns the Room. Federated rooms
+            -- continue to derive owner truth from coordinator membership plus
+            -- the locally held credential and never write this table.
+            CREATE TABLE IF NOT EXISTS room_local_roles (
+                room_id       TEXT NOT NULL REFERENCES rooms(id) ON DELETE CASCADE,
+                member_id     TEXT NOT NULL,
+                role          TEXT NOT NULL CHECK (role IN ('owner', 'member')),
+                established_at TEXT NOT NULL,
+                established_by TEXT NOT NULL,
+                PRIMARY KEY (room_id, member_id)
+            );
+
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_room_local_roles_one_owner
+                ON room_local_roles(room_id) WHERE role = 'owner';
 
             -- Which WORKER owns which agent participant, within one local room.
             -- This is the local half of "a worker persists alongside their
@@ -2650,6 +2763,269 @@ impl SqliteRoomStore {
         Ok(())
     }
 
+    /// Establish or verify the Local room owner and one package-derived Agent
+    /// participant under a single write lock.
+    ///
+    /// This is a bootstrap mutation, not authorization: it never creates a
+    /// `room_agent_bindings` row and never consumes a decision id. The exact
+    /// `(room, owner, agent participant)` tuple is idempotent. A different
+    /// owner, participant kind/display, or Agent owner conflicts without any
+    /// partial role, roster, ownership, marker, or timestamp write.
+    pub fn bootstrap_local_room_agent(
+        &mut self,
+        key: &RoomKey,
+        owner_member_id: &str,
+        participant: RoomParticipant,
+        agent_package_id: &str,
+        established_by: &str,
+        now: DateTime<Utc>,
+    ) -> Result<LocalRoomAgentBootstrap> {
+        if agent_package_id.trim().is_empty() || established_by.trim().is_empty() {
+            return Err(RoomStoreError::Encode(
+                "bootstrap package and principal are required".into(),
+            ));
+        }
+        if participant.kind != RoomParticipantKind::Agent {
+            return Err(RoomStoreError::InvalidAgentOwner {
+                agent: participant.id,
+                owner: owner_member_id.to_string(),
+                reason: "bootstrap target is not an agent".into(),
+            });
+        }
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let closed_at: Option<Option<String>> = tx
+            .query_row(
+                "SELECT closed_at FROM rooms WHERE id = ?1",
+                params![key.as_str()],
+                |row| row.get(0),
+            )
+            .optional()?;
+        if !matches!(closed_at, Some(None)) {
+            return Err(RoomStoreError::UnknownRoom(key.clone()));
+        }
+        let access_state: Option<String> = tx
+            .query_row(
+                "SELECT state FROM room_access WHERE room_id = ?1",
+                params![key.as_str()],
+                |row| row.get(0),
+            )
+            .optional()?;
+        let has_federation_credential: Option<i64> = tx
+            .query_row(
+                "SELECT 1 FROM room_federation WHERE room_id = ?1",
+                params![key.as_str()],
+                |row| row.get(0),
+            )
+            .optional()?;
+        if access_state
+            .as_deref()
+            .is_some_and(|state| state != "local")
+            || has_federation_credential.is_some()
+        {
+            return Err(RoomStoreError::RoomNotLocal(key.clone()));
+        }
+        let owner_kind: Option<String> = tx
+            .query_row(
+                "SELECT kind FROM participants WHERE room_id = ?1 AND id = ?2",
+                params![key.as_str(), owner_member_id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        if owner_kind.as_deref() != Some("human") {
+            return Err(RoomStoreError::InvalidAgentOwner {
+                agent: participant.id,
+                owner: owner_member_id.to_string(),
+                reason: "room owner is not a live Human participant".into(),
+            });
+        }
+        let existing_owner: Option<String> = tx
+            .query_row(
+                "SELECT member_id FROM room_local_roles
+                  WHERE room_id = ?1 AND role = 'owner'",
+                params![key.as_str()],
+                |row| row.get(0),
+            )
+            .optional()?;
+        if let Some(existing_owner) = existing_owner.as_deref() {
+            if existing_owner != owner_member_id {
+                return Err(RoomStoreError::LocalRoomOwnerConflict {
+                    room: key.clone(),
+                    existing_owner: existing_owner.to_string(),
+                    offered_owner: owner_member_id.to_string(),
+                });
+            }
+        }
+        let owner_created = existing_owner.is_none();
+        if owner_created {
+            tx.execute(
+                "INSERT INTO room_local_roles
+                     (room_id, member_id, role, established_at, established_by)
+                 VALUES (?1, ?2, 'owner', ?3, ?4)",
+                params![
+                    key.as_str(),
+                    owner_member_id,
+                    now.to_rfc3339(),
+                    established_by,
+                ],
+            )?;
+        }
+
+        Self::guard_participant_kind_on(&tx, key, &participant)?;
+        let existing_agent: Option<String> = tx
+            .query_row(
+                "SELECT id FROM participants WHERE room_id = ?1 AND id = ?2",
+                params![key.as_str(), participant.id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        let existing_agent_owner: Option<String> = tx
+            .query_row(
+                "SELECT owner_id FROM room_agent_owners
+                  WHERE room_id = ?1 AND agent_id = ?2",
+                params![key.as_str(), participant.id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        if let Some(existing_agent_owner) = existing_agent_owner.as_deref() {
+            if existing_agent_owner != owner_member_id {
+                return Err(RoomStoreError::ParticipantRecordImmutable {
+                    room: key.clone(),
+                    participant: participant.id,
+                    field: "owner_id",
+                });
+            }
+        }
+
+        let participant_created = existing_agent.is_none();
+        let participant_message = if participant_created {
+            if existing_agent_owner.is_some() {
+                return Err(RoomStoreError::ParticipantRecordImmutable {
+                    room: key.clone(),
+                    participant: participant.id,
+                    field: "owner_id",
+                });
+            }
+            let next_pos: i64 = tx.query_row(
+                "SELECT COALESCE(MAX(position) + 1, 0) FROM participants WHERE room_id = ?1",
+                params![key.as_str()],
+                |row| row.get(0),
+            )?;
+            tx.execute(
+                "INSERT INTO participants (room_id, id, kind, display_name, position)
+                 VALUES (?1, ?2, ?3, ?4, ?5)",
+                params![
+                    key.as_str(),
+                    participant.id,
+                    encode_participant_kind(participant.kind),
+                    participant.display_name,
+                    next_pos,
+                ],
+            )?;
+            tx.execute(
+                "INSERT INTO room_agent_owners (room_id, agent_id, owner_id, created_at)
+                 VALUES (?1, ?2, ?3, ?4)",
+                params![
+                    key.as_str(),
+                    participant.id,
+                    owner_member_id,
+                    now.to_rfc3339(),
+                ],
+            )?;
+            Some(Self::insert_message_on(
+                &tx,
+                key,
+                MessageDraft::marker(
+                    &participant.id,
+                    participant.kind,
+                    RoomMessageKind::ParticipantJoined,
+                    &format!("{} joined", marker_prose(&participant.display_name)),
+                ),
+                now,
+            )?)
+        } else {
+            if existing_agent_owner.is_none() {
+                tx.execute(
+                    "INSERT INTO room_agent_owners (room_id, agent_id, owner_id, created_at)
+                     VALUES (?1, ?2, ?3, ?4)",
+                    params![
+                        key.as_str(),
+                        participant.id,
+                        owner_member_id,
+                        now.to_rfc3339(),
+                    ],
+                )?;
+            }
+            None
+        };
+        let created = owner_created || participant_created || existing_agent_owner.is_none();
+        let audit_message = if created {
+            let body = serde_json::to_string(&serde_json::json!({
+                "type": "room.agent.bootstrap",
+                "room_id": key.as_str(),
+                "owner_member_id": owner_member_id,
+                "agent_member_id": participant.id,
+                "agent_package_id": agent_package_id,
+                "operator_principal_id": established_by,
+                "outcome": "established",
+            }))
+            .map_err(|error| RoomStoreError::Encode(error.to_string()))?;
+            Some(Self::insert_message_on(
+                &tx,
+                key,
+                MessageDraft::marker(
+                    "system",
+                    RoomParticipantKind::System,
+                    RoomMessageKind::System,
+                    &body,
+                ),
+                now,
+            )?)
+        } else {
+            None
+        };
+        if created {
+            Self::touch_on(&tx, key, now)?;
+        }
+        tx.commit()?;
+        let room = self
+            .load_record(key, false)?
+            .ok_or_else(|| RoomStoreError::UnknownRoom(key.clone()))?
+            .room;
+        Ok(LocalRoomAgentBootstrap {
+            room,
+            created,
+            participant_message,
+            audit_message,
+        })
+    }
+
+    /// Current durable owner role for a Local room, with live Human eligibility.
+    pub fn local_room_owner(&self, key: &RoomKey) -> Result<Option<LocalRoomOwnerRole>> {
+        self.conn
+            .query_row(
+                "SELECT roles.member_id,
+                        EXISTS (
+                            SELECT 1 FROM participants member
+                             WHERE member.room_id = roles.room_id
+                               AND member.id = roles.member_id
+                               AND member.kind = 'human'
+                        )
+                   FROM room_local_roles roles
+                  WHERE roles.room_id = ?1 AND roles.role = 'owner'",
+                params![key.as_str()],
+                |row| {
+                    Ok(LocalRoomOwnerRole {
+                        member_id: row.get(0)?,
+                        eligible: row.get::<_, i64>(1)? != 0,
+                    })
+                },
+            )
+            .optional()
+            .map_err(RoomStoreError::from)
+    }
+
     /// Add an Agent participant AND record the worker who owns it, atomically.
     ///
     /// This is the local half of "a worker persists alongside their agents".
@@ -3443,6 +3819,261 @@ impl SqliteRoomStore {
         Self::touch_on(&tx, key, now)?;
         tx.commit()?;
         Ok(msg)
+    }
+
+    fn authorized_room_agent_binding_on(
+        conn: &Connection,
+        key: &RoomKey,
+        agent_member_id: &str,
+        expected_generation: u64,
+    ) -> Result<RoomAgentBinding> {
+        let binding = conn
+            .query_row(
+                "SELECT agent_member_id, agent_package_id, agent_definition_digest,
+                        agent_definition_revision, display_name, owner_member_id,
+                        authorized_by, authorized_at, activation_policy, context_policy,
+                        memory_scope, requested_capabilities, room_capability_grants,
+                        status, generation, decision_id, request_digest,
+                        revoked_at, revoked_by
+                   FROM room_agent_bindings
+                  WHERE room_id = ?1 AND agent_member_id = ?2",
+                params![key.as_str(), agent_member_id],
+                |row| Self::binding_from_row(key, row),
+            )
+            .optional()?
+            .transpose()?
+            .ok_or_else(|| RoomStoreError::UnknownAgentBinding {
+                room: key.clone(),
+                agent: agent_member_id.to_string(),
+            })?;
+        if binding.status != AgentBindingStatus::Active || binding.generation != expected_generation
+        {
+            return Err(RoomStoreError::AgentBindingStatusConflict {
+                room: key.clone(),
+                agent: agent_member_id.to_string(),
+                from: binding.status.as_str(),
+                to: "admitted_generation",
+            });
+        }
+        Ok(binding)
+    }
+
+    /// Append a locally executed room-agent reply and a generation-attribution
+    /// fact in the same transaction.
+    ///
+    /// The audit's `admission_id` mechanically joins the earlier admission
+    /// decision to this concrete `message_seq`; consumers never have to infer
+    /// authority from chronology. A generation/status change after admission
+    /// refuses the write, which is the final checkpoint backstop.
+    #[allow(clippy::too_many_arguments)]
+    pub fn append_authorized_agent_reply(
+        &mut self,
+        key: &RoomKey,
+        agent_member_id: &str,
+        expected_generation: u64,
+        admission_id: &str,
+        body: &str,
+        now: DateTime<Utc>,
+        thread_parent_seq: Option<u64>,
+        session_id: &str,
+    ) -> std::result::Result<(RoomMessage, RoomMessage), ThreadAppendError> {
+        if !self.room_is_open(key)? {
+            return Err(RoomStoreError::UnknownRoom(key.clone()).into());
+        }
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let binding =
+            Self::authorized_room_agent_binding_on(&tx, key, agent_member_id, expected_generation)
+                .map_err(ThreadAppendError::Store)?;
+        if let Some(parent_seq) = thread_parent_seq {
+            Self::validate_thread_parent_on(&tx, key, parent_seq)?;
+        }
+        let reply = Self::insert_message_on(
+            &tx,
+            key,
+            MessageDraft {
+                author_id: agent_member_id,
+                author_kind: RoomParticipantKind::Agent,
+                kind: RoomMessageKind::Message,
+                body,
+                thread_parent_seq,
+                session_id: Some(session_id),
+                attachment_id: None,
+            },
+            now,
+        )?;
+        let audit_body = serde_json::to_string(&serde_json::json!({
+            "type": "room.agent.output",
+            "room_id": key.as_str(),
+            "admission_id": admission_id,
+            "agent_member_id": agent_member_id,
+            "agent_package_id": binding.agent_package_id,
+            "generation": expected_generation.to_string(),
+            "message_seq": reply.seq.to_string(),
+            "session_id": session_id,
+            "outcome": "emitted",
+        }))
+        .map_err(|error| RoomStoreError::Encode(error.to_string()))?;
+        let audit = Self::insert_message_on(
+            &tx,
+            key,
+            MessageDraft {
+                author_id: "system",
+                author_kind: RoomParticipantKind::System,
+                kind: RoomMessageKind::System,
+                body: &audit_body,
+                thread_parent_seq: None,
+                session_id: None,
+                attachment_id: None,
+            },
+            now,
+        )?;
+        Self::touch_on(&tx, key, now)?;
+        tx.commit()?;
+        Ok((reply, audit))
+    }
+
+    /// Record a failed local room-agent turn only while its admitted authority
+    /// generation is still active.
+    ///
+    /// The caller supplies no provider/runtime error text. The human-facing row
+    /// uses a fixed reason code, and the adjacent audit carries the exact
+    /// admission, package, generation, and session correlation without prompt,
+    /// response, stderr, or capability content.
+    pub fn append_authorized_agent_failure(
+        &mut self,
+        key: &RoomKey,
+        agent_member_id: &str,
+        expected_generation: u64,
+        admission_id: &str,
+        now: DateTime<Utc>,
+        session_id: &str,
+    ) -> Result<(RoomMessage, RoomMessage)> {
+        if !self.room_is_open(key)? {
+            return Err(RoomStoreError::UnknownRoom(key.clone()));
+        }
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let binding =
+            Self::authorized_room_agent_binding_on(&tx, key, agent_member_id, expected_generation)?;
+        let failure_body = format!("auto-convene failed for {agent_member_id}: turn_failed");
+        let failure = Self::insert_message_on(
+            &tx,
+            key,
+            MessageDraft {
+                author_id: "system",
+                author_kind: RoomParticipantKind::System,
+                kind: RoomMessageKind::System,
+                body: &failure_body,
+                thread_parent_seq: None,
+                session_id: None,
+                attachment_id: None,
+            },
+            now,
+        )?;
+        let audit_body = serde_json::to_string(&serde_json::json!({
+            "type": "room.agent.output",
+            "room_id": key.as_str(),
+            "admission_id": admission_id,
+            "agent_member_id": agent_member_id,
+            "agent_package_id": binding.agent_package_id,
+            "generation": expected_generation.to_string(),
+            "failure_seq": failure.seq.to_string(),
+            "session_id": session_id,
+            "outcome": "failed",
+            "reason_code": "turn_failed",
+        }))
+        .map_err(|error| RoomStoreError::Encode(error.to_string()))?;
+        let audit = Self::insert_message_on(
+            &tx,
+            key,
+            MessageDraft {
+                author_id: "system",
+                author_kind: RoomParticipantKind::System,
+                kind: RoomMessageKind::System,
+                body: &audit_body,
+                thread_parent_seq: None,
+                session_id: None,
+                attachment_id: None,
+            },
+            now,
+        )?;
+        Self::touch_on(&tx, key, now)?;
+        tx.commit()?;
+        Ok((failure, audit))
+    }
+
+    /// Read one bounded backwards transcript page under an exact active
+    /// room-agent generation.
+    ///
+    /// Binding validation and the room-scoped `seq < before_seq` query share
+    /// one SQLite read transaction, so a racing suspend/revoke orders wholly
+    /// before the page (and refuses it) or wholly after its snapshot. Rows are
+    /// newest-first and a `limit + 1` sentinel computes `has_more` without an
+    /// unbounded count.
+    pub fn authorized_room_history_page(
+        &mut self,
+        key: &RoomKey,
+        agent_member_id: &str,
+        expected_generation: u64,
+        before_seq: Option<u64>,
+        limit: usize,
+    ) -> Result<AuthorizedRoomHistoryPage> {
+        let limit = limit.clamp(1, MAX_TRANSCRIPT_LIMIT);
+        let fetch_limit = limit.saturating_add(1);
+        let sql_fetch_limit = i64::try_from(fetch_limit)
+            .map_err(|_| RoomStoreError::Encode("history page limit out of range".into()))?;
+        let tx = self.conn.transaction()?;
+        Self::authorized_room_agent_binding_on(&tx, key, agent_member_id, expected_generation)?;
+        let before = match before_seq {
+            Some(0) => {
+                tx.commit()?;
+                return Ok(AuthorizedRoomHistoryPage {
+                    messages: Vec::new(),
+                    has_more: false,
+                });
+            }
+            Some(value) => i64::try_from(value).ok(),
+            None => None,
+        };
+        let mut rows = if let Some(before) = before {
+            let mut statement = tx.prepare(&format!(
+                "SELECT {MESSAGE_ROW_COLUMNS} FROM messages
+                  WHERE room_id = ?1 AND seq < ?2
+                  ORDER BY seq DESC LIMIT ?3"
+            ))?;
+            let mapped = statement.query_map(
+                params![key.as_str(), before, sql_fetch_limit],
+                RawMessageRow::read,
+            )?;
+            let mut messages = Vec::with_capacity(fetch_limit);
+            for row in mapped {
+                messages.push(row?.decode()?);
+            }
+            messages
+        } else {
+            let mut statement = tx.prepare(&format!(
+                "SELECT {MESSAGE_ROW_COLUMNS} FROM messages
+                  WHERE room_id = ?1
+                  ORDER BY seq DESC LIMIT ?2"
+            ))?;
+            let mapped =
+                statement.query_map(params![key.as_str(), sql_fetch_limit], RawMessageRow::read)?;
+            let mut messages = Vec::with_capacity(fetch_limit);
+            for row in mapped {
+                messages.push(row?.decode()?);
+            }
+            messages
+        };
+        let has_more = rows.len() > limit;
+        rows.truncate(limit);
+        tx.commit()?;
+        Ok(AuthorizedRoomHistoryPage {
+            messages: rows,
+            has_more,
+        })
     }
 
     /// Enforce the G1 one-level thread policy for `parent_seq` in `key`.
@@ -4299,7 +4930,7 @@ impl SqliteRoomStore {
         key: &RoomKey,
         input: AuthorizeAgentInput,
         now: DateTime<Utc>,
-    ) -> Result<(RoomAgentBinding, bool)> {
+    ) -> Result<(RoomAgentBinding, bool, Option<RoomMessage>)> {
         if input.agent_member_id.trim().is_empty()
             || input.decision_id.trim().is_empty()
             || input.request_digest.trim().is_empty()
@@ -4364,20 +4995,23 @@ impl SqliteRoomStore {
                     agent: input.agent_member_id.clone(),
                 })?;
             tx.commit()?;
-            return Ok((existing, false));
+            return Ok((existing, false, None));
         }
 
         // A revoked identity is terminal: re-adding must mint a new
         // agent_member_id rather than resurrect the old row.
-        let existing_authority: Option<(String, String)> = tx
+        let existing_authority: Option<(String, String, String)> = tx
             .query_row(
-                "SELECT status, generation FROM room_agent_bindings
+                "SELECT status, generation, agent_definition_digest FROM room_agent_bindings
                  WHERE room_id = ?1 AND agent_member_id = ?2",
                 params![key.as_str(), input.agent_member_id],
-                |row| Ok((row.get(0)?, row.get(1)?)),
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
             )
             .optional()?;
-        let generation = if let Some((status, generation)) = existing_authority {
+        let previous_definition_digest = existing_authority
+            .as_ref()
+            .map(|(_, _, digest)| digest.clone());
+        let generation = if let Some((status, generation, _)) = existing_authority {
             let from = AgentBindingStatus::parse(&status)?;
             if from == AgentBindingStatus::Revoked {
                 return Err(RoomStoreError::AgentBindingStatusConflict {
@@ -4487,8 +5121,34 @@ impl SqliteRoomStore {
                 room: key.clone(),
                 agent: input.agent_member_id.clone(),
             })?;
+        let audit = Self::insert_room_agent_authority_audit_on(
+            &tx,
+            key,
+            RoomAgentAuthorityAudit {
+                action: "authorization",
+                agent_member_id: &binding.agent_member_id,
+                agent_package_id: &binding.agent_package_id,
+                previous_definition_digest: previous_definition_digest.as_deref(),
+                agent_definition_digest: &binding.agent_definition_digest,
+                generation: binding.generation,
+                operator_principal_id: &binding.authorized_by,
+                decision_id: &binding.decision_id,
+                admission_id: None,
+                outcome: if previous_definition_digest.is_some() {
+                    "reauthorized"
+                } else {
+                    "authorized"
+                },
+                reason_code: if previous_definition_digest.is_some() {
+                    "fresh_definition_approved"
+                } else {
+                    "initial_authorization_approved"
+                },
+            },
+            now,
+        )?;
         tx.commit()?;
-        Ok((binding, true))
+        Ok((binding, true, Some(audit)))
     }
 
     /// One binding, or `None`. Callers must treat `None` as refusal.
@@ -4531,6 +5191,200 @@ impl SqliteRoomStore {
         rows.into_iter().collect()
     }
 
+    /// Read one consumed replay decision without projecting it onto the public
+    /// inspection wire. Mutation handlers use this under the room-store lock to
+    /// distinguish a harmless exact retry from an implicit re-authorization.
+    pub fn room_agent_decision(
+        &self,
+        key: &RoomKey,
+        decision_id: &str,
+    ) -> Result<Option<(String, String)>> {
+        self.conn
+            .query_row(
+                "SELECT agent_member_id, request_digest
+                   FROM room_agent_decisions
+                  WHERE room_id = ?1 AND decision_id = ?2",
+                params![key.as_str(), decision_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()
+            .map_err(RoomStoreError::from)
+    }
+
+    /// Atomically mark an active binding stale when the package digest changed.
+    ///
+    /// The pinned digest remains the digest the operator approved. The newly
+    /// observed digest exists only in the audit fact until a fresh decision
+    /// re-authorizes it. A generation/digest mismatch means the caller planned
+    /// against old authority and receives the latest row without mutating it.
+    #[allow(clippy::too_many_arguments)]
+    pub fn mark_room_agent_stale(
+        &mut self,
+        key: &RoomKey,
+        agent_member_id: &str,
+        expected_generation: u64,
+        expected_definition_digest: &str,
+        observed_definition_digest: &str,
+        admission_id: &str,
+        now: DateTime<Utc>,
+    ) -> Result<(RoomAgentBinding, bool, Option<RoomMessage>)> {
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let current = tx
+            .query_row(
+                "SELECT agent_member_id, agent_package_id, agent_definition_digest,
+                        agent_definition_revision, display_name, owner_member_id,
+                        authorized_by, authorized_at, activation_policy, context_policy,
+                        memory_scope, requested_capabilities, room_capability_grants,
+                        status, generation, decision_id, request_digest,
+                        revoked_at, revoked_by
+                   FROM room_agent_bindings
+                  WHERE room_id = ?1 AND agent_member_id = ?2",
+                params![key.as_str(), agent_member_id],
+                |row| Self::binding_from_row(key, row),
+            )
+            .optional()?
+            .transpose()?
+            .ok_or_else(|| RoomStoreError::UnknownAgentBinding {
+                room: key.clone(),
+                agent: agent_member_id.to_string(),
+            })?;
+        if current.status != AgentBindingStatus::Active
+            || current.generation != expected_generation
+            || current.agent_definition_digest != expected_definition_digest
+        {
+            tx.commit()?;
+            return Ok((current, false, None));
+        }
+        if current.agent_definition_digest == observed_definition_digest {
+            tx.commit()?;
+            return Ok((current, false, None));
+        }
+        let next_generation = current
+            .generation
+            .checked_add(1)
+            .ok_or_else(|| RoomStoreError::Encode("room-agent generation is exhausted".into()))?;
+        tx.execute(
+            "UPDATE room_agent_bindings
+                SET status = 'stale', generation = ?3
+              WHERE room_id = ?1 AND agent_member_id = ?2",
+            params![
+                key.as_str(),
+                agent_member_id,
+                write_u64_text(next_generation),
+            ],
+        )?;
+        let updated = RoomAgentBinding {
+            status: AgentBindingStatus::Stale,
+            generation: next_generation,
+            ..current.clone()
+        };
+        let audit = Self::insert_room_agent_authority_audit_on(
+            &tx,
+            key,
+            RoomAgentAuthorityAudit {
+                action: "admission",
+                agent_member_id: &updated.agent_member_id,
+                agent_package_id: &updated.agent_package_id,
+                previous_definition_digest: Some(&updated.agent_definition_digest),
+                agent_definition_digest: observed_definition_digest,
+                generation: updated.generation,
+                operator_principal_id: &updated.authorized_by,
+                decision_id: &updated.decision_id,
+                admission_id: Some(admission_id),
+                outcome: "refused",
+                reason_code: "binding_stale",
+            },
+            now,
+        )?;
+        tx.commit()?;
+        Ok((updated, true, Some(audit)))
+    }
+
+    /// Final generation check for a previously planned admission.
+    pub fn room_agent_generation_is_active(
+        &self,
+        key: &RoomKey,
+        agent_member_id: &str,
+        expected_generation: u64,
+    ) -> Result<bool> {
+        Ok(self
+            .room_agent_binding(key, agent_member_id)?
+            .is_some_and(|binding| {
+                binding.status == AgentBindingStatus::Active
+                    && binding.generation == expected_generation
+            }))
+    }
+
+    /// Append one content-minimal admission allow/refusal fact durably.
+    ///
+    /// Digest-drift callers use [`Self::mark_room_agent_stale`] instead because
+    /// the state transition and refusal audit must share one transaction.
+    pub fn append_room_agent_admission_audit(
+        &mut self,
+        key: &RoomKey,
+        input: RoomAgentAdmissionAuditInput,
+        now: DateTime<Utc>,
+    ) -> Result<RoomMessage> {
+        if input.admission_id.trim().is_empty()
+            || input.agent_member_id.trim().is_empty()
+            || input.agent_package_id.trim().is_empty()
+            || input.observed_definition_digest.trim().is_empty()
+            || input.outcome.trim().is_empty()
+            || input.reason_code.trim().is_empty()
+        {
+            return Err(RoomStoreError::Encode(
+                "admission audit identity, digest, outcome, and reason are required".into(),
+            ));
+        }
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let room_open: Option<i64> = tx
+            .query_row(
+                "SELECT 1 FROM rooms WHERE id = ?1 AND closed_at IS NULL",
+                params![key.as_str()],
+                |row| row.get(0),
+            )
+            .optional()?;
+        if room_open.is_none() {
+            return Err(RoomStoreError::UnknownRoom(key.clone()));
+        }
+        let body = serde_json::to_string(&serde_json::json!({
+            "type": "room.agent.admission",
+            "room_id": key.as_str(),
+            "admission_id": input.admission_id,
+            "agent_member_id": input.agent_member_id,
+            "agent_package_id": input.agent_package_id,
+            "approved_definition_digest": input.approved_definition_digest,
+            "observed_definition_digest": input.observed_definition_digest,
+            "generation": input.generation.map(|value| value.to_string()),
+            "operator_principal_id": input.operator_principal_id,
+            "decision_id": input.decision_id,
+            "outcome": input.outcome,
+            "reason_code": input.reason_code,
+        }))
+        .map_err(|error| RoomStoreError::Encode(error.to_string()))?;
+        let message = Self::insert_message_on(
+            &tx,
+            key,
+            MessageDraft {
+                author_id: "system",
+                author_kind: RoomParticipantKind::System,
+                kind: RoomMessageKind::System,
+                body: &body,
+                thread_parent_seq: None,
+                session_id: None,
+                attachment_id: None,
+            },
+            now,
+        )?;
+        Self::touch_on(&tx, key, now)?;
+        tx.commit()?;
+        Ok(message)
+    }
+
     /// Apply one replay-safe status decision, bumping the generation when the
     /// status changes so anything planned against the old authority is
     /// refused.
@@ -4550,7 +5404,7 @@ impl SqliteRoomStore {
         agent_member_id: &str,
         input: SetAgentBindingStatusInput,
         now: DateTime<Utc>,
-    ) -> Result<(RoomAgentBinding, bool)> {
+    ) -> Result<(RoomAgentBinding, bool, Option<RoomMessage>)> {
         if agent_member_id.trim().is_empty()
             || input.actor.trim().is_empty()
             || input.decision_id.trim().is_empty()
@@ -4616,7 +5470,7 @@ impl SqliteRoomStore {
                     agent: agent_member_id.to_string(),
                 })?;
             tx.commit()?;
-            return Ok((existing, false));
+            return Ok((existing, false, None));
         }
 
         let to = input.status;
@@ -4714,8 +5568,70 @@ impl SqliteRoomStore {
                 room: key.clone(),
                 agent: agent_member_id.to_string(),
             })?;
+        let audit = Self::insert_room_agent_authority_audit_on(
+            &tx,
+            key,
+            RoomAgentAuthorityAudit {
+                action: "status",
+                agent_member_id: &updated.agent_member_id,
+                agent_package_id: &updated.agent_package_id,
+                previous_definition_digest: None,
+                agent_definition_digest: &updated.agent_definition_digest,
+                generation: updated.generation,
+                operator_principal_id: &input.actor,
+                decision_id: &updated.decision_id,
+                admission_id: None,
+                outcome: updated.status.as_str(),
+                reason_code: if current.status == updated.status {
+                    "status_already_set"
+                } else {
+                    "operator_status_decision"
+                },
+            },
+            now,
+        )?;
         tx.commit()?;
-        Ok((updated, true))
+        Ok((updated, true, Some(audit)))
+    }
+
+    fn insert_room_agent_authority_audit_on(
+        conn: &Connection,
+        key: &RoomKey,
+        fact: RoomAgentAuthorityAudit<'_>,
+        now: DateTime<Utc>,
+    ) -> Result<RoomMessage> {
+        let body = serde_json::to_string(&serde_json::json!({
+            "type": "room.agent.authority",
+            "action": fact.action,
+            "room_id": key.as_str(),
+            "agent_member_id": fact.agent_member_id,
+            "agent_package_id": fact.agent_package_id,
+            "previous_definition_digest": fact.previous_definition_digest,
+            "agent_definition_digest": fact.agent_definition_digest,
+            "generation": fact.generation.to_string(),
+            "operator_principal_id": fact.operator_principal_id,
+            "decision_id": fact.decision_id,
+            "admission_id": fact.admission_id,
+            "outcome": fact.outcome,
+            "reason_code": fact.reason_code,
+        }))
+        .map_err(|error| RoomStoreError::Encode(error.to_string()))?;
+        let message = Self::insert_message_on(
+            conn,
+            key,
+            MessageDraft {
+                author_id: "system",
+                author_kind: RoomParticipantKind::System,
+                kind: RoomMessageKind::System,
+                body: &body,
+                thread_parent_seq: None,
+                session_id: None,
+                attachment_id: None,
+            },
+            now,
+        )?;
+        Self::touch_on(conn, key, now)?;
+        Ok(message)
     }
 
     fn binding_from_row(
@@ -5321,6 +6237,63 @@ impl SqliteRoomStore {
     /// starting at 1; exhausting `u64::MAX` fails closed rather than reusing
     /// a value. Concurrent callers on the same DB file are serialized by the
     /// `IMMEDIATE` write lock, so no sequence is ever allocated twice.
+    #[allow(clippy::too_many_arguments)]
+    fn allocate_outbox_pending_on(
+        conn: &Connection,
+        key: &RoomKey,
+        author_member_id: &str,
+        client_event_id: &str,
+        event_type: &str,
+        payload: serde_json::Value,
+        mention_member_ids: Vec<String>,
+    ) -> Result<RoomOutboxItem> {
+        let instance_id = Self::federation_instance_id_on(conn)?;
+        let cur: Option<String> = conn
+            .query_row(
+                "SELECT next_sequence FROM producer_counters
+                 WHERE room_id = ?1 AND author_member_id = ?2",
+                params![key.as_str(), author_member_id],
+                |r| r.get(0),
+            )
+            .optional()?;
+        let next = match cur {
+            None => 1u64,
+            Some(t) => parse_canonical_u64_text(&t)?,
+        };
+        let after = next.checked_add(1).ok_or_else(|| {
+            RoomStoreError::FederationCorruption("producer counter exhausted at u64::MAX".into())
+        })?;
+        conn.execute(
+            "INSERT INTO producer_counters (room_id, author_member_id, next_sequence)
+             VALUES (?1, ?2, ?3)
+             ON CONFLICT(room_id, author_member_id) DO UPDATE SET
+               next_sequence = excluded.next_sequence",
+            params![key.as_str(), author_member_id, write_u64_text(after)],
+        )?;
+        let pos: i64 = conn.query_row(
+            "SELECT COALESCE(MAX(position) + 1, 0) FROM outbox WHERE room_id = ?1",
+            params![key.as_str()],
+            |r| r.get(0),
+        )?;
+        let item = RoomOutboxItem {
+            client_event_id: client_event_id.to_string(),
+            source_id: format!(
+                "room:{}:member:{}:producer:{}",
+                key.as_str(),
+                author_member_id,
+                instance_id
+            ),
+            source_sequence: next,
+            author_member_id: author_member_id.to_string(),
+            event_type: event_type.to_string(),
+            payload,
+            mention_member_ids,
+            state: OutboxItemState::Pending,
+        };
+        Self::insert_outbox_item_on(conn, key, &item, pos as usize)?;
+        Ok(item)
+    }
+
     pub fn allocate_outbox_pending(
         &mut self,
         key: &RoomKey,
@@ -5348,52 +6321,95 @@ impl SqliteRoomStore {
         if room_exists.is_none() {
             return Err(RoomStoreError::UnknownRoom(key.clone()));
         }
-        let instance_id = Self::federation_instance_id_on(&tx)?;
-        let cur: Option<String> = tx
-            .query_row(
-                "SELECT next_sequence FROM producer_counters
-                 WHERE room_id = ?1 AND author_member_id = ?2",
-                params![key.as_str(), author_member_id],
-                |r| r.get(0),
-            )
-            .optional()?;
-        let next = match cur {
-            None => 1u64,
-            Some(t) => parse_canonical_u64_text(&t)?,
-        };
-        let after = next.checked_add(1).ok_or_else(|| {
-            RoomStoreError::FederationCorruption("producer counter exhausted at u64::MAX".into())
-        })?;
-        tx.execute(
-            "INSERT INTO producer_counters (room_id, author_member_id, next_sequence)
-             VALUES (?1, ?2, ?3)
-             ON CONFLICT(room_id, author_member_id) DO UPDATE SET
-               next_sequence = excluded.next_sequence",
-            params![key.as_str(), author_member_id, write_u64_text(after)],
-        )?;
-        let pos: i64 = tx.query_row(
-            "SELECT COALESCE(MAX(position) + 1, 0) FROM outbox WHERE room_id = ?1",
-            params![key.as_str()],
-            |r| r.get(0),
-        )?;
-        let item = RoomOutboxItem {
-            client_event_id: client_event_id.to_string(),
-            source_id: format!(
-                "room:{}:member:{}:producer:{}",
-                key.as_str(),
-                author_member_id,
-                instance_id
-            ),
-            source_sequence: next,
-            author_member_id: author_member_id.to_string(),
-            event_type: event_type.to_string(),
+        let item = Self::allocate_outbox_pending_on(
+            &tx,
+            key,
+            author_member_id,
+            client_event_id,
+            event_type,
             payload,
             mention_member_ids,
-            state: OutboxItemState::Pending,
-        };
-        Self::insert_outbox_item_on(&tx, key, &item, pos as usize)?;
+        )?;
         tx.commit()?;
         Ok(item)
+    }
+
+    /// Atomically allocate a federated room-agent output and its exact
+    /// generation/admission audit correlation.
+    ///
+    /// The binding check, producer counter advance, Pending outbox insert, audit
+    /// transcript insert, and room timestamp touch share one `IMMEDIATE`
+    /// transaction. A racing suspend/revoke/re-authorization therefore orders
+    /// wholly before this commit (and refuses it) or wholly after it; there is
+    /// no checked-then-enqueued gap.
+    #[allow(clippy::too_many_arguments)]
+    pub fn allocate_authorized_agent_outbox(
+        &mut self,
+        key: &RoomKey,
+        agent_member_id: &str,
+        expected_generation: u64,
+        admission_id: &str,
+        client_event_id: &str,
+        body: &str,
+        mention_member_ids: Vec<String>,
+        now: DateTime<Utc>,
+    ) -> Result<AuthorizedRoomAgentOutboxCommit> {
+        if agent_member_id.trim().is_empty()
+            || admission_id.trim().is_empty()
+            || client_event_id.trim().is_empty()
+        {
+            return Err(RoomStoreError::Encode(
+                "authorized output identity is required".into(),
+            ));
+        }
+        if !self.room_is_open(key)? {
+            return Err(RoomStoreError::UnknownRoom(key.clone()));
+        }
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let binding =
+            Self::authorized_room_agent_binding_on(&tx, key, agent_member_id, expected_generation)?;
+        let outbox = Self::allocate_outbox_pending_on(
+            &tx,
+            key,
+            agent_member_id,
+            client_event_id,
+            "message",
+            serde_json::json!({"body": body}),
+            mention_member_ids,
+        )?;
+        let audit_body = serde_json::to_string(&serde_json::json!({
+            "type": "room.agent.output",
+            "room_id": key.as_str(),
+            "admission_id": admission_id,
+            "agent_member_id": agent_member_id,
+            "agent_package_id": binding.agent_package_id,
+            "generation": expected_generation.to_string(),
+            "client_event_id": outbox.client_event_id,
+            "source_id": outbox.source_id,
+            "source_sequence": outbox.source_sequence.to_string(),
+            "outcome": "enqueued_remote",
+            "reason_code": "bedrock_delivery_pending",
+        }))
+        .map_err(|error| RoomStoreError::Encode(error.to_string()))?;
+        let audit = Self::insert_message_on(
+            &tx,
+            key,
+            MessageDraft {
+                author_id: "system",
+                author_kind: RoomParticipantKind::System,
+                kind: RoomMessageKind::System,
+                body: &audit_body,
+                thread_parent_seq: None,
+                session_id: None,
+                attachment_id: None,
+            },
+            now,
+        )?;
+        Self::touch_on(&tx, key, now)?;
+        tx.commit()?;
+        Ok(AuthorizedRoomAgentOutboxCommit { outbox, audit })
     }
 
     /// List the room's Pending outbox rows in stable producer order (P2-A) —
@@ -6082,6 +7098,242 @@ mod tests {
     }
 
     #[test]
+    fn local_room_agent_bootstrap_is_atomic_idempotent_and_non_authorizing() {
+        let mut s = store();
+        let key = RoomKey::new("bootstrap-room");
+        s.create(key.clone(), "Bootstrap", None, now()).unwrap();
+        s.add_participant(&key, human("human-1", "Human One"), now())
+            .unwrap();
+        let agent = RoomParticipant {
+            id: "builder".into(),
+            kind: RoomParticipantKind::Agent,
+            display_name: "Builder".into(),
+        };
+
+        let first = s
+            .bootstrap_local_room_agent(
+                &key,
+                "human-1",
+                agent.clone(),
+                "builder",
+                "operator-1",
+                now(),
+            )
+            .unwrap();
+        assert!(first.created);
+        assert_eq!(
+            first.participant_message.as_ref().unwrap().author_id,
+            "builder"
+        );
+        let bootstrap_audit: serde_json::Value =
+            serde_json::from_str(&first.audit_message.as_ref().expect("bootstrap audit").body)
+                .unwrap();
+        assert_eq!(bootstrap_audit["type"], "room.agent.bootstrap");
+        assert_eq!(bootstrap_audit["operator_principal_id"], "operator-1");
+        assert!(first
+            .room
+            .participants
+            .iter()
+            .any(|participant| participant == &agent));
+        assert_eq!(
+            s.local_room_owner(&key).unwrap(),
+            Some(LocalRoomOwnerRole {
+                member_id: "human-1".into(),
+                eligible: true,
+            })
+        );
+        let established_by: String = s
+            .conn
+            .query_row(
+                "SELECT established_by FROM room_local_roles
+                  WHERE room_id = ?1 AND role = 'owner'",
+                params![key.as_str()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(established_by, "operator-1");
+        assert_eq!(
+            s.agent_owners(&key).unwrap(),
+            vec![("builder".into(), "human-1".into(), true)]
+        );
+        assert!(s.room_agent_binding(&key, "builder").unwrap().is_none());
+        assert!(s
+            .room_agent_decision(&key, "unused-decision")
+            .unwrap()
+            .is_none());
+
+        let transcript_before_replay = s.transcript(&key, None).unwrap();
+        let replay = s
+            .bootstrap_local_room_agent(&key, "human-1", agent, "builder", "operator-1", now())
+            .unwrap();
+        assert!(!replay.created);
+        assert!(replay.participant_message.is_none());
+        assert!(replay.audit_message.is_none());
+        assert_eq!(s.transcript(&key, None).unwrap(), transcript_before_replay);
+
+        s.add_participant(&key, human("human-2", "Human Two"), now())
+            .unwrap();
+        let before_conflict = s.transcript(&key, None).unwrap();
+        let error = s
+            .bootstrap_local_room_agent(
+                &key,
+                "human-2",
+                RoomParticipant {
+                    id: "reviewer".into(),
+                    kind: RoomParticipantKind::Agent,
+                    display_name: "Reviewer".into(),
+                },
+                "reviewer",
+                "operator-1",
+                now(),
+            )
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            RoomStoreError::LocalRoomOwnerConflict { .. }
+        ));
+        assert_eq!(s.transcript(&key, None).unwrap(), before_conflict);
+        assert!(!s
+            .get(&key)
+            .unwrap()
+            .unwrap()
+            .room
+            .participants
+            .iter()
+            .any(|participant| participant.id == "reviewer"));
+    }
+
+    #[test]
+    fn existing_agent_label_bootstrap_writes_one_audit_then_replay_writes_none() {
+        let mut s = store();
+        let key = RoomKey::new("existing-label-bootstrap");
+        s.create(key.clone(), "Existing Label", None, now())
+            .unwrap();
+        s.add_participant(&key, human("human-1", "Human One"), now())
+            .unwrap();
+        let agent = RoomParticipant {
+            id: "builder".into(),
+            kind: RoomParticipantKind::Agent,
+            display_name: "Builder".into(),
+        };
+        s.add_agent_participant_with_owner(&key, agent.clone(), "human-1", now())
+            .unwrap();
+        let before = s.transcript(&key, None).unwrap();
+
+        let first = s
+            .bootstrap_local_room_agent(
+                &key,
+                "human-1",
+                agent.clone(),
+                "builder",
+                "operator-1",
+                now(),
+            )
+            .unwrap();
+        assert!(first.created);
+        assert!(first.participant_message.is_none());
+        assert_eq!(
+            s.transcript(&key, None).unwrap().len(),
+            before.len() + 1,
+            "role-only bootstrap writes exactly its authority audit"
+        );
+        let audit: serde_json::Value =
+            serde_json::from_str(&first.audit_message.unwrap().body).unwrap();
+        assert_eq!(audit["type"], "room.agent.bootstrap");
+        assert_eq!(audit["agent_member_id"], "builder");
+
+        let before_replay = s.transcript(&key, None).unwrap();
+        let replay = s
+            .bootstrap_local_room_agent(&key, "human-1", agent, "builder", "operator-1", now())
+            .unwrap();
+        assert!(!replay.created);
+        assert!(replay.participant_message.is_none());
+        assert!(replay.audit_message.is_none());
+        assert_eq!(s.transcript(&key, None).unwrap(), before_replay);
+    }
+
+    #[test]
+    fn local_room_agent_bootstrap_refuses_federated_room_without_local_role() {
+        let mut s = store();
+        let key = RoomKey::new("federated-bootstrap");
+        s.create(key.clone(), "Federated", None, now()).unwrap();
+        s.add_participant(&key, human("human-1", "Human One"), now())
+            .unwrap();
+        s.install_room_credential(&key, "private-bearer", "human-1")
+            .unwrap();
+        let transcript_before = s.transcript(&key, None).unwrap();
+        let error = s
+            .bootstrap_local_room_agent(
+                &key,
+                "human-1",
+                RoomParticipant {
+                    id: "builder".into(),
+                    kind: RoomParticipantKind::Agent,
+                    display_name: "Builder".into(),
+                },
+                "builder",
+                "operator-1",
+                now(),
+            )
+            .unwrap_err();
+        assert!(matches!(error, RoomStoreError::RoomNotLocal(_)));
+        assert!(s.local_room_owner(&key).unwrap().is_none());
+        assert_eq!(s.transcript(&key, None).unwrap(), transcript_before);
+    }
+
+    #[test]
+    fn local_role_migration_is_additive_idempotent_and_fail_closed_on_rollback() {
+        let mut s = store();
+        let key = RoomKey::new("role-migration");
+        s.create(key.clone(), "Role Migration", None, now())
+            .unwrap();
+        s.add_participant(&key, human("human-1", "Human One"), now())
+            .unwrap();
+        s.conn
+            .execute_batch(
+                "DROP INDEX idx_room_local_roles_one_owner;
+                 DROP TABLE room_local_roles;",
+            )
+            .unwrap();
+
+        s.migrate().unwrap();
+        s.migrate().unwrap();
+        assert!(s.local_room_owner(&key).unwrap().is_none());
+        assert!(s
+            .get(&key)
+            .unwrap()
+            .unwrap()
+            .room
+            .participants
+            .iter()
+            .any(|participant| participant.id == "human-1"));
+
+        s.bootstrap_local_room_agent(
+            &key,
+            "human-1",
+            RoomParticipant {
+                id: "builder".into(),
+                kind: RoomParticipantKind::Agent,
+                display_name: "Builder".into(),
+            },
+            "builder",
+            "operator-1",
+            now(),
+        )
+        .unwrap();
+        s.conn
+            .execute_batch(
+                "DROP INDEX idx_room_local_roles_one_owner;
+                 DROP TABLE room_local_roles;",
+            )
+            .unwrap();
+        assert!(s.room_agent_binding(&key, "builder").unwrap().is_none());
+        assert!(s.get(&key).unwrap().is_some());
+        s.migrate().unwrap();
+        assert!(s.local_room_owner(&key).unwrap().is_none());
+    }
+
+    #[test]
     fn authorize_creates_an_active_binding_at_generation_one() {
         let (s, key) = room_with_agent("agent-1");
         let b = s.room_agent_binding(&key, "agent-1").unwrap().unwrap();
@@ -6120,7 +7372,7 @@ mod tests {
     #[test]
     fn replaying_a_decision_with_identical_content_is_idempotent() {
         let (mut s, key) = room_with_agent("agent-1");
-        let (b, created) = s
+        let (b, created, _audit) = s
             .authorize_room_agent(&key, auth_input("agent-1", "dec-1", "digest-1"), now())
             .unwrap();
         assert!(!created, "a replay must not create a second binding");
@@ -6168,7 +7420,7 @@ mod tests {
         let (mut s, key) = room_with_agent("agent-1");
         let mut next = auth_input("agent-1", "dec-2", "digest-2");
         next.agent_definition_digest = "sha256:def-2".into();
-        let (b, created) = s.authorize_room_agent(&key, next, now()).unwrap();
+        let (b, created, _audit) = s.authorize_room_agent(&key, next, now()).unwrap();
         assert!(created);
         assert_eq!(b.agent_member_id, "agent-1", "identity must be stable");
         assert_eq!(b.generation, 2);
@@ -6260,7 +7512,7 @@ mod tests {
 
         // Replaying the original approval exactly is a no-op against the
         // current binding; it must not roll authority back to generation 1.
-        let (current, created) = s
+        let (current, created, _audit) = s
             .authorize_room_agent(&key, auth_input("agent-1", "dec-1", "digest-1"), now())
             .unwrap();
         assert!(!created);
@@ -6284,7 +7536,7 @@ mod tests {
     fn replaying_a_status_decision_is_idempotent() {
         let (mut s, key) = room_with_agent("agent-1");
         let input = status_input(AgentBindingStatus::Suspended, "dec-2", "suspend-2");
-        let (first, applied) = s
+        let (first, applied, _audit) = s
             .set_room_agent_binding_status(&key, "agent-1", input.clone(), now())
             .unwrap();
         assert!(applied);
@@ -6292,7 +7544,7 @@ mod tests {
         assert_eq!(first.generation, 2);
         assert_eq!(first.decision_id, "dec-2");
 
-        let (replayed, applied) = s
+        let (replayed, applied, _audit) = s
             .set_room_agent_binding_status(&key, "agent-1", input, now())
             .unwrap();
         assert!(!applied);
@@ -6344,7 +7596,7 @@ mod tests {
     #[test]
     fn a_new_noop_status_decision_is_consumed_without_bumping_generation() {
         let (mut s, key) = room_with_agent("agent-1");
-        let (binding, applied) = s
+        let (binding, applied, _audit) = s
             .set_room_agent_binding_status(
                 &key,
                 "agent-1",
@@ -6363,7 +7615,7 @@ mod tests {
     fn suspended_and_stale_refuse_admission_and_bump_generation() {
         for to in [AgentBindingStatus::Suspended, AgentBindingStatus::Stale] {
             let (mut s, key) = room_with_agent("agent-1");
-            let (b, applied) = s
+            let (b, applied, _audit) = s
                 .set_room_agent_binding_status(
                     &key,
                     "agent-1",
@@ -6409,7 +7661,7 @@ mod tests {
 
         // Revocation remains the only status transition available without a
         // fresh authorization decision.
-        let (revoked, applied) = s
+        let (revoked, applied, _audit) = s
             .set_room_agent_binding_status(
                 &key,
                 "agent-1",
@@ -6484,6 +7736,287 @@ mod tests {
         let final_binding = first.room_agent_binding(&key, "agent-1").unwrap().unwrap();
         assert_eq!(final_binding.status, AgentBindingStatus::Stale);
         assert_eq!(final_binding.generation, 3);
+    }
+
+    #[test]
+    fn authority_mutation_and_content_minimal_audit_commit_once() {
+        let mut s = store();
+        let key = RoomKey::new("hq");
+        s.create(key.clone(), "HQ", None, now()).unwrap();
+        let (_binding, created, audit) = s
+            .authorize_room_agent(&key, auth_input("agent-1", "dec-1", "digest-1"), now())
+            .unwrap();
+        assert!(created);
+        let audit = audit.expect("new authority must return its committed audit row");
+        let body: serde_json::Value = serde_json::from_str(&audit.body).unwrap();
+        assert_eq!(body["type"], "room.agent.authority");
+        assert_eq!(body["generation"], "1");
+        assert!(body.get("room_capability_grants").is_none());
+        assert!(body.get("operator_credential").is_none());
+
+        let (_binding, created, replay_audit) = s
+            .authorize_room_agent(&key, auth_input("agent-1", "dec-1", "digest-1"), now())
+            .unwrap();
+        assert!(!created);
+        assert!(
+            replay_audit.is_none(),
+            "an exact retry cannot duplicate audit"
+        );
+    }
+
+    #[test]
+    fn digest_drift_marks_stale_and_audits_in_one_transaction() {
+        let (mut s, key) = room_with_agent("agent-1");
+        let (binding, changed, audit) = s
+            .mark_room_agent_stale(
+                &key,
+                "agent-1",
+                1,
+                "sha256:def-1",
+                "sha256:def-2",
+                "admission-1",
+                now(),
+            )
+            .unwrap();
+        assert!(changed);
+        assert_eq!(binding.status, AgentBindingStatus::Stale);
+        assert_eq!(binding.generation, 2);
+        let body: serde_json::Value =
+            serde_json::from_str(&audit.expect("stale audit").body).unwrap();
+        assert_eq!(body["admission_id"], "admission-1");
+        assert_eq!(body["reason_code"], "binding_stale");
+    }
+
+    #[test]
+    fn authorized_reply_is_generation_checked_and_correlated() {
+        let (mut s, key) = room_with_agent("agent-1");
+        let (reply, audit) = s
+            .append_authorized_agent_reply(
+                &key,
+                "agent-1",
+                1,
+                "admission-1",
+                "done",
+                now(),
+                None,
+                "session-generation-1",
+            )
+            .unwrap();
+        let body: serde_json::Value = serde_json::from_str(&audit.body).unwrap();
+        assert_eq!(body["type"], "room.agent.output");
+        assert_eq!(body["admission_id"], "admission-1");
+        assert_eq!(body["message_seq"], reply.seq.to_string());
+        assert_eq!(reply.session_id.as_deref(), Some("session-generation-1"));
+
+        s.set_room_agent_binding_status(
+            &key,
+            "agent-1",
+            status_input(AgentBindingStatus::Suspended, "dec-2", "suspend-2"),
+            now(),
+        )
+        .unwrap();
+        let before = s.transcript(&key, None).unwrap().len();
+        let error = s
+            .append_authorized_agent_reply(
+                &key,
+                "agent-1",
+                1,
+                "admission-1",
+                "late output",
+                now(),
+                None,
+                "session-generation-1",
+            )
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            ThreadAppendError::Store(RoomStoreError::AgentBindingStatusConflict { .. })
+        ));
+        assert_eq!(s.transcript(&key, None).unwrap().len(), before);
+    }
+
+    #[test]
+    fn authorized_remote_output_allocates_outbox_and_exact_audit_atomically() {
+        let (mut s, key) = room_with_agent("agent-1");
+        let before = s.transcript(&key, None).unwrap().len();
+        let committed = s
+            .allocate_authorized_agent_outbox(
+                &key,
+                "agent-1",
+                1,
+                "admission-remote-1",
+                "client-event-1",
+                "remote answer",
+                vec!["human-1".into()],
+                now(),
+            )
+            .unwrap();
+        assert_eq!(committed.outbox.author_member_id, "agent-1");
+        assert_eq!(committed.outbox.source_sequence, 1);
+        assert_eq!(
+            s.pending_outbox(&key).unwrap(),
+            vec![committed.outbox.clone()]
+        );
+        let audit: serde_json::Value = serde_json::from_str(&committed.audit.body).unwrap();
+        assert_eq!(audit["type"], "room.agent.output");
+        assert_eq!(audit["admission_id"], "admission-remote-1");
+        assert_eq!(audit["generation"], "1");
+        assert_eq!(audit["client_event_id"], "client-event-1");
+        assert_eq!(
+            audit["source_sequence"],
+            committed.outbox.source_sequence.to_string()
+        );
+        assert_eq!(s.transcript(&key, None).unwrap().len(), before + 1);
+
+        s.set_room_agent_binding_status(
+            &key,
+            "agent-1",
+            status_input(AgentBindingStatus::Suspended, "dec-2", "suspend-2"),
+            now(),
+        )
+        .unwrap();
+        let outbox_before = s.pending_outbox(&key).unwrap();
+        let transcript_before = s.transcript(&key, None).unwrap();
+        let error = s
+            .allocate_authorized_agent_outbox(
+                &key,
+                "agent-1",
+                1,
+                "admission-remote-1",
+                "client-event-late",
+                "late answer",
+                Vec::new(),
+                now(),
+            )
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            RoomStoreError::AgentBindingStatusConflict { .. }
+        ));
+        assert_eq!(s.pending_outbox(&key).unwrap(), outbox_before);
+        assert_eq!(s.transcript(&key, None).unwrap(), transcript_before);
+    }
+
+    #[test]
+    fn failed_turn_is_generation_checked_and_never_accepts_stderr_content() {
+        let (mut s, key) = room_with_agent("agent-1");
+        let (failure, audit) = s
+            .append_authorized_agent_failure(
+                &key,
+                "agent-1",
+                1,
+                "admission-failure-1",
+                now(),
+                "session-generation-1",
+            )
+            .unwrap();
+        assert_eq!(failure.body, "auto-convene failed for agent-1: turn_failed");
+        assert!(!failure.body.contains("provider-secret"));
+        let audit: serde_json::Value = serde_json::from_str(&audit.body).unwrap();
+        assert_eq!(audit["outcome"], "failed");
+        assert_eq!(audit["reason_code"], "turn_failed");
+        assert_eq!(audit["generation"], "1");
+
+        s.set_room_agent_binding_status(
+            &key,
+            "agent-1",
+            status_input(AgentBindingStatus::Suspended, "dec-2", "suspend-2"),
+            now(),
+        )
+        .unwrap();
+        let before = s.transcript(&key, None).unwrap();
+        let error = s
+            .append_authorized_agent_failure(
+                &key,
+                "agent-1",
+                1,
+                "admission-failure-1",
+                now(),
+                "session-generation-1",
+            )
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            RoomStoreError::AgentBindingStatusConflict { .. }
+        ));
+        assert_eq!(s.transcript(&key, None).unwrap(), before);
+    }
+
+    #[test]
+    fn authorized_room_history_is_exact_scope_newest_first_and_generation_bound() {
+        let (mut s, key) = room_with_agent("agent-1");
+        let other = RoomKey::new("other-room");
+        s.create(other.clone(), "Other", None, now()).unwrap();
+        s.append_message(
+            &other,
+            "other-human",
+            RoomParticipantKind::Human,
+            RoomMessageKind::Message,
+            "cross-room-secret",
+            now(),
+        )
+        .unwrap();
+        let mut seqs = Vec::new();
+        for index in 0..5 {
+            seqs.push(
+                s.append_message(
+                    &key,
+                    "human-1",
+                    RoomParticipantKind::Human,
+                    RoomMessageKind::Message,
+                    &format!("room-row-{index}"),
+                    now(),
+                )
+                .unwrap()
+                .seq,
+            );
+        }
+
+        let first = s
+            .authorized_room_history_page(&key, "agent-1", 1, None, 2)
+            .unwrap();
+        assert!(first.has_more);
+        assert_eq!(
+            first
+                .messages
+                .iter()
+                .map(|message| message.seq)
+                .collect::<Vec<_>>(),
+            vec![seqs[4], seqs[3]]
+        );
+        assert!(first
+            .messages
+            .iter()
+            .all(|message| !message.body.contains("cross-room-secret")));
+
+        let second = s
+            .authorized_room_history_page(&key, "agent-1", 1, Some(seqs[3]), 2)
+            .unwrap();
+        assert_eq!(
+            second
+                .messages
+                .iter()
+                .map(|message| message.seq)
+                .collect::<Vec<_>>(),
+            vec![seqs[2], seqs[1]],
+            "before_seq is strict and pages backward without overlap"
+        );
+        assert!(matches!(
+            s.authorized_room_history_page(&other, "agent-1", 1, None, 2),
+            Err(RoomStoreError::UnknownAgentBinding { .. })
+        ));
+
+        s.set_room_agent_binding_status(
+            &key,
+            "agent-1",
+            status_input(AgentBindingStatus::Suspended, "dec-2", "suspend-2"),
+            now(),
+        )
+        .unwrap();
+        assert!(matches!(
+            s.authorized_room_history_page(&key, "agent-1", 1, None, 2),
+            Err(RoomStoreError::AgentBindingStatusConflict { .. })
+        ));
     }
 
     #[test]
@@ -6685,7 +8218,7 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(binding.generation, 7);
-        let (replayed, created) = s
+        let (replayed, created, _audit) = s
             .authorize_room_agent(
                 &RoomKey::new("hq"),
                 auth_input("agent-1", "dec-1", "digest-1"),

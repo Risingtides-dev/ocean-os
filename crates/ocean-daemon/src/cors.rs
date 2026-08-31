@@ -91,7 +91,11 @@ pub(super) fn cors_layer(extra_origins: Vec<String>) -> CorsLayer {
             is_trusted_origin(origin, &extra_origins)
         }))
         .allow_methods(cors_allowed_methods())
-        .allow_headers([header::CONTENT_TYPE, header::AUTHORIZATION])
+        .allow_headers([
+            header::CONTENT_TYPE,
+            header::AUTHORIZATION,
+            axum::http::HeaderName::from_static(crate::room_operator::OPERATOR_HEADER),
+        ])
 }
 
 #[cfg(test)]

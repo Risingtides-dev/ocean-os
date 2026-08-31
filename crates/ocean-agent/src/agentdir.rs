@@ -20,6 +20,7 @@
 //! so an operator edits a prompt and the next turn picks it up (same hot-read
 //! contract as the existing surface profiles).
 
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -272,6 +273,104 @@ pub fn resolve(root: &Path, name: &str) -> Result<AgentDef, ResolveError> {
         tools,
         subagents,
     })
+}
+
+/// Resolve an agent exclusively from an immutable, caller-captured file map.
+///
+/// Keys are normalized `/`-separated paths relative to the agent directory.
+/// The caller owns filesystem confinement and captures every file before this
+/// function runs; parsing never reopens a pathname. This lets authorization
+/// layers bind the exact bytes they hashed to the runtime profile they admit.
+pub fn resolve_snapshot(
+    root: &Path,
+    name: &str,
+    files: &BTreeMap<String, Vec<u8>>,
+) -> Result<AgentDef, ResolveError> {
+    if name.is_empty() || name.contains('/') || name.contains('\\') || name.contains("..") {
+        return Err(ResolveError::InvalidName(name.to_string()));
+    }
+    let has_instructions = files.contains_key("instructions.md");
+    let has_config = files.contains_key("agent.toml");
+    if !has_instructions && !has_config {
+        return Err(ResolveError::NotFound(name.to_string()));
+    }
+
+    let config = match files.get("agent.toml") {
+        Some(bytes) => {
+            let raw = std::str::from_utf8(bytes)
+                .map_err(|error| ResolveError::Io(root.join("agent.toml"), error.to_string()))?;
+            toml::from_str(raw)
+                .map_err(|error| ResolveError::Config(name.to_string(), error.to_string()))?
+        }
+        None => AgentConfig::default(),
+    };
+    let instructions = match files.get("instructions.md") {
+        Some(bytes) => std::str::from_utf8(bytes)
+            .map_err(|error| ResolveError::Io(root.join("instructions.md"), error.to_string()))?
+            .to_owned(),
+        None => String::new(),
+    };
+
+    let skills = snapshot_stems(files, "skills", Some("md"))
+        .into_iter()
+        .map(|name| Skill {
+            path: root.join("skills").join(format!("{name}.md")),
+            name,
+        })
+        .collect();
+    let tools = snapshot_stems(files, "tools", None);
+    let mut subagents = BTreeSet::new();
+    for relative in files.keys() {
+        let mut components = relative.split('/');
+        if components.next() != Some("subagents") {
+            continue;
+        }
+        let Some(child) = components.next() else {
+            continue;
+        };
+        let Some(slot) = components.next() else {
+            continue;
+        };
+        if components.next().is_none() && matches!(slot, "instructions.md" | "agent.toml") {
+            subagents.insert(child.to_string());
+        }
+    }
+
+    Ok(AgentDef {
+        name: name.to_string(),
+        root: root.to_path_buf(),
+        config,
+        instructions,
+        skills,
+        tools,
+        subagents: subagents.into_iter().collect(),
+    })
+}
+
+fn snapshot_stems(
+    files: &BTreeMap<String, Vec<u8>>,
+    directory: &str,
+    extension: Option<&str>,
+) -> Vec<String> {
+    let mut stems = BTreeSet::new();
+    for relative in files.keys() {
+        let Some((parent, file_name)) = relative.rsplit_once('/') else {
+            continue;
+        };
+        if parent != directory {
+            continue;
+        }
+        let path = Path::new(file_name);
+        if extension.is_some_and(|expected| {
+            path.extension().and_then(|value| value.to_str()) != Some(expected)
+        }) {
+            continue;
+        }
+        if let Some(stem) = path.file_stem().and_then(|value| value.to_str()) {
+            stems.insert(stem.to_string());
+        }
+    }
+    stems.into_iter().collect()
 }
 
 /// List `(stem, path)` for files directly under `dir`, optionally filtered by
@@ -957,6 +1056,38 @@ mod tests {
         assert!(def.skills.is_empty());
         assert!(def.effective_tools().is_empty());
         let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn snapshot_resolution_uses_only_captured_bytes() {
+        let root = PathBuf::from("/captured/agents/builder");
+        let mut files = BTreeMap::new();
+        files.insert(
+            "agent.toml".to_string(),
+            b"model = 'claude-sonnet-4-5'\ntools = ['read']\n".to_vec(),
+        );
+        files.insert(
+            "instructions.md".to_string(),
+            b"captured instructions\n".to_vec(),
+        );
+        files.insert("tools/check.sh".to_string(), b"#!/bin/sh\n".to_vec());
+        files.insert("skills/review.md".to_string(), b"captured skill\n".to_vec());
+        files.insert(
+            "subagents/worker/instructions.md".to_string(),
+            b"captured worker\n".to_vec(),
+        );
+
+        let definition = resolve_snapshot(&root, "builder", &files).unwrap();
+
+        assert_eq!(definition.root, root);
+        assert_eq!(definition.system_prompt(), Some("captured instructions"));
+        assert_eq!(
+            definition.config.model.as_deref(),
+            Some("claude-sonnet-4-5")
+        );
+        assert_eq!(definition.effective_tools(), vec!["read", "check"]);
+        assert_eq!(definition.skills[0].name, "review");
+        assert_eq!(definition.subagents, vec!["worker"]);
     }
 
     #[test]
