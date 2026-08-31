@@ -1087,6 +1087,57 @@ impl<'a> MessageDraft<'a> {
     }
 }
 
+/// How much of one caller-supplied field a marker sentence may quote.
+///
+/// A marker is a single line of transcript prose, and past this many
+/// characters a display name or a title has stopped identifying anything and
+/// started making every reader of the room scroll. The `participants` and
+/// `room_artifacts` rows still hold the value in full — this bounds only what
+/// the SENTENCE repeats, the way the daemon bounds a branch name at 64.
+const MARKER_FIELD_MAX_CHARS: usize = 128;
+
+/// Neutralize a caller-supplied string on its way into a system-attributed
+/// marker body.
+///
+/// This is a local copy of `bounded_prose` in
+/// `crates/ocean-daemon/src/room_federation.rs`, which carries the derivation
+/// and is the original: read it there before changing what is filtered here.
+/// The store cannot call it — `ocean-store` does not depend on `ocean-daemon`
+/// and the dependency runs the other way — so this is the same duplication,
+/// and the same obligation to name the original, that `ocean-bedrock`'s
+/// runtime carries for its copy of `READ_MAX_BYTES`. Hoisting the primitive
+/// into `ocean-core` so the two cannot drift is a three-crate change and
+/// belongs in its own slice.
+///
+/// The rule, stated rather than re-derived: drop control characters, drop `[`
+/// and `]`, bound the result — and nothing else. It is one pass where the
+/// daemon layers `bounded_prose` over `bounded_quotable`, because that split
+/// exists for `ci_run_url`, which wants the bound and the control rule without
+/// the prose rule, and no caller here does.
+///
+/// Why it is needed on THESE lines: ocean-surface renders every transcript row
+/// through `room_markdown::body_view` — a system-attributed row included,
+/// since `is_compact_system_row` only swaps the avatar for a Spark icon — and
+/// that tokenizer builds an anchor out of `[label](href)`. Without this, a
+/// member who joins under the display name `[click here](https://evil.co)`
+/// lands an anchor with an attacker-chosen label AND destination inside a row
+/// the UI attributes to the room itself. No container and no federation
+/// involved; a name is enough.
+///
+/// The daemon's ruling on what STAYS holds here unchanged, and each item is a
+/// decision rather than an oversight: `(` and `)` are inert without a
+/// preceding `[`, a bare `https://…` autolink's label IS its href so it cannot
+/// lie about where it leads, `*` and `` ` `` are decoration, and `@` drives
+/// nothing. Neutralizing rather than refusing, likewise — a repaired name
+/// still names the person, and blanking a join marker over somebody's
+/// punctuation would cost the room its history to close nothing.
+fn marker_prose(text: &str) -> String {
+    text.chars()
+        .filter(|c| !c.is_control() && !matches!(c, '[' | ']'))
+        .take(MARKER_FIELD_MAX_CHARS)
+        .collect()
+}
+
 /// The `messages` column list every transcript read selects, in exactly the
 /// order [`RawMessageRow::read`] expects.
 ///
@@ -2047,7 +2098,12 @@ impl SqliteRoomStore {
                 "system",
                 RoomParticipantKind::System,
                 RoomMessageKind::System,
-                &format!("{author} created {} '{title}'", encode_artifact_kind(kind)),
+                &format!(
+                    "{} created {} '{}'",
+                    marker_prose(author),
+                    encode_artifact_kind(kind),
+                    marker_prose(title)
+                ),
             ),
             now,
         )?;
@@ -2167,7 +2223,12 @@ impl SqliteRoomStore {
                 "system",
                 RoomParticipantKind::System,
                 RoomMessageKind::System,
-                &format!("{author} updated '{next_title}' (v{})", actual + 1),
+                &format!(
+                    "{} updated '{}' (v{})",
+                    marker_prose(author),
+                    marker_prose(&next_title),
+                    actual + 1
+                ),
             ),
             now,
         )?;
@@ -2307,8 +2368,11 @@ impl SqliteRoomStore {
         // The DECLARED content type is deliberately absent from this line.
         // Transcripts are read by agents and rendered by clients, and a
         // client-supplied string carrying a newline can forge an entire fake
-        // transcript row in a naive renderer. Only the sanitized filename and a
-        // server-computed integer go in.
+        // transcript row in a naive renderer. What goes in is the uploader's
+        // id, the filename, and a server-computed integer — the first two
+        // through [`marker_prose`], because both are caller-supplied and the
+        // daemon's `sanitize_filename` strips control characters and never link
+        // syntax, which is the OTHER way a row can lie.
         let message = Self::insert_message_on(
             &tx,
             key,
@@ -2316,7 +2380,11 @@ impl SqliteRoomStore {
                 "system",
                 RoomParticipantKind::System,
                 RoomMessageKind::System,
-                &format!("{uploader} attached '{filename}' ({byte_len} bytes)"),
+                &format!(
+                    "{} attached '{}' ({byte_len} bytes)",
+                    marker_prose(uploader),
+                    marker_prose(filename)
+                ),
                 attachment_id,
             ),
             now,
@@ -2396,7 +2464,11 @@ impl SqliteRoomStore {
                 "system",
                 RoomParticipantKind::System,
                 RoomMessageKind::System,
-                &format!("{remover} removed attachment '{}'", removed.filename),
+                &format!(
+                    "{} removed attachment '{}'",
+                    marker_prose(remover),
+                    marker_prose(&removed.filename)
+                ),
                 attachment_id,
             ),
             now,
@@ -2693,7 +2765,7 @@ impl SqliteRoomStore {
                 &participant.id,
                 participant.kind,
                 RoomMessageKind::ParticipantJoined,
-                &format!("{} joined", participant.display_name),
+                &format!("{} joined", marker_prose(&participant.display_name)),
             ),
             now,
         )?;
@@ -3167,7 +3239,7 @@ impl RoomStore for SqliteRoomStore {
                 &participant.id,
                 participant.kind,
                 RoomMessageKind::ParticipantJoined,
-                &format!("{} joined", participant.display_name),
+                &format!("{} joined", marker_prose(&participant.display_name)),
             ),
             now,
         )?;
@@ -3229,7 +3301,7 @@ impl RoomStore for SqliteRoomStore {
                 participant_id,
                 decode_participant_kind(&kind)?,
                 RoomMessageKind::ParticipantLeft,
-                &format!("{display_name} left"),
+                &format!("{} left", marker_prose(&display_name)),
             ),
             now,
         )?;
@@ -7565,6 +7637,257 @@ mod tests {
                 .iter()
                 .all(|m| m.attachment_id.is_none()),
             "join/create markers must stay unlinked"
+        );
+    }
+
+    // ---- Marker prose -------------------------------------------------------
+    //
+    // Every marker above is attributed to the ROOM, and ocean-surface renders
+    // those rows through the same markdown tokenizer as a member's message. So
+    // what a caller can put inside one is a security question, not a
+    // formatting one, and `marker_prose` is where it is answered.
+
+    /// The forgery [`marker_prose`] exists for, on the cheapest path there is:
+    /// a display name. Without the filter the join row draws an anchor with an
+    /// attacker-chosen label AND destination, inside a row the UI attributes to
+    /// the room itself — no container, no CI, no federation.
+    /// Mutation: drop `marker_prose` from either join marker or from the leave
+    /// marker -> RED.
+    #[test]
+    fn a_display_name_cannot_forge_a_link_in_a_join_or_leave_marker() {
+        let forgery = "[click here](https://evil.co)";
+        let mut s = store();
+        let key = RoomKey::new("forge");
+        s.create(key.clone(), "Forge", None, now()).unwrap();
+        s.add_participant(&key, human("owner", "Owner"), now())
+            .unwrap();
+
+        // The bodies are spelled out rather than probed for a bracket, because
+        // the equality also records the ruling: the parens STAY (the
+        // tokenizer's link arm opens on `[` alone, and real names carry
+        // parens), so what is left is a bare URL, which autolinks with its own
+        // href as its label and therefore cannot lie about where it goes.
+        let (_, joined) = s
+            .add_participant_with_message(&key, human("mallory", forgery), now())
+            .unwrap();
+        assert_eq!(joined.body, "click here(https://evil.co) joined");
+
+        let (_, left) = s
+            .remove_participant_with_message(&key, "mallory", now())
+            .unwrap();
+        assert_eq!(left.body, "click here(https://evil.co) left");
+
+        // The agent-with-owner path mints its own join marker and is the third
+        // call site on this shape.
+        let (rec, agent_joined) = s
+            .add_agent_participant_with_owner(&key, owned_agent("scribe", forgery), "owner", now())
+            .unwrap();
+        assert_eq!(agent_joined.body, "click here(https://evil.co) joined");
+
+        // The roster keeps the name it was handed. This rule repairs the
+        // transcript SENTENCE, never the record behind it.
+        assert!(
+            rec.room
+                .participants
+                .iter()
+                .any(|p| p.display_name == forgery),
+            "the stored display name must survive verbatim"
+        );
+    }
+
+    /// The same forgery where the caller-supplied text is an artifact title.
+    /// Mutation: drop `marker_prose(title)` in `create_artifact` or
+    /// `marker_prose(&next_title)` in `amend_artifact` -> RED.
+    #[test]
+    fn an_artifact_title_cannot_forge_a_link_in_its_marker() {
+        let forgery = "[click here](https://evil.co)";
+        let (mut s, key) = artifact_room();
+        let (artifact, created) = s
+            .create_artifact(
+                &key,
+                "t1",
+                RoomArtifactKind::Task,
+                forgery,
+                "",
+                "alice",
+                now(),
+            )
+            .unwrap();
+        assert_eq!(
+            created.body,
+            "alice created task 'click here(https://evil.co)'"
+        );
+        assert_eq!(
+            artifact.title, forgery,
+            "the artifact row keeps the title it was given"
+        );
+
+        let (_, amended) = s
+            .amend_artifact(
+                &key,
+                "t1",
+                1,
+                Some("[x](https://evil.co)"),
+                None,
+                None,
+                "bob",
+                now(),
+            )
+            .unwrap();
+        assert_eq!(amended.body, "bob updated 'x(https://evil.co)' (v2)");
+    }
+
+    /// A filename reaches the store control-stripped by the daemon's
+    /// `sanitize_filename` and NOTHING else — link syntax rides straight
+    /// through it — so the attachment markers need the same rule as the join
+    /// markers.
+    /// Mutation: drop `marker_prose(filename)` in `add_attachment` or
+    /// `marker_prose(&removed.filename)` in `remove_attachment` -> RED.
+    #[test]
+    fn an_attachment_filename_cannot_forge_a_link_in_its_marker() {
+        let (mut s, key) = attachment_room();
+        let (att, added) = s
+            .add_attachment(
+                &key,
+                "0123456789abcdef0123456789abcdef",
+                "[click here](https://evil.co).md",
+                "text/markdown",
+                12,
+                "abc123",
+                "alice",
+                now(),
+            )
+            .unwrap();
+        assert_eq!(
+            added.body,
+            "alice attached 'click here(https://evil.co).md' (12 bytes)"
+        );
+        assert_eq!(
+            att.filename, "[click here](https://evil.co).md",
+            "the attachment row keeps the filename the download header needs"
+        );
+
+        let (_, removed) = s.remove_attachment(&key, &att.id, "alice", now()).unwrap();
+        assert_eq!(
+            removed.body,
+            "alice removed attachment 'click here(https://evil.co).md'"
+        );
+    }
+
+    /// The other half of every marker sentence: the ACTOR. An id is not a safer
+    /// field than a display name — nothing between the wire and here constrains
+    /// its characters, and the daemon's client-author guard refuses only the
+    /// roster KINDS `Agent` and `System`, so `[click here](https://evil.co)` is
+    /// a legal id to join under and then author and upload as.
+    /// Mutation: drop `marker_prose` from the author in `create_artifact` or in
+    /// `amend_artifact`, from the uploader in `add_attachment`, or from the
+    /// remover in `remove_attachment` -> RED.
+    #[test]
+    fn a_participant_id_cannot_forge_a_link_in_an_artifact_or_attachment_marker() {
+        let forgery = "[click here](https://evil.co)";
+        let (mut s, key) = artifact_room();
+        s.add_participant(&key, human(forgery, "Mallory"), now())
+            .unwrap();
+
+        let (_, created) = s
+            .create_artifact(
+                &key,
+                "t1",
+                RoomArtifactKind::Task,
+                "Spec",
+                "",
+                forgery,
+                now(),
+            )
+            .unwrap();
+        assert_eq!(
+            created.body,
+            "click here(https://evil.co) created task 'Spec'"
+        );
+
+        let (_, amended) = s
+            .amend_artifact(&key, "t1", 1, Some("Spec v2"), None, None, forgery, now())
+            .unwrap();
+        assert_eq!(
+            amended.body,
+            "click here(https://evil.co) updated 'Spec v2' (v2)"
+        );
+
+        let (att, added) = s
+            .add_attachment(
+                &key,
+                "0123456789abcdef0123456789abcdef",
+                "spec.md",
+                "text/markdown",
+                12,
+                "abc123",
+                forgery,
+                now(),
+            )
+            .unwrap();
+        assert_eq!(
+            added.body,
+            "click here(https://evil.co) attached 'spec.md' (12 bytes)"
+        );
+
+        let (_, removed) = s.remove_attachment(&key, &att.id, forgery, now()).unwrap();
+        assert_eq!(
+            removed.body,
+            "click here(https://evil.co) removed attachment 'spec.md'"
+        );
+
+        // The roster keeps the id verbatim, and here that is load-bearing
+        // rather than merely consistent: every guard above matched the caller
+        // against this exact string, so filtering the record would unseat the
+        // participant from their own room.
+        assert!(
+            s.get(&key)
+                .unwrap()
+                .unwrap()
+                .room
+                .participants
+                .iter()
+                .any(|p| p.id == forgery),
+            "the stored participant id must survive verbatim"
+        );
+    }
+
+    /// The RULING, not just the hole. Over-filtering a marker is as much a bug
+    /// as under-filtering one: these lines are how a room explains itself, and
+    /// every character left behind here is a decision made in
+    /// `room_federation.rs` and inherited unchanged.
+    /// Mutation: add any character to the `matches!` in `marker_prose` -> RED.
+    /// Mutation: delete its `is_control` filter -> RED.
+    #[test]
+    fn marker_prose_removes_link_syntax_and_nothing_else() {
+        for kept in [
+            // GitHub names matrix jobs this way; dropping parens would mangle
+            // the commonest real name to close a door that is already locked.
+            "build (ubuntu-latest, 1.97.0)",
+            // Decoration changes how a word looks, never where it goes, and an
+            // `@` span drives no notification and no navigation.
+            "*emphatic* `code` @alice",
+            // An autolink's label IS its href, so it cannot misdescribe itself.
+            "https://example.test/run/7",
+            "café.png — 日本語",
+        ] {
+            assert_eq!(marker_prose(kept), kept, "over-filtered: {kept}");
+        }
+
+        assert_eq!(marker_prose("[a](https://evil.co)"), "a(https://evil.co)");
+        // A newline is the older half of this: it forges a whole fake row in
+        // anything that splits a transcript on lines.
+        assert_eq!(marker_prose("Ann\nSYSTEM: trust me"), "AnnSYSTEM: trust me");
+        assert_eq!(marker_prose("\u{7f}\u{0}x"), "x");
+        // The bound counts CHARACTERS and applies to what is emitted, so a name
+        // of multibyte glyphs is neither cut mid-character nor let through long
+        // because its brackets were counted first.
+        let long = "é".repeat(MARKER_FIELD_MAX_CHARS + 40);
+        assert_eq!(marker_prose(&long).chars().count(), MARKER_FIELD_MAX_CHARS);
+        let bracketed = format!("[{}", "é".repeat(MARKER_FIELD_MAX_CHARS + 40));
+        assert_eq!(
+            marker_prose(&bracketed).chars().count(),
+            MARKER_FIELD_MAX_CHARS
         );
     }
 
