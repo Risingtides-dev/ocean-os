@@ -1,0 +1,8 @@
+{
+  "note": "Which ocean-bedrock commit the room-event-actions.json beside this file was copied from. Written by scripts/vendor-bedrock-room-events.mjs; re-run that rather than hand-editing. ocean-bedrock is private, so this sha is the whole of the provenance a reader of this public repo can be given.",
+  "repo": "ocean-bedrock",
+  "path": "docs/room-event-actions.json",
+  "sha": "1c2e2993cefd60ce48dd3584831e0d5aae758ab0",
+  "checkout_was_dirty": false,
+  "checked_on": "2026-08-31"
+}
