@@ -200,10 +200,14 @@ Two additional SQLite databases live alongside sessions and the config dir:
 Set `OCEAN_FEDERATION_URL` to the Bedrock **origin only** (for example
 `https://bedrock.example.com` or trusted-loopback diagnostics such as
 `http://127.0.0.1:8787`). The daemon rejects userinfo, paths, query strings,
-fragments, non-HTTPS remote origins, and redirects. Each room bearer remains
-in owner-only `rooms.db`; requests use the Authorization header and never a
-query token. Missing or invalid configuration moves every credentialed,
-non-revoked room to `recovering` instead of leaving stale `live` chrome.
+fragments, non-HTTPS remote origins, and redirects. A loopback origin still
+federates, but a minted invite carries no `onboard_url` on it: that address
+means this machine, not the invitee's. Loopback is the only base suppressed —
+any other origin composes a link, so a LAN-only Bedrock hands out a link that
+resolves only for an invitee already on that LAN. Each room bearer remains in
+owner-only `rooms.db`; requests use the Authorization header and never a query
+token. Missing or invalid configuration moves every credentialed, non-revoked
+room to `recovering` instead of leaving stale `live` chrome.
 
 Set daemon-only `OCEAN_FEDERATION_OWNER_TOKEN` when this daemon may bootstrap
 an existing Local room as its Bedrock owner and mint invites. The value is read
@@ -571,7 +575,7 @@ GET    /v1/rooms/persistent/{key}/events                  SSE: initial full room
 GET    /v1/rooms/persistent/{key}/read-cursor             fetch the daemon-owned read cursor projection for Local/Live rooms; closed/pending/revoked return typed unsupported
 PATCH  /v1/rooms/persistent/{key}/read-cursor             advance the daemon-owned read cursor { read_seq }; Local/Live only, monotonic, publishes room_read_cursor wake on success
 POST   /v1/rooms/persistent/{key}/outbox/retry            retry a locally-authored federated event awaiting Bedrock confirmation { client_event_id }; 202 on success, 403 revoked, 404 unknown room/item, 409 pending/local, 400 malformed body, 500 sanitized store error
-POST   /v1/rooms/persistent/{key}/invites                 bootstrap owner if Local, then mint invite { recipient_name?, ttl_minutes? }; raw InviteResponse 201
+POST   /v1/rooms/persistent/{key}/invites                 bootstrap owner if Local, then mint invite { recipient_name?, ttl_minutes? }; raw InviteResponse 201 — the four fields it has always had plus `onboard_url`, Bedrock's public onboarding manifest for the minted code (`GET {OCEAN_FEDERATION_URL}/api/v1/invites/{code}/onboard`: the invite's name/role/scopes/expiry, the redeem form, and a one-command bootstrap prompt), so the owner shares a link rather than a bare code. OMITTED, never null, when the daemon cannot compose one — a client written against the old shape is unaffected — and it is omitted for every LOOPBACK `OCEAN_FEDERATION_URL`, because that origin resolves on the invitee's machine and not the owner's. The URL EMBEDS the code, so it is the same bearer grant `code` is and not a pointer to one: it belongs in this 201 body and nowhere else — never a log line, never a ticket, never a screenshot
 POST   /v1/rooms/persistent/invites/redeem                restart-safe redeem/self-join { code }; raw RoomRedeemResponse 200 — the RoomAccessProjection's own fields at the TOP level (unchanged, so a client that only checks `state` is unaffected) plus `room_key`, the room the invite's scope resolved to. Only the daemon can know that key; without it a redeemer has to diff its room list before and after, which cannot answer under a concurrent create. No room_name: this path creates the room with name == key
 POST   /v1/rooms/persistent/{key}/members/agents          register safe local agent descriptors { agent_names }; raw RoomAccessProjection 200
 DELETE /v1/rooms/persistent/{key}/members/{member_id}     remove one federated member via Bedrock; refreshed RoomAccessProjection 200, Bedrock's owner-or-self 403 surfaces as federation_forbidden with the credential intact

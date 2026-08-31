@@ -1072,6 +1072,18 @@ pub struct InviteResponse {
     pub expires_at: String,
     pub room_key: String,
     pub room_name: String,
+    /// Bedrock's public onboarding manifest for this code — the invite's
+    /// name/role/scopes/expiry, the redeem form, and a one-command bootstrap
+    /// prompt — so the owner can hand an invitee a link instead of a bare code.
+    ///
+    /// Composed by the daemon, which is the only party that knows its own
+    /// Bedrock origin. OMITTED rather than null when it cannot compose one, so
+    /// a surface written against the four-field shape is untouched.
+    ///
+    /// The URL EMBEDS the code, which makes it the same bearer grant `code` is
+    /// and not a pointer to one: it belongs in this reply and nowhere else.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub onboard_url: Option<String>,
 }
 
 /// Response from `POST .../invites/redeem` — the access the redeemer landed
@@ -2435,11 +2447,33 @@ mod tests {
             expires_at: "2026-07-17T18:00:00Z".into(),
             room_key: "warroom".into(),
             room_name: "War Room".into(),
+            onboard_url: Some("https://bedrock.example.com/api/v1/invites/abc123/onboard".into()),
         };
         let json = serde_json::to_value(&resp).unwrap();
         assert_eq!(json["code"], "abc123");
+        assert_eq!(
+            json["onboard_url"],
+            "https://bedrock.example.com/api/v1/invites/abc123/onboard"
+        );
         let roundtrip: InviteResponse = serde_json::from_value(json).unwrap();
         assert_eq!(roundtrip, resp);
+    }
+
+    #[test]
+    fn invite_response_without_onboard_url_roundtrips_and_stays_absent() {
+        // The compatibility contract in both directions: a body minted before
+        // the field still deserializes, and a `None` re-serializes to the same
+        // four keys rather than to an `onboard_url: null` an older surface
+        // would have to know to ignore.
+        let json = serde_json::json!({
+            "code": "abc123",
+            "expires_at": "2026-07-17T18:00:00Z",
+            "room_key": "warroom",
+            "room_name": "War Room"
+        });
+        let resp: InviteResponse = serde_json::from_value(json.clone()).unwrap();
+        assert_eq!(resp.onboard_url, None);
+        assert_eq!(serde_json::to_value(&resp).unwrap(), json);
     }
 
     // ── required-field rejection — missing metadata/projection fields fail ─

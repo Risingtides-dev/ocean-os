@@ -415,12 +415,7 @@ impl FederationClient {
             return Err(BridgeError::InvalidConfig);
         }
         let host = base.host_str().ok_or(BridgeError::InvalidConfig)?;
-        let ip_host = host.trim_start_matches('[').trim_end_matches(']');
-        let loopback = host.eq_ignore_ascii_case("localhost")
-            || ip_host
-                .parse::<IpAddr>()
-                .map(|ip| ip.is_loopback())
-                .unwrap_or(false);
+        let loopback = loopback_host(host);
         match base.scheme() {
             "https" => {}
             "http" if loopback => {}
@@ -464,6 +459,39 @@ impl FederationClient {
     fn ledger_endpoint(&self) -> Result<Url, BridgeError> {
         self.endpoint(&["api", "v1", "ledger", "events"])
     }
+
+    /// Bedrock's public onboarding manifest for a freshly minted invite code.
+    ///
+    /// `None` for a loopback base. `new` accepts `http://localhost:8787` so a
+    /// dev daemon can federate against a Bedrock on the same machine, but that
+    /// origin resolves on the INVITEE's machine, not the owner's: the link is
+    /// either dead or it hands a bearer grant to whatever else is listening on
+    /// their loopback. Sending no link is strictly better than either, and the
+    /// owner still has `code`.
+    ///
+    /// `None` too if the base somehow refuses segments — the invite already
+    /// exists on Bedrock by the time this runs, so failing to decorate it must
+    /// never fail the mint.
+    fn invite_onboard_url(&self, code: &str) -> Option<String> {
+        if self.base.host_str().is_none_or(loopback_host) {
+            return None;
+        }
+        self.endpoint(&["api", "v1", "invites", code, "onboard"])
+            .ok()
+            .map(String::from)
+    }
+}
+
+/// Loopback by host alone, scheme irrelevant: an `https://127.0.0.1` origin is
+/// no more reachable from an invitee's machine than an `http` one.
+fn loopback_host(host: &str) -> bool {
+    host.eq_ignore_ascii_case("localhost")
+        || host
+            .trim_start_matches('[')
+            .trim_end_matches(']')
+            .parse::<IpAddr>()
+            .map(|ip| ip.is_loopback())
+            .unwrap_or(false)
 }
 
 #[derive(Clone)]
@@ -1307,11 +1335,13 @@ impl FederationSupervisor {
         {
             return Err(IntentError::Protocol);
         }
+        let onboard_url = client.invite_onboard_url(&envelope.code);
         Ok(InviteResponse {
             code: envelope.code,
             expires_at: envelope.invite.expires_at,
             room_key: key.as_str().into(),
             room_name: room.name,
+            onboard_url,
         })
     }
 
@@ -4163,6 +4193,58 @@ mod tests {
     }
 
     #[test]
+    fn invite_onboard_url_composed_unless_the_base_is_loopback() {
+        for (base, expected) in [
+            (
+                "https://bedrock.example.com",
+                "https://bedrock.example.com/api/v1/invites/fake-code/onboard",
+            ),
+            (
+                "https://bedrock.example.com/",
+                "https://bedrock.example.com/api/v1/invites/fake-code/onboard",
+            ),
+            (
+                "https://bedrock.example.com:8443",
+                "https://bedrock.example.com:8443/api/v1/invites/fake-code/onboard",
+            ),
+        ] {
+            let client = FederationClient::new(base).unwrap();
+            assert_eq!(
+                client.invite_onboard_url("fake-code").as_deref(),
+                Some(expected),
+                "bad onboard link for {base}"
+            );
+        }
+        // A base only this daemon can resolve must not be handed to an invitee,
+        // whatever scheme it wears.
+        for base in [
+            "http://127.0.0.1:14780",
+            "http://localhost:14780",
+            "http://[::1]:14780",
+            "https://127.0.0.1:14780",
+            "https://LOCALHOST:14780",
+        ] {
+            let client = FederationClient::new(base).unwrap();
+            assert_eq!(
+                client.invite_onboard_url("fake-code"),
+                None,
+                "loopback base {base} produced a link"
+            );
+        }
+    }
+
+    #[test]
+    fn invite_onboard_url_escapes_the_code_into_one_segment() {
+        // The code's shape is Bedrock's to decide, so it rides as a segment and
+        // never as a path: a separator in it must not grow the URL a segment.
+        let client = FederationClient::new("https://bedrock.example.com").unwrap();
+        assert_eq!(
+            client.invite_onboard_url("a/b?c").as_deref(),
+            Some("https://bedrock.example.com/api/v1/invites/a%2Fb%3Fc/onboard")
+        );
+    }
+
+    #[test]
     fn outbox_validation_denies_extra_fields_and_non_message() {
         let base = RoomOutboxItem {
             client_event_id: "e".into(),
@@ -5899,6 +5981,10 @@ mod tests {
         assert!(invite.code == "share-code", "invite code mismatch");
         assert_eq!(invite.room_key, key.as_str());
         assert_eq!(invite.room_name, "Invite Room");
+        assert_eq!(
+            invite.onboard_url, None,
+            "a loopback Bedrock must not hand the invitee a link"
+        );
         let credential = with_rooms_handle(&rooms, |s| s.room_credential(&key))
             .unwrap()
             .unwrap();

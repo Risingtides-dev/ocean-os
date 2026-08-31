@@ -38,7 +38,13 @@ This crate owns shared protocol types used across Ocean clients, daemon, runtime
   and `#[serde(flatten)]`s the projection beside a required `room_key`, so that
   reply's top level stays the projection's own keys plus the one new key; the
   key is not a projection field because the projection is also the per-room SSE
-  frame.
+  frame. `InviteResponse.onboard_url: Option<String>` is additive and
+  `skip_serializing_if`, so a `None` re-serializes to the original four keys
+  rather than to a null an older surface has to learn to ignore; only the daemon
+  composes it, because only it knows its own Bedrock origin. The URL embeds the
+  invite code, which makes it a bearer grant and not a pointer to one — it
+  belongs in the mint reply and nowhere else, and no fixture here may spell it
+  with a live-shaped code.
 - Invite request bodies are not mirrored here. `POST .../invites` and
   `POST .../invites/redeem` are deserialized by the daemon's own
   `CreateInviteBody`/`RedeemInviteBody` under `deny_unknown_fields`, which is
