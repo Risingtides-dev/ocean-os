@@ -15226,6 +15226,11 @@ mod tests {
     #[test]
     fn ocean_yolo_env_defaults_off_and_opts_in_explicitly() {
         let _guard = yolo_env_guard();
+        // `fake_convene_state` sets `OCEAN_YOLO=1` under the convene lock only, so
+        // the yolo lock alone does not keep this test's writes to itself. Acquire
+        // it AFTER the yolo lock; no path takes these in the reverse order, so this
+        // can't deadlock.
+        let _convene_guard = AUTO_CONVENE_ENV_LOCK.blocking_lock();
         // Serialize env mutation within this test; restore the prior value.
         let prior = env::var("OCEAN_YOLO").ok();
 
@@ -25256,6 +25261,8 @@ mod tests {
         use axum::{body::Body, http::Request};
         use tower::ServiceExt;
 
+        let _guard = AUTO_CONVENE_ENV_LOCK.lock().await;
+        let _env = TestEnvRestore::capture(&["OCEAN_CONFIG_DIR", "OCEAN_MODEL", "OCEAN_YOLO"]);
         let tmp = tempfile::tempdir().unwrap();
         let app = room_routes().with_state(fake_convene_state(&tmp));
 
