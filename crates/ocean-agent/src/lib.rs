@@ -48,6 +48,12 @@ mod oauth_refresh;
 pub use agentdir::{AgentDef, ResolveError as AgentDirResolveError};
 mod project;
 pub use project::{git_head_info, WorktreeInfo};
+mod room_history;
+pub use room_history::{
+    AdmittedRoomHistory, RoomHistoryAdmission, RoomHistoryAuthorKind, RoomHistoryPage,
+    RoomHistoryRequest, RoomHistoryRow, RoomHistoryScope, RoomHistorySource,
+    RoomHistorySourceError,
+};
 mod rooms;
 pub use rooms::{RoomRecord, RoomRegistry, RoomStoreError};
 
@@ -486,6 +492,18 @@ impl AgentRuntime {
             .as_ref()
             .context("memory provider unavailable")?
             .admit_room(admission)
+    }
+
+    /// Mint one opaque Room-history handle from final admission evidence and
+    /// the daemon-owned durable history source. The source receives the fixed
+    /// Room/agent/generation scope on every retrieval; model arguments cannot
+    /// replace any part of it.
+    pub fn admit_room_history(
+        &self,
+        admission: &impl RoomHistoryAdmission,
+        source: Arc<dyn RoomHistorySource>,
+    ) -> anyhow::Result<AdmittedRoomHistory> {
+        AdmittedRoomHistory::from_admission(admission, source)
     }
 
     /// Connect configured MCP servers and fold their tools into the capability
@@ -2248,6 +2266,7 @@ impl AgentRuntime {
             agent_capabilities,
             authorized_capabilities,
             memory,
+            room_history,
             tools_disabled,
             hashline_edits,
             artifact_spill,
@@ -2315,22 +2334,18 @@ impl AgentRuntime {
         // ordering is load-bearing: applying the snapshot before dynamic or
         // subprocess providers would let a later provider widen the turn.
         // Operator memory and admitted Room memory are mutually exclusive.
-        // Remove the registry's global tools before applying the ambient
-        // capability ceiling; a Room handle adds its own scoped tools only
-        // after that intersection is complete.
-        if !matches!(memory, PromptMemory::Operator) {
-            tools.retain(|tool| !matches!(tool.name(), "retain" | "recall"));
-        }
-        if let Some(capabilities) = authorized_capabilities.as_deref() {
-            tools.retain(|tool| capability_authorizes_tool(capabilities, tool.name()));
-        }
-        if !tools_disabled {
-            if let PromptMemory::Room(room) = &memory {
-                tools.extend(room.tools());
-            }
-        }
+        // The reserved Room-history name and registry memory tools are removed
+        // before applying ambient authority. Opaque admitted tools are appended
+        // only after that intersection, and never when `without_tools()` won.
+        tools = apply_admitted_room_tools(
+            tools,
+            authorized_capabilities.as_deref(),
+            &memory,
+            room_history.as_ref(),
+            tools_disabled,
+        );
 
-        let system_prompt = match &memory {
+        let mut system_prompt = match &memory {
             PromptMemory::Operator => {
                 system_prompt::build_system_prompt(Some(&req.cwd), req.client_type.as_deref())
             }
@@ -2343,6 +2358,11 @@ impl AgentRuntime {
                 req.client_type.as_deref(),
             ),
         };
+        // A retained handle is not an advertised capability when the caller
+        // selected the stronger fail-closed `without_tools()` boundary.
+        if room_history.is_some() && !tools_disabled {
+            system_prompt::append_room_history_context(&mut system_prompt);
+        }
         let mut cfg = AgentConfig::new(snapshot.model.clone(), system_prompt)
             .with_tools(tools)
             .with_max_turns(req.max_turns.unwrap_or(32))
@@ -2760,6 +2780,10 @@ pub struct PromptControl {
     /// Exact memory authority for this turn. Private and mutually exclusive so
     /// no caller can combine operator-global and Room memory tools.
     memory: PromptMemory,
+    /// Opaque durable Room-history authority. `None` for ordinary,
+    /// invocation-only, and recent-context turns. Its fixed scoped tool is
+    /// appended only after the ambient capability intersection.
+    room_history: Option<AdmittedRoomHistory>,
     /// Fail-closed per-turn control that suppresses every tool source, including
     /// dynamically registered and folder-agent subprocess capabilities.
     pub tools_disabled: bool,
@@ -2844,6 +2868,39 @@ fn capability_authorizes_tool(capabilities: &[String], tool_name: &str) -> bool 
     })
 }
 
+/// Apply final Room authority after every ambient provider has been assembled.
+///
+/// `room_history` is a reserved tool name: an ambient provider can never
+/// impersonate the opaque admitted reader. Room-owned memory/history tools are
+/// appended after the ambient intersection so an empty Phase 1 ceiling can
+/// coexist with these narrow read authorities. `tools_disabled` is stronger
+/// than every admitted handle.
+fn apply_admitted_room_tools(
+    mut tools: Vec<SharedTool>,
+    authorized_capabilities: Option<&[String]>,
+    memory: &PromptMemory,
+    room_history: Option<&AdmittedRoomHistory>,
+    tools_disabled: bool,
+) -> Vec<SharedTool> {
+    if tools_disabled {
+        return Vec::new();
+    }
+    tools.retain(|tool| tool.name() != "room_history");
+    if !matches!(memory, PromptMemory::Operator) {
+        tools.retain(|tool| !matches!(tool.name(), "retain" | "recall"));
+    }
+    if let Some(capabilities) = authorized_capabilities {
+        tools.retain(|tool| capability_authorizes_tool(capabilities, tool.name()));
+    }
+    if let PromptMemory::Room(room) = memory {
+        tools.extend(room.tools());
+    }
+    if let Some(history) = room_history {
+        tools.push(history.tool());
+    }
+    tools
+}
+
 impl PromptControl {
     pub fn new(permission: Arc<dyn PermissionPolicy>) -> Self {
         Self {
@@ -2857,6 +2914,7 @@ impl PromptControl {
             agent_capabilities: None,
             authorized_capabilities: None,
             memory: PromptMemory::Operator,
+            room_history: None,
             tools_disabled: false,
             hashline_edits: false,
             artifact_spill: false,
@@ -2930,6 +2988,15 @@ impl PromptControl {
     /// Replace operator-global memory with one opaque admitted Room handle.
     pub fn with_room_memory(mut self, room: AdmittedRoomMemory) -> Self {
         self.memory = PromptMemory::Room(room);
+        self
+    }
+
+    /// Attach one opaque admitted durable Room-history reader to this turn.
+    pub fn with_room_history(mut self, history: AdmittedRoomHistory) -> Self {
+        if matches!(self.memory, PromptMemory::Operator) {
+            self.memory = PromptMemory::Disabled;
+        }
+        self.room_history = Some(history);
         self
     }
 
@@ -4087,6 +4154,104 @@ mod tests {
         fn admitted_room_key(&self) -> &str {
             self.0
         }
+    }
+
+    struct TestRoomHistoryAdmission;
+
+    impl RoomHistoryAdmission for TestRoomHistoryAdmission {
+        fn admitted_room_key(&self) -> &str {
+            "exact-room"
+        }
+
+        fn admitted_agent_member_id(&self) -> &str {
+            "exact-agent"
+        }
+
+        fn admitted_generation(&self) -> u64 {
+            9
+        }
+    }
+
+    struct EmptyRoomHistorySource;
+
+    #[async_trait]
+    impl RoomHistorySource for EmptyRoomHistorySource {
+        async fn page(
+            &self,
+            _scope: &RoomHistoryScope,
+            _request: RoomHistoryRequest,
+        ) -> Result<RoomHistoryPage, RoomHistorySourceError> {
+            Ok(RoomHistoryPage {
+                rows: Vec::new(),
+                has_more: false,
+            })
+        }
+    }
+
+    fn admitted_room_history() -> AdmittedRoomHistory {
+        let runtime = runtime(
+            temp_config_dir("room-history-authority"),
+            provider_config(ProviderId::OpenAi, "test-model", true),
+        );
+        runtime
+            .admit_room_history(&TestRoomHistoryAdmission, Arc::new(EmptyRoomHistorySource))
+            .unwrap()
+    }
+
+    #[test]
+    fn room_history_is_post_intersection_opt_in_and_without_tools_is_stronger() {
+        let names = |tools: Vec<SharedTool>| {
+            tools
+                .iter()
+                .map(|tool| tool.name().to_string())
+                .collect::<Vec<_>>()
+        };
+        let history = admitted_room_history();
+
+        let ordinary = apply_admitted_room_tools(
+            vec![tool("read"), tool("room_history")],
+            None,
+            &PromptMemory::Operator,
+            None,
+            false,
+        );
+        assert_eq!(names(ordinary), vec!["read"]);
+
+        let recent = apply_admitted_room_tools(
+            vec![tool("read")],
+            Some(&[]),
+            &PromptMemory::Disabled,
+            None,
+            false,
+        );
+        assert!(recent.is_empty());
+
+        let durable_history = apply_admitted_room_tools(
+            vec![tool("read")],
+            Some(&[]),
+            &PromptMemory::Disabled,
+            Some(&history),
+            false,
+        );
+        assert_eq!(names(durable_history), vec!["room_history"]);
+
+        let room_only = PromptControl::yolo(false).with_room_history(history.clone());
+        assert!(matches!(room_only.memory, PromptMemory::Disabled));
+
+        let control = PromptControl::yolo(false)
+            .with_authorized_capabilities(Vec::new())
+            .without_operator_memory()
+            .with_room_history(history.clone())
+            .without_tools();
+        assert!(control.room_history.is_some());
+        let disabled = apply_admitted_room_tools(
+            vec![tool("read")],
+            control.authorized_capabilities.as_deref(),
+            &control.memory,
+            control.room_history.as_ref(),
+            control.tools_disabled,
+        );
+        assert!(disabled.is_empty());
     }
 
     #[test]
