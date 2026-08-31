@@ -156,14 +156,37 @@ outbox, and the restart-safe federation core (S2 P2-A). One database file
   `UnknownAttachment`, never a silent success. `add_attachment` and
   `remove_attachment` each write their System transcript marker in the SAME
   transaction as the row.
-- **Every caller-supplied string a marker quotes goes through
+- **Every caller-supplied string a marker's PROSE quotes goes through
   `marker_prose`.** That is `ocean_core::bounded_prose` under this crate's
   `MARKER_FIELD_MAX_CHARS`, and the split is deliberate: the filter is a
   security rule shared with `ocean-daemon`'s workspace markers and lives in
   `ocean-core` because the dependency runs daemon -> store and neither crate
   can call the other; the bound is this crate's policy. Read the derivation
   there before widening what these lines drop, and do not re-inline a filter
-  here — a second copy is exactly the drift the hoist removed.
+  here — a second copy is exactly the drift the hoist removed. The same rule,
+  same bound, now also guards `ocean_agent::rooms::RoomRegistry`, the dormant
+  in-memory twin of this store.
+- **The `room.agent.*` audit rows are records, not prose, and are NOT
+  filtered.** They are `RoomMessageKind::System` bodies like the markers
+  above, so the rule preceding this one would read as covering them; it
+  deliberately does not. `bootstrap_local_room_agent`,
+  `append_authorized_agent_*` and the admission/authority writers interpolate
+  the ids that ARRIVED into a `serde_json` object, and an audit line that
+  quietly repairs `owner_member_id` reports the attempt as something other
+  than what was made — sanitizing a ledger to fix a rendering bug fixes it in
+  the wrong crate and destroys the evidence on the way.
+  `a_failure_marker_is_neutralized_and_the_audit_beside_it_is_not` pins both
+  halves so neither side of the boundary drifts.
+  KNOWN OPEN, deliberately not closed here: neutralizing an audit body belongs
+  at the READ boundary, and only half of it exists. `ocean-daemon`'s
+  `room_history_text` already replaces every `room.agent.*` body with
+  `[room agent bootstrap audit]` before an agent sees it, but
+  `GET /v1/rooms/persistent/{key}/transcript` hands a human client the body
+  raw and ocean-surface puts it through `room_markdown::body_view`, so a
+  bootstrap `owner_member_id` — free-form, shape-checked nowhere — of
+  `[click here](https://evil.co)` still renders as an attacker-labelled link
+  in the room's own voice. That closes by giving the human transcript route
+  the projection the agent route already has, tracked as its own slice.
 - **An artifact title is refused blank, never stored blank.** `create_artifact`
   and `amend_artifact` both raise `ArtifactTitleBlank` on a whitespace-only
   title before any read, UPDATE, or transcript insert, so a refusal writes

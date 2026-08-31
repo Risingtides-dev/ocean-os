@@ -8404,7 +8404,7 @@ Stage 2 contributed folders remains closed pending its own accepted manifest.
 _________________________________________________________________________________
 
 time:      [19:03] [31-08-26]
-agent:     [claude-code], [claude-opus-5]
+agent:     [claude] [opus 5]
 worktree:  loop/os-bounded-prose-is-about-to-exist-in-two-crates-with-no-shared-home
 type:      [refactor]
 area:      [backend]
@@ -8450,4 +8450,79 @@ Gate: `cargo test -p ocean-core -p ocean-store -p ocean-daemon` 62 + 195 + 854
 green, `cargo clippy ... --all-targets -- -D warnings` clean, `cargo fmt --check`
 clean, `cargo check --workspace` clean. No deploy and no migration; this lands
 to main like any other code change.
+_________________________________________________________________________________
+
+time:      [19:30] [31-08-26]
+agent:     [claude] [opus 5]
+worktree:  loop/os-bounded-prose-is-about-to-exist-in-two-crates-with-no-shared-home
+type:      [review]
+area:      [backend]
+
+Refine pass on the marker-prose hoist, against two review findings. The first
+was the sharper one: this slice's whole subject is a security rule whose
+correctness lives in prose, and it wrote a NEW piece of prose into
+`crates/ocean-store/AGENTS.md` that was false -- "Every caller-supplied string a
+marker quotes goes through `marker_prose`". Auditing every `System` body this
+crate writes found not one counterexample but seven. Six are `room.agent.*`
+audit rows whose body is a `serde_json` object interpolating the ids that
+arrived (`bootstrap_local_room_agent`, both `room.agent.output` writers, the
+failure audit, admission, authority); serde escapes control characters but not
+`[` or `]`. The seventh was ordinary prose that had simply been missed:
+`append_authorized_agent_failure` built `"auto-convene failed for
+{agent_member_id}: turn_failed"` with no filter at all.
+
+The seventh is fixed. The six are ruled the OTHER way, deliberately, and that
+ruling is the substance of this pass. An audit row is a record, not a sentence.
+An audit line that quietly repairs `owner_member_id` reports the attempt as
+something other than what was made, and sanitizing a ledger to fix a rendering
+bug fixes it in the wrong crate while destroying the evidence on the way. The
+right layer already exists on one side: `ocean-daemon`'s `room_history_text`
+replaces every `room.agent.*` body with `[room agent bootstrap audit]` before an
+AGENT sees it. The gap is that
+`GET /v1/rooms/persistent/{key}/transcript` hands a human client the same body
+raw and ocean-surface renders it through `room_markdown::body_view`, so a
+bootstrap `owner_member_id` of `[click here](https://evil.co)` -- free-form,
+shape-checked nowhere on that path -- still forges a link in the room's own
+voice. That is now filed as its own slice against
+`crates/ocean-daemon/src/persistent_rooms.rs`, out of this slice's file scope,
+and the AGENTS.md bullet says so in the same breath as the exception rather than
+claiming a closure that does not exist.
+
+The boundary is enforced, not merely written down, which was the whole point of
+the finding. `append_authorized_agent_failure` writes both kinds of row in one
+transaction, so
+`a_failure_marker_is_neutralized_and_the_audit_beside_it_is_not` pins it from
+both sides: RED if the human-facing sentence loses `marker_prose`, and RED if
+someone later "helpfully" filters the audit's `agent_member_id`. Both mutations
+were applied and both failed as claimed.
+
+The second finding was a named instruction this slice had silently dropped:
+fold in `RoomRegistry`, the dormant in-memory twin, whose join/leave markers
+had no filter at all. Done -- `ocean-agent` already depended on `ocean-core`,
+so the hoist is exactly what made it two calls plus a bound, with
+`join_and_leave_markers_neutralize_link_syntax` covering forged link syntax, a
+forged row break, and the emitted-sentence bound. Dropping either call goes RED.
+Being dormant is not a filter; it is why the twin kept an unbounded `format!`
+for a release after the durable side was fixed. Also corrected one number the
+hoist had invented: `marker_prose`'s doc claimed "the fourteen call sites
+below" where there were twelve, which is the same species of defect as the false
+absolute, one order of magnitude smaller.
+
+Gate: `cargo test -p ocean-core -p ocean-store -p ocean-agent -p ocean-daemon`
+62 + 196 + 239 + 854 green, `cargo clippy ... --all-targets -- -D warnings`
+exit 0, `cargo fmt --check` exit 0, `cargo check --workspace` exit 0. No deploy
+and no migration.
+
+Two land-time corrections from the review notes, both to prose this commit
+itself wrote. The `agent:` field on these two entries read
+`[claude-code], [claude-opus-5]`, matching neither the schema nor any of the
+~8400 lines already here (`[claude] [opus 5]` is the established form, 38 uses)
+-- cosmetic, except that this file is grep-parsed by agents. And the new clause
+in `crates/ocean-daemon/AGENTS.md` enumerated the caps as "16 for a conclusion,
+32 for a check name, 64 for a branch or the total-function fallback", which
+reads as a per-field table and is not one: the `quoted` closure at
+`room_federation.rs:3718` puts `driver`, `script` and `exec_id` through the
+same 64 -- three fields the very next clause names by provenance. A positive
+enumeration missing half its members is the same defect as the false absolute
+this slice exists to fix.
 _________________________________________________________________________________

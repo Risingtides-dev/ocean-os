@@ -1201,10 +1201,16 @@ const MARKER_FIELD_MAX_CHARS: usize = 128;
 /// The RULE is `ocean_core::bounded_prose`, which carries the derivation of
 /// what is filtered and why; read it there before changing what these lines
 /// quote. This crate supplies only the POLICY — which bound — and keeps the
-/// name so the fourteen call sites below read as prose. It used to be a
-/// second copy of the rule, sitting beside the daemon's; the hoist into the
-/// one crate both already depend on is what removed the drift this doc used
-/// to warn about.
+/// name so the call sites below read as prose. It used to be a second copy of
+/// the rule, sitting beside the daemon's; the hoist into the one crate both
+/// already depend on is what removed the drift this doc used to warn about.
+///
+/// It guards a marker's PROSE, and only that. The `room.agent.*` audit rows
+/// are `System` bodies too and deliberately do NOT pass through here: they
+/// are records rather than sentences, and an audit line that quietly repairs
+/// the id that arrived reports something other than what happened. Their
+/// neutralization belongs at the read boundary — see this crate's AGENTS.md,
+/// which names the gap and where it closes.
 ///
 /// Why it is needed on THESE lines, which is the part the shared doc cannot
 /// know: ocean-surface renders every transcript row through
@@ -3943,7 +3949,10 @@ impl SqliteRoomStore {
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
         let binding =
             Self::authorized_room_agent_binding_on(&tx, key, agent_member_id, expected_generation)?;
-        let failure_body = format!("auto-convene failed for {agent_member_id}: turn_failed");
+        let failure_body = format!(
+            "auto-convene failed for {}: turn_failed",
+            marker_prose(agent_member_id)
+        );
         let failure = Self::insert_message_on(
             &tx,
             key,
@@ -9440,6 +9449,39 @@ mod tests {
                 "the store re-forked the rule on {text:?}"
             );
         }
+    }
+
+    /// Where the rule stops, enforced rather than asserted in AGENTS.md.
+    /// `append_authorized_agent_failure` writes BOTH kinds of `System` row in
+    /// one transaction, so it is the one place the boundary can be pinned from
+    /// both sides: the human-facing sentence is neutralized like any other
+    /// marker, and the audit beside it keeps the id EXACTLY as it arrived,
+    /// because an audit that quietly repairs its subject reports something
+    /// other than what happened. The audit's own exposure closes in the
+    /// daemon's read projection, not by sanitizing the ledger.
+    /// Mutation: drop `marker_prose` from the failure body -> RED.
+    /// Mutation: "helpfully" filter the audit's `agent_member_id` -> RED.
+    #[test]
+    fn a_failure_marker_is_neutralized_and_the_audit_beside_it_is_not() {
+        let forgery = "[click here](https://evil.co)";
+        let (mut s, key) = room_with_agent(forgery);
+        let (failure, audit) = s
+            .append_authorized_agent_failure(
+                &key,
+                forgery,
+                1,
+                "admission-failure-1",
+                now(),
+                "session-1",
+            )
+            .unwrap();
+
+        assert_eq!(
+            failure.body,
+            "auto-convene failed for click here(https://evil.co): turn_failed"
+        );
+        let audit: serde_json::Value = serde_json::from_str(&audit.body).unwrap();
+        assert_eq!(audit["agent_member_id"], forgery);
     }
 
     /// An attached spec must outlive the process, or the room is a chat window

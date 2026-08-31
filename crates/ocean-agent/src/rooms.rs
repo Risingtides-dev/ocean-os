@@ -20,9 +20,29 @@ use std::collections::HashMap;
 
 use chrono::{DateTime, Utc};
 use ocean_core::{
-    Room, RoomKey, RoomMessage, RoomMessageKind, RoomParticipant, RoomParticipantKind,
-    RoomTriggerPolicy,
+    bounded_prose, Room, RoomKey, RoomMessage, RoomMessageKind, RoomParticipant,
+    RoomParticipantKind, RoomTriggerPolicy,
 };
+
+/// How much of one caller-supplied field a marker sentence may quote.
+///
+/// Deliberately the same 128 as `ocean_store`'s constant of this name: a room
+/// reads the same whichever backend wrote its join line, and the two numbers
+/// are policy rather than a shared rule, so they live with their callers
+/// (see `ocean_core::bounded_prose`) instead of behind one export.
+const MARKER_FIELD_MAX_CHARS: usize = 128;
+
+/// Neutralize a caller-supplied string on its way into a marker body.
+///
+/// The RULE and its derivation are `ocean_core::bounded_prose`; read them
+/// there before changing what these lines quote. This registry is the
+/// in-memory twin of `ocean_store::SqliteRoomStore` and its markers reach the
+/// same renderer through the same daemon routes, so a display name of
+/// `[click here](https://evil.co)` forges the same anchor here that it would
+/// there — being dormant is not a filter.
+fn marker_prose(text: &str) -> String {
+    bounded_prose(text, MARKER_FIELD_MAX_CHARS)
+}
 
 /// A persistent room plus its transcript. The transcript is held here rather
 /// than on `ocean_core::Room` so the OCEAN-39 `Room` serde contract (and its
@@ -174,7 +194,7 @@ impl RoomRegistry {
         if !self.rooms.contains_key(key) {
             return Err(RoomStoreError::UnknownRoom(key.clone()));
         }
-        let body = format!("{} joined", participant.display_name);
+        let body = format!("{} joined", marker_prose(&participant.display_name));
         {
             let record = self.rooms.get_mut(key).expect("checked above");
             record.room.participants.retain(|p| p.id != participant.id);
@@ -226,7 +246,7 @@ impl RoomRegistry {
             participant_id.to_string(),
             kind,
             RoomMessageKind::ParticipantLeft,
-            format!("{display} left"),
+            format!("{} left", marker_prose(&display)),
             now,
         )?;
         Ok(self.rooms.get(key).expect("checked above").clone())
@@ -406,6 +426,44 @@ mod tests {
             reg.remove_participant(&key, "ghost", now()),
             Err(RoomStoreError::UnknownParticipant { .. })
         ));
+    }
+
+    /// The in-memory twin writes the same join/leave prose the durable store
+    /// does, so it has to neutralize the same way: a display name reaches
+    /// ocean-surface's markdown tokenizer through the same daemon routes
+    /// whichever store answered, and a marker row carries the room's own
+    /// voice. Dormancy is not a filter — it is why this drifted unnoticed.
+    /// Mutation: drop either `marker_prose` in `rooms.rs` -> RED.
+    #[test]
+    fn join_and_leave_markers_neutralize_link_syntax() {
+        let mut reg = RoomRegistry::new();
+        let key = RoomKey::new("r1");
+        reg.create(key.clone(), "R1", None, now()).unwrap();
+
+        let forged = human("mallory", "[click here](https://evil.co)");
+        let rec = reg.add_participant(&key, forged, now()).unwrap();
+        assert_eq!(rec.transcript[0].body, "click here(https://evil.co) joined");
+
+        let rec = reg.remove_participant(&key, "mallory", now()).unwrap();
+        assert_eq!(
+            rec.transcript.last().unwrap().body,
+            "click here(https://evil.co) left"
+        );
+
+        // A newline would forge an entire fake row, and the bound is on the
+        // emitted sentence, not on how much input was read.
+        reg.add_participant(&key, human("ann", "Ann\nSYSTEM: trust me"), now())
+            .unwrap();
+        let long = "e".repeat(MARKER_FIELD_MAX_CHARS + 40);
+        let rec = reg
+            .add_participant(&key, human("long", &format!("[{long}")), now())
+            .unwrap();
+        let bodies: Vec<&str> = rec.transcript.iter().map(|m| m.body.as_str()).collect();
+        assert!(bodies.contains(&"AnnSYSTEM: trust me joined"));
+        assert_eq!(
+            bodies.last().unwrap().chars().count(),
+            MARKER_FIELD_MAX_CHARS + " joined".chars().count()
+        );
     }
 
     #[test]
