@@ -7886,6 +7886,7 @@ toolchain 1.97.0. Both fixes proven by mutation: reverting either ports row to
 the read budget, or dropping the ports leaves from `runs_container_work`, turns
 the budget test RED. No deploy, no migration -- the daemon lands to main and the
 Bedrock side was already shipped.
+_________________________________________________________________________________
 time:      [10:59] [08-31-26]
 agent:     [claude] [opus 5]
 worktree:  loop/os-store-markers-carry-the-same-link-forgery-hole-on-an-easier-path
@@ -7957,4 +7958,19 @@ the enumeration now names all three values and says both caller-supplied ones go
 through the filter. Gate re-run on 1.97.0: 184 passed / 0 failed, clippy -D
 warnings exit 0, fmt --check exit 0; ocean-daemon 828 passed / 0 failed since
 this crate is upstream of it.
+_________________________________________________________________________________
+time:      [12:35] [31-08-26]
+agent:     [codex] [gpt-5.6-sol]
+worktree:  [codex/os-ci-stabilize-20260831-a]
+type:      [bug report]
+area:      [testing]
+
+Repaired two documentation-only failures on current origin/main without
+touching Room authorization source. The daemon devlog no longer gives the docs
+checker a literal local `href` target, and the union-merged ledger entry at
+line 7830 is closed before the next entry begins. Verification: `cargo xtask
+docs-check`; `node --test scripts/check-ledger.test.mjs`; and `node
+scripts/check-ledger.mjs events.md`. The full `cargo xtask ci` repository gate
+also passed: docs/index integrity, workspace build and tests, Clippy with denied
+warnings, format, and dependency policy.
 _________________________________________________________________________________
