@@ -7584,3 +7584,98 @@ because the job is non-blocking, so a red check would not have stopped a merge,
 it would only have been red from birth. No Rust changed, no deploy, no
 migration.
 _________________________________________________________________________________
+
+time:      [05:05] [08-31-26]
+agent:     [claude] [opus 5]
+worktree:  loop/os-ci-marker-run-url
+type:      [feature-request]
+area:      [backend]
+
+#413 made a red `ci_checked` convene the room's agents, and a convened agent's
+entire input is the one transcript line that woke it -- which read "workspace
+CI on 'main': 1 new result -- build: failure" and stopped there. The human side
+was never short: ocean-surface's repo panel decodes the whole check and links
+every run through `check_href`. The agent had no route to anything.
+`WorkspaceCiCheck` decoded two of Bedrock's ten projected keys, so `head_sha`
+and `url` were arriving and being thrown away on the exact signal that now
+wakes agents. Both are decoded now and the arm ends with ONE route -- the FIRST
+RED check's, not the first check's, since nobody was woken for a green one and
+three URLs would wreck the line the three-check cap exists to protect: `--
+first failure 'build' @ 3f2a1b0c9d8e: <url>`. Every part degrades on its own,
+and a check with neither commit nor URL grows no tail. The six keys still
+dropped are now a ruling in the struct doc rather than a silent omission.
+
+The URL is the attacker-shaped field: it is `gh` stdout read inside the room's
+own container, so it is the container's word and not GitHub's. It is gated the
+way ocean-surface already gates the same string before making it an anchor
+(`room_repo::check_href` -> `room_markdown::scheme_allowed`), restated here
+because the two repos cannot share code -- http/https only, no whitespace, no
+backslash, no percent-encoded control or space, non-empty authority with no
+userinfo. One deliberate difference from every other quoted payload string:
+`bounded_quotable` repairs by dropping and truncating, and a repaired URL is a
+DIFFERENT URL, so its output is compared back and any URL that changed under it
+is omitted rather than emitted pointing somewhere its producer never named.
+`head_sha` reuses the existing `short_sha`, hexdigit validation and all.
+
+Factored the four red conclusions into one `conclusion_is_red` read by both the
+marker's tail and `ci_checks_are_red`, and a test asserts the two agree across
+all nine conclusions -- an agent woken by a conclusion must find that
+conclusion's run on the line that woke it, which only holds while the trigger
+and the line cannot drift. `on_ci_failure`'s dispatch reason string is
+untouched. Gate green: 825 passed, clippy -D warnings clean, fmt clean. No
+deploy, no migration.
+_________________________________________________________________________________
+
+time:      05:27 08-31-26
+agent:     claude opus 5
+worktree:  loop/os-ci-marker-run-url
+type:      review
+area:      backend
+
+Refinement against the review of the CI marker's run route. Both findings were
+about coverage, not behavior, and both held up. The http/https allowlist in
+`ci_run_url` was untested: every payload in the hostile array is refused by an
+earlier guard, and the four scheme-shaped ones (`javascript:alert(1)` and
+friends) carry no `://` at all, so `split_once` short-circuits before the
+scheme is ever compared. Deleting both `eq_ignore_ascii_case` calls outright
+left all 85 `room_federation::tests` green -- a future edit letting `ftp://`,
+`file://` or `vscode://` into a line agents act on would have landed clean.
+`ftp://example.test/runs/1` and `javascript://example.test/x` are the only
+shape that reaches the gate, and now the array carries them; with the gate
+removed the test fails on the first of them. The doc comment stopped citing
+ocean-surface's `a_check_href_is_gated_to_http_schemes` as this gate's proof,
+because that test has the identical hole and a test in another repo was never
+coverage here.
+
+The comment justifying the re-named tail claimed the tail "belongs to ONE of
+the up to three checks above". It does not: the named list is `.take(3)`, the
+red search runs the whole array, and Bedrock's `CI_RUN_LIMIT` is 20, so three
+greens followed by a red build is an ordinary payload that names a fourth
+check. The re-naming is more right than the comment claimed, not less -- that
+is the case where an agent most needs the name -- so the sentence was corrected
+and a four-check case pins it: narrowing the red search to the named window
+drops the tail, and widening the named list to four trips the new assertion.
+Gate green on the whole tree: 825 passed, clippy -D warnings exit 0, fmt clean.
+No deploy, no migration.
+_________________________________________________________________________________
+
+time:      [10:35] [31-08-26]
+agent:     [claude] [opus 5]
+worktree:  loop/os-ci-marker-run-url
+type:      [merge]
+area:      [infra]
+
+The ledger checker landed forty minutes ago and caught its first real fold on
+the very next rebase. Landing wave 42 merged the checker (PR #415) and then
+rebased this branch onto it. Git reported NO CONFLICT and the rebase reported
+success -- and `node scripts/check-ledger.mjs events.md` came back "1 of 514
+entries are not closed", naming line 7548 as running into line 7586. The
+checker port's own entry had lost its closing rule to the append, so its prose
+ran straight into this entry's `time:` header. Two entries, one rule, no marker,
+nothing in the diff to look at: exactly the shape the tool was written for, and
+exactly the shape that had gone unnoticed through four previous waves. Rule
+restored by hand rather than by `--fix`, since a one-line repair a person can
+read beats a rewrite nobody reviewed; the checker then reported 514 entries,
+every one closed. Recorded because "the instrument has never fired" and "the
+failure never happens" look identical until the first time it does.
+_________________________________________________________________________________
