@@ -8250,3 +8250,88 @@ rehearsal remains valid because the final repair changed no schema. No push,
 merge to main, install, restart, live database mutation, or deployment was
 performed; upstream landing is the next release boundary.
 _________________________________________________________________________________
+
+time:      [14:58] [08-31-26]
+agent:     [claude] [opus 5]
+worktree:  loop/os-vendors-bedrock-events
+type:      [refactor]
+area:      [backend]
+
+`BEDROCK_ROOM_WORKSPACE_EVENTS` was 22 hand-typed strings under a comment
+reading "pinned against ocean-bedrock origin/master @ 9efef97, checked
+2026-08-30" -- a claim about another repo with no written way to re-derive it.
+The classification over it was already exhaustive and already caught the
+`mkdir` phantom, so the gap was never the ruling; it was that the pinned set
+itself could go quietly wrong and nothing would say so. Bedrock has since moved
+to 1c2e299 with seven commits touching src/server.mjs, and the set is still
+exactly those 22 -- so this landed as a mechanism, not a bug fix.
+ocean-bedrock's own `docs/room-event-actions.json` (which its suite holds equal
+to the `WORKSPACE_EVENT_ACTIONS` table beside `emitWorkspaceEvent`) is now
+vendored verbatim into `crates/ocean-daemon/tests/fixtures/bedrock-room-events/`
+with the sha stamped beside it in `vendored-from.json`, and
+`pinned_bedrock_event_set_matches_the_vendored_artifact` `include_str!`s it and
+reports the two directions separately: an action bedrock publishes and this
+file has never seen is the silent-drop case, an action pinned here and
+published nowhere is the phantom case. Proved it bites by adding
+`newly_minted` and removing `flushed` from the fixture and watching it fail
+with the intended sentence, then restoring through the script.
+
+A COPY and deliberately not a fetch, and that is a repo-shape ruling worth
+recording once so nobody re-derives it: ocean-bedrock is PRIVATE while ocean-os
+and ocean-surface are PUBLIC, so a workflow here cannot check out or fetch that
+sibling without a cross-repo secret this project will not put in CI. A CI step
+reaching across the two is not an unfinished chore, it is unavailable -- which
+is exactly why the assertion is over a checked-in file: it runs on every build
+with no checkout, no network, and no skip-when-absent arm, the arm that would
+stop asserting on precisely the machine where the repos are not side by side.
+`scripts/vendor-bedrock-room-events.mjs` is the refresh (checkout from
+`$OCEAN_BEDROCK_DIR`, a named path, or the `../ocean-bedrock` sibling; exit 2
+with instructions when it is absent; `--check` compares without writing; a
+moved set prints the delta and names the partitions a human has to rule on).
+The doc comments and `crates/ocean-daemon/AGENTS.md` both said "no automated
+cross-repo check exists" and now say what does exist and what still cannot,
+because the half that stays open is real: the copy still ages, and until
+someone runs that command an action bedrock added is dropped in silence.
+`.github/workflows/ci.yml` names its node test files one at a time and belongs
+to another slice, so `scripts/vendor-bedrock-room-events.test.mjs` runs by hand
+(`node --test`) and is documented as such in its own header.
+_________________________________________________________________________________
+
+time:      [15:22] [08-31-26]
+agent:     [claude] [opus 5]
+worktree:  loop/os-vendors-bedrock-events
+type:      [review]
+area:      [backend]
+
+Refinement pass on the vendored-event slice, against four review findings, and
+one of them RETRACTS a paragraph the entry above this one wrote. That entry and
+`crates/ocean-daemon/AGENTS.md` recorded "a CI step reaching across the two is
+unavailable, not merely unbuilt" as a standing repo-shape ruling, down to
+telling the next agent not to propose one. That was wrong and it was mine: the
+private/public asymmetry is real, but it makes a cross-repo check a CREDENTIAL
+this project has not taken on, not a shape the repo cannot hold -- a
+fine-grained token in ocean-os secrets makes `actions/checkout` of a private
+sibling work today, and no prior ruling here says otherwise. The contract now
+states the cost and the current choice and invites the trade to be argued;
+minting policy into a file other agents obey is an operator's call, not a
+builder's.
+
+The other three all landed on the slice's own thesis. The namespace assertion
+read `prefix` out of the artifact it was validating, so a fixture declaring
+`"prefix": "room."` passed trivially -- the one guard in a slice about not
+trusting hand-editable claims was itself trusting one. It now pins
+`ROOM_EVENT_PREFIX = "room.workspace."`, the value bedrock's own suite holds
+that key equal to, and the mjs fixture test stopped reading the field back for
+the same reason. `--check` compared only the parsed action set, so a fixture
+whose bytes had diverged reported "is current." at exit 0 -- a false green on
+the byte identity the whole fixture is evidence for; it now compares the file
+contents and says which of the two failures it found. And `vendored-from.json`,
+the machine-written provenance that replaced a hand-typed sha, was asserted only
+by the mjs test CI does not name, so on a green build it could have been emptied
+while the doc comments kept pointing readers at it;
+`the_vendored_artifact_names_the_bedrock_commit_it_came_from` `include_str!`s it
+under the gate that runs every build. Proved each bites by re-running the
+reviewer's own mutations: widened prefix -> the pin fails naming both values,
+emptied sha -> the provenance test fails, prefix edited with no action moved ->
+`--check` exits 1 saying the sets agree but the bytes do not.
+_________________________________________________________________________________

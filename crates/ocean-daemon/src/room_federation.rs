@@ -3441,11 +3441,20 @@ const WORKSPACE_MARKER_SOURCE_ID: &str = "workspace";
 /// action is dropped, and dropped SILENTLY, so a new upstream event reads as
 /// nothing having happened.
 /// `workspace_marker_allowlist_classifies_every_bedrock_event` turns that
-/// silence into a failing test, but only once a human has re-derived the
-/// pinned set against a newer Bedrock: nothing in ocean-os reads
-/// ocean-bedrock, so no automated cross-repo check exists and the pin cannot
-/// notice an addition by itself. Skipping that re-derivation is how `mkdir`
-/// survived in this file as a phantom.
+/// silence into a failing test over `BEDROCK_ROOM_WORKSPACE_EVENTS`, and
+/// `pinned_bedrock_event_set_matches_the_vendored_artifact` holds that set
+/// equal to ocean-bedrock's own published artifact, vendored into
+/// `tests/fixtures/bedrock-room-events/`. Be exact about what that closes and
+/// what it does not: the two are now the same list on every build, so the
+/// classification can no longer drift from the pin, and the pin can no longer
+/// drift from the copy — which is how `mkdir` survived here as a phantom. The
+/// COPY still ages. Nothing in this repo reads ocean-bedrock, and nothing does
+/// today: that repo is PRIVATE and this one is PUBLIC, so a workflow here could
+/// fetch it only on a cross-repo token held in this repo's secrets, which this
+/// project has not taken on for a staleness check. Refreshing the copy is a
+/// human step, run through `scripts/vendor-bedrock-room-events.mjs`, and until
+/// someone runs it against a newer Bedrock an action added there is still
+/// dropped in silence by this matcher's default.
 fn workspace_action_is_marker(event_type: &str) -> bool {
     matches!(
         event_type,
@@ -8345,15 +8354,22 @@ mod tests {
 
     /// Every `room.workspace.*` event type ocean-bedrock actually emits.
     ///
-    /// Pinned against ocean-bedrock `origin/master` @ 9efef97, checked
-    /// 2026-08-30. The rule that decides membership, and the only one: a
-    /// string belongs here if and only if it is the `action` of an
-    /// `emitWorkspaceEvent` call in ocean-bedrock `src/server.mjs`. That
-    /// helper is what stamps `correlation_id` and the room-scoped `path` onto
-    /// the audit row, and the SSE stream this daemon ingests is that ledger
-    /// filtered on exactly those two fields — so a `room.workspace.*` string
-    /// reaching `appendAudit` by any other route cannot arrive on this rail,
-    /// however much it reads like a room event.
+    /// Held equal to `VENDORED_BEDROCK_ROOM_EVENTS` — ocean-bedrock's own
+    /// published artifact, checked in beside this crate — by
+    /// `pinned_bedrock_event_set_matches_the_vendored_artifact`, so this list
+    /// is no longer a hand-typed claim about a repo nothing here reads. The
+    /// commit the copy came from is stamped in the fixture directory's
+    /// `vendored-from.json` and not in this comment, because a sha maintained
+    /// by hand is exactly the thing that goes stale without saying so.
+    ///
+    /// The rule that decides membership, and the only one: a string belongs
+    /// here if and only if it is the `action` of an `emitWorkspaceEvent` call
+    /// in ocean-bedrock `src/server.mjs`. That helper is what stamps
+    /// `correlation_id` and the room-scoped `path` onto the audit row, and the
+    /// SSE stream this daemon ingests is that ledger filtered on exactly those
+    /// two fields — so a `room.workspace.*` string reaching `appendAudit` by
+    /// any other route cannot arrive on this rail, however much it reads like
+    /// a room event.
     ///
     /// `build_finished` / `build_failed` are the two arms of one call site's
     /// ternary rather than two literals; a grep for the names misses them.
@@ -8381,6 +8397,118 @@ mod tests {
         "room.workspace.port_closed",
         "room.workspace.secrets_updated",
     ];
+
+    /// ocean-bedrock's `docs/room-event-actions.json`, vendored verbatim.
+    ///
+    /// Bedrock generates that file from the `WORKSPACE_EVENT_ACTIONS` table
+    /// beside `emitWorkspaceEvent` and holds it equal to that table in its own
+    /// suite, so it is the producer's word on what it publishes rather than a
+    /// reader's transcription of it.
+    ///
+    /// A COPY, and deliberately not a fetch: ocean-bedrock is PRIVATE and this
+    /// repo is PUBLIC, so a workflow here could read that sibling only on a
+    /// cross-repo token this project has chosen not to carry in its secrets. `include_str!` makes the
+    /// comparison below run on every build with no checkout, no network and no
+    /// skip-when-absent arm — the arm that would stop asserting on exactly the
+    /// machine where the two repos are not side by side. What that buys is
+    /// worth stating narrowly: the pinned set can no longer drift from the
+    /// copy. The copy itself still goes stale against a newer Bedrock, and
+    /// `scripts/vendor-bedrock-room-events.mjs` is the one command that
+    /// refreshes it.
+    const VENDORED_BEDROCK_ROOM_EVENTS: &str =
+        include_str!("../tests/fixtures/bedrock-room-events/room-event-actions.json");
+
+    /// The ocean-bedrock commit the copy beside it was taken from, written by
+    /// `scripts/vendor-bedrock-room-events.mjs`.
+    const VENDORED_BEDROCK_PROVENANCE: &str =
+        include_str!("../tests/fixtures/bedrock-room-events/vendored-from.json");
+
+    #[test]
+    fn pinned_bedrock_event_set_matches_the_vendored_artifact() {
+        let artifact: serde_json::Value = serde_json::from_str(VENDORED_BEDROCK_ROOM_EVENTS)
+            .expect("the vendored artifact parses as JSON");
+        assert_eq!(
+            artifact["produced_by"].as_str(),
+            Some("ocean-bedrock"),
+            "this fixture is evidence only while it is the producer's own file"
+        );
+        // The namespace is a fixed fact of this rail rather than a field the
+        // artifact gets to supply — ocean-bedrock's own suite holds this key
+        // equal to its hardcoded `ROOM_EVENT_PREFIX` — so it is asserted here
+        // before it is used. Reading it out of the file under validation would
+        // let a widened `prefix` pass the loop below trivially.
+        const ROOM_EVENT_PREFIX: &str = "room.workspace.";
+        assert_eq!(
+            artifact["prefix"].as_str(),
+            Some(ROOM_EVENT_PREFIX),
+            "the artifact declares a namespace the room stream does not filter on"
+        );
+        let listed: Vec<&str> = artifact["actions"]
+            .as_array()
+            .expect("the artifact carries an `actions` array")
+            .iter()
+            .map(|action| action.as_str().expect("every published action is a string"))
+            .collect();
+
+        let published: std::collections::BTreeSet<&str> = listed.iter().copied().collect();
+        let pinned: std::collections::BTreeSet<&str> =
+            BEDROCK_ROOM_WORKSPACE_EVENTS.into_iter().collect();
+        assert_eq!(
+            published.len(),
+            listed.len(),
+            "the artifact repeats an action"
+        );
+        assert_eq!(
+            pinned.len(),
+            BEDROCK_ROOM_WORKSPACE_EVENTS.len(),
+            "BEDROCK_ROOM_WORKSPACE_EVENTS repeats an action"
+        );
+
+        // Reported as two directions rather than one set compare, because the
+        // two failures are not the same failure. An action Bedrock publishes
+        // and this file has never seen is the silent-drop case the allowlist's
+        // default hides; an action pinned here and published nowhere is the
+        // phantom case, which is how `mkdir` sat in this file unemitted for as
+        // long as it existed.
+        let unpinned: Vec<&str> = published.difference(&pinned).copied().collect();
+        assert!(
+            unpinned.is_empty(),
+            "ocean-bedrock publishes {unpinned:?}, which this daemon drops silently — \
+             rule on each in ADMITTED or DELIBERATE_NOISE, then add it here"
+        );
+        let phantom: Vec<&str> = pinned.difference(&published).copied().collect();
+        assert!(
+            phantom.is_empty(),
+            "{phantom:?} is pinned here but ocean-bedrock publishes nothing by that name"
+        );
+
+        for action in listed {
+            assert!(
+                action.starts_with(ROOM_EVENT_PREFIX),
+                "{action} is outside the {ROOM_EVENT_PREFIX} namespace the room stream filters on"
+            );
+        }
+    }
+
+    // Every doc comment about this fixture sends a reader to the stamp for the
+    // one piece of provenance a PUBLIC repo can be given about a PRIVATE one,
+    // so the stamp is asserted by the gate that runs on every build rather than
+    // only by the vendor script's own test, which CI does not name.
+    #[test]
+    fn the_vendored_artifact_names_the_bedrock_commit_it_came_from() {
+        let stamp: serde_json::Value = serde_json::from_str(VENDORED_BEDROCK_PROVENANCE)
+            .expect("the provenance stamp parses as JSON");
+        assert_eq!(
+            stamp["repo"].as_str(),
+            Some("ocean-bedrock"),
+            "the stamp is provenance only while it names the repo the copy came from"
+        );
+        let sha = stamp["sha"].as_str().unwrap_or_default();
+        assert!(
+            sha.len() == 40 && sha.chars().all(|c| c.is_ascii_hexdigit()),
+            "{sha:?} is not a full ocean-bedrock commit sha — re-run the vendor script"
+        );
+    }
 
     #[test]
     fn workspace_marker_allowlist_classifies_every_bedrock_event() {
