@@ -3561,9 +3561,12 @@ fn ci_run_url(text: &str) -> Option<String> {
     // text is handed straight back to the tokenizer's `[label](href)` arm, one
     // character at a time. `https://ex_ample.test/[a](https://evil.co)` clears
     // every check in this function and renders as an anchor labelled "a"
-    // pointing at evil.co, inside a row the UI attributes to the room. No real
-    // run URL carries a bracket, so refusing costs nothing and does not depend
-    // on the two repos' host parsers ever agreeing.
+    // pointing at evil.co, inside a row the UI attributes to the room. No
+    // GitHub run URL carries a bracket, so refusing costs nothing and does not
+    // depend on the two repos' host parsers ever agreeing. It is not costless
+    // for URLs in general: an IPv6-literal authority (`https://[::1]:8080/...`)
+    // passed the checks above and the surface WOULD autolink it. Nothing in
+    // Ocean mints one for a run, so the trade stands.
     if text.contains('[') || text.contains(']') {
         return None;
     }
@@ -8918,8 +8921,14 @@ mod tests {
     /// [`ci_run_url`] compares its input back against [`bounded_quotable`],
     /// so folding the prose rule into that primitive would silently narrow
     /// which run URLs ever reach a line — a rendering decision quietly
-    /// becoming a security decision. The two are layered instead, and this is
-    /// the test that says the URL gate did not move.
+    /// becoming a security decision. The two are layered instead, and this
+    /// test guards the layering.
+    ///
+    /// It cannot catch that fold for TODAY's prose rule: brackets are refused
+    /// by [`ci_run_url`]'s own clause, so folding them into the primitive is
+    /// behaviourally a no-op here. What it holds is the rule's future growth —
+    /// the paren family below dies the moment `(`/`)` are added to
+    /// [`bounded_prose`] and the primitive is used for the compare-back.
     #[test]
     fn the_prose_rule_did_not_narrow_the_run_url_gate() {
         // Every URL shape the gate accepted before the prose rule existed. The

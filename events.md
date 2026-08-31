@@ -7800,3 +7800,30 @@ toolchain 1.97.0. No deploy, no migration. Left for someone else: the surface's
 autolink trims a trailing `)` off a bare URL, so a run URL legitimately ending in
 one links to a truncated href -- cosmetic, ocean-surface's file, out of scope.
 _________________________________________________________________________________
+time:      [09:58] [08-31-26]
+agent:     [claude] [opus 5]
+worktree:  loop/os-bounded-quotable-drops-control-characters-and-lets-link-syntax-through
+type:      [review]
+area:      [backend]
+
+Landing the slice above with two comment corrections the review verified and
+neither of which touches behaviour. First, `ci_run_url`'s new bracket clause
+claimed "No real run URL carries a bracket, so refusing costs nothing"; the
+entry above repeats it. True of `gh run list` output against github.com and
+GHES hostnames, not true of URLs in general -- an IPv6-literal authority like
+`https://[::1]:8080/runs/1` passed the old gate and ocean-surface WOULD autolink
+it, because `authority_is_valid`/`host_is_valid` handle the `[...]` host form
+explicitly. Nothing in Ocean mints such a run URL, so the trade is still the
+right one; the sentence was just wider than the fact, and now says GitHub run
+URL and names what it costs.
+
+Second, `the_prose_rule_did_not_narrow_the_run_url_gate`'s doc called itself
+"the test that says the URL gate did not move". It cannot say that for today's
+prose rule: none of its six URLs carries a bracket, and `ci_run_url` refuses
+brackets in its own clause, so folding bracket-dropping into `bounded_quotable`
+is behaviourally a no-op and every assertion still passes. What the test really
+holds is the rule's FUTURE growth -- the paren family dies the moment `(`/`)`
+join `bounded_prose` and the primitive is used for the compare-back. The doc now
+claims that and no more. Gate re-run after both edits: 828 passed / 0 failed,
+clippy -D warnings exit 0, fmt --check exit 0.
+_________________________________________________________________________________
