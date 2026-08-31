@@ -554,14 +554,40 @@ pub(super) struct RoomCreateRequest {
     pub(super) workspace_root: Option<String>,
 }
 
+/// The frozen refusal body for a trigger value the daemon will not store: a
+/// stable machine `code` and the exact field the caller has to change. Both
+/// refusals below share it so the shape can only ever be written once.
+fn trigger_unwired_response(
+    field: &'static str,
+    error: String,
+) -> (StatusCode, Json<serde_json::Value>) {
+    (
+        StatusCode::BAD_REQUEST,
+        Json(json!({
+            "ok": false,
+            "code": "trigger_unwired",
+            "field": field,
+            "error": error,
+        })),
+    )
+}
+
 /// Refuse a submitted policy that enables a trigger the daemon never fires.
-/// Mention, thread-reply, build-failure, and CI-failure events come from real
-/// code paths; nothing emits a schedule tick or a component event, so storing
-/// those values would accept configuration that silently never acts. Refuse
-/// the VALUE, not the field's presence: clients serialize
-/// `"on_component_event": false` into every policy body (bools have no
-/// skip-if-default on the wire), so presence-refusal would 400 every room
-/// write that sets any trigger.
+/// Mention, build-failure, and CI-failure events come from real code paths —
+/// mention from a local post and a federated inbound alike, the two failure
+/// flags from the federation ingest rail alone; nothing emits a schedule tick
+/// or a component event, so storing those values would accept configuration
+/// that silently never acts. Refuse the VALUE, not the field's presence:
+/// clients serialize `"on_component_event": false` into every policy body
+/// (bools have no skip-if-default on the wire), so presence-refusal would 400
+/// every room write that sets any trigger.
+///
+/// Neither thread-reply nor the two failure flags is refused here, for
+/// opposite reasons. A room is created `Local` and only ever federates later,
+/// so enabling a failure flag in a Local room is anticipatory, not inert.
+/// Thread-reply runs the asymmetry the other way — live in `Local`, dead the
+/// moment a room leaves it — so it is gated on the room's access state by
+/// [`dead_thread_reply_transition`] rather than on its value alone.
 fn unwired_trigger_response(
     policy: &RoomTriggerPolicy,
 ) -> Option<(StatusCode, Json<serde_json::Value>)> {
@@ -572,15 +598,81 @@ fn unwired_trigger_response(
     } else {
         return None;
     };
-    Some((
-        StatusCode::BAD_REQUEST,
-        Json(json!({
-            "ok": false,
-            "code": "trigger_unwired",
-            "field": field,
-            "error": format!("{field} has no runtime yet: the daemon never fires this trigger, so the value would be stored and never act"),
-        })),
+    Some(trigger_unwired_response(
+        field,
+        format!("{field} has no runtime yet: the daemon never fires this trigger, so the value would be stored and never act"),
     ))
+}
+
+/// Is this policy write switching `on_thread_reply` ON in a room that no
+/// longer fires it?
+///
+/// The daemon builds `RoomTriggerEvent::ThreadReply` on exactly one path — the
+/// local post, from the thread root's author — and a federated inbound message
+/// carries no thread parent, so the flag is dead from the moment a room leaves
+/// `Local`.
+///
+/// What is refused is the TRANSITION (stored false or absent → requested
+/// true), never the value, and that distinction is the whole design.
+/// ocean-surface builds a policy PATCH by cloning the room's STORED policy and
+/// flipping one field, so a federated room already holding
+/// `on_thread_reply: true` re-sends `true` on every unrelated toggle. Refusing
+/// the value would 400 all of them and brick the trigger panel for exactly the
+/// rooms this rule exists to protect. Refusing the transition is unreachable
+/// from that client — which also disables the thread-reply row in a federated
+/// room — so it cannot wedge the form.
+///
+/// Both of those ocean-surface facts are a MANUAL pin, conditional on it and on
+/// nothing else: they were read at `rooms_workspace.rs` (`policy_with_toggle`
+/// clones the stored policy and flips one field; `trigger_row_is_editable`
+/// blocks the row) and hold there today, but no automated cross-repo check
+/// exists and nothing in ocean-os reads ocean-surface, so a client that stops
+/// cloning the stored policy turns "unreachable" into a 400 nobody re-derived.
+/// What does NOT depend on the pin is the direction below: switching the flag
+/// off is accepted in every access state, so no client can be locked out of
+/// clearing it however its write is composed.
+///
+/// Switching the flag OFF stays allowed in every access state. It is the only
+/// way a room that federated while the flag was set can ever be cleaned up,
+/// and the daemon must not be the thing blocking that.
+///
+/// A room that already stores `true` and has since federated KEEPS its stored
+/// value: this path deliberately does not normalize it to false. A PATCH about
+/// some other flag silently rewriting a field the caller never named would put
+/// the stored policy out of step with the request that wrote it, and the house
+/// answer to an unstorable value here is a typed refusal, not a quiet rewrite.
+/// Clearing it is blocked on the client, not here — the surface's
+/// `trigger_row_is_editable` disables a dead row in BOTH directions, so nobody
+/// can uncheck it. That is filed as
+/// `surface-dead-trigger-row-cannot-be-unchecked-so-stored-dead-state-is-permanent`;
+/// the moment that row can be unchecked, the true→false PATCH it sends is
+/// already accepted here.
+///
+/// `room_create` has no counterpart check: a room is `Local` at creation and
+/// federates only later, so a create has no non-Local room to refuse.
+fn dead_thread_reply_transition(
+    stored: Option<&RoomTriggerPolicy>,
+    requested: &RoomTriggerPolicy,
+    access: RoomAccessState,
+) -> bool {
+    requested.on_thread_reply
+        && !stored.is_some_and(|p| p.on_thread_reply)
+        && access != RoomAccessState::Local
+}
+
+/// The update route's error: a store fault, or the daemon refusing the policy
+/// on evidence it could only read under the store guard. Keeping them apart is
+/// what lets the refusal answer with its own typed 400 while a store fault
+/// keeps [`room_store_error_response`]'s existing mapping.
+enum RoomUpdateError {
+    Store(ocean_store::RoomStoreError),
+    DeadThreadReply,
+}
+
+impl From<ocean_store::RoomStoreError> for RoomUpdateError {
+    fn from(e: ocean_store::RoomStoreError) -> Self {
+        Self::Store(e)
+    }
 }
 
 /// `POST /v1/rooms/persistent` — create a persistent room.
@@ -680,14 +772,42 @@ pub(super) async fn room_update(
     }
     let key = RoomKey::new(trimmed);
     let result = with_rooms(&state, |reg| {
+        // The thread-reply rule needs the STORED policy and the room's access
+        // state, so unlike `unwired_trigger_response` it cannot run before the
+        // store is open. Reading both under the SAME guard as the write is the
+        // point: a room federating between the access read and the update it
+        // gates would otherwise land the flag the read had just cleared.
+        if let Some(requested) = req.trigger_policy.as_ref().and_then(|p| p.as_ref()) {
+            // Establish the room is WRITABLE before refusing a write to it.
+            // `trigger_policy` and `room_access` both answer for any room the
+            // store still holds, soft-closed included, while `update` writes
+            // only an open one — so without this gate a closed federated room
+            // asking for the flag would learn its federation state from a typed
+            // 400 where the contract has always been a flat 404. Same gate
+            // `room_post_message` opens with, and under the same guard as the
+            // write, so it cannot be raced by a close in between.
+            if reg.get(&key)?.is_none() {
+                return Err(ocean_store::RoomStoreError::UnknownRoom(key.clone()).into());
+            }
+            let stored = reg.trigger_policy(&key)?;
+            let access = reg.room_access(&key)?.state;
+            if dead_thread_reply_transition(stored.as_ref(), requested, access) {
+                return Err(RoomUpdateError::DeadThreadReply);
+            }
+        }
         reg.update(&key, req.name, req.trigger_policy, Utc::now())
+            .map_err(RoomUpdateError::Store)
     });
     match result {
         Ok(rec) => (
             StatusCode::OK,
             Json(json!({ "ok": true, "room": rec.room })),
         ),
-        Err(e) => room_store_error_response(e),
+        Err(RoomUpdateError::DeadThreadReply) => trigger_unwired_response(
+            "on_thread_reply",
+            "on_thread_reply has no runtime in a federated room: the daemon raises that trigger only from a local post, and a federated message carries no thread parent, so the value would be stored and never act".to_string(),
+        ),
+        Err(RoomUpdateError::Store(e)) => room_store_error_response(e),
     }
 }
 
@@ -4348,6 +4468,227 @@ mod tests {
             body.0["room"]["trigger_policy"]["on_thread_reply"],
             json!(true)
         );
+    }
+
+    /// The transition rule in one table, with neither store nor route in the
+    /// way: only a false-or-absent → true flip in a room that has left `Local`
+    /// is refused.
+    #[test]
+    fn dead_thread_reply_transition_refuses_only_the_flip_out_of_a_local_room() {
+        let on = RoomTriggerPolicy {
+            on_thread_reply: true,
+            ..Default::default()
+        };
+        let off = RoomTriggerPolicy::default();
+
+        // The flip, in every room state that no longer fires the trigger. An
+        // absent stored policy reads the same as a stored `false`.
+        for access in [
+            RoomAccessState::Connecting,
+            RoomAccessState::Live,
+            RoomAccessState::Recovering,
+            RoomAccessState::Revoked,
+        ] {
+            assert!(dead_thread_reply_transition(Some(&off), &on, access));
+            assert!(dead_thread_reply_transition(None, &on, access));
+        }
+
+        // Not a flip: the room already stores the value, so every later write
+        // that carries it back through is accepted.
+        assert!(!dead_thread_reply_transition(
+            Some(&on),
+            &on,
+            RoomAccessState::Live
+        ));
+        // Switching it OFF is allowed everywhere — it is the only way a stored
+        // dead value ever goes away.
+        assert!(!dead_thread_reply_transition(
+            Some(&on),
+            &off,
+            RoomAccessState::Live
+        ));
+        // A Local room fires the trigger, so nothing is refused there.
+        assert!(!dead_thread_reply_transition(
+            Some(&off),
+            &on,
+            RoomAccessState::Local
+        ));
+        assert!(!dead_thread_reply_transition(
+            None,
+            &on,
+            RoomAccessState::Local
+        ));
+    }
+
+    /// A room that federates after creation stops firing thread-reply: the
+    /// daemon builds that event only on the local post path, from the thread
+    /// root's author, and a federated message carries no thread parent. So
+    /// switching the flag ON there is refused with the same typed body every
+    /// other unwired trigger gets, and nothing is written.
+    #[tokio::test]
+    async fn room_update_refuses_enabling_thread_reply_once_the_room_federates() {
+        let _env = AUTO_CONVENE_ENV_LOCK.lock().await;
+        let tmp = tempfile::tempdir().unwrap();
+        let state = fake_convene_state(&tmp);
+        let key = RoomKey::new("thread-reply-federated");
+        let created_policy = RoomTriggerPolicy {
+            on_mention: true,
+            ..Default::default()
+        };
+        with_rooms(&state, |store| {
+            store.create(
+                key.clone(),
+                "Thread Reply Federated",
+                Some(created_policy.clone()),
+                Utc::now(),
+            )?;
+            store.update_room_access_safe(&key, Some(RoomAccessState::Live), None, None)?;
+            store.install_room_credential(&key, "test-bearer", "member-a")?;
+            Ok::<_, ocean_store::RoomStoreError>(())
+        })
+        .unwrap();
+
+        let (status, body) = room_update(
+            State(state.clone()),
+            Path(key.as_str().to_string()),
+            Bytes::from_static(
+                br#"{"trigger_policy":{"on_mention":true,"on_thread_reply":true,"on_component_event":false}}"#,
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(body.0["ok"], json!(false));
+        assert_eq!(body.0["code"], json!("trigger_unwired"));
+        assert_eq!(body.0["field"], json!("on_thread_reply"));
+
+        // The refusal wrote nothing: the policy is still what create stored.
+        let stored = with_rooms(&state, |store| store.get(&key))
+            .unwrap()
+            .expect("room exists");
+        assert_eq!(stored.room.trigger_policy, Some(created_policy));
+    }
+
+    /// The refusal answers only for rooms that can be WRITTEN. `trigger_policy`
+    /// and `room_access` read any room the store still holds, soft-closed
+    /// included, while `update` writes only an open one — so the check had to be
+    /// gated or it would have answered for a room no PATCH can reach, changing a
+    /// documented 404 into a typed 400 that also discloses the closed room's
+    /// federation state. Same room as the refusal test above, closed first.
+    #[tokio::test]
+    async fn room_update_404s_a_closed_room_rather_than_refusing_its_dead_trigger() {
+        let _env = AUTO_CONVENE_ENV_LOCK.lock().await;
+        let tmp = tempfile::tempdir().unwrap();
+        let state = fake_convene_state(&tmp);
+        let key = RoomKey::new("thread-reply-closed");
+        with_rooms(&state, |store| {
+            store.create(
+                key.clone(),
+                "Thread Reply Closed",
+                Some(RoomTriggerPolicy {
+                    on_mention: true,
+                    ..Default::default()
+                }),
+                Utc::now(),
+            )?;
+            store.update_room_access_safe(&key, Some(RoomAccessState::Live), None, None)?;
+            store.install_room_credential(&key, "test-bearer", "member-a")?;
+            store.close(&key)?;
+            Ok::<_, ocean_store::RoomStoreError>(())
+        })
+        .unwrap();
+
+        // Exactly the body the open federated room is refused for.
+        let (status, body) = room_update(
+            State(state.clone()),
+            Path(key.as_str().to_string()),
+            Bytes::from_static(
+                br#"{"trigger_policy":{"on_mention":true,"on_thread_reply":true,"on_component_event":false}}"#,
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert_eq!(body.0["ok"], json!(false));
+        // Not `trigger_unwired`: a closed room is answered as absent, and is
+        // told nothing about whether it had federated.
+        assert_eq!(body.0["code"], json!(serde_json::Value::Null));
+    }
+
+    /// The property the refusal turns on, and the reason it is a TRANSITION
+    /// rule and not a value rule. ocean-surface builds a policy PATCH by
+    /// cloning the room's STORED policy and flipping one field, so a federated
+    /// room already holding `on_thread_reply: true` re-sends `true` on every
+    /// unrelated toggle. Refusing the value would 400 all of them and brick the
+    /// trigger panel for exactly the rooms the rule protects. Clearing the flag
+    /// has to keep working too: that is the write the surface will send once
+    /// its dead row can be unchecked, and the daemon must not be what blocks
+    /// it. Once cleared, switching it back on is a real flip and is refused.
+    #[tokio::test]
+    async fn room_update_accepts_a_federated_room_resending_a_thread_reply_it_already_stores() {
+        let _env = AUTO_CONVENE_ENV_LOCK.lock().await;
+        let tmp = tempfile::tempdir().unwrap();
+        let state = fake_convene_state(&tmp);
+        let key = RoomKey::new("thread-reply-already-stored");
+        with_rooms(&state, |store| {
+            store.create(
+                key.clone(),
+                "Thread Reply Already Stored",
+                Some(RoomTriggerPolicy {
+                    on_thread_reply: true,
+                    ..Default::default()
+                }),
+                Utc::now(),
+            )?;
+            store.update_room_access_safe(&key, Some(RoomAccessState::Live), None, None)?;
+            store.install_room_credential(&key, "test-bearer", "member-a")?;
+            Ok::<_, ocean_store::RoomStoreError>(())
+        })
+        .unwrap();
+
+        // Exactly what the surface sends to turn `on_mention` on: the stored
+        // policy, one field flipped, the dead flag carried through untouched.
+        let (status, body) = room_update(
+            State(state.clone()),
+            Path(key.as_str().to_string()),
+            Bytes::from_static(
+                br#"{"trigger_policy":{"on_mention":true,"on_thread_reply":true,"on_component_event":false}}"#,
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body.0["room"]["trigger_policy"]["on_mention"], json!(true));
+        // Still stored, still dead. The daemon does not quietly normalize it.
+        assert_eq!(
+            body.0["room"]["trigger_policy"]["on_thread_reply"],
+            json!(true)
+        );
+
+        // The clearing write.
+        let (status, body) = room_update(
+            State(state.clone()),
+            Path(key.as_str().to_string()),
+            Bytes::from_static(
+                br#"{"trigger_policy":{"on_mention":true,"on_thread_reply":false,"on_component_event":false}}"#,
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            body.0["room"]["trigger_policy"]["on_thread_reply"],
+            json!(false)
+        );
+
+        // And now it is a flip again, so the room cannot re-acquire the dead
+        // value it just gave up.
+        let (status, body) = room_update(
+            State(state),
+            Path(key.as_str().to_string()),
+            Bytes::from_static(
+                br#"{"trigger_policy":{"on_mention":true,"on_thread_reply":true,"on_component_event":false}}"#,
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(body.0["field"], json!("on_thread_reply"));
     }
 
     /// M6 + H1 regression: the Live-room `GET .../read-cursor` response uses

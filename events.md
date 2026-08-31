@@ -8039,3 +8039,66 @@ a mistyped `preview_url` poisoning the whole row like every other typed field.
 Gate on 1.97.0: ocean-daemon 831 passed / 0 failed, clippy -D warnings exit 0,
 fmt --check exit 0.
 _________________________________________________________________________________
+time:      [13:19] [08-31-26]
+agent:     [claude] [opus 5]
+worktree:  loop/os-thread-reply-refusal-as-recorded-would-wedge-every-policy-write
+type:      [bug report]
+area:      [backend]
+
+`unwired_trigger_response` had just been widened to refuse `on_thread_reply`
+alongside the schedule and component-event flags, and as recorded that refusal
+was on the VALUE. ocean-surface builds a policy PATCH by cloning the room's
+stored policy and flipping one field, so a federated room already holding
+`on_thread_reply: true` re-sends `true` on every unrelated toggle — a value
+refusal would have 400'd all of them and bricked the trigger panel for exactly
+the rooms the rule exists to protect. What is dead is the flag in a non-`Local`
+room (`RoomTriggerEvent::ThreadReply` is built on one path, the local post from
+the thread root's author, and a federated inbound message carries no thread
+parent), so `dead_thread_reply_transition` now refuses the TRANSITION — stored
+false-or-absent → requested true, in a room whose access state is not `Local` —
+and the update route reads access under the same store guard that writes the
+policy. Switching the flag OFF stays legal in every state, since that is the
+only way a room that federated while set can ever be cleaned up. The refusal
+body was factored into `trigger_unwired_response` so both refusals emit one
+shape.
+
+Refinement pass on the reviewer's two findings. The amended doc claimed the
+mention, build-failure and CI-failure events "come from real code paths in
+every room", which is false for two of the three: `BuildFailed` and `CiFailure`
+are constructed only in the federation SSE ingest rail
+(`room_federation.rs:3954-3956`), so both are dead in a `Local` room — the same
+asymmetry the paragraph under it introduces, pointing the other way. The
+sentence now says where each event actually comes from and why the direction
+decides the gate: a room is created `Local` and only federates later, so a
+failure flag set locally is anticipatory rather than inert, while thread-reply
+is live in `Local` and dead the moment a room leaves it. Second finding was
+this entry's own absence — CI's `ledger` job fails any diff touching `crates/`
+without one. This entry closes with the rule plus the blank line the ledger
+already puts between a rule and the next header: `origin/main` gained an entry
+after this branch was cut, and with the file ending on a bare rule the union
+driver eats one of the two rules and fuses that entry into this one — the fold
+`scripts/check-ledger.mjs` exists to catch. Gate on 1.97.0: ocean-daemon 833
+passed / 0 failed, clippy -D warnings exit 0, fmt --check exit 0.
+Mutation-checked earlier in the slice: neutering the predicate to `false` fails
+3 of the 4 thread_reply tests, and dropping the `!stored.is_some_and(...)`
+clause (the naive value rule) fails the accept test 400 != 200 plus the
+predicate table.
+
+Two reviewer notes taken at land. The refusal was being evaluated before the
+store's OPEN-room gate: `trigger_policy` and `room_access` answer for any room
+the store still holds, soft-closed included, while `update` writes only an open
+one -- so a soft-closed federated room PATCHed with the flag on returned 400
+`trigger_unwired` where the contract has always been a flat 404, and was told
+its federation state in the bargain. The check now opens with the same
+`reg.get(&key)?.is_none()` gate `room_post_message` uses, under the same guard
+as the write so a close cannot race in between. Reproduced before and after:
+removing that gate turns the new
+`room_update_404s_a_closed_room_rather_than_refusing_its_dead_trigger` red with
+left 400 / right 404. And the predicate's doc stated ocean-surface internals as
+present-tense fact; it now carries this crate's convention for a cross-repo
+claim -- the guarantee is conditional on a manual pin and on nothing else, since
+no automated cross-repo check exists -- plus the half that does NOT depend on
+the pin, which is that the off direction is accepted in every access state, so
+no client can be locked out of clearing the flag however its write is composed.
+_________________________________________________________________________________
+
