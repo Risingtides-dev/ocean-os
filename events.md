@@ -7886,4 +7886,75 @@ toolchain 1.97.0. Both fixes proven by mutation: reverting either ports row to
 the read budget, or dropping the ports leaves from `runs_container_work`, turns
 the budget test RED. No deploy, no migration -- the daemon lands to main and the
 Bedrock side was already shipped.
+time:      [10:59] [08-31-26]
+agent:     [claude] [opus 5]
+worktree:  loop/os-store-markers-carry-the-same-link-forgery-hole-on-an-easier-path
+type:      [bug-report]
+area:      [backend]
+
+ocean-os#418 closed the `[label](href)` forgery on room_federation.rs's CI
+markers, but the same hole was open in ocean-store on a much cheaper path: five
+`MessageDraft::marker` bodies and both `attachment_marker` bodies interpolated
+caller-supplied text -- a display name, an artifact title, an uploader's
+filename, an author id -- straight into a row ocean-surface attributes to the
+room and renders through `room_markdown::body_view`. Joining a room under the
+display name `[click here](https://evil.co)` was enough to put an anchor with
+an attacker-chosen label AND destination into the room's own voice. No
+container, no CI, no federation. `crates/ocean-store/src/lib.rs` had no prose
+filter of any kind: a grep for is_control / sanitize / bounded found nothing,
+and the daemon's `sanitize_filename` strips control characters and never link
+syntax, so the attachment marker's claim that "only the sanitized filename"
+went in was true about newlines and wrong about brackets.
+
+The fix is `marker_prose`, a local copy of `bounded_prose` -- ocean-store cannot
+import it, the crate dependency runs the other way -- applied per field at all
+seven marker sites. Same rule, no widening: control characters and `[`/`]` go,
+and `(`/`)`, `*`, backtick, `@` and bare autolinks stay, because the tokenizer's
+link arm opens on `[` alone and an autolink's label IS its href. Bounded at 128
+characters, on the emitted string. The stored rows keep their values verbatim;
+this repairs the transcript SENTENCE only, which three of the four new tests
+assert directly. Hoisting the primitive into ocean-core so the daemon and the
+store cannot drift is a three-crate change; it needs its own slice and does not
+happen here.
+
+Scope note for the reviewer: the slice named five markers and I did seven. The
+two attachment markers are in the same file, carry the same uploader-supplied
+filename, and leaving them would have half-closed the hole in the one file the
+slice owns. Gate on 1.97.0: 183 passed / 0 failed, clippy -D warnings exit 0,
+fmt --check exit 0. Mutation-checked: dropping `marker_prose` from the two join
+markers, the leave marker and `create_artifact`'s title takes two of the new
+tests RED.
+_________________________________________________________________________________
+time:      [11:15] [08-31-26]
+agent:     [claude] [opus 5]
+worktree:  loop/os-store-markers-carry-the-same-link-forgery-hole-on-an-easier-path
+type:      [review]
+area:      [backend]
+
+Refinement pass on the marker_prose slice. The review accepted the fix and
+rejected the evidence: the id half of it -- `marker_prose(author)` in
+`create_artifact` and `amend_artifact`, `marker_prose(uploader)` in
+`add_attachment`, `marker_prose(remover)` in `remove_attachment` -- had no test
+at all. The reviewer reverted all four to raw interpolation and the suite stayed
+at 183 green, which in this repo means those lines are decoration a refactor can
+delete silently. They are not decoration: the daemon's client-author guard
+refuses only the roster KINDS Agent and System, and a participant id is
+validated only as non-empty-and-equal-to-its-own-trim, so
+`[click here](https://evil.co)` is a legal id to join under and then author and
+upload as. `a_participant_id_cannot_forge_a_link_in_an_artifact_or_attachment_marker`
+joins under exactly that id and walks all four call sites; each of the four
+reverts now lands on its own assertion (7803 / 7811 / 7828 / 7834). It also
+asserts the roster keeps the id verbatim, which is load-bearing rather than
+tidy: every guard on those paths matched the caller against that exact string,
+so filtering the record would unseat the participant from their own room.
+
+Second finding, and the sharper one: the attachment comment this slice
+deliberately rewrote still misdescribed the line under it. It enumerated "only
+the filename and a server-computed integer", three lines above a format string
+whose first argument is the uploader id -- caller-supplied text this very commit
+had just filtered. That is the same defect class the slice exists to correct, so
+the enumeration now names all three values and says both caller-supplied ones go
+through the filter. Gate re-run on 1.97.0: 184 passed / 0 failed, clippy -D
+warnings exit 0, fmt --check exit 0; ocean-daemon 828 passed / 0 failed since
+this crate is upstream of it.
 _________________________________________________________________________________
