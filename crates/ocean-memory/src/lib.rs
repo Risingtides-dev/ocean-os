@@ -673,7 +673,8 @@ impl SqliteMemoryStore {
         // Room partitions deliberately allow the same logical id. Detect a
         // database written by an invalid intermediate build before installing
         // the partial unique index, and fail without changing its rows.
-        let duplicate_operator_id: Option<String> = conn
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let duplicate_operator_id: Option<String> = tx
             .query_row(
                 "SELECT id FROM memories
                  WHERE partition = ?1
@@ -688,6 +689,19 @@ impl SqliteMemoryStore {
                 "operator memory id {id} exists for multiple owners"
             )));
         }
+        // Recreate a versioned index under the same write transaction as the
+        // duplicate check. `IF NOT EXISTS` alone is unsafe here: an invalid
+        // intermediate build could have created the expected name as a
+        // non-unique or differently-filtered index, and SQLite would silently
+        // keep it. Dropping both historical names makes the installed
+        // invariant self-verifying on every open.
+        tx.execute_batch(
+            "DROP INDEX IF EXISTS idx_memories_operator_id;
+             DROP INDEX IF EXISTS idx_memories_operator_id_v2;
+             CREATE UNIQUE INDEX idx_memories_operator_id_v2
+                ON memories(id) WHERE partition = 'operator:v1';",
+        )?;
+        tx.commit()?;
         conn.execute_batch(
             "CREATE INDEX IF NOT EXISTS idx_memories_owner_seq
                 ON memories(owner, seq DESC);
@@ -696,9 +710,7 @@ impl SqliteMemoryStore {
              CREATE INDEX IF NOT EXISTS idx_memories_partition_owner_seq
                 ON memories(partition, owner, seq DESC);
              CREATE INDEX IF NOT EXISTS idx_memories_partition_owner_live
-                ON memories(partition, owner) WHERE deleted_at IS NULL;
-             CREATE UNIQUE INDEX IF NOT EXISTS idx_memories_operator_id
-                ON memories(id) WHERE partition = 'operator:v1';",
+                ON memories(partition, owner) WHERE deleted_at IS NULL;",
         )?;
         Ok(())
     }
@@ -2045,6 +2057,79 @@ mod tests {
             .query_row("SELECT COUNT(*) FROM memories", [], |row| row.get(0))
             .unwrap();
         assert_eq!(rows, 2, "failed migration must preserve ambiguous rows");
+    }
+
+    #[test]
+    fn migration_replaces_wrong_named_operator_index() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let path = tmp.path();
+        {
+            let conn = Connection::open(path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE memories (
+                    id TEXT NOT NULL, scope TEXT NOT NULL, owner TEXT NOT NULL,
+                    kind TEXT NOT NULL, body TEXT NOT NULL, provenance TEXT NOT NULL,
+                    trust TEXT NOT NULL, seq INTEGER NOT NULL, written_at INTEGER NOT NULL,
+                    updated_at INTEGER NOT NULL, deleted_at INTEGER,
+                    history TEXT NOT NULL DEFAULT '[]',
+                    partition TEXT NOT NULL DEFAULT 'operator:v1',
+                    PRIMARY KEY (partition, owner, id)
+                 );
+                 CREATE INDEX idx_memories_operator_id_v2
+                    ON memories(owner);",
+            )
+            .unwrap();
+        }
+
+        let store = SqliteMemoryStore::open(path).unwrap();
+        let index_sql: String = store
+            .conn
+            .query_row(
+                "SELECT sql FROM sqlite_master
+                 WHERE type = 'index' AND name = 'idx_memories_operator_id_v2'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(index_sql.contains("CREATE UNIQUE INDEX"));
+        assert!(index_sql.contains("partition = 'operator:v1'"));
+
+        let first = sample_memory("alice", "one");
+        let second = sample_memory("bob", "two");
+        for (owner, memory) in [("alice", first), ("bob", second)] {
+            let result = store.conn.execute(
+                "INSERT INTO memories
+                    (id, scope, owner, kind, body, provenance, trust, seq,
+                     written_at, updated_at, history, partition)
+                 VALUES ('same-id', ?1, ?2, ?3, ?4, ?5, ?6, 1, ?7, ?8, ?9, ?10)",
+                params![
+                    memory.scope.as_str(),
+                    owner,
+                    memory.kind.as_str(),
+                    serde_json::to_string(&memory.body).unwrap(),
+                    serde_json::to_string(&memory.provenance).unwrap(),
+                    trust_to_str(memory.trust),
+                    memory.written_at,
+                    memory.updated_at,
+                    serde_json::to_string(&memory.history).unwrap(),
+                    OPERATOR_PARTITION,
+                ],
+            );
+            if owner == "alice" {
+                result.unwrap();
+            } else {
+                assert!(matches!(
+                    result,
+                    Err(rusqlite::Error::SqliteFailure(
+                        rusqlite::ffi::Error {
+                            code: rusqlite::ErrorCode::ConstraintViolation,
+                            ..
+                        },
+                        _
+                    ))
+                ));
+            }
+        }
     }
 
     #[test]
