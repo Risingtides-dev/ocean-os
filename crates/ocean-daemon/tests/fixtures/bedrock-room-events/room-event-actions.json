@@ -1,0 +1,30 @@
+{
+  "note": "Every room.workspace.* action ocean-bedrock stamps on a room event stream: the PRODUCER set, derived from the WORKSPACE_EVENT_ACTIONS table beside emitWorkspaceEvent in src/server.mjs and held equal to it by test/room-event-actions.test.mjs. The stream carries more than this list -- a room's messages ride the identical correlation_id and virtual_path pair, which is what makes them the same stream -- so read this as the workspace slice of a room's events, not as everything a reader of that stream will see. A consumer allowlist is expected to be a SUBSET of this, and a smaller one is not a defect on its face -- ocean-os deliberately ignores several of these when deciding what becomes a room marker, because file_written and file_deleted are keystrokes, exec_* is chatter an agent would read back as its own typing, and a *_started doubles the operation it opens. Read that repo's own rationale before filing its omissions as a bug against this list. What IS a defect: an action emitted here that a consumer has never seen, because an unlisted action is dropped silently and a new event then reads downstream as nothing having happened.",
+  "produced_by": "ocean-bedrock",
+  "source": "src/server.mjs :: WORKSPACE_EVENT_ACTIONS",
+  "prefix": "room.workspace.",
+  "actions": [
+    "room.workspace.build_failed",
+    "room.workspace.build_finished",
+    "room.workspace.build_started",
+    "room.workspace.ci_checked",
+    "room.workspace.destroyed",
+    "room.workspace.exec_failed",
+    "room.workspace.exec_finished",
+    "room.workspace.exec_started",
+    "room.workspace.execs_purged",
+    "room.workspace.file_deleted",
+    "room.workspace.file_written",
+    "room.workspace.flushed",
+    "room.workspace.hydrated",
+    "room.workspace.port_closed",
+    "room.workspace.port_exposed",
+    "room.workspace.provisioned",
+    "room.workspace.repo_bound",
+    "room.workspace.repo_clone_failed",
+    "room.workspace.repo_clone_started",
+    "room.workspace.repo_cloned",
+    "room.workspace.repo_unbound",
+    "room.workspace.secrets_updated"
+  ]
+}
