@@ -3631,6 +3631,35 @@ fn compose_workspace_marker(event_type: &str, p: &WorkspaceEventPayload) -> Stri
     }
 }
 
+/// Whether a `ci_checked` payload carries a result a room should be woken for.
+///
+/// `build_failed` IS the failure; `ci_checked` is one event type carrying both
+/// colors, so this half of the decision has to read the payload. Bedrock lists
+/// only completed runs (`gh run list --status completed`), which makes a null
+/// conclusion a defensive case rather than the normal one — and an unreadable
+/// conclusion is never grounds to convene. Absent or empty `checks` means there
+/// is nothing to judge.
+///
+/// The listed conclusions are the ones that mean a human has to look.
+/// `cancelled` and `stale` are superseded runs, `skipped` and `neutral` are not
+/// failures, and `success` is the point.
+///
+/// Deduplication is upstream and deliberately NOT repeated here: Bedrock sends
+/// only checks the room has not seen plus re-runs whose conclusion actually
+/// changed, and emits no event at all when there is no news. So a member
+/// polling on a timer does not re-convene on the same red check, and a
+/// green-to-red re-run still arrives as news.
+fn ci_checks_are_red(checks: Option<&[WorkspaceCiCheck]>) -> bool {
+    checks.is_some_and(|checks| {
+        checks.iter().any(|check| {
+            matches!(
+                check.conclusion.as_deref(),
+                Some("failure" | "timed_out" | "action_required" | "startup_failure")
+            )
+        })
+    })
+}
+
 /// Ingest one allowlisted `room.workspace.*` ledger row as a System
 /// transcript marker.
 ///
@@ -3650,16 +3679,20 @@ fn compose_workspace_marker(event_type: &str, p: &WorkspaceEventPayload) -> Stri
 ///   row, so a replayed row rebuilds byte-identical meta and lands in the
 ///   store's Duplicate arm instead of its corruption arm.
 ///
-/// `trigger_targets` is filled for exactly one row kind: `build_failed`, and
-/// only in a room whose trigger policy opts in via `on_build_failure` (ruled
+/// `trigger_targets` is filled for exactly two row kinds, each behind its own
+/// opt-in: `build_failed` under `on_build_failure`, and a `ci_checked` row
+/// whose payload [`ci_checks_are_red`] judges red under `on_ci_failure` (ruled
 /// 2026-08-29: a build failure is a trigger event on the existing convene
-/// path, not a new mechanism). Targets are the roster's Agent members; the
-/// store's claim site keeps only the locally-bound ones and consumes each
-/// (row, target) pair once, and the dispatcher re-validates ownership and
-/// binding before queuing a turn — so a replayed row or a foreign agent can
-/// never be convened from here. Every other workspace row keeps empty
-/// targets: the marker reaching agents through the transcript on their NEXT
-/// convened turn is the point of this lane.
+/// path, not a new mechanism; a red check joined it on the same terms). The
+/// two flags are independent, so a room that opted in to build failures before
+/// CI triggers existed convenes on exactly what it opted in to. Targets are
+/// the roster's Agent members; the store's claim site keeps only the
+/// locally-bound ones and consumes each (row, target) pair once, and the
+/// dispatcher re-validates ownership and binding before queuing a turn — so a
+/// replayed row or a foreign agent can never be convened from here. Every
+/// other workspace row — a green build, a green or in-progress CI run — keeps
+/// empty targets: the marker reaching agents through the transcript on their
+/// NEXT convened turn is the point of this lane.
 fn ingest_workspace_row(
     inner: &Arc<SupervisorInner>,
     key: &RoomKey,
@@ -3672,13 +3705,22 @@ fn ingest_workspace_row(
     let payload: WorkspaceEventPayload =
         serde_json::from_value(row.payload).map_err(|_| BridgeError::Protocol)?;
     let body = compose_workspace_marker(&row.event_type, &payload);
-    // Only a failed build consults the policy; a green build and a CI result
-    // stay pure markers. The over-broad roster read is deliberate — the store
+    // Only a failure consults the policy, and each kind answers to its own
+    // flag. A build row IS the failure; a CI row has to be read, because the
+    // one `ci_checked` event type carries green and red alike. Everything else
+    // stays a pure marker. The over-broad roster read is deliberate — the store
     // and the dispatcher both re-filter (see the doc above).
-    let (trigger_targets, trigger_reason) = if row.event_type == "room.workspace.build_failed" {
+    let trigger_event = match row.event_type.as_str() {
+        "room.workspace.build_failed" => Some(RoomTriggerEvent::BuildFailed),
+        "room.workspace.ci_checked" if ci_checks_are_red(payload.checks.as_deref()) => {
+            Some(RoomTriggerEvent::CiFailure)
+        }
+        _ => None,
+    };
+    let (trigger_targets, trigger_reason) = if let Some(trigger_event) = trigger_event {
         let policy = with_rooms_handle(&inner.rooms, |store| store.trigger_policy(key))
             .map_err(|_| BridgeError::Store)?;
-        let decision = evaluate_trigger_policy(policy.as_ref(), &RoomTriggerEvent::BuildFailed);
+        let decision = evaluate_trigger_policy(policy.as_ref(), &trigger_event);
         let targets = if decision.should_convene {
             with_rooms_handle(&inner.rooms, |store| store.room_access(key))
                 .map_err(|_| BridgeError::Store)?
@@ -8363,6 +8405,50 @@ mod tests {
         }
     }
 
+    #[test]
+    fn ci_conclusions_convene_only_on_a_red_result() {
+        let checks = |value: serde_json::Value| -> Vec<WorkspaceCiCheck> {
+            serde_json::from_value(value).expect("checks deserialize")
+        };
+
+        // The four conclusions that mean a human has to look.
+        for red in ["failure", "timed_out", "action_required", "startup_failure"] {
+            assert!(
+                ci_checks_are_red(Some(&checks(json!([{"name": "ci", "conclusion": red}])))),
+                "{red} must convene"
+            );
+        }
+
+        // Everything else is either green, superseded by a later run, or not a
+        // result at all. `null` is defensive — Bedrock lists only completed
+        // runs — and an unreadable conclusion is never grounds to wake a room.
+        for quiet in [
+            json!([{"name": "ci", "conclusion": "success"}]),
+            json!([{"name": "ci", "conclusion": "skipped"}]),
+            json!([{"name": "ci", "conclusion": "neutral"}]),
+            json!([{"name": "ci", "conclusion": "cancelled"}]),
+            json!([{"name": "ci", "conclusion": "stale"}]),
+            json!([{"name": "ci", "conclusion": null}]),
+            json!([{"name": "ci"}]),
+            json!([{"conclusion": "FAILURE"}]),
+            json!([]),
+        ] {
+            assert!(
+                !ci_checks_are_red(Some(&checks(quiet.clone()))),
+                "{quiet} must convene nobody"
+            );
+        }
+
+        // A row with no checks at all has nothing to judge.
+        assert!(!ci_checks_are_red(None));
+
+        // One red among greens is still news: the whole batch is what arrived.
+        assert!(ci_checks_are_red(Some(&checks(json!([
+            {"name": "lint", "conclusion": "success"},
+            {"name": "test", "conclusion": "failure"}
+        ])))));
+    }
+
     #[tokio::test]
     async fn workspace_marker_commits_one_system_row_and_replays_as_noop() {
         let key = RoomKey::new("workspace-marker");
@@ -8512,7 +8598,9 @@ mod tests {
         let inner = test_supervisor_inner_with_trigger(rooms, trigger_tx);
 
         // The opt-in gates the ROW KIND, not the lane: a green build and a CI
-        // result stay pure markers even with on_build_failure enabled.
+        // row with nothing red in it stay pure markers even with
+        // on_build_failure enabled. (A RED CI row under this same flag is
+        // pinned in ci_failure_marker_convenes_only_on_a_red_check_and_opt_in.)
         for (id, sequence, event_type) in [
             ("ledger-ok", "1", "room.workspace.build_finished"),
             ("ledger-ci", "2", "room.workspace.ci_checked"),
@@ -8561,6 +8649,182 @@ mod tests {
             trigger_rx.try_recv().is_err(),
             "a replayed row must not double-convene"
         );
+    }
+
+    /// A red CI row is a trigger event on the same convene path as a build
+    /// failure, gated by its own flag. This walks the whole matrix in one
+    /// room: the colors that must stay silent, the cross-flag case that proves
+    /// `on_build_failure` was not quietly widened, and the red row that fires.
+    #[tokio::test]
+    async fn ci_failure_marker_convenes_only_on_a_red_check_and_opt_in() {
+        let key = RoomKey::new("workspace-ci-trigger");
+        let human = "11111111-1111-4111-8111-111111111111";
+        let agent = "33333333-3333-4333-8333-333333333333";
+
+        let ci_row = |key: &RoomKey, id: &str, sequence: &str, payload: serde_json::Value| {
+            let mut row = workspace_trigger_row(key, id, sequence, "room.workspace.ci_checked");
+            row.payload = payload;
+            row
+        };
+
+        // First room: opted in to BUILD failures only. A red check must not
+        // convene it — that is the whole reason this is a separate flag.
+        let mut store = ocean_store::SqliteRoomStore::open_in_memory().unwrap();
+        store
+            .create(
+                key.clone(),
+                "Workspace",
+                Some(ocean_core::RoomTriggerPolicy {
+                    on_build_failure: true,
+                    ..Default::default()
+                }),
+                chrono::Utc::now(),
+            )
+            .unwrap();
+        store
+            .install_room_credential(&key, "workspace-bearer", human)
+            .unwrap();
+        store.bind_room_agent(&key, agent, "sage", "key").unwrap();
+        store
+            .update_room_access_safe(
+                &key,
+                Some(RoomAccessState::Live),
+                Some(&[
+                    p2c_projected_member(human, FederatedActorType::User, None),
+                    p2c_projected_member(agent, FederatedActorType::Agent, Some(human)),
+                ]),
+                None,
+            )
+            .unwrap();
+        let rooms = Arc::new(std::sync::Mutex::new(store));
+        let (trigger_tx, mut trigger_rx) = mpsc::unbounded_channel();
+        let inner = test_supervisor_inner_with_trigger(rooms, trigger_tx);
+
+        let outcome = ingest_workspace_row(
+            &inner,
+            &key,
+            ci_row(
+                &key,
+                "ledger-ci-red",
+                "1",
+                json!({"checks": [{"name": "test", "conclusion": "failure"}]}),
+            ),
+        )
+        .unwrap();
+        assert_eq!(outcome, IngestDisposition::Committed);
+        assert!(
+            trigger_rx.try_recv().is_err(),
+            "a room that opted in to build failures must not convene on CI"
+        );
+
+        // Second room: opted in to CI failures.
+        let key = RoomKey::new("workspace-ci-trigger-optin");
+        let mut store = ocean_store::SqliteRoomStore::open_in_memory().unwrap();
+        store
+            .create(
+                key.clone(),
+                "Workspace",
+                Some(ocean_core::RoomTriggerPolicy {
+                    on_ci_failure: true,
+                    ..Default::default()
+                }),
+                chrono::Utc::now(),
+            )
+            .unwrap();
+        store
+            .install_room_credential(&key, "workspace-bearer", human)
+            .unwrap();
+        store.bind_room_agent(&key, agent, "sage", "key").unwrap();
+        store
+            .update_room_access_safe(
+                &key,
+                Some(RoomAccessState::Live),
+                Some(&[
+                    p2c_projected_member(human, FederatedActorType::User, None),
+                    p2c_projected_member(agent, FederatedActorType::Agent, Some(human)),
+                ]),
+                None,
+            )
+            .unwrap();
+        let rooms = Arc::new(std::sync::Mutex::new(store));
+        let (trigger_tx, mut trigger_rx) = mpsc::unbounded_channel();
+        let inner = test_supervisor_inner_with_trigger(rooms.clone(), trigger_tx);
+
+        // Green, in-progress, empty and absent `checks` all reach the
+        // transcript as markers and convene nobody. A build failure does not
+        // fire either: this room did not opt in to that one.
+        for (id, seq, payload) in [
+            (
+                "green",
+                "1",
+                json!({"checks": [{"name": "test", "conclusion": "success"}]}),
+            ),
+            (
+                "in-progress",
+                "2",
+                json!({"checks": [{"name": "test", "conclusion": null}]}),
+            ),
+            ("empty", "3", json!({"checks": []})),
+            ("absent", "4", json!({"checks_new": 0})),
+        ] {
+            let row = ci_row(&key, &format!("ledger-{id}"), seq, payload);
+            let outcome = ingest_workspace_row(&inner, &key, row).unwrap();
+            assert_eq!(outcome, IngestDisposition::Committed);
+            assert!(trigger_rx.try_recv().is_err(), "{id} must convene nobody");
+        }
+
+        let outcome = ingest_workspace_row(
+            &inner,
+            &key,
+            workspace_trigger_row(&key, "ledger-build", "5", "room.workspace.build_failed"),
+        )
+        .unwrap();
+        assert_eq!(outcome, IngestDisposition::Committed);
+        assert!(
+            trigger_rx.try_recv().is_err(),
+            "opting in to CI must not opt the room in to build failures"
+        );
+
+        // The red row, with one green alongside it: the batch is the news.
+        let red = || {
+            ci_row(
+                &key,
+                "ledger-ci-red",
+                "6",
+                json!({"branch": "main", "checks_new": 2, "checks": [
+                    {"name": "lint", "conclusion": "success"},
+                    {"name": "test", "conclusion": "failure"}
+                ]}),
+            )
+        };
+        let outcome = ingest_workspace_row(&inner, &key, red()).unwrap();
+        assert_eq!(outcome, IngestDisposition::Committed);
+        let dispatch = trigger_rx
+            .try_recv()
+            .expect("a red check convenes the bound agent");
+        assert_eq!(dispatch.target_member_id, agent);
+        assert_eq!(dispatch.ledger_event_id, "ledger-ci-red");
+        assert_eq!(dispatch.reason, "on_ci_failure: workspace CI failed");
+        assert!(
+            trigger_rx.try_recv().is_err(),
+            "only the bound Agent member is dispatched — never the human"
+        );
+
+        // SSE replay: the store's consume-once claim leaves nothing to
+        // dispatch, exactly as on the build lane.
+        let outcome = ingest_workspace_row(&inner, &key, red()).unwrap();
+        assert_eq!(outcome, IngestDisposition::Duplicate);
+        assert!(
+            trigger_rx.try_recv().is_err(),
+            "a replayed row must not double-convene"
+        );
+
+        // Every row above still landed as a marker; the trigger is additive.
+        let transcript = with_rooms_handle(&rooms, |s| s.get(&key))
+            .unwrap()
+            .unwrap()
+            .transcript;
+        assert_eq!(transcript.len(), 6, "each row lands exactly one marker");
     }
 
     #[tokio::test]

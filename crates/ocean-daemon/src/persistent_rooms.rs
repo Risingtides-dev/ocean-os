@@ -555,12 +555,13 @@ pub(super) struct RoomCreateRequest {
 }
 
 /// Refuse a submitted policy that enables a trigger the daemon never fires.
-/// Mention, thread-reply, and build-failure events come from real code paths;
-/// nothing emits a schedule tick or a component event, so storing those values
-/// would accept configuration that silently never acts. Refuse the VALUE, not
-/// the field's presence: clients serialize `"on_component_event": false` into
-/// every policy body (bools have no skip-if-default on the wire), so
-/// presence-refusal would 400 every room write that sets any trigger.
+/// Mention, thread-reply, build-failure, and CI-failure events come from real
+/// code paths; nothing emits a schedule tick or a component event, so storing
+/// those values would accept configuration that silently never acts. Refuse
+/// the VALUE, not the field's presence: clients serialize
+/// `"on_component_event": false` into every policy body (bools have no
+/// skip-if-default on the wire), so presence-refusal would 400 every room
+/// write that sets any trigger.
 fn unwired_trigger_response(
     policy: &RoomTriggerPolicy,
 ) -> Option<(StatusCode, Json<serde_json::Value>)> {
@@ -4130,7 +4131,7 @@ mod tests {
             State(state.clone()),
             Path(key.as_str().to_string()),
             Bytes::from_static(
-                br#"{"trigger_policy":{"on_mention":true,"on_build_failure":true}}"#,
+                br#"{"trigger_policy":{"on_mention":true,"on_build_failure":true,"on_ci_failure":true}}"#,
             ),
         )
         .await;
@@ -4139,6 +4140,10 @@ mod tests {
         assert_eq!(body.0["room"]["trigger_policy"]["on_mention"], json!(true));
         assert_eq!(
             body.0["room"]["trigger_policy"]["on_build_failure"],
+            json!(true)
+        );
+        assert_eq!(
+            body.0["room"]["trigger_policy"]["on_ci_failure"],
             json!(true)
         );
 
@@ -4152,6 +4157,12 @@ mod tests {
         assert_eq!(body.0["room"]["name"], json!("Renamed"));
         assert_eq!(
             body.0["room"]["trigger_policy"]["on_build_failure"],
+            json!(true)
+        );
+        // Read back through the store's hand-rolled policy codec: a flag that
+        // codec drops would read false here while the write response lied.
+        assert_eq!(
+            body.0["room"]["trigger_policy"]["on_ci_failure"],
             json!(true)
         );
 
@@ -4262,11 +4273,18 @@ mod tests {
                 "on_thread_reply": true,
                 "on_component_event": false,
                 "on_build_failure": true,
+                "on_ci_failure": true,
             }))),
         )
         .await;
         assert_eq!(status, StatusCode::CREATED);
         assert_eq!(body.0["room"]["trigger_policy"]["on_mention"], json!(true));
+        // Wired, so it is stored rather than refused — the create route must
+        // not grow a refusal for a flag the daemon actually fires.
+        assert_eq!(
+            body.0["room"]["trigger_policy"]["on_ci_failure"],
+            json!(true)
+        );
     }
 
     /// The same refusal on PATCH: the update route must not be the back door

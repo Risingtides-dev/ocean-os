@@ -521,11 +521,11 @@ impl std::fmt::Display for RoomKey {
 
 /// How a room's agents are woken. The data-model half of the collaboration
 /// model's trigger policy (OCEAN-39). The daemon fires `on_mention`,
-/// `on_thread_reply`, and `on_build_failure`; nothing emits a schedule tick
-/// or a component event yet, so the room write routes refuse values that
-/// would turn those two on rather than store configuration that silently
-/// never acts. All fields default off, so an absent/partial policy means "no
-/// automatic triggers".
+/// `on_thread_reply`, `on_build_failure`, and `on_ci_failure`; nothing emits
+/// a schedule tick or a component event yet, so the room write routes refuse
+/// values that would turn those two on rather than store configuration that
+/// silently never acts. All fields default off, so an absent/partial policy
+/// means "no automatic triggers".
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub struct RoomTriggerPolicy {
     /// Wake an agent when it is @-mentioned in the transcript.
@@ -543,6 +543,13 @@ pub struct RoomTriggerPolicy {
     /// so every policy stored before this field existed keeps its behavior.
     #[serde(default)]
     pub on_build_failure: bool,
+    /// Wake the room's agents when a workspace CI check comes back red. Off by
+    /// default, for the same reason as `on_build_failure`. Deliberately its own
+    /// flag rather than a widening of that one: widening would silently change
+    /// what a stored `true` means for every room that opted in to build
+    /// failures alone.
+    #[serde(default)]
+    pub on_ci_failure: bool,
     /// Optional cron expression for scheduled wake-ups. `None` = no schedule.
     /// UNWIRED: no scheduler tick exists, so the write routes refuse
     /// `Some(_)` (see the struct doc).
@@ -803,6 +810,11 @@ pub enum RoomTriggerEvent {
     /// A workspace build failed. Carries no participant: the policy convenes
     /// the room's agents, not one named target.
     BuildFailed,
+    /// A workspace CI check came back red. Carries no participant for the same
+    /// reason as [`Self::BuildFailed`]. Unlike a build failure, which IS the
+    /// event, CI reports both colors through one event type — so the red/green
+    /// call is the caller's, made before it constructs this.
+    CiFailure,
 }
 
 /// The decision produced by [`evaluate_trigger_policy`]: whether a room event
@@ -825,11 +837,12 @@ pub struct TriggerDecision {
 ///
 /// This is the pure, testable core of trigger evaluation — no I/O, no awaits.
 /// The daemon calls it after appending a transcript entry (mentions and thread
-/// replies) and on a workspace build failure; a positive decision emits a
-/// notice event and queues a turn for the target agent. No caller constructs
-/// [`RoomTriggerEvent::Schedule`] or [`RoomTriggerEvent::ComponentEvent`], so
-/// their branches here are documentation of intended semantics, not live
-/// behavior — the room write routes refuse policies that enable them.
+/// replies), on a workspace build failure, and on a red workspace CI check; a
+/// positive decision emits a notice event and queues a turn for the target
+/// agent. No caller constructs [`RoomTriggerEvent::Schedule`] or
+/// [`RoomTriggerEvent::ComponentEvent`], so their branches here are
+/// documentation of intended semantics, not live behavior — the room write
+/// routes refuse policies that enable them.
 ///
 /// An absent policy (`None`) never convenes. Each policy flag gates exactly one
 /// event variant, matching the collaboration model's `TriggerPolicy`.
@@ -877,6 +890,11 @@ pub fn evaluate_trigger_policy(
             should_convene: true,
             target_participant: None,
             reason: "on_build_failure: workspace build failed".into(),
+        },
+        RoomTriggerEvent::CiFailure if policy.on_ci_failure => TriggerDecision {
+            should_convene: true,
+            target_participant: None,
+            reason: "on_ci_failure: workspace CI failed".into(),
         },
         _ => TriggerDecision {
             should_convene: false,
@@ -1754,6 +1772,7 @@ mod tests {
             },
             RoomTriggerEvent::Schedule,
             RoomTriggerEvent::BuildFailed,
+            RoomTriggerEvent::CiFailure,
         ] {
             let decision = evaluate_trigger_policy(Some(&policy), &event);
             assert!(
@@ -1799,6 +1818,7 @@ mod tests {
             on_thread_reply: true,
             on_component_event: true,
             on_build_failure: true,
+            on_ci_failure: true,
             on_schedule: Some("*/5 * * * *".into()),
         };
 
@@ -1837,6 +1857,11 @@ mod tests {
         assert!(schedule.target_participant.is_none());
         assert!(schedule.reason.contains("*/5 * * * *"));
 
+        let ci = evaluate_trigger_policy(Some(&policy), &RoomTriggerEvent::CiFailure);
+        assert!(ci.should_convene);
+        assert!(ci.target_participant.is_none());
+        assert!(ci.reason.contains("on_ci_failure"));
+
         let build = evaluate_trigger_policy(Some(&policy), &RoomTriggerEvent::BuildFailed);
         assert!(build.should_convene);
         assert!(build.target_participant.is_none());
@@ -1854,6 +1879,74 @@ mod tests {
         // Build failures wake the room's agents, not one named participant.
         assert!(decision.target_participant.is_none());
         assert_eq!(decision.reason, "on_build_failure: workspace build failed");
+    }
+
+    #[test]
+    fn trigger_policy_fires_on_ci_failure() {
+        let policy = RoomTriggerPolicy {
+            on_ci_failure: true,
+            ..Default::default()
+        };
+        let decision = evaluate_trigger_policy(Some(&policy), &RoomTriggerEvent::CiFailure);
+        assert!(decision.should_convene);
+        // Like a build failure, a red check wakes the room's agents rather
+        // than one named participant.
+        assert!(decision.target_participant.is_none());
+        assert_eq!(decision.reason, "on_ci_failure: workspace CI failed");
+    }
+
+    #[test]
+    fn trigger_policy_ci_and_build_failure_flags_are_independent() {
+        // The reason this is a NEW flag rather than a widening of
+        // `on_build_failure`: a room that opted in to build failures alone must
+        // keep convening on exactly what it opted in to, and the inverse must
+        // hold too.
+        let build_only = RoomTriggerPolicy {
+            on_build_failure: true,
+            ..Default::default()
+        };
+        assert!(
+            !evaluate_trigger_policy(Some(&build_only), &RoomTriggerEvent::CiFailure)
+                .should_convene,
+            "a stored on_build_failure must not start firing on CI"
+        );
+        assert!(
+            evaluate_trigger_policy(Some(&build_only), &RoomTriggerEvent::BuildFailed)
+                .should_convene
+        );
+
+        let ci_only = RoomTriggerPolicy {
+            on_ci_failure: true,
+            ..Default::default()
+        };
+        assert!(
+            !evaluate_trigger_policy(Some(&ci_only), &RoomTriggerEvent::BuildFailed).should_convene,
+            "opting in to CI must not opt a room in to build failures"
+        );
+    }
+
+    #[test]
+    fn trigger_policy_ci_failure_field_is_optional_on_the_wire() {
+        // Same contract as `on_build_failure`: every policy stored before this
+        // field existed omits it and must deserialize to off, and the event tag
+        // stays snake_case for the surface's mirror of this enum.
+        let stored: RoomTriggerPolicy =
+            serde_json::from_value(serde_json::json!({"on_build_failure": true})).unwrap();
+        assert!(stored.on_build_failure);
+        assert!(!stored.on_ci_failure);
+
+        let policy = RoomTriggerPolicy {
+            on_ci_failure: true,
+            ..Default::default()
+        };
+        let roundtrip: RoomTriggerPolicy =
+            serde_json::from_value(serde_json::to_value(&policy).unwrap()).unwrap();
+        assert_eq!(roundtrip, policy);
+
+        assert_eq!(
+            serde_json::to_value(RoomTriggerEvent::CiFailure).unwrap(),
+            serde_json::json!({"type": "ci_failure"})
+        );
     }
 
     #[test]
@@ -1889,6 +1982,7 @@ mod tests {
         assert!(!policy.on_thread_reply);
         assert!(!policy.on_component_event);
         assert!(!policy.on_build_failure);
+        assert!(!policy.on_ci_failure);
         assert!(policy.on_schedule.is_none());
 
         for event in [
@@ -1903,6 +1997,7 @@ mod tests {
             },
             RoomTriggerEvent::Schedule,
             RoomTriggerEvent::BuildFailed,
+            RoomTriggerEvent::CiFailure,
         ] {
             let decision = evaluate_trigger_policy(Some(&policy), &event);
             assert!(
