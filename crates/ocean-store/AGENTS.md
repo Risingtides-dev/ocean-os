@@ -121,6 +121,13 @@ outbox, and the restart-safe federation core (S2 P2-A). One database file
   bump, mutation, returned projection, and commit in one IMMEDIATE transaction
   so a racing writer cannot change the authority a caller believes it
   approved. Closed rooms retain immutable audit history.
+- **Room-agent audit and output commits use the authority transaction.**
+  Authorization/status decisions persist their same-generation audit row in
+  the mutation's IMMEDIATE transaction, stale detection records the checked
+  transition and audit together, and a local agent reply commits only when the
+  binding still matches the admitted generation and digest. Never split these
+  into a mutation followed by a best-effort audit or a generation check
+  followed by an unguarded output write.
 - **Attachments are immutable, so the discipline is refusal, not CAS.** There is
   deliberately no `version` column on `room_attachments`: nothing amends an
   attachment, so a compare-and-swap guard would be decoration, and a decorative

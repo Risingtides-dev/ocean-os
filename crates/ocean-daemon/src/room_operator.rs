@@ -51,7 +51,8 @@ pub enum OperatorAuthError {
     /// refused; this is the required fail-closed stop, NOT a fallback to
     /// ambient trust. Maps to 503.
     Unavailable,
-    /// The `X-Ocean-Operator` header was absent. Maps to 401.
+    /// The `X-Ocean-Operator` header was absent. Room-agent mutation routes
+    /// map this to 503 under the accepted Phase 1 wire contract.
     Missing,
     /// The presented credential did not match. Maps to 403.
     Invalid,

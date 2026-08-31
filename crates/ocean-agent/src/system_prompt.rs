@@ -36,11 +36,30 @@ pub fn build_system_prompt(cwd: Option<&str>, client_type: Option<&str>) -> Stri
 
 /// Build the ordinary prompt while deliberately omitting operator-global
 /// memory guidance and auto-recalled facts. Room-scoped turns use this boundary
-/// even when their durable memory scope is `none`; a future room-memory
-/// provider must supply its own partitioned prompt/tool seam rather than
-/// redirecting this operator store by convention.
+/// when their durable memory scope is `none`.
 pub fn build_system_prompt_without_memory(cwd: Option<&str>, client_type: Option<&str>) -> String {
     build_system_prompt_from(cwd, client_type, assistants_root().as_deref(), None)
+}
+
+/// Build a prompt whose memory guidance is fixed to one admitted Room.
+///
+/// Unlike the ordinary prompt, this never auto-loads operator-global facts.
+/// The matching retain/recall tools carry their opaque store-issued partition
+/// through `PromptControl`.
+pub fn build_system_prompt_with_room_memory(
+    cwd: Option<&str>,
+    client_type: Option<&str>,
+) -> String {
+    let mut prompt = build_system_prompt_without_memory(cwd, client_type);
+    append_room_memory_context(&mut prompt);
+    prompt
+}
+
+fn append_room_memory_context(prompt: &mut String) {
+    prompt.push_str(
+        "\n## Room memory\n\
+         `recall {query?, limit?}` and `retain {text, kind?}` operate only on this Room's shared memory partition. They cannot read the operator's global memory or another Room. Call `recall` only when the request depends on a prior Room decision or fact not already present in the supplied Room context; retain only stable Room knowledge, never ephemeral task state.\n",
+    );
 }
 
 /// Inner form of [`build_system_prompt`] that resolves any file-loaded
@@ -537,7 +556,10 @@ fn load_project_prompt(start: &Path) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{build_system_prompt_from, load_surface_profile_from, surface_dir, surface_flag};
+    use super::{
+        append_room_memory_context, build_system_prompt_from, load_surface_profile_from,
+        surface_dir, surface_flag,
+    };
     use ocean_context::{ClaimStatus, Provenance};
     use ocean_memory::{
         Memory, MemoryId, MemoryKind, MemoryScope, MemoryStore, PrincipalId, SqliteMemoryStore,
@@ -1071,6 +1093,27 @@ mod tests {
         let prompt = build_system_prompt_from(None, Some("tui"), Some(root.path()), None);
 
         assert!(!prompt.contains("## Memory"));
+        assert!(!prompt.contains("## What you already know"));
+    }
+
+    #[test]
+    fn room_memory_prompt_never_injects_operator_facts() {
+        let root = empty_assistants_root();
+        let memory_dir = TempDir::new().expect("memory tempdir");
+        let memory_db = memory_dir.path().join("memory.sqlite");
+        seed_memory(
+            &memory_db,
+            "operator-only secret must not enter a Room",
+            MemoryKind::Fact,
+        );
+
+        let mut prompt = build_system_prompt_from(None, Some("tui"), Some(root.path()), None);
+        append_room_memory_context(&mut prompt);
+
+        assert!(prompt.contains("## Room memory"));
+        assert!(prompt.contains("only on this Room's shared memory partition"));
+        assert!(prompt.contains("cannot read the operator's global memory"));
+        assert!(!prompt.contains("operator-only secret"));
         assert!(!prompt.contains("## What you already know"));
     }
 

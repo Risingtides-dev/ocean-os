@@ -42,7 +42,8 @@ pub use config::{DaemonConfig, McpSection, OffshoreSection};
 pub mod agentdir;
 mod durable;
 mod memory_tools;
-pub use memory_tools::{list_memories, MemoryView};
+pub use memory_tools::{list_memories, AdmittedRoomMemory, MemoryView};
+pub use ocean_memory::RoomMemoryAdmission;
 mod oauth_refresh;
 pub use agentdir::{AgentDef, ResolveError as AgentDirResolveError};
 mod project;
@@ -348,6 +349,10 @@ pub struct AgentRuntime {
     /// builds tools directly — this is the one seam that replaced the old
     /// hardcoded `default_tools()` call. Assembled once at startup.
     capabilities: Arc<CapabilityRegistry>,
+    /// The same memory-store authority backing the registry's ordinary
+    /// operator provider. It alone can mint opaque Room handles from final
+    /// admission evidence, so room tools can never be redirected by a raw key.
+    memory_factory: Option<memory_tools::MemoryToolsFactory>,
     /// Per-session turn serialization. A turn against a session must hold this
     /// session's lock across load → run → save, so two concurrent turns on the
     /// same session can't both load the same history and clobber each other's
@@ -444,6 +449,7 @@ impl AgentRuntime {
             config_dir,
             state: Arc::new(RwLock::new(state)),
             capabilities: Arc::new(CapabilityRegistry::builtin_only()),
+            memory_factory: None,
             session_locks: Arc::new(std::sync::Mutex::new(HashMap::new())),
             hooks,
             provider_quarantine: Arc::new(ocean_providers::ProviderQuarantine::default()),
@@ -469,6 +475,19 @@ impl AgentRuntime {
         &self.config_dir
     }
 
+    /// Issue one opaque Room-memory handle from authoritative admission
+    /// evidence. A missing/unavailable memory factory is a fail-closed error;
+    /// callers must never downgrade the Room to operator or disabled memory.
+    pub fn admit_room_memory(
+        &self,
+        admission: &impl RoomMemoryAdmission,
+    ) -> anyhow::Result<AdmittedRoomMemory> {
+        self.memory_factory
+            .as_ref()
+            .context("memory provider unavailable")?
+            .admit_room(admission)
+    }
+
     /// Connect configured MCP servers and fold their tools into the capability
     /// registry, on top of the built-ins. Reads `<config_dir>/ocean.toml`;
     /// absent/empty config leaves the registry built-ins-only. Each server is
@@ -489,8 +508,9 @@ impl AgentRuntime {
         mut self,
         longhouse: Option<ocean_longhouse::LonghouseRegistryHandle>,
     ) -> Self {
-        let registry = build_capability_registry(&self.config_dir, longhouse).await;
-        self.capabilities = Arc::new(registry);
+        let built = build_capability_registry(&self.config_dir, longhouse).await;
+        self.capabilities = Arc::new(built.registry);
+        self.memory_factory = built.memory_factory;
         self
     }
 
@@ -2227,7 +2247,7 @@ impl AgentRuntime {
             tool_allowlist,
             agent_capabilities,
             authorized_capabilities,
-            operator_memory_disabled,
+            memory,
             tools_disabled,
             hashline_edits,
             artifact_spill,
@@ -2294,20 +2314,34 @@ impl AgentRuntime {
         // Room authority is evaluated after every provider is assembled. This
         // ordering is load-bearing: applying the snapshot before dynamic or
         // subprocess providers would let a later provider widen the turn.
+        // Operator memory and admitted Room memory are mutually exclusive.
+        // Remove the registry's global tools before applying the ambient
+        // capability ceiling; a Room handle adds its own scoped tools only
+        // after that intersection is complete.
+        if !matches!(memory, PromptMemory::Operator) {
+            tools.retain(|tool| !matches!(tool.name(), "retain" | "recall"));
+        }
         if let Some(capabilities) = authorized_capabilities.as_deref() {
             tools.retain(|tool| capability_authorizes_tool(capabilities, tool.name()));
         }
-        if operator_memory_disabled {
-            tools.retain(|tool| !matches!(tool.name(), "retain" | "recall"));
+        if !tools_disabled {
+            if let PromptMemory::Room(room) = &memory {
+                tools.extend(room.tools());
+            }
         }
 
-        let system_prompt = if operator_memory_disabled {
-            system_prompt::build_system_prompt_without_memory(
+        let system_prompt = match &memory {
+            PromptMemory::Operator => {
+                system_prompt::build_system_prompt(Some(&req.cwd), req.client_type.as_deref())
+            }
+            PromptMemory::Disabled => system_prompt::build_system_prompt_without_memory(
                 Some(&req.cwd),
                 req.client_type.as_deref(),
-            )
-        } else {
-            system_prompt::build_system_prompt(Some(&req.cwd), req.client_type.as_deref())
+            ),
+            PromptMemory::Room(_) => system_prompt::build_system_prompt_with_room_memory(
+                Some(&req.cwd),
+                req.client_type.as_deref(),
+            ),
         };
         let mut cfg = AgentConfig::new(snapshot.model.clone(), system_prompt)
             .with_tools(tools)
@@ -2673,6 +2707,13 @@ fn turn_timeout_secs_from_env() -> Option<u32> {
         .filter(|secs| *secs > 0)
 }
 
+#[derive(Clone, Debug)]
+enum PromptMemory {
+    Operator,
+    Disabled,
+    Room(AdmittedRoomMemory),
+}
+
 #[derive(Clone)]
 pub struct PromptControl {
     pub permission: Arc<dyn PermissionPolicy>,
@@ -2716,10 +2757,9 @@ pub struct PromptControl {
     /// vector, is a security boundary applied after every built-in/dynamic
     /// provider has been assembled so no later provider can widen the turn.
     pub authorized_capabilities: Option<Vec<String>>,
-    /// Suppress operator-global memory tools and prompt injection for a
-    /// room-scoped turn. Room memory requires its own partitioned provider;
-    /// this flag never redirects operator memory by caller convention.
-    pub operator_memory_disabled: bool,
+    /// Exact memory authority for this turn. Private and mutually exclusive so
+    /// no caller can combine operator-global and Room memory tools.
+    memory: PromptMemory,
     /// Fail-closed per-turn control that suppresses every tool source, including
     /// dynamically registered and folder-agent subprocess capabilities.
     pub tools_disabled: bool,
@@ -2816,7 +2856,7 @@ impl PromptControl {
             agent_model: None,
             agent_capabilities: None,
             authorized_capabilities: None,
-            operator_memory_disabled: false,
+            memory: PromptMemory::Operator,
             tools_disabled: false,
             hashline_edits: false,
             artifact_spill: false,
@@ -2883,7 +2923,13 @@ impl PromptControl {
 
     /// Remove operator-global memory from this turn's tools and system prompt.
     pub fn without_operator_memory(mut self) -> Self {
-        self.operator_memory_disabled = true;
+        self.memory = PromptMemory::Disabled;
+        self
+    }
+
+    /// Replace operator-global memory with one opaque admitted Room handle.
+    pub fn with_room_memory(mut self, room: AdmittedRoomMemory) -> Self {
+        self.memory = PromptMemory::Room(room);
         self
     }
 
@@ -2956,10 +3002,15 @@ impl PermissionPolicy for StaticPermissionPolicy {
 /// (`std::env::var`), which is loaded from `tools.env`. Names only ever leave
 /// this layer; values are injected straight into the child by `ocean-mcp` and
 /// are never logged.
+struct BuiltCapabilities {
+    registry: CapabilityRegistry,
+    memory_factory: Option<memory_tools::MemoryToolsFactory>,
+}
+
 async fn build_capability_registry(
     config_dir: &Path,
     longhouse: Option<ocean_longhouse::LonghouseRegistryHandle>,
-) -> CapabilityRegistry {
+) -> BuiltCapabilities {
     let mut providers: Vec<Arc<dyn CapabilityProvider>> = vec![Arc::new(BuiltinProvider::new())];
 
     // Browser control. With the default-off `legacy-chromium` feature, Chrome
@@ -2998,12 +3049,18 @@ async fn build_capability_registry(
     // Memory verbs (port-map "cheapest win"): `retain`/`recall` over the typed
     // SQLite store at <config>/memory.sqlite. Fail-soft — a store that can't
     // open logs and is skipped; the turn runs without memory tools.
-    match memory_tools::MemoryToolsProvider::open(&config_dir.join("memory.sqlite")) {
-        Ok(p) => providers.push(Arc::new(p)),
+    let memory_factory = match memory_tools::MemoryToolsFactory::open(
+        &config_dir.join("memory.sqlite"),
+    ) {
+        Ok(factory) => {
+            providers.push(Arc::new(factory.operator_provider()));
+            Some(factory)
+        }
         Err(e) => {
             tracing::warn!(error = %e, "memory store unavailable; retain/recall tools disabled");
+            None
         }
-    }
+    };
 
     let cfg = match config::DaemonConfig::load(config_dir) {
         Ok(c) => c,
@@ -3011,7 +3068,10 @@ async fn build_capability_registry(
             // A malformed config shouldn't take the agent down — run with
             // built-ins and make the misconfiguration loud.
             tracing::error!(error = %e, "failed to load ocean.toml; running with built-in tools only");
-            return CapabilityRegistry::new(providers);
+            return BuiltCapabilities {
+                registry: CapabilityRegistry::new(providers),
+                memory_factory,
+            };
         }
     };
 
@@ -3078,7 +3138,10 @@ async fn build_capability_registry(
         providers.push(Arc::new(ocean_longhouse::LonghouseProvider::new(registry)));
     }
 
-    CapabilityRegistry::new(providers)
+    BuiltCapabilities {
+        registry: CapabilityRegistry::new(providers),
+        memory_factory,
+    }
 }
 
 /// Resolve the plugins directory: `OCEAN_PLUGINS_DIR` if set, else
@@ -4015,7 +4078,36 @@ mod tests {
             .with_authorized_capabilities(Vec::new())
             .without_operator_memory();
         assert_eq!(control.authorized_capabilities, Some(Vec::new()));
-        assert!(control.operator_memory_disabled);
+        assert!(matches!(control.memory, PromptMemory::Disabled));
+    }
+
+    struct TestRoomMemoryAdmission(&'static str);
+
+    impl RoomMemoryAdmission for TestRoomMemoryAdmission {
+        fn admitted_room_key(&self) -> &str {
+            self.0
+        }
+    }
+
+    #[test]
+    fn room_memory_requires_the_factory_and_sets_one_exclusive_mode() {
+        let config_dir = temp_config_dir("room-memory-authority");
+        std::fs::create_dir_all(&config_dir).unwrap();
+        let mut runtime = runtime(
+            config_dir.clone(),
+            provider_config(ProviderId::OpenAi, "test-model", true),
+        );
+        let admission = TestRoomMemoryAdmission("exact-room");
+        assert!(runtime.admit_room_memory(&admission).is_err());
+
+        runtime.memory_factory = Some(
+            memory_tools::MemoryToolsFactory::open(&config_dir.join("memory.sqlite")).unwrap(),
+        );
+        let room = runtime.admit_room_memory(&admission).unwrap();
+        let control = PromptControl::yolo(false).with_room_memory(room);
+        assert!(matches!(control.memory, PromptMemory::Room(_)));
+
+        let _ = std::fs::remove_dir_all(config_dir);
     }
 
     fn temp_config_dir(name: &str) -> PathBuf {
@@ -4987,7 +5079,7 @@ done
         )
         .unwrap();
 
-        let registry = build_capability_registry(&config_dir, None).await;
+        let registry = build_capability_registry(&config_dir, None).await.registry;
         assert!(
             registry.providers().iter().any(|p| p.id() == "offshore"),
             "offshore provider registered"
@@ -5016,7 +5108,7 @@ done
     async fn offshore_provider_absent_without_config_or_when_disabled() {
         let no_table = temp_config_dir("offshore-absent");
         std::fs::create_dir_all(&no_table).unwrap();
-        let registry = build_capability_registry(&no_table, None).await;
+        let registry = build_capability_registry(&no_table, None).await.registry;
         assert!(
             !registry.providers().iter().any(|p| p.id() == "offshore"),
             "no table → no offshore provider"
@@ -5035,7 +5127,7 @@ done
             "#,
         )
         .unwrap();
-        let registry = build_capability_registry(&disabled, None).await;
+        let registry = build_capability_registry(&disabled, None).await.registry;
         assert!(
             !registry.providers().iter().any(|p| p.id() == "offshore"),
             "enabled = false → no offshore provider"
@@ -5229,6 +5321,7 @@ done
             config_dir,
             state: std::sync::Arc::new(std::sync::RwLock::new(state)),
             capabilities: Arc::new(CapabilityRegistry::builtin_only()),
+            memory_factory: None,
             session_locks: Arc::new(std::sync::Mutex::new(HashMap::new())),
             hooks: ocean_hooks::HooksConfig::default(),
             provider_quarantine: Arc::new(ocean_providers::ProviderQuarantine::default()),

@@ -7974,3 +7974,36 @@ scripts/check-ledger.mjs events.md`. The full `cargo xtask ci` repository gate
 also passed: docs/index integrity, workspace build and tests, Clippy with denied
 warnings, format, and dependency policy.
 _________________________________________________________________________________
+time:      [14:05] [31-08-26]
+agent:     [codex] [gpt-5.6-sol]
+worktree:  [codex/rooms-phase1-integration-20260831]
+type:      [feature-request]
+area:      [backend]
+
+Integrated the accepted Ocean Rooms Phase 1 local room-agent authorization
+contract on the green `01708527aef976fb98eecec4b428c09b85573a9d` baseline.
+The daemon now owns credential-free package preview and binding inspection,
+operator-authenticated authorize/reauthorize/suspend/resume/revoke routes,
+server-derived owner eligibility, deterministic package digests, immutable
+generation-bound admission, explicit transcript-backed invoke, cancellation of
+superseded generations, context-policy shaping, and exact-generation output and
+audit persistence. The Phase 1 ambient capability ceiling remains empty; no
+filesystem, shell, network, browser, MCP, or subprocess authority is admitted.
+
+Completed the memory boundary instead of relabeling global memory. The agent
+runtime now has one exclusive per-turn memory mode: operator, disabled, or an
+opaque admitted-Room handle minted from the private non-Serde
+`RoomAgentAdmission`. Room `retain`/`recall` use the store-fixed exact Room
+partition and stable room-wide owner, are appended only after the ambient
+capability intersection, and inject no operator facts into the Room prompt.
+Memory-factory failure is an audited 503 and never downgrades to operator memory
+or `none`.
+
+Verification at this checkpoint: ocean-agent 230 passed, ocean-daemon 839
+passed, ocean-store 187 passed; targeted Room memory isolation and prompt tests
+passed; `cargo clippy -p ocean-agent -p ocean-daemon -p ocean-store
+--all-targets -- -D warnings`; `cargo check -p ocean-agent -p ocean-daemon`;
+`cargo fmt --all`; and `git diff --check`. No push, merge, migration against a
+live database, install, restart, or deployment was performed. Stage 2
+contributed-folder authority remains closed.
+_________________________________________________________________________________

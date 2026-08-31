@@ -18,7 +18,8 @@ use std::sync::{Arc, Mutex};
 use async_trait::async_trait;
 use ocean_context::{ClaimStatus, Provenance};
 use ocean_memory::{
-    Memory, MemoryId, MemoryKind, MemoryScope, MemoryStore, PrincipalId, SqliteMemoryStore,
+    room_memory_owner, Memory, MemoryId, MemoryKind, MemoryScope, MemoryStore, PrincipalId,
+    RoomMemoryAdmission, SessionMemoryScope, SqliteMemoryStore,
 };
 use ocean_runtime::capability::{CapabilityProvider, ProviderHealth, SessionContext, SharedTool};
 use ocean_runtime::types::{AgentTool, AgentToolResult};
@@ -35,6 +36,73 @@ const RECALL_MAX_LIMIT: usize = 25;
 const MAX_RETAIN_CHARS: usize = 4000;
 
 type SharedStore = Arc<Mutex<SqliteMemoryStore>>;
+
+/// One process-wide memory-store handle used to issue mutually exclusive
+/// operator and admitted-Room tool authorities.
+#[derive(Clone)]
+pub(crate) struct MemoryToolsFactory {
+    store: SharedStore,
+}
+
+impl std::fmt::Debug for MemoryToolsFactory {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("MemoryToolsFactory")
+    }
+}
+
+impl MemoryToolsFactory {
+    pub(crate) fn open(path: &std::path::Path) -> anyhow::Result<Self> {
+        Ok(Self {
+            store: Arc::new(Mutex::new(SqliteMemoryStore::open(path)?)),
+        })
+    }
+
+    pub(crate) fn operator_provider(&self) -> MemoryToolsProvider {
+        MemoryToolsProvider {
+            store: self.store.clone(),
+            owner: PrincipalId::new("operator"),
+        }
+    }
+
+    pub(crate) fn admit_room(
+        &self,
+        admission: &impl RoomMemoryAdmission,
+    ) -> anyhow::Result<AdmittedRoomMemory> {
+        let scope = self
+            .store
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .trusted_room_scope(admission)?;
+        Ok(AdmittedRoomMemory {
+            store: self.store.clone(),
+            owner: room_memory_owner(),
+            scope,
+        })
+    }
+}
+
+/// Opaque, non-serializable authority for one admitted Room's shared memory.
+///
+/// Its fields are private and its only constructor is
+/// [`MemoryToolsFactory::admit_room`], which requires final admission evidence.
+#[derive(Clone)]
+pub struct AdmittedRoomMemory {
+    store: SharedStore,
+    owner: PrincipalId,
+    scope: SessionMemoryScope,
+}
+
+impl std::fmt::Debug for AdmittedRoomMemory {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("AdmittedRoomMemory")
+    }
+}
+
+impl AdmittedRoomMemory {
+    pub(crate) fn tools(&self) -> Vec<SharedTool> {
+        scoped_tools(self.store.clone(), self.owner.clone(), self.scope.clone())
+    }
+}
 
 /// A read-only view of one retained memory for a surface (the TUI `/memory`
 /// picker). Flattens the store's rich `Memory` down to what a browser shows:
@@ -97,16 +165,6 @@ pub struct MemoryToolsProvider {
 }
 
 impl MemoryToolsProvider {
-    /// Open (or create) the daemon's memory db and build the provider. The
-    /// caller (registry assembly) treats an open failure as fail-soft.
-    pub fn open(path: &std::path::Path) -> anyhow::Result<Self> {
-        let store = SqliteMemoryStore::open(path)?;
-        Ok(Self {
-            store: Arc::new(Mutex::new(store)),
-            owner: PrincipalId::new("operator"),
-        })
-    }
-
     #[cfg(test)]
     fn in_memory() -> Self {
         Self {
@@ -127,10 +185,12 @@ impl CapabilityProvider for MemoryToolsProvider {
             Arc::new(RetainTool {
                 store: self.store.clone(),
                 owner: self.owner.clone(),
+                room_scope: None,
             }) as SharedTool,
             Arc::new(RecallTool {
                 store: self.store.clone(),
                 owner: self.owner.clone(),
+                room_scope: None,
             }) as SharedTool,
         ]
     }
@@ -140,9 +200,29 @@ impl CapabilityProvider for MemoryToolsProvider {
     }
 }
 
+fn scoped_tools(
+    store: SharedStore,
+    owner: PrincipalId,
+    scope: SessionMemoryScope,
+) -> Vec<SharedTool> {
+    vec![
+        Arc::new(RetainTool {
+            store: store.clone(),
+            owner: owner.clone(),
+            room_scope: Some(scope.clone()),
+        }) as SharedTool,
+        Arc::new(RecallTool {
+            store,
+            owner,
+            room_scope: Some(scope),
+        }) as SharedTool,
+    ]
+}
+
 struct RetainTool {
     store: SharedStore,
     owner: PrincipalId,
+    room_scope: Option<SessionMemoryScope>,
 }
 
 #[async_trait]
@@ -151,9 +231,15 @@ impl AgentTool for RetainTool {
         "retain"
     }
     fn description(&self) -> &str {
-        "Persist one durable fact to long-term memory (survives across sessions). \
-         Use for stable facts, preferences, and decisions worth remembering — not transcripts or dumps. \
-         kind ∈ {fact, preference, relationship, event, skill} (default fact)."
+        if self.room_scope.is_some() {
+            "Persist one durable fact to this Room's shared memory. \
+             Use for stable Room decisions and context worth remembering — not transcripts or dumps. \
+             kind ∈ {fact, preference, relationship, event, skill} (default fact)."
+        } else {
+            "Persist one durable fact to long-term memory (survives across sessions). \
+             Use for stable facts, preferences, and decisions worth remembering — not transcripts or dumps. \
+             kind ∈ {fact, preference, relationship, event, skill} (default fact)."
+        }
     }
     fn parameters(&self) -> Value {
         json!({
@@ -209,7 +295,13 @@ impl AgentTool for RetainTool {
         };
         let stored = {
             let mut store = self.store.lock().unwrap_or_else(|p| p.into_inner());
-            store.put(mem).map_err(|e| format!("retain: {e:?}"))?
+            match self.room_scope.as_ref() {
+                Some(scope) => store
+                    .scoped(scope, &self.owner)
+                    .and_then(|mut scoped| scoped.put(mem)),
+                None => store.put(mem),
+            }
+            .map_err(|e| format!("retain: {e:?}"))?
         };
         Ok(AgentToolResult::text(format!(
             "retained ({}, seq {}): {}",
@@ -223,6 +315,7 @@ impl AgentTool for RetainTool {
 struct RecallTool {
     store: SharedStore,
     owner: PrincipalId,
+    room_scope: Option<SessionMemoryScope>,
 }
 
 #[async_trait]
@@ -234,8 +327,13 @@ impl AgentTool for RecallTool {
         ocean_runtime::types::Concurrency::Shared
     }
     fn description(&self) -> &str {
-        "Search long-term memory (facts saved with `retain`, across all sessions). \
-         Case-insensitive substring match, newest first. Empty query returns the most recent memories."
+        if self.room_scope.is_some() {
+            "Search this Room's shared memory (facts saved with `retain` in this Room only). \
+             Case-insensitive substring match, newest first. Empty query returns the most recent memories."
+        } else {
+            "Search long-term memory (facts saved with `retain`, across all sessions). \
+             Case-insensitive substring match, newest first. Empty query returns the most recent memories."
+        }
     }
     fn parameters(&self) -> Value {
         json!({
@@ -264,10 +362,14 @@ impl AgentTool for RecallTool {
         let mut after: Option<u64> = None;
         loop {
             let page = {
-                let store = self.store.lock().unwrap_or_else(|p| p.into_inner());
-                store
-                    .list_page(&self.owner, after, Some(100))
-                    .map_err(|e| format!("recall: {e:?}"))?
+                let mut store = self.store.lock().unwrap_or_else(|p| p.into_inner());
+                match self.room_scope.as_ref() {
+                    Some(scope) => store
+                        .scoped(scope, &self.owner)
+                        .and_then(|scoped| scoped.list_page(after, Some(100))),
+                    None => store.list_page(&self.owner, after, Some(100)),
+                }
+                .map_err(|e| format!("recall: {e:?}"))?
             };
             for mem in &page.memories {
                 scanned += 1;
@@ -319,6 +421,14 @@ fn unix_secs() -> i64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    struct TestAdmission(String);
+
+    impl RoomMemoryAdmission for TestAdmission {
+        fn admitted_room_key(&self) -> &str {
+            &self.0
+        }
+    }
 
     #[tokio::test]
     async fn retain_then_recall_round_trips() {
@@ -385,5 +495,109 @@ mod tests {
             .await
             .expect_err("oversized retain must be rejected");
         assert!(err.contains("durable facts"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn admitted_room_tools_cannot_see_operator_or_another_room() {
+        let temp = tempfile::NamedTempFile::new().unwrap();
+        let factory = MemoryToolsFactory::open(temp.path()).unwrap();
+        let room_a = factory.admit_room(&TestAdmission("room-a".into())).unwrap();
+        let room_b = factory.admit_room(&TestAdmission("room-b".into())).unwrap();
+        let operator = factory.operator_provider();
+
+        let operator_tools = operator.tools(&SessionContext::default()).await;
+        let tools_a = room_a.tools();
+        let tools_b = room_b.tools();
+
+        operator_tools
+            .iter()
+            .find(|tool| tool.name() == "retain")
+            .unwrap()
+            .execute("operator", json!({"text": "operator secret"}))
+            .await
+            .unwrap();
+        tools_a
+            .iter()
+            .find(|tool| tool.name() == "retain")
+            .unwrap()
+            .execute("a", json!({"text": "room a fact"}))
+            .await
+            .unwrap();
+        tools_b
+            .iter()
+            .find(|tool| tool.name() == "retain")
+            .unwrap()
+            .execute("b", json!({"text": "room b fact"}))
+            .await
+            .unwrap();
+
+        let recalled_a = tools_a
+            .iter()
+            .find(|tool| tool.name() == "recall")
+            .unwrap()
+            .execute("recall-a", json!({}))
+            .await
+            .unwrap();
+        let text_a = recalled_a.content[0].as_text().unwrap();
+        assert!(text_a.contains("room a fact"), "{text_a}");
+        assert!(!text_a.contains("room b fact"), "{text_a}");
+        assert!(!text_a.contains("operator secret"), "{text_a}");
+
+        let recalled_b = tools_b
+            .iter()
+            .find(|tool| tool.name() == "recall")
+            .unwrap()
+            .execute("recall-b", json!({}))
+            .await
+            .unwrap();
+        let text_b = recalled_b.content[0].as_text().unwrap();
+        assert!(text_b.contains("room b fact"), "{text_b}");
+        assert!(!text_b.contains("room a fact"), "{text_b}");
+        assert!(!text_b.contains("operator secret"), "{text_b}");
+
+        let operator_recall = operator_tools
+            .iter()
+            .find(|tool| tool.name() == "recall")
+            .unwrap()
+            .execute("recall-operator", json!({}))
+            .await
+            .unwrap();
+        let operator_text = operator_recall.content[0].as_text().unwrap();
+        assert!(operator_text.contains("operator secret"), "{operator_text}");
+        assert!(!operator_text.contains("room a fact"), "{operator_text}");
+        assert!(!operator_text.contains("room b fact"), "{operator_text}");
+    }
+
+    #[tokio::test]
+    async fn two_admissions_to_one_room_share_memory() {
+        let temp = tempfile::NamedTempFile::new().unwrap();
+        let factory = MemoryToolsFactory::open(temp.path()).unwrap();
+        let first = factory
+            .admit_room(&TestAdmission("shared-room".into()))
+            .unwrap();
+        let second = factory
+            .admit_room(&TestAdmission("shared-room".into()))
+            .unwrap();
+        let first_tools = first.tools();
+        let second_tools = second.tools();
+
+        first_tools
+            .iter()
+            .find(|tool| tool.name() == "retain")
+            .unwrap()
+            .execute("retain", json!({"text": "shared room decision"}))
+            .await
+            .unwrap();
+        let recalled = second_tools
+            .iter()
+            .find(|tool| tool.name() == "recall")
+            .unwrap()
+            .execute("recall", json!({}))
+            .await
+            .unwrap();
+        assert!(recalled.content[0]
+            .as_text()
+            .unwrap()
+            .contains("shared room decision"));
     }
 }

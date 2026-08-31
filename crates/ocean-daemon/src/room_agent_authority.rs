@@ -117,6 +117,13 @@ pub(super) struct RoomAgentAdmission {
     pub(super) decision_id: String,
     pub(super) context_policy: ContextPolicy,
     pub(super) effective_capabilities: Vec<String>,
+    pub(super) room_memory: Option<ocean_agent::AdmittedRoomMemory>,
+}
+
+impl ocean_agent::RoomMemoryAdmission for RoomAgentAdmission {
+    fn admitted_room_key(&self) -> &str {
+        self.room.as_str()
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -1127,36 +1134,43 @@ pub(super) async fn admit_room_agent(
         )?;
         return Err(ApiError::conflict("activation_policy_refused"));
     }
-    // Room-partitioned memory does not exist yet. Refuse instead of exposing
-    // the hard-coded operator namespace under a room-shaped label.
-    if binding.memory_scope == MemoryScope::Room {
-        append_admission_audit(
-            state,
-            room,
-            &admission_id,
-            &package,
-            agent_member_id,
-            Some(&binding),
-            "refused",
-            "room_memory_unavailable",
-        )?;
-        return Err(ApiError::service_unavailable("room_memory_unavailable"));
-    }
+    let wants_room_memory = binding.memory_scope == MemoryScope::Room;
     let effective_capabilities = binding
         .effective_capabilities()
         .into_iter()
         .filter(|capability| PHASE1_SAFE_CAPABILITIES.contains(&capability.as_str()))
         .collect();
-    Ok(RoomAgentAdmission {
+    let mut admission = RoomAgentAdmission {
         admission_id,
         room: room.clone(),
         agent_member_id: agent_member_id.to_string(),
         package,
         generation: binding.generation,
-        decision_id: binding.decision_id,
+        decision_id: binding.decision_id.clone(),
         context_policy: binding.context_policy,
         effective_capabilities,
-    })
+        room_memory: None,
+    };
+    if wants_room_memory {
+        admission.room_memory = match state.runtime.admit_room_memory(&admission) {
+            Ok(room_memory) => Some(room_memory),
+            Err(error) => {
+                tracing::warn!(room = %room, %error, "room memory admission unavailable");
+                append_admission_audit(
+                    state,
+                    room,
+                    &admission.admission_id,
+                    &admission.package,
+                    agent_member_id,
+                    Some(&binding),
+                    "refused",
+                    "room_memory_unavailable",
+                )?;
+                return Err(ApiError::service_unavailable("room_memory_unavailable"));
+            }
+        };
+    }
+    Ok(admission)
 }
 
 pub(super) fn append_admission_allow(
@@ -1256,9 +1270,13 @@ pub(super) fn apply_admission_to_control(
     if !subprocess.is_empty() {
         control = control.with_agent_capabilities(admission.package.root.clone(), subprocess);
     }
-    control
+    let control = control
         .with_authorized_capabilities(admission.effective_capabilities.clone())
-        .without_operator_memory()
+        .without_operator_memory();
+    match admission.room_memory.as_ref() {
+        Some(room_memory) => control.with_room_memory(room_memory.clone()),
+        None => control,
+    }
 }
 
 fn into_response(result: Result<(StatusCode, Value), ApiError>) -> (StatusCode, Json<Value>) {
