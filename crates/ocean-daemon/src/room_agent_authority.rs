@@ -18,7 +18,7 @@ use axum::{
 };
 use chrono::Utc;
 use ocean_core::{
-    FederatedActorType, FederatedRoomRole, RequestId, RoomAccessState, RoomKey,
+    FederatedActorType, FederatedRoomRole, RequestId, RoomAccessState, RoomKey, RoomParticipant,
     RoomParticipantKind, RoomTriggerEvent,
 };
 use ocean_store::{
@@ -64,6 +64,13 @@ pub(super) struct AuthorizeAgentBody {
     memory_scope: String,
     #[serde(default)]
     room_capability_grants: Vec<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct BootstrapRoomAgentBody {
+    owner_member_id: String,
+    agent_package_id: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -128,6 +135,20 @@ pub(super) struct RoomAgentAdmission {
 impl ocean_agent::RoomMemoryAdmission for RoomAgentAdmission {
     fn admitted_room_key(&self) -> &str {
         self.room.as_str()
+    }
+}
+
+impl ocean_agent::RoomHistoryAdmission for RoomAgentAdmission {
+    fn admitted_room_key(&self) -> &str {
+        self.room.as_str()
+    }
+
+    fn admitted_agent_member_id(&self) -> &str {
+        &self.agent_member_id
+    }
+
+    fn admitted_generation(&self) -> u64 {
+        self.generation
     }
 }
 
@@ -577,6 +598,37 @@ struct TargetProof {
     owner_eligible: bool,
 }
 
+#[derive(Debug)]
+struct RoomOwnerProof {
+    member_id: String,
+    eligible: bool,
+}
+
+fn room_owner_proof(
+    store: &mut ocean_store::SqliteRoomStore,
+    room: &RoomKey,
+) -> Result<Option<RoomOwnerProof>, RoomStoreError> {
+    let access = store.room_access(room)?;
+    if access.state == RoomAccessState::Local {
+        return Ok(store.local_room_owner(room)?.map(|owner| RoomOwnerProof {
+            member_id: owner.member_id,
+            eligible: owner.eligible,
+        }));
+    }
+    let Some(credential) = store.room_credential(room)? else {
+        return Ok(None);
+    };
+    let eligible = access.members.iter().any(|member| {
+        member.member_id == credential.local_human_member_id
+            && member.actor_type == FederatedActorType::User
+            && member.role_in_room == FederatedRoomRole::Owner
+    });
+    Ok(Some(RoomOwnerProof {
+        member_id: credential.local_human_member_id,
+        eligible,
+    }))
+}
+
 /// Resolve package identity to the room-scoped member without accepting a
 /// browser-nominated label as authority.
 fn target_proof(
@@ -595,17 +647,21 @@ fn target_proof(
         let Some(target) = target else {
             return Ok(None);
         };
-        let owner = store
+        let Some(owner) = room_owner_proof(store, room)? else {
+            return Ok(None);
+        };
+        let agent_owner = store
             .agent_owners(room)?
             .into_iter()
             .find(|(agent, _, _)| agent == &target.id);
-        return Ok(
-            owner.map(|(_, owner_member_id, owner_present)| TargetProof {
-                agent_member_id: target.id.clone(),
-                owner_member_id,
-                owner_eligible: owner_present,
-            }),
-        );
+        let agent_owned_by_room_owner = agent_owner
+            .as_ref()
+            .is_some_and(|(_, agent_owner, present)| *present && agent_owner == &owner.member_id);
+        return Ok(Some(TargetProof {
+            agent_member_id: target.id.clone(),
+            owner_member_id: owner.member_id,
+            owner_eligible: owner.eligible && agent_owned_by_room_owner,
+        }));
     }
 
     let Some(agent_member_id) = store.resolve_room_agent_member(room, package_id)? else {
@@ -619,14 +675,8 @@ fn target_proof(
     let Some(owner_member_id) = member.owner_member_id.clone() else {
         return Ok(None);
     };
-    let owner_eligible = store.room_credential(room)?.is_some_and(|credential| {
-        credential.local_human_member_id == owner_member_id
-            && access.members.iter().any(|candidate| {
-                candidate.member_id == owner_member_id
-                    && candidate.actor_type == FederatedActorType::User
-                    && candidate.role_in_room == FederatedRoomRole::Owner
-            })
-    });
+    let owner_eligible = room_owner_proof(store, room)?
+        .is_some_and(|owner| owner.member_id == owner_member_id && owner.eligible);
     Ok(Some(TargetProof {
         agent_member_id,
         owner_member_id,
@@ -691,6 +741,31 @@ fn binding_projection(binding: &RoomAgentBinding) -> Value {
     })
 }
 
+fn package_preview_projection(
+    package: &ResolvedPackage,
+    proof: Option<&TargetProof>,
+    binding: Option<&RoomAgentBinding>,
+) -> Value {
+    json!({
+        "package_id": package.package_id,
+        "display_name": package.display_name,
+        "definition_digest": package.definition_digest,
+        "definition_revision": package.definition_revision,
+        "requested_capabilities": package.requested_capabilities,
+        "grantable_capabilities": PHASE1_SAFE_CAPABILITIES,
+        "unavailable_capabilities": package.requested_capabilities.iter().map(|capability| {
+            json!({
+                "capability": capability,
+                "reason": "phase1_resource_confinement_unavailable",
+            })
+        }).collect::<Vec<_>>(),
+        "agent_member_id": proof.map(|value| value.agent_member_id.clone()),
+        "owner_member_id": proof.map(|value| value.owner_member_id.clone()),
+        "owner_eligible": proof.is_some_and(|value| value.owner_eligible),
+        "binding": binding.map(binding_projection),
+    })
+}
+
 pub(super) async fn room_agent_preview(
     State(state): State<AppState>,
     Path((key, package_id)): Path<(String, String)>,
@@ -708,26 +783,76 @@ pub(super) async fn room_agent_preview(
             };
             Ok((proof, binding))
         })?;
+        let mut preview = package_preview_projection(&package, proof.as_ref(), binding.as_ref());
+        preview["ok"] = json!(true);
+        Ok((StatusCode::OK, preview))
+    })();
+    into_response(result)
+}
+
+pub(super) async fn room_agent_bootstrap(
+    State(state): State<AppState>,
+    Path(key): Path<String>,
+    headers: HeaderMap,
+    body: Result<Json<BootstrapRoomAgentBody>, JsonRejection>,
+) -> (StatusCode, Json<Value>) {
+    let _requests = state.requests.write().await;
+    let result = (|| {
+        let principal = operator(&state, &headers)?;
+        let Json(body) = body.map_err(|_| ApiError::bad_request("invalid_request"))?;
+        let room = RoomKey::new(key.trim());
+        let owner_member_id = body.owner_member_id.trim().to_string();
+        if room.as_str().is_empty() || owner_member_id.is_empty() {
+            return Err(ApiError::bad_request("invalid_request"));
+        }
+        let package = resolve_package(&body.agent_package_id)?;
+        let agent_member_id = package.package_id.clone();
+        let (bootstrap, proof, binding) = with_rooms(&state, |store| -> Result<_, ApiError> {
+            let bootstrap = store
+                .bootstrap_local_room_agent(
+                    &room,
+                    &owner_member_id,
+                    RoomParticipant {
+                        id: agent_member_id.clone(),
+                        kind: RoomParticipantKind::Agent,
+                        display_name: package.display_name.clone(),
+                    },
+                    &package.package_id,
+                    principal.id(),
+                    Utc::now(),
+                )
+                .map_err(ApiError::from)?;
+            let proof = target_proof(store, &room, &package.package_id)
+                .map_err(ApiError::from)?
+                .ok_or_else(|| ApiError::internal("bootstrap_projection_unavailable"))?;
+            let binding = store
+                .room_agent_binding(&room, &proof.agent_member_id)
+                .map_err(ApiError::from)?;
+            Ok((bootstrap, proof, binding))
+        })?;
+        if let Some(message) = bootstrap.participant_message.as_ref() {
+            publish_room_wake(&state, &room, message);
+        }
+        if let Some(message) = bootstrap.audit_message.as_ref() {
+            publish_room_wake(&state, &room, message);
+        }
+        let package_preview = package_preview_projection(&package, Some(&proof), binding.as_ref());
         Ok((
-            StatusCode::OK,
+            if bootstrap.created {
+                StatusCode::CREATED
+            } else {
+                StatusCode::OK
+            },
             json!({
                 "ok": true,
-                "package_id": package.package_id,
-                "display_name": package.display_name,
-                "definition_digest": package.definition_digest,
-                "definition_revision": package.definition_revision,
-                "requested_capabilities": package.requested_capabilities.clone(),
-                "grantable_capabilities": PHASE1_SAFE_CAPABILITIES,
-                "unavailable_capabilities": package.requested_capabilities.iter().map(|capability| {
-                    json!({
-                        "capability": capability,
-                        "reason": "phase1_resource_confinement_unavailable",
-                    })
-                }).collect::<Vec<_>>(),
-                "agent_member_id": proof.as_ref().map(|value| value.agent_member_id.clone()),
-                "owner_member_id": proof.as_ref().map(|value| value.owner_member_id.clone()),
-                "owner_eligible": proof.as_ref().is_some_and(|value| value.owner_eligible),
-                "binding": binding.as_ref().map(binding_projection),
+                "created": bootstrap.created,
+                "room_id": room,
+                "owner_member_id": proof.owner_member_id,
+                "agent_member_id": proof.agent_member_id,
+                "agent_package_id": package.package_id,
+                "owner_eligible": proof.owner_eligible,
+                "room": bootstrap.room,
+                "package_preview": package_preview,
             }),
         ))
     })();
@@ -743,20 +868,23 @@ pub(super) async fn room_agent_bindings(
         if store.get(&room)?.is_none() {
             return Err(RoomStoreError::UnknownRoom(room.clone()));
         }
-        store
+        let owner = room_owner_proof(store, &room)?;
+        let bindings = store
             .room_agent_bindings(&room)?
             .into_iter()
             .map(|binding| {
                 let owner_eligible = binding_owner_eligible(store, &room, &binding)?;
                 Ok((binding, owner_eligible))
             })
-            .collect::<Result<Vec<_>, RoomStoreError>>()
+            .collect::<Result<Vec<_>, RoomStoreError>>()?;
+        Ok::<_, RoomStoreError>((owner, bindings))
     }) {
-        Ok(bindings) => (
+        Ok((owner, bindings)) => (
             StatusCode::OK,
             Json(json!({
                 "ok": true,
-                "owner_eligible": !bindings.is_empty() && bindings.iter().all(|(_, eligible)| *eligible),
+                "owner_member_id": owner.as_ref().map(|owner| owner.member_id.clone()),
+                "owner_eligible": owner.as_ref().is_some_and(|owner| owner.eligible),
                 "bindings": bindings.iter().map(|(binding, owner_eligible)| {
                     let mut projection = binding_projection(binding);
                     projection["owner_eligible"] = json!(owner_eligible);
@@ -1580,6 +1708,13 @@ impl From<RoomStoreError> for ApiError {
             RoomStoreError::AgentBindingStatusConflict { .. } => {
                 Self::conflict("agent_binding_status_conflict")
             }
+            RoomStoreError::RoomNotLocal(_) => Self::conflict("local_room_required"),
+            RoomStoreError::LocalRoomOwnerConflict { .. } => Self::conflict("room_owner_conflict"),
+            RoomStoreError::ParticipantKindConflict { .. }
+            | RoomStoreError::ParticipantRecordImmutable { .. } => {
+                Self::conflict("bootstrap_target_conflict")
+            }
+            RoomStoreError::InvalidAgentOwner { .. } => Self::forbidden("room_owner_required"),
             RoomStoreError::Encode(_) => Self::bad_request("invalid_request"),
             _ => Self::internal("room_store_error"),
         }
@@ -1784,14 +1919,16 @@ mod tests {
             )
             .unwrap();
         store
-            .add_agent_participant_with_owner(
+            .bootstrap_local_room_agent(
                 &room,
+                "human-a",
                 ocean_core::RoomParticipant {
                     id: "builder".into(),
                     kind: RoomParticipantKind::Agent,
                     display_name: "Builder".into(),
                 },
-                "human-a",
+                "builder",
+                "operator-test",
                 Utc::now(),
             )
             .unwrap();

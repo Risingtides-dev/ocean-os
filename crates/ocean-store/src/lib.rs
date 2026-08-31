@@ -105,6 +105,38 @@ pub struct RoomRecord {
     pub transcript: Vec<RoomMessage>,
 }
 
+/// Server-derived owner authority for one Local room.
+///
+/// `eligible` is live roster truth: the durable owner row can survive a Human
+/// leaving, but it cannot authorize a mutation until that exact member is
+/// present again as a Human.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LocalRoomOwnerRole {
+    pub member_id: String,
+    pub eligible: bool,
+}
+
+/// Result of the operator-authenticated Local room-agent bootstrap mutation.
+///
+/// `participant_message` is present only when the transaction inserted the
+/// Agent participant for the first time. Exact replay returns no marker, which
+/// lets the daemon publish the join wake exactly once.
+#[derive(Debug, Clone)]
+pub struct LocalRoomAgentBootstrap {
+    pub room: Room,
+    pub created: bool,
+    pub participant_message: Option<RoomMessage>,
+    pub audit_message: Option<RoomMessage>,
+}
+
+/// Newest-first durable transcript page returned only after exact room-agent
+/// authority validation in the same SQLite read transaction.
+#[derive(Debug, Clone, PartialEq)]
+pub struct AuthorizedRoomHistoryPage {
+    pub messages: Vec<RoomMessage>,
+    pub has_more: bool,
+}
+
 /// Default number of transcript rows returned when a caller does not specify a
 /// limit (OCEAN-249). Transcript reads used to be unbounded — a long-lived call
 /// room would re-read its entire log on every hydration (O(n) per poll, O(n²)
@@ -204,6 +236,14 @@ pub enum RoomStoreError {
     UnknownRoom(RoomKey),
     /// A room with this key already exists (on create).
     AlreadyExists(RoomKey),
+    /// A Local-only authority mutation was attempted for a federated room.
+    RoomNotLocal(RoomKey),
+    /// A Local room already has a different durable owner role.
+    LocalRoomOwnerConflict {
+        room: RoomKey,
+        existing_owner: String,
+        offered_owner: String,
+    },
     /// No participant with the given id is in the room (on remove).
     UnknownParticipant { room: RoomKey, participant: String },
     /// The room exists but has no federation access projection row (P2-A).
@@ -308,6 +348,15 @@ impl std::fmt::Display for RoomStoreError {
             Self::BadKey(k) => write!(f, "invalid room key '{k}'; must be non-empty"),
             Self::UnknownRoom(k) => write!(f, "no room with key '{k}'"),
             Self::AlreadyExists(k) => write!(f, "room '{k}' already exists"),
+            Self::RoomNotLocal(k) => write!(f, "room '{k}' is not local"),
+            Self::LocalRoomOwnerConflict {
+                room,
+                existing_owner,
+                offered_owner,
+            } => write!(
+                f,
+                "room '{room}' owner is '{existing_owner}', not '{offered_owner}'"
+            ),
             Self::UnknownParticipant { room, participant } => {
                 write!(f, "room '{room}' has no participant '{participant}'")
             }
@@ -1345,6 +1394,23 @@ impl SqliteRoomStore {
                 position     INTEGER NOT NULL,       -- preserves roster order
                 PRIMARY KEY (room_id, id)
             );
+
+            -- Durable Local-room membership authority. This is deliberately
+            -- separate from `room_agent_owners`: the latter says which Human
+            -- owns an Agent, not which Human owns the Room. Federated rooms
+            -- continue to derive owner truth from coordinator membership plus
+            -- the locally held credential and never write this table.
+            CREATE TABLE IF NOT EXISTS room_local_roles (
+                room_id       TEXT NOT NULL REFERENCES rooms(id) ON DELETE CASCADE,
+                member_id     TEXT NOT NULL,
+                role          TEXT NOT NULL CHECK (role IN ('owner', 'member')),
+                established_at TEXT NOT NULL,
+                established_by TEXT NOT NULL,
+                PRIMARY KEY (room_id, member_id)
+            );
+
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_room_local_roles_one_owner
+                ON room_local_roles(room_id) WHERE role = 'owner';
 
             -- Which WORKER owns which agent participant, within one local room.
             -- This is the local half of "a worker persists alongside their
@@ -2697,6 +2763,269 @@ impl SqliteRoomStore {
         Ok(())
     }
 
+    /// Establish or verify the Local room owner and one package-derived Agent
+    /// participant under a single write lock.
+    ///
+    /// This is a bootstrap mutation, not authorization: it never creates a
+    /// `room_agent_bindings` row and never consumes a decision id. The exact
+    /// `(room, owner, agent participant)` tuple is idempotent. A different
+    /// owner, participant kind/display, or Agent owner conflicts without any
+    /// partial role, roster, ownership, marker, or timestamp write.
+    pub fn bootstrap_local_room_agent(
+        &mut self,
+        key: &RoomKey,
+        owner_member_id: &str,
+        participant: RoomParticipant,
+        agent_package_id: &str,
+        established_by: &str,
+        now: DateTime<Utc>,
+    ) -> Result<LocalRoomAgentBootstrap> {
+        if agent_package_id.trim().is_empty() || established_by.trim().is_empty() {
+            return Err(RoomStoreError::Encode(
+                "bootstrap package and principal are required".into(),
+            ));
+        }
+        if participant.kind != RoomParticipantKind::Agent {
+            return Err(RoomStoreError::InvalidAgentOwner {
+                agent: participant.id,
+                owner: owner_member_id.to_string(),
+                reason: "bootstrap target is not an agent".into(),
+            });
+        }
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let closed_at: Option<Option<String>> = tx
+            .query_row(
+                "SELECT closed_at FROM rooms WHERE id = ?1",
+                params![key.as_str()],
+                |row| row.get(0),
+            )
+            .optional()?;
+        if !matches!(closed_at, Some(None)) {
+            return Err(RoomStoreError::UnknownRoom(key.clone()));
+        }
+        let access_state: Option<String> = tx
+            .query_row(
+                "SELECT state FROM room_access WHERE room_id = ?1",
+                params![key.as_str()],
+                |row| row.get(0),
+            )
+            .optional()?;
+        let has_federation_credential: Option<i64> = tx
+            .query_row(
+                "SELECT 1 FROM room_federation WHERE room_id = ?1",
+                params![key.as_str()],
+                |row| row.get(0),
+            )
+            .optional()?;
+        if access_state
+            .as_deref()
+            .is_some_and(|state| state != "local")
+            || has_federation_credential.is_some()
+        {
+            return Err(RoomStoreError::RoomNotLocal(key.clone()));
+        }
+        let owner_kind: Option<String> = tx
+            .query_row(
+                "SELECT kind FROM participants WHERE room_id = ?1 AND id = ?2",
+                params![key.as_str(), owner_member_id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        if owner_kind.as_deref() != Some("human") {
+            return Err(RoomStoreError::InvalidAgentOwner {
+                agent: participant.id,
+                owner: owner_member_id.to_string(),
+                reason: "room owner is not a live Human participant".into(),
+            });
+        }
+        let existing_owner: Option<String> = tx
+            .query_row(
+                "SELECT member_id FROM room_local_roles
+                  WHERE room_id = ?1 AND role = 'owner'",
+                params![key.as_str()],
+                |row| row.get(0),
+            )
+            .optional()?;
+        if let Some(existing_owner) = existing_owner.as_deref() {
+            if existing_owner != owner_member_id {
+                return Err(RoomStoreError::LocalRoomOwnerConflict {
+                    room: key.clone(),
+                    existing_owner: existing_owner.to_string(),
+                    offered_owner: owner_member_id.to_string(),
+                });
+            }
+        }
+        let owner_created = existing_owner.is_none();
+        if owner_created {
+            tx.execute(
+                "INSERT INTO room_local_roles
+                     (room_id, member_id, role, established_at, established_by)
+                 VALUES (?1, ?2, 'owner', ?3, ?4)",
+                params![
+                    key.as_str(),
+                    owner_member_id,
+                    now.to_rfc3339(),
+                    established_by,
+                ],
+            )?;
+        }
+
+        Self::guard_participant_kind_on(&tx, key, &participant)?;
+        let existing_agent: Option<String> = tx
+            .query_row(
+                "SELECT id FROM participants WHERE room_id = ?1 AND id = ?2",
+                params![key.as_str(), participant.id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        let existing_agent_owner: Option<String> = tx
+            .query_row(
+                "SELECT owner_id FROM room_agent_owners
+                  WHERE room_id = ?1 AND agent_id = ?2",
+                params![key.as_str(), participant.id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        if let Some(existing_agent_owner) = existing_agent_owner.as_deref() {
+            if existing_agent_owner != owner_member_id {
+                return Err(RoomStoreError::ParticipantRecordImmutable {
+                    room: key.clone(),
+                    participant: participant.id,
+                    field: "owner_id",
+                });
+            }
+        }
+
+        let participant_created = existing_agent.is_none();
+        let participant_message = if participant_created {
+            if existing_agent_owner.is_some() {
+                return Err(RoomStoreError::ParticipantRecordImmutable {
+                    room: key.clone(),
+                    participant: participant.id,
+                    field: "owner_id",
+                });
+            }
+            let next_pos: i64 = tx.query_row(
+                "SELECT COALESCE(MAX(position) + 1, 0) FROM participants WHERE room_id = ?1",
+                params![key.as_str()],
+                |row| row.get(0),
+            )?;
+            tx.execute(
+                "INSERT INTO participants (room_id, id, kind, display_name, position)
+                 VALUES (?1, ?2, ?3, ?4, ?5)",
+                params![
+                    key.as_str(),
+                    participant.id,
+                    encode_participant_kind(participant.kind),
+                    participant.display_name,
+                    next_pos,
+                ],
+            )?;
+            tx.execute(
+                "INSERT INTO room_agent_owners (room_id, agent_id, owner_id, created_at)
+                 VALUES (?1, ?2, ?3, ?4)",
+                params![
+                    key.as_str(),
+                    participant.id,
+                    owner_member_id,
+                    now.to_rfc3339(),
+                ],
+            )?;
+            Some(Self::insert_message_on(
+                &tx,
+                key,
+                MessageDraft::marker(
+                    &participant.id,
+                    participant.kind,
+                    RoomMessageKind::ParticipantJoined,
+                    &format!("{} joined", marker_prose(&participant.display_name)),
+                ),
+                now,
+            )?)
+        } else {
+            if existing_agent_owner.is_none() {
+                tx.execute(
+                    "INSERT INTO room_agent_owners (room_id, agent_id, owner_id, created_at)
+                     VALUES (?1, ?2, ?3, ?4)",
+                    params![
+                        key.as_str(),
+                        participant.id,
+                        owner_member_id,
+                        now.to_rfc3339(),
+                    ],
+                )?;
+            }
+            None
+        };
+        let created = owner_created || participant_created || existing_agent_owner.is_none();
+        let audit_message = if created {
+            let body = serde_json::to_string(&serde_json::json!({
+                "type": "room.agent.bootstrap",
+                "room_id": key.as_str(),
+                "owner_member_id": owner_member_id,
+                "agent_member_id": participant.id,
+                "agent_package_id": agent_package_id,
+                "operator_principal_id": established_by,
+                "outcome": "established",
+            }))
+            .map_err(|error| RoomStoreError::Encode(error.to_string()))?;
+            Some(Self::insert_message_on(
+                &tx,
+                key,
+                MessageDraft::marker(
+                    "system",
+                    RoomParticipantKind::System,
+                    RoomMessageKind::System,
+                    &body,
+                ),
+                now,
+            )?)
+        } else {
+            None
+        };
+        if created {
+            Self::touch_on(&tx, key, now)?;
+        }
+        tx.commit()?;
+        let room = self
+            .load_record(key, false)?
+            .ok_or_else(|| RoomStoreError::UnknownRoom(key.clone()))?
+            .room;
+        Ok(LocalRoomAgentBootstrap {
+            room,
+            created,
+            participant_message,
+            audit_message,
+        })
+    }
+
+    /// Current durable owner role for a Local room, with live Human eligibility.
+    pub fn local_room_owner(&self, key: &RoomKey) -> Result<Option<LocalRoomOwnerRole>> {
+        self.conn
+            .query_row(
+                "SELECT roles.member_id,
+                        EXISTS (
+                            SELECT 1 FROM participants member
+                             WHERE member.room_id = roles.room_id
+                               AND member.id = roles.member_id
+                               AND member.kind = 'human'
+                        )
+                   FROM room_local_roles roles
+                  WHERE roles.room_id = ?1 AND roles.role = 'owner'",
+                params![key.as_str()],
+                |row| {
+                    Ok(LocalRoomOwnerRole {
+                        member_id: row.get(0)?,
+                        eligible: row.get::<_, i64>(1)? != 0,
+                    })
+                },
+            )
+            .optional()
+            .map_err(RoomStoreError::from)
+    }
+
     /// Add an Agent participant AND record the worker who owns it, atomically.
     ///
     /// This is the local half of "a worker persists alongside their agents".
@@ -3674,6 +4003,77 @@ impl SqliteRoomStore {
         Self::touch_on(&tx, key, now)?;
         tx.commit()?;
         Ok((failure, audit))
+    }
+
+    /// Read one bounded backwards transcript page under an exact active
+    /// room-agent generation.
+    ///
+    /// Binding validation and the room-scoped `seq < before_seq` query share
+    /// one SQLite read transaction, so a racing suspend/revoke orders wholly
+    /// before the page (and refuses it) or wholly after its snapshot. Rows are
+    /// newest-first and a `limit + 1` sentinel computes `has_more` without an
+    /// unbounded count.
+    pub fn authorized_room_history_page(
+        &mut self,
+        key: &RoomKey,
+        agent_member_id: &str,
+        expected_generation: u64,
+        before_seq: Option<u64>,
+        limit: usize,
+    ) -> Result<AuthorizedRoomHistoryPage> {
+        let limit = limit.clamp(1, MAX_TRANSCRIPT_LIMIT);
+        let fetch_limit = limit.saturating_add(1);
+        let sql_fetch_limit = i64::try_from(fetch_limit)
+            .map_err(|_| RoomStoreError::Encode("history page limit out of range".into()))?;
+        let tx = self.conn.transaction()?;
+        Self::authorized_room_agent_binding_on(&tx, key, agent_member_id, expected_generation)?;
+        let before = match before_seq {
+            Some(0) => {
+                tx.commit()?;
+                return Ok(AuthorizedRoomHistoryPage {
+                    messages: Vec::new(),
+                    has_more: false,
+                });
+            }
+            Some(value) => i64::try_from(value).ok(),
+            None => None,
+        };
+        let mut rows = if let Some(before) = before {
+            let mut statement = tx.prepare(&format!(
+                "SELECT {MESSAGE_ROW_COLUMNS} FROM messages
+                  WHERE room_id = ?1 AND seq < ?2
+                  ORDER BY seq DESC LIMIT ?3"
+            ))?;
+            let mapped = statement.query_map(
+                params![key.as_str(), before, sql_fetch_limit],
+                RawMessageRow::read,
+            )?;
+            let mut messages = Vec::with_capacity(fetch_limit);
+            for row in mapped {
+                messages.push(row?.decode()?);
+            }
+            messages
+        } else {
+            let mut statement = tx.prepare(&format!(
+                "SELECT {MESSAGE_ROW_COLUMNS} FROM messages
+                  WHERE room_id = ?1
+                  ORDER BY seq DESC LIMIT ?2"
+            ))?;
+            let mapped =
+                statement.query_map(params![key.as_str(), sql_fetch_limit], RawMessageRow::read)?;
+            let mut messages = Vec::with_capacity(fetch_limit);
+            for row in mapped {
+                messages.push(row?.decode()?);
+            }
+            messages
+        };
+        let has_more = rows.len() > limit;
+        rows.truncate(limit);
+        tx.commit()?;
+        Ok(AuthorizedRoomHistoryPage {
+            messages: rows,
+            has_more,
+        })
     }
 
     /// Enforce the G1 one-level thread policy for `parent_seq` in `key`.
@@ -6698,6 +7098,242 @@ mod tests {
     }
 
     #[test]
+    fn local_room_agent_bootstrap_is_atomic_idempotent_and_non_authorizing() {
+        let mut s = store();
+        let key = RoomKey::new("bootstrap-room");
+        s.create(key.clone(), "Bootstrap", None, now()).unwrap();
+        s.add_participant(&key, human("human-1", "Human One"), now())
+            .unwrap();
+        let agent = RoomParticipant {
+            id: "builder".into(),
+            kind: RoomParticipantKind::Agent,
+            display_name: "Builder".into(),
+        };
+
+        let first = s
+            .bootstrap_local_room_agent(
+                &key,
+                "human-1",
+                agent.clone(),
+                "builder",
+                "operator-1",
+                now(),
+            )
+            .unwrap();
+        assert!(first.created);
+        assert_eq!(
+            first.participant_message.as_ref().unwrap().author_id,
+            "builder"
+        );
+        let bootstrap_audit: serde_json::Value =
+            serde_json::from_str(&first.audit_message.as_ref().expect("bootstrap audit").body)
+                .unwrap();
+        assert_eq!(bootstrap_audit["type"], "room.agent.bootstrap");
+        assert_eq!(bootstrap_audit["operator_principal_id"], "operator-1");
+        assert!(first
+            .room
+            .participants
+            .iter()
+            .any(|participant| participant == &agent));
+        assert_eq!(
+            s.local_room_owner(&key).unwrap(),
+            Some(LocalRoomOwnerRole {
+                member_id: "human-1".into(),
+                eligible: true,
+            })
+        );
+        let established_by: String = s
+            .conn
+            .query_row(
+                "SELECT established_by FROM room_local_roles
+                  WHERE room_id = ?1 AND role = 'owner'",
+                params![key.as_str()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(established_by, "operator-1");
+        assert_eq!(
+            s.agent_owners(&key).unwrap(),
+            vec![("builder".into(), "human-1".into(), true)]
+        );
+        assert!(s.room_agent_binding(&key, "builder").unwrap().is_none());
+        assert!(s
+            .room_agent_decision(&key, "unused-decision")
+            .unwrap()
+            .is_none());
+
+        let transcript_before_replay = s.transcript(&key, None).unwrap();
+        let replay = s
+            .bootstrap_local_room_agent(&key, "human-1", agent, "builder", "operator-1", now())
+            .unwrap();
+        assert!(!replay.created);
+        assert!(replay.participant_message.is_none());
+        assert!(replay.audit_message.is_none());
+        assert_eq!(s.transcript(&key, None).unwrap(), transcript_before_replay);
+
+        s.add_participant(&key, human("human-2", "Human Two"), now())
+            .unwrap();
+        let before_conflict = s.transcript(&key, None).unwrap();
+        let error = s
+            .bootstrap_local_room_agent(
+                &key,
+                "human-2",
+                RoomParticipant {
+                    id: "reviewer".into(),
+                    kind: RoomParticipantKind::Agent,
+                    display_name: "Reviewer".into(),
+                },
+                "reviewer",
+                "operator-1",
+                now(),
+            )
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            RoomStoreError::LocalRoomOwnerConflict { .. }
+        ));
+        assert_eq!(s.transcript(&key, None).unwrap(), before_conflict);
+        assert!(!s
+            .get(&key)
+            .unwrap()
+            .unwrap()
+            .room
+            .participants
+            .iter()
+            .any(|participant| participant.id == "reviewer"));
+    }
+
+    #[test]
+    fn existing_agent_label_bootstrap_writes_one_audit_then_replay_writes_none() {
+        let mut s = store();
+        let key = RoomKey::new("existing-label-bootstrap");
+        s.create(key.clone(), "Existing Label", None, now())
+            .unwrap();
+        s.add_participant(&key, human("human-1", "Human One"), now())
+            .unwrap();
+        let agent = RoomParticipant {
+            id: "builder".into(),
+            kind: RoomParticipantKind::Agent,
+            display_name: "Builder".into(),
+        };
+        s.add_agent_participant_with_owner(&key, agent.clone(), "human-1", now())
+            .unwrap();
+        let before = s.transcript(&key, None).unwrap();
+
+        let first = s
+            .bootstrap_local_room_agent(
+                &key,
+                "human-1",
+                agent.clone(),
+                "builder",
+                "operator-1",
+                now(),
+            )
+            .unwrap();
+        assert!(first.created);
+        assert!(first.participant_message.is_none());
+        assert_eq!(
+            s.transcript(&key, None).unwrap().len(),
+            before.len() + 1,
+            "role-only bootstrap writes exactly its authority audit"
+        );
+        let audit: serde_json::Value =
+            serde_json::from_str(&first.audit_message.unwrap().body).unwrap();
+        assert_eq!(audit["type"], "room.agent.bootstrap");
+        assert_eq!(audit["agent_member_id"], "builder");
+
+        let before_replay = s.transcript(&key, None).unwrap();
+        let replay = s
+            .bootstrap_local_room_agent(&key, "human-1", agent, "builder", "operator-1", now())
+            .unwrap();
+        assert!(!replay.created);
+        assert!(replay.participant_message.is_none());
+        assert!(replay.audit_message.is_none());
+        assert_eq!(s.transcript(&key, None).unwrap(), before_replay);
+    }
+
+    #[test]
+    fn local_room_agent_bootstrap_refuses_federated_room_without_local_role() {
+        let mut s = store();
+        let key = RoomKey::new("federated-bootstrap");
+        s.create(key.clone(), "Federated", None, now()).unwrap();
+        s.add_participant(&key, human("human-1", "Human One"), now())
+            .unwrap();
+        s.install_room_credential(&key, "private-bearer", "human-1")
+            .unwrap();
+        let transcript_before = s.transcript(&key, None).unwrap();
+        let error = s
+            .bootstrap_local_room_agent(
+                &key,
+                "human-1",
+                RoomParticipant {
+                    id: "builder".into(),
+                    kind: RoomParticipantKind::Agent,
+                    display_name: "Builder".into(),
+                },
+                "builder",
+                "operator-1",
+                now(),
+            )
+            .unwrap_err();
+        assert!(matches!(error, RoomStoreError::RoomNotLocal(_)));
+        assert!(s.local_room_owner(&key).unwrap().is_none());
+        assert_eq!(s.transcript(&key, None).unwrap(), transcript_before);
+    }
+
+    #[test]
+    fn local_role_migration_is_additive_idempotent_and_fail_closed_on_rollback() {
+        let mut s = store();
+        let key = RoomKey::new("role-migration");
+        s.create(key.clone(), "Role Migration", None, now())
+            .unwrap();
+        s.add_participant(&key, human("human-1", "Human One"), now())
+            .unwrap();
+        s.conn
+            .execute_batch(
+                "DROP INDEX idx_room_local_roles_one_owner;
+                 DROP TABLE room_local_roles;",
+            )
+            .unwrap();
+
+        s.migrate().unwrap();
+        s.migrate().unwrap();
+        assert!(s.local_room_owner(&key).unwrap().is_none());
+        assert!(s
+            .get(&key)
+            .unwrap()
+            .unwrap()
+            .room
+            .participants
+            .iter()
+            .any(|participant| participant.id == "human-1"));
+
+        s.bootstrap_local_room_agent(
+            &key,
+            "human-1",
+            RoomParticipant {
+                id: "builder".into(),
+                kind: RoomParticipantKind::Agent,
+                display_name: "Builder".into(),
+            },
+            "builder",
+            "operator-1",
+            now(),
+        )
+        .unwrap();
+        s.conn
+            .execute_batch(
+                "DROP INDEX idx_room_local_roles_one_owner;
+                 DROP TABLE room_local_roles;",
+            )
+            .unwrap();
+        assert!(s.room_agent_binding(&key, "builder").unwrap().is_none());
+        assert!(s.get(&key).unwrap().is_some());
+        s.migrate().unwrap();
+        assert!(s.local_room_owner(&key).unwrap().is_none());
+    }
+
+    #[test]
     fn authorize_creates_an_active_binding_at_generation_one() {
         let (s, key) = room_with_agent("agent-1");
         let b = s.room_agent_binding(&key, "agent-1").unwrap().unwrap();
@@ -7304,6 +7940,83 @@ mod tests {
             RoomStoreError::AgentBindingStatusConflict { .. }
         ));
         assert_eq!(s.transcript(&key, None).unwrap(), before);
+    }
+
+    #[test]
+    fn authorized_room_history_is_exact_scope_newest_first_and_generation_bound() {
+        let (mut s, key) = room_with_agent("agent-1");
+        let other = RoomKey::new("other-room");
+        s.create(other.clone(), "Other", None, now()).unwrap();
+        s.append_message(
+            &other,
+            "other-human",
+            RoomParticipantKind::Human,
+            RoomMessageKind::Message,
+            "cross-room-secret",
+            now(),
+        )
+        .unwrap();
+        let mut seqs = Vec::new();
+        for index in 0..5 {
+            seqs.push(
+                s.append_message(
+                    &key,
+                    "human-1",
+                    RoomParticipantKind::Human,
+                    RoomMessageKind::Message,
+                    &format!("room-row-{index}"),
+                    now(),
+                )
+                .unwrap()
+                .seq,
+            );
+        }
+
+        let first = s
+            .authorized_room_history_page(&key, "agent-1", 1, None, 2)
+            .unwrap();
+        assert!(first.has_more);
+        assert_eq!(
+            first
+                .messages
+                .iter()
+                .map(|message| message.seq)
+                .collect::<Vec<_>>(),
+            vec![seqs[4], seqs[3]]
+        );
+        assert!(first
+            .messages
+            .iter()
+            .all(|message| !message.body.contains("cross-room-secret")));
+
+        let second = s
+            .authorized_room_history_page(&key, "agent-1", 1, Some(seqs[3]), 2)
+            .unwrap();
+        assert_eq!(
+            second
+                .messages
+                .iter()
+                .map(|message| message.seq)
+                .collect::<Vec<_>>(),
+            vec![seqs[2], seqs[1]],
+            "before_seq is strict and pages backward without overlap"
+        );
+        assert!(matches!(
+            s.authorized_room_history_page(&other, "agent-1", 1, None, 2),
+            Err(RoomStoreError::UnknownAgentBinding { .. })
+        ));
+
+        s.set_room_agent_binding_status(
+            &key,
+            "agent-1",
+            status_input(AgentBindingStatus::Suspended, "dec-2", "suspend-2"),
+            now(),
+        )
+        .unwrap();
+        assert!(matches!(
+            s.authorized_room_history_page(&key, "agent-1", 1, None, 2),
+            Err(RoomStoreError::AgentBindingStatusConflict { .. })
+        ));
     }
 
     #[test]

@@ -581,6 +581,7 @@ POST   /v1/rooms/persistent/{key}/members/agents          register safe local ag
 DELETE /v1/rooms/persistent/{key}/members/{member_id}     remove one federated member via Bedrock; refreshed RoomAccessProjection 200, Bedrock's owner-or-self 403 surfaces as federation_forbidden with the credential intact
 GET    /v1/rooms/persistent/{key}/agents                  inspect durable room-agent bindings; no operator credential is returned
 POST   /v1/rooms/persistent/{key}/agents                  authorize one exact room member/package/digest under X-Ocean-Operator; missing header or unavailable operator key is 503
+POST   /v1/rooms/persistent/{key}/agents/bootstrap        under X-Ocean-Operator, atomically establish/verify the Local Room owner plus package-derived Agent roster tuple; does not authorize execution or consume a decision
 GET    /v1/rooms/persistent/{key}/agents/preview/{agent_package_id}  non-authorizing package/digest/capability preview; returns daemon-derived grantable/unavailable capabilities and any existing member/binding
 GET    /v1/rooms/persistent/{key}/agents/{agent_member_id}  inspect one binding
 DELETE /v1/rooms/persistent/{key}/agents/{agent_member_id}  terminal revoke under X-Ocean-Operator + replay decision

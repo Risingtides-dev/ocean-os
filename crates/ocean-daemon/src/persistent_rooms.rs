@@ -422,6 +422,85 @@ pub(super) fn with_rooms<T>(
     f(&mut guard)
 }
 
+#[derive(Clone)]
+struct DurableRoomHistorySource {
+    rooms: RoomStoreHandle,
+}
+
+fn room_history_row(message: RoomMessage) -> ocean_agent::RoomHistoryRow {
+    let author_kind = match message.author_kind {
+        RoomParticipantKind::Human => ocean_agent::RoomHistoryAuthorKind::Human,
+        RoomParticipantKind::Agent => ocean_agent::RoomHistoryAuthorKind::Agent,
+        RoomParticipantKind::System => ocean_agent::RoomHistoryAuthorKind::System,
+        RoomParticipantKind::Bot => ocean_agent::RoomHistoryAuthorKind::Bot,
+        RoomParticipantKind::Tool => ocean_agent::RoomHistoryAuthorKind::Tool,
+    };
+    ocean_agent::RoomHistoryRow {
+        seq: message.seq,
+        author_id: message.author_id,
+        author_kind,
+        text: room_history_text(message.body),
+    }
+}
+
+fn room_history_text(body: String) -> String {
+    let audit_type = serde_json::from_str::<serde_json::Value>(&body)
+        .ok()
+        .and_then(|value| {
+            value
+                .get("type")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_owned)
+        });
+    match audit_type.as_deref() {
+        Some("room.agent.admission") => "[room agent admission audit]".into(),
+        Some("room.agent.authority") => "[room agent authority audit]".into(),
+        Some("room.agent.bootstrap") => "[room agent bootstrap audit]".into(),
+        Some("room.agent.output") => "[room agent output audit]".into(),
+        _ => body,
+    }
+}
+
+#[async_trait::async_trait]
+impl ocean_agent::RoomHistorySource for DurableRoomHistorySource {
+    async fn page(
+        &self,
+        scope: &ocean_agent::RoomHistoryScope,
+        request: ocean_agent::RoomHistoryRequest,
+    ) -> Result<ocean_agent::RoomHistoryPage, ocean_agent::RoomHistorySourceError> {
+        if scope.room_key().is_empty()
+            || scope.agent_member_id().is_empty()
+            || scope.generation() == 0
+        {
+            return Err(ocean_agent::RoomHistorySourceError::AuthorityChanged);
+        }
+        let room = RoomKey::new(scope.room_key());
+        let page = with_rooms_handle(&self.rooms, |store| {
+            store.authorized_room_history_page(
+                &room,
+                scope.agent_member_id(),
+                scope.generation(),
+                request.before_seq(),
+                request.limit(),
+            )
+        })
+        .map_err(|error| match error {
+            ocean_store::RoomStoreError::UnknownAgentBinding { .. }
+            | ocean_store::RoomStoreError::AgentBindingStatusConflict { .. } => {
+                ocean_agent::RoomHistorySourceError::AuthorityChanged
+            }
+            ocean_store::RoomStoreError::UnknownRoom(_) => {
+                ocean_agent::RoomHistorySourceError::Unavailable
+            }
+            _ => ocean_agent::RoomHistorySourceError::Internal,
+        })?;
+        Ok(ocean_agent::RoomHistoryPage {
+            rows: page.messages.into_iter().map(room_history_row).collect(),
+            has_more: page.has_more,
+        })
+    }
+}
+
 /// Map a store error onto an HTTP status + typed JSON body.
 pub(super) fn room_store_error_response(
     err: ocean_store::RoomStoreError,
@@ -430,7 +509,7 @@ pub(super) fn room_store_error_response(
     let status = match &err {
         BadKey(_) => StatusCode::BAD_REQUEST,
         UnknownRoom(_) | UnknownParticipant { .. } => StatusCode::NOT_FOUND,
-        AlreadyExists(_) => StatusCode::CONFLICT,
+        AlreadyExists(_) | RoomNotLocal(_) | LocalRoomOwnerConflict { .. } => StatusCode::CONFLICT,
         // The room exists but is not federated: a client-side misuse of a
         // federation-only operation, not a server fault.
         RoomNotFederated(_) => StatusCode::CONFLICT,
@@ -2508,7 +2587,7 @@ fn authorized_room_transcript_context(
             }
             rows
         }
-        ContextPolicy::RoomRecent => {
+        ContextPolicy::RoomRecent | ContextPolicy::RoomHistory => {
             let latest = store
                 .room_latest_durable_seq(&admission.room)
                 .ok()
@@ -2520,11 +2599,6 @@ fn authorized_room_transcript_context(
                 .map(|page| page.messages)
                 .unwrap_or_default()
         }
-        // `room_history` is refused before request registration until the
-        // bounded opaque retrieval seam is installed. Keep this branch empty
-        // so no future call-site bypass can silently reinterpret history as a
-        // recent-tail prompt.
-        ContextPolicy::RoomHistory => Vec::new(),
     })
 }
 
@@ -2641,15 +2715,6 @@ async fn spawn_room_agent_turn(
     footprint: Option<RoomTurnFootprint>,
 ) -> Result<QueuedRoomAgentTurn, RoomTurnStartError> {
     let room = admission.room.clone();
-    if admission.context_policy == ContextPolicy::RoomHistory {
-        room_agent_authority::append_remote_output_outcome(
-            &state,
-            &admission,
-            "refused",
-            "room_history_unavailable",
-        );
-        return Err(RoomTurnStartError::RoomHistoryUnavailable);
-    }
     let room_workspace = with_rooms(&state, |reg| {
         reg.get(&room)
             .ok()
@@ -2672,6 +2737,27 @@ async fn spawn_room_agent_turn(
         .ok()
         .flatten()
         .map(|project| project.id);
+    let room_history = if admission.context_policy == ContextPolicy::RoomHistory {
+        match state.runtime.admit_room_history(
+            &admission,
+            Arc::new(DurableRoomHistorySource {
+                rooms: state.rooms.clone(),
+            }),
+        ) {
+            Ok(history) => Some(history),
+            Err(_) => {
+                room_agent_authority::append_remote_output_outcome(
+                    &state,
+                    &admission,
+                    "refused",
+                    "room_history_unavailable",
+                );
+                return Err(RoomTurnStartError::RoomHistoryUnavailable);
+            }
+        }
+    } else {
+        None
+    };
     let session_id =
         authorized_room_agent_session_id(&room, &admission.agent_member_id, admission.generation);
     let is_new = state.runtime.session_detail(core_sid(session_id)).is_err();
@@ -2784,6 +2870,10 @@ async fn spawn_room_agent_turn(
             prompt_req.decision_token.clone(),
         );
         let control = room_agent_authority::apply_admission_to_control(control, &admission);
+        let control = match room_history {
+            Some(history) => control.with_room_history(history),
+            None => control,
+        };
         #[cfg(test)]
         capture_room_turn(&agent.id, &prompt_req.prompt, &control);
 
@@ -3889,6 +3979,122 @@ mod tests {
         ));
         assert!(prompt.contains("[file] spec.md (text/markdown, 9 bytes)\nthe spec\n"));
         assert!(prompt.ends_with("--- end context files ---\n\nYour reply:"));
+    }
+
+    #[test]
+    fn room_history_projection_omits_audit_and_transport_metadata() {
+        let projected = room_history_row(RoomMessage {
+            seq: 7,
+            author_id: "builder".into(),
+            author_kind: RoomParticipantKind::Agent,
+            kind: RoomMessageKind::Message,
+            body: "durable fact".into(),
+            created_at: Utc::now(),
+            federated: Some(ocean_core::FederatedMessageMeta {
+                ledger_event_id: "private-ledger-correlation".into(),
+                global_sequence: 99,
+                source_id: "private-source".into(),
+                source_sequence: 12,
+                client_event_id: "private-client-event".into(),
+                origin_principal_id: "private-principal".into(),
+                origin_member_id: "private-member".into(),
+            }),
+            thread_parent_seq: Some(3),
+            session_id: Some("private-session".into()),
+            attachment_id: Some("private-attachment".into()),
+        });
+        assert_eq!(projected.seq, 7);
+        assert_eq!(projected.author_id, "builder");
+        assert_eq!(
+            projected.author_kind,
+            ocean_agent::RoomHistoryAuthorKind::Agent
+        );
+        assert_eq!(projected.text, "durable fact");
+    }
+
+    #[test]
+    fn room_history_redacts_structured_audit_without_breaking_backward_cursor() {
+        let mut store = ocean_store::SqliteRoomStore::open_in_memory().unwrap();
+        let room = RoomKey::new("history-redaction");
+        store
+            .create(room.clone(), "History Redaction", None, Utc::now())
+            .unwrap();
+        store
+            .authorize_room_agent(
+                &room,
+                ocean_store::AuthorizeAgentInput {
+                    agent_member_id: "builder".into(),
+                    agent_package_id: "builder".into(),
+                    agent_definition_digest: "sha256:def".into(),
+                    agent_definition_revision: None,
+                    display_name: "Builder".into(),
+                    owner_member_id: "human-1".into(),
+                    authorized_by: "operator:test".into(),
+                    activation_policy: ocean_store::ActivationPolicy::ExplicitOnly,
+                    context_policy: ContextPolicy::RoomHistory,
+                    memory_scope: ocean_store::MemoryScope::None,
+                    requested_capabilities: Vec::new(),
+                    room_capability_grants: Vec::new(),
+                    decision_id: "decision-secret".into(),
+                    request_digest: "request-secret".into(),
+                },
+                Utc::now(),
+            )
+            .unwrap();
+        let older = store
+            .append_message(
+                &room,
+                "human-1",
+                RoomParticipantKind::Human,
+                RoomMessageKind::Message,
+                "older user fact",
+                Utc::now(),
+            )
+            .unwrap();
+        let audit = store
+            .append_message(
+                &room,
+                "system",
+                RoomParticipantKind::System,
+                RoomMessageKind::System,
+                r#"{"type":"room.agent.bootstrap","operator_principal_id":"operator-private","decision_id":"decision-private","agent_member_id":"builder-private"}"#,
+                Utc::now(),
+            )
+            .unwrap();
+        let newer = store
+            .append_message(
+                &room,
+                "human-1",
+                RoomParticipantKind::Human,
+                RoomMessageKind::Message,
+                "newer user fact",
+                Utc::now(),
+            )
+            .unwrap();
+
+        let first = store
+            .authorized_room_history_page(&room, "builder", 1, None, 2)
+            .unwrap();
+        assert!(first.has_more);
+        let projected = first
+            .messages
+            .into_iter()
+            .map(room_history_row)
+            .collect::<Vec<_>>();
+        assert_eq!(projected[0].seq, newer.seq);
+        assert_eq!(projected[1].seq, audit.seq);
+        assert_eq!(projected[1].text, "[room agent bootstrap audit]");
+        assert!(!projected[1].text.contains("operator-private"));
+        assert!(!projected[1].text.contains("decision-private"));
+        assert!(!projected[1].text.contains("builder-private"));
+
+        let second = store
+            .authorized_room_history_page(&room, "builder", 1, Some(projected[1].seq), 2)
+            .unwrap();
+        assert!(second
+            .messages
+            .iter()
+            .any(|message| message.seq == older.seq && message.body == "older user fact"));
     }
 
     use crate::tests::{
@@ -7625,11 +7831,10 @@ env = { FIXTURE = "1" }
         });
     }
 
-    /// `room_history` stays an advertised authorization value, but no turn may
-    /// reinterpret it as a recent transcript plus attachments before the
-    /// bounded opaque retrieval seam exists.
+    /// `room_history` admits an ordinary turn while durable older transcript
+    /// retrieval stays behind the opaque exact-generation source.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn room_history_fails_closed_before_runtime_context_reads() {
+    async fn room_history_turn_is_admitted_with_room_context() {
         let _guard = AUTO_CONVENE_ENV_LOCK.lock().await;
         let _env = TestEnvRestore::capture(&[
             "OCEAN_CONFIG_DIR",
@@ -7698,15 +7903,21 @@ env = { FIXTURE = "1" }
         .await;
         assert_eq!(post_status, StatusCode::CREATED);
 
-        assert!(ROOM_TURN_CAPTURES
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .is_empty());
-        assert!(state.requests.read().await.is_empty());
+        let capture = wait_for_turn_capture("reader-agent")
+            .await
+            .expect("room-history turn reaches runtime with its opaque tool authority");
+        assert!(capture
+            .prompt
+            .contains("[file] brief.md (text/markdown, 22 bytes)\nship the narrow slice\n"));
+        assert!(capture
+            .prompt
+            .contains("[file] logo.png (text/plain, 16 bytes) — binary, not inlined"));
+        assert!(!capture.prompt.contains("IHDR"));
+        assert!(!state.requests.read().await.is_empty());
         let transcript = with_rooms(&state, |store| store.transcript(&key, None)).unwrap();
         assert!(transcript
             .iter()
-            .any(|row| row.body.contains("room_history_unavailable")));
+            .all(|row| !row.body.contains("room_history_unavailable")));
         assert!(transcript.iter().all(|row| !row.body.contains("IHDR")));
     }
 

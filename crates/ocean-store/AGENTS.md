@@ -131,6 +131,19 @@ outbox, and the restart-safe federation core (S2 P2-A). One database file
   audit in one IMMEDIATE transaction. Never split these into a mutation followed
   by a best-effort audit or a generation check followed by an unguarded output
   write; provider stderr is not an input to the durable failure API.
+- **Local Room ownership is not Agent ownership.** `room_local_roles` records
+  the durable Local-room owner role and the non-secret operator principal that
+  established it; `room_agent_owners` remains only Agent→Human ownership. The
+  operator-authenticated bootstrap verifies a live Human, exact existing role,
+  package-derived Agent participant, and Agent owner in one IMMEDIATE
+  transaction. Its first applied mutation writes one content-minimal
+  `room.agent.bootstrap` audit; exact replay writes no marker or audit. It never
+  creates `room_agent_bindings` or consumes a decision, and federated rooms may
+  never receive a local role row.
+- **Durable Room history is backwards, bounded, and generation-bound.** The
+  exact Active binding/generation check and newest-first room-scoped
+  `seq < before_seq` query share one read transaction. Use a `limit + 1`
+  sentinel for `has_more`; never count or load an unbounded transcript page.
 - **Attachments are immutable, so the discipline is refusal, not CAS.** There is
   deliberately no `version` column on `room_attachments`: nothing amends an
   attachment, so a compare-and-swap guard would be decoration, and a decorative

@@ -1582,6 +1582,7 @@ fn banner_routes() -> &'static [&'static str] {
         "DELETE /v1/rooms/persistent/{key}/members/{member_id}",
         "GET /v1/rooms/persistent/{key}/agents",
         "POST /v1/rooms/persistent/{key}/agents",
+        "POST /v1/rooms/persistent/{key}/agents/bootstrap",
         "GET /v1/rooms/persistent/{key}/agents/preview/{agent_package_id}",
         "GET /v1/rooms/persistent/{key}/agents/{agent_member_id}",
         "DELETE /v1/rooms/persistent/{key}/agents/{agent_member_id}",
@@ -2996,6 +2997,10 @@ fn room_routes() -> Router<AppState> {
             "/v1/rooms/persistent/{key}/agents",
             get(room_agent_authority::room_agent_bindings)
                 .post(room_agent_authority::room_agent_authorize),
+        )
+        .route(
+            "/v1/rooms/persistent/{key}/agents/bootstrap",
+            post(room_agent_authority::room_agent_bootstrap),
         )
         .route(
             "/v1/rooms/persistent/{key}/agents/preview/{agent_package_id}",
@@ -13078,6 +13083,38 @@ mod tests {
         )
     }
 
+    async fn operator_room_http_request(
+        app: Router,
+        method: axum::http::Method,
+        uri: &str,
+        body: Option<serde_json::Value>,
+        headers: &[(&str, &str)],
+    ) -> (StatusCode, serde_json::Value) {
+        use http_body_util::BodyExt;
+        use tower::ServiceExt as _;
+
+        let mut builder = axum::http::Request::builder()
+            .method(method)
+            .uri(uri)
+            .header(axum::http::header::CONTENT_TYPE, "application/json");
+        for (name, value) in headers {
+            builder = builder.header(*name, *value);
+        }
+        let response = app
+            .oneshot(
+                builder
+                    .body(axum::body::Body::from(
+                        body.map(|value| value.to_string()).unwrap_or_default(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let status = response.status();
+        let bytes = response.into_body().collect().await.unwrap().to_bytes();
+        (status, serde_json::from_slice(&bytes).unwrap())
+    }
+
     fn persistent_room_http_json(raw: &str) -> serde_json::Value {
         serde_json::from_str(raw).unwrap_or_else(|error| {
             panic!("persistent-room response was not JSON ({error}): {raw:?}")
@@ -16040,13 +16077,30 @@ mod tests {
         let (binding, created, _audit) = with_rooms(state, |store| {
             let access = store.room_access(room)?;
             let owner_member_id = if access.state == ocean_core::RoomAccessState::Local {
-                store
+                let owner_member_id = store
                     .agent_owners(room)?
                     .into_iter()
                     .find_map(|(agent, owner, present)| {
                         (agent == agent_member_id && present).then_some(owner)
                     })
-                    .expect("local authority fixture requires a live recorded owner")
+                    .expect("local authority fixture requires a live recorded owner");
+                let participant = store
+                    .get(room)?
+                    .expect("local authority fixture room")
+                    .room
+                    .participants
+                    .into_iter()
+                    .find(|participant| participant.id == agent_member_id)
+                    .expect("local authority fixture agent participant");
+                store.bootstrap_local_room_agent(
+                    room,
+                    &owner_member_id,
+                    participant,
+                    &package.package_id,
+                    "fixture-operator",
+                    Utc::now(),
+                )?;
+                owner_member_id
             } else {
                 store
                     .room_credential(room)?
@@ -25437,6 +25491,310 @@ mod tests {
     // Room route retirement + retained-contract guards
     // -------------------------------------------------
 
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn local_room_agent_bootstrap_is_authenticated_previewable_and_non_authorizing() {
+        let _guard = AUTO_CONVENE_ENV_LOCK.lock().await;
+        let _env = TestEnvRestore::capture(&[
+            "OCEAN_CONFIG_DIR",
+            "OCEAN_MODEL",
+            "OCEAN_YOLO",
+            "OCEAN_AGENTS_DIR",
+        ]);
+        let tmp = tempfile::tempdir().unwrap();
+        let agents_root = tmp.path().join("agents");
+        write_agent_fixture(&agents_root, "builder", "description = 'Builder'\n", None);
+        std::env::set_var("OCEAN_AGENTS_DIR", &agents_root);
+        let state = fake_convene_state(&tmp);
+        let key = RoomKey::new("bootstrap-route");
+        with_rooms(&state, |store| {
+            store.create(key.clone(), "Bootstrap Route", None, Utc::now())?;
+            store.add_participant(
+                &key,
+                RoomParticipant {
+                    id: "human-1".into(),
+                    kind: RoomParticipantKind::Human,
+                    display_name: "Human One".into(),
+                },
+                Utc::now(),
+            )?;
+            store.add_participant(
+                &key,
+                RoomParticipant {
+                    id: "human-2".into(),
+                    kind: RoomParticipantKind::Human,
+                    display_name: "Human Two".into(),
+                },
+                Utc::now(),
+            )?;
+            Ok::<_, ocean_store::RoomStoreError>(())
+        })
+        .unwrap();
+        let app = room_routes().with_state(state.clone());
+        let path = "/v1/rooms/persistent/bootstrap-route/agents/bootstrap";
+        let bootstrap_body = json!({
+            "owner_member_id": "human-1",
+            "agent_package_id": "builder",
+        });
+
+        let (status, body) = operator_room_http_request(
+            app.clone(),
+            axum::http::Method::POST,
+            path,
+            Some(bootstrap_body.clone()),
+            &[],
+        )
+        .await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(body["error"], "operator_credential_missing");
+
+        let (status, body) = operator_room_http_request(
+            app.clone(),
+            axum::http::Method::POST,
+            path,
+            Some(bootstrap_body.clone()),
+            &[
+                ("x-ocean-operator", "test-room-operator"),
+                ("cookie", "ambient=1"),
+            ],
+        )
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        assert_eq!(body["error"], "ambient_credential_rejected");
+
+        let operator = &[("x-ocean-operator", "test-room-operator")];
+        let (status, body) = operator_room_http_request(
+            app.clone(),
+            axum::http::Method::POST,
+            path,
+            Some(bootstrap_body.clone()),
+            operator,
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED);
+        assert_eq!(body["ok"], true);
+        assert_eq!(body["created"], true);
+        assert_eq!(body["room_id"], "bootstrap-route");
+        assert_eq!(body["owner_member_id"], "human-1");
+        assert_eq!(body["agent_member_id"], "builder");
+        assert_eq!(body["agent_package_id"], "builder");
+        assert_eq!(body["owner_eligible"], true);
+        assert_eq!(body["package_preview"]["binding"], serde_json::Value::Null);
+        assert!(body["room"]["participants"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|participant| participant["id"] == "builder"));
+        for field in [
+            "package_id",
+            "display_name",
+            "definition_digest",
+            "definition_revision",
+            "requested_capabilities",
+            "grantable_capabilities",
+            "unavailable_capabilities",
+            "agent_member_id",
+            "owner_member_id",
+            "owner_eligible",
+            "binding",
+        ] {
+            assert!(body["package_preview"].get(field).is_some(), "{field}");
+        }
+        assert!(
+            with_rooms(&state, |store| store.room_agent_binding(&key, "builder"))
+                .unwrap()
+                .is_none()
+        );
+        let after_first = with_rooms(&state, |store| store.transcript(&key, None)).unwrap();
+        let bootstrap_audits = after_first
+            .iter()
+            .filter(|row| row.body.contains("\"type\":\"room.agent.bootstrap\""))
+            .collect::<Vec<_>>();
+        assert_eq!(bootstrap_audits.len(), 1);
+        assert!(bootstrap_audits[0].body.contains("operator_principal_id"));
+        assert!(!bootstrap_audits[0].body.contains("test-room-operator"));
+
+        let (status, replay) = operator_room_http_request(
+            app.clone(),
+            axum::http::Method::POST,
+            path,
+            Some(bootstrap_body),
+            operator,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(replay["created"], false);
+        assert_eq!(
+            with_rooms(&state, |store| store.transcript(&key, None)).unwrap(),
+            after_first,
+            "exact replay must write no marker or audit"
+        );
+
+        let (status, preview) = operator_room_http_request(
+            app.clone(),
+            axum::http::Method::GET,
+            "/v1/rooms/persistent/bootstrap-route/agents/preview/builder",
+            None,
+            &[],
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(preview["owner_member_id"], "human-1");
+        assert_eq!(preview["owner_eligible"], true);
+        assert_eq!(preview["binding"], serde_json::Value::Null);
+        let (status, bindings) = operator_room_http_request(
+            app.clone(),
+            axum::http::Method::GET,
+            "/v1/rooms/persistent/bootstrap-route/agents",
+            None,
+            &[],
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(bindings["owner_member_id"], "human-1");
+        assert_eq!(bindings["owner_eligible"], true);
+        assert_eq!(bindings["bindings"], json!([]));
+
+        let (status, body) = operator_room_http_request(
+            app.clone(),
+            axum::http::Method::POST,
+            path,
+            Some(json!({
+                "owner_member_id": "human-2",
+                "agent_package_id": "builder",
+            })),
+            operator,
+        )
+        .await;
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert_eq!(body["error"], "room_owner_conflict");
+
+        let decision_id = Uuid::new_v4().to_string();
+        let (status, authorized) = operator_room_http_request(
+            app.clone(),
+            axum::http::Method::POST,
+            "/v1/rooms/persistent/bootstrap-route/agents",
+            Some(json!({
+                "agent_member_id": "builder",
+                "agent_package_id": "builder",
+                "owner_member_id": "human-1",
+                "decision_id": decision_id,
+                "activation_policy": "explicit_only",
+                "context_policy": "invocation_only",
+                "memory_scope": "none",
+                "room_capability_grants": [],
+            })),
+            operator,
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED);
+        assert_eq!(authorized["binding"]["status"], "active");
+
+        let (status, reauthorized) = operator_room_http_request(
+            app.clone(),
+            axum::http::Method::POST,
+            "/v1/rooms/persistent/bootstrap-route/agents/builder/reauthorize",
+            Some(json!({
+                "decision_id": Uuid::new_v4().to_string(),
+                "activation_policy": "explicit_only",
+                "context_policy": "invocation_only",
+                "memory_scope": "room",
+                "room_capability_grants": [],
+            })),
+            operator,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(reauthorized["binding"]["memory_scope"], "room");
+        let invocation = with_rooms(&state, |store| {
+            store.append_message(
+                &key,
+                "human-1",
+                RoomParticipantKind::Human,
+                RoomMessageKind::Message,
+                "explicit invocation",
+                Utc::now(),
+            )
+        })
+        .unwrap();
+        let (status, unavailable) = operator_room_http_request(
+            app.clone(),
+            axum::http::Method::POST,
+            "/v1/rooms/persistent/bootstrap-route/agents/builder/invoke",
+            Some(json!({
+                "invoked_by": "human-1",
+                "message_seq": invocation.seq,
+            })),
+            &[],
+        )
+        .await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(unavailable["error"], "room_memory_unavailable");
+
+        let (status, _) = operator_room_http_request(
+            app.clone(),
+            axum::http::Method::POST,
+            "/v1/rooms/persistent/bootstrap-route/agents/builder/reauthorize",
+            Some(json!({
+                "decision_id": Uuid::new_v4().to_string(),
+                "activation_policy": "explicit_only",
+                "context_policy": "invocation_only",
+                "memory_scope": "none",
+                "room_capability_grants": [],
+            })),
+            operator,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let (status, unavailable) = operator_room_http_request(
+            app.clone(),
+            axum::http::Method::POST,
+            "/v1/rooms/persistent/bootstrap-route/agents/builder/invoke",
+            Some(json!({
+                "invoked_by": "human-1",
+                "message_seq": invocation.seq,
+            })),
+            &[],
+        )
+        .await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(unavailable["error"], "workspace_unavailable");
+
+        let federated = RoomKey::new("bootstrap-federated");
+        with_rooms(&state, |store| {
+            store.create(federated.clone(), "Federated", None, Utc::now())?;
+            store.add_participant(
+                &federated,
+                RoomParticipant {
+                    id: "human-1".into(),
+                    kind: RoomParticipantKind::Human,
+                    display_name: "Human One".into(),
+                },
+                Utc::now(),
+            )?;
+            store.install_room_credential(&federated, "private-bearer", "human-1")?;
+            Ok::<_, ocean_store::RoomStoreError>(())
+        })
+        .unwrap();
+        let (status, body) = operator_room_http_request(
+            app,
+            axum::http::Method::POST,
+            "/v1/rooms/persistent/bootstrap-federated/agents/bootstrap",
+            Some(json!({
+                "owner_member_id": "human-1",
+                "agent_package_id": "builder",
+            })),
+            operator,
+        )
+        .await;
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert_eq!(body["error"], "local_room_required");
+        assert!(
+            with_rooms(&state, |store| store.local_room_owner(&federated))
+                .unwrap()
+                .is_none()
+        );
+    }
+
     #[tokio::test]
     async fn room_router_retires_track0_gets_and_keeps_persistent_and_livekit_routes() {
         use axum::{body::Body, http::Request};
@@ -25785,9 +26143,12 @@ mod tests {
         // for the capability the agent-delete sweep already exercised.
         // 114 -> 123: Rooms Phase 1 adds binding list/detail/preview,
         // authorize/reauthorize/suspend/resume/revoke, and explicit invoke.
+        // 123 -> 124: Local-room agent bootstrap establishes the durable Room
+        // owner role and package-derived Agent roster tuple without authorizing
+        // execution or consuming a decision.
         assert_eq!(
             banner.len(),
-            123,
+            124,
             "route baseline changed; review the manifest"
         );
 
