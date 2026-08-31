@@ -3430,19 +3430,77 @@ struct WorkspaceCiCheck {
     url: Option<String>,
 }
 
-/// Bound and neutralize a member-controlled string (branch, script name,
-/// driver id) before quoting it into a transcript line.
+/// Bound an upstream-controlled string and drop its control characters.
 ///
 /// Same threat as the attachment marker in `ocean-store`: transcripts are
-/// rendered by clients and read by agents, and an upstream-controlled string
-/// carrying a newline could forge an entire fake transcript row in a naive
-/// renderer. Control characters are dropped rather than escaped, and the
-/// result is hard-capped so a pathological branch name cannot balloon the
-/// marker.
+/// rendered by clients and read by agents, and an upstream string carrying a
+/// newline could forge an entire fake transcript row. Control characters are
+/// dropped rather than escaped, and the result is hard-capped so a
+/// pathological branch name cannot balloon the marker.
+///
+/// This is the PRIMITIVE, not the whole quoting rule. It handles the two
+/// things that are wrong with a string in any renderer — the row break and
+/// the flood — and deliberately nothing that depends on how one particular
+/// client draws a line. Prose goes through [`bounded_prose`] instead;
+/// [`ci_run_url`] compares back against this function precisely because it
+/// wants the primitive and not the prose rule.
 fn bounded_quotable(text: &str, max_chars: usize) -> String {
     text.chars()
         .filter(|c| !c.is_control())
         .take(max_chars)
+        .collect()
+}
+
+/// Neutralize an upstream-controlled string for a marker's PROSE, on top of
+/// [`bounded_quotable`]'s bound and control-character rule.
+///
+/// The renderer is NOT naive, and this file used to say it was. ocean-surface
+/// puts every transcript row through `room_markdown::body_view` — a
+/// system-attributed row included, since `is_compact_system_row` only swaps
+/// the avatar for a Spark icon — and that tokenizer builds an anchor out of
+/// `[label](href)`. Markdown metacharacters are not control characters, so a
+/// CI check named `[click here](https://evil.co)` fits under the 32-char cap
+/// and lands as a link with an attacker-chosen label AND destination, inside a
+/// row the UI attributes to the room itself, composed from a string the room's
+/// own container produced. `scheme_allowed` holds it to http/https, so the
+/// reachable end of that is phishing rather than script execution — which is
+/// still a room lying to its members in the room's own voice.
+///
+/// The rule, then: an upstream string may not carry a character that
+/// manufactures a DESTINATION the marker did not author. That is `[` and `]`,
+/// and each thing left behind is a ruling rather than an oversight:
+///
+/// - `(` and `)` are inert without a preceding `[…]` — the tokenizer's link
+///   arm is entered on `[` alone — and GitHub names matrix jobs
+///   `build (ubuntu-latest, 1.97.0)`. Dropping them would mangle the
+///   commonest real check name to close a door that is already locked.
+/// - A bare `https://…` still autolinks, and that is ACCEPTED: an autolink's
+///   label IS its href, so it cannot lie about where it leads, and the same
+///   posture already governs member messages. It is also load-bearing here —
+///   #416's run URL is emitted bare (`": {url}"`) and reaches the reader
+///   through exactly that path, which is the fact that makes neutralizing
+///   bracket syntax free.
+/// - `*` and `` ` `` are decoration: they change how a word looks, never
+///   where it goes.
+/// - `@` highlights only when the id resolves against the room's live roster,
+///   and the span drives nothing else — no notification, no navigation. A
+///   decoration naming a member who really is in the room is not a
+///   destination.
+///
+/// Neutralizing rather than refusing is the deliberate opposite of
+/// [`ci_run_url`], which omits a URL it would have to repair because a
+/// repaired URL points somewhere its producer never named. A name is not a
+/// pointer: a repaired name still identifies, and the cap above already
+/// repairs it by truncating. Refusing a check name for a bracket would blank
+/// the marker over a naming convention nobody chose adversarially.
+///
+/// The two lanes still reach the same place: no finished marker line carries
+/// bracket syntax, because the only other upstream string on one is a run URL
+/// and [`ci_run_url`] refuses those for its own reason.
+fn bounded_prose(text: &str, max_chars: usize) -> String {
+    bounded_quotable(text, max_chars)
+        .chars()
+        .filter(|c| !matches!(c, '[' | ']'))
         .collect()
 }
 
@@ -3479,6 +3537,12 @@ const CI_RUN_URL_MAX_CHARS: usize = 256;
 /// truncating, and a repaired URL is a DIFFERENT URL. So its output is
 /// compared back, and a URL that changed under it is omitted rather than
 /// emitted pointing somewhere its producer never named.
+///
+/// That compare-back reads the PRIMITIVE and never [`bounded_prose`], on
+/// purpose: the prose rule is about how one client draws a line and is
+/// expected to grow, and inheriting it here would let a rendering decision
+/// silently change which URLs this gate accepts. Anything this lane wants
+/// from the prose rule it states below, in its own words.
 fn ci_run_url(text: &str) -> Option<String> {
     if bounded_quotable(text, CI_RUN_URL_MAX_CHARS) != text {
         return None;
@@ -3487,6 +3551,20 @@ fn ci_run_url(text: &str) -> Option<String> {
     // the tail of a URL read as separate prose. A backslash is the surface's
     // rule verbatim.
     if text.chars().any(char::is_whitespace) || text.contains('\\') {
+        return None;
+    }
+    // Brackets are the same class of thing, and the reason is subtle enough to
+    // be worth spelling out. A URL that autolinks is harmless — the tokenizer
+    // swallows it whole and the label it draws IS the href. But this gate is
+    // deliberately LOOSER about the authority than the surface is (see below),
+    // so a URL can pass here and be REFUSED an autolink there — and refused
+    // text is handed straight back to the tokenizer's `[label](href)` arm, one
+    // character at a time. `https://ex_ample.test/[a](https://evil.co)` clears
+    // every check in this function and renders as an anchor labelled "a"
+    // pointing at evil.co, inside a row the UI attributes to the room. No real
+    // run URL carries a bracket, so refusing costs nothing and does not depend
+    // on the two repos' host parsers ever agreeing.
+    if text.contains('[') || text.contains(']') {
         return None;
     }
     if percent_encodes_control_or_space(text) {
@@ -3533,15 +3611,40 @@ fn fmt_duration_ms(ms: u64) -> String {
 /// Compose the transcript marker for an allowlisted workspace row.
 ///
 /// The prose is SERVER-DERIVED: event type plus typed, bounded payload fields
-/// (integers, a validated short hash, control-stripped length-capped strings).
+/// (integers, a validated short hash, neutralized length-capped strings).
 /// Missing fields degrade to a shorter sentence instead of failing the row —
 /// the marker's job is "something happened in the workspace", not a faithful
 /// replay of the audit record, which stays on the ledger.
+///
+/// Every string this function quotes, and where it actually comes from —
+/// [`bounded_prose`] is only worth reading if you know which fields are
+/// upstream of it:
+///
+/// - `driver` — Bedrock's own `computeDriver.kind`. Server-derived, and
+///   filtered anyway: this lane never trusts a payload string, however it got
+///   here.
+/// - `branch` — the repo binding a room owner set over `/v1`. MEMBER.
+/// - `script` — `request.script`, the build caller's word verbatim. MEMBER.
+/// - `exec_id` — the caller's, though Bedrock validates it to an id shape
+///   before the event is written, and the sentinel `all` is dropped here.
+/// - a check's `name` and `conclusion` — `gh run list --json` stdout read
+///   INSIDE the room's container, capped at 256 by Bedrock and otherwise
+///   unfiltered. CONTAINER: the least trusted string on the line, and the one
+///   the bracket rule exists for.
+/// - `event_type` in the fallback arm — off the wire. Unreachable behind
+///   `workspace_action_is_marker`, filtered regardless, because a total
+///   function that quotes an unfiltered string is one allowlist edit away
+///   from being wrong.
+///
+/// Two upstream strings are NOT quoted through the prose filter and do not
+/// need to be: `head_sha` must survive [`short_sha`]'s hex test, and a
+/// check's `url` must survive [`ci_run_url`]'s. Both refuse rather than
+/// repair, so neither can carry a metacharacter through.
 fn compose_workspace_marker(event_type: &str, p: &WorkspaceEventPayload) -> String {
     let quoted = |value: &Option<String>| {
         value
             .as_deref()
-            .map(|v| bounded_quotable(v, 64))
+            .map(|v| bounded_prose(v, 64))
             .filter(|v| !v.is_empty())
     };
     match event_type {
@@ -3679,8 +3782,8 @@ fn compose_workspace_marker(event_type: &str, p: &WorkspaceEventPayload) -> Stri
                 .iter()
                 .flatten()
                 .filter_map(|check| {
-                    let name = bounded_quotable(check.name.as_deref()?, 32);
-                    let conclusion = bounded_quotable(check.conclusion.as_deref()?, 16);
+                    let name = bounded_prose(check.name.as_deref()?, 32);
+                    let conclusion = bounded_prose(check.conclusion.as_deref()?, 16);
                     (!name.is_empty() && !conclusion.is_empty())
                         .then(|| format!("{name}: {conclusion}"))
                 })
@@ -3719,7 +3822,7 @@ fn compose_workspace_marker(event_type: &str, p: &WorkspaceEventPayload) -> Stri
                     if let Some(name) = red
                         .name
                         .as_deref()
-                        .map(|name| bounded_quotable(name, 32))
+                        .map(|name| bounded_prose(name, 32))
                         .filter(|name| !name.is_empty())
                     {
                         line.push_str(&format!(" '{name}'"));
@@ -3753,7 +3856,7 @@ fn compose_workspace_marker(event_type: &str, p: &WorkspaceEventPayload) -> Stri
         }
         // Unreachable behind `workspace_action_is_marker`, but a total
         // function keeps the allowlist the single behavioral gate.
-        other => format!("workspace event {}", bounded_quotable(other, 64)),
+        other => format!("workspace event {}", bounded_prose(other, 64)),
     }
 }
 
@@ -8209,8 +8312,10 @@ mod tests {
 
     #[test]
     fn workspace_marker_prose_is_bounded_and_newline_free() {
-        // A script name carrying a newline could forge a whole transcript row
-        // in a naive renderer; control characters are dropped, not escaped.
+        // A script name carrying a newline could forge a whole transcript row;
+        // control characters are dropped, not escaped. The brackets go too —
+        // this assertion used to keep them, from back when the doc claimed the
+        // renderer was naive. See `a_quoted_field_cannot_forge_a_link`.
         let p = WorkspaceEventPayload {
             script: Some("ci\nfake-row: [system] room destroyed".into()),
             exit_code: Some(1),
@@ -8220,7 +8325,7 @@ mod tests {
         let line = compose_workspace_marker("room.workspace.build_failed", &p);
         assert_eq!(
             line,
-            "workspace build 'cifake-row: [system] room destroyed' failed (exit 1, 12.3s)"
+            "workspace build 'cifake-row: system room destroyed' failed (exit 1, 12.3s)"
         );
 
         let p = WorkspaceEventPayload {
@@ -8255,6 +8360,118 @@ mod tests {
             ),
             "workspace provisioned",
             "missing fields degrade to shorter prose instead of failing the row"
+        );
+    }
+
+    /// The threat [`bounded_prose`] exists for. ocean-surface renders EVERY
+    /// transcript row through `room_markdown::body_view` — a system row
+    /// included, since `is_compact_system_row` only swaps the avatar — and
+    /// that tokenizer turns `[label](href)` into an anchor. So an upstream
+    /// string that fits under the cap can put a link of its own choosing into
+    /// a row the UI attributes to the room itself.
+    #[test]
+    fn a_quoted_field_cannot_forge_a_link() {
+        let forgery = "[click here](https://evil.co)";
+        // 29 characters: it fits under every cap on this line, which is why
+        // the bound was never the defence here.
+        assert!(forgery.chars().count() < 32);
+
+        // One marker per member-controlled prose field.
+        for (event, payload) in [
+            (
+                "room.workspace.repo_cloned",
+                WorkspaceEventPayload {
+                    branch: Some(forgery.into()),
+                    ..Default::default()
+                },
+            ),
+            (
+                "room.workspace.build_failed",
+                WorkspaceEventPayload {
+                    script: Some(forgery.into()),
+                    ..Default::default()
+                },
+            ),
+            (
+                "room.workspace.provisioned",
+                WorkspaceEventPayload {
+                    driver: Some(forgery.into()),
+                    ..Default::default()
+                },
+            ),
+            (
+                "room.workspace.execs_purged",
+                WorkspaceEventPayload {
+                    exec_id: Some(forgery.into()),
+                    ..Default::default()
+                },
+            ),
+        ] {
+            let line = compose_workspace_marker(event, &payload);
+            assert!(
+                !line.contains('[') && !line.contains(']'),
+                "{event} kept link syntax: {line}"
+            );
+            assert!(
+                line.contains("click here"),
+                "the field is neutralized, not dropped: {line}"
+            );
+        }
+
+        // The container's own strings, in both places a check name reaches
+        // prose — the named list and the first-failure tail. The equality is
+        // spelled out rather than probed because it also records the ruling:
+        // the parens stay (inert without a bracket, and GitHub names matrix
+        // jobs with them), so what is left is a BARE URL, which autolinks with
+        // its own href as its label and therefore cannot lie about where it
+        // goes.
+        let payload: WorkspaceEventPayload = serde_json::from_value(json!({
+            "branch": "main",
+            "checks_new": 1,
+            "checks": [{
+                "name": forgery,
+                "conclusion": "failure",
+                "head_sha": "a".repeat(40)
+            }]
+        }))
+        .unwrap();
+        assert_eq!(
+            compose_workspace_marker("room.workspace.ci_checked", &payload),
+            "workspace CI on 'main': 1 new result \
+             — click here(https://evil.co): failure \
+             — first failure 'click here(https://evil.co)' @ aaaaaaaaaaaa"
+        );
+
+        // A conclusion is upstream too, and its 16-char cap does not save it:
+        // the brackets are the first characters in.
+        let payload: WorkspaceEventPayload = serde_json::from_value(json!({
+            "branch": "main",
+            "checks_new": 1,
+            "checks": [{"name": "lint", "conclusion": "[x](http://evil.co)"}]
+        }))
+        .unwrap();
+        let line = compose_workspace_marker("room.workspace.ci_checked", &payload);
+        assert!(!line.contains('[') && !line.contains(']'), "got: {line}");
+
+        // A field that is nothing BUT link syntax neutralizes to empty and is
+        // dropped, which the existing non-empty filter already handles.
+        assert_eq!(
+            compose_workspace_marker(
+                "room.workspace.repo_cloned",
+                &WorkspaceEventPayload {
+                    branch: Some("[]".into()),
+                    ..Default::default()
+                }
+            ),
+            "workspace repo cloned"
+        );
+
+        // The total-function arm quotes a wire string too. Unreachable behind
+        // `workspace_action_is_marker` today, one allowlist edit from not
+        // being.
+        assert_eq!(
+            compose_workspace_marker(forgery, &WorkspaceEventPayload::default()),
+            "workspace event click here(https://evil.co)"
         );
     }
 
@@ -8696,6 +8913,93 @@ mod tests {
                 "{conclusion}: the marker's route and the convening trigger disagree"
             );
         }
+    }
+
+    /// [`ci_run_url`] compares its input back against [`bounded_quotable`],
+    /// so folding the prose rule into that primitive would silently narrow
+    /// which run URLs ever reach a line — a rendering decision quietly
+    /// becoming a security decision. The two are layered instead, and this is
+    /// the test that says the URL gate did not move.
+    #[test]
+    fn the_prose_rule_did_not_narrow_the_run_url_gate() {
+        // Every URL shape the gate accepted before the prose rule existed. The
+        // parens matter most: `bounded_prose` deliberately keeps them, and a
+        // filter that dropped them would have taken this whole family with it.
+        for url in [
+            "https://github.com/acme/site/actions/runs/1/job/2?check_suite_focus=true#step:3",
+            "https://example.test/runs/1?matrix=build(ubuntu-latest)&x=1",
+            "https://example.test/runs/1#a*b`c",
+            "https://example.test/~ci/runs/1",
+            "http://example.test:8080/runs/1",
+            "https://example.test/runs/1?q=a@b",
+        ] {
+            assert_eq!(
+                ci_run_url(url).as_deref(),
+                Some(url),
+                "the URL gate narrowed on {url:?}"
+            );
+            // Not a vacuous pass: the prose filter leaves these alone, which is
+            // exactly why layering them was safe.
+            assert_eq!(bounded_prose(url, CI_RUN_URL_MAX_CHARS), url);
+        }
+
+        // End to end: an accepted URL still closes the line #416 built it for.
+        let payload: WorkspaceEventPayload = serde_json::from_value(json!({
+            "branch": "main",
+            "checks_new": 1,
+            "checks": [{
+                "name": "test",
+                "conclusion": "failure",
+                "url": "https://example.test/runs/1?matrix=build(ubuntu-latest)&x=1"
+            }]
+        }))
+        .unwrap();
+        assert!(
+            compose_workspace_marker("room.workspace.ci_checked", &payload).ends_with(
+                " — first failure 'test': https://example.test/runs/1?matrix=build(ubuntu-latest)&x=1"
+            ),
+            "a paren-carrying run URL stopped reaching the line"
+        );
+    }
+
+    /// The one shape the URL gate DOES now refuse, and why it is not the prose
+    /// rule leaking in. A URL the surface autolinks is safe — the tokenizer
+    /// swallows it whole and draws the href as its own label. But `ci_run_url`
+    /// is looser about the authority than `room_markdown::scheme_allowed` is,
+    /// and a URL the surface refuses to autolink falls back to plain text,
+    /// where its brackets meet the `[label](href)` arm.
+    #[test]
+    fn a_run_url_carrying_bracket_syntax_is_refused() {
+        // Host with an underscore: accepted here before this rule, refused an
+        // autolink by the surface, and then read as a link with a label that
+        // names neither its destination nor the check.
+        for hostile in [
+            "https://ex_ample.test/[a](https://evil.co)",
+            "https://example.test:80x/[a](https://evil.co)",
+            "https://example.test/runs/[1]",
+        ] {
+            assert_eq!(ci_run_url(hostile), None, "{hostile:?} survived the gate");
+        }
+
+        // And it costs the link, never the marker — the same shape every other
+        // refusal in this gate takes.
+        let payload: WorkspaceEventPayload = serde_json::from_value(json!({
+            "branch": "main",
+            "checks_new": 1,
+            "checks": [{
+                "name": "test",
+                "conclusion": "failure",
+                "head_sha": "d".repeat(40),
+                "url": "https://ex_ample.test/[a](https://evil.co)"
+            }]
+        }))
+        .unwrap();
+        let line = compose_workspace_marker("room.workspace.ci_checked", &payload);
+        assert!(
+            line.ends_with(" — first failure 'test' @ dddddddddddd"),
+            "got: {line}"
+        );
+        assert!(!line.contains('[') && !line.contains(']'), "got: {line}");
     }
 
     #[test]

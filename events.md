@@ -7735,3 +7735,68 @@ toolchain 1.97.0. Also recorded the lock discipline and its acquisition order in
 on `fake_convene_state` was the only statement of the rule and comments do not
 enforce. No deploy, no migration.
 _________________________________________________________________________________
+
+time:      [09:00] [08-31-26]
+agent:     [claude] [opus 5]
+worktree:  loop/os-bounded-quotable-drops-control-characters-and-lets-link-syntax-through
+type:      [bug-report]
+area:      [backend]
+
+`bounded_quotable` in room_federation.rs stated its own threat as an upstream
+string forging a row "in a NAIVE renderer". That premise was false. ocean-surface
+sends every transcript row through `room_markdown::body_view` regardless of kind
+-- `is_compact_system_row` only swaps the avatar for a Spark icon -- and that
+tokenizer parses `[label](href)`. Markdown metacharacters are not control
+characters, so a CI check named `[click here](https://evil.co)` is 29 chars, fits
+under the 32-char cap, and lands as an anchor with an attacker-chosen label AND
+destination inside a row the UI attributes to the room system, composed from
+`gh run list` stdout read inside the room's own container. `scheme_allowed` holds
+it to http/https, so the reachable end is phishing, not script execution.
+
+Fixed by layering rather than widening: `bounded_quotable` stays the primitive
+(bound + control characters) because `ci_run_url` compares back against it with
+an equality test, and a new `bounded_prose` drops `[` and `]` on top. Every
+quoted prose call site moved to it -- the `quoted` closure (driver, branch,
+script, exec_id), both check-name sites, the conclusion, and the total-function
+fallback arm.
+
+The ruling, written into the doc: an upstream string may not carry a character
+that manufactures a DESTINATION the marker did not author, and that is bracket
+syntax alone. Parens stay -- inert without a preceding `[...]`, and GitHub names
+matrix jobs `build (ubuntu-latest, 1.97.0)`, so dropping them would mangle the
+commonest real check name to close a door already locked. `*` and backticks are
+decoration. `@` highlights only against the room's live roster and drives nothing
+else. A BARE `https://...` still autolinks and that is ACCEPTED: an autolink's
+label IS its href so it cannot lie about where it goes, and #416's run URL is
+emitted bare and reaches the reader through exactly that path -- which is the
+fact that makes neutralising bracket syntax free. Prose neutralises where
+`ci_run_url` refuses, deliberately: a repaired URL is a different URL, but a
+repaired name still identifies and the cap already truncates it.
+
+FOUND BEYOND THE BRIEF, and I changed `ci_run_url` because of it. That gate is
+deliberately looser about the authority than the surface's `scheme_allowed` is
+(its doc says the full host parse is the client's job). So a URL can pass here
+and be REFUSED an autolink there -- and refused text falls straight back to the
+tokenizer's `[label](href)` arm. `https://ex_ample.test/[a](https://evil.co)`
+cleared every check in `ci_run_url` and rendered as an anchor labelled "a"
+pointing at evil.co. `ci_run_url` now refuses brackets in its own words, one
+clause beside the existing whitespace/backslash forging-vector refusal. That is
+a real narrowing of what it accepts, against the brief's "must be unchanged" --
+but the brief's own DONE WHEN says a payload field carrying `[label](href)`
+cannot produce an anchor, and `url` is a payload field. No real run URL carries
+a bracket; parens and every other URL character are untouched, and a test proves
+the paren family still passes.
+
+Tests: `a_quoted_field_cannot_forge_a_link` (every prose field plus both
+check-name sites, the empty-after-neutralisation case, and the fallback arm),
+`the_prose_rule_did_not_narrow_the_run_url_gate` (six URL shapes accepted
+unchanged, each also proven unchanged by `bounded_prose`, plus the end-to-end
+marker line), and `a_run_url_carrying_bracket_syntax_is_refused`.
+`workspace_marker_prose_is_bounded_and_newline_free` had been asserting the hole
+-- its expected line literally kept `[system]` -- and now asserts the fix.
+
+Gate green: 828 passed / 0 failed, clippy -D warnings exit 0, fmt --check exit 0,
+toolchain 1.97.0. No deploy, no migration. Left for someone else: the surface's
+autolink trims a trailing `)` off a bare URL, so a run URL legitimately ending in
+one links to a truncated href -- cosmetic, ocean-surface's file, out of scope.
+_________________________________________________________________________________
