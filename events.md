@@ -7623,3 +7623,36 @@ and the line cannot drift. `on_ci_failure`'s dispatch reason string is
 untouched. Gate green: 825 passed, clippy -D warnings clean, fmt clean. No
 deploy, no migration.
 _________________________________________________________________________________
+
+time:      05:27 08-31-26
+agent:     claude opus 5
+worktree:  loop/os-ci-marker-run-url
+type:      review
+area:      backend
+
+Refinement against the review of the CI marker's run route. Both findings were
+about coverage, not behavior, and both held up. The http/https allowlist in
+`ci_run_url` was untested: every payload in the hostile array is refused by an
+earlier guard, and the four scheme-shaped ones (`javascript:alert(1)` and
+friends) carry no `://` at all, so `split_once` short-circuits before the
+scheme is ever compared. Deleting both `eq_ignore_ascii_case` calls outright
+left all 85 `room_federation::tests` green -- a future edit letting `ftp://`,
+`file://` or `vscode://` into a line agents act on would have landed clean.
+`ftp://example.test/runs/1` and `javascript://example.test/x` are the only
+shape that reaches the gate, and now the array carries them; with the gate
+removed the test fails on the first of them. The doc comment stopped citing
+ocean-surface's `a_check_href_is_gated_to_http_schemes` as this gate's proof,
+because that test has the identical hole and a test in another repo was never
+coverage here.
+
+The comment justifying the re-named tail claimed the tail "belongs to ONE of
+the up to three checks above". It does not: the named list is `.take(3)`, the
+red search runs the whole array, and Bedrock's `CI_RUN_LIMIT` is 20, so three
+greens followed by a red build is an ordinary payload that names a fourth
+check. The re-naming is more right than the comment claimed, not less -- that
+is the case where an agent most needs the name -- so the sentence was corrected
+and a four-check case pins it: narrowing the red search to the named window
+drops the tail, and widening the named list to four trips the new assertion.
+Gate green on the whole tree: 825 passed, clippy -D warnings exit 0, fmt clean.
+No deploy, no migration.
+_________________________________________________________________________________
