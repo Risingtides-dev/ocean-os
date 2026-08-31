@@ -2226,6 +2226,8 @@ impl AgentRuntime {
             agent_model: _,
             tool_allowlist,
             agent_capabilities,
+            authorized_capabilities,
+            operator_memory_disabled,
             tools_disabled,
             hashline_edits,
             artifact_spill,
@@ -2289,17 +2291,32 @@ impl AgentRuntime {
             }
         }
 
-        let mut cfg = AgentConfig::new(
-            snapshot.model.clone(),
-            system_prompt::build_system_prompt(Some(&req.cwd), req.client_type.as_deref()),
-        )
-        .with_tools(tools)
-        .with_max_turns(req.max_turns.unwrap_or(32))
-        .with_turn_timeout_secs(turn_timeout_secs_from_env())
-        .with_permission(permission)
-        // Stamp the session onto every runtime AgentEvent so the daemon SSE
-        // bridge can route by session natively (OCEAN-54).
-        .with_session_id(session_id.to_string());
+        // Room authority is evaluated after every provider is assembled. This
+        // ordering is load-bearing: applying the snapshot before dynamic or
+        // subprocess providers would let a later provider widen the turn.
+        if let Some(capabilities) = authorized_capabilities.as_deref() {
+            tools.retain(|tool| capability_authorizes_tool(capabilities, tool.name()));
+        }
+        if operator_memory_disabled {
+            tools.retain(|tool| !matches!(tool.name(), "retain" | "recall"));
+        }
+
+        let system_prompt = if operator_memory_disabled {
+            system_prompt::build_system_prompt_without_memory(
+                Some(&req.cwd),
+                req.client_type.as_deref(),
+            )
+        } else {
+            system_prompt::build_system_prompt(Some(&req.cwd), req.client_type.as_deref())
+        };
+        let mut cfg = AgentConfig::new(snapshot.model.clone(), system_prompt)
+            .with_tools(tools)
+            .with_max_turns(req.max_turns.unwrap_or(32))
+            .with_turn_timeout_secs(turn_timeout_secs_from_env())
+            .with_permission(permission)
+            // Stamp the session onto every runtime AgentEvent so the daemon SSE
+            // bridge can route by session natively (OCEAN-54).
+            .with_session_id(session_id.to_string());
         // Per-turn reasoning override (OCEAN-41): when the turn carries an
         // explicit `thinking_level`, apply it to *this* turn's config only. The
         // runtime's global `thinking_level` is untouched, so the next turn falls
@@ -2694,6 +2711,15 @@ pub struct PromptControl {
     /// unchanged. Fail-soft: a spec that can't spawn is warned and skipped, never
     /// breaking the turn.
     pub agent_capabilities: Option<(PathBuf, Vec<agentdir::SubprocessCapability>)>,
+    /// Immutable authorization snapshot computed by the daemon at admission.
+    /// `None` preserves ordinary-turn behavior; `Some`, including an empty
+    /// vector, is a security boundary applied after every built-in/dynamic
+    /// provider has been assembled so no later provider can widen the turn.
+    pub authorized_capabilities: Option<Vec<String>>,
+    /// Suppress operator-global memory tools and prompt injection for a
+    /// room-scoped turn. Room memory requires its own partitioned provider;
+    /// this flag never redirects operator memory by caller convention.
+    pub operator_memory_disabled: bool,
     /// Fail-closed per-turn control that suppresses every tool source, including
     /// dynamically registered and folder-agent subprocess capabilities.
     pub tools_disabled: bool,
@@ -2758,6 +2784,26 @@ fn narrow_tools(tools: Vec<SharedTool>, allowlist: Option<&[String]>) -> Vec<Sha
     }
 }
 
+/// Whether one immutable admission capability permits a concrete runtime tool.
+///
+/// Plain entries and `builtin:` name exact tools. Provider entries authorize
+/// only that provider's namespaced tools; prefix matching is delimiter-bound so
+/// `subprocess:git` cannot authorize `plugin__github__*`.
+fn capability_authorizes_tool(capabilities: &[String], tool_name: &str) -> bool {
+    capabilities.iter().any(|capability| {
+        capability == tool_name
+            || capability
+                .strip_prefix("builtin:")
+                .is_some_and(|name| name == tool_name)
+            || capability
+                .strip_prefix("subprocess:")
+                .is_some_and(|name| tool_name.starts_with(&format!("plugin__{name}__")))
+            || capability
+                .strip_prefix("mcp:")
+                .is_some_and(|name| tool_name.starts_with(&format!("mcp__{name}__")))
+    })
+}
+
 impl PromptControl {
     pub fn new(permission: Arc<dyn PermissionPolicy>) -> Self {
         Self {
@@ -2769,6 +2815,8 @@ impl PromptControl {
             tool_allowlist: None,
             agent_model: None,
             agent_capabilities: None,
+            authorized_capabilities: None,
+            operator_memory_disabled: false,
             tools_disabled: false,
             hashline_edits: false,
             artifact_spill: false,
@@ -2824,6 +2872,18 @@ impl PromptControl {
         caps: Vec<agentdir::SubprocessCapability>,
     ) -> Self {
         self.agent_capabilities = (!caps.is_empty()).then_some((agent_root, caps));
+        self
+    }
+
+    /// Apply a fail-closed capability snapshot after all providers are built.
+    pub fn with_authorized_capabilities(mut self, capabilities: Vec<String>) -> Self {
+        self.authorized_capabilities = Some(capabilities);
+        self
+    }
+
+    /// Remove operator-global memory from this turn's tools and system prompt.
+    pub fn without_operator_memory(mut self) -> Self {
+        self.operator_memory_disabled = true;
         self
     }
 
@@ -3932,6 +3992,30 @@ mod tests {
             3,
             "no match must fail safe to the full toolset"
         );
+    }
+
+    #[test]
+    fn immutable_authority_snapshot_is_fail_closed_and_provider_bound() {
+        assert!(!capability_authorizes_tool(&[], "read"));
+        assert!(capability_authorizes_tool(&["builtin:read".into()], "read"));
+        assert!(capability_authorizes_tool(
+            &["subprocess:git".into()],
+            "plugin__git__status"
+        ));
+        assert!(!capability_authorizes_tool(
+            &["subprocess:git".into()],
+            "plugin__github__status"
+        ));
+        assert!(!capability_authorizes_tool(
+            &["mcp:docs".into()],
+            "mcp__docs_admin__read"
+        ));
+
+        let control = PromptControl::yolo(false)
+            .with_authorized_capabilities(Vec::new())
+            .without_operator_memory();
+        assert_eq!(control.authorized_capabilities, Some(Vec::new()));
+        assert!(control.operator_memory_disabled);
     }
 
     fn temp_config_dir(name: &str) -> PathBuf {

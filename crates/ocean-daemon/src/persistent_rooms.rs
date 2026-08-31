@@ -14,14 +14,14 @@ use axum::{
 use chrono::Utc;
 use ocean_agent_sdk::{AgentSessionId, AgentTurnEvent};
 use ocean_core::{
-    evaluate_trigger_policy, PermissionMode, PromptRequest, PublicAgentDescriptor, RequestState,
+    evaluate_trigger_policy, PermissionMode, PromptRequest, PublicAgentDescriptor,
     RoomAccessProjection, RoomAccessState, RoomArtifactKind, RoomArtifactState, RoomKey,
     RoomMessage, RoomMessageKind, RoomParticipant, RoomParticipantKind, RoomReadCursorProjection,
     RoomReadCursorUpdateRequest, RoomTriggerEvent, RoomTriggerPolicy,
 };
 #[cfg(test)]
 use ocean_core::{OutboxItemState, RoomOutboxItem};
-use ocean_store::{RoomStore, ThreadAppendError};
+use ocean_store::{ContextPolicy, RoomStore, ThreadAppendError};
 use serde::Deserialize;
 use serde_json::json;
 use sha2::{Digest, Sha256};
@@ -34,8 +34,11 @@ use super::{
     build_prompt_control, core_sid, emit_session_changed, record_prompt_result, sdk_sid,
     sse_until_shutdown, AppState, SSE_KEEPALIVE_INTERVAL,
 };
-use crate::request_control::register_running_request;
-use crate::room_federation::{AgentRegistrationInput, FederatedTriggerDispatch, IntentError};
+use crate::request_control::{register_room_agent_request_checked, RoomAgentRequestAuthority};
+use crate::room_agent_authority::{self, AdmissionTrigger, RoomAgentAdmission};
+use crate::room_federation::{
+    AgentRegistrationInput, FederatedTriggerDispatch, FederatedTriggerKind, IntentError,
+};
 use crate::room_summary;
 use crate::yolo_settings::effective_permission_mode;
 
@@ -238,6 +241,7 @@ fn append_room_message(
 ///    [`ThreadAppendError::InvalidThreadParent`] therefore does not fail the
 ///    reply: it is re-appended top-level (the pre-thread behaviour) and the
 ///    stale parent is logged. Only a real store error propagates.
+#[cfg(test)]
 pub(super) fn append_room_agent_reply(
     state: &AppState,
     room: &RoomKey,
@@ -293,6 +297,55 @@ pub(super) fn append_room_agent_reply(
     );
     publish_room_wake(state, room, &message);
     Ok(message)
+}
+
+fn append_authorized_room_agent_reply(
+    state: &AppState,
+    admission: &RoomAgentAdmission,
+    body: &str,
+    thread_parent_seq: Option<u64>,
+    session_id: AgentSessionId,
+) -> Result<RoomMessage, ocean_store::RoomStoreError> {
+    let session = session_id.to_string();
+    let append = with_rooms(state, |store| {
+        store.append_authorized_agent_reply(
+            &admission.room,
+            &admission.agent_member_id,
+            admission.generation,
+            &admission.admission_id,
+            body,
+            Utc::now(),
+            thread_parent_seq,
+            &session,
+        )
+    });
+    let (reply, audit) = match append {
+        Ok(messages) => messages,
+        Err(ThreadAppendError::InvalidThreadParent {
+            parent_seq, reason, ..
+        }) => {
+            tracing::warn!(room = %admission.room, agent = %admission.agent_member_id,
+                parent_seq, %reason,
+                "stale thread parent for authorized agent reply; posting top-level");
+            with_rooms(state, |store| {
+                store.append_authorized_agent_reply(
+                    &admission.room,
+                    &admission.agent_member_id,
+                    admission.generation,
+                    &admission.admission_id,
+                    body,
+                    Utc::now(),
+                    None,
+                    &session,
+                )
+            })
+            .map_err(ocean_store::RoomStoreError::from)?
+        }
+        Err(ThreadAppendError::Store(error)) => return Err(error),
+    };
+    publish_room_wake(state, &admission.room, &reply);
+    publish_room_wake(state, &admission.room, &audit);
+    Ok(reply)
 }
 
 // ---- Persistent Rooms (OCEAN-65) -------------------------------------------
@@ -1800,61 +1853,48 @@ pub(super) async fn room_post_message(
                 continue;
             }
 
-            // Named-agent binding gate (TASK-9): a roster Agent participant must
-            // ALSO resolve to a real folder-as-agent definition before any
-            // convene footprint is written. A legacy phantom Agent (already in
-            // the roster from before this gate, or whose folder was since
-            // removed) must NOT claim a convene — emit NO `room_trigger` event
-            // and NO `auto-convene:` audit line, and queue NO turn. Instead post
-            // one honest System note via a direct `append_message`. System rows
-            // skip trigger evaluation, and this is a direct store write (not a
-            // recursive `room_post_message`), so it convenes nobody. `room_join`
-            // blocks NEW unresolved agents; this gate catches the legacy ones.
-            if resolve_named_agent(&agent.id).is_err() {
-                let _ = append_room_message(
-                    &state,
-                    &key,
-                    "system",
-                    RoomParticipantKind::System,
-                    RoomMessageKind::System,
-                    &format!("agent '{}' is not bound; no turn queued", agent.id),
-                );
-                continue;
-            }
-
-            // Emit a notice onto the agent event bus so any subscriber sees the
-            // convene. Uses the generic Extension event so it respects the
-            // existing agent-event scoping rules.
-            state.agent_events.emit(AgentTurnEvent::Extension {
-                extension: "room_trigger".into(),
-                payload: json!({
-                    "room": key.as_str(),
-                    "target": decision.target_participant,
-                    "reason": decision.reason,
-                    "triggered_by_seq": msg.seq,
-                }),
-                // Room-wide, not session-scoped: reaches `?all=1` subscribers
-                // only, exactly like longhouse council events (Invariant 5
-                // exception). Keeps this out of any single session's stream.
-                scope: None,
-            });
-
-            // Audit line inside the room — only written now that an Agent has
-            // actually been resolved and is about to be convened.
-            let _ = append_room_message(
+            // Phase 1 authority is the first observable convene boundary. A
+            // refusal writes only its content-minimal admission decision; it
+            // never emits the legacy room_trigger/auto-convene footprint and
+            // never reads transcript or attachment context.
+            let admission = match room_agent_authority::admit_room_agent(
                 &state,
                 &key,
-                "system",
-                RoomParticipantKind::System,
-                RoomMessageKind::System,
-                &format!(
-                    "auto-convene: {} ({})",
-                    decision.target_participant.clone().unwrap_or_default(),
-                    decision.reason
-                ),
-            );
+                &agent.id,
+                &agent.id,
+                AdmissionTrigger::from_room_event(&event),
+            )
+            .await
+            {
+                Ok(admission) => admission,
+                Err(error) => {
+                    tracing::info!(room = %key, agent = %agent.id, reason = error.code(),
+                        "room-agent admission refused before convene footprint");
+                    continue;
+                }
+            };
 
-            spawn_room_agent_turn(state.clone(), key.clone(), agent, msg.seq, None);
+            let target = decision.target_participant.clone().unwrap_or_default();
+            let reason = decision.reason.clone();
+            let _ = spawn_room_agent_turn(
+                state.clone(),
+                admission,
+                agent,
+                msg.seq,
+                None,
+                Uuid::new_v4(),
+                None,
+                Some(RoomTurnFootprint {
+                    payload: json!({
+                        "room": key.as_str(),
+                        "target": target,
+                        "reason": reason,
+                        "triggered_by_seq": msg.seq,
+                    }),
+                    audit_line: Some(format!("auto-convene: {} ({})", target, reason)),
+                }),
+            )
+            .await;
         }
     }
 
@@ -1883,6 +1923,206 @@ pub(super) struct RedeemInviteBody {
 #[serde(deny_unknown_fields)]
 pub(super) struct RegisterAgentsBody {
     agent_names: Vec<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct InvokeRoomAgentBody {
+    invoked_by: String,
+    message_seq: u64,
+    #[serde(default)]
+    decision_token: Option<String>,
+}
+
+/// Explicit same-room invocation seam. The caller can point only at an already
+/// durable message it authored as a non-agent/non-system roster member; labels
+/// and client event ids never create authority.
+pub(super) async fn room_agent_invoke(
+    State(state): State<AppState>,
+    Path((key, agent_member_id)): Path<(String, String)>,
+    body: Result<Json<InvokeRoomAgentBody>, JsonRejection>,
+) -> (StatusCode, Json<serde_json::Value>) {
+    let Json(body) = match body {
+        Ok(body) => body,
+        Err(_) => return invalid_request_response(),
+    };
+    let room = RoomKey::new(key.trim());
+    let invoked_by = body.invoked_by.trim();
+    let agent_member_id = agent_member_id.trim();
+    if room.as_str().is_empty()
+        || invoked_by.is_empty()
+        || agent_member_id.is_empty()
+        || body
+            .decision_token
+            .as_deref()
+            .is_some_and(|token| token.trim().is_empty())
+    {
+        return invalid_request_response();
+    }
+    let resolved = with_rooms(&state, |store| {
+        let record = store
+            .get(&room)?
+            .ok_or_else(|| ocean_store::RoomStoreError::UnknownRoom(room.clone()))?;
+        let binding = store
+            .room_agent_binding(&room, agent_member_id)?
+            .ok_or_else(|| ocean_store::RoomStoreError::UnknownAgentBinding {
+                room: room.clone(),
+                agent: agent_member_id.to_string(),
+            })?;
+        let access = store.room_access(&room)?;
+        let local = access.state == RoomAccessState::Local;
+        let invoker_is_member = if local {
+            record.room.participants.iter().any(|participant| {
+                participant.id == invoked_by
+                    && !matches!(
+                        participant.kind,
+                        RoomParticipantKind::Agent | RoomParticipantKind::System
+                    )
+            })
+        } else {
+            access.members.iter().any(|member| {
+                member.member_id == invoked_by
+                    && member.actor_type == ocean_core::FederatedActorType::User
+            })
+        };
+        let target = if local {
+            record
+                .room
+                .participants
+                .iter()
+                .find(|participant| {
+                    participant.id == agent_member_id
+                        && participant.kind == RoomParticipantKind::Agent
+                })
+                .cloned()
+        } else {
+            access
+                .members
+                .iter()
+                .any(|member| {
+                    member.member_id == agent_member_id
+                        && member.actor_type == ocean_core::FederatedActorType::Agent
+                })
+                .then(|| RoomParticipant {
+                    id: binding.agent_package_id.clone(),
+                    kind: RoomParticipantKind::Agent,
+                    display_name: binding.display_name.clone(),
+                })
+        };
+        if !invoker_is_member || target.is_none() {
+            return Err(ocean_store::RoomStoreError::Encode(
+                "invoke_membership_required".into(),
+            ));
+        }
+        Ok((
+            binding.agent_package_id,
+            target.expect("checked above"),
+            !local,
+        ))
+    });
+    let (package_id, agent, federated) = match resolved {
+        Ok(value) => value,
+        Err(ocean_store::RoomStoreError::UnknownRoom(_)) => {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(json!({"ok": false, "error": "room_not_found"})),
+            );
+        }
+        Err(ocean_store::RoomStoreError::UnknownAgentBinding { .. }) => {
+            return (
+                StatusCode::CONFLICT,
+                Json(json!({"ok": false, "error": "agent_binding_required"})),
+            );
+        }
+        Err(error) => {
+            let code = match error.to_string().as_str() {
+                value if value.contains("invoke_message_not_found") => "invoke_message_not_found",
+                value if value.contains("invoke_author_mismatch") => "invoke_author_mismatch",
+                _ => "invoke_membership_required",
+            };
+            return (
+                StatusCode::FORBIDDEN,
+                Json(json!({"ok": false, "error": code})),
+            );
+        }
+    };
+    let admission = match room_agent_authority::admit_room_agent(
+        &state,
+        &room,
+        agent_member_id,
+        &package_id,
+        AdmissionTrigger::Explicit,
+    )
+    .await
+    {
+        Ok(admission) => admission,
+        Err(error) => {
+            return (
+                StatusCode::CONFLICT,
+                Json(json!({"ok": false, "error": error.code()})),
+            );
+        }
+    };
+    // The binding gate precedes the one authoritative transcript lookup. A
+    // client cannot use invoke as a transcript oracle for a room agent that is
+    // not currently admissible, and the later checked registration still
+    // revalidates the exact authority generation before any runtime context.
+    let invocation_message = with_rooms(&state, |store| {
+        room_message_at_seq(store, &room, body.message_seq)
+            .ok_or_else(|| ocean_store::RoomStoreError::Encode("invoke_message_not_found".into()))
+    });
+    let invocation_message = match invocation_message {
+        Ok(message)
+            if message.author_id == invoked_by
+                && !matches!(
+                    message.author_kind,
+                    RoomParticipantKind::Agent | RoomParticipantKind::System
+                ) =>
+        {
+            message
+        }
+        Ok(_) => {
+            return (
+                StatusCode::FORBIDDEN,
+                Json(json!({"ok": false, "error": "invoke_author_mismatch"})),
+            );
+        }
+        Err(_) => {
+            return (
+                StatusCode::FORBIDDEN,
+                Json(json!({"ok": false, "error": "invoke_message_not_found"})),
+            );
+        }
+    };
+    let request_id = Uuid::new_v4();
+    let queued = spawn_room_agent_turn(
+        state,
+        admission,
+        agent,
+        invocation_message.seq,
+        federated.then(|| agent_member_id.to_string()),
+        request_id,
+        body.decision_token,
+        None,
+    )
+    .await;
+    match queued {
+        Some(queued) => (
+            StatusCode::ACCEPTED,
+            Json(json!({
+                "ok": true,
+                "status": "queued",
+                "admission_id": queued.admission_id,
+                "request_id": queued.request_id,
+                "generation": queued.generation.to_string(),
+                "session_id": queued.session_id,
+            })),
+        ),
+        None => (
+            StatusCode::CONFLICT,
+            Json(json!({"ok": false, "error": "authority_changed_before_registration"})),
+        ),
+    }
 }
 
 /// The room family's one shape for "your request was malformed". Shared with
@@ -2076,35 +2316,48 @@ pub(super) async fn run_federated_trigger_dispatcher(
             Ok(Some(name)) => name,
             _ => continue,
         };
-        if resolve_named_agent(&agent_name).is_err() {
-            continue;
-        }
         let agent = RoomParticipant {
             id: agent_name.clone(),
             kind: RoomParticipantKind::Agent,
             display_name: agent_name.clone(),
         };
-        state.agent_events.emit(AgentTurnEvent::Extension {
-            extension: "room_trigger".into(),
-            payload: json!({
-                "room": dispatch.room.as_str(),
-                "target": dispatch.target_member_id.clone(),
-                "agent_name": agent_name,
-                // The ingest site that evaluated the policy owns the wording —
-                // a build-failure convene must not be logged as a mention.
-                "reason": dispatch.reason,
-                "triggered_by_seq": dispatch.local_seq,
-                "ledger_event_id": dispatch.ledger_event_id,
-            }),
-            scope: None,
-        });
-        spawn_room_agent_turn(
+        let admission = match room_agent_authority::admit_room_agent(
+            &state,
+            &dispatch.room,
+            &dispatch.target_member_id,
+            &agent_name,
+            match dispatch.trigger_kind {
+                FederatedTriggerKind::Mention => AdmissionTrigger::Mention,
+                FederatedTriggerKind::ThreadReply => AdmissionTrigger::ThreadReply,
+                FederatedTriggerKind::Unknown => AdmissionTrigger::Unknown,
+            },
+        )
+        .await
+        {
+            Ok(admission) => admission,
+            Err(_) => continue,
+        };
+        let _ = spawn_room_agent_turn(
             state.clone(),
-            dispatch.room,
+            admission,
             agent,
             dispatch.local_seq,
-            Some(dispatch.target_member_id),
-        );
+            Some(dispatch.target_member_id.clone()),
+            Uuid::new_v4(),
+            None,
+            Some(RoomTurnFootprint {
+                payload: json!({
+                    "room": dispatch.room.as_str(),
+                    "target": dispatch.target_member_id,
+                    "agent_name": agent_name,
+                    "reason": dispatch.reason,
+                    "triggered_by_seq": dispatch.local_seq,
+                    "ledger_event_id": dispatch.ledger_event_id,
+                }),
+                audit_line: None,
+            }),
+        )
+        .await;
     }
 }
 
@@ -2148,7 +2401,14 @@ pub(super) fn parse_mentions(body: &str) -> Vec<String> {
 /// agent RESUMES its room transcript across mentions instead of forking a fresh
 /// session on every wake. The constant itself is arbitrary but must never
 /// change, or existing room-agent sessions would orphan.
+#[cfg(test)]
 const ROOM_AGENT_SESSION_NS: Uuid = Uuid::from_u128(0x0ce1_a111_0000_4780_8000_526f_6f6d_4147);
+
+/// Authorized room sessions use a separate domain and include binding
+/// generation. This prevents a Phase 1 turn from resuming a legacy room session
+/// that may contain operator memory or tools from broader prior authority.
+const AUTHORIZED_ROOM_AGENT_SESSION_NS: Uuid =
+    Uuid::from_u128(0x0ce1_a112_0000_4780_8000_526f_6f6d_4131);
 
 /// How many recent transcript lines to feed the woken agent as context. Enough
 /// to ground the reply in the conversation without bloating the prompt.
@@ -2171,9 +2431,75 @@ pub(super) fn resolve_agent_participant(
 /// Deterministic session id for a (room, agent-participant) pair. Stable across
 /// daemon restarts and repeated mentions so the agent keeps one durable
 /// transcript per room.
+#[cfg(test)]
 pub(super) fn room_agent_session_id(room: &RoomKey, participant_id: &str) -> AgentSessionId {
     let seed = format!("{}:{}", room.as_str(), participant_id);
     sdk_sid(Uuid::new_v5(&ROOM_AGENT_SESSION_NS, seed.as_bytes()))
+}
+
+pub(super) fn authorized_room_agent_session_id(
+    room: &RoomKey,
+    agent_member_id: &str,
+    generation: u64,
+) -> AgentSessionId {
+    let mut seed = Vec::with_capacity(room.as_str().len() + agent_member_id.len() + 24);
+    for value in [room.as_str().as_bytes(), agent_member_id.as_bytes()] {
+        seed.extend_from_slice(&(value.len() as u64).to_be_bytes());
+        seed.extend_from_slice(value);
+    }
+    seed.extend_from_slice(&generation.to_be_bytes());
+    sdk_sid(Uuid::new_v5(&AUTHORIZED_ROOM_AGENT_SESSION_NS, &seed))
+}
+
+fn room_message_at_seq(
+    store: &ocean_store::SqliteRoomStore,
+    room: &RoomKey,
+    seq: u64,
+) -> Option<RoomMessage> {
+    store
+        .transcript_page(room, Some(seq.saturating_sub(1)), Some(1))
+        .ok()?
+        .messages
+        .into_iter()
+        .find(|message| message.seq == seq)
+}
+
+/// Read exactly the transcript set authorized by the binding. Admission has
+/// already succeeded before this function is reachable.
+fn authorized_room_transcript_context(
+    state: &AppState,
+    admission: &RoomAgentAdmission,
+    triggered_by_seq: u64,
+) -> Vec<RoomMessage> {
+    with_rooms(state, |store| match admission.context_policy {
+        ContextPolicy::InvocationOnly => {
+            let Some(trigger) = room_message_at_seq(store, &admission.room, triggered_by_seq)
+            else {
+                return Vec::new();
+            };
+            let mut rows = trigger
+                .thread_parent_seq
+                .and_then(|seq| room_message_at_seq(store, &admission.room, seq))
+                .into_iter()
+                .collect::<Vec<_>>();
+            if rows.last().is_none_or(|row| row.seq != trigger.seq) {
+                rows.push(trigger);
+            }
+            rows
+        }
+        ContextPolicy::RoomRecent | ContextPolicy::RoomHistory => {
+            let latest = store
+                .room_latest_durable_seq(&admission.room)
+                .ok()
+                .flatten()
+                .unwrap_or(0);
+            let after = latest.saturating_sub(ROOM_CONTEXT_TAIL as u64);
+            store
+                .transcript_page(&admission.room, Some(after), Some(ROOM_CONTEXT_TAIL))
+                .map(|page| page.messages)
+                .unwrap_or_default()
+        }
+    })
 }
 
 /// Build the prompt handed to a woken agent: a framing header that tells it it's
@@ -2229,104 +2555,150 @@ were mentioned.\n\n",
     out
 }
 
-/// Queue an agent turn in response to a room mention, run it asynchronously, and
-/// post the reply back into the room. The room store mutex is NEVER held across
-/// the await: every store touch goes through `with_rooms`, whose std guard is
-/// dropped synchronously before `runtime.prompt(...).await`.
-///
-/// Anti-loop guardrail #2: the reply is posted with `author_kind = Agent`, and
-/// `room_post_message` refuses to evaluate triggers on agent-authored messages,
-/// so a reply can never re-convene anyone.
-fn spawn_room_agent_turn(
+#[derive(Debug, Clone)]
+struct RoomTurnFootprint {
+    payload: serde_json::Value,
+    audit_line: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+pub(super) struct QueuedRoomAgentTurn {
+    pub(super) request_id: Uuid,
+    pub(super) session_id: AgentSessionId,
+    pub(super) admission_id: String,
+    pub(super) generation: u64,
+}
+
+/// Register a generation-bound turn before any room context read, write its
+/// durable allow audit, then emit the legacy convene footprint and start the
+/// runtime. Refusals never reach the footprint or request registry.
+#[allow(clippy::too_many_arguments)]
+async fn spawn_room_agent_turn(
     state: AppState,
-    room: RoomKey,
+    admission: RoomAgentAdmission,
     agent: RoomParticipant,
     triggered_by_seq: u64,
     federated_member_id: Option<String>,
-) {
-    tokio::spawn(async move {
-        // Resolve a working directory for the turn. A `Room` may now carry its own
-        // `workspace_root` (OCEAN-260): if it does, that binding is the project the
-        // room belongs to, so the turn runs in that dir and resolves its owning
-        // project from it via the reverse map (`project_for_workspace`, OCEAN-228).
-        // If the room has no binding (None — the legacy default, and every room
-        // created before OCEAN-260), we fall back to the daemon's launch dir and
-        // key the session by room+agent, exactly as before. (Sessions that land in
-        // a project's workspace are still associated back to that project on read,
-        // via `find_by_workspace` in `enrich_session_detail`.)
-        let room_workspace = with_rooms(&state, |reg| {
-            reg.get(&room)
+    request_id: Uuid,
+    decision_token: Option<String>,
+    footprint: Option<RoomTurnFootprint>,
+) -> Option<QueuedRoomAgentTurn> {
+    let room = admission.room.clone();
+    let room_workspace = with_rooms(&state, |reg| {
+        reg.get(&room)
+            .ok()
+            .flatten()
+            .and_then(|record| record.room.workspace_root)
+    });
+    let (cwd, project_id) = match room_workspace {
+        Some(workspace) => {
+            let project_id = state
+                .runtime
+                .project_for_workspace(&workspace)
                 .ok()
                 .flatten()
-                .and_then(|rec| rec.room.workspace_root)
+                .map(|project| project.id);
+            (workspace, project_id)
+        }
+        None => {
+            let cwd = std::env::current_dir()
+                .map(|path| path.to_string_lossy().into_owned())
+                .unwrap_or_else(|_| ".".to_string());
+            (cwd, None)
+        }
+    };
+    let session_id =
+        authorized_room_agent_session_id(&room, &admission.agent_member_id, admission.generation);
+    let is_new = state.runtime.session_detail(core_sid(session_id)).is_err();
+    let session_lease = state.runtime.session_operation(core_sid(session_id)).await;
+    let permission_mode = effective_permission_mode();
+    let mut prompt_req = PromptRequest {
+        prompt: String::new(),
+        images: None,
+        request_id: Some(request_id),
+        session_id: Some(core_sid(session_id)),
+        create_if_missing: is_new,
+        max_turns: None,
+        yolo: permission_mode == PermissionMode::SkipAll,
+        cwd,
+        project_id,
+        client_type: Some("room".to_string()),
+        decision_token,
+    };
+    let authority = RoomAgentRequestAuthority {
+        room: room.clone(),
+        agent_member_id: admission.agent_member_id.clone(),
+        generation: admission.generation,
+        admission_id: admission.admission_id.clone(),
+        decision_id: admission.decision_id.clone(),
+        approved_definition_digest: admission.package.definition_digest.clone(),
+        session_id: core_sid(session_id),
+    };
+    let registration = register_room_agent_request_checked(
+        &state.requests,
+        &mut prompt_req,
+        format!("room agent {} in room {}", agent.id, room.as_str()),
+        authority,
+        || room_agent_authority::append_admission_allow(&state, &admission),
+    )
+    .await;
+    let (_registered_request, cancel) = match registration {
+        Ok(value) => value,
+        Err(error) => {
+            tracing::info!(room = %room, agent = %admission.agent_member_id, reason = error.code(),
+                "room-agent admission changed before request registration");
+            return None;
+        }
+    };
+    emit_session_changed(&state.agent_events, session_id);
+
+    if let Some(footprint) = footprint {
+        state.agent_events.emit(AgentTurnEvent::Extension {
+            extension: "room_trigger".into(),
+            payload: footprint.payload,
+            scope: None,
         });
+        if let Some(line) = footprint.audit_line {
+            let _ = append_room_message(
+                &state,
+                &room,
+                "system",
+                RoomParticipantKind::System,
+                RoomMessageKind::System,
+                &line,
+            );
+        }
+    }
 
-        let (cwd, project_id) = match room_workspace {
-            Some(ws) => {
-                // Bound room: cwd is the room's workspace. Resolve the owning
-                // project (best-effort) so the turn is project-scoped; a lookup
-                // error or "no project at this root" degrades to no project_id
-                // rather than failing the convene.
-                let project_id = state
-                    .runtime
-                    .project_for_workspace(&ws)
-                    .ok()
-                    .flatten()
-                    .map(|p| p.id);
-                (ws, project_id)
-            }
-            None => {
-                // Unbound room (legacy): the daemon's launch dir, no project.
-                let cwd = std::env::current_dir()
-                    .map(|p| p.to_string_lossy().into_owned())
-                    .unwrap_or_else(|_| ".".to_string());
-                (cwd, None)
-            }
+    let queued = QueuedRoomAgentTurn {
+        request_id,
+        session_id,
+        admission_id: admission.admission_id.clone(),
+        generation: admission.generation,
+    };
+    tokio::spawn(async move {
+        let tail = authorized_room_transcript_context(&state, &admission, triggered_by_seq);
+        let context_files = if admission.context_policy == ContextPolicy::RoomHistory {
+            let attachments =
+                with_rooms(&state, |store| store.attachments(&room)).unwrap_or_else(|error| {
+                    tracing::warn!(room = %room, %error,
+                        "room-history attachment context unavailable for this turn");
+                    Vec::new()
+                });
+            crate::room_context::build_attachment_context(
+                &attachments,
+                |row| {
+                    crate::room_attachments::attachment_bytes(
+                        state.room_attachments_root.as_path(),
+                        &room,
+                        row,
+                    )
+                },
+                crate::room_context::ROOM_CONTEXT_BYTE_BUDGET,
+            )
+        } else {
+            None
         };
-
-        let session_id = room_agent_session_id(&room, &agent.id);
-
-        // Read the recent transcript tail (read-before-answer context). Lock is
-        // dropped when `with_rooms` returns, before any await below.
-        let tail = with_rooms(&state, |reg| reg.transcript(&room, None)).unwrap_or_default();
-        let tail: Vec<_> = tail
-            .into_iter()
-            .rev()
-            .take(ROOM_CONTEXT_TAIL)
-            .collect::<Vec<_>>()
-            .into_iter()
-            .rev()
-            .collect();
-        // The room's context files, on the same terms as the tail: the rows come
-        // out of `with_rooms` and the bytes are read here, synchronously, before
-        // any await below. That I/O is bounded by `room_context`'s own read
-        // budget, NOT by the byte budget — the byte budget bounds what the block
-        // says, and a binary says one line however many megabytes it is on disk.
-        let attachments = match with_rooms(&state, |reg| reg.attachments(&room)) {
-            Ok(rows) => rows,
-            Err(e) => {
-                // Louder than the tail's `unwrap_or_default` above, because the
-                // two failures do not land the same way: an empty transcript is
-                // self-evident to the agent, while a lost attachment list reaches
-                // it as a room that simply has no files. That is the confident
-                // answer from unseen material this block exists to prevent, and
-                // the log line is the only place it is visible.
-                tracing::warn!(room = %room, error = %e,
-                    "room context files unavailable for this turn");
-                Vec::new()
-            }
-        };
-        let context_files = crate::room_context::build_attachment_context(
-            &attachments,
-            |row| {
-                crate::room_attachments::attachment_bytes(
-                    state.room_attachments_root.as_path(),
-                    &room,
-                    row,
-                )
-            },
-            crate::room_context::ROOM_CONTEXT_BYTE_BUDGET,
-        );
         let prompt = build_room_prompt(
             &room,
             &agent,
@@ -2334,156 +2706,80 @@ fn spawn_room_agent_turn(
             triggered_by_seq,
             context_files.as_deref(),
         );
-
-        // Named-agent binding (TASK-9): a room agent turn must DRIVE a resolved
-        // folder-as-agent, never a default assistant. Re-resolve the participant
-        // id to a real AgentDef before building the turn; on failure fail-closed
-        // (post an honest System note, queue NO turn) rather than silently
-        // running the default model. `room_join` blocks NEW unresolved agents;
-        // this re-resolve catches LEGACY phantoms already in stored rosters.
-        // (room_post_message's gate already short-circuited a phantom before the
-        // footprint, but a re-resolve here is defense-in-depth: the roster may
-        // have changed between the mention and the spawn, or the folder removed.)
-        let resolved = match resolve_named_agent(&agent.id) {
-            Ok(r) => r,
-            Err(_) => {
-                if federated_member_id.is_none() {
-                    let _ = append_room_message(
-                        &state,
-                        &room,
-                        "system",
-                        RoomParticipantKind::System,
-                        RoomMessageKind::System,
-                        &format!("agent '{}' is not bound; no turn queued", agent.id),
-                    );
-                }
-                return;
-            }
-        };
-        // Prepend the resolved agent's instructions as a steering layer, exactly
-        // as `agent_turn` does for a named folder-as-agent.
-        let prompt = match resolved.instructions_layer {
-            Some(instr) => super::compose_folder_agent_prompt(&instr, &prompt),
+        prompt_req.prompt = match admission.package.instructions_layer.as_deref() {
+            Some(instructions) => super::compose_folder_agent_prompt(instructions, &prompt),
             None => prompt,
         };
-
-        // Does this session already exist on disk? If so we RESUME it (strict);
-        // otherwise we create it under the deterministic id. This mirrors the
-        // create-if-missing logic in `agent_turn`. `session_detail` errors on a
-        // missing/corrupt session, so `Ok` ⇒ exists ⇒ resume.
-        let is_new = state.runtime.session_detail(core_sid(session_id)).is_err();
-
-        let request_id = Uuid::new_v4();
-        // Auto-convene has no per-request flag, so the effective posture is the
-        // operator's resolved global permission mode.
-        let permission_mode = effective_permission_mode();
-        let yolo = permission_mode == PermissionMode::SkipAll;
-        let mut prompt_req = PromptRequest {
-            prompt,
-            images: None,
-            request_id: Some(request_id),
-            session_id: Some(core_sid(session_id)),
-            create_if_missing: is_new,
-            max_turns: None,
-            yolo,
-            cwd,
-            // The room's workspace binding resolves to its owning project
-            // (OCEAN-260); `None` for unbound rooms preserves the legacy posture.
-            project_id,
-            client_type: Some("room".to_string()),
-            // Daemon-internal auto-convene: no external submitter, so no
-            // decision_token. Permission gating here defers to OCEAN_YOLO.
-            decision_token: None,
-        };
-
-        // The durable room trigger/audit footprint already committed before
-        // this spawned turn. Wait for the shared lane rather than dropping the
-        // acknowledged trigger; registration still happens only after admission.
-        let session_lease = state.runtime.session_operation(core_sid(session_id)).await;
-        emit_session_changed(&state.agent_events, session_id);
-
-        let (_request_id, cancel) = register_running_request(
-            &state.requests,
-            &mut prompt_req,
-            format!("auto-convene: {} in room {}", agent.id, room.as_str()),
-            RequestState::Running,
-        )
-        .await;
-
         let control = build_prompt_control(
             &state,
             request_id,
             Some(core_sid(session_id)),
             permission_mode,
             cancel,
-            None,
+            prompt_req.decision_token.clone(),
         );
-        // Apply the resolved agent's declared tool allowlist, model, and tier-1
-        // subprocess capabilities to this turn, exactly as `agent_turn` does:
-        // allowlist narrows the toolset, model drives the turn (fail-soft to the
-        // global model via `with_agent_model`'s empty-trim), and caps launch
-        // per-turn and merge their tools (fail-soft). PRESERVED vs the prior
-        // room path: no `without_tools()`, `yolo` from `effective_permission_mode()`,
-        // and `decision_token: None` above — only the four resolved fields are
-        // newly applied.
-        let control = match resolved.tool_allowlist {
-            Some(tools) => control.with_tool_allowlist(tools),
-            None => control,
-        };
-        let control = control.with_agent_model(resolved.model);
-        let control = match resolved.subprocess_caps {
-            Some((root, caps)) => control.with_agent_capabilities(root, caps),
-            None => control,
-        };
+        let control = room_agent_authority::apply_admission_to_control(control, &admission);
         #[cfg(test)]
         capture_room_turn(&agent.id, &prompt_req.prompt, &control);
 
-        let res = state
+        let result = state
             .runtime
             .prompt_with_lease(prompt_req, control, &session_lease)
             .await;
-        // Federated room turn: delivery is the legacy-bus record itself (origin
-        // None), with no separate agent-bus terminal frame, so pass `None`.
-        record_prompt_result(&state, request_id, &res, None, None).await;
+        record_prompt_result(&state, request_id, &result, None, None).await;
         emit_session_changed(&state.agent_events, session_id);
 
-        // Post the agent's reply back into the room as the agent participant.
-        // The lock is taken synchronously here, after the await completed.
-        if res.ok {
-            let body = clamp_room_message_body(res.stdout.trim());
-            let body = body.as_ref();
+        if result.ok {
+            let body = clamp_room_message_body(result.stdout.trim());
             if !body.is_empty() {
                 if let Some(member_id) = federated_member_id.as_deref() {
-                    if state
+                    if !room_agent_authority::admission_generation_is_current(&state, &admission) {
+                        room_agent_authority::append_remote_output_outcome(
+                            &state,
+                            &admission,
+                            "refused",
+                            "authority_changed_before_remote_enqueue",
+                        );
+                        tracing::warn!(room = %room, outcome = "agent_reply_enqueue_suppressed",
+                            "federated agent reply lost authority before enqueue");
+                    } else if state
                         .room_federation
-                        .enqueue_federated_message(&room, Some(member_id), body)
+                        .enqueue_federated_message(&room, Some(member_id), body.as_ref())
                         .await
                         .is_err()
                     {
-                        tracing::warn!(room = %room, outcome = "agent_reply_enqueue_failed", "federated agent reply suppressed");
+                        room_agent_authority::append_remote_output_outcome(
+                            &state,
+                            &admission,
+                            "refused",
+                            "remote_enqueue_failed",
+                        );
+                        tracing::warn!(room = %room, outcome = "agent_reply_enqueue_failed",
+                            "federated agent reply enqueue failed");
+                    } else {
+                        room_agent_authority::append_remote_output_outcome(
+                            &state,
+                            &admission,
+                            "enqueued_remote",
+                            "bedrock_delivery_pending",
+                        );
                     }
                 } else {
-                    // G3: thread the answer under the ROOT of the line that
-                    // convened it. When the trigger row is itself a thread
-                    // reply, its own `thread_parent_seq` is the root — parenting
-                    // under the reply row would violate one-level threading and
-                    // demote the answer to top-level. A top-level trigger is its
-                    // own root. Stamp the daemon-derived session either way; a
-                    // stale/invalid parent still degrades inside the helper.
                     let thread_root = with_rooms(&state, |store| {
-                        store.transcript(&room, Some(triggered_by_seq.saturating_sub(1)))
+                        room_message_at_seq(store, &room, triggered_by_seq)
                     })
-                    .ok()
-                    .and_then(|rows| rows.into_iter().find(|m| m.seq == triggered_by_seq))
-                    .and_then(|m| m.thread_parent_seq)
+                    .and_then(|message| message.thread_parent_seq)
                     .unwrap_or(triggered_by_seq);
-                    let _ =
-                        append_room_agent_reply(&state, &room, &agent.id, body, Some(thread_root));
+                    let _ = append_authorized_room_agent_reply(
+                        &state,
+                        &admission,
+                        body.as_ref(),
+                        Some(thread_root),
+                        session_id,
+                    );
                 }
             }
         } else if federated_member_id.is_none() {
-            // Local rooms retain the historical failure audit row. Federated
-            // failures stay operational-only to avoid divergent transcripts.
             let _ = append_room_message(
                 &state,
                 &room,
@@ -2493,11 +2789,12 @@ fn spawn_room_agent_turn(
                 &format!(
                     "auto-convene failed for {}: {}",
                     agent.id,
-                    res.stderr.lines().next().unwrap_or("turn failed")
+                    result.stderr.lines().next().unwrap_or("turn failed")
                 ),
             );
         }
     });
+    Some(queued)
 }
 
 #[derive(serde::Deserialize)]
@@ -3422,6 +3719,7 @@ pub(super) async fn room_retry_outbox(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ocean_store::ActivationPolicy;
 
     #[test]
     fn a_short_body_is_borrowed_untouched() {
@@ -3542,7 +3840,8 @@ mod tests {
     }
 
     use crate::tests::{
-        fake_convene_state, write_agent_fixture, TestEnvRestore, AUTO_CONVENE_ENV_LOCK,
+        authorize_room_agent_fixture, authorize_room_agent_package_fixture, fake_convene_state,
+        write_agent_fixture, TestEnvRestore, AUTO_CONVENE_ENV_LOCK,
     };
     use axum::{
         body::{Body, Bytes},
@@ -3898,7 +4197,7 @@ mod tests {
             member_id: member_id.into(),
             owner_member_id: None,
             actor_type: ocean_core::FederatedActorType::User,
-            role_in_room: ocean_core::FederatedRoomRole::Member,
+            role_in_room: ocean_core::FederatedRoomRole::Owner,
             display_name: "Reclassified Human".into(),
             public_agent_descriptor: None,
             joined_at: "2026-07-17T00:00:00Z".into(),
@@ -5041,23 +5340,35 @@ mod tests {
                 }),
                 Utc::now(),
             )?;
-            for participant in [
-                RoomParticipant {
-                    id: "helper".into(),
-                    kind: RoomParticipantKind::Agent,
-                    display_name: "Helper".into(),
-                },
+            store.add_participant(
+                &key,
                 RoomParticipant {
                     id: "john".into(),
                     kind: RoomParticipantKind::Human,
                     display_name: "John".into(),
                 },
-            ] {
-                store.add_participant(&key, participant, Utc::now())?;
-            }
+                Utc::now(),
+            )?;
+            store.add_agent_participant_with_owner(
+                &key,
+                RoomParticipant {
+                    id: "helper".into(),
+                    kind: RoomParticipantKind::Agent,
+                    display_name: "Helper".into(),
+                },
+                "john",
+                Utc::now(),
+            )?;
             Ok::<_, ocean_store::RoomStoreError>(())
         })
         .unwrap();
+        let generation = authorize_room_agent_fixture(
+            &state,
+            &key,
+            "helper",
+            ActivationPolicy::TaskAndThread,
+            ContextPolicy::InvocationOnly,
+        );
         let root = append_room_agent_reply(&state, &key, "helper", "agent root", None)
             .expect("agent root append");
 
@@ -5091,7 +5402,8 @@ mod tests {
         }
         assert_eq!(room_trigger_count, 1, "one agent gets one dispatch per row");
 
-        let expected_session = room_agent_session_id(&key, "helper").to_string();
+        let expected_session =
+            authorized_room_agent_session_id(&key, "helper", generation).to_string();
         let mut generated_reply = None;
         for _ in 0..100 {
             generated_reply = with_rooms(&state, |store| store.transcript(&key, None))
@@ -5127,9 +5439,10 @@ mod tests {
         )
         .expect("invalid agent parent must fall back");
         assert_eq!(fallback.thread_parent_seq, None);
+        let legacy_session = room_agent_session_id(&key, "helper").to_string();
         assert_eq!(
             fallback.session_id.as_deref(),
-            Some(expected_session.as_str())
+            Some(legacy_session.as_str())
         );
     }
 
@@ -5143,6 +5456,24 @@ mod tests {
         assert!(
             key == "b8b1b37415ebcbcf56fc283df2f49841bd9e06775758115995e66869061ffd34",
             "registration-key known-answer mismatch"
+        );
+    }
+
+    #[test]
+    fn authorized_room_session_is_generation_bound_and_collision_safe() {
+        let room = RoomKey::new("ab");
+        let first = authorized_room_agent_session_id(&room, "c", 1);
+        assert_eq!(first, authorized_room_agent_session_id(&room, "c", 1));
+        assert_ne!(first, authorized_room_agent_session_id(&room, "c", 2));
+        assert_ne!(
+            first,
+            authorized_room_agent_session_id(&RoomKey::new("a"), "bc", 1),
+            "length-prefixing must distinguish concatenation-equivalent pairs"
+        );
+        assert_ne!(
+            first,
+            room_agent_session_id(&room, "c"),
+            "Phase 1 must never resume a legacy room session"
         );
     }
 
@@ -5720,12 +6051,23 @@ mod tests {
             store.update_room_access_safe(
                 &key,
                 Some(RoomAccessState::Live),
-                Some(&[dispatch_agent_projection(member, human, "bound-agent")]),
+                Some(&[
+                    dispatch_agent_projection(member, human, "bound-agent"),
+                    dispatch_human_projection(human),
+                ]),
                 None,
             )?;
             Ok::<_, ocean_store::RoomStoreError>(())
         })
         .unwrap();
+        authorize_room_agent_package_fixture(
+            &state,
+            &key,
+            member,
+            "bound-agent",
+            ActivationPolicy::Mention,
+            ContextPolicy::InvocationOnly,
+        );
         let (tx, rx) = mpsc::unbounded_channel();
         let cancel = CancellationToken::new();
         let dispatcher = tokio::spawn(run_federated_trigger_dispatcher(
@@ -5738,6 +6080,7 @@ mod tests {
             ledger_event_id: "ledger-trigger".into(),
             local_seq: 7,
             target_member_id: member.into(),
+            trigger_kind: FederatedTriggerKind::Mention,
             reason: format!("on_mention: @{member} mentioned"),
         })
         .unwrap();
@@ -5765,7 +6108,8 @@ mod tests {
         .expect("agent reply must become a Pending outbox item");
         assert!(with_rooms(&state, |store| store.transcript(&key, None))
             .unwrap()
-            .is_empty());
+            .iter()
+            .all(|row| row.kind == RoomMessageKind::System));
 
         // Main follows this order: federation producers stop, the dedicated
         // dispatcher cancellation fires, and the retained JoinHandle is joined.
@@ -5775,7 +6119,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn p2c_unresolved_and_stale_dispatches_emit_no_turn_or_audit_row() {
+    async fn p2c_unresolved_and_stale_dispatches_emit_no_turn_and_only_denial_audits() {
         let _env = AUTO_CONVENE_ENV_LOCK.lock().await;
         let tmp = tempfile::tempdir().unwrap();
         let _restore = TestEnvRestore::capture(&[
@@ -5857,6 +6201,7 @@ mod tests {
                 ledger_event_id: ledger.into(),
                 local_seq: 1,
                 target_member_id: member.into(),
+                trigger_kind: FederatedTriggerKind::Mention,
                 reason: format!("on_mention: @{member} mentioned"),
             })
             .unwrap();
@@ -5869,9 +6214,10 @@ mod tests {
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .is_empty());
         for key in [&unresolved, &removed, &reclassified, &remote] {
-            assert!(with_rooms(&state, |store| store.transcript(key, None))
-                .unwrap()
-                .is_empty());
+            let transcript = with_rooms(&state, |store| store.transcript(key, None)).unwrap();
+            assert!(transcript.iter().all(|row| {
+                row.kind == RoomMessageKind::System && row.body.contains("\"outcome\":\"refused\"")
+            }));
             assert!(with_rooms(&state, |store| store.pending_outbox(key))
                 .unwrap()
                 .is_empty());
@@ -6211,12 +6557,24 @@ mod tests {
                 id: "helper".into(),
                 display_name: "Helper".into(),
                 kind: RoomParticipantKind::Agent,
-                owner_id: None,
+                owner_id: Some("human".into()),
             }),
         )
         .await;
         assert_eq!(join_status, StatusCode::OK);
-        let (mut convene_tail, release) = paused_tail(&state, &convene, Some(1)).await;
+        let _generation = authorize_room_agent_fixture(
+            &state,
+            &convene,
+            "helper",
+            ActivationPolicy::Mention,
+            ContextPolicy::InvocationOnly,
+        );
+        let authority_seq = with_rooms(&state, |store| store.transcript(&convene, None))
+            .unwrap()
+            .last()
+            .expect("authority audit")
+            .seq;
+        let (mut convene_tail, release) = paused_tail(&state, &convene, Some(authority_seq)).await;
         release.send(()).unwrap();
         let (post_status, _) = room_post_message(
             State(state),
@@ -6231,6 +6589,9 @@ mod tests {
         .await;
         assert_eq!(post_status, StatusCode::CREATED);
         assert_eq!(next_message(&mut convene_tail).await.body, "@helper report");
+        let admission = next_message(&mut convene_tail).await;
+        assert_eq!(admission.kind, RoomMessageKind::System);
+        assert!(admission.body.contains("admission_id") && admission.body.contains("admitted"));
         let audit = next_message(&mut convene_tail).await;
         assert_eq!(audit.kind, RoomMessageKind::System);
         assert!(audit.body.starts_with("auto-convene: helper"));
@@ -7068,11 +7429,11 @@ mod tests {
         assert!(wait_for_turn_capture("phantom").await.is_none());
         let transcript =
             with_rooms(&state, |store| store.transcript(&key, None)).expect("transcript");
-        assert!(transcript
-            .iter()
-            .any(|message| message.author_kind == RoomParticipantKind::System
-                && message.kind == RoomMessageKind::System
-                && message.body == "agent 'phantom' is not bound; no turn queued"));
+        assert!(transcript.iter().any(|message| message.author_kind
+            == RoomParticipantKind::System
+            && message.kind == RoomMessageKind::System
+            && message.body.contains("\"outcome\":\"refused\"")
+            && message.body.contains("agent_package_not_found")));
         assert!(!transcript
             .iter()
             .any(|message| message.body.starts_with("auto-convene:")));
@@ -7117,11 +7478,18 @@ env = { FIXTURE = "1" }
                 id: "bound-agent".into(),
                 display_name: "Bound Agent".into(),
                 kind: RoomParticipantKind::Agent,
-                owner_id: None,
+                owner_id: Some("human".into()),
             }),
         )
         .await;
         assert_eq!(join_status, StatusCode::OK);
+        let generation = authorize_room_agent_fixture(
+            &state,
+            &key,
+            "bound-agent",
+            ActivationPolicy::Mention,
+            ContextPolicy::InvocationOnly,
+        );
 
         let (post_status, _) = room_post_message(
             State(state.clone()),
@@ -7147,18 +7515,20 @@ env = { FIXTURE = "1" }
             .starts_with("[folder-agent instructions]\nBOUND_AGENT_INSTRUCTIONS\n[end folder-agent instructions]\n\n"));
         assert_eq!(
             capture.tool_allowlist,
-            Some(vec!["read".to_string(), "glob".to_string()])
+            Some(vec!["glob".to_string(), "read".to_string()])
         );
         assert_eq!(capture.model.as_deref(), Some("fake-ok"));
-        let (root, caps) = capture
-            .subprocess_caps
-            .expect("declared subprocess capability must reach PromptControl");
-        assert_eq!(root, agents_root.join("bound-agent"));
-        assert_eq!(caps.len(), 1);
-        assert_eq!(caps[0].effective_name(), "fixture-cap");
-        assert_eq!(caps[0].command, "/definitely/missing/ocean-fixture-cap");
+        assert!(
+            capture.subprocess_caps.is_none(),
+            "the Phase 1 node ceiling must remove ambient subprocess access"
+        );
         assert!(state.requests.read().await.values().any(|request| {
-            request.status.session_id == Some(core_sid(room_agent_session_id(&key, "bound-agent")))
+            request.status.session_id
+                == Some(core_sid(authorized_room_agent_session_id(
+                    &key,
+                    "bound-agent",
+                    generation,
+                )))
         }));
     }
 
@@ -7243,11 +7613,18 @@ env = { FIXTURE = "1" }
                 id: "reader-agent".into(),
                 display_name: "Reader".into(),
                 kind: RoomParticipantKind::Agent,
-                owner_id: None,
+                owner_id: Some("human".into()),
             }),
         )
         .await;
         assert_eq!(join_status, StatusCode::OK);
+        authorize_room_agent_fixture(
+            &state,
+            &key,
+            "reader-agent",
+            ActivationPolicy::Mention,
+            ContextPolicy::RoomHistory,
+        );
 
         let (post_status, _) = room_post_message(
             State(state.clone()),
@@ -7302,11 +7679,18 @@ env = { FIXTURE = "1" }
                 id: "bare-agent".into(),
                 display_name: "Bare".into(),
                 kind: RoomParticipantKind::Agent,
-                owner_id: None,
+                owner_id: Some("human".into()),
             }),
         )
         .await;
         assert_eq!(join_status, StatusCode::OK);
+        authorize_room_agent_fixture(
+            &state,
+            &key,
+            "bare-agent",
+            ActivationPolicy::Mention,
+            ContextPolicy::RoomHistory,
+        );
 
         let (post_status, _) = room_post_message(
             State(state.clone()),
@@ -7357,11 +7741,18 @@ env = { FIXTURE = "1" }
                 id: "data-only".into(),
                 display_name: "Data Only".into(),
                 kind: RoomParticipantKind::Agent,
-                owner_id: None,
+                owner_id: Some("human".into()),
             }),
         )
         .await;
         assert_eq!(join_status, StatusCode::OK);
+        let generation = authorize_room_agent_fixture(
+            &state,
+            &key,
+            "data-only",
+            ActivationPolicy::Mention,
+            ContextPolicy::InvocationOnly,
+        );
 
         let (post_status, _) = room_post_message(
             State(state.clone()),
@@ -7375,9 +7766,15 @@ env = { FIXTURE = "1" }
         )
         .await;
         assert_eq!(post_status, StatusCode::CREATED);
-        let event = trigger_rx
-            .try_recv()
-            .expect("resolved agent emits room_trigger");
+        let event = loop {
+            let event = trigger_rx
+                .try_recv()
+                .expect("resolved agent emits room_trigger");
+            if matches!(event.event, AgentTurnEvent::Extension { ref extension, .. } if extension == "room_trigger")
+            {
+                break event;
+            }
+        };
         assert!(matches!(
             event.event,
             AgentTurnEvent::Extension { ref extension, .. } if extension == "room_trigger"
@@ -7391,7 +7788,12 @@ env = { FIXTURE = "1" }
         assert!(capture.subprocess_caps.is_none());
         assert!(!capture.prompt.starts_with("\n\n"));
         assert!(state.requests.read().await.values().any(|request| {
-            request.status.session_id == Some(core_sid(room_agent_session_id(&key, "data-only")))
+            request.status.session_id
+                == Some(core_sid(authorized_room_agent_session_id(
+                    &key,
+                    "data-only",
+                    generation,
+                )))
         }));
     }
 

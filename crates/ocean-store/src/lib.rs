@@ -838,6 +838,40 @@ pub struct SetAgentBindingStatusInput {
     pub request_digest: String,
 }
 
+/// Content-minimal admission decision supplied by the daemon after resolving
+/// the package and trigger. Capability sets and prompt content are deliberately
+/// absent from this value and therefore cannot leak into the room transcript.
+pub struct RoomAgentAdmissionAuditInput {
+    pub admission_id: String,
+    pub agent_member_id: String,
+    pub agent_package_id: String,
+    pub approved_definition_digest: Option<String>,
+    pub observed_definition_digest: String,
+    pub generation: Option<u64>,
+    pub operator_principal_id: Option<String>,
+    pub decision_id: Option<String>,
+    pub outcome: String,
+    pub reason_code: String,
+}
+
+/// Content-minimal durable audit fact for room-agent authority changes.
+///
+/// These facts intentionally omit capability payloads, prompts, package source,
+/// and the operator credential. The principal id is a one-way fingerprint.
+struct RoomAgentAuthorityAudit<'a> {
+    action: &'static str,
+    agent_member_id: &'a str,
+    agent_package_id: &'a str,
+    previous_definition_digest: Option<&'a str>,
+    agent_definition_digest: &'a str,
+    generation: u64,
+    operator_principal_id: &'a str,
+    decision_id: &'a str,
+    admission_id: Option<&'a str>,
+    outcome: &'a str,
+    reason_code: &'a str,
+}
+
 /// Sort + dedupe so a capability list has one canonical form. Two approvals
 /// listing the same capabilities in different orders must produce the same
 /// stored value, or replay comparison becomes order-sensitive.
@@ -3445,6 +3479,108 @@ impl SqliteRoomStore {
         Ok(msg)
     }
 
+    /// Append a locally executed room-agent reply and a generation-attribution
+    /// fact in the same transaction.
+    ///
+    /// The audit's `admission_id` mechanically joins the earlier admission
+    /// decision to this concrete `message_seq`; consumers never have to infer
+    /// authority from chronology. A generation/status change after admission
+    /// refuses the write, which is the final checkpoint backstop.
+    #[allow(clippy::too_many_arguments)]
+    pub fn append_authorized_agent_reply(
+        &mut self,
+        key: &RoomKey,
+        agent_member_id: &str,
+        expected_generation: u64,
+        admission_id: &str,
+        body: &str,
+        now: DateTime<Utc>,
+        thread_parent_seq: Option<u64>,
+        session_id: &str,
+    ) -> std::result::Result<(RoomMessage, RoomMessage), ThreadAppendError> {
+        if !self.room_is_open(key)? {
+            return Err(RoomStoreError::UnknownRoom(key.clone()).into());
+        }
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let binding = tx
+            .query_row(
+                "SELECT agent_member_id, agent_package_id, agent_definition_digest,
+                        agent_definition_revision, display_name, owner_member_id,
+                        authorized_by, authorized_at, activation_policy, context_policy,
+                        memory_scope, requested_capabilities, room_capability_grants,
+                        status, generation, decision_id, request_digest,
+                        revoked_at, revoked_by
+                   FROM room_agent_bindings
+                  WHERE room_id = ?1 AND agent_member_id = ?2",
+                params![key.as_str(), agent_member_id],
+                |row| Self::binding_from_row(key, row),
+            )
+            .optional()?
+            .transpose()?
+            .ok_or_else(|| RoomStoreError::UnknownAgentBinding {
+                room: key.clone(),
+                agent: agent_member_id.to_string(),
+            })?;
+        if binding.status != AgentBindingStatus::Active || binding.generation != expected_generation
+        {
+            return Err(RoomStoreError::AgentBindingStatusConflict {
+                room: key.clone(),
+                agent: agent_member_id.to_string(),
+                from: binding.status.as_str(),
+                to: "admitted_generation",
+            }
+            .into());
+        }
+        if let Some(parent_seq) = thread_parent_seq {
+            Self::validate_thread_parent_on(&tx, key, parent_seq)?;
+        }
+        let reply = Self::insert_message_on(
+            &tx,
+            key,
+            MessageDraft {
+                author_id: agent_member_id,
+                author_kind: RoomParticipantKind::Agent,
+                kind: RoomMessageKind::Message,
+                body,
+                thread_parent_seq,
+                session_id: Some(session_id),
+                attachment_id: None,
+            },
+            now,
+        )?;
+        let audit_body = serde_json::to_string(&serde_json::json!({
+            "type": "room.agent.output",
+            "room_id": key.as_str(),
+            "admission_id": admission_id,
+            "agent_member_id": agent_member_id,
+            "agent_package_id": binding.agent_package_id,
+            "generation": expected_generation.to_string(),
+            "message_seq": reply.seq.to_string(),
+            "session_id": session_id,
+            "outcome": "emitted",
+        }))
+        .map_err(|error| RoomStoreError::Encode(error.to_string()))?;
+        let audit = Self::insert_message_on(
+            &tx,
+            key,
+            MessageDraft {
+                author_id: "system",
+                author_kind: RoomParticipantKind::System,
+                kind: RoomMessageKind::System,
+                body: &audit_body,
+                thread_parent_seq: None,
+                session_id: None,
+                attachment_id: None,
+            },
+            now,
+        )?;
+        Self::touch_on(&tx, key, now)?;
+        tx.commit()?;
+        Ok((reply, audit))
+    }
+
     /// Enforce the G1 one-level thread policy for `parent_seq` in `key`.
     ///
     /// Runs on the caller's transaction (`&Connection`, which a
@@ -4299,7 +4435,7 @@ impl SqliteRoomStore {
         key: &RoomKey,
         input: AuthorizeAgentInput,
         now: DateTime<Utc>,
-    ) -> Result<(RoomAgentBinding, bool)> {
+    ) -> Result<(RoomAgentBinding, bool, Option<RoomMessage>)> {
         if input.agent_member_id.trim().is_empty()
             || input.decision_id.trim().is_empty()
             || input.request_digest.trim().is_empty()
@@ -4364,20 +4500,23 @@ impl SqliteRoomStore {
                     agent: input.agent_member_id.clone(),
                 })?;
             tx.commit()?;
-            return Ok((existing, false));
+            return Ok((existing, false, None));
         }
 
         // A revoked identity is terminal: re-adding must mint a new
         // agent_member_id rather than resurrect the old row.
-        let existing_authority: Option<(String, String)> = tx
+        let existing_authority: Option<(String, String, String)> = tx
             .query_row(
-                "SELECT status, generation FROM room_agent_bindings
+                "SELECT status, generation, agent_definition_digest FROM room_agent_bindings
                  WHERE room_id = ?1 AND agent_member_id = ?2",
                 params![key.as_str(), input.agent_member_id],
-                |row| Ok((row.get(0)?, row.get(1)?)),
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
             )
             .optional()?;
-        let generation = if let Some((status, generation)) = existing_authority {
+        let previous_definition_digest = existing_authority
+            .as_ref()
+            .map(|(_, _, digest)| digest.clone());
+        let generation = if let Some((status, generation, _)) = existing_authority {
             let from = AgentBindingStatus::parse(&status)?;
             if from == AgentBindingStatus::Revoked {
                 return Err(RoomStoreError::AgentBindingStatusConflict {
@@ -4487,8 +4626,34 @@ impl SqliteRoomStore {
                 room: key.clone(),
                 agent: input.agent_member_id.clone(),
             })?;
+        let audit = Self::insert_room_agent_authority_audit_on(
+            &tx,
+            key,
+            RoomAgentAuthorityAudit {
+                action: "authorization",
+                agent_member_id: &binding.agent_member_id,
+                agent_package_id: &binding.agent_package_id,
+                previous_definition_digest: previous_definition_digest.as_deref(),
+                agent_definition_digest: &binding.agent_definition_digest,
+                generation: binding.generation,
+                operator_principal_id: &binding.authorized_by,
+                decision_id: &binding.decision_id,
+                admission_id: None,
+                outcome: if previous_definition_digest.is_some() {
+                    "reauthorized"
+                } else {
+                    "authorized"
+                },
+                reason_code: if previous_definition_digest.is_some() {
+                    "fresh_definition_approved"
+                } else {
+                    "initial_authorization_approved"
+                },
+            },
+            now,
+        )?;
         tx.commit()?;
-        Ok((binding, true))
+        Ok((binding, true, Some(audit)))
     }
 
     /// One binding, or `None`. Callers must treat `None` as refusal.
@@ -4531,6 +4696,200 @@ impl SqliteRoomStore {
         rows.into_iter().collect()
     }
 
+    /// Read one consumed replay decision without projecting it onto the public
+    /// inspection wire. Mutation handlers use this under the room-store lock to
+    /// distinguish a harmless exact retry from an implicit re-authorization.
+    pub fn room_agent_decision(
+        &self,
+        key: &RoomKey,
+        decision_id: &str,
+    ) -> Result<Option<(String, String)>> {
+        self.conn
+            .query_row(
+                "SELECT agent_member_id, request_digest
+                   FROM room_agent_decisions
+                  WHERE room_id = ?1 AND decision_id = ?2",
+                params![key.as_str(), decision_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()
+            .map_err(RoomStoreError::from)
+    }
+
+    /// Atomically mark an active binding stale when the package digest changed.
+    ///
+    /// The pinned digest remains the digest the operator approved. The newly
+    /// observed digest exists only in the audit fact until a fresh decision
+    /// re-authorizes it. A generation/digest mismatch means the caller planned
+    /// against old authority and receives the latest row without mutating it.
+    #[allow(clippy::too_many_arguments)]
+    pub fn mark_room_agent_stale(
+        &mut self,
+        key: &RoomKey,
+        agent_member_id: &str,
+        expected_generation: u64,
+        expected_definition_digest: &str,
+        observed_definition_digest: &str,
+        admission_id: &str,
+        now: DateTime<Utc>,
+    ) -> Result<(RoomAgentBinding, bool, Option<RoomMessage>)> {
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let current = tx
+            .query_row(
+                "SELECT agent_member_id, agent_package_id, agent_definition_digest,
+                        agent_definition_revision, display_name, owner_member_id,
+                        authorized_by, authorized_at, activation_policy, context_policy,
+                        memory_scope, requested_capabilities, room_capability_grants,
+                        status, generation, decision_id, request_digest,
+                        revoked_at, revoked_by
+                   FROM room_agent_bindings
+                  WHERE room_id = ?1 AND agent_member_id = ?2",
+                params![key.as_str(), agent_member_id],
+                |row| Self::binding_from_row(key, row),
+            )
+            .optional()?
+            .transpose()?
+            .ok_or_else(|| RoomStoreError::UnknownAgentBinding {
+                room: key.clone(),
+                agent: agent_member_id.to_string(),
+            })?;
+        if current.status != AgentBindingStatus::Active
+            || current.generation != expected_generation
+            || current.agent_definition_digest != expected_definition_digest
+        {
+            tx.commit()?;
+            return Ok((current, false, None));
+        }
+        if current.agent_definition_digest == observed_definition_digest {
+            tx.commit()?;
+            return Ok((current, false, None));
+        }
+        let next_generation = current
+            .generation
+            .checked_add(1)
+            .ok_or_else(|| RoomStoreError::Encode("room-agent generation is exhausted".into()))?;
+        tx.execute(
+            "UPDATE room_agent_bindings
+                SET status = 'stale', generation = ?3
+              WHERE room_id = ?1 AND agent_member_id = ?2",
+            params![
+                key.as_str(),
+                agent_member_id,
+                write_u64_text(next_generation),
+            ],
+        )?;
+        let updated = RoomAgentBinding {
+            status: AgentBindingStatus::Stale,
+            generation: next_generation,
+            ..current.clone()
+        };
+        let audit = Self::insert_room_agent_authority_audit_on(
+            &tx,
+            key,
+            RoomAgentAuthorityAudit {
+                action: "admission",
+                agent_member_id: &updated.agent_member_id,
+                agent_package_id: &updated.agent_package_id,
+                previous_definition_digest: Some(&updated.agent_definition_digest),
+                agent_definition_digest: observed_definition_digest,
+                generation: updated.generation,
+                operator_principal_id: &updated.authorized_by,
+                decision_id: &updated.decision_id,
+                admission_id: Some(admission_id),
+                outcome: "refused",
+                reason_code: "binding_stale",
+            },
+            now,
+        )?;
+        tx.commit()?;
+        Ok((updated, true, Some(audit)))
+    }
+
+    /// Final generation check for a previously planned admission.
+    pub fn room_agent_generation_is_active(
+        &self,
+        key: &RoomKey,
+        agent_member_id: &str,
+        expected_generation: u64,
+    ) -> Result<bool> {
+        Ok(self
+            .room_agent_binding(key, agent_member_id)?
+            .is_some_and(|binding| {
+                binding.status == AgentBindingStatus::Active
+                    && binding.generation == expected_generation
+            }))
+    }
+
+    /// Append one content-minimal admission allow/refusal fact durably.
+    ///
+    /// Digest-drift callers use [`Self::mark_room_agent_stale`] instead because
+    /// the state transition and refusal audit must share one transaction.
+    pub fn append_room_agent_admission_audit(
+        &mut self,
+        key: &RoomKey,
+        input: RoomAgentAdmissionAuditInput,
+        now: DateTime<Utc>,
+    ) -> Result<RoomMessage> {
+        if input.admission_id.trim().is_empty()
+            || input.agent_member_id.trim().is_empty()
+            || input.agent_package_id.trim().is_empty()
+            || input.observed_definition_digest.trim().is_empty()
+            || input.outcome.trim().is_empty()
+            || input.reason_code.trim().is_empty()
+        {
+            return Err(RoomStoreError::Encode(
+                "admission audit identity, digest, outcome, and reason are required".into(),
+            ));
+        }
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let room_open: Option<i64> = tx
+            .query_row(
+                "SELECT 1 FROM rooms WHERE id = ?1 AND closed_at IS NULL",
+                params![key.as_str()],
+                |row| row.get(0),
+            )
+            .optional()?;
+        if room_open.is_none() {
+            return Err(RoomStoreError::UnknownRoom(key.clone()));
+        }
+        let body = serde_json::to_string(&serde_json::json!({
+            "type": "room.agent.admission",
+            "room_id": key.as_str(),
+            "admission_id": input.admission_id,
+            "agent_member_id": input.agent_member_id,
+            "agent_package_id": input.agent_package_id,
+            "approved_definition_digest": input.approved_definition_digest,
+            "observed_definition_digest": input.observed_definition_digest,
+            "generation": input.generation.map(|value| value.to_string()),
+            "operator_principal_id": input.operator_principal_id,
+            "decision_id": input.decision_id,
+            "outcome": input.outcome,
+            "reason_code": input.reason_code,
+        }))
+        .map_err(|error| RoomStoreError::Encode(error.to_string()))?;
+        let message = Self::insert_message_on(
+            &tx,
+            key,
+            MessageDraft {
+                author_id: "system",
+                author_kind: RoomParticipantKind::System,
+                kind: RoomMessageKind::System,
+                body: &body,
+                thread_parent_seq: None,
+                session_id: None,
+                attachment_id: None,
+            },
+            now,
+        )?;
+        Self::touch_on(&tx, key, now)?;
+        tx.commit()?;
+        Ok(message)
+    }
+
     /// Apply one replay-safe status decision, bumping the generation when the
     /// status changes so anything planned against the old authority is
     /// refused.
@@ -4550,7 +4909,7 @@ impl SqliteRoomStore {
         agent_member_id: &str,
         input: SetAgentBindingStatusInput,
         now: DateTime<Utc>,
-    ) -> Result<(RoomAgentBinding, bool)> {
+    ) -> Result<(RoomAgentBinding, bool, Option<RoomMessage>)> {
         if agent_member_id.trim().is_empty()
             || input.actor.trim().is_empty()
             || input.decision_id.trim().is_empty()
@@ -4616,7 +4975,7 @@ impl SqliteRoomStore {
                     agent: agent_member_id.to_string(),
                 })?;
             tx.commit()?;
-            return Ok((existing, false));
+            return Ok((existing, false, None));
         }
 
         let to = input.status;
@@ -4714,8 +5073,70 @@ impl SqliteRoomStore {
                 room: key.clone(),
                 agent: agent_member_id.to_string(),
             })?;
+        let audit = Self::insert_room_agent_authority_audit_on(
+            &tx,
+            key,
+            RoomAgentAuthorityAudit {
+                action: "status",
+                agent_member_id: &updated.agent_member_id,
+                agent_package_id: &updated.agent_package_id,
+                previous_definition_digest: None,
+                agent_definition_digest: &updated.agent_definition_digest,
+                generation: updated.generation,
+                operator_principal_id: &input.actor,
+                decision_id: &updated.decision_id,
+                admission_id: None,
+                outcome: updated.status.as_str(),
+                reason_code: if current.status == updated.status {
+                    "status_already_set"
+                } else {
+                    "operator_status_decision"
+                },
+            },
+            now,
+        )?;
         tx.commit()?;
-        Ok((updated, true))
+        Ok((updated, true, Some(audit)))
+    }
+
+    fn insert_room_agent_authority_audit_on(
+        conn: &Connection,
+        key: &RoomKey,
+        fact: RoomAgentAuthorityAudit<'_>,
+        now: DateTime<Utc>,
+    ) -> Result<RoomMessage> {
+        let body = serde_json::to_string(&serde_json::json!({
+            "type": "room.agent.authority",
+            "action": fact.action,
+            "room_id": key.as_str(),
+            "agent_member_id": fact.agent_member_id,
+            "agent_package_id": fact.agent_package_id,
+            "previous_definition_digest": fact.previous_definition_digest,
+            "agent_definition_digest": fact.agent_definition_digest,
+            "generation": fact.generation.to_string(),
+            "operator_principal_id": fact.operator_principal_id,
+            "decision_id": fact.decision_id,
+            "admission_id": fact.admission_id,
+            "outcome": fact.outcome,
+            "reason_code": fact.reason_code,
+        }))
+        .map_err(|error| RoomStoreError::Encode(error.to_string()))?;
+        let message = Self::insert_message_on(
+            conn,
+            key,
+            MessageDraft {
+                author_id: "system",
+                author_kind: RoomParticipantKind::System,
+                kind: RoomMessageKind::System,
+                body: &body,
+                thread_parent_seq: None,
+                session_id: None,
+                attachment_id: None,
+            },
+            now,
+        )?;
+        Self::touch_on(conn, key, now)?;
+        Ok(message)
     }
 
     fn binding_from_row(
@@ -6120,7 +6541,7 @@ mod tests {
     #[test]
     fn replaying_a_decision_with_identical_content_is_idempotent() {
         let (mut s, key) = room_with_agent("agent-1");
-        let (b, created) = s
+        let (b, created, _audit) = s
             .authorize_room_agent(&key, auth_input("agent-1", "dec-1", "digest-1"), now())
             .unwrap();
         assert!(!created, "a replay must not create a second binding");
@@ -6168,7 +6589,7 @@ mod tests {
         let (mut s, key) = room_with_agent("agent-1");
         let mut next = auth_input("agent-1", "dec-2", "digest-2");
         next.agent_definition_digest = "sha256:def-2".into();
-        let (b, created) = s.authorize_room_agent(&key, next, now()).unwrap();
+        let (b, created, _audit) = s.authorize_room_agent(&key, next, now()).unwrap();
         assert!(created);
         assert_eq!(b.agent_member_id, "agent-1", "identity must be stable");
         assert_eq!(b.generation, 2);
@@ -6260,7 +6681,7 @@ mod tests {
 
         // Replaying the original approval exactly is a no-op against the
         // current binding; it must not roll authority back to generation 1.
-        let (current, created) = s
+        let (current, created, _audit) = s
             .authorize_room_agent(&key, auth_input("agent-1", "dec-1", "digest-1"), now())
             .unwrap();
         assert!(!created);
@@ -6284,7 +6705,7 @@ mod tests {
     fn replaying_a_status_decision_is_idempotent() {
         let (mut s, key) = room_with_agent("agent-1");
         let input = status_input(AgentBindingStatus::Suspended, "dec-2", "suspend-2");
-        let (first, applied) = s
+        let (first, applied, _audit) = s
             .set_room_agent_binding_status(&key, "agent-1", input.clone(), now())
             .unwrap();
         assert!(applied);
@@ -6292,7 +6713,7 @@ mod tests {
         assert_eq!(first.generation, 2);
         assert_eq!(first.decision_id, "dec-2");
 
-        let (replayed, applied) = s
+        let (replayed, applied, _audit) = s
             .set_room_agent_binding_status(&key, "agent-1", input, now())
             .unwrap();
         assert!(!applied);
@@ -6344,7 +6765,7 @@ mod tests {
     #[test]
     fn a_new_noop_status_decision_is_consumed_without_bumping_generation() {
         let (mut s, key) = room_with_agent("agent-1");
-        let (binding, applied) = s
+        let (binding, applied, _audit) = s
             .set_room_agent_binding_status(
                 &key,
                 "agent-1",
@@ -6363,7 +6784,7 @@ mod tests {
     fn suspended_and_stale_refuse_admission_and_bump_generation() {
         for to in [AgentBindingStatus::Suspended, AgentBindingStatus::Stale] {
             let (mut s, key) = room_with_agent("agent-1");
-            let (b, applied) = s
+            let (b, applied, _audit) = s
                 .set_room_agent_binding_status(
                     &key,
                     "agent-1",
@@ -6409,7 +6830,7 @@ mod tests {
 
         // Revocation remains the only status transition available without a
         // fresh authorization decision.
-        let (revoked, applied) = s
+        let (revoked, applied, _audit) = s
             .set_room_agent_binding_status(
                 &key,
                 "agent-1",
@@ -6484,6 +6905,103 @@ mod tests {
         let final_binding = first.room_agent_binding(&key, "agent-1").unwrap().unwrap();
         assert_eq!(final_binding.status, AgentBindingStatus::Stale);
         assert_eq!(final_binding.generation, 3);
+    }
+
+    #[test]
+    fn authority_mutation_and_content_minimal_audit_commit_once() {
+        let mut s = store();
+        let key = RoomKey::new("hq");
+        s.create(key.clone(), "HQ", None, now()).unwrap();
+        let (_binding, created, audit) = s
+            .authorize_room_agent(&key, auth_input("agent-1", "dec-1", "digest-1"), now())
+            .unwrap();
+        assert!(created);
+        let audit = audit.expect("new authority must return its committed audit row");
+        let body: serde_json::Value = serde_json::from_str(&audit.body).unwrap();
+        assert_eq!(body["type"], "room.agent.authority");
+        assert_eq!(body["generation"], "1");
+        assert!(body.get("room_capability_grants").is_none());
+        assert!(body.get("operator_credential").is_none());
+
+        let (_binding, created, replay_audit) = s
+            .authorize_room_agent(&key, auth_input("agent-1", "dec-1", "digest-1"), now())
+            .unwrap();
+        assert!(!created);
+        assert!(
+            replay_audit.is_none(),
+            "an exact retry cannot duplicate audit"
+        );
+    }
+
+    #[test]
+    fn digest_drift_marks_stale_and_audits_in_one_transaction() {
+        let (mut s, key) = room_with_agent("agent-1");
+        let (binding, changed, audit) = s
+            .mark_room_agent_stale(
+                &key,
+                "agent-1",
+                1,
+                "sha256:def-1",
+                "sha256:def-2",
+                "admission-1",
+                now(),
+            )
+            .unwrap();
+        assert!(changed);
+        assert_eq!(binding.status, AgentBindingStatus::Stale);
+        assert_eq!(binding.generation, 2);
+        let body: serde_json::Value =
+            serde_json::from_str(&audit.expect("stale audit").body).unwrap();
+        assert_eq!(body["admission_id"], "admission-1");
+        assert_eq!(body["reason_code"], "binding_stale");
+    }
+
+    #[test]
+    fn authorized_reply_is_generation_checked_and_correlated() {
+        let (mut s, key) = room_with_agent("agent-1");
+        let (reply, audit) = s
+            .append_authorized_agent_reply(
+                &key,
+                "agent-1",
+                1,
+                "admission-1",
+                "done",
+                now(),
+                None,
+                "session-generation-1",
+            )
+            .unwrap();
+        let body: serde_json::Value = serde_json::from_str(&audit.body).unwrap();
+        assert_eq!(body["type"], "room.agent.output");
+        assert_eq!(body["admission_id"], "admission-1");
+        assert_eq!(body["message_seq"], reply.seq.to_string());
+        assert_eq!(reply.session_id.as_deref(), Some("session-generation-1"));
+
+        s.set_room_agent_binding_status(
+            &key,
+            "agent-1",
+            status_input(AgentBindingStatus::Suspended, "dec-2", "suspend-2"),
+            now(),
+        )
+        .unwrap();
+        let before = s.transcript(&key, None).unwrap().len();
+        let error = s
+            .append_authorized_agent_reply(
+                &key,
+                "agent-1",
+                1,
+                "admission-1",
+                "late output",
+                now(),
+                None,
+                "session-generation-1",
+            )
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            ThreadAppendError::Store(RoomStoreError::AgentBindingStatusConflict { .. })
+        ));
+        assert_eq!(s.transcript(&key, None).unwrap().len(), before);
     }
 
     #[test]
@@ -6685,7 +7203,7 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(binding.generation, 7);
-        let (replayed, created) = s
+        let (replayed, created, _audit) = s
             .authorize_room_agent(
                 &RoomKey::new("hq"),
                 auth_input("agent-1", "dec-1", "digest-1"),

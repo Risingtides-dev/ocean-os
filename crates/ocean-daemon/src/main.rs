@@ -149,6 +149,7 @@ mod project_registry;
 mod recall_registry;
 /// In-memory request and permission control records plus bounded lifecycle mutations.
 mod request_control;
+mod room_agent_authority;
 /// Room attachment BYTES: blob path derivation, the size cap, server-minted
 /// ids, and the upload/list/download/delete adapters over `ocean-store`'s index.
 mod room_attachments;
@@ -307,6 +308,8 @@ struct AppState {
     /// the guard is always dropped before any `await`, and every store method is
     /// synchronous, so a std `Mutex` is correct and never blocks the scheduler.
     rooms: RoomStoreHandle,
+    /// Fail-closed local principal for room-agent authority mutations.
+    room_operator: Arc<room_operator::OperatorIdentity>,
     /// Root of the room-attachment blob tree, resolved ONCE at startup.
     ///
     /// `ocean-store` indexes attachments; their bytes live on disk under this
@@ -999,6 +1002,7 @@ async fn main() -> anyhow::Result<()> {
     tracing::info!(path = %titles_db_path.display(), "persisted longhouse title registry ready");
 
     let config_dir = ocean_agent::config_dir_from_env();
+    let room_operator = Arc::new(room_operator::OperatorIdentity::load(&config_dir));
     let roles = load_model_roles(&config_dir);
 
     // The lifecycle dispatcher exists before reconciliation so daemon_started is
@@ -1133,6 +1137,7 @@ async fn main() -> anyhow::Result<()> {
         permissions: Arc::new(RwLock::new(HashMap::new())),
         longhouse,
         rooms,
+        room_operator,
         room_attachments_root: Arc::new(room_attachments_root),
         room_wakes,
         room_access_wakes,
@@ -1575,6 +1580,15 @@ fn banner_routes() -> &'static [&'static str] {
         "POST /v1/rooms/persistent/invites/redeem",
         "POST /v1/rooms/persistent/{key}/members/agents",
         "DELETE /v1/rooms/persistent/{key}/members/{member_id}",
+        "GET /v1/rooms/persistent/{key}/agents",
+        "POST /v1/rooms/persistent/{key}/agents",
+        "GET /v1/rooms/persistent/{key}/agents/preview/{agent_package_id}",
+        "GET /v1/rooms/persistent/{key}/agents/{agent_member_id}",
+        "DELETE /v1/rooms/persistent/{key}/agents/{agent_member_id}",
+        "POST /v1/rooms/persistent/{key}/agents/{agent_member_id}/reauthorize",
+        "POST /v1/rooms/persistent/{key}/agents/{agent_member_id}/suspend",
+        "POST /v1/rooms/persistent/{key}/agents/{agent_member_id}/resume",
+        "POST /v1/rooms/persistent/{key}/agents/{agent_member_id}/invoke",
         "GET /v1/rooms/persistent/{key}/transcript",
         "POST /v1/rooms/persistent/{key}/artifacts",
         "GET /v1/rooms/persistent/{key}/artifacts",
@@ -2977,6 +2991,36 @@ fn room_routes() -> Router<AppState> {
         .route(
             "/v1/rooms/persistent/{key}/members/{member_id}",
             axum::routing::delete(room_remove_member),
+        )
+        .route(
+            "/v1/rooms/persistent/{key}/agents",
+            get(room_agent_authority::room_agent_bindings)
+                .post(room_agent_authority::room_agent_authorize),
+        )
+        .route(
+            "/v1/rooms/persistent/{key}/agents/preview/{agent_package_id}",
+            get(room_agent_authority::room_agent_preview),
+        )
+        .route(
+            "/v1/rooms/persistent/{key}/agents/{agent_member_id}",
+            get(room_agent_authority::room_agent_binding)
+                .delete(room_agent_authority::room_agent_revoke),
+        )
+        .route(
+            "/v1/rooms/persistent/{key}/agents/{agent_member_id}/reauthorize",
+            post(room_agent_authority::room_agent_reauthorize),
+        )
+        .route(
+            "/v1/rooms/persistent/{key}/agents/{agent_member_id}/suspend",
+            post(room_agent_authority::room_agent_suspend),
+        )
+        .route(
+            "/v1/rooms/persistent/{key}/agents/{agent_member_id}/resume",
+            post(room_agent_authority::room_agent_resume),
+        )
+        .route(
+            "/v1/rooms/persistent/{key}/agents/{agent_member_id}/invoke",
+            post(persistent_rooms::room_agent_invoke),
         )
         .route(
             "/v1/rooms/persistent/{key}/transcript",
@@ -9593,6 +9637,7 @@ mod tests {
             cancel: CancellationToken::new(),
             handle: None,
             decision_token: None,
+            room_agent_authority: None,
         }
     }
 
@@ -9633,6 +9678,7 @@ mod tests {
             cancel: CancellationToken::new(),
             handle: None,
             decision_token: None,
+            room_agent_authority: None,
         }
     }
 
@@ -12901,9 +12947,9 @@ mod tests {
     /// The runtime assertions prove the emitted payload and final transcript;
     /// this source-order characterization closes the otherwise-unobservable
     /// synchronous seam between the committed author row, its wake publication,
-    /// `AgentEventBus::emit`, the committed audit append+wake, and the non-awaited
-    /// spawn. It is intentionally updated to read the owning private module when
-    /// the production body moves mechanically.
+    /// the fail-closed authority gate, and the generation-bound spawn. The
+    /// legacy event/audit footprint now belongs to the spawn only after checked
+    /// request registration and its durable allow audit.
     #[test]
     fn room_post_message_source_preserves_persist_event_audit_spawn_order() {
         let source = include_str!("persistent_rooms.rs");
@@ -12922,26 +12968,27 @@ mod tests {
         let published_author = body
             .find("\n    publish_room_wake(&state, &key, &msg);")
             .expect("author wake must follow its committed append");
-        let emitted_event = body
-            .find("\n            state.agent_events.emit(")
-            .expect("room_trigger event emission must stay in the handler");
-        let audit_section = body
-            .find("// Audit line inside the room")
-            .expect("auto-convene audit section must stay identifiable");
-        let appended_audit = audit_section
-            + body[audit_section..]
-                .find("\n            let _ = append_room_message(")
-                .expect("auto-convene audit append+wake must stay in the handler");
+        let admitted = body
+            .find("room_agent_authority::admit_room_agent(")
+            .expect("authority admission must stay before the convene footprint");
         let spawned_turn = body
-            .find("\n            spawn_room_agent_turn(state.clone()")
+            .find("\n            let _ = spawn_room_agent_turn(")
             .expect("room-agent turn spawn must stay in the handler");
+        let footprint = body
+            .find("Some(RoomTurnFootprint {")
+            .expect("legacy footprint must be delegated to checked spawn");
 
         assert!(
             persisted_author < published_author
-                && published_author < emitted_event
-                && emitted_event < appended_audit
-                && appended_audit < spawned_turn,
-            "required order is persisted author row → author wake → emitted event → audit row+wake → spawn"
+                && published_author < admitted
+                && admitted < spawned_turn
+                && spawned_turn < footprint,
+            "required order is persisted author row → author wake → admission → checked spawn carrying footprint"
+        );
+        assert!(
+            !body[..spawned_turn].contains("state.agent_events.emit(")
+                && !body[..spawned_turn].contains("append_room_message("),
+            "no convene footprint may precede admission and checked registration"
         );
     }
 
@@ -14238,6 +14285,10 @@ mod tests {
             permissions: Arc::new(RwLock::new(HashMap::new())),
             longhouse: Arc::new(Mutex::new(ocean_longhouse::LonghouseRegistry::new())),
             rooms,
+            room_operator: Arc::new(room_operator::OperatorIdentity::for_test(
+                Some("test-room-operator"),
+                vec!["http://127.0.0.1:8790".into()],
+            )),
             room_attachments_root: Arc::new(tmp.path().join("room-attachments")),
             room_wakes,
             room_access_wakes,
@@ -15954,6 +16005,80 @@ mod tests {
         }
     }
 
+    /// Install the durable authority row that a room-agent runtime fixture
+    /// needs. Tests call this only after the package and room roster exist, so
+    /// the production path remains fail closed and no compatibility label is
+    /// mistaken for executable authority.
+    pub(super) fn authorize_room_agent_fixture(
+        state: &AppState,
+        room: &RoomKey,
+        agent_member_id: &str,
+        activation_policy: ocean_store::ActivationPolicy,
+        context_policy: ocean_store::ContextPolicy,
+    ) -> u64 {
+        authorize_room_agent_package_fixture(
+            state,
+            room,
+            agent_member_id,
+            agent_member_id,
+            activation_policy,
+            context_policy,
+        )
+    }
+
+    pub(super) fn authorize_room_agent_package_fixture(
+        state: &AppState,
+        room: &RoomKey,
+        agent_member_id: &str,
+        package_id: &str,
+        activation_policy: ocean_store::ActivationPolicy,
+        context_policy: ocean_store::ContextPolicy,
+    ) -> u64 {
+        let package = crate::room_agent_authority::resolve_package(package_id)
+            .expect("room-agent package fixture");
+        let decision_id = uuid::Uuid::new_v4().to_string();
+        let (binding, created, _audit) = with_rooms(state, |store| {
+            let access = store.room_access(room)?;
+            let owner_member_id = if access.state == ocean_core::RoomAccessState::Local {
+                store
+                    .agent_owners(room)?
+                    .into_iter()
+                    .find_map(|(agent, owner, present)| {
+                        (agent == agent_member_id && present).then_some(owner)
+                    })
+                    .expect("local authority fixture requires a live recorded owner")
+            } else {
+                store
+                    .room_credential(room)?
+                    .expect("federated authority fixture credential")
+                    .local_human_member_id
+            };
+            store.authorize_room_agent(
+                room,
+                ocean_store::AuthorizeAgentInput {
+                    agent_member_id: agent_member_id.to_string(),
+                    agent_package_id: package.package_id,
+                    agent_definition_digest: package.definition_digest,
+                    agent_definition_revision: package.definition_revision,
+                    display_name: package.display_name,
+                    owner_member_id,
+                    authorized_by: "fixture-operator".into(),
+                    activation_policy,
+                    context_policy,
+                    memory_scope: ocean_store::MemoryScope::None,
+                    requested_capabilities: package.requested_capabilities,
+                    room_capability_grants: Vec::new(),
+                    request_digest: format!("fixture:{decision_id}"),
+                    decision_id,
+                },
+                Utc::now(),
+            )
+        })
+        .expect("room-agent authority fixture");
+        assert!(created, "fixture authority must be a fresh binding");
+        binding.generation
+    }
+
     /// Build an `AppState` whose runtime is pinned to the Fake provider (so a
     /// turn runs synchronously and deterministically with no live LLM) and whose
     /// room store is a fresh in-memory SQLite DB. Returns the state plus the
@@ -16002,6 +16127,10 @@ mod tests {
             permissions: Arc::new(RwLock::new(HashMap::new())),
             longhouse: Arc::new(Mutex::new(ocean_longhouse::LonghouseRegistry::new())),
             rooms,
+            room_operator: Arc::new(room_operator::OperatorIdentity::for_test(
+                Some("test-room-operator"),
+                vec!["http://127.0.0.1:8790".into()],
+            )),
             // Injected, not read from the environment — same TASK-58 rule as the
             // runtime config dir above, so parallel tests never share a root.
             room_attachments_root: Arc::new(tmp.path().join("room-attachments")),
@@ -16454,6 +16583,10 @@ mod tests {
             permissions: Arc::new(RwLock::new(HashMap::new())),
             longhouse: Arc::new(Mutex::new(ocean_longhouse::LonghouseRegistry::new())),
             rooms,
+            room_operator: Arc::new(room_operator::OperatorIdentity::for_test(
+                Some("test-room-operator"),
+                vec!["http://127.0.0.1:8790".into()],
+            )),
             room_attachments_root: Arc::new(tmp.path().join("room-attachments")),
             room_wakes,
             room_access_wakes,
@@ -16626,16 +16759,6 @@ mod tests {
             reg.add_participant(
                 &key,
                 RoomParticipant {
-                    id: "helper".into(),
-                    kind: RoomParticipantKind::Agent,
-                    display_name: "Helper".into(),
-                },
-                Utc::now(),
-            )
-            .unwrap();
-            reg.add_participant(
-                &key,
-                RoomParticipant {
                     id: "john".into(),
                     kind: RoomParticipantKind::Human,
                     display_name: "John".into(),
@@ -16643,7 +16766,25 @@ mod tests {
                 Utc::now(),
             )
             .unwrap();
+            reg.add_agent_participant_with_owner(
+                &key,
+                RoomParticipant {
+                    id: "helper".into(),
+                    kind: RoomParticipantKind::Agent,
+                    display_name: "Helper".into(),
+                },
+                "john",
+                Utc::now(),
+            )
+            .unwrap();
         });
+        let generation = authorize_room_agent_fixture(
+            &state,
+            &key,
+            "helper",
+            ocean_store::ActivationPolicy::Mention,
+            ocean_store::ContextPolicy::InvocationOnly,
+        );
 
         // A human @-mentions the agent → should convene + queue a turn.
         let (status, body) = room_post_message(
@@ -16659,7 +16800,7 @@ mod tests {
         .await;
         assert_eq!(status, StatusCode::CREATED);
         let returned_message = &body.0["message"];
-        assert_eq!(returned_message["seq"], 2);
+        assert_eq!(returned_message["seq"], 3);
         assert_eq!(returned_message["author_id"], "john");
         assert_eq!(returned_message["author_kind"], "human");
         assert_eq!(
@@ -16681,9 +16822,15 @@ mod tests {
             "mention of an agent must fire exactly one trigger"
         );
 
-        let envelope = trigger_rx
-            .try_recv()
-            .expect("resolved Agent mention must emit room_trigger");
+        let envelope = loop {
+            let envelope = trigger_rx
+                .try_recv()
+                .expect("resolved Agent mention must emit room_trigger");
+            if matches!(envelope.event, AgentTurnEvent::Extension { ref extension, .. } if extension == "room_trigger")
+            {
+                break envelope;
+            }
+        };
         match envelope.event {
             AgentTurnEvent::Extension {
                 extension,
@@ -16697,7 +16844,7 @@ mod tests {
                         "room": "convene-room",
                         "target": "helper",
                         "reason": "on_mention: @helper mentioned",
-                        "triggered_by_seq": 2,
+                        "triggered_by_seq": 3,
                     })
                 );
                 assert_eq!(scope, None, "room triggers remain globally scoped");
@@ -16719,31 +16866,37 @@ mod tests {
             }
         }
 
-        // The event is followed synchronously by the audit append. The spawned
-        // turn may already have replied, but these first three persisted rows
-        // must stay densely ordered: join → author row → auto-convene audit.
+        // Admission is durably recorded before the legacy convene footprint.
+        // The spawned turn may already have replied, but the authority, author,
+        // admission, and legacy audit rows remain densely ordered.
         let immediate = with_rooms(&state, |reg| reg.transcript(&key, None)).unwrap();
-        assert!(immediate.len() >= 4);
+        assert!(immediate.len() >= 6);
         let returned: ocean_core::RoomMessage =
             serde_json::from_value(returned_message.clone()).unwrap();
         assert_eq!(
-            returned, immediate[2],
+            returned, immediate[3],
             "the response message is the exact persisted author row"
         );
         assert_eq!(immediate[0].seq, 0);
         assert_eq!(immediate[0].kind, RoomMessageKind::ParticipantJoined);
         assert_eq!(immediate[1].seq, 1);
-        assert_eq!(immediate[1].author_id, "john");
+        assert_eq!(immediate[1].author_id, "helper");
         assert_eq!(immediate[1].kind, RoomMessageKind::ParticipantJoined);
         assert_eq!(immediate[2].seq, 2);
-        assert_eq!(immediate[2].author_id, "john");
-        assert_eq!(immediate[2].kind, RoomMessageKind::Message);
+        assert_eq!(immediate[2].author_id, "system");
+        assert_eq!(immediate[2].kind, RoomMessageKind::System);
         assert_eq!(immediate[3].seq, 3);
-        assert_eq!(immediate[3].author_id, "system");
-        assert_eq!(immediate[3].author_kind, RoomParticipantKind::System);
-        assert_eq!(immediate[3].kind, RoomMessageKind::System);
+        assert_eq!(immediate[3].author_id, "john");
+        assert_eq!(immediate[3].kind, RoomMessageKind::Message);
+        assert_eq!(immediate[4].seq, 4);
+        assert_eq!(immediate[4].author_id, "system");
+        assert!(immediate[4].body.contains("\"outcome\":\"admitted\""));
+        assert_eq!(immediate[5].seq, 5);
+        assert_eq!(immediate[5].author_id, "system");
+        assert_eq!(immediate[5].author_kind, RoomParticipantKind::System);
+        assert_eq!(immediate[5].kind, RoomMessageKind::System);
         assert_eq!(
-            immediate[3].body,
+            immediate[5].body,
             "auto-convene: helper (on_mention: @helper mentioned)"
         );
 
@@ -16762,12 +16915,14 @@ mod tests {
             reply.body
         );
         assert!(
-            reply.seq > 2,
+            reply.seq > 3,
             "the spawned turn reply must follow the synchronous audit row"
         );
 
         // A session was queued/registered for the deterministic room+agent id.
-        let expected_sid = core_sid(room_agent_session_id(&key, "helper"));
+        let expected_sid = core_sid(persistent_rooms::authorized_room_agent_session_id(
+            &key, "helper", generation,
+        ));
         let registered = state
             .requests
             .read()
@@ -17016,16 +17171,6 @@ mod tests {
             reg.add_participant(
                 &key,
                 RoomParticipant {
-                    id: "helper".into(),
-                    kind: RoomParticipantKind::Agent,
-                    display_name: "Helper".into(),
-                },
-                Utc::now(),
-            )
-            .unwrap();
-            reg.add_participant(
-                &key,
-                RoomParticipant {
                     id: "john".into(),
                     kind: RoomParticipantKind::Human,
                     display_name: "John".into(),
@@ -17033,7 +17178,26 @@ mod tests {
                 Utc::now(),
             )
             .unwrap();
+            reg.add_agent_participant_with_owner(
+                &key,
+                RoomParticipant {
+                    id: "helper".into(),
+                    kind: RoomParticipantKind::Agent,
+                    display_name: "Helper".into(),
+                },
+                "john",
+                Utc::now(),
+            )
+            .unwrap();
         });
+
+        let generation = authorize_room_agent_fixture(
+            &state,
+            &key,
+            "helper",
+            ocean_store::ActivationPolicy::Mention,
+            ocean_store::ContextPolicy::InvocationOnly,
+        );
 
         // Mention the agent → convene a turn that runs in the room's workspace.
         let (status, _body) = room_post_message(
@@ -17050,7 +17214,9 @@ mod tests {
         assert_eq!(status, StatusCode::CREATED);
 
         // Wait for the convened reply so the turn has run and the session exists.
-        let expected_sid = core_sid(room_agent_session_id(&key, "helper"));
+        let expected_sid = core_sid(persistent_rooms::authorized_room_agent_session_id(
+            &key, "helper", generation,
+        ));
         let _reply = wait_for_message(&state, &key, |m| {
             m.author_id == "helper" && matches!(m.author_kind, RoomParticipantKind::Agent)
         })
@@ -17123,16 +17289,6 @@ mod tests {
             reg.add_participant(
                 &key,
                 RoomParticipant {
-                    id: "helper".into(),
-                    kind: RoomParticipantKind::Agent,
-                    display_name: "Helper".into(),
-                },
-                Utc::now(),
-            )
-            .unwrap();
-            reg.add_participant(
-                &key,
-                RoomParticipant {
                     id: "john".into(),
                     kind: RoomParticipantKind::Human,
                     display_name: "John".into(),
@@ -17140,7 +17296,26 @@ mod tests {
                 Utc::now(),
             )
             .unwrap();
+            reg.add_agent_participant_with_owner(
+                &key,
+                RoomParticipant {
+                    id: "helper".into(),
+                    kind: RoomParticipantKind::Agent,
+                    display_name: "Helper".into(),
+                },
+                "john",
+                Utc::now(),
+            )
+            .unwrap();
         });
+
+        let generation = authorize_room_agent_fixture(
+            &state,
+            &key,
+            "helper",
+            ocean_store::ActivationPolicy::Mention,
+            ocean_store::ContextPolicy::InvocationOnly,
+        );
 
         let (status, _body) = room_post_message(
             State(state.clone()),
@@ -17155,7 +17330,9 @@ mod tests {
         .await;
         assert_eq!(status, StatusCode::CREATED);
 
-        let expected_sid = core_sid(room_agent_session_id(&key, "helper"));
+        let expected_sid = core_sid(persistent_rooms::authorized_room_agent_session_id(
+            &key, "helper", generation,
+        ));
         let _reply = wait_for_message(&state, &key, |m| {
             m.author_id == "helper" && matches!(m.author_kind, RoomParticipantKind::Agent)
         })
@@ -18405,6 +18582,10 @@ mod tests {
             permissions: Arc::new(RwLock::new(HashMap::new())),
             longhouse: Arc::new(Mutex::new(ocean_longhouse::LonghouseRegistry::new())),
             rooms,
+            room_operator: Arc::new(room_operator::OperatorIdentity::for_test(
+                Some("test-room-operator"),
+                vec!["http://127.0.0.1:8790".into()],
+            )),
             room_attachments_root: Arc::new(dir.join("room-attachments")),
             room_wakes,
             room_access_wakes,
@@ -25602,9 +25783,11 @@ mod tests {
         // 113 -> 114: federated member removal added DELETE
         // /v1/rooms/persistent/{key}/members/{member_id}, the HTTP surface
         // for the capability the agent-delete sweep already exercised.
+        // 114 -> 123: Rooms Phase 1 adds binding list/detail/preview,
+        // authorize/reauthorize/suspend/resume/revoke, and explicit invoke.
         assert_eq!(
             banner.len(),
-            114,
+            123,
             "route baseline changed; review the manifest"
         );
 

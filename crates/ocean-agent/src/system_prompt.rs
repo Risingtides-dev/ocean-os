@@ -34,6 +34,15 @@ pub fn build_system_prompt(cwd: Option<&str>, client_type: Option<&str>) -> Stri
     )
 }
 
+/// Build the ordinary prompt while deliberately omitting operator-global
+/// memory guidance and auto-recalled facts. Room-scoped turns use this boundary
+/// even when their durable memory scope is `none`; a future room-memory
+/// provider must supply its own partitioned prompt/tool seam rather than
+/// redirecting this operator store by convention.
+pub fn build_system_prompt_without_memory(cwd: Option<&str>, client_type: Option<&str>) -> String {
+    build_system_prompt_from(cwd, client_type, assistants_root().as_deref(), None)
+}
+
 /// Inner form of [`build_system_prompt`] that resolves any file-loaded
 /// surface profile against an explicit `assistants_root` instead of the
 /// process-global one. This is the isolation seam (OCEAN-285): tests pass a

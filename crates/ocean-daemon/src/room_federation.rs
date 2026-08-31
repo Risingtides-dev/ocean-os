@@ -244,10 +244,22 @@ pub(super) struct FederatedTriggerDispatch {
     pub(super) ledger_event_id: String,
     pub(super) local_seq: u64,
     pub(super) target_member_id: String,
+    /// Exact durable source classification. Message ingestion can prove
+    /// mentions from the confirmed payload; workspace failure events remain
+    /// unknown to Phase 1 admission and therefore fail closed.
+    pub(super) trigger_kind: FederatedTriggerKind,
     /// The evaluator's wording for WHY this convene fired, quoted verbatim
     /// into the dispatcher's `room_trigger` payload — a build-failure convene
     /// must not log itself as a mention.
     pub(super) reason: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[allow(dead_code)] // ThreadReply is reserved for a confirmed federated thread source.
+pub(super) enum FederatedTriggerKind {
+    Mention,
+    ThreadReply,
+    Unknown,
 }
 
 #[derive(Debug, Deserialize)]
@@ -3255,6 +3267,7 @@ async fn ingest_message_row(
                         ledger_event_id: event.ledger_event_id.clone(),
                         local_seq: commit.message.seq,
                         target_member_id,
+                        trigger_kind: FederatedTriggerKind::Mention,
                         reason,
                     })
                     .is_err()
@@ -4020,6 +4033,7 @@ fn ingest_workspace_row(
                         ledger_event_id: event.ledger_event_id.clone(),
                         local_seq: commit.message.seq,
                         target_member_id,
+                        trigger_kind: FederatedTriggerKind::Unknown,
                         reason: trigger_reason.clone(),
                     })
                     .is_err()
