@@ -7338,3 +7338,36 @@ safe to build ahead of the deploy, and the absent-field case is the live path
 until it ships. Gate: fmt clean, clippy `-p ocean-daemon --all-targets -D
 warnings` clean, 822 tests 0 failed, toolchain 1.97.0. No deploy, no migration.
 _________________________________________________________________________________
+
+time:      [01:26] [08-31-26]
+agent:     [claude] [opus 5]
+worktree:  sweep/wave40-bedrock-audit-action-rename
+type:      [merge]
+area:      [backend]
+
+Wave-40 land sweep of cross-repo debt this same wave created. ocean-bedrock #68
+took its two durable-write audit actions off the room-event namespace --
+`room.workspace.flush_write` -> `file.workspace_flush`, `room.workspace.file_write`
+-> `file.workspace_write` -- because `room.workspace.file_write` sat four lines
+from the genuine event `room.workspace.file_written` and had already sent three
+readers hunting rows on a rail those rows do not travel. Three sites here named
+the old spellings: the `file_written` bullet's cross-reference at :3288, the
+`workspace_action_is_marker` paragraph that exists precisely to say which rail
+these rows travel, and live test code inside
+`workspace_marker_matcher_rejects_near_miss_shapes` whose comment introduced
+them as "Real ocean-bedrock strings that are not room events". For a doc comment
+whose whole job is telling the next reader which rail a row travels, being wrong
+about the row's NAME is the exact failure it exists to prevent.
+
+No behaviour changed and nothing was widened. `workspace_action_is_marker` is a
+pure string function over an unchanged 13-entry allowlist; the rename touched
+`appendAudit` actions, never `emitWorkspaceEvent`, so the pinned set is still 22
+and no tripwire count moved. The test now names all FOUR strings -- both current
+spellings and both historical ones -- because Bedrock did not rewrite stored
+history, so an old row read back still carries the `room.workspace.` pair, and
+both paragraphs now say so. Verified the new pins are load-bearing rather than
+decorative: adding `file.workspace_write` to the allowlist fails
+`workspace_marker_matcher_rejects_near_miss_shapes` at :8031. Gate: fmt clean,
+clippy `-p ocean-daemon --all-targets -D warnings` clean, 822 tests 0 failed,
+toolchain 1.97.0. Docs and one test literal only -- no deploy, no migration.
+_________________________________________________________________________________
