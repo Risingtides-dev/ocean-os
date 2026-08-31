@@ -8375,3 +8375,30 @@ landing and keep Stage 2 contributed folders explicitly closed pending its own
 accepted implementation manifest. No local daemon install/restart, live database
 mutation, or Surface served-state claim was made in this closeout.
 _________________________________________________________________________________
+
+time:      [17:33] [31-08-26]
+agent:     [codex] [gpt-5.6-sol]
+worktree:  [codex/rooms-phase1-live-receipt-20260831]
+type:      [handoff]
+area:      [testing]
+
+Completed the live Rooms Phase 1 cutover from isolated clean worktrees without
+changing the operator's dirty Claude checkout. Installed Ocean OS main
+`7bf80cdcb191bf1ca8c03d502b160e91fe248802`; launchd now serves daemon PID
+73654 on loopback `:4780`, `/health` reports revision `7bf80cdcb191` with zero
+persist and GC failures, and the immutable installed binary hashes
+`0c2baf3a17415ce05920211ab1191a9970a92e9ae691d20c56657a34f3c75e07`.
+
+Ocean Surface's fail-safe deployer preserved prior release `9982a7f8` after its
+first exact-main build exhausted disk while writing a generated Cargo artifact.
+Removed only reproducible Cargo targets from the two completed disposable Codex
+worktrees, recovering 70.7 GiB, then allowed the normal full gate to retry. All
+64 proxy tests, 1,200-plus UI and regression tests, denied-warning checks, format,
+24 atomic-promotion assertions, Trunk release, and proxy release completed. The
+deployer atomically promoted merged Surface main
+`877788a3beebb84fc14150b0f59c9a7cf041dc9c`, exited 0, and now serves PID 22608
+on `:8790`. Health is green; the served WASM and JS hashes exactly match the
+immutable release at `6872181a6f4f535498e3a816020cb197f0ee65dd3c39aafdba57119be4cd55a0`
+and `7846b1c95e915c7899bff104368503ee1aadb78cfa68653f41af84ad24d5d223`.
+Stage 2 contributed folders remains closed pending its own accepted manifest.
+_________________________________________________________________________________
