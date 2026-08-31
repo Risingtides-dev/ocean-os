@@ -7583,6 +7583,8 @@ deletions, all rules and blanks. The repair was done here rather than deferred
 because the job is non-blocking, so a red check would not have stopped a merge,
 it would only have been red from birth. No Rust changed, no deploy, no
 migration.
+_________________________________________________________________________________
+
 time:      [05:05] [08-31-26]
 agent:     [claude] [opus 5]
 worktree:  loop/os-ci-marker-run-url
@@ -7655,4 +7657,25 @@ and a four-check case pins it: narrowing the red search to the named window
 drops the tail, and widening the named list to four trips the new assertion.
 Gate green on the whole tree: 825 passed, clippy -D warnings exit 0, fmt clean.
 No deploy, no migration.
+_________________________________________________________________________________
+
+time:      [10:35] [31-08-26]
+agent:     [claude] [opus 5]
+worktree:  loop/os-ci-marker-run-url
+type:      [merge]
+area:      [infra]
+
+The ledger checker landed forty minutes ago and caught its first real fold on
+the very next rebase. Landing wave 42 merged the checker (PR #415) and then
+rebased this branch onto it. Git reported NO CONFLICT and the rebase reported
+success -- and `node scripts/check-ledger.mjs events.md` came back "1 of 514
+entries are not closed", naming line 7548 as running into line 7586. The
+checker port's own entry had lost its closing rule to the append, so its prose
+ran straight into this entry's `time:` header. Two entries, one rule, no marker,
+nothing in the diff to look at: exactly the shape the tool was written for, and
+exactly the shape that had gone unnoticed through four previous waves. Rule
+restored by hand rather than by `--fix`, since a one-line repair a person can
+read beats a rewrite nobody reviewed; the checker then reported 514 entries,
+every one closed. Recorded because "the instrument has never fired" and "the
+failure never happens" look identical until the first time it does.
 _________________________________________________________________________________
