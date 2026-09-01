@@ -13,7 +13,18 @@ type:      [issues] | [gh actions] | [bug report] | [refactor] | [feature-reques
 area:      [research] | [testing] | [review] | [writing] | [automations] | [skill/mcp] | [agent-building] | [frontend] | [backend] | [design] | [analysis] | [docs] | [infra]
 
 <description of work done>
+_________________________________________________________________________________ HH:MM branch
 ```
+
+Close every entry with that `___` rule, and put the entry's own `HH:MM` and
+`worktree:` after it. `events.md merge=union` keeps a line both sides added only
+once: two parallel appends that end on the SAME bare rule come out of the merge
+sharing one, and the second entry's `time:` header then lands under the first
+entry's prose — no conflict, no marker, nothing a merge check can see. A rule
+that names its own entry is not a line the other side also wrote. The 697 bare
+rules already below stay valid, because the ledger is append-only and nothing
+rewrites them; `node scripts/check-ledger.mjs [--fix]` is what finds an entry
+that lost its rule and closes it by identity.
 
 `time:` is 24-hour, always. This line used to read `[HH:MMam/pm]`, so 251 of the
 386 entries below were written in am/pm — by agents correctly following the
@@ -8866,3 +8877,52 @@ No production line changed in this pass. Gate re-run on the amended tree:
 ocean-daemon --all-targets -- -D warnings` exit 0, `cargo fmt --check` exit 0,
 `cargo xtask docs-check` PASS, `node scripts/check-ledger.mjs` clean.
 _________________________________________________________________________________
+time:      [02:51] [01-09-26]
+agent:     [claude-code], [claude-opus-5]
+worktree:  loop/os-ledger-needs-the-per-entry-identity-separator-too
+type:      [refactor]
+area:      [infra]
+
+Ported ocean-bedrock's per-entry identity separator (its PR #98) to this repo,
+the third and largest copy of one convention. `events.md merge=union` keeps a
+line both sides added only once, so two parallel appends that end on the SAME
+bare `___` rule come out of a merge sharing one: the second entry's `time:`
+header lands under the first entry's prose, with no conflict and nothing a merge
+check can see. A rule carrying its own entry's `HH:MM` and `worktree:` is not a
+line the other side also wrote, so the two entries no longer END on one.
+`scripts/check-ledger.mjs` now accepts both rule forms — the 697 bare ones
+already here stay valid forever, because the ledger is append-only — measures
+rule width off the underscore RUN rather than the whole line so a suffix cannot
+widen every later repair, and `--fix` writes the identity form read off the
+entry itself. Its executable lines are once again byte-identical to bedrock's
+copy apart from the usage text, which is what ci.yml already claims of them and
+what stopped being true the day bedrock's port landed. Documented the separator
+in the fenced schema block at the top of this file, where this repo's entry
+contract actually lives, with one pointer to it from AGENTS.md. Three limits are
+recorded in the checker header rather than coded around: it never asserts a
+separator is unique or identity-bearing, since that would red every historical
+bare rule and every entry a slice in flight is writing; identity saves an
+entry's tail and not its head, so two same-minute appends on ANY branches can
+still fuse their shared blank and `time:` lines — the branch sits below both, on
+`worktree:` — with this check exiting 0; and an entry owns its rule but NOT the
+blank line after it — union ate that blank on one sibling repo's rebase and kept
+it on another's within the hour, purely on where xdiff anchored, and losing it
+costs nothing the rule does not already do.
+
+One correction to the brief this slice was cut from: the fenced template was
+expected to take a bare rule, on the reading that it names no worktree VALUE. It
+names `[branch/ref]`, so `entryIdentity` returns that placeholder and a repair
+would close the template `___ [branch/ref]`. Harmless — the template is closed
+and an append-only file does not reopen it — but pinned in the test rather than
+left to surprise someone mid-rebase.
+
+Gate: `node --test scripts/check-ledger.test.mjs` 14 passed / 0 failed, `node
+scripts/check-ledger.mjs events.md` 545 entries every one closed, `node --check`
+clean on both files. Each of the five ported changes was reverted individually
+against the new suite and every one went red, including the two that bedrock's
+own port first missed. No Rust touched, no deploy, no migration. CI's `ledger`
+job runs this suite and — like `check`, `msrv` and `deny` — is deliberately NOT
+a required status check there: red is information, not a lock. Three backlog
+entries and one earlier wave's lesson said otherwise; ci.yml's own comment is
+the authority and it says the opposite.
+_________________________________________________________________________________ 02:51 loop/os-ledger-needs-the-per-entry-identity-separator-too

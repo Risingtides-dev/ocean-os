@@ -18,7 +18,7 @@ This is the root devlog contract for the `ocean-os` repository. Every agent ente
 - No child doc may weaken this root contract.
 - Cross-repo routing map: `docs/OCEAN_PROJECT_MAP.md`.
 - Canonical workspace package/entry/test index: `crates/AGENTS.md`. Do not maintain a second crate inventory here.
-- After any meaningful change, do a devlog pass: update the nearest owning `AGENTS.md`, refresh affected child indexes, remove stale text, and append a root `events.md` entry with `worktree:`.
+- After any meaningful change, do a devlog pass: update the nearest owning `AGENTS.md`, refresh affected child indexes, remove stale text, and append a root `events.md` entry with `worktree:`, closed by the `___ HH:MM <worktree>` rule the fenced schema block at the top of `events.md` defines — that block is the entry contract, and the identity on the rule is what stops a union merge fusing two parallel appends.
 - Project code is `MIT OR Apache-2.0`, copyright © 2026 Rising Tides. Preserve `NOTICE.md` and local donor notices; Ocean names, logos, and distinctive brand assets remain outside the open-source grants under `TRADEMARKS.md`.
 - Rust workspace packages are private distribution inputs, not crates.io releases: `[workspace.package] publish = false`, and every member must inherit it or set `publish = false` explicitly. `cargo xtask docs-check` enforces this for new members.
 

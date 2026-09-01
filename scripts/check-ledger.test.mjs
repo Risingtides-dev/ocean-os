@@ -1,8 +1,9 @@
 // Covers scripts/check-ledger.mjs. ocean-bedrock exercises the same logic from
 // the other end — it merges two branches with the real union driver and asserts
-// the checker sees the fold — but that test needs a node manifest and a git
-// harness this repo has none of. These are pure over the text instead, plus the
-// exit contract, which is the part CI actually depends on.
+// the checker sees the fold, and that the identity separator stops it — but that
+// test needs a node manifest and a git harness this repo has none of. These are
+// pure over the text instead, plus the exit contract, which is the part CI
+// actually depends on.
 //
 // Run: node --test scripts/check-ledger.test.mjs
 import assert from 'node:assert/strict';
@@ -11,12 +12,22 @@ import os from 'node:os';
 import path from 'node:path';
 import { mkdtemp, readFile, writeFile } from 'node:fs/promises';
 
-import { closeEntries, main, openEntries, readEntries } from './check-ledger.mjs';
+import { closeEntries, entryIdentity, main, openEntries, readEntries } from './check-ledger.mjs';
 
 const RULE = '_'.repeat(81);
 
-function entry(time, prose) {
-  return [`time:      [${time}] [01-01-26]`, 'agent:     [test]', 'worktree:  main', '', prose];
+// `worktree` is a parameter because the identity a repair writes is read off
+// this line: an entry on a branch closes with its minute AND its branch, one
+// written on the main checkout with the minute alone. Pass null for an entry
+// carrying no `worktree:` field at all.
+function entry(time, prose, worktree = 'main') {
+  return [
+    `time:      [${time}] [01-01-26]`,
+    'agent:     [test]',
+    ...(worktree === null ? [] : [`worktree:  ${worktree}`]),
+    '',
+    prose,
+  ];
 }
 
 // A healthy ledger: every entry closed by its rule, one blank line between the
@@ -59,8 +70,17 @@ test('a fold leaves the first entry open and names where the next one starts', (
   assert.equal(open[0].runsInto, 6, 'the second header lands directly under the first prose');
 });
 
+// All 697 rules this ledger carried before the convention are bare, and it is
+// append-only, so the bare form has to keep closing an entry for as long as the
+// file exists.
+test('both rule forms close an entry, and a rule may carry anything after the bar', () => {
+  const bare = [...entry('10:00', 'First.'), RULE, ''];
+  const identity = [...entry('11:00', 'Second.'), `${RULE} 11:00 loop/slice-b`, ''];
+  assert.equal(openEntries([...bare, ...identity].join('\n')).length, 0);
+});
+
 test('an entry closed anywhere in its body counts as closed', () => {
-  // 144 entries in this ledger quote a second rule inside their prose, so the
+  // 145 entries in this ledger quote a second rule inside their prose, so the
   // check is "a rule before the next header", never "a rule on the last line".
   // The first entry's rule is followed by more prose, so a last-line reading
   // would call it open — which is what makes this fixture discriminate.
@@ -68,6 +88,16 @@ test('an entry closed anywhere in its body counts as closed', () => {
   const ledger = [...quoted, ...entry('11:00', 'Second.'), RULE].join('\n');
   assert.equal(openEntries(ledger).length, 0);
   assert.notEqual(quoted.filter((line) => line.trim()).pop(), RULE, 'the fixture must not end on a rule');
+});
+
+test('entryIdentity reads the minute and the worktree off the entry itself', () => {
+  assert.equal(entryIdentity(entry('09:04', 'On a branch.', 'loop/slice-a')), '09:04 loop/slice-a');
+  assert.equal(entryIdentity(entry('09:04', 'On the main checkout.', null)), '09:04', 'no branch to name');
+  assert.equal(
+    entryIdentity(['time:      no clock here', 'worktree:', '', 'Neither field carries a value.']),
+    '',
+    'an entry naming neither a time nor a branch has no identity to write',
+  );
 });
 
 test('closeEntries repairs the fold without deleting a line, and the rerun is clean', () => {
@@ -79,15 +109,47 @@ test('closeEntries repairs the fold without deleting a line, and the rerun is cl
   const after = text.split('\n');
   assert.ok(after.length > before.length, 'the repair inserts');
   assert.ok(isSubsequence(before, after), 'the repair deletes nothing');
-  assert.ok(after.includes(RULE));
+  // The identity form, not a bare rule: a repair that wrote the bare one would
+  // close this entry and hand the next merge the same shared line to fold on.
+  assert.equal(after[5], `${RULE} 10:00 main`, "the repaired rule carries the first entry's own identity");
+  assert.deepEqual(
+    after.slice(6, 8),
+    ['', 'time:      [11:00] [01-01-26]'],
+    'and the blank line the fold ate comes back with it, before the header it was fused into',
+  );
 });
 
-test('the repair copies the rule width the file already uses', () => {
-  const narrow = '_'.repeat(73);
-  const folded = [...entry('10:00', 'First.'), ...entry('11:00', 'Second.'), narrow, ''].join('\n');
+// The property the whole port buys, at the width the loop actually runs: two
+// slices appending in parallel must not end on the same line, or union emits
+// that line once and fuses them again.
+test('two entries repaired in the same minute close with rules that differ', () => {
+  const folded = [
+    ...entry('09:00', 'The entry both slices branched from.'),
+    RULE,
+    '',
+    ...entry('12:30', 'Slice A.', 'loop/slice-a'),
+    ...entry('12:30', 'Slice B.', 'loop/slice-b'),
+  ].join('\n');
   const repaired = closeEntries(folded).text.split('\n');
-  assert.ok(repaired.includes(narrow));
-  assert.ok(!repaired.includes(RULE), 'never the default width when the file has one of its own');
+  const rules = repaired.filter((line) => /^_{5,}/.test(line));
+  assert.equal(rules.length, 3, "the base entry's bare rule plus one per repaired entry");
+  assert.equal(new Set(rules).size, 3, 'the minute is shared, so the worktree is the whole of the identity here');
+});
+
+test('the repair copies the rule width the file already uses, measuring the bar and not the line', () => {
+  const narrow = '_'.repeat(73);
+  // The file's own rules already carry identity. Measuring the whole line
+  // instead of the underscore run would read this as a 73 + suffix width and
+  // widen every later repair away from the shape the file uses.
+  const folded = [
+    ...entry('10:00', 'First.'),
+    ...entry('11:00', 'Second.'),
+    `${narrow} 11:00 main`,
+    '',
+  ].join('\n');
+  const repaired = closeEntries(folded).text.split('\n');
+  assert.equal(repaired[5], `${narrow} 10:00 main`);
+  assert.ok(!repaired.some((line) => line.startsWith(RULE)), 'never the default width when the file has one of its own');
 });
 
 test('a ledger whose every entry is open is fully repaired in one pass', () => {
@@ -102,15 +164,35 @@ test('a ledger whose every entry is open is fully repaired in one pass', () => {
 // see the script header — and the accepted behaviour is pinned here so nobody
 // later reads it as a bug and forks this copy from bedrock's to "fix" it.
 test('the fenced schema template parses as an entry, and a rule closes it', () => {
-  const header = ['# ocean-os — canonical repo ledger', '', '```', 'time:      [HH:MM] [dd-mm-yy]', '```', '', '---', ''];
+  // The real header's shape, placeholders included: its clock is a literal
+  // `[HH:MM]`, which is not a time and never matches, and its `worktree:` line
+  // holds a placeholder rather than a branch.
+  const header = [
+    '# ocean-os — canonical repo ledger',
+    '',
+    '**Schema — required fields:**',
+    '',
+    '```',
+    'time:      [HH:MM] [dd-mm-yy]  (24-hour, EST UTC-4 — never am/pm)',
+    'agent:     [harness], [model-id], [persona]*  (* if known)',
+    'worktree:  [branch/ref] or [main]   (required on every entry)',
+    '```',
+    '',
+    '---',
+    '',
+  ];
   const withHeader = [...header, ...entry('10:00', 'First.'), RULE, ''].join('\n');
 
   const open = openEntries(withHeader);
   assert.equal(open.length, 1, 'the template, not the real entry');
-  assert.equal(open[0].line, 4);
+  assert.equal(open[0].line, 6);
 
   const repaired = closeEntries(withHeader).text.split('\n');
-  assert.equal(repaired[7], RULE, 'the rule lands after the --- that already divides header from log');
+  assert.equal(
+    repaired[11],
+    `${RULE} [branch/ref]`,
+    'the rule lands after the --- that already divides header from log, and carries no minute because `[HH:MM]` is not a clock',
+  );
   assert.equal(openEntries(repaired.join('\n')).length, 0);
 });
 
@@ -119,10 +201,12 @@ test('main exits 0 on a clean ledger and 1 on an open one', async () => {
   assert.equal(await main([await tempLedger(FOLDED)]), 1);
 });
 
-test('main --fix closes the ledger in place and exits 0', async () => {
+test('main --fix closes the ledger in place with the identity form, and exits 0', async () => {
   const file = await tempLedger(FOLDED);
   assert.equal(await main([file, '--fix']), 0);
-  assert.equal(openEntries(await readFile(file, 'utf8')).length, 0);
+  const repaired = await readFile(file, 'utf8');
+  assert.equal(openEntries(repaired).length, 0);
+  assert.match(repaired, /^_{5,} 10:00 main$/m, 'the rule --fix wrote names the entry it closes');
   assert.equal(await main([file]), 0, 'and the plain rerun now agrees');
 });
 
