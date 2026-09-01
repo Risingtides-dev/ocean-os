@@ -8580,3 +8580,24 @@ Gate on the amended tree: `cargo test -p ocean-daemon` 855 green,
 ocean-store --all-targets -- -D warnings` exit 0, `cargo fmt --check` exit 0.
 No deploy and no migration.
 _________________________________________________________________________________
+
+time:      [21:38] [08-31-26]
+agent:     [claude] [opus 5]
+worktree:  loop/os-audit-json-rows-reach-the-human-transcript-unprojected
+type:      [merge]
+area:      [docs]
+
+Landing this slice ran `cargo xtask docs-check`, which the Verification section
+names as the docs-only lane, and it was already RED on origin/main:
+`crates/ocean-store/AGENTS.md has broken local link href`. Confirmed
+pre-existing by restoring origin/main's copy of that file and watching it fail
+identically, so this branch did not cause it — commit ec23a5a0's markdown-link
+attack description spells the vector out literally, and the link checker reads
+that literal as a local link target no matter that it sits inside backticks.
+The prose now names the syntax instead of writing it (a bracketed label
+followed by a parenthesised destination), which is the same claim, and carries
+one clause saying why it is spelled out so the next author does not helpfully
+restore the literal. docs-check goes from FAILED (1 issue) to PASS across 30
+packages, 157 active Markdown files, 179 local links. No code, no invariant, no
+deploy.
+_________________________________________________________________________________

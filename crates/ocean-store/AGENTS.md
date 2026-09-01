@@ -224,9 +224,12 @@ outbox, and the restart-safe federation core (S2 P2-A). One database file
   carries only the sanitized filename and a server-computed byte count —
   sanitized meaning `marker_prose`, above. A client-supplied string can
   otherwise forge a transcript line twice over: a newline forges a row in
-  anything that splits on lines, and `[label](href)` forges an anchor in
+  anything that splits on lines, and markdown's own link syntax — a bracketed
+  label followed by a parenthesised destination — forges an anchor in
   ocean-surface, which puts system rows through a markdown tokenizer and is
-  not the naive renderer this bullet used to name. `byte_len` and `sha256`
+  not the naive renderer this bullet used to name. Spelled out rather than
+  written literally because `cargo xtask docs-check` reads the literal form as
+  a local link and reds on it, backticks included. `byte_len` and `sha256`
   are what the server measured; a negative stored `byte_len` fails closed on
   read.
 
