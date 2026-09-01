@@ -177,16 +177,19 @@ outbox, and the restart-safe federation core (S2 P2-A). One database file
   the wrong crate and destroys the evidence on the way.
   `a_failure_marker_is_neutralized_and_the_audit_beside_it_is_not` pins both
   halves so neither side of the boundary drifts.
-  KNOWN OPEN, deliberately not closed here: neutralizing an audit body belongs
-  at the READ boundary, and only half of it exists. `ocean-daemon`'s
-  `room_history_text` already replaces every `room.agent.*` body with
-  `[room agent bootstrap audit]` before an agent sees it, but
-  `GET /v1/rooms/persistent/{key}/transcript` hands a human client the body
-  raw and ocean-surface puts it through `room_markdown::body_view`, so a
-  bootstrap `owner_member_id` — free-form, shape-checked nowhere — of
-  `[click here](https://evil.co)` still renders as an attacker-labelled link
-  in the room's own voice. That closes by giving the human transcript route
-  the projection the agent route already has, tracked as its own slice.
+  Neutralizing an audit body belongs at the READ boundary, and both halves now
+  exist there. `ocean-daemon`'s `room_history_text` replaces every
+  `room.agent.*` body with `[room agent <kind> audit]`, and
+  `projected_room_message` beside it applies the SAME function to every
+  human-facing read — `GET /v1/rooms/persistent/{key}`, `/transcript`,
+  `/snapshot`, and the `/events` SSE tail. It was never one route: a client
+  hydrates through `/snapshot` and then tails `/events`, so a fix covering the
+  paged reads alone would have left the live path injectable while reading as
+  closed. `audit_rows_reach_every_human_route_projected` drives a bootstrap
+  `owner_member_id` — free-form, shape-checked nowhere — of
+  `[click here](https://evil.co)` through all four and asserts this store still
+  holds it verbatim, which is the boundary: the rendering bug is fixed where it
+  is read, and the ledger keeps the evidence.
 - **An artifact title is refused blank, never stored blank.** `create_artifact`
   and `amend_artifact` both raise `ArtifactTitleBlank` on a whitespace-only
   title before any read, UPDATE, or transcript insert, so a refusal writes
