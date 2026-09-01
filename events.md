@@ -33,6 +33,17 @@ rewriting history to satisfy a format change is worse than the inconsistency.
 New entries use 24-hour. Reviewers: flag am/pm on new entries only, and point
 here rather than at a rule that lived outside the repo.
 
+The date is `dd-mm-yy`. At least 116 of the entries below are `mm-dd-yy`
+(another 127, when this paragraph was written, have both fields under 13 and
+cannot be told apart either way),
+written by agents following the failure text in `.github/workflows/ci.yml`,
+which said `MM-DD-YY` until 1 September 2026, when the commit that added this
+paragraph changed it to match. Those are
+grandfathered for the same reason the am/pm entries are: the ledger is
+append-only, and a date rewritten into a different format is a date nobody can
+read back with confidence. New entries use `dd-mm-yy`; reviewers flag it on new
+entries only.
+
 ---
 _________________________________________________________________________________
 
@@ -9025,3 +9036,55 @@ Gate re-run after the doc pass: `cargo test -p ocean-daemon` 863 passed / 0 fail
 files, 179 local links), `node scripts/check-ledger.mjs events.md` 546 entries
 every one closed.
 _________________________________________________________________________________ 04:49 loop/os-snapshot-closed-marker
+
+time:      [04:49] [01-09-26]
+agent:     [claude-code], [claude-opus-5]
+worktree:  loop/os-ledger-date-format-is-ruled-dd-mm-yy-by-the-schema-and-mm-dd-yy-by-ci
+type:      [refactor]
+area:      [docs]
+
+Two checked-in authorities in this repo told agents opposite things about the
+date in a `time:` header, and an agent that picked the wrong one wrote a
+September entry that reads as January in a file whose entire contract is
+chronological order. The schema block at the top of this file says `dd-mm-yy`;
+`.github/workflows/ci.yml`'s guard failure text said `MM-DD-YY`. The schema
+block wins, for three reasons that are in the repo rather than in taste. Root
+AGENTS.md names "the fenced schema block at the top of `events.md`" as the entry
+contract, which ci.yml's shell `echo` inside a failure message is not. The ledger
+already obeys it: counting entries whose first date field exceeds 12, 297 are
+provably `dd-mm-yy` against 116 provably `mm-dd-yy`, with 127 ambiguous as this
+lands — ruling
+the other way would make 297 existing entries wrong in an append-only file. And
+this file already settled a change of exactly this shape once, when the `time:`
+line stopped being am/pm: grandfather the old entries, tell reviewers to flag new
+ones only, point here rather than at a rule living outside the repo. So one CI
+string changed, a comment above it records that it now deliberately diverges from
+the bedrock and surface mirrors it was copied from, and one paragraph joined the
+am/pm one. No historical entry was rewritten, including the entry headed `time: [01:03] [09-01-26]` — named by its
+timestamp rather than by a line number, because a line number in this file holds
+only while nothing above it moves and this very commit moved it. It is preceded
+by an entry
+dated `[08-31-26]` and followed by entries dated `[01-09-26]` — the same day
+written two ways on either side of it — and stays exactly as its author left it.
+
+This ruling binds ocean-os and nothing else, because a ledger is a per-repo
+contract and the three legitimately differ. Measured, so nobody harmonises the
+wrong way: ocean-bedrock is 95 `mm-dd` against 13 `dd-mm` and its own ci.yml says
+`MM-DD-YY` — self-consistent, leave it alone. ocean-surface is 139 `mm-dd`
+against 73 `dd-mm` at origin/main and has no schema block, but its ci.yml:310
+carries the same `MM-DD-YY` guard text bedrock's does — an authority, just not a
+schema block — so it is self-consistent too and is likewise left alone. No
+date-format check was added to `scripts/check-ledger.mjs`: diffed against
+bedrock's copy with comments stripped, every executable line is identical bar the
+HELP usage text, and a per-repo format rule would fork the one file three repos
+share. This is a text change, and it is one string plus one paragraph for a human
+to reverse if the ruling is wrong.
+
+Note for anyone reading this as a merge unblock: it is not one. ci.yml's own
+comment says the `ledger` job — like `check`, `msrv` and `deny` — is deliberately
+NOT a required status check, because red there is information, not a lock.
+
+Gate: `cargo xtask docs-check` PASS, `node scripts/check-ledger.mjs events.md`
+547 entries every one closed on the rebased tree this lands as, ci.yml re-parsed
+clean and the `ledger` job still carries its steps. No Rust touched, no deploy, no migration.
+_________________________________________________________________________________ 04:49 loop/os-ledger-date-format-is-ruled-dd-mm-yy-by-the-schema-and-mm-dd-yy-by-ci
