@@ -9088,3 +9088,129 @@ Gate: `cargo xtask docs-check` PASS, `node scripts/check-ledger.mjs events.md`
 547 entries every one closed on the rebased tree this lands as, ci.yml re-parsed
 clean and the `ledger` job still carries its steps. No Rust touched, no deploy, no migration.
 _________________________________________________________________________________ 04:49 loop/os-ledger-date-format-is-ruled-dd-mm-yy-by-the-schema-and-mm-dd-yy-by-ci
+
+time:      07:10 01-09-26
+agent:     claude-code, claude-opus-5, ocean-loop builder
+worktree:  loop/os-no-route-can-serve-the-newest-page-of-a-transcript-only-the-oldest
+type:      feature-request
+area:      backend
+
+Every transcript read in this repo started at the beginning. `transcript_page`'s
+SQL is `WHERE seq > ?2 ORDER BY seq`, so a room with 12,000 messages hydrated at
+message #1 and the tail — the only part anyone opens a room to see — was
+reachable only by transferring the whole log. The proof the shape was missing is
+already in the tree: `ContextPolicy::RoomRecent` reads `MAX(seq)` and does
+`latest.saturating_sub(ROOM_CONTEXT_TAIL)` to fake a window, which quietly hands
+a woken agent fewer than 20 rows the moment seq has a gap.
+
+Added `RoomStore::transcript_tail_page(key, before_seq, limit)` beside the
+forward read rather than widening it — a fourth parameter on `transcript_page`
+would have dragged ten call sites plus `room_summary.rs` into the diff for a
+window only `/snapshot` serves. Its rows stay ASCENDING so no renderer
+downstream changes; only the cursor runs the other way, and it is a separate
+`TranscriptTailPage` type whose cursor is named `prev_seq` precisely so a
+backward cursor has no field called `next_seq` to be replayed into an
+`after_seq`. `has_more` means "older rows exist" there, the mirror of what it
+means forward.
+
+The bounds are the mirror image of the guard `load_transcript_page` already
+carries. Forward, a `u64` cursor above `i64::MAX` is after every row, so the
+honest answer is an empty page — the comment there records an `as` cast that
+once wrapped such a cursor negative and replayed the entire transcript.
+Backward, that same cursor is BEFORE every row, so the honest answer is the
+newest page: it saturates to `i64::MAX`. That is not a sentinel bolted on, it is
+what "rows before a number past the end" means, and it is how a client opens at
+the tail before it knows the last seq. `before_seq = 0` is a terminal empty page,
+since the first message's seq is 0 and nothing precedes it.
+
+On the wire: `GET /v1/rooms/persistent/{key}/snapshot?before_seq=N&limit=M`.
+Forward behaviour is untouched when the parameter is absent, so the existing
+surface client sees no change. `after_seq` and `before_seq` together are a typed
+400 (`conflicting_transcript_cursors`) — a caller that sent both has two
+different pages in mind and no precedence rule would answer the one it meant.
+The parameter is on a new `SnapshotQuery` rather than the shared
+`TranscriptQuery`, so `/transcript` does not advertise a cursor it would drop.
+
+The soft-closed audit arm mirrors the window. Without that, a frozen call room
+would paint its OLDEST page while a live one painted its newest — the same
+hydration, two different screens, decided by whether the call had ended. One
+ceiling is inherited and recorded in the code rather than hidden: the frozen
+record `get_including_closed` loads is itself the oldest `MAX_TRANSCRIPT_LIMIT`
+rows, so a closed room longer than that serves the newest of its first thousand.
+Lifting that is a change to `load_record`, not to this window.
+
+Outside the declared scope, and flagged: `crates/ocean-daemon/src/main.rs`. Two
+of its tests construct `Query(TranscriptQuery { .. })` to call `room_snapshot`
+directly, so the handler's new query type forced them to change. Test-only, two
+literals, no behaviour touched — but the loop's scoping was wrong to omit it.
+
+Gate: `cargo xtask ci` PASS. Beyond it, 30 individual mutations run against the
+new assertions one at a time (Wave 52's lesson: one run per test function only
+proves the first assertion bites). Every new assertion is a proven first-failure
+except six, named here rather than glossed: the paging loop's own
+`pages <= total + 2` tripwire, `is_empty()` on a genuinely empty table and
+`last_seq == null` on an empty page (no mutation of this code can fabricate rows
+into them), the two `status == OK` preconditions, and two mid-walk spot checks on
+pages 2 and 3 that evaluate the same expressions page 1 already pins. No deploy,
+no migration.
+_________________________________________________________________________________ 07:10 loop/os-no-route-can-serve-the-newest-page-of-a-transcript-only-the-oldest
+
+time:      07:44 01-09-26
+agent:     claude-code, claude-opus-5, ocean-loop builder (refinement)
+worktree:  loop/os-no-route-can-serve-the-newest-page-of-a-transcript-only-the-oldest
+type:      review
+area:      backend
+
+The review rejected the execution, not the design, and it was right on all
+three counts. The headline was that the closed-room tail served the WRONG page
+and nothing on the wire said so: a soft-closed room of 1005 messages answered
+`?before_seq=<u64::MAX>&limit=4` with seqs 996-999, `last_seq: 999`,
+`prev_seq: 996`, `has_more: true`, `closed: true` — every field consistent, rows
+1000-1004 reachable by nothing. I reproduced it as a test before touching the
+code and got exactly that page. The cause was the audit arm windowing
+`get_including_closed(key).transcript`, which `load_record` fills with
+`load_transcript_page(key, None, MAX_TRANSCRIPT_LIMIT)` — the OLDEST thousand
+rows — so the window ran over a prefix. The previous pass knew about the ceiling
+and recorded it in a Rust doc comment, then wrote the flat opposite into the
+contract doc another repo's builder implements from. Recording a defect in the
+one place its victims will not look is not disclosure.
+
+The fix is where the reviewer said it was. `load_transcript_tail_page` never
+gated on openness, so `SqliteRoomStore::transcript_tail_page_including_closed`
+is that helper behind a `room_exists` check rather than a `room_is_open` one,
+and the daemon's audit arm — filter, drain, recompute the cursor, 30 lines of
+paging written a second time — collapses to one delegating call. Less code, and
+the parity the contract already claimed is now true at any length. A room that
+never existed is still `UnknownRoom`: this widens visibility from open rooms to
+closed ones and no further, which is the check the route's 404 rests on.
+
+Three documentation surfaces were stale or wrong, two of them named by wave 54's
+standing rule on this slice ("scope main.rs plus all three route-contract
+docs"). `docs/OCEAN_RUNTIME_OPERATOR_GUIDE.md` still listed the snapshot route
+with `?after_seq=N&limit=M` and no `prev_seq`, so an operator reading it could
+not discover the feature. `crates/ocean-daemon/AGENTS.md` asserted that
+`room_get`, `/transcript` and `/snapshot` are "one PAGING contract, not two",
+which this diff falsifies — `/snapshot?before_seq=` answers `prev_seq` beside a
+null `next_seq` — and the nearest owning AGENTS.md of `persistent_rooms.rs` is
+that file, not `ocean-store`'s. `docs/OCEAN_ECOSYSTEM_CONTRACT.md` now says WHY
+the closed room answers identically, because "it just does" is what made the
+sentence survivable while it was false.
+
+Third finding, and the one worth keeping: the 30-mutation matrix had a
+wave-54-shaped hole. `>` to `>=` on the audit arm's `has_more` survived all 28
+snapshot tests, because every closed-room fixture sat well over the limit (12
+rows against 4) or well under (2 against 4) and none exactly AT it. The fix
+deletes that arm, so the equivalent line is now the store's own; mutated there,
+the new `snapshot_closed_room_page_exactly_at_the_limit_has_no_cursor` is the
+ONLY snapshot test that goes red (29 passed, 1 failed) and the store's boundary
+test goes red beside it. A full page is not thereby a page with more behind it,
+and saying otherwise costs a client a round trip to learn its "load older"
+affordance had nothing under it.
+
+Gate: `OCEAN_ALLOW_REPO_CWD=1 cargo xtask ci` — docs-check PASS, workspace build,
+3231 tests passed / 0 failed, Clippy all-targets with denied warnings clean, fmt
+clean. `cargo deny check advisories` is the one red stage and is unchanged from
+`origin/main`: the `ReadChunk::commit` double-free and the yanked `spin 0.9.8`,
+neither reachable from a diff that touches no Cargo.toml, Cargo.lock or
+deny.toml. Both mutation experiments reverted. No deploy, no migration.
+_________________________________________________________________________________ 07:44 loop/os-no-route-can-serve-the-newest-page-of-a-transcript-only-the-oldest

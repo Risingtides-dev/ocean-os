@@ -144,6 +144,25 @@ outbox, and the restart-safe federation core (S2 P2-A). One database file
   exact Active binding/generation check and newest-first room-scoped
   `seq < before_seq` query share one read transaction. Use a `limit + 1`
   sentinel for `has_more`; never count or load an unbounded transcript page.
+- **A transcript page reads forward or backward, and the two are separate
+  methods.** `transcript_page` walks `seq > after_seq ORDER BY seq`;
+  `transcript_tail_page` walks `seq < before_seq ORDER BY seq DESC` and reverses
+  the rows back to ascending, so a renderer never learns which one it got. Do NOT
+  widen the forward signature to serve both — a fourth parameter there drags ten
+  daemon call sites plus `room_summary.rs` in for a window only `/snapshot`
+  serves. Both clamp through `clamp_transcript_limit` and both use the `limit + 1`
+  sentinel; the cursors are named `next_seq` and `prev_seq` respectively so a
+  backward cursor cannot be replayed as an `after_seq`. The `u64 -> i64` cursor
+  guard is checked in both and lands opposite ways: forward, a cursor above
+  `i64::MAX` is a terminal empty page, and backward it saturates to `i64::MAX`
+  and is the newest page, because "before a number past the end" includes every
+  row. `before_seq = 0` is empty — the first message's seq is 0. The backward read
+  is also the one whose soft-closed answer the STORE owns
+  (`transcript_tail_page_including_closed`, gated on existence rather than
+  openness): the daemon cannot window `get_including_closed`'s record for it the
+  way it does the forward read, because that record is itself the oldest
+  `MAX_TRANSCRIPT_LIMIT` rows, so windowing it answers the newest page of the
+  first thousand and calls it the tail.
 - **Attachments are immutable, so the discipline is refusal, not CAS.** There is
   deliberately no `version` column on `room_attachments`: nothing amends an
   attachment, so a compare-and-swap guard would be decoration, and a decorative

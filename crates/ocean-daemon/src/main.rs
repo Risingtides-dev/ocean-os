@@ -268,7 +268,7 @@ use ocean_core::{
 #[cfg(test)]
 use persistent_rooms::{
     parse_mentions, resolve_agent_participant, room_agent_session_id, room_store_error_response,
-    RoomMessageRequest, RoomsListQuery, TranscriptQuery,
+    RoomMessageRequest, RoomsListQuery, SnapshotQuery, TranscriptQuery,
 };
 #[cfg(test)]
 use project_registry::{
@@ -21202,8 +21202,9 @@ mod tests {
         let (status, Json(snap)) = room_snapshot(
             State(state.clone()),
             Path("hydrate-me".to_string()),
-            Query(TranscriptQuery {
+            Query(SnapshotQuery {
                 after_seq: None,
+                before_seq: None,
                 limit: None,
             }),
         )
@@ -21247,8 +21248,9 @@ mod tests {
         let (status, _) = room_snapshot(
             State(state.clone()),
             Path("no-such-room".to_string()),
-            Query(TranscriptQuery {
+            Query(SnapshotQuery {
                 after_seq: None,
+                before_seq: None,
                 limit: None,
             }),
         )
@@ -21505,6 +21507,9 @@ mod tests {
                 "transcript",
                 "last_seq",
                 "next_seq",
+                // The backward cursor is always keyed, null on a forward read, so
+                // the envelope does not change shape with the direction asked for.
+                "prev_seq",
                 "has_more",
                 "closed",
             ],
