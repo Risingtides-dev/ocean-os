@@ -172,7 +172,11 @@ jobs:
             printf '%s\n' "$guarded" | sed 's/^/  /'
             echo ""
             echo "Append an entry to the repo-root events.md in this PR:"
-            echo "time [HH:MM] [MM-DD-YY] (24-hour), agent, worktree (branch"
+            # dd-mm-yy diverges deliberately from the bedrock and surface
+            # mirrors named above, which both still echo MM-DD-YY: this repo's
+            # events.md schema block rules dd-mm-yy and 297 entries already
+            # obey it. Re-sync this line from them and the split reopens.
+            echo "time [HH:MM] [dd-mm-yy] (24-hour), agent, worktree (branch"
             echo "when not on main), type, area, then one plain-prose"
             echo "paragraph on what changed and why."
             exit 1
