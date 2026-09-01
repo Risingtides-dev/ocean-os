@@ -9331,3 +9331,98 @@ rtrb `ReadChunk::commit` double-free via livekit and the yanked `spin 0.9.8`,
 neither reachable from a diff that touches no Cargo.toml, Cargo.lock or
 deny.toml. No deploy, no migration.
 _________________________________________________________________________________ 09:51 loop/os-snapshot-agent-owners
+time:      [09:30] [01-09-26]
+agent:     [claude code], [opus 5], [ocean-loop builder]
+worktree:  loop/os-roomrecord-transcript-prefix
+type:      [bug report]
+area:      [backend]
+
+`ocean_store::RoomRecord` handed back an unmarked prefix of a room's transcript
+and the type had no way to say so. `load_record` builds the transcript from
+`load_transcript_page(key, None, MAX_TRANSCRIPT_LIMIT)` — a page that computes
+`has_more` from a `limit + 1` sentinel — and then took `.messages` and dropped
+the flag on the next line. The old comment there shrugged it off ("the has_more
+signal is available through transcript_page for callers that care"), which reads
+as a pointer but is actually the bug: the information existed, at that exact
+line, and was destroyed at the boundary. Recovering it afterwards costs a second
+query, and no holder of a record could even tell there was something to recover.
+
+That is now on the wire, not just in memory. `get_including_closed` is the
+soft-closed AUDIT view, and #434 made WHICH of `get`/`get_including_closed`
+answered into `/snapshot`'s `closed` boolean — so the frozen-room replay a
+soft-closed room exists for was also silently capped at its oldest thousand. The
+repo already knew: `transcript_tail_page_including_closed`'s doc spells out that
+windowing the record in memory "answers the newest page of the FIRST THOUSAND
+and calls it the tail", with every cursor beside it looking correct. That
+paragraph was an argument for a marker on the struct and nobody had put one
+there.
+
+Added `RoomRecord::transcript_has_more`, populated from the same page the rows
+came from — zero extra queries, and it cannot drift from what `transcript_page`
+would answer because it IS that page's sentinel. Chose the bool over
+`transcript_next_seq` deliberately: the resume cursor is
+`transcript.last().map(|m| m.seq)`, already on the struct, so a cursor field
+would restate rows the record holds and add a second thing able to contradict
+them. `has_more` is the only part of the page that is genuinely unrecoverable
+from what the record already carries. This is a field that was being DESTROYED
+at a boundary, not new state nobody can reach.
+
+The two daemon consumers are named in the field's doc and both are left to their
+own slice. The one that loses rows is `read_transcript_page`'s closed arm
+(persistent_rooms.rs:3272-3300): it re-pages the frozen record in memory, so its
+`msgs.len() > effective_limit` runs over rows the record already dropped and the
+window it can see ends at MAX_TRANSCRIPT_LIMIT however long the room is — a
+soft-closed room past 1000 rows answers `has_more: false, next_seq: None` at seq
+999 and the client stops. That arm is
+shared by `/transcript`, `/snapshot`'s forward read and `room_summary.rs`, so the
+follow-up is one fix for three routes. The cheaper consumer is `room_get`, which
+throws its record's transcript away and re-reads a page purely to learn this one
+bit. AND: `room_get`'s comment at persistent_rooms.rs:1203-1216 IS NOW STALE and
+this slice does not touch it. It says "only the page can tell 'exactly the cap'
+from 'the cap, with more behind it'" — which is exactly what
+`transcript_has_more` now tells — and on that basis accepts decoding up to
+MAX_TRANSCRIPT_LIMIT rows twice on "the call ocean-surface makes every time a
+room is opened", listing as the cheaper form a probe "only when
+`record.transcript.len() == MAX_TRANSCRIPT_LIMIT`" that this field retires
+outright. Editing the daemon was out of scope for a store-only slice; the
+correction is recorded here so a false WHY-comment in the hottest room route is
+tracked rather than discovered.
+
+The test that matters is the boundary one. `transcript.len() ==
+MAX_TRANSCRIPT_LIMIT` is not a substitute for the flag and never was: a room
+that ENDS on the cap and a room cut at it hydrate an identical number of rows.
+So `record_at_exactly_the_cap_is_not_marked_truncated` builds exactly 1000 rows
+and `record_marks_a_transcript_it_holds_only_a_prefix_of` builds 1005 — the two
+records are the same length and only the sentinel separates them — with the
+second carrying the assertion through `get_including_closed` after a close, so
+the audit path is pinned too.
+
+Two mutations prove the pair discriminates and that neither test is decoration.
+Hardcoding the field to `false` reddens only the prefix test (210 passed, 1
+failed). Replacing it with the plausible heuristic — the length test a reviewer
+might reasonably propose instead of carrying the flag — reddens only
+`record_at_exactly_the_cap_is_not_marked_truncated`, and the prefix test stays
+GREEN under it, which is the whole argument for the boundary fixture existing.
+Both reverted.
+
+Deliberately did NOT mirror the field onto `ocean_agent::rooms::RoomRecord`, and
+said so in the doc where the struct claims to be a mirror: that in-memory twin
+keeps every row it was handed, so the flag there could only ever be `false`, and
+a field that can never be anything else is noise. Trap #1 held — no
+`crates/ocean-daemon/**` edit was needed; grepping for `RoomRecord {` finds
+exactly one construction site, the daemon reads `rec.transcript` only inside test
+modules, and a full workspace build is green with the daemon untouched.
+
+Gate: `OCEAN_ALLOW_REPO_CWD=1 cargo xtask ci` — docs-check PASS (30 packages,
+157 files, 179 links), workspace build, every test lane green including
+ocean-store 211/211, then standalone `cargo clippy --workspace --all-targets --
+-D warnings` exit 0 with zero warnings and `cargo fmt --all -- --check` exit 0.
+Also ran `RUSTDOCFLAGS="-D warnings" cargo doc -p ocean-store --no-deps` (exit 0)
+because the new field's doc adds four intra-doc links the gate does not check.
+`cargo deny check` is the one red stage and is UNCHANGED from `origin/main`: I
+cut a detached worktree at pristine bcf5222c and reproduced the identical exit 1
+(RUSTSEC-2026-0274 `ReadChunk::commit` double-free via rtrb, plus yanked `spin
+0.9.8`), against a diff touching no Cargo.toml, Cargo.lock or deny.toml. That
+advisory is a real workspace-wide blocker and wants its own slice; it is not
+mine to fix from inside ocean-store. No deploy, no migration.
+_________________________________________________________________________________ 09:30 loop/os-roomrecord-transcript-prefix
