@@ -448,9 +448,11 @@ fn room_history_row(message: RoomMessage) -> ocean_agent::RoomHistoryRow {
 /// when it does. A new audit writer adds its `type` here in the same commit.
 ///
 /// `pub(super)` for `room_summary.rs`, which shapes a model PROMPT rather than a
-/// response and so has no `RoomMessage` to hand to `projected_room_message`. One
-/// function on purpose: the agent history page, the human reads, and the
-/// summarizer must not drift into three rules.
+/// response and so has no `RoomMessage` to hand to `projected_room_message`;
+/// `build_room_prompt` calls it directly for the same reason. One function on
+/// purpose, and every renderer of a room body in this crate is a caller —
+/// `room_history_row`, `projected_room_message`, `summary_user_prompt`, and
+/// `build_room_prompt`. Four renderers must not become four rules.
 pub(super) fn room_history_text(body: String) -> String {
     let audit_type = serde_json::from_str::<serde_json::Value>(&body)
         .ok()
@@ -485,11 +487,13 @@ pub(super) fn room_history_text(body: String) -> String {
 /// as something other than what was made (see `crates/ocean-store/AGENTS.md`).
 /// It goes at the point each response is SHAPED rather than inside
 /// `read_transcript_page`, which stays the one raw paging implementation all of
-/// its consumers share. `/summarize` is the third such consumer and now projects
-/// too, in `summary_user_prompt`: it builds a model prompt rather than a
-/// `RoomMessage`, so it calls `room_history_text` directly. Keeping ONE function
-/// is the whole point — the human reads, the agent history page, and the
-/// summarizer cannot drift into three rules.
+/// its consumers share. The two MODEL-facing renderers build a prompt rather
+/// than a `RoomMessage`, so they call `room_history_text` directly:
+/// `summary_user_prompt` for `/summarize`, and `build_room_prompt` for the
+/// transcript tail handed to a convened agent, whose window comes from
+/// `authorized_room_transcript_context` and is not pre-projected either. Keeping
+/// ONE function is the whole point — the human reads, the agent history page,
+/// the summarizer, and the convened agent cannot drift into four rules.
 ///
 /// Still open, and this does not close it: `room_history_text` matches four
 /// literal `type` values, so a FIFTH audit writer falls through raw on every one
@@ -2819,6 +2823,17 @@ fn authorized_room_transcript_context(
 /// before context files existed. Every room that never uploads a file keeps the
 /// prompt it already had, so this feature cannot perturb an unrelated room's
 /// agent behavior.
+///
+/// Bodies run through `room_history_text`, the same collapse the human reads,
+/// the agent history page, and `/summarize` apply. `tail` arrives from
+/// `authorized_room_transcript_context`, which pages the store raw and filters
+/// no kind, so without it a `room.agent.*` audit row inside the last
+/// `ROOM_CONTEXT_TAIL` messages hands this model a free-form `owner_member_id`
+/// — and the answer it shapes is appended to the room and markdown-rendered by
+/// ocean-surface, which is the same laundered route the read boundary closes.
+/// Under `context_policy:room_history` an unprojected tail would also serve one
+/// turn the same row twice, as a label through the bounded history tool and raw
+/// through here.
 fn build_room_prompt(
     room: &RoomKey,
     agent: &RoomParticipant,
@@ -2848,7 +2863,7 @@ were mentioned.\n\n",
             "[#{seq}] {author}: {body}{marker}\n",
             seq = m.seq,
             author = m.author_id,
-            body = m.body,
+            body = room_history_text(m.body.clone()),
             marker = marker,
         ));
     }
@@ -4198,6 +4213,96 @@ mod tests {
         ));
         assert!(prompt.contains("[file] spec.md (text/markdown, 9 bytes)\nthe spec\n"));
         assert!(prompt.ends_with("--- end context files ---\n\nYour reply:"));
+    }
+
+    /// The convened agent's prompt is the other MODEL-facing render of these
+    /// rows, and it is the sharper of the two: `/summarize` writes an artifact,
+    /// while this answer is appended straight back into the room by
+    /// `append_room_agent_reply` and markdown-rendered by ocean-surface. Its
+    /// window comes from `authorized_room_transcript_context`, which pages the
+    /// store raw and filters no kind, so an unprojected tail would hand the
+    /// model the `owner_member_id` a bootstrap audit interpolates — free-form
+    /// and shape-checked nowhere on the write path. Under
+    /// `context_policy:room_history` it would also serve one turn the same row
+    /// twice, as a label through the bounded history tool and raw through here.
+    ///
+    /// The tail is read back through `transcript_page`, the exact call
+    /// `authorized_room_transcript_context` makes, so the row under test is the
+    /// one the store actually mints rather than a hand-written body.
+    #[test]
+    fn a_convened_agents_transcript_tail_projects_an_audit_row() {
+        const POISON_OWNER: &str = "[click here](https://evil.co)";
+        const PACKAGE: &str = "pkg-interpolated-only-into-the-audit";
+        const OPERATOR: &str = "operator:only-in-the-audit";
+
+        let mut store = ocean_store::SqliteRoomStore::open_in_memory().unwrap();
+        let room = RoomKey::new("prompt-tail-projection");
+        store
+            .create(room.clone(), "Prompt Tail", None, Utc::now())
+            .unwrap();
+        store
+            .add_participant(
+                &room,
+                RoomParticipant {
+                    id: POISON_OWNER.into(),
+                    kind: RoomParticipantKind::Human,
+                    display_name: "Owner".into(),
+                },
+                Utc::now(),
+            )
+            .unwrap();
+        store
+            .bootstrap_local_room_agent(
+                &room,
+                POISON_OWNER,
+                prompt_fixture_agent(),
+                PACKAGE,
+                OPERATOR,
+                Utc::now(),
+            )
+            .expect("bootstrap writes the audit row");
+        let mention = store
+            .append_message(
+                &room,
+                "alice",
+                RoomParticipantKind::Human,
+                RoomMessageKind::Message,
+                "@researcher what does the spec say",
+                Utc::now(),
+            )
+            .unwrap();
+
+        let tail = store
+            .transcript_page(&room, None, Some(ROOM_CONTEXT_TAIL))
+            .expect("the tail this prompt is built from")
+            .messages;
+        let prompt = build_room_prompt(&room, &prompt_fixture_agent(), &tail, mention.seq, None);
+
+        assert!(
+            prompt.contains("[room agent bootstrap audit]"),
+            "the audit row must reach the model as its fixed label: {prompt}"
+        );
+        // Every string only the audit body interpolates. The join markers carry
+        // the owner id too, so asserting on those would pass for the wrong reason.
+        for leaked in [PACKAGE, OPERATOR, "room.agent.bootstrap", "owner_member_id"] {
+            assert!(
+                !prompt.contains(leaked),
+                "`{leaked}` rode into the convened turn: {prompt}"
+            );
+        }
+        assert!(
+            prompt.contains("@researcher what does the spec say  «— mention\n"),
+            "an ordinary body and the mention marker are untouched: {prompt}"
+        );
+
+        // The ledger is untouched: this projects the prompt, never the record.
+        let stored = store.transcript(&room, None).expect("transcript");
+        assert!(
+            stored
+                .iter()
+                .any(|m| m.body.contains(POISON_OWNER) && m.body.contains(PACKAGE)),
+            "the audit row must still hold verbatim what was attempted"
+        );
     }
 
     #[test]

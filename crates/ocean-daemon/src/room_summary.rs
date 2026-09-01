@@ -160,12 +160,13 @@ fn summary_system_prompt() -> &'static str {
 
 /// Render the transcript window as the model's user turn. Oldest → newest, one
 /// line per message, in the same `[#seq] author: body` shape `build_room_prompt`
-/// hands a convened agent — one transcript rendering for the whole daemon.
+/// hands a convened agent. The two model-facing renderers differ in their
+/// framing and in nothing about how a row is rendered.
 ///
 /// Bodies go through `room_history_text`, the SAME projection the four human
-/// reads and the agent history page apply, so a `room.agent.*` audit row arrives
-/// as its fixed label rather than as the principal, decision, and session
-/// metadata it carries. That matters more here than on a read: the audit
+/// reads, the agent history page, and `build_room_prompt` apply, so a
+/// `room.agent.*` audit row arrives as its fixed label rather than as the
+/// principal, decision, and session metadata it carries. That matters more here than on a read: the audit
 /// interpolates a free-form `owner_member_id` nothing on the write path
 /// shape-checks, and the summary this prompt produces is itself an artifact
 /// ocean-surface markdown-renders — an unprojected body would have a laundered
@@ -826,11 +827,13 @@ mod tests {
         assert!(artifact.body.contains("#21–#30"));
     }
 
-    /// The fifth human-facing read of a `room.agent.*` audit row, and the one
-    /// that laundered it: `owner_member_id` is free-form and shape-checked
-    /// nowhere, and the artifact this pass writes is markdown-rendered by
-    /// ocean-surface, so a raw body was a route from an operator-supplied string
-    /// through a model turn and into a room-attributed link.
+    /// The fifth read of a `room.agent.*` audit row, and one of the two that
+    /// laundered it — `build_room_prompt` is the other, pinned by
+    /// `a_convened_agents_transcript_tail_projects_an_audit_row`.
+    /// `owner_member_id` is free-form and shape-checked nowhere, and the
+    /// artifact this pass writes is markdown-rendered by ocean-surface, so a raw
+    /// body was a route from an operator-supplied string through a model turn
+    /// and into a room-attributed link.
     #[tokio::test]
     async fn a_bootstrap_audit_row_reaches_the_model_as_a_label_not_as_its_ids() {
         const POISON_OWNER: &str = "[click here](https://evil.co)";
