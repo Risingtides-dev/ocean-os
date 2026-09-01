@@ -443,6 +443,9 @@ fn room_history_row(message: RoomMessage) -> ocean_agent::RoomHistoryRow {
     }
 }
 
+/// A CLOSED whitelist, not a `room.agent.` prefix: an audit `type` that is not
+/// one of these four falls through raw to both audiences, and no test goes red
+/// when it does. A new audit writer adds its `type` here in the same commit.
 fn room_history_text(body: String) -> String {
     let audit_type = serde_json::from_str::<serde_json::Value>(&body)
         .ok()
@@ -475,12 +478,18 @@ fn room_history_text(body: String) -> String {
 /// The repair belongs HERE and not in `ocean-store`: that audit row is a ledger,
 /// and a store that quietly repaired `owner_member_id` would report the attempt
 /// as something other than what was made (see `crates/ocean-store/AGENTS.md`).
-/// It also belongs at the point each response is SHAPED and not inside
+/// It goes at the point each response is SHAPED rather than inside
 /// `read_transcript_page`, which is `pub(super)` precisely so `room_summary.rs`
-/// feeds the identical window to a model turn — projecting there would silently
-/// change what the summarizer reads. Routing both audiences through
-/// `room_history_text` is the point: the human and agent rules cannot drift into
-/// two.
+/// feeds the identical window to a model turn — projecting there changes what
+/// the summarizer reads, which is a separate decision owing its own test.
+/// Routing both audiences through `room_history_text` is the point: the human
+/// and agent rules cannot drift into two.
+///
+/// Leaving `read_transcript_page` raw is a scope boundary, not a virtue:
+/// `/summarize` still takes these bodies whole, so the same unchecked
+/// `owner_member_id` rides into a model turn and back out through a summary
+/// artifact the surface markdown-renders — the anchor keeps a laundered route.
+/// Named as open in `crates/ocean-store/AGENTS.md`.
 fn projected_room_message(mut message: RoomMessage) -> RoomMessage {
     message.body = room_history_text(message.body);
     message

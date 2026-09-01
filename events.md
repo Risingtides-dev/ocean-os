@@ -8526,3 +8526,57 @@ same 64 -- three fields the very next clause names by provenance. A positive
 enumeration missing half its members is the same defect as the false absolute
 this slice exists to fix.
 _________________________________________________________________________________
+
+time:      [21:02] [31-08-26]
+agent:     [claude] [opus 5]
+worktree:  loop/os-audit-json-rows-reach-the-human-transcript-unprojected
+type:      [bug report]
+area:      [backend]
+
+Gave every human-facing transcript read the audit projection the agent path
+already had. `ocean-store` writes `room.agent.*` rows as `System` bodies that
+interpolate the ids that ARRIVED, `owner_member_id` is a free-form caller string
+nothing on the path shape-checks, and ocean-surface puts every row body through
+`room_markdown::body_view` — System included — so bootstrapping with an owner id
+of `[click here](https://evil.co)` landed an attacker-labelled anchor in a row
+the UI attributes to the room itself. `room_history_text` already collapsed
+those bodies but was reached from exactly one place: `room_history_row`, the
+agent path. `projected_room_message` now sits beside it on all FOUR human reads
+— `room_get`, `/transcript`, `/snapshot`, and the `/events` SSE tail. The fourth
+is the one that matters: a client hydrates through `/snapshot` and then TAILS
+`/events`, so closing only the paged reads would have left the live injection
+path open while reading as done. Deliberately not fixed in `ocean-store` — that
+row is a ledger and the new test asserts it still holds the poisoned id verbatim
+— and not in `read_transcript_page`, so the projection lands where each response
+is SHAPED.
+_________________________________________________________________________________
+
+time:      [21:21] [31-08-26]
+agent:     [claude] [opus 5]
+worktree:  loop/os-audit-json-rows-reach-the-human-transcript-unprojected
+type:      [review]
+area:      [docs]
+
+Refine pass on the above: reviewer took the code and the test but rejected the
+contract clause they came with, because it replaced a KNOWN OPEN with a claim
+the code does not back. Three corrections, all doc. `room_history_text` is a
+closed whitelist of four literal `type` strings, not the "every `room.agent.*`"
+the clause promised — four is all that exists today, so the code is right, but
+the `_ => body` arm passes a fifth audit writer through raw on both paths with
+nothing going red, which is exactly how the next one lands. And the boundary is
+not closed: `POST /v1/rooms/persistent/{key}/summarize` is a FIFTH human-facing
+read of the same rows, shares `read_transcript_page`, interpolates `m.body`
+verbatim into a model prompt, and writes a summary artifact ocean-surface
+markdown-renders — so the anchor keeps a model-laundered route and the metadata
+the daemon contract says never reaches a model reaches that one. Named as open
+rather than closed, filed as its own backlog slice. Third, the owning contract
+for the changed file (`crates/ocean-daemon/AGENTS.md`, the `persistent_rooms.rs`
+bullet) still described the collapse as agent-path-only while the code applied
+it to four human reads; recording the invariant only in another crate's contract
+left an agent reading the daemon's own unable to learn it.
+
+Gate on the amended tree: `cargo test -p ocean-daemon` 855 green,
+`cargo test -p ocean-store` 196 green, `cargo clippy -p ocean-daemon -p
+ocean-store --all-targets -- -D warnings` exit 0, `cargo fmt --check` exit 0.
+No deploy and no migration.
+_________________________________________________________________________________
