@@ -1165,8 +1165,17 @@ pub(super) async fn rooms_list_persistent(
     }
 }
 
-/// `GET /v1/rooms/persistent/{key}` — one persistent room (with its transcript
-/// and access projection). Open rooms only; soft-closed rooms return 404.
+/// `GET /v1/rooms/persistent/{key}` — one persistent room (with the first page
+/// of its transcript and its access projection). Open rooms only; soft-closed
+/// rooms return 404.
+///
+/// The `transcript` array is a BOUNDED FIRST PAGE (OCEAN-249), like
+/// `room_transcript` and `room_snapshot`: at most `MAX_TRANSCRIPT_LIMIT` rows
+/// from the start of the log, carrying `next_seq` (replay as
+/// `/transcript?after_seq=next_seq`) and `has_more` so a caller can tell a whole
+/// transcript from its oldest prefix. Without those two fields a room past the
+/// cap answered its oldest thousand messages and presented them as the
+/// transcript.
 pub(super) async fn room_get(
     State(state): State<AppState>,
     Path(key): Path<String>,
@@ -1180,9 +1189,31 @@ pub(super) async fn room_get(
     }
     let key = RoomKey::new(trimmed);
     match with_rooms(&state, |reg| {
+        // `get` is the OPEN-room getter, and that choice alone is the 404
+        // contract: `read_transcript_page` falls through to
+        // `get_including_closed`, so the page it hands back must never be what
+        // decides the room exists. Widen this line to `get_including_closed`
+        // and the route quietly starts serving frozen rooms — it becomes
+        // `room_snapshot`. The ORDER of the two calls is not the guard: page
+        // first and a closed or unknown room still 404s with the same body,
+        // having paid for a read it throws away.
         let Some(record) = reg.get(&key)? else {
             return Ok(None);
         };
+        // The record's own transcript is dropped in favour of the paged read.
+        // Both are capped at MAX_TRANSCRIPT_LIMIT and hold the same rows, but
+        // only the page can tell "exactly the cap" from "the cap, with more
+        // behind it" — that needs the store's `limit + 1` sentinel, and it is
+        // the whole point of the two fields below. `get` is the only open-room
+        // getter on the trait, so this route now decodes the same rows TWICE —
+        // up to MAX_TRANSCRIPT_LIMIT for the existence guard, thrown away, then
+        // limit + 1 for the page — on the call ocean-surface makes every time a
+        // room is opened. Accepted rather than hidden: the cheaper form needs no
+        // new store method (probe only when `record.transcript.len() ==
+        // MAX_TRANSCRIPT_LIMIT`, via `reg.transcript_page(&key,
+        // record.transcript.last().map(|m| m.seq), Some(1))`), but one paging
+        // implementation is what `read_transcript_page`'s doc comment asks for.
+        let page = read_transcript_page(reg, &key, None, Some(ocean_store::MAX_TRANSCRIPT_LIMIT))?;
         let access = reg.room_access(&key)?;
         // Which worker owns which agent in THIS room. Adjacent to the roster,
         // never a field on RoomParticipant (the federated design reserves
@@ -1190,14 +1221,16 @@ pub(super) async fn room_get(
         // Absent key == no local ownership recorded, which is what every
         // pre-existing room reports.
         let owners = reg.agent_owners(&key)?;
-        Ok(Some((record, access, owners)))
+        Ok(Some((record.room, page, access, owners)))
     }) {
-        Ok(Some((rec, access, owners))) => (
+        Ok(Some((room, page, access, owners))) => (
             StatusCode::OK,
             Json(json!({
                 "ok": true,
-                "room": rec.room,
-                "transcript": projected_transcript(rec.transcript),
+                "room": room,
+                "transcript": projected_transcript(page.messages),
+                "next_seq": page.next_seq,
+                "has_more": page.has_more,
                 "access": access,
                 "agent_owners": owners
                     .into_iter()
@@ -9014,6 +9047,116 @@ env = { FIXTURE = "1" }
         )
         .unwrap();
         assert_eq!(body["access"], json!({"state": "local"}));
+    }
+
+    /// Append `n` chat rows bodied `msg-{i}` to an existing room, so a test can
+    /// assert exactly which slice of the log came back.
+    fn seed_transcript(state: &AppState, key: &RoomKey, n: usize) {
+        with_rooms(state, |store| {
+            for i in 0..n {
+                store
+                    .append_message(
+                        key,
+                        "john",
+                        RoomParticipantKind::Human,
+                        RoomMessageKind::Message,
+                        &format!("msg-{i}"),
+                        Utc::now(),
+                    )
+                    .expect("seed transcript");
+            }
+        });
+    }
+
+    /// GET a room and return its parsed body.
+    async fn room_get_body(state: &AppState, key: &RoomKey) -> serde_json::Value {
+        let app = room_routes().with_state(state.clone());
+        let resp = app
+            .oneshot(
+                axum::http::Request::get(format!("/v1/rooms/persistent/{key}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        serde_json::from_slice(
+            &axum::body::to_bytes(resp.into_body(), 8 * 1024 * 1024)
+                .await
+                .unwrap(),
+        )
+        .unwrap()
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn room_get_under_the_cap_says_there_is_no_more() {
+        let _guard = AUTO_CONVENE_ENV_LOCK.lock().await;
+        let tmp = tempfile::TempDir::new().unwrap();
+        let state = fake_convene_state(&tmp);
+        let key = RoomKey::new("s2-get-short");
+        seed_access(&state, &key, local_access());
+        seed_transcript(&state, &key, 3);
+
+        let body = room_get_body(&state, &key).await;
+        // The rows this route already answered, unchanged.
+        let rows = body["transcript"].as_array().expect("transcript array");
+        assert_eq!(rows.len(), 3);
+        assert_eq!(rows[0]["body"], json!("msg-0"));
+        assert_eq!(rows[2]["body"], json!("msg-2"));
+        // Plus the two fields that say it is the WHOLE log, not a prefix.
+        assert_eq!(body["has_more"], json!(false));
+        assert_eq!(body["next_seq"], json!(null));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn room_get_past_the_cap_admits_it_is_a_prefix() {
+        let _guard = AUTO_CONVENE_ENV_LOCK.lock().await;
+        let tmp = tempfile::TempDir::new().unwrap();
+        let state = fake_convene_state(&tmp);
+        let key = RoomKey::new("s2-get-long");
+        seed_access(&state, &key, local_access());
+        // One past the cap is the case the record-backed read could not see: its
+        // transcript was ALSO 1000 rows, and nothing in the response said so.
+        seed_transcript(&state, &key, ocean_store::MAX_TRANSCRIPT_LIMIT + 1);
+
+        let body = room_get_body(&state, &key).await;
+        let rows = body["transcript"].as_array().expect("transcript array");
+        assert_eq!(rows.len(), ocean_store::MAX_TRANSCRIPT_LIMIT);
+        assert_eq!(body["has_more"], json!(true));
+        // The cursor is the last row actually returned, replayable as after_seq.
+        let last_seq = rows.last().unwrap()["seq"].clone();
+        assert_eq!(body["next_seq"], last_seq);
+        assert_eq!(
+            body["next_seq"],
+            json!(ocean_store::MAX_TRANSCRIPT_LIMIT as u64 - 1)
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn room_get_closed_room_with_a_transcript_is_still_404() {
+        // A closed room whose audit fallback HAS rows to serve is still 404.
+        // `room_get_closed_is_404` pins the empty one; this pins the case that
+        // makes serving those rows tempting, now that the handler calls
+        // `read_transcript_page` at all. Both go red on the one mutation that
+        // matters — `reg.get` widened to `get_including_closed`.
+        let _guard = AUTO_CONVENE_ENV_LOCK.lock().await;
+        let tmp = tempfile::TempDir::new().unwrap();
+        let state = fake_convene_state(&tmp);
+        let key = RoomKey::new("s2-get-closed-with-rows");
+        seed_access(&state, &key, local_access());
+        seed_transcript(&state, &key, 4);
+        with_rooms(&state, |store| store.close(&key).expect("close"));
+
+        let app = room_routes().with_state(state.clone());
+        let resp = app
+            .oneshot(
+                axum::http::Request::get(format!("/v1/rooms/persistent/{key}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
     }
 
     // ── Merged SSE routed tests ──────────────────────────────────────────────

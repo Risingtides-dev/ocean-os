@@ -555,7 +555,7 @@ POST   /v1/permissions/{id}/decision      allow/deny a mutating-tool request
 # Rooms — persistent lifecycle (SQLite-backed; survives restarts)
 GET    /v1/rooms/persistent               list persistent rooms
 POST   /v1/rooms/persistent               create a room { key, name, trigger_policy?, workspace_root? }; blank workspace_root is unbound, while a nonblank value must resolve to an existing absolute directory and is persisted canonically (400 invalid_workspace_root otherwise). Agent execution revalidates the stored canonical directory and returns 503 workspace_unavailable instead of inheriting daemon cwd when it is missing, symlink-replaced, relative, or noncanonical.
-GET    /v1/rooms/persistent/{key}         room + transcript
+GET    /v1/rooms/persistent/{key}         room + transcript + access + agent_owners; the transcript is a BOUNDED first page like `/transcript` and `/snapshot` — at most 1000 rows from the START of the log, with next_seq/has_more beside it, so replay the rest as `/transcript?after_seq=next_seq` rather than reading the array as the whole history. Open rooms only; unknown/closed room 404
 PATCH  /v1/rooms/persistent/{key}         update mutable metadata { name?, trigger_policy? }; an absent field is unchanged, trigger_policy: null clears the policy, an unknown field is a 400; 200 { room }, 404 unknown/closed room
 POST   /v1/rooms/persistent/{key}/participants            join { id, display_name, kind? }
 DELETE /v1/rooms/persistent/{key}/participants/{participant_id}  leave

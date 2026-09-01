@@ -8757,3 +8757,112 @@ Gate: `cargo test -p ocean-daemon` 859 passed / 0 failed (857 before, +2 new),
 files, 179 local links). New typed 400 codes on two existing routes; no schema,
 no migration, no deploy.
 _________________________________________________________________________________
+
+time:      [02:53] [01-09-26]
+agent:     [claude] [opus 5]
+worktree:  loop/os-room-get-truncates-the-transcript-at-1000-and-never-says-so
+type:      [bug-report]
+area:      [backend]
+
+`GET /v1/rooms/persistent/{key}` answered `rec.transcript` — whatever
+`load_record` hydrated, which OCEAN-249 already bounded to
+`load_transcript_page(key, None, MAX_TRANSCRIPT_LIMIT)`, ascending `seq`. So a
+room past a thousand messages was served its OLDEST thousand and told nothing:
+no `next_seq`, no `has_more`, no way for a caller to know it was reading the
+beginning of history rather than the room. Both siblings, `/transcript` and
+`/snapshot`, have carried the two fields since OCEAN-249; this route was the odd
+one out, and ocean-surface's `open_room` calls it today.
+
+Kept it a transcript route and gave it the missing fields rather than turning it
+into a metadata route: additive fields break nobody, and demoting the transcript
+would have broken that live consumer the same day. The page now comes from the
+existing `read_transcript_page` — `pub(super)` precisely so a second paging
+implementation does not grow — capped at `MAX_TRANSCRIPT_LIMIT`, and the
+response carries `next_seq` and `has_more` beside the unchanged `transcript`
+array, still through `projected_transcript`. Under the cap the body is what it
+was plus `next_seq: null` and `has_more: false`. The record's own transcript
+could never have answered this: `rec.transcript.len() == 1000` cannot tell a
+last page from a truncated one — only the store's `limit + 1` sentinel can, and
+that is what the page read uses.
+
+The GUARD, not the order of the two calls, is what keeps the 404, and this
+paragraph said otherwise until the review disproved it. `reg.get` is the
+open-room getter and it alone decides the room exists; `read_transcript_page`
+falls through to `get_including_closed`, so the page it returns must never
+become that test. Widening the guard to `get_including_closed` turns
+`room_get_closed_room_with_a_transcript_is_still_404` AND the pre-existing
+`room_get_closed_is_404` red, both 200 vs 404. Merely paging BEFORE the guard
+does not: moving the `read_transcript_page` call above `reg.get` and changing
+nothing else leaves all 7 `room_get` tests green, because a closed room's
+`reg.get` still answers None and the fallback page is thrown away, while an
+unknown room's `Err(UnknownRoom)` reaches the same 404 through
+`room_store_error_response` with a byte-identical body. Order costs one
+discarded read and nothing else.
+
+Three new tests, and every new assertion was mutation-checked on its own rather
+than by one batch revert. Deleting the `has_more` field: both cap tests fail,
+`left: Null right: Bool(false)` and `left: Null right: Bool(true)`. Hard-coding
+`next_seq` to null: only the long-room test fails, and on a DIFFERENT assertion
+(`left: Null right: Number(999)`). Hard-coding it to `0`: long room fails
+`Number(0)` vs `Number(999)`, short room fails `Number(0)` vs `Null`. Paging
+`Some(2)`: the row-count assertions fail 2 vs 1000 and 2 vs 3. Reversing the
+rows: `msg-2` vs `msg-0`, and the cursor 999 vs 0. Restoring the pre-slice
+response shape: both cap tests fail on `has_more`.
+
+OUT OF SCOPE, ON PURPOSE: `crates/ocean-daemon/src/main.rs` holds the frozen
+wire-envelope gate for this route (`assert_json_object_keys` inside
+`persistent_room_http_lifecycle_preserves_envelopes_and_ordering`), and it went
+red on the first run — which is the gate doing its job, the same way it did when
+`agent_owners` was added. The frozen key-set is updated on purpose with its
+reason recorded beside the existing one, plus two value assertions that a fresh
+room reports `next_seq: null` / `has_more: false`. No production line in that
+file changed.
+
+Gate: `cargo test -p ocean-daemon` 862 passed / 0 failed (859 before, +3 new),
+`cargo clippy -p ocean-daemon --all-targets -- -D warnings` exit 0, `cargo fmt
+--check` exit 0. Additive response fields on one existing route; no schema, no
+migration, no deploy.
+_________________________________________________________________________________
+
+time:      [03:20] [01-09-26]
+agent:     [claude] [opus 5]
+worktree:  loop/os-room-get-truncates-the-transcript-at-1000-and-never-says-so
+type:      [review]
+area:      [backend]
+
+Refinement pass on the room_get paging slice. The reviewer accepted the
+production change unchanged — the transcript array is byte-identical, the two
+fields are additive, neither cross-repo consumer uses `deny_unknown_fields` —
+and rejected one CLAIM I had written into four places: the handler comment, the
+new test's doc comment, `crates/ocean-daemon/AGENTS.md`, and the entry above.
+All four said the `reg.get` guard must stay AHEAD of `read_transcript_page` or
+the route's 404-on-closed silently becomes `room_snapshot`'s 200. It does not. I
+re-ran both mutations here rather than take the finding on trust: moving the
+page read above the guard and changing nothing else leaves all 7 `room_get`
+tests green (a closed room's `reg.get` still answers None, the fallback page is
+discarded, and an unknown room's `Err(UnknownRoom)` reaches the same 404 through
+`room_store_error_response` — the store's `Display` is byte-identical to the
+handler's own literal, so even the body matches); widening the guard to
+`get_including_closed` fails `room_get_closed_room_with_a_transcript_is_still_404`
+and `room_get_closed_is_404`, both 200 vs 404. So the invariant is WHICH getter
+the guard calls, never the order of the two lines, and the earlier evidence had
+been attributed to the wrong mutation. All four texts now name the real one; the
+comment additionally says out loud that order is free, so the next reader does
+not re-derive it. The redundancy question on the third test went the other way
+from the reviewer's default: it is kept, because a closed room with rows in it
+is the state that makes serving the audit page tempting now that this handler
+calls `read_transcript_page` at all, and its doc comment now says exactly that
+instead of claiming to pin an ordering.
+
+The operator guide's route table also still read `GET
+/v1/rooms/persistent/{key}   room + transcript` while the `/snapshot` row
+fifteen lines below already advertised `next_seq`/`has_more` — the same silence
+this slice exists to remove, one level up. That row now says the transcript is a
+bounded first page of at most 1000 rows from the START of the log, carries
+next_seq/has_more, and is replayed through `/transcript?after_seq=next_seq`.
+
+No production line changed in this pass. Gate re-run on the amended tree:
+`cargo test -p ocean-daemon` 862 passed / 0 failed, `cargo clippy -p
+ocean-daemon --all-targets -- -D warnings` exit 0, `cargo fmt --check` exit 0,
+`cargo xtask docs-check` PASS, `node scripts/check-ledger.mjs` clean.
+_________________________________________________________________________________
