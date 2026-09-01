@@ -21512,6 +21512,11 @@ mod tests {
                 "prev_seq",
                 "has_more",
                 "closed",
+                // Additive for the same reason `closed` was: hydration moved off
+                // `room_get` onto this route, so a field only `room_get` sends is
+                // a field the surface cannot read. Empty for every room with no
+                // owned agents, which is every pre-existing one.
+                "agent_owners",
             ],
         );
         assert_eq!(snapshot["ok"], true);
