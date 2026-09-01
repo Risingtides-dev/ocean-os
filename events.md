@@ -8665,3 +8665,95 @@ Gate at land: `cargo test -p ocean-daemon` 857 passed / 0 failed, `cargo clippy
 local links). No route, no schema, no wire field — a prompt rendering and its
 contracts — so no deploy and no migration.
 _________________________________________________________________________________
+
+time:      [01:03] [09-01-26]
+agent:     [claude] [opus 5]
+worktree:  loop/os-owner-member-id-is-an-identity-with-no-shape-and-no-bound
+type:      [bug-report]
+area:      [backend]
+
+Closed the WRITE half of the room.agent audit link-forgery vector that #429 and
+#430 closed on the read side. `room_agent_authority.rs` did exactly one thing to
+a caller-supplied member id — trim, then check non-empty — before handing it to
+a durable row: the `room.agent.bootstrap` System body interpolates
+`owner_member_id` verbatim and forever, and `room_agent_bindings` stores both
+`owner_member_id` and `agent_member_id` for four renderers to project. Added
+`validate_member_id` beside the existing `validate_decision_id` and used it at
+both mutation routes, on `owner_member_id` in `room_agent_bootstrap` and on both
+ids in `room_agent_authorize`, with typed 400s `invalid_owner_member_id` and
+`invalid_agent_member_id`. A REFUSAL, never a repair: the audit row is a ledger
+and a sanitized id would have it report an attempt other than the one made
+(crates/ocean-store/AGENTS.md). Nothing is written and no System line is minted.
+An omitted field keeps each route's existing `invalid_request`, so a caller can
+tell "not an identity" from "missing".
+
+Both halves of the bound carry their reason. 128 CHARACTERS is ocean-store's
+`MARKER_FIELD_MAX_CHARS` taken deliberately rather than invented — that number
+governs what a marker sentence may repeat, and a member id is what these rows
+repeat, so sharing it stops the write boundary admitting an id the render
+boundary would have to truncate. It is not ocean-agent's `MAX_AUTHOR_ID_CHARS`
+(256), which TRUNCATES on read; a refusal on write can afford the tighter number
+because refusing loses nothing. The character rule is
+`ocean_core::bounded_prose`'s and is reused on purpose: controls and `[`/`]`. A
+newline forges a whole row in anything that splits a transcript on lines;
+brackets are the only characters that manufacture a destination the row did not
+author. Everything that rule argues is safe — `(`, `)`, `*`, backtick, `@`, a
+bare URL — stays legal here, so the write and render boundaries cannot drift
+into two ideas of dangerous.
+
+Correcting the brief, which overstated the hole: neither route ever accepted a
+free-floating id. `bootstrap_local_room_agent` already requires `owner_member_id`
+to name a live Human participant of the room, and `prove_owner_and_target`
+already requires both ids to equal what the store derives. A 40 KB member id had
+to be a 40 KB PARTICIPANT id first, minted on a `persistent_rooms.rs` path this
+slice does not own. So this guard is defence in depth — what it closes is the
+step AFTER that, where such a row gets spent minting a permanent audit line that
+repeats it — and the doc comment says so rather than claiming more.
+
+Prose sweep, which is most of the diff, and it was wider than the brief listed.
+The brief named four sites; a grep for free-form / shape-checked / unbounded
+across the crate found seven: three in `persistent_rooms.rs` (comments only, no
+code touched there), THREE in `room_summary.rs` rather than one — the
+`summary_user_prompt` doc and the `a_bootstrap_audit_row_reaches_the_model...`
+doc as well as the assertion comment — and two AGENTS.md bullets rather than
+one, since the `persistent_rooms.rs` bullet also said "free-form". Each now says
+what actually landed and why the read-side projection is still not redundant:
+rows written before the guard are permanent, the store still accepts whatever an
+in-process caller hands it, and the audit body interpolates the package and
+principal ids too. The sweep is re-verified by grep, not by the list. Wave 51
+predicted `room_summary.rs`'s POISON_OWNER author-label assertion would have to
+flip in this diff. It was wrong and the assertion stays green: that fixture calls
+`add_participant` and `bootstrap_local_room_agent` directly, bypassing the HTTP
+boundary the guard lives on. Its comment now says that, which is the more useful
+invariant — a renderer may never assume the guard ran. Three contract bullets in
+crates/ocean-daemon/AGENTS.md were updated: `room_agent_authority.rs` gains the
+guard, `room_summary.rs` loses "the same unbounded caller-supplied identity",
+and `persistent_rooms.rs` loses "a free-form `owner_member_id`".
+
+Route-level assertions WERE added, on refine, and the first pass's stated reason
+for skipping them was wrong. It said the main.rs harness mutates process env
+under a lock so replicating it would break the loop's no-global-env rule.
+Nothing needed replicating:
+`local_room_agent_bootstrap_is_authenticated_previewable_and_non_authorizing`
+already holds `AUTO_CONVENE_ENV_LOCK` and `TestEnvRestore::capture` and already
+POSTs to the bootstrap route, so asserting inside it adds no global-env mutation
+at all. The honest reason was that main.rs sat outside the slice's file scope — a
+scope call, not a rule — and the review priced it: reverting bootstrap's call
+site alone, deleting the guard on the very System body this slice exists for,
+left clippy at exit 0 and all 859 tests green, because both unit tests call
+`validate_member_id` directly. That harness test now fires all three call sites
+over HTTP — a forged `owner_member_id` on `/agents/bootstrap`, then a forged
+`agent_member_id` and a forged `owner_member_id` on `/agents` — each a typed 400,
+with the existing "exactly one bootstrap audit" transcript assertion downstream
+proving the refusals minted nothing. Without the guard those requests answer 403
+`room_owner_required` from the ownership proof, so the typed code is a real pin
+and not a coincidence. The two unit tests stay for what HTTP cannot reach
+cheaply: the character bound at and one past 128, a newline, a NUL, and legal
+UUID / roster / folder-agent ids still passing.
+
+Gate: `cargo test -p ocean-daemon` 859 passed / 0 failed (857 before, +2 new),
+`cargo clippy -p ocean-daemon --all-targets -- -D warnings` exit 0, `cargo fmt
+--check` exit 0, `cargo xtask docs-check` PASS (30 packages, 157 active Markdown
+files, 179 local links). New typed 400 codes on two existing routes; no schema,
+no migration, no deploy.
+_________________________________________________________________________________

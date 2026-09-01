@@ -476,11 +476,16 @@ pub(super) fn room_history_text(body: String) -> String {
 ///
 /// Two things are wrong with handing that body over raw. The dull one is that a
 /// human reads a wall of serde_json where an agent reads one line. The sharp one
-/// is that the audit interpolates the ids that ARRIVED — `owner_member_id` is a
-/// free-form caller string nothing on the path shape-checks — and ocean-surface
-/// markdown-renders every row body, System included, so an operator who
-/// bootstraps with an `owner_member_id` of `[click here](https://evil.co)` lands
-/// an attacker-labelled link in a row the UI attributes to the room itself.
+/// is that the audit interpolates the ids that ARRIVED, and ocean-surface
+/// markdown-renders every row body, System included, so a row whose
+/// `owner_member_id` reads `[click here](https://evil.co)` lands an
+/// attacker-labelled link in a row the UI attributes to the room itself.
+///
+/// `room_agent_authority::validate_member_id` now refuses that id at both
+/// mutation routes, so no NEW row can be minted carrying one. This projection
+/// is not thereby redundant: rows written before that guard are permanent, the
+/// store still accepts whatever an in-process caller hands it, and the body
+/// interpolates the package and operator-principal ids too.
 ///
 /// The repair belongs HERE and not in `ocean-store`: that audit row is a ledger,
 /// and a store that quietly repaired `owner_member_id` would report the attempt
@@ -2828,8 +2833,12 @@ fn authorized_room_transcript_context(
 /// the agent history page, and `/summarize` apply. `tail` arrives from
 /// `authorized_room_transcript_context`, which pages the store raw and filters
 /// no kind, so without it a `room.agent.*` audit row inside the last
-/// `ROOM_CONTEXT_TAIL` messages hands this model a free-form `owner_member_id`
-/// — and the answer it shapes is appended to the room and markdown-rendered by
+/// `ROOM_CONTEXT_TAIL` messages hands this model the ids that audit
+/// interpolates — an `owner_member_id` among them, which the mutation routes
+/// refuse ill-shaped since `room_agent_authority::validate_member_id` but which
+/// rows minted before that guard still carry verbatim, because the record is a
+/// ledger and is never rewritten. The answer this model shapes is appended to
+/// the room and markdown-rendered by
 /// ocean-surface, which is the same laundered route the read boundary closes.
 /// Under `context_policy:room_history` an unprojected tail would also serve one
 /// turn the same row twice, as a label through the bounded history tool and raw
@@ -4221,10 +4230,14 @@ mod tests {
     /// `append_room_agent_reply` and markdown-rendered by ocean-surface. Its
     /// window comes from `authorized_room_transcript_context`, which pages the
     /// store raw and filters no kind, so an unprojected tail would hand the
-    /// model the `owner_member_id` a bootstrap audit interpolates — free-form
-    /// and shape-checked nowhere on the write path. Under
-    /// `context_policy:room_history` it would also serve one turn the same row
-    /// twice, as a label through the bounded history tool and raw through here.
+    /// model the `owner_member_id` a bootstrap audit interpolates. The HTTP
+    /// routes refuse an id shaped like this one now
+    /// (`room_agent_authority::validate_member_id`), but a renderer may not
+    /// assume the guard ran: rows minted before it are permanent, and this
+    /// fixture builds its row the way those did, by calling the store in
+    /// process. Under `context_policy:room_history` an unprojected tail would
+    /// also serve one turn the same row twice, as a label through the bounded
+    /// history tool and raw through here.
     ///
     /// The tail is read back through `transcript_page`, the exact call
     /// `authorized_room_transcript_context` makes, so the row under test is the
