@@ -444,9 +444,14 @@ fn room_history_row(message: RoomMessage) -> ocean_agent::RoomHistoryRow {
 }
 
 /// A CLOSED whitelist, not a `room.agent.` prefix: an audit `type` that is not
-/// one of these four falls through raw to both audiences, and no test goes red
+/// one of these four falls through raw to every audience, and no test goes red
 /// when it does. A new audit writer adds its `type` here in the same commit.
-fn room_history_text(body: String) -> String {
+///
+/// `pub(super)` for `room_summary.rs`, which shapes a model PROMPT rather than a
+/// response and so has no `RoomMessage` to hand to `projected_room_message`. One
+/// function on purpose: the agent history page, the human reads, and the
+/// summarizer must not drift into three rules.
+pub(super) fn room_history_text(body: String) -> String {
     let audit_type = serde_json::from_str::<serde_json::Value>(&body)
         .ok()
         .and_then(|value| {
@@ -479,17 +484,17 @@ fn room_history_text(body: String) -> String {
 /// and a store that quietly repaired `owner_member_id` would report the attempt
 /// as something other than what was made (see `crates/ocean-store/AGENTS.md`).
 /// It goes at the point each response is SHAPED rather than inside
-/// `read_transcript_page`, which is `pub(super)` precisely so `room_summary.rs`
-/// feeds the identical window to a model turn — projecting there changes what
-/// the summarizer reads, which is a separate decision owing its own test.
-/// Routing both audiences through `room_history_text` is the point: the human
-/// and agent rules cannot drift into two.
+/// `read_transcript_page`, which stays the one raw paging implementation all of
+/// its consumers share. `/summarize` is the third such consumer and now projects
+/// too, in `summary_user_prompt`: it builds a model prompt rather than a
+/// `RoomMessage`, so it calls `room_history_text` directly. Keeping ONE function
+/// is the whole point — the human reads, the agent history page, and the
+/// summarizer cannot drift into three rules.
 ///
-/// Leaving `read_transcript_page` raw is a scope boundary, not a virtue:
-/// `/summarize` still takes these bodies whole, so the same unchecked
-/// `owner_member_id` rides into a model turn and back out through a summary
-/// artifact the surface markdown-renders — the anchor keeps a laundered route.
-/// Named as open in `crates/ocean-store/AGENTS.md`.
+/// Still open, and this does not close it: `room_history_text` matches four
+/// literal `type` values, so a FIFTH audit writer falls through raw on every one
+/// of those paths with no test going red. Named in
+/// `crates/ocean-store/AGENTS.md`.
 fn projected_room_message(mut message: RoomMessage) -> RoomMessage {
     message.body = room_history_text(message.body);
     message
