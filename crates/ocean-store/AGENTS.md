@@ -163,6 +163,20 @@ outbox, and the restart-safe federation core (S2 P2-A). One database file
   way it does the forward read, because that record is itself the oldest
   `MAX_TRANSCRIPT_LIMIT` rows, so windowing it answers the newest page of the
   first thousand and calls it the tail.
+- **A `RoomRecord` says whether it is the whole log.** `load_record` builds the
+  transcript from `load_transcript_page(key, None, MAX_TRANSCRIPT_LIMIT)` and
+  keeps that page's `has_more` as `RoomRecord::transcript_has_more`, so both
+  getters — `get` and the soft-closed audit `get_including_closed`, whose choice
+  `/snapshot` serializes as its `closed` boolean — hand back a prefix that admits
+  it is one. Populate the flag from the SAME page the rows came from; a second
+  query, or a re-derivation, is a fact that can disagree with the rows beside it.
+  `transcript.len() == MAX_TRANSCRIPT_LIMIT` is NOT the test and never was: a room
+  that ENDS on the cap is indistinguishable by length from one cut at it, and only
+  the `limit + 1` sentinel separates them. Do NOT add the resume cursor as a
+  second field — it is `transcript.last().map(|m| m.seq)`, already on the struct.
+  This is where the SQLite record deliberately stops mirroring
+  `ocean_agent::rooms::RoomRecord`: that in-memory twin holds every row it was
+  given, so the flag there could only ever be `false`.
 - **Attachments are immutable, so the discipline is refusal, not CAS.** There is
   deliberately no `version` column on `room_attachments`: nothing amends an
   attachment, so a compare-and-swap guard would be decoration, and a decorative

@@ -93,18 +93,59 @@ use ocean_core::{
 };
 use rusqlite::{params, Connection, OptionalExtension, TransactionBehavior};
 
-/// A persistent room plus its transcript. Mirror of `ocean_agent::rooms::RoomRecord`
-/// so callers can move between the in-memory and SQLite stores without changing
-/// their handling of returned records.
+/// A persistent room plus the OLDEST bounded page of its transcript.
+///
+/// Near-mirror of `ocean_agent::rooms::RoomRecord`, deliberately one field wider.
+/// That in-memory twin keeps every row it was ever handed, so it has no prefix to
+/// mark and a `transcript_has_more` there could only ever be `false`; here the
+/// transcript is capped, and whether it is the whole log is the one thing a holder
+/// cannot work out for itself.
 #[derive(Debug, Clone, PartialEq)]
 pub struct RoomRecord {
     /// The persistent room entity (id, name, roster, timestamps, trigger policy).
     pub room: Room,
-    /// Append-only transcript of room events, in `seq` order. Bounded by
+    /// The OLDEST rows of the transcript, in ascending `seq` order, capped at
     /// [`MAX_TRANSCRIPT_LIMIT`] — a record never hydrates an unbounded transcript
-    /// (OCEAN-249). For a transcript longer than that cap, page with
+    /// (OCEAN-249). Check [`transcript_has_more`](Self::transcript_has_more) before
+    /// treating this as the whole log; page the rest with
     /// [`RoomStore::transcript_page`].
     pub transcript: Vec<RoomMessage>,
+    /// Whether rows exist beyond [`transcript`](Self::transcript) — whether this
+    /// record holds a PREFIX of the room's log rather than all of it.
+    ///
+    /// Copied from the same [`TranscriptPage`] the transcript came from, so it is
+    /// that page's own `limit + 1` sentinel and cannot drift from what
+    /// [`RoomStore::transcript_page`] would answer for the same room. It costs no
+    /// extra query; before it existed the answer was simply destroyed at this
+    /// boundary and unrecoverable without a second read.
+    ///
+    /// `transcript.len() == MAX_TRANSCRIPT_LIMIT` is NOT a substitute: a room
+    /// holding exactly the cap and one holding more are indistinguishable by
+    /// length, the same trap
+    /// [`transcript_tail_page_including_closed`](SqliteRoomStore::transcript_tail_page_including_closed)
+    /// documents. The resume cursor is deliberately absent instead — it is
+    /// `transcript.last().map(|m| m.seq)`, precisely what [`TranscriptPage::next_seq`]
+    /// carries, so a field for it would restate rows already on this struct and add
+    /// a second thing able to contradict them. This flag is the only part of the
+    /// page that is not recomputable from what the record already holds.
+    ///
+    /// Two daemon consumers wait on this, both in
+    /// `crates/ocean-daemon/src/persistent_rooms.rs` and both left to their own slice.
+    /// The one that LOSES ROWS is `read_transcript_page`'s closed arm: it re-pages a
+    /// record from [`get_including_closed`](SqliteRoomStore::get_including_closed) in
+    /// memory, so `has_more` is `msgs.len() > effective_limit` over rows the record
+    /// already dropped — the window it can see ends at [`MAX_TRANSCRIPT_LIMIT`]
+    /// however long the room is, and a soft-closed room past the cap therefore
+    /// answers `has_more: false, next_seq: None` on its last held row and a paging
+    /// client stops there. That arm is shared by
+    /// `/transcript`, `/snapshot`'s forward read and `room_summary.rs`, so this flag
+    /// is one fix for three routes. The second is `room_get`, which throws its
+    /// record's transcript away and re-reads a page for the sole reason its own
+    /// comment gives — that only the page can tell "exactly the cap" from "the cap,
+    /// with more behind it" — and so decodes up to the cap TWICE on the call
+    /// ocean-surface makes every time a room is opened. That sentence stopped being
+    /// true when this field landed.
+    pub transcript_has_more: bool,
 }
 
 /// Server-derived owner authority for one Local room.
@@ -2106,8 +2147,9 @@ impl SqliteRoomStore {
     /// The tail is the one read the record-level audit view cannot supply.
     /// [`get_including_closed`](Self::get_including_closed) hydrates the OLDEST
     /// [`MAX_TRANSCRIPT_LIMIT`] rows, so windowing that record in memory answers
-    /// the newest page of the FIRST THOUSAND and calls it the tail — with the
-    /// cursor and `has_more` beside it looking correct, so no caller can tell.
+    /// the newest page of the FIRST THOUSAND and calls it the tail. The record does
+    /// now admit that it is a prefix ([`RoomRecord::transcript_has_more`]), but a
+    /// marker only says the newest rows are absent — it cannot produce them.
     /// Going to the rows is what lets a frozen call room and a live one hydrate to
     /// the same screen however long either got.
     ///
@@ -2189,12 +2231,12 @@ impl SqliteRoomStore {
         let participants = self.load_participants(key)?;
         // A record's transcript is bounded (OCEAN-249): even the audit/closed-room
         // view caps at MAX_TRANSCRIPT_LIMIT rather than hydrating an unbounded log.
-        // Callers needing the full history of a very long room page via
-        // `transcript_page`. This reads the first (oldest) page; the `has_more`
-        // signal is available through `transcript_page` for callers that care.
-        let transcript = self
-            .load_transcript_page(key, None, MAX_TRANSCRIPT_LIMIT)?
-            .messages;
+        // This reads the first (oldest) page and KEEPS its `has_more`, because the
+        // page is the only thing that knows: `messages.len()` cannot tell the cap
+        // from a room that stops exactly on it, so dropping the flag here left every
+        // holder — the audit view through `get_including_closed` included — with an
+        // unmarked prefix and no way to ask.
+        let page = self.load_transcript_page(key, None, MAX_TRANSCRIPT_LIMIT)?;
 
         let room = Room {
             id: RoomKey::new(id),
@@ -2205,7 +2247,11 @@ impl SqliteRoomStore {
             trigger_policy,
             workspace_root,
         };
-        Ok(Some(RoomRecord { room, transcript }))
+        Ok(Some(RoomRecord {
+            room,
+            transcript: page.messages,
+            transcript_has_more: page.has_more,
+        }))
     }
 
     /// Create a room artifact and explain it in the transcript, atomically.
@@ -10664,6 +10710,59 @@ mod tests {
         );
         assert_eq!(page.prev_seq, Some(newest - 3));
         assert!(page.has_more, "a thousand older rows remain");
+    }
+
+    #[test]
+    fn record_marks_a_transcript_it_holds_only_a_prefix_of() {
+        // A record hydrates the OLDEST MAX_TRANSCRIPT_LIMIT rows, so a longer room
+        // hands back a prefix. The page that produced those rows knows it did; that
+        // signal used to be dropped one line after it was computed, leaving every
+        // holder with a truncated log and no way to ask.
+        let (mut s, key) = store_with_messages(MAX_TRANSCRIPT_LIMIT + 5);
+
+        let open = s.get(&key).unwrap().expect("open room");
+        assert_eq!(open.transcript.len(), MAX_TRANSCRIPT_LIMIT);
+        assert_eq!(
+            open.transcript.last().map(|m| m.seq),
+            Some(MAX_TRANSCRIPT_LIMIT as u64 - 1),
+            "the record stops at the cap, five rows short of the room"
+        );
+        assert!(open.transcript_has_more);
+
+        // The audit view is the same read and must not lose the marker: /snapshot
+        // derives its `closed` flag from WHICH getter answered, so a frozen room
+        // replays through exactly this record.
+        s.close(&key).unwrap();
+        assert!(s.get(&key).unwrap().is_none(), "closed to the open getter");
+        let audit = s.get_including_closed(&key).unwrap().expect("audit view");
+        assert_eq!(audit.transcript.len(), MAX_TRANSCRIPT_LIMIT);
+        assert!(
+            audit.transcript_has_more,
+            "closing a room does not shorten its log"
+        );
+    }
+
+    #[test]
+    fn record_of_a_whole_transcript_is_not_marked_truncated() {
+        let (s, key) = store_with_messages(10);
+        let rec = s.get(&key).unwrap().expect("open room");
+        assert_eq!(seqs(&rec.transcript), (0..10).collect::<Vec<u64>>());
+        assert!(!rec.transcript_has_more);
+    }
+
+    #[test]
+    fn record_at_exactly_the_cap_is_not_marked_truncated() {
+        // The case `transcript.len()` can never answer, and the reason the marker has
+        // to be carried rather than derived: this room and the MAX + 5 room above
+        // hydrate an identical number of rows, and only the page's `limit + 1`
+        // sentinel separates a log that ENDS on the cap from one cut at it.
+        let (s, key) = store_with_messages(MAX_TRANSCRIPT_LIMIT);
+        let rec = s.get(&key).unwrap().expect("open room");
+        assert_eq!(rec.transcript.len(), MAX_TRANSCRIPT_LIMIT);
+        assert!(
+            !rec.transcript_has_more,
+            "the last row IS the last row; nothing lies beyond it"
+        );
     }
 
     #[test]
