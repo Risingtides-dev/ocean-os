@@ -13218,9 +13218,24 @@ mod tests {
         // present (empty for every pre-existing room), and this frozen key-set
         // is updated on purpose, not worked around. The gate did its job: it
         // caught the wire change on the first run.
+        //
+        // Same again for `next_seq`/`has_more`: this route's `transcript` was
+        // always a bounded first page (OCEAN-249 capped the record read at
+        // MAX_TRANSCRIPT_LIMIT) but said nothing about it, so a room past the
+        // cap presented its OLDEST thousand rows as the whole log. Both fields
+        // are additive and match what `/transcript` and `/snapshot` already
+        // answer. The gate caught this one on the first run too.
         assert_json_object_keys(
             &detail,
-            &["access", "agent_owners", "ok", "room", "transcript"],
+            &[
+                "access",
+                "agent_owners",
+                "has_more",
+                "next_seq",
+                "ok",
+                "room",
+                "transcript",
+            ],
         );
         assert_eq!(detail["ok"], true);
         assert_eq!(detail["room"]["id"], "lifecycle-room");
@@ -13228,6 +13243,9 @@ mod tests {
         assert!(detail["room"].get("workspace_root").is_none());
         assert!(detail["room"].get("trigger_policy").is_none());
         assert_eq!(detail["transcript"], json!([]));
+        // A fresh room is the whole transcript, not a prefix of one.
+        assert_eq!(detail["next_seq"], serde_json::Value::Null);
+        assert_eq!(detail["has_more"], false);
         assert_eq!(
             detail["access"],
             json!({"state": "local"}),
