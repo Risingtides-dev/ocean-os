@@ -25620,6 +25620,11 @@ mod tests {
         std::env::set_var("OCEAN_AGENTS_DIR", &agents_root);
         let state = fake_convene_state(&tmp);
         let key = RoomKey::new("bootstrap-route");
+        // The literal `persistent_rooms.rs` and `room_summary.rs` use as their
+        // poison, so both halves of the audit link-forgery vector answer for one
+        // value: the renderers project it, and these routes never mint a row
+        // that carries it.
+        const FORGED_MEMBER_ID: &str = "[click here](https://evil.co)";
         with_rooms(&state, |store| {
             store.create(key.clone(), "Bootstrap Route", None, Utc::now())?;
             store.add_participant(
@@ -25676,6 +25681,24 @@ mod tests {
         assert_eq!(body["error"], "ambient_credential_rejected");
 
         let operator = &[("x-ocean-operator", "test-room-operator")];
+        // Pinned at the route and not only at the helper: an authenticated
+        // operator still cannot mint a bootstrap System body carrying a forged
+        // destination. The single-audit assertion further down is what makes
+        // this a refusal rather than a repair — a refused call leaves no row.
+        let (status, forged) = operator_room_http_request(
+            app.clone(),
+            axum::http::Method::POST,
+            path,
+            Some(json!({
+                "owner_member_id": FORGED_MEMBER_ID,
+                "agent_package_id": "builder",
+            })),
+            operator,
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(forged["error"], "invalid_owner_member_id");
+
         let (status, body) = operator_room_http_request(
             app.clone(),
             axum::http::Method::POST,
@@ -25781,6 +25804,35 @@ mod tests {
         .await;
         assert_eq!(status, StatusCode::CONFLICT);
         assert_eq!(body["error"], "room_owner_conflict");
+
+        // The same guard on the sibling route, where the ids land on the
+        // binding row four renderers project instead of in a System body.
+        // Without it either forgery is a 403 `room_owner_required` from the
+        // ownership proof, so the typed 400 is what pins the shape check.
+        for (agent, owner, code) in [
+            (FORGED_MEMBER_ID, "human-1", "invalid_agent_member_id"),
+            ("builder", FORGED_MEMBER_ID, "invalid_owner_member_id"),
+        ] {
+            let (status, forged) = operator_room_http_request(
+                app.clone(),
+                axum::http::Method::POST,
+                "/v1/rooms/persistent/bootstrap-route/agents",
+                Some(json!({
+                    "agent_member_id": agent,
+                    "agent_package_id": "builder",
+                    "owner_member_id": owner,
+                    "decision_id": Uuid::new_v4().to_string(),
+                    "activation_policy": "explicit_only",
+                    "context_policy": "invocation_only",
+                    "memory_scope": "none",
+                    "room_capability_grants": [],
+                })),
+                operator,
+            )
+            .await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{code}");
+            assert_eq!(forged["error"], code);
+        }
 
         let decision_id = Uuid::new_v4().to_string();
         let (status, authorized) = operator_room_http_request(

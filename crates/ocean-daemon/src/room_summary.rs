@@ -166,17 +166,19 @@ fn summary_system_prompt() -> &'static str {
 /// Bodies go through `room_history_text`, the SAME projection the four human
 /// reads, the agent history page, and `build_room_prompt` apply, so a
 /// `room.agent.*` audit row arrives as its fixed label rather than as the
-/// principal, decision, and session metadata it carries. That matters more here than on a read: the audit
-/// interpolates a free-form `owner_member_id` nothing on the write path
-/// shape-checks, and the summary this prompt produces is itself an artifact
-/// ocean-surface markdown-renders — an unprojected body would have a laundered
-/// route straight back out.
+/// principal, decision, and session metadata it carries. That matters more here
+/// than on a read: the audit interpolates the ids that arrived, and the summary
+/// this prompt produces is itself an artifact ocean-surface markdown-renders —
+/// an unprojected body would have a laundered route straight back out.
 ///
-/// The AUTHOR label is deliberately left raw. It is the same unbounded
-/// caller-supplied identity, but it reaches every human read raw as well, and
-/// bounding it belongs where the id is minted rather than in one of four
-/// renderers — `os-owner-member-id-is-an-identity-with-no-shape-and-no-bound`
-/// owns that. Quoting it here alone would only move the gap.
+/// The AUTHOR label is deliberately left raw. It reaches every human read raw
+/// as well, and bounding the id belongs where it is MINTED rather than in one
+/// of four renderers: `room_agent_authority::validate_member_id` refuses one
+/// over 128 characters or carrying a control character or `[`/`]` at both
+/// mutation routes. That is the HTTP boundary only — the store still accepts
+/// whatever an in-process caller hands it and rows written before the guard are
+/// permanent — so this renderer may not assume it ran. Quoting the label here
+/// alone would still only move the gap.
 fn summary_user_prompt(room: &RoomKey, room_name: &str, msgs: &[RoomMessage]) -> String {
     let mut out = String::new();
     out.push_str(&format!(
@@ -830,10 +832,12 @@ mod tests {
     /// The fifth read of a `room.agent.*` audit row, and one of the two that
     /// laundered it — `build_room_prompt` is the other, pinned by
     /// `a_convened_agents_transcript_tail_projects_an_audit_row`.
-    /// `owner_member_id` is free-form and shape-checked nowhere, and the
-    /// artifact this pass writes is markdown-rendered by ocean-surface, so a raw
-    /// body was a route from an operator-supplied string through a model turn
-    /// and into a room-attributed link.
+    /// The artifact this pass writes is markdown-rendered by ocean-surface, so a
+    /// raw body was a route from an operator-supplied string through a model
+    /// turn and into a room-attributed link. `validate_member_id` now refuses
+    /// the `owner_member_id` used below at both mutation routes, but this
+    /// fixture mints its row in process, the way every row written before that
+    /// guard was minted.
     #[tokio::test]
     async fn a_bootstrap_audit_row_reaches_the_model_as_a_label_not_as_its_ids() {
         const POISON_OWNER: &str = "[click here](https://evil.co)";
@@ -899,9 +903,14 @@ mod tests {
         );
 
         // The author label is still raw, and this pins that rather than leaving
-        // it to be discovered: it is the same unbounded identity, it reaches
-        // every human read raw as well, and it is bounded where the id is minted
-        // by `os-owner-member-id-is-an-identity-with-no-shape-and-no-bound`.
+        // it to be discovered. The bound did land where the id is MINTED:
+        // `room_agent_authority::validate_member_id` refuses exactly this string
+        // at both mutation routes. But that refusal is at the HTTP boundary and
+        // this fixture is not — it calls `add_participant` and
+        // `bootstrap_local_room_agent` in process, which still accept whatever
+        // the caller hands them, as every row written before the guard did. So
+        // the assertion stays green on purpose: a renderer may never assume the
+        // guard ran.
         assert!(prompt.contains(&format!("{POISON_OWNER}:")));
 
         // The ledger is untouched: this projects the read, never the record.
