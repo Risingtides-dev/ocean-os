@@ -21,7 +21,9 @@ use chrono::{DateTime, Utc};
 use ocean_core::{RoomArtifact, RoomArtifactKind, RoomKey, RoomMessage, RoomParticipantKind};
 use ocean_store::{RoomStore as _, RoomStoreError, SqliteRoomStore};
 
-use crate::persistent_rooms::{read_transcript_page, with_rooms_handle, RoomStoreHandle};
+use crate::persistent_rooms::{
+    read_transcript_page, room_history_text, with_rooms_handle, RoomStoreHandle,
+};
 
 /// The well-known artifact id every summarize call writes to. It is a constant,
 /// not a caller parameter, because "the room's summary" is a singular thing:
@@ -158,7 +160,23 @@ fn summary_system_prompt() -> &'static str {
 
 /// Render the transcript window as the model's user turn. Oldest → newest, one
 /// line per message, in the same `[#seq] author: body` shape `build_room_prompt`
-/// hands a convened agent — one transcript rendering for the whole daemon.
+/// hands a convened agent. The two model-facing renderers differ in their
+/// framing and in nothing about how a row is rendered.
+///
+/// Bodies go through `room_history_text`, the SAME projection the four human
+/// reads, the agent history page, and `build_room_prompt` apply, so a
+/// `room.agent.*` audit row arrives as its fixed label rather than as the
+/// principal, decision, and session metadata it carries. That matters more here than on a read: the audit
+/// interpolates a free-form `owner_member_id` nothing on the write path
+/// shape-checks, and the summary this prompt produces is itself an artifact
+/// ocean-surface markdown-renders — an unprojected body would have a laundered
+/// route straight back out.
+///
+/// The AUTHOR label is deliberately left raw. It is the same unbounded
+/// caller-supplied identity, but it reaches every human read raw as well, and
+/// bounding it belongs where the id is minted rather than in one of four
+/// renderers — `os-owner-member-id-is-an-identity-with-no-shape-and-no-bound`
+/// owns that. Quoting it here alone would only move the gap.
 fn summary_user_prompt(room: &RoomKey, room_name: &str, msgs: &[RoomMessage]) -> String {
     let mut out = String::new();
     out.push_str(&format!(
@@ -171,7 +189,7 @@ fn summary_user_prompt(room: &RoomKey, room_name: &str, msgs: &[RoomMessage]) ->
             "[#{seq}] {author}: {body}\n",
             seq = m.seq,
             author = m.author_id,
-            body = m.body,
+            body = room_history_text(m.body.clone()),
         ));
     }
     out.push_str("--- end transcript ---\n\nYour summary:");
@@ -807,6 +825,93 @@ mod tests {
         assert_eq!(artifact.version, 1);
         assert!(artifact.body.contains("tail summary"));
         assert!(artifact.body.contains("#21–#30"));
+    }
+
+    /// The fifth read of a `room.agent.*` audit row, and one of the two that
+    /// laundered it — `build_room_prompt` is the other, pinned by
+    /// `a_convened_agents_transcript_tail_projects_an_audit_row`.
+    /// `owner_member_id` is free-form and shape-checked nowhere, and the
+    /// artifact this pass writes is markdown-rendered by ocean-surface, so a raw
+    /// body was a route from an operator-supplied string through a model turn
+    /// and into a room-attributed link.
+    #[tokio::test]
+    async fn a_bootstrap_audit_row_reaches_the_model_as_a_label_not_as_its_ids() {
+        const POISON_OWNER: &str = "[click here](https://evil.co)";
+        const PACKAGE: &str = "pkg-interpolated-only-into-the-audit";
+        const OPERATOR: &str = "operator:only-in-the-audit";
+
+        let key = RoomKey::new("audit-into-the-prompt");
+        let rooms = room_with_messages(&key, 2);
+        // A real bootstrap, not a hand-written body: the row under test has to be
+        // the one the store actually mints, or the projection is asserted against
+        // a shape nothing writes.
+        let bootstrap = with_rooms_handle(&rooms, |store| {
+            store.add_participant(
+                &key,
+                participant(POISON_OWNER, RoomParticipantKind::Human),
+                Utc::now(),
+            )?;
+            store.bootstrap_local_room_agent(
+                &key,
+                POISON_OWNER,
+                participant("builder", RoomParticipantKind::Agent),
+                PACKAGE,
+                OPERATOR,
+                Utc::now(),
+            )
+        })
+        .expect("bootstrap");
+        let audit_seq = bootstrap
+            .audit_message
+            .expect("a first bootstrap mints the audit row")
+            .seq;
+
+        let seen = Arc::new(Mutex::new(String::new()));
+        let captured = seen.clone();
+        let outcome = summarize_room(&rooms, input(&key, None), move |_, _, user| {
+            *captured.lock().expect("prompt") = user;
+            std::future::ready(Ok::<_, &'static str>((
+                "they bootstrapped an agent".into(),
+                "model-x".into(),
+            )))
+        })
+        .await;
+        assert!(matches!(outcome, SummarizeOutcome::Wrote { .. }));
+
+        let prompt = seen.lock().expect("prompt").clone();
+        assert!(
+            prompt.contains(&format!(
+                "[#{audit_seq}] system: [room agent bootstrap audit]\n"
+            )),
+            "the audit row must reach the model as its fixed label: {prompt}"
+        );
+        // Every string only the audit body interpolates. The join markers carry
+        // the owner id too, so asserting on those would pass for the wrong reason.
+        for leaked in [PACKAGE, OPERATOR, "room.agent.bootstrap", "owner_member_id"] {
+            assert!(
+                !prompt.contains(leaked),
+                "`{leaked}` rode into the model turn: {prompt}"
+            );
+        }
+        assert!(
+            prompt.contains("message 1"),
+            "an ordinary body is not projected"
+        );
+
+        // The author label is still raw, and this pins that rather than leaving
+        // it to be discovered: it is the same unbounded identity, it reaches
+        // every human read raw as well, and it is bounded where the id is minted
+        // by `os-owner-member-id-is-an-identity-with-no-shape-and-no-bound`.
+        assert!(prompt.contains(&format!("{POISON_OWNER}:")));
+
+        // The ledger is untouched: this projects the read, never the record.
+        let stored = with_rooms_handle(&rooms, |store| store.transcript(&key, None)).expect("read");
+        assert!(
+            stored
+                .iter()
+                .any(|m| m.body.contains(POISON_OWNER) && m.body.contains(PACKAGE)),
+            "the audit row must still hold verbatim what was attempted"
+        );
     }
 
     #[tokio::test]

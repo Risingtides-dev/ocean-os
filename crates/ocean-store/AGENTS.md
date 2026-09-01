@@ -191,21 +191,37 @@ outbox, and the restart-safe federation core (S2 P2-A). One database file
   `[click here](https://evil.co)` through all four and asserts this store still
   holds it verbatim: the rendering bug is fixed where it is read, and the ledger
   keeps the evidence.
-  Two things that boundary does NOT yet cover, named because a doc claiming
-  otherwise is how the next one gets missed. First, that match is a closed
+  The two MODEL-facing reads of those rows are projected too, and closing only
+  one of them would have moved the route rather than shut it. `POST
+  /v1/rooms/persistent/{key}/summarize` shares `read_transcript_page`, and a
+  convened agent's transcript tail comes from
+  `authorized_room_transcript_context`, which pages this store raw and filters
+  no message kind; both build a model prompt rather than a response, so both
+  apply `room_history_text` themselves — in `summary_user_prompt` and in
+  `build_room_prompt` — instead of going through `projected_room_message`.
+  `read_transcript_page` stays the one raw paging implementation its consumers
+  share, and the projection sits at each point a prompt or a response is SHAPED.
+  That closes the model-laundered route: the audit metadata
+  `crates/ocean-daemon/AGENTS.md` says never reaches a model reaches neither
+  prompt, so it cannot ride back out through the summary artifact ocean-surface
+  markdown-renders, nor through a convened reply `append_room_agent_reply`
+  appends to the room and the same surface renders.
+  `a_bootstrap_audit_row_reaches_the_model_as_a_label_not_as_its_ids` drives a
+  real `bootstrap_local_room_agent` row through summarize and asserts the prompt
+  carries `[room agent bootstrap audit]` and none of the package, principal, or
+  `owner_member_id` strings the body interpolates;
+  `a_convened_agents_transcript_tail_projects_an_audit_row` pins the same for the
+  convened-agent prompt, off a tail read back through `transcript_page`.
+  Two things that boundary still does NOT cover, named because a doc claiming
+  otherwise is how the next one gets missed. First, the match is a closed
   whitelist of four literal strings and not a `room.agent.` prefix; its fallback
-  arm hands anything else through raw on BOTH the human and the agent path with
-  no test going red, so a fifth audit writer lands unprojected and silent —
-  add its `type` there in the same commit that adds the row. Second, a FIFTH
-  human-facing read still takes these bodies raw: `POST
-  /v1/rooms/persistent/{key}/summarize` shares `read_transcript_page` and
-  interpolates `m.body` verbatim into its model prompt, so the
-  principal/decision/session metadata that `crates/ocean-daemon/AGENTS.md` says
-  never reaches a model reaches THAT one, and the summary artifact it writes is
-  itself markdown-rendered by ocean-surface — a model-laundered route back to
-  the same anchor. Projecting inside `read_transcript_page` closes it, and is
-  deliberately not done here because it changes what the summarizer reads and
-  that deserves its own test.
+  arm hands anything else through raw on the human, agent, summarizer AND
+  convened-agent paths with no test going red, so a new audit writer lands
+  unprojected and silent — add its `type` there in the same commit that adds the
+  row. Second, only the BODY is projected: all four renderers still interpolate
+  `author_id` verbatim, which is the same unbounded caller-supplied identity,
+  and it is bounded at the write side where the id is minted rather than in any
+  one of them.
 - **An artifact title is refused blank, never stored blank.** `create_artifact`
   and `amend_artifact` both raise `ArtifactTitleBlank` on a whitespace-only
   title before any read, UPDATE, or transcript insert, so a refusal writes

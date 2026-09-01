@@ -8601,3 +8601,67 @@ restore the literal. docs-check goes from FAILED (1 issue) to PASS across 30
 packages, 157 active Markdown files, 179 local links. No code, no invariant, no
 deploy.
 _________________________________________________________________________________
+
+time:      [23:48] [08-31-26]
+agent:     [claude] [opus 5]
+worktree:  loop/os-summarize-reads-audit-bodies-raw-into-a-model-and-the-surface-renders-the-result
+type:      [bug-report]
+area:      [backend]
+
+`POST /v1/rooms/persistent/{key}/summarize` was the fifth human-facing read of
+the `room.agent.*` audit rows and the only one still raw. The previous slice
+projected four reads and named this one as open; it interpolated `m.body`
+verbatim into the model's user turn, and the summary that comes back is written
+as an artifact ocean-surface markdown-renders — so an operator-supplied string
+reached a model and came back out as room-attributed markdown, which is a worse
+shape than the raw read it was filed beside. `summary_user_prompt` now renders
+bodies through `room_history_text`, the same projection the four human reads
+apply. The AUTHOR label is deliberately left raw and the test pins that rather
+than leaving it to be discovered: it is the same unbounded caller-supplied
+identity, it reaches every human read raw as well, and quoting it in one of four
+renderers would only move the gap — it is bounded where the id is minted, which
+`os-owner-member-id-is-an-identity-with-no-shape-and-no-bound` owns.
+
+Review found the fix true and the CONTRACT around it false. `build_room_prompt`
+(persistent_rooms.rs) interpolated `m.body` raw into a convened agent's prompt,
+its tail is unprojected room transcript with audit rows in it, and the agent's
+reply is appended into the room ocean-surface renders — the same
+operator-string → model turn → rendered link route, one function away in the
+same file. So three new claims were false as written (ocean-store/AGENTS.md's
+"that closes the model-laundered route", ocean-daemon/AGENTS.md's "all three
+audiences run one function and none of them can drift", persistent_rooms.rs's
+"cannot drift into three rules") and room_summary.rs's retained "one transcript
+rendering for the whole daemon" had been made untrue by the commit itself.
+Sharpest form: under `context_policy:room_history` one turn got the projected
+label from the bounded history tool AND the same row's raw JSON from the inline
+prompt tail. Taken the cheaper-and-truer way — `body =
+room_history_text(m.body.clone())` at the second site too, the identical
+one-line shape, needing no visibility change since the function was already
+private to that module. All four renderings of a room body in this crate now
+run one function: `room_history_row`, `projected_room_message`,
+`summary_user_prompt`, `build_room_prompt`. Every doc site was then corrected to
+COUNT four rather than three, and what is still open is left named in the same
+places rather than quietly dropped: the whitelist is four literal `type` values
+with a raw `_ => body` fallback and nothing goes red on a fifth writer, filed as
+`os-audit-type-whitelist-has-no-guard-that-reds-on-a-fifth-writer`.
+
+Both tests mint a real row through `bootstrap_local_room_agent` rather than
+hand-writing a body, and read it back through the exact call the production path
+makes — `transcript_page` for the convened tail, `summarize_room` for the
+prompt. Each asserts the fixed label is present, that the package id, operator
+principal, `room.agent.bootstrap` and `owner_member_id` are absent, that an
+ordinary body is untouched, and that the store still holds the attempt verbatim:
+this projects the read, never the record. Not decoration — reverting only the
+one line in `build_room_prompt` turns the suite to 856 passed / 1 failed and
+that one failure is the new test. At land the owning contract bullet for the
+file that actually changed (`room_summary.rs` in crates/ocean-daemon/AGENTS.md)
+was given the invariant too; it had been recorded only in the
+`persistent_rooms.rs` bullet and in another crate's contract, leaving an agent
+reading the daemon's own unable to learn it.
+
+Gate at land: `cargo test -p ocean-daemon` 857 passed / 0 failed, `cargo clippy
+-p ocean-daemon --all-targets -- -D warnings` exit 0, `cargo fmt --check` exit
+0, `cargo xtask docs-check` PASS (30 packages, 157 active Markdown files, 179
+local links). No route, no schema, no wire field — a prompt rendering and its
+contracts — so no deploy and no migration.
+_________________________________________________________________________________
