@@ -443,6 +443,9 @@ fn room_history_row(message: RoomMessage) -> ocean_agent::RoomHistoryRow {
     }
 }
 
+/// A CLOSED whitelist, not a `room.agent.` prefix: an audit `type` that is not
+/// one of these four falls through raw to both audiences, and no test goes red
+/// when it does. A new audit writer adds its `type` here in the same commit.
 fn room_history_text(body: String) -> String {
     let audit_type = serde_json::from_str::<serde_json::Value>(&body)
         .ok()
@@ -459,6 +462,43 @@ fn room_history_text(body: String) -> String {
         Some("room.agent.output") => "[room agent output audit]".into(),
         _ => body,
     }
+}
+
+/// Collapse a `room.agent.*` audit body to the same summary line the agent path
+/// already gets, for a row on its way to a HUMAN client.
+///
+/// Two things are wrong with handing that body over raw. The dull one is that a
+/// human reads a wall of serde_json where an agent reads one line. The sharp one
+/// is that the audit interpolates the ids that ARRIVED — `owner_member_id` is a
+/// free-form caller string nothing on the path shape-checks — and ocean-surface
+/// markdown-renders every row body, System included, so an operator who
+/// bootstraps with an `owner_member_id` of `[click here](https://evil.co)` lands
+/// an attacker-labelled link in a row the UI attributes to the room itself.
+///
+/// The repair belongs HERE and not in `ocean-store`: that audit row is a ledger,
+/// and a store that quietly repaired `owner_member_id` would report the attempt
+/// as something other than what was made (see `crates/ocean-store/AGENTS.md`).
+/// It goes at the point each response is SHAPED rather than inside
+/// `read_transcript_page`, which is `pub(super)` precisely so `room_summary.rs`
+/// feeds the identical window to a model turn — projecting there changes what
+/// the summarizer reads, which is a separate decision owing its own test.
+/// Routing both audiences through `room_history_text` is the point: the human
+/// and agent rules cannot drift into two.
+///
+/// Leaving `read_transcript_page` raw is a scope boundary, not a virtue:
+/// `/summarize` still takes these bodies whole, so the same unchecked
+/// `owner_member_id` rides into a model turn and back out through a summary
+/// artifact the surface markdown-renders — the anchor keeps a laundered route.
+/// Named as open in `crates/ocean-store/AGENTS.md`.
+fn projected_room_message(mut message: RoomMessage) -> RoomMessage {
+    message.body = room_history_text(message.body);
+    message
+}
+
+/// [`projected_room_message`] across a page, for the handlers that hand back a
+/// whole `transcript` array.
+fn projected_transcript(messages: Vec<RoomMessage>) -> Vec<RoomMessage> {
+    messages.into_iter().map(projected_room_message).collect()
 }
 
 #[async_trait::async_trait]
@@ -1143,7 +1183,7 @@ pub(super) async fn room_get(
             Json(json!({
                 "ok": true,
                 "room": rec.room,
-                "transcript": rec.transcript,
+                "transcript": projected_transcript(rec.transcript),
                 "access": access,
                 "agent_owners": owners
                     .into_iter()
@@ -3203,7 +3243,7 @@ pub(super) async fn room_transcript(
             StatusCode::OK,
             Json(json!({
                 "ok": true,
-                "transcript": page.messages,
+                "transcript": projected_transcript(page.messages),
                 "next_seq": page.next_seq,
                 "has_more": page.has_more,
             })),
@@ -3272,7 +3312,7 @@ pub(super) async fn room_snapshot(
                     "ok": true,
                     "room": rec.room.clone(),
                     "participants": rec.room.participants,
-                    "transcript": page.messages,
+                    "transcript": projected_transcript(page.messages),
                     "last_seq": last_seq,
                     "next_seq": page.next_seq,
                     "has_more": page.has_more,
@@ -3644,8 +3684,9 @@ fn room_message_tail(
 
 /// `GET /v1/rooms/persistent/{key}/events?after_seq=N` — durable replay plus a
 /// room-scoped live SSE tail. Every frame is `event: room_message`, `id: <seq>`
-/// with the exact existing `RoomMessage` JSON. SQLite is authoritative; the
-/// bounded broadcast carries wake hints only.
+/// with the existing `RoomMessage` JSON, its body through
+/// [`projected_room_message`] like every other human-facing read. SQLite is
+/// authoritative; the bounded broadcast carries wake hints only.
 ///
 /// S2-P1 merged SSE: also carries `event: room_access` frames (no `id`) with
 /// RoomAccessProjection JSON. An initial access frame ships before any messages;
@@ -3737,7 +3778,12 @@ pub(super) async fn room_events(
     let msg_stream = room_message_tail(state.clone(), room.clone(), resume, message_hints, None)
         .map(|message| -> Result<Event, Infallible> {
             let seq = message.seq.to_string();
-            let data = serde_json::to_string(&message).expect("RoomMessage serializable");
+            // The live tail is the other half of one client read — a surface
+            // hydrates through `/snapshot` and then tails here — so projecting
+            // only the paged reads would leave the injection path that matters
+            // wide open while reading as closed.
+            let data = serde_json::to_string(&projected_room_message(message))
+                .expect("RoomMessage serializable");
             Ok(Event::default().id(seq).event("room_message").data(data))
         });
 
@@ -4263,6 +4309,180 @@ mod tests {
             .messages
             .iter()
             .any(|message| message.seq == older.seq && message.body == "older user fact"));
+    }
+
+    /// The human half of the same read boundary, on all FOUR of its routes.
+    ///
+    /// A bootstrap audit interpolates `owner_member_id` verbatim, nothing on the
+    /// path bounds or shape-checks it, and ocean-surface markdown-renders every
+    /// row body including `System` — so an owner id of `[click here](...)` would
+    /// otherwise render as an attacker-labelled anchor in a row the UI attributes
+    /// to the room itself. A client hydrates through `/snapshot` and then TAILS
+    /// through `/events`, which is why closing only the paged reads would leave
+    /// the live path open while reading as done.
+    ///
+    /// The row comes from the real store writer rather than a hand-rolled body:
+    /// the ledger keeps the id exactly as it arrived (asserted below) and the READ
+    /// is what neutralizes it. An ordinary message rides along to pin that the
+    /// projection is surgical and does not rewrite bodies it was not aimed at.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn audit_rows_reach_every_human_route_projected() {
+        use http_body_util::BodyExt as _;
+
+        const POISON_OWNER: &str = "[click here](https://evil.co)";
+        const PACKAGE: &str = "pkg-interpolated-only-into-the-audit";
+        const PLAIN: &str = "they reverted the map change";
+
+        fn audit_and_plain(
+            rows: &[serde_json::Value],
+            route: &str,
+        ) -> (serde_json::Value, serde_json::Value) {
+            let audit = rows
+                .iter()
+                .find(|row| row["kind"] == "system")
+                .unwrap_or_else(|| panic!("{route} dropped the audit row"))
+                .clone();
+            let plain = rows
+                .iter()
+                .find(|row| row["kind"] == "message")
+                .unwrap_or_else(|| panic!("{route} dropped the human row"))
+                .clone();
+            (audit, plain)
+        }
+
+        fn assert_projected(rows: &[serde_json::Value], route: &str) {
+            let (audit, plain) = audit_and_plain(rows, route);
+            let body = audit["body"]
+                .as_str()
+                .unwrap_or_else(|| panic!("{route} audit body is not a string"));
+            assert_eq!(
+                body, "[room agent bootstrap audit]",
+                "{route} served it raw"
+            );
+            assert!(!body.contains("]("), "{route} kept link syntax: {body}");
+            assert!(!body.contains("evil.co"), "{route}: {body}");
+            assert!(!body.contains(POISON_OWNER), "{route}: {body}");
+            assert!(!body.contains(PACKAGE), "{route}: {body}");
+            assert_eq!(plain["body"], PLAIN, "{route} rewrote an ordinary body");
+        }
+
+        let _guard = AUTO_CONVENE_ENV_LOCK.lock().await;
+        let tmp = tempfile::TempDir::new().unwrap();
+        let state = fake_convene_state(&tmp);
+        let key = RoomKey::new("audit-projection");
+        create_plain_room(&state, &key);
+        join_participant(
+            &state,
+            &key,
+            POISON_OWNER,
+            RoomParticipantKind::Human,
+            "Owner",
+        );
+        with_rooms(&state, |store| {
+            store
+                .bootstrap_local_room_agent(
+                    &key,
+                    POISON_OWNER,
+                    RoomParticipant {
+                        id: "builder".into(),
+                        kind: RoomParticipantKind::Agent,
+                        display_name: "Builder".into(),
+                    },
+                    PACKAGE,
+                    "operator:test",
+                    Utc::now(),
+                )
+                .expect("bootstrap writes the audit row");
+        });
+        append_room_message(
+            &state,
+            &key,
+            "human",
+            RoomParticipantKind::Human,
+            RoomMessageKind::Message,
+            PLAIN,
+        )
+        .expect("plain message");
+
+        // The ledger is untouched: this slice fixes the read, not the record, and
+        // `crates/ocean-store/AGENTS.md` rules the audit rows records-not-prose.
+        let stored = with_rooms(&state, |store| store.transcript(&key, None)).expect("transcript");
+        assert!(
+            stored.iter().any(|message| {
+                message.kind == RoomMessageKind::System && message.body.contains(POISON_OWNER)
+            }),
+            "the store must still hold the audit exactly as it arrived"
+        );
+
+        for (route, path) in [
+            ("room_get", format!("/v1/rooms/persistent/{key}")),
+            (
+                "room_transcript",
+                format!("/v1/rooms/persistent/{key}/transcript"),
+            ),
+            (
+                "room_snapshot",
+                format!("/v1/rooms/persistent/{key}/snapshot"),
+            ),
+        ] {
+            let app = room_routes().with_state(state.clone());
+            let response = app
+                .oneshot(axum::http::Request::get(&path).body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK, "{route}");
+            let value: serde_json::Value = serde_json::from_slice(
+                &axum::body::to_bytes(response.into_body(), 1024 * 1024)
+                    .await
+                    .unwrap(),
+            )
+            .unwrap();
+            let rows: Vec<serde_json::Value> = value["transcript"]
+                .as_array()
+                .unwrap_or_else(|| panic!("{route} returned no transcript array"))
+                .clone();
+            assert_projected(&rows, route);
+        }
+
+        // The live tail carries the same projection: replay it off the wire.
+        let app = room_routes().with_state(state.clone());
+        let response = app
+            .oneshot(
+                axum::http::Request::get(format!("/v1/rooms/persistent/{key}/events"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let mut body = response.into_body();
+        let mut wire = String::new();
+        for _ in 0..8 {
+            if sse_room_messages(&wire)
+                .iter()
+                .any(|row| row["kind"] == "message")
+            {
+                break;
+            }
+            let frame = tokio::time::timeout(std::time::Duration::from_millis(500), body.frame())
+                .await
+                .expect("SSE frame exceeded 500ms")
+                .expect("SSE body ended before the transcript replayed")
+                .expect("SSE body error");
+            wire.push_str(std::str::from_utf8(frame.data_ref().expect("SSE data frame")).unwrap());
+        }
+        assert_projected(&sse_room_messages(&wire), "room_events");
+    }
+
+    /// Every `RoomMessage` decoded out of a raw SSE wire, in arrival order. The
+    /// whole accumulated wire is re-scanned each pass because frames may batch —
+    /// one HTTP body frame is not guaranteed to hold exactly one event.
+    fn sse_room_messages(wire: &str) -> Vec<serde_json::Value> {
+        wire.lines()
+            .filter_map(|line| line.strip_prefix("data: "))
+            .filter_map(|data| serde_json::from_str::<serde_json::Value>(data).ok())
+            .filter(|value| value.get("seq").is_some())
+            .collect()
     }
 
     use crate::tests::{

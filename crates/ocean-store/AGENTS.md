@@ -177,16 +177,35 @@ outbox, and the restart-safe federation core (S2 P2-A). One database file
   the wrong crate and destroys the evidence on the way.
   `a_failure_marker_is_neutralized_and_the_audit_beside_it_is_not` pins both
   halves so neither side of the boundary drifts.
-  KNOWN OPEN, deliberately not closed here: neutralizing an audit body belongs
-  at the READ boundary, and only half of it exists. `ocean-daemon`'s
-  `room_history_text` already replaces every `room.agent.*` body with
-  `[room agent bootstrap audit]` before an agent sees it, but
-  `GET /v1/rooms/persistent/{key}/transcript` hands a human client the body
-  raw and ocean-surface puts it through `room_markdown::body_view`, so a
-  bootstrap `owner_member_id` — free-form, shape-checked nowhere — of
-  `[click here](https://evil.co)` still renders as an attacker-labelled link
-  in the room's own voice. That closes by giving the human transcript route
-  the projection the agent route already has, tracked as its own slice.
+  Neutralizing an audit body belongs at the READ boundary, and the four routes
+  that hand a transcript straight to a human client now do it. `ocean-daemon`'s
+  `room_history_text` collapses the four audit `type` values that exist today —
+  `room.agent.admission`, `.authority`, `.bootstrap`, `.output` — to
+  `[room agent <kind> audit]`, and `projected_room_message` beside it applies
+  that SAME function to `GET /v1/rooms/persistent/{key}`, `/transcript`,
+  `/snapshot`, and the `/events` SSE tail. It was never one route: a client
+  hydrates through `/snapshot` and then tails `/events`, so a fix covering the
+  paged reads alone would have left the live path injectable while reading as
+  closed. `audit_rows_reach_every_human_route_projected` drives a bootstrap
+  `owner_member_id` — free-form, shape-checked nowhere — of
+  `[click here](https://evil.co)` through all four and asserts this store still
+  holds it verbatim: the rendering bug is fixed where it is read, and the ledger
+  keeps the evidence.
+  Two things that boundary does NOT yet cover, named because a doc claiming
+  otherwise is how the next one gets missed. First, that match is a closed
+  whitelist of four literal strings and not a `room.agent.` prefix; its fallback
+  arm hands anything else through raw on BOTH the human and the agent path with
+  no test going red, so a fifth audit writer lands unprojected and silent —
+  add its `type` there in the same commit that adds the row. Second, a FIFTH
+  human-facing read still takes these bodies raw: `POST
+  /v1/rooms/persistent/{key}/summarize` shares `read_transcript_page` and
+  interpolates `m.body` verbatim into its model prompt, so the
+  principal/decision/session metadata that `crates/ocean-daemon/AGENTS.md` says
+  never reaches a model reaches THAT one, and the summary artifact it writes is
+  itself markdown-rendered by ocean-surface — a model-laundered route back to
+  the same anchor. Projecting inside `read_transcript_page` closes it, and is
+  deliberately not done here because it changes what the summarizer reads and
+  that deserves its own test.
 - **An artifact title is refused blank, never stored blank.** `create_artifact`
   and `amend_artifact` both raise `ArtifactTitleBlank` on a whitespace-only
   title before any read, UPDATE, or transcript insert, so a refusal writes
@@ -205,9 +224,12 @@ outbox, and the restart-safe federation core (S2 P2-A). One database file
   carries only the sanitized filename and a server-computed byte count —
   sanitized meaning `marker_prose`, above. A client-supplied string can
   otherwise forge a transcript line twice over: a newline forges a row in
-  anything that splits on lines, and `[label](href)` forges an anchor in
+  anything that splits on lines, and markdown's own link syntax — a bracketed
+  label followed by a parenthesised destination — forges an anchor in
   ocean-surface, which puts system rows through a markdown tokenizer and is
-  not the naive renderer this bullet used to name. `byte_len` and `sha256`
+  not the naive renderer this bullet used to name. Spelled out rather than
+  written literally because `cargo xtask docs-check` reads the literal form as
+  a local link and reds on it, backticks included. `byte_len` and `sha256`
   are what the server measured; a negative stored `byte_len` fails closed on
   read.
 
