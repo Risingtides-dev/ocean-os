@@ -515,6 +515,28 @@ fn projected_transcript(messages: Vec<RoomMessage>) -> Vec<RoomMessage> {
     messages.into_iter().map(projected_room_message).collect()
 }
 
+/// The wire shape of [`ocean_store::SqliteRoomStore::agent_owners`], shared by
+/// every route that reports it. `room_get` and `room_snapshot` both hydrate a
+/// room and must not answer with two different shapes for one fact, so the
+/// projection lives here rather than being written out twice.
+///
+/// `owner_present` is kept alongside `owner_id` rather than collapsed into it:
+/// a worker can leave and the binding outlives them, so the room says who owns
+/// the agent AND whether that worker is still here instead of asserting a live
+/// claim it cannot prove.
+fn projected_agent_owners(owners: Vec<(String, String, bool)>) -> Vec<serde_json::Value> {
+    owners
+        .into_iter()
+        .map(|(agent, owner, owner_present)| {
+            json!({
+                "agent_id": agent,
+                "owner_id": owner,
+                "owner_present": owner_present,
+            })
+        })
+        .collect()
+}
+
 #[async_trait::async_trait]
 impl ocean_agent::RoomHistorySource for DurableRoomHistorySource {
     async fn page(
@@ -1232,17 +1254,7 @@ pub(super) async fn room_get(
                 "next_seq": page.next_seq,
                 "has_more": page.has_more,
                 "access": access,
-                "agent_owners": owners
-                    .into_iter()
-                    .map(|(agent, owner, owner_present)| json!({
-                        "agent_id": agent,
-                        "owner_id": owner,
-                        // "owned" is not "owner still in the room". A worker can
-                        // leave and the binding outlives them; the room says so
-                        // rather than asserting a live claim it cannot prove.
-                        "owner_present": owner_present,
-                    }))
-                    .collect::<Vec<_>>(),
+                "agent_owners": projected_agent_owners(owners),
             })),
         ),
         Ok(None) => (
@@ -3409,6 +3421,12 @@ struct SnapshotTranscript {
 /// without it a hydrating client cannot tell a frozen room from a live one, so it
 /// opens a tail that the events route will never feed and a composer whose every
 /// send is rejected.
+///
+/// `agent_owners` is the same projection `room_get` serves, for the same reason
+/// `closed` is here: ocean-surface#185 moved hydration onto this route, and a
+/// field only `room_get` sends is a field the surface can no longer read. It
+/// annotates the roster in the same body — who owns each agent, and whether that
+/// worker is still present.
 pub(super) async fn room_snapshot(
     State(state): State<AppState>,
     Path(key): Path<String>,
@@ -3480,10 +3498,16 @@ pub(super) async fn room_snapshot(
         // Access projection (S2-P1): the room's federated state, outbox, and
         // member roster (Local if no access row exists).
         let access = reg.room_access(&key)?;
-        Ok(Some((record, page, access, closed)))
+        // Which worker owns which agent in THIS room, on the same lock as the
+        // roster it annotates. A hydrating client renders ownership beside the
+        // participants it just read, so the two coming from one acquisition is
+        // what stops a join landing between them and painting an agent whose
+        // owner the roster does not list.
+        let owners = reg.agent_owners(&key)?;
+        Ok(Some((record, page, access, closed, owners)))
     });
     match result {
-        Ok(Some((rec, page, access, closed))) => {
+        Ok(Some((rec, page, access, closed, owners))) => {
             let last_seq = page.messages.last().map(|m| m.seq);
             (
                 StatusCode::OK,
@@ -3498,6 +3522,7 @@ pub(super) async fn room_snapshot(
                     "has_more": page.has_more,
                     "access": access,
                     "closed": closed,
+                    "agent_owners": projected_agent_owners(owners),
                 })),
             )
         }
@@ -9150,6 +9175,136 @@ env = { FIXTURE = "1" }
         .unwrap();
         assert_eq!(body["ok"], json!(true));
         assert_eq!(body["closed"], json!(false));
+    }
+
+    /// `agent_owners` on the route the surface actually hydrates through.
+    /// ocean-surface#185 moved hydration off `room_get`, so the projection only
+    /// `room_get` served became unreachable from the UI.
+    ///
+    /// Four states on ONE fixture, because a hardcoded value would satisfy any of
+    /// them alone: a roster with no owned agent answers `[]`; an owned agent whose
+    /// worker is present answers `owner_present: true`; the same binding after that
+    /// worker leaves answers `false` WITHOUT dropping the row; and the room closed
+    /// answers that row still. The first three are also compared against
+    /// `room_get`, so the two hydration routes cannot grow two shapes for one fact.
+    /// The fourth cannot be compared, and that is exactly why it is asserted.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn snapshot_reports_agent_owners_exactly_as_room_get_does() {
+        let _guard = AUTO_CONVENE_ENV_LOCK.lock().await;
+        let tmp = tempfile::TempDir::new().unwrap();
+        let state = fake_convene_state(&tmp);
+        let key = RoomKey::new("s2-snap-owners");
+        with_rooms(&state, |store| {
+            store
+                .create(key.clone(), "Owned", None, Utc::now())
+                .expect("create");
+            // An agent cannot be owned by someone absent, so the worker lands first.
+            store
+                .add_participant_with_message(
+                    &key,
+                    RoomParticipant {
+                        id: "alice".into(),
+                        kind: RoomParticipantKind::Human,
+                        display_name: "Alice".into(),
+                    },
+                    Utc::now(),
+                )
+                .expect("seed owner");
+        });
+
+        let (status, body) = snapshot_response(&state, &key, "").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            body["agent_owners"],
+            json!([]),
+            "a room with no owned agent still answers the field"
+        );
+        assert_eq!(
+            body["agent_owners"],
+            room_get_body(&state, &key).await["agent_owners"]
+        );
+
+        with_rooms(&state, |store| {
+            store
+                .add_agent_participant_with_owner(
+                    &key,
+                    RoomParticipant {
+                        id: "researcher".into(),
+                        kind: RoomParticipantKind::Agent,
+                        display_name: "Researcher".into(),
+                    },
+                    "alice",
+                    Utc::now(),
+                )
+                .expect("own the agent");
+        });
+
+        let (status, body) = snapshot_response(&state, &key, "").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            body["agent_owners"],
+            json!([{ "agent_id": "researcher", "owner_id": "alice", "owner_present": true }]),
+            "hydration must say whose agent this is"
+        );
+        assert_eq!(
+            body["agent_owners"],
+            room_get_body(&state, &key).await["agent_owners"],
+            "the two hydration routes must report one shape for one fact"
+        );
+
+        // The worker leaves. The binding outlives them, so the flag moves and the
+        // row does not — an agent that is unclaimed now, not one that never was.
+        with_rooms(&state, |store| {
+            store
+                .remove_participant_with_message(&key, "alice", Utc::now())
+                .expect("owner leaves");
+        });
+
+        let (status, body) = snapshot_response(&state, &key, "").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            body["agent_owners"],
+            json!([{ "agent_id": "researcher", "owner_id": "alice", "owner_present": false }]),
+            "a departed owner is reported, not erased"
+        );
+        assert_eq!(
+            body["agent_owners"],
+            room_get_body(&state, &key).await["agent_owners"]
+        );
+
+        // Freezing the room does not erase who owned what: `close` is a soft
+        // `UPDATE rooms SET closed_at` that retains the roster and the ownership
+        // rows, and the store read carries no openness guard. This stage exists
+        // because hydration moving here made `/snapshot` the ONLY route that can
+        // report ownership for a frozen room — `room_get` 404s — so giving that
+        // read the `room_is_open` check its neighbours carry would empty every
+        // audit view's annotation with nothing red: the key-set pin in `main.rs`
+        // sees a present key, and the stages above never close the room.
+        with_rooms(&state, |store| store.close(&key).expect("close"));
+
+        let (status, body) = snapshot_response(&state, &key, "").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["closed"], json!(true), "the audit view");
+        assert_eq!(
+            body["agent_owners"],
+            json!([{ "agent_id": "researcher", "owner_id": "alice", "owner_present": false }]),
+            "a frozen room still reports the binding it froze with"
+        );
+
+        let app = room_routes().with_state(state.clone());
+        let closed_get = app
+            .oneshot(
+                axum::http::Request::get(format!("/v1/rooms/persistent/{key}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            closed_get.status(),
+            StatusCode::NOT_FOUND,
+            "the other hydration route cannot answer this state at all"
+        );
     }
 
     // ── Snapshot tail paging (`before_seq`) ──────────────────────────────────

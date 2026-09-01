@@ -9214,3 +9214,120 @@ clean. `cargo deny check advisories` is the one red stage and is unchanged from
 neither reachable from a diff that touches no Cargo.toml, Cargo.lock or
 deny.toml. Both mutation experiments reverted. No deploy, no migration.
 _________________________________________________________________________________ 07:44 loop/os-no-route-can-serve-the-newest-page-of-a-transcript-only-the-oldest
+
+
+time:      [09:31] [01-09-26]
+agent:     [claude code], [opus 5], [ocean-loop builder]
+worktree:  loop/os-snapshot-agent-owners
+type:      [feature-request]
+area:      [backend]
+
+`agent_owners` — which WORKER owns which agent participant, and whether that
+worker is still on the roster — has been built, projected and documented on
+`room_get` since the ownership work landed. ocean-surface#185 then moved room
+hydration onto `/snapshot`, and `/snapshot` did not serve the field: `git grep
+agent_owners` across ocean-surface returns one hit and it is prose in that
+repo's own ledger. Server state that no client route can reach is the loop's
+first category of work, and the fix is the read the route was already positioned
+for — `reg.agent_owners(&key)` inside `room_snapshot`'s existing `with_rooms`
+closure, beside `reg.room_access(&key)`, on the same lock as the roster it
+annotates. A second `with_rooms` call to ask would let a join land between the
+two and paint an agent whose owner the roster does not list.
+
+The projection is now a shared `projected_agent_owners` helper rather than a
+second copy of `room_get`'s inline `.map()`. Copying it would have satisfied the
+slice; two hydration routes each carrying their own spelling of one fact is the
+drift that makes a later `owner_present` rename a silent half-migration.
+`owner_present` stays a field rather than a filter for the reason the store's own
+doc comment gives: the binding outlives a worker who leaves, so dropping the row
+denies that the ownership happened and reporting the row alone asserts a live
+claim the room cannot prove.
+
+Additive on the SNAPSHOT BODY only, following #434's `closed` exactly — not a
+field on `ocean_core::Room`, which is serialized by room create, detail, PATCH,
+list and the federation payloads, so a field there is a wire change across six
+surfaces to serve one. `room_get`'s 404-on-closed contract and the two-arm
+`get` -> `get_including_closed` existence fallback are both untouched; the added
+read sits after them and cannot reorder which arm answered.
+
+One test, three states on one fixture, because a hardcoded value satisfies any
+of them alone: an owner-only roster answers `[]`, an owned agent whose worker is
+present answers `owner_present: true`, and the same binding after that worker
+leaves answers `false` with the row intact. Each stage is compared against
+`room_get`'s body as well, so the two routes cannot answer differently. It seeds
+through the store rather than through `room_join`, which keeps it off the
+process-global `OCEAN_AGENTS_DIR` the existing ownership test needs. Two
+mutations, both reverted: hardcoding `owner_present` to `true` reds the departed-
+owner stage, and dropping the field from the body reds the empty stage with
+`left: Null`.
+
+`crates/ocean-daemon/src/main.rs` is in scope on purpose and for #434's reason:
+`closed_persistent_room_preserves_audit_http_asymmetry` pins the snapshot's exact
+key set through `assert_json_object_keys`, so an additive field is a red test
+until that list learns about it. All three route-contract docs move with the
+wire — the operator guide's route line, a new `Agent ownership` paragraph in
+`docs/OCEAN_ECOSYSTEM_CONTRACT.md` beside `Closed marker` (that doc, not this
+diff, is what the ocean-surface consumer will be written against), and the
+`persistent_rooms.rs` paragraph in `crates/ocean-daemon/AGENTS.md`.
+
+The honest answer to "is this another field nobody reads?": the surface cannot
+read what is not sent, and the consumer half is a separate slice.
+
+Gate: `OCEAN_ALLOW_REPO_CWD=1 cargo xtask ci` — docs-check PASS (30 packages,
+157 active Markdown files, 179 local links), workspace build, workspace tests
+green including the daemon's 874, Clippy all-targets with denied warnings clean,
+fmt clean. `dependency policy` is the one red stage and is unchanged from
+`origin/main`: re-running `cargo deny check advisories` on a pristine detached
+worktree at bcf5222c fails identically (rtrb `ReadChunk::commit` double-free via
+livekit, yanked `spin 0.9.8`), and this diff touches no Cargo.toml, Cargo.lock or
+deny.toml. No deploy, no migration.
+_________________________________________________________________________________ 09:31 loop/os-snapshot-agent-owners
+time:      [09:51] [01-09-26]
+agent:     [claude code], [opus 5], [ocean-loop builder (refinement)]
+worktree:  loop/os-snapshot-agent-owners
+type:      [review]
+area:      [backend]
+
+The review took the design and the code and rejected one gap in the test, and it
+was right. Serving `agent_owners` from `/snapshot` gave a SOFT-CLOSED room a
+readable ownership field that no route could serve before this diff — `room_get`
+404s on closed and `ocean_store::agent_owners` carries no openness guard, so
+`close`'s soft `UPDATE rooms SET closed_at` leaves the roster and the
+`room_agent_owners` rows exactly where they were and the audit view now answers
+from them. The first pass's three states all used an OPEN fixture, and the only
+closed-room coverage anywhere was `assert_json_object_keys` in
+`closed_persistent_room_preserves_audit_http_asymmetry`, which proves the key
+exists and never looks at what is under it. New wire behavior pinned by key
+presence is the "passes for the wrong reason" shape, and my own summary said
+`room_get`'s 404-on-closed contract was untouched without ever saying that closed
+rooms had gained a field.
+
+The test now runs a FOURTH state on the same fixture: close it, and the departed-
+owner row must still come back. It also asserts `room_get` 404s at that point,
+which is what makes the stage say something the three above it cannot — this
+route is alone in answering, so nothing else can catch a regression here. I ran
+the reviewer's own failure scenario as a mutation: adding
+`AND (SELECT closed_at FROM rooms WHERE id = ?1) IS NULL` to the store's
+`agent_owners` query — the `room_is_open` check its neighbouring mutation paths
+carry — reds ONLY the new stage, at persistent_rooms.rs:9288 with
+`left: Array [], right: Array [{researcher, alice, false}]`, while
+`closed_persistent_room_preserves_audit_http_asymmetry` passes green beside it.
+That is the gap, reproduced and then closed. Mutation reverted; `ocean-store` is
+untouched by this diff.
+
+Both contract paragraphs now say what a frozen room reports, because the failure
+mode is a later reader adding that guard in good faith:
+`crates/ocean-daemon/AGENTS.md` names the unguarded read, the soft close, and the
+test stage that holds them; `docs/OCEAN_ECOSYSTEM_CONTRACT.md` — the doc an
+ocean-surface consumer is written against — says the closed room is the one place
+the two routes diverge. Nothing else moved: no production code changed in this
+pass, and the finding did not ask for any.
+
+Gate: `OCEAN_ALLOW_REPO_CWD=1 cargo xtask ci` — docs-check PASS (30 packages,
+157 active Markdown files, 179 local links), workspace build, 3232 tests passed /
+0 failed, Clippy all-targets with denied warnings clean, fmt clean.
+`dependency policy` is the one red stage and is unchanged from `origin/main`: the
+rtrb `ReadChunk::commit` double-free via livekit and the yanked `spin 0.9.8`,
+neither reachable from a diff that touches no Cargo.toml, Cargo.lock or
+deny.toml. No deploy, no migration.
+_________________________________________________________________________________ 09:51 loop/os-snapshot-agent-owners
