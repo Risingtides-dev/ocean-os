@@ -2100,6 +2100,32 @@ impl SqliteRoomStore {
         self.load_record(key, true)
     }
 
+    /// Like [`RoomStore::transcript_tail_page`] but also serves soft-closed rooms
+    /// (audit view).
+    ///
+    /// The tail is the one read the record-level audit view cannot supply.
+    /// [`get_including_closed`](Self::get_including_closed) hydrates the OLDEST
+    /// [`MAX_TRANSCRIPT_LIMIT`] rows, so windowing that record in memory answers
+    /// the newest page of the FIRST THOUSAND and calls it the tail — with the
+    /// cursor and `has_more` beside it looking correct, so no caller can tell.
+    /// Going to the rows is what lets a frozen call room and a live one hydrate to
+    /// the same screen however long either got.
+    ///
+    /// A room that never existed is still [`RoomStoreError::UnknownRoom`]: this
+    /// widens visibility from open rooms to closed ones, never to absent ones.
+    pub fn transcript_tail_page_including_closed(
+        &self,
+        key: &RoomKey,
+        before_seq: Option<u64>,
+        limit: Option<usize>,
+    ) -> Result<TranscriptTailPage> {
+        if !self.room_exists(key)? {
+            return Err(RoomStoreError::UnknownRoom(key.clone()));
+        }
+        let effective_limit = clamp_transcript_limit(limit);
+        self.load_transcript_tail_page(key, before_seq, effective_limit)
+    }
+
     // ---- internal helpers ---------------------------------------------------
 
     /// Does an open room exist for this key?
@@ -10605,6 +10631,67 @@ mod tests {
         s.close(&key).unwrap();
         assert!(matches!(
             s.transcript_tail_page(&key, None, Some(10)),
+            Err(RoomStoreError::UnknownRoom(_))
+        ));
+    }
+
+    #[test]
+    fn transcript_tail_page_including_closed_answers_past_the_record_cap() {
+        // The audit read the frozen RECORD cannot serve, and the reason this method
+        // exists instead of a window over `get_including_closed`: that record holds
+        // the OLDEST MAX_TRANSCRIPT_LIMIT rows, so it stops at seq 999 while the
+        // room's real newest row is 1004. Windowing it answers the newest page of
+        // the first thousand with a correct-looking cursor and has_more beside it,
+        // which is exactly the shape no caller can detect.
+        let total = MAX_TRANSCRIPT_LIMIT + 5;
+        let (mut s, key) = store_with_messages(total);
+        s.close(&key).unwrap();
+        let record = s.get_including_closed(&key).unwrap().expect("audit view");
+        assert_eq!(
+            record.transcript.last().map(|m| m.seq),
+            Some(MAX_TRANSCRIPT_LIMIT as u64 - 1),
+            "the record itself stops at the cap"
+        );
+
+        let newest = (total - 1) as u64;
+        let page = s
+            .transcript_tail_page_including_closed(&key, None, Some(4))
+            .unwrap();
+        assert_eq!(
+            seqs(&page.messages),
+            vec![newest - 3, newest - 2, newest - 1, newest],
+            "the room's true tail, not the newest page of the first thousand"
+        );
+        assert_eq!(page.prev_seq, Some(newest - 3));
+        assert!(page.has_more, "a thousand older rows remain");
+    }
+
+    #[test]
+    fn transcript_tail_page_including_closed_serves_an_open_room_identically() {
+        // Openness is not a second contract: the same call on a live room answers
+        // what `transcript_tail_page` answers, so the daemon needs one read and not
+        // a fallback pair, and a room closing mid-session cannot change the page.
+        let (mut s, key) = store_with_messages(10);
+        let open = s
+            .transcript_tail_page_including_closed(&key, None, Some(4))
+            .unwrap();
+        assert_eq!(seqs(&open.messages), vec![6, 7, 8, 9]);
+        s.close(&key).unwrap();
+        let closed = s
+            .transcript_tail_page_including_closed(&key, None, Some(4))
+            .unwrap();
+        assert_eq!(seqs(&closed.messages), seqs(&open.messages));
+        assert_eq!(closed.prev_seq, open.prev_seq);
+        assert_eq!(closed.has_more, open.has_more);
+    }
+
+    #[test]
+    fn transcript_tail_page_including_closed_on_an_absent_room_is_unknown() {
+        // Visibility widens from open rooms to closed ones and no further. A room
+        // that never existed is what keeps the daemon's 404 on this path.
+        let (s, _key) = store_with_messages(3);
+        assert!(matches!(
+            s.transcript_tail_page_including_closed(&RoomKey::new("never-created"), None, Some(10)),
             Err(RoomStoreError::UnknownRoom(_))
         ));
     }

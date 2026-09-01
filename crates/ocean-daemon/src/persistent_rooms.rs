@@ -3303,65 +3303,29 @@ pub(super) fn read_transcript_page(
     }
 }
 
-/// Read one bounded transcript page from the NEWEST end, with the same
-/// soft-closed audit fallback [`read_transcript_page`] applies to the forward read.
+/// Read one bounded transcript page from the NEWEST end, serving a soft-closed
+/// room as [`read_transcript_page`] does for the forward read.
 ///
-/// The fallback is the whole reason this exists as a sibling rather than living
+/// The closed room is the whole reason this exists as a sibling rather than living
 /// inside the handler. A finished call's room is closed but still replayable, and
-/// if only the open path learned to read from the tail then a frozen call room
-/// would paint its OLDEST page while a live one painted its newest — the same
-/// hydration, two different screens, decided by whether the call had ended. So the
-/// audit arm applies the identical window to the frozen record's rows: keep those
-/// with `seq < before_seq`, then take the LAST `limit` of them.
+/// if only the open path could read from the tail then a frozen call room would
+/// paint its OLDEST page while a live one painted its newest — the same hydration,
+/// two different screens, decided by whether the call had ended.
 ///
-/// One inherited ceiling, shared with the forward arm and not introduced here:
-/// `get_including_closed` loads the frozen transcript as the OLDEST
-/// `MAX_TRANSCRIPT_LIMIT` rows, so a closed room longer than that cannot serve its
-/// true newest page from the audit view — its "newest" is the newest of the first
-/// thousand. Lifting that means paging the store's closed-room read, a change to
-/// `load_record` rather than to this window.
+/// Where the forward arm windows the frozen RECORD, this one goes to the store's
+/// rows: `get_including_closed` hydrates the oldest `MAX_TRANSCRIPT_LIMIT` of them,
+/// so a window over that record answers the newest page of the first thousand and
+/// calls it the tail — and a 12,000-message room, the case this window exists for,
+/// is exactly where that lands. `transcript_tail_page_including_closed` gates on
+/// existence rather than openness, so the open and closed answers are one query
+/// with one contract, and a room that never existed is still `UnknownRoom`.
 pub(super) fn read_transcript_tail_page(
     reg: &ocean_store::SqliteRoomStore,
     key: &RoomKey,
     before_seq: Option<u64>,
     limit: Option<usize>,
 ) -> Result<ocean_store::TranscriptTailPage, ocean_store::RoomStoreError> {
-    use ocean_store::RoomStore as _;
-    match reg.transcript_tail_page(key, before_seq, limit) {
-        Ok(page) => Ok(page),
-        Err(ocean_store::RoomStoreError::UnknownRoom(_)) => {
-            match reg.get_including_closed(key) {
-                Ok(Some(rec)) => {
-                    let effective_limit = ocean_store::clamp_transcript_limit(limit);
-                    let mut msgs: Vec<_> = rec
-                        .transcript
-                        .into_iter()
-                        .filter(|m| before_seq.is_none_or(|before| m.seq < before))
-                        .collect();
-                    // Overflow is at the OLDEST end here, the mirror of the forward
-                    // arm dropping its newest sentinel: drain from the front so the
-                    // newest `effective_limit` rows are what survives.
-                    let has_more = msgs.len() > effective_limit;
-                    if has_more {
-                        msgs.drain(..msgs.len() - effective_limit);
-                    }
-                    let prev_seq = if has_more {
-                        msgs.first().map(|m| m.seq)
-                    } else {
-                        None
-                    };
-                    Ok(ocean_store::TranscriptTailPage {
-                        messages: msgs,
-                        prev_seq,
-                        has_more,
-                    })
-                }
-                Ok(None) => Err(ocean_store::RoomStoreError::UnknownRoom(key.clone())),
-                Err(e) => Err(e),
-            }
-        }
-        Err(e) => Err(e),
-    }
+    reg.transcript_tail_page_including_closed(key, before_seq, limit)
 }
 
 /// `GET /v1/rooms/persistent/{key}/transcript?after_seq=N&limit=M` — read one
@@ -9387,6 +9351,64 @@ env = { FIXTURE = "1" }
         assert_eq!(transcript_seqs(&second), vec![0, 1]);
         assert_eq!(second["has_more"], json!(false));
         assert_eq!(second["prev_seq"], json!(null));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn snapshot_closed_room_past_the_record_cap_still_serves_its_true_tail() {
+        // Parity has to hold for the LONG room too, and that is exactly where the
+        // frozen record cannot supply it: `get_including_closed` hydrates the oldest
+        // MAX_TRANSCRIPT_LIMIT rows, so a window applied to that answered 996..999 —
+        // the newest page of the first thousand — with `has_more`, `prev_seq`,
+        // `last_seq` and `closed` all looking right and rows 1000..1004 reachable by
+        // nothing on the wire. The 12,000-message room is the case this slice exists
+        // for, so the audit arm reads the store's rows and not the record's copy.
+        let _guard = AUTO_CONVENE_ENV_LOCK.lock().await;
+        let tmp = tempfile::TempDir::new().unwrap();
+        let state = fake_convene_state(&tmp);
+        let key = RoomKey::new("s2-snap-closed-long");
+        seed_access(&state, &key, local_access());
+        let seeded = ocean_store::MAX_TRANSCRIPT_LIMIT + 5;
+        seed_transcript(&state, &key, seeded);
+        with_rooms(&state, |store| store.close(&key).expect("close"));
+
+        let (status, body) =
+            snapshot_response(&state, &key, &format!("?before_seq={BEYOND_END}&limit=4")).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["closed"], json!(true), "still the audit view");
+        let newest = (seeded - 1) as u64;
+        assert_eq!(
+            transcript_seqs(&body),
+            vec![newest - 3, newest - 2, newest - 1, newest],
+            "the true tail, not the newest page of the first thousand"
+        );
+        assert_eq!(body["last_seq"], json!(newest));
+        assert_eq!(body["prev_seq"], json!(newest - 3));
+        assert_eq!(body["has_more"], json!(true));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn snapshot_closed_room_page_exactly_at_the_limit_has_no_cursor() {
+        // The closed room's boundary, which every other frozen fixture steps over —
+        // 12 rows against a limit of 4, or 2 against 4, never exactly 4. A page that
+        // is full has not thereby got more behind it, and reporting `has_more` when
+        // it has not costs the client a round trip to learn that a "load older"
+        // affordance had nothing under it. The mirror of the store's
+        // `transcript_tail_page_exact_boundary_page_has_no_cursor`.
+        let _guard = AUTO_CONVENE_ENV_LOCK.lock().await;
+        let tmp = tempfile::TempDir::new().unwrap();
+        let state = fake_convene_state(&tmp);
+        let key = RoomKey::new("s2-snap-closed-exact");
+        seed_access(&state, &key, local_access());
+        seed_transcript(&state, &key, 4);
+        with_rooms(&state, |store| store.close(&key).expect("close"));
+
+        let (status, body) =
+            snapshot_response(&state, &key, &format!("?before_seq={BEYOND_END}&limit=4")).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["closed"], json!(true));
+        assert_eq!(transcript_seqs(&body), vec![0, 1, 2, 3]);
+        assert_eq!(body["has_more"], json!(false), "nothing older remains");
+        assert_eq!(body["prev_seq"], json!(null));
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

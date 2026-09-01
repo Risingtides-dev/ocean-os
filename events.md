@@ -9154,3 +9154,63 @@ into them), the two `status == OK` preconditions, and two mid-walk spot checks o
 pages 2 and 3 that evaluate the same expressions page 1 already pins. No deploy,
 no migration.
 _________________________________________________________________________________ 07:10 loop/os-no-route-can-serve-the-newest-page-of-a-transcript-only-the-oldest
+
+time:      07:44 01-09-26
+agent:     claude-code, claude-opus-5, ocean-loop builder (refinement)
+worktree:  loop/os-no-route-can-serve-the-newest-page-of-a-transcript-only-the-oldest
+type:      review
+area:      backend
+
+The review rejected the execution, not the design, and it was right on all
+three counts. The headline was that the closed-room tail served the WRONG page
+and nothing on the wire said so: a soft-closed room of 1005 messages answered
+`?before_seq=<u64::MAX>&limit=4` with seqs 996-999, `last_seq: 999`,
+`prev_seq: 996`, `has_more: true`, `closed: true` — every field consistent, rows
+1000-1004 reachable by nothing. I reproduced it as a test before touching the
+code and got exactly that page. The cause was the audit arm windowing
+`get_including_closed(key).transcript`, which `load_record` fills with
+`load_transcript_page(key, None, MAX_TRANSCRIPT_LIMIT)` — the OLDEST thousand
+rows — so the window ran over a prefix. The previous pass knew about the ceiling
+and recorded it in a Rust doc comment, then wrote the flat opposite into the
+contract doc another repo's builder implements from. Recording a defect in the
+one place its victims will not look is not disclosure.
+
+The fix is where the reviewer said it was. `load_transcript_tail_page` never
+gated on openness, so `SqliteRoomStore::transcript_tail_page_including_closed`
+is that helper behind a `room_exists` check rather than a `room_is_open` one,
+and the daemon's audit arm — filter, drain, recompute the cursor, 30 lines of
+paging written a second time — collapses to one delegating call. Less code, and
+the parity the contract already claimed is now true at any length. A room that
+never existed is still `UnknownRoom`: this widens visibility from open rooms to
+closed ones and no further, which is the check the route's 404 rests on.
+
+Three documentation surfaces were stale or wrong, two of them named by wave 54's
+standing rule on this slice ("scope main.rs plus all three route-contract
+docs"). `docs/OCEAN_RUNTIME_OPERATOR_GUIDE.md` still listed the snapshot route
+with `?after_seq=N&limit=M` and no `prev_seq`, so an operator reading it could
+not discover the feature. `crates/ocean-daemon/AGENTS.md` asserted that
+`room_get`, `/transcript` and `/snapshot` are "one PAGING contract, not two",
+which this diff falsifies — `/snapshot?before_seq=` answers `prev_seq` beside a
+null `next_seq` — and the nearest owning AGENTS.md of `persistent_rooms.rs` is
+that file, not `ocean-store`'s. `docs/OCEAN_ECOSYSTEM_CONTRACT.md` now says WHY
+the closed room answers identically, because "it just does" is what made the
+sentence survivable while it was false.
+
+Third finding, and the one worth keeping: the 30-mutation matrix had a
+wave-54-shaped hole. `>` to `>=` on the audit arm's `has_more` survived all 28
+snapshot tests, because every closed-room fixture sat well over the limit (12
+rows against 4) or well under (2 against 4) and none exactly AT it. The fix
+deletes that arm, so the equivalent line is now the store's own; mutated there,
+the new `snapshot_closed_room_page_exactly_at_the_limit_has_no_cursor` is the
+ONLY snapshot test that goes red (29 passed, 1 failed) and the store's boundary
+test goes red beside it. A full page is not thereby a page with more behind it,
+and saying otherwise costs a client a round trip to learn its "load older"
+affordance had nothing under it.
+
+Gate: `OCEAN_ALLOW_REPO_CWD=1 cargo xtask ci` — docs-check PASS, workspace build,
+3231 tests passed / 0 failed, Clippy all-targets with denied warnings clean, fmt
+clean. `cargo deny check advisories` is the one red stage and is unchanged from
+`origin/main`: the `ReadChunk::commit` double-free and the yanked `spin 0.9.8`,
+neither reachable from a diff that touches no Cargo.toml, Cargo.lock or
+deny.toml. Both mutation experiments reverted. No deploy, no migration.
+_________________________________________________________________________________ 07:44 loop/os-no-route-can-serve-the-newest-page-of-a-transcript-only-the-oldest
