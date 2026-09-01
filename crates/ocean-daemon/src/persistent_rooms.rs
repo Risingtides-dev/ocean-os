@@ -1211,31 +1211,29 @@ pub(super) async fn room_get(
     }
     let key = RoomKey::new(trimmed);
     match with_rooms(&state, |reg| {
-        // `get` is the OPEN-room getter, and that choice alone is the 404
-        // contract: `read_transcript_page` falls through to
-        // `get_including_closed`, so the page it hands back must never be what
-        // decides the room exists. Widen this line to `get_including_closed`
-        // and the route quietly starts serving frozen rooms — it becomes
-        // `room_snapshot`. The ORDER of the two calls is not the guard: page
-        // first and a closed or unknown room still 404s with the same body,
-        // having paid for a read it throws away.
+        // `get` is the OPEN-room getter, and that choice alone is this route's
+        // 404 contract. Widen it to `get_including_closed` and the route quietly
+        // starts serving frozen rooms — it becomes `room_snapshot`, whose
+        // `closed` boolean exists precisely because that is a different answer.
         let Some(record) = reg.get(&key)? else {
             return Ok(None);
         };
-        // The record's own transcript is dropped in favour of the paged read.
-        // Both are capped at MAX_TRANSCRIPT_LIMIT and hold the same rows, but
-        // only the page can tell "exactly the cap" from "the cap, with more
-        // behind it" — that needs the store's `limit + 1` sentinel, and it is
-        // the whole point of the two fields below. `get` is the only open-room
-        // getter on the trait, so this route now decodes the same rows TWICE —
-        // up to MAX_TRANSCRIPT_LIMIT for the existence guard, thrown away, then
-        // limit + 1 for the page — on the call ocean-surface makes every time a
-        // room is opened. Accepted rather than hidden: the cheaper form needs no
-        // new store method (probe only when `record.transcript.len() ==
-        // MAX_TRANSCRIPT_LIMIT`, via `reg.transcript_page(&key,
-        // record.transcript.last().map(|m| m.seq), Some(1))`), but one paging
-        // implementation is what `read_transcript_page`'s doc comment asks for.
-        let page = read_transcript_page(reg, &key, None, Some(ocean_store::MAX_TRANSCRIPT_LIMIT))?;
+        // This record IS the page, so there is nothing to re-read. `load_record`
+        // builds its transcript from `load_transcript_page(key, None,
+        // MAX_TRANSCRIPT_LIMIT)` — the same rows, the same cap, the same clamp
+        // this route asked `read_transcript_page` for — and it carries that page's
+        // own `limit + 1` sentinel as `transcript_has_more`. The paged
+        // re-read was justified by only a page being able to tell "exactly the
+        // cap" from "the cap, with more behind it"; the record answers that
+        // itself now, so the second decode of up to MAX_TRANSCRIPT_LIMIT rows was
+        // paying for a fact already in hand. The cursor is not a second field on
+        // the record on purpose — it is the last row the record holds, and it is
+        // only a cursor when the flag says rows follow it.
+        let next_seq = if record.transcript_has_more {
+            record.transcript.last().map(|m| m.seq)
+        } else {
+            None
+        };
         let access = reg.room_access(&key)?;
         // Which worker owns which agent in THIS room. Adjacent to the roster,
         // never a field on RoomParticipant (the federated design reserves
@@ -1243,16 +1241,23 @@ pub(super) async fn room_get(
         // Absent key == no local ownership recorded, which is what every
         // pre-existing room reports.
         let owners = reg.agent_owners(&key)?;
-        Ok(Some((record.room, page, access, owners)))
+        Ok(Some((
+            record.room,
+            record.transcript,
+            record.transcript_has_more,
+            next_seq,
+            access,
+            owners,
+        )))
     }) {
-        Ok(Some((room, page, access, owners))) => (
+        Ok(Some((room, transcript, has_more, next_seq, access, owners))) => (
             StatusCode::OK,
             Json(json!({
                 "ok": true,
                 "room": room,
-                "transcript": projected_transcript(page.messages),
-                "next_seq": page.next_seq,
-                "has_more": page.has_more,
+                "transcript": projected_transcript(transcript),
+                "next_seq": next_seq,
+                "has_more": has_more,
                 "access": access,
                 "agent_owners": projected_agent_owners(owners),
             })),
@@ -3257,16 +3262,23 @@ pub(super) struct SnapshotQuery {
     pub(super) limit: Option<usize>,
 }
 
-/// Read one bounded transcript page for a room, transparently falling back to the
-/// soft-closed audit view (OCEAN-249 + OCEAN-170).
+/// Read one bounded transcript page for a room, open or soft-closed
+/// (OCEAN-249 + OCEAN-170).
 ///
-/// The open path defers to `transcript_page` (the `LIMIT`ed query). For a closed
-/// room — a finished call's frozen transcript that must stay queryable — the audit
-/// getter still returns a (now `MAX_TRANSCRIPT_LIMIT`-bounded) record, so we apply
-/// the same `after_seq` filter and `limit + 1` sentinel paging in memory to hand
-/// back an identical `TranscriptPage` shape regardless of room state. `Ok(None)`
-/// from the audit view (room never existed) is mapped back to `UnknownRoom` so the
-/// handlers preserve their 404.
+/// One store query for both room states, because the closed room is the one this
+/// read used to get wrong. It served a frozen room by windowing the record from
+/// `get_including_closed` in memory, and that record IS the oldest
+/// `MAX_TRANSCRIPT_LIMIT` rows: `has_more` came out as `msgs.len() >
+/// effective_limit` over rows the record had already dropped, so a soft-closed room
+/// with twelve thousand messages answered `has_more: false, next_seq: null` on row
+/// 999 and a paging client stopped there believing it had the log.
+/// `RoomRecord::transcript_has_more` could have told it the answer was short, but
+/// the same record still cannot produce row 1000 — the honest fix is the query, not
+/// the marker. `transcript_page_including_closed` gates on existence rather than
+/// openness, so a room that never existed is still `UnknownRoom` and the handlers
+/// keep their 404, and the forward and backward reads are now the same shape:
+/// see `read_transcript_tail_page`, which has argued for exactly this since it
+/// landed.
 ///
 /// `pub(super)` so `room_summary.rs` reads its bounded window through the SAME
 /// paging implementation rather than growing a second one.
@@ -3276,43 +3288,7 @@ pub(super) fn read_transcript_page(
     after_seq: Option<u64>,
     limit: Option<usize>,
 ) -> Result<ocean_store::TranscriptPage, ocean_store::RoomStoreError> {
-    use ocean_store::RoomStore as _;
-    match reg.transcript_page(key, after_seq, limit) {
-        // Open room (the live case): the store already paged it.
-        Ok(page) => Ok(page),
-        // Closed room: page the frozen audit transcript in-handler with the same
-        // contract the store would apply.
-        Err(ocean_store::RoomStoreError::UnknownRoom(_)) => {
-            match reg.get_including_closed(key) {
-                Ok(Some(rec)) => {
-                    let effective_limit = ocean_store::clamp_transcript_limit(limit);
-                    let mut msgs: Vec<_> = rec
-                        .transcript
-                        .into_iter()
-                        .filter(|m| after_seq.is_none_or(|after| m.seq > after))
-                        .collect();
-                    let has_more = msgs.len() > effective_limit;
-                    if has_more {
-                        msgs.truncate(effective_limit);
-                    }
-                    let next_seq = if has_more {
-                        msgs.last().map(|m| m.seq)
-                    } else {
-                        None
-                    };
-                    Ok(ocean_store::TranscriptPage {
-                        messages: msgs,
-                        next_seq,
-                        has_more,
-                    })
-                }
-                // Genuinely no such room (never created): preserve the 404.
-                Ok(None) => Err(ocean_store::RoomStoreError::UnknownRoom(key.clone())),
-                Err(e) => Err(e),
-            }
-        }
-        Err(e) => Err(e),
-    }
+    reg.transcript_page_including_closed(key, after_seq, limit)
 }
 
 /// Read one bounded transcript page from the NEWEST end, serving a soft-closed
@@ -3324,11 +3300,11 @@ pub(super) fn read_transcript_page(
 /// paint its OLDEST page while a live one painted its newest — the same hydration,
 /// two different screens, decided by whether the call had ended.
 ///
-/// Where the forward arm windows the frozen RECORD, this one goes to the store's
-/// rows: `get_including_closed` hydrates the oldest `MAX_TRANSCRIPT_LIMIT` of them,
-/// so a window over that record answers the newest page of the first thousand and
-/// calls it the tail — and a 12,000-message room, the case this window exists for,
-/// is exactly where that lands. `transcript_tail_page_including_closed` gates on
+/// Like the forward read it goes to the store's rows and not to the frozen record:
+/// `get_including_closed` hydrates the oldest `MAX_TRANSCRIPT_LIMIT` of them, so a
+/// window over that record answers the newest page of the first thousand and calls
+/// it the tail — and a 12,000-message room, the case this window exists for, is
+/// exactly where that lands. `transcript_tail_page_including_closed` gates on
 /// existence rather than openness, so the open and closed answers are one query
 /// with one contract, and a room that never existed is still `UnknownRoom`.
 pub(super) fn read_transcript_tail_page(
@@ -9699,8 +9675,10 @@ env = { FIXTURE = "1" }
         let state = fake_convene_state(&tmp);
         let key = RoomKey::new("s2-get-long");
         seed_access(&state, &key, local_access());
-        // One past the cap is the case the record-backed read could not see: its
-        // transcript was ALSO 1000 rows, and nothing in the response said so.
+        // One past the cap is the case a bare row count could not see: the record's
+        // transcript is ALSO 1000 rows here, and only the page's `limit + 1`
+        // sentinel — carried on the record as `transcript_has_more` — separates it
+        // from a room that ends exactly on the cap.
         seed_transcript(&state, &key, ocean_store::MAX_TRANSCRIPT_LIMIT + 1);
 
         let body = room_get_body(&state, &key).await;
@@ -9716,13 +9694,81 @@ env = { FIXTURE = "1" }
         );
     }
 
+    /// GET a room's `/transcript` with a raw query string, returning `(status, body)`.
+    async fn transcript_response(
+        state: &AppState,
+        key: &RoomKey,
+        query: &str,
+    ) -> (StatusCode, serde_json::Value) {
+        let app = room_routes().with_state(state.clone());
+        let resp = app
+            .oneshot(
+                axum::http::Request::get(format!("/v1/rooms/persistent/{key}/transcript{query}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let status = resp.status();
+        let body: serde_json::Value = serde_json::from_slice(
+            &axum::body::to_bytes(resp.into_body(), 8 * 1024 * 1024)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        (status, body)
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn transcript_of_a_closed_room_pages_forward_past_the_record_cap() {
+        // The forward twin of `snapshot_closed_room_past_the_record_cap_...`, and the
+        // case the audit arm answered wrong for as long as it windowed the frozen
+        // RECORD: that record is the oldest MAX_TRANSCRIPT_LIMIT rows, so
+        // `msgs.len() > effective_limit` was false at the cap however long the room
+        // was. A soft-closed 1005-row room served its first full page with
+        // `has_more: false, next_seq: null` at seq 999 and a paging client stopped
+        // there believing it had the log — rows 1000..1004 reachable by nothing on
+        // this route. The arm reads the store's rows now, so the walk finishes.
+        let _guard = AUTO_CONVENE_ENV_LOCK.lock().await;
+        let tmp = tempfile::TempDir::new().unwrap();
+        let state = fake_convene_state(&tmp);
+        let key = RoomKey::new("s2-transcript-closed-long");
+        seed_access(&state, &key, local_access());
+        let seeded = ocean_store::MAX_TRANSCRIPT_LIMIT + 5;
+        seed_transcript(&state, &key, seeded);
+        with_rooms(&state, |store| store.close(&key).expect("close"));
+
+        let cap = ocean_store::MAX_TRANSCRIPT_LIMIT;
+        let (status, first) = transcript_response(&state, &key, &format!("?limit={cap}")).await;
+        assert_eq!(status, StatusCode::OK, "a frozen room stays queryable");
+        assert_eq!(transcript_seqs(&first).len(), cap);
+        let cap_edge = cap as u64 - 1;
+        assert_eq!(
+            first["has_more"],
+            json!(true),
+            "five rows lie past the record's last one"
+        );
+        assert_eq!(first["next_seq"], json!(cap_edge));
+
+        let (_, rest) =
+            transcript_response(&state, &key, &format!("?after_seq={cap_edge}&limit={cap}")).await;
+        let newest = (seeded - 1) as u64;
+        assert_eq!(
+            transcript_seqs(&rest),
+            (cap_edge + 1..=newest).collect::<Vec<u64>>(),
+            "the rows past the record's cap, not an empty terminal page"
+        );
+        assert_eq!(rest["has_more"], json!(false));
+        assert_eq!(rest["next_seq"], json!(null));
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn room_get_closed_room_with_a_transcript_is_still_404() {
-        // A closed room whose audit fallback HAS rows to serve is still 404.
+        // A closed room whose audit view HAS rows to serve is still 404.
         // `room_get_closed_is_404` pins the empty one; this pins the case that
-        // makes serving those rows tempting, now that the handler calls
-        // `read_transcript_page` at all. Both go red on the one mutation that
-        // matters — `reg.get` widened to `get_including_closed`.
+        // makes serving those rows tempting, since `/snapshot` reads exactly this
+        // room and answers 200. Both go red on the one mutation that matters —
+        // `reg.get` widened to `get_including_closed`.
         let _guard = AUTO_CONVENE_ENV_LOCK.lock().await;
         let tmp = tempfile::TempDir::new().unwrap();
         let state = fake_convene_state(&tmp);

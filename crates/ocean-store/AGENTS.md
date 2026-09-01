@@ -156,13 +156,20 @@ outbox, and the restart-safe federation core (S2 P2-A). One database file
   guard is checked in both and lands opposite ways: forward, a cursor above
   `i64::MAX` is a terminal empty page, and backward it saturates to `i64::MAX`
   and is the newest page, because "before a number past the end" includes every
-  row. `before_seq = 0` is empty — the first message's seq is 0. The backward read
-  is also the one whose soft-closed answer the STORE owns
-  (`transcript_tail_page_including_closed`, gated on existence rather than
-  openness): the daemon cannot window `get_including_closed`'s record for it the
-  way it does the forward read, because that record is itself the oldest
-  `MAX_TRANSCRIPT_LIMIT` rows, so windowing it answers the newest page of the
-  first thousand and calls it the tail.
+  row. `before_seq = 0` is empty — the first message's seq is 0. BOTH directions'
+  soft-closed answers are the STORE's, through `transcript_page_including_closed`
+  and `transcript_tail_page_including_closed` — each a `room_exists()` guard plus
+  the private loader, gated on existence rather than openness, so an absent room
+  is still `UnknownRoom` and openness never becomes a second paging contract. The
+  daemon may NOT window `get_including_closed`'s record for either: that record is
+  itself the oldest `MAX_TRANSCRIPT_LIMIT` rows, so windowing it answers the newest
+  page of the first thousand and calls it the tail going backward, and going
+  forward it can never report `has_more` at the cap — a frozen room past 1000 said
+  `has_more: false, next_seq: None` on row 999 and every client paging forward
+  stopped there. `RoomRecord::transcript_has_more` is not the repair for that and
+  must not be OR-ed in: the same record still cannot produce row 1000, so a
+  truthful flag over an unreachable page trades a silent stop for a loop that never
+  advances. A marker says rows are missing; only a query returns them.
 - **A `RoomRecord` says whether it is the whole log.** `load_record` builds the
   transcript from `load_transcript_page(key, None, MAX_TRANSCRIPT_LIMIT)` and
   keeps that page's `has_more` as `RoomRecord::transcript_has_more`, so both
@@ -176,7 +183,11 @@ outbox, and the restart-safe federation core (S2 P2-A). One database file
   second field — it is `transcript.last().map(|m| m.seq)`, already on the struct.
   This is where the SQLite record deliberately stops mirroring
   `ocean_agent::rooms::RoomRecord`: that in-memory twin holds every row it was
-  given, so the flag there could only ever be `false`.
+  given, so the flag there could only ever be `false`. The flag's reader is the
+  daemon's `room_get`, which serves the record's own transcript and derives
+  `has_more`/`next_seq` from it rather than re-paging the identical rows — that
+  route decodes up to the cap ONCE. It is not a substitute for a page anywhere the
+  rows beyond the record are actually wanted; see the paging bullet above.
 - **Attachments are immutable, so the discipline is refusal, not CAS.** There is
   deliberately no `version` column on `room_attachments`: nothing amends an
   attachment, so a compare-and-swap guard would be decoration, and a decorative
