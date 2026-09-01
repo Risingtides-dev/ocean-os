@@ -64,8 +64,11 @@
 //! existing DB. Methods are sync and `&mut self`: lock the `Mutex`, call, and
 //! drop the guard before any `.await`. `close` **soft-closes** (marks
 //! `closed_at`) rather than deleting, so transcripts survive an audit; use
-//! [`SqliteRoomStore::get_including_closed`] for audit views. The daemon maps
-//! [`RoomStoreError`] onto HTTP responses in
+//! [`SqliteRoomStore::get_including_closed`] for audit views, and its two paging
+//! siblings — [`SqliteRoomStore::transcript_page_including_closed`] and
+//! [`SqliteRoomStore::transcript_tail_page_including_closed`] — whenever the audit
+//! read has to reach past [`MAX_TRANSCRIPT_LIMIT`], which the record itself never
+//! can. The daemon maps [`RoomStoreError`] onto HTTP responses in
 //! `persistent_rooms.rs::room_store_error_response`, so new error variants
 //! here require a matching arm there (the match is deliberately exhaustive).
 //!
@@ -129,22 +132,23 @@ pub struct RoomRecord {
     /// a second thing able to contradict them. This flag is the only part of the
     /// page that is not recomputable from what the record already holds.
     ///
-    /// Two daemon consumers wait on this, both in
-    /// `crates/ocean-daemon/src/persistent_rooms.rs` and both left to their own slice.
-    /// The one that LOSES ROWS is `read_transcript_page`'s closed arm: it re-pages a
-    /// record from [`get_including_closed`](SqliteRoomStore::get_including_closed) in
-    /// memory, so `has_more` is `msgs.len() > effective_limit` over rows the record
-    /// already dropped — the window it can see ends at [`MAX_TRANSCRIPT_LIMIT`]
-    /// however long the room is, and a soft-closed room past the cap therefore
-    /// answers `has_more: false, next_seq: None` on its last held row and a paging
-    /// client stops there. That arm is shared by
-    /// `/transcript`, `/snapshot`'s forward read and `room_summary.rs`, so this flag
-    /// is one fix for three routes. The second is `room_get`, which throws its
-    /// record's transcript away and re-reads a page for the sole reason its own
-    /// comment gives — that only the page can tell "exactly the cap" from "the cap,
-    /// with more behind it" — and so decodes up to the cap TWICE on the call
-    /// ocean-surface makes every time a room is opened. That sentence stopped being
-    /// true when this field landed.
+    /// `room_get` in `crates/ocean-daemon/src/persistent_rooms.rs` is the reader.
+    /// It serves the record's own rows and derives `has_more` and `next_seq` from
+    /// this flag, where it used to discard the record and re-page the identical
+    /// rows for the one reason its comment gave — that only a page could tell
+    /// "exactly the cap" from "the cap, with more behind it". That is this
+    /// field's job now, so the route decodes up to [`MAX_TRANSCRIPT_LIMIT`] rows
+    /// once rather than twice.
+    ///
+    /// What this flag deliberately did NOT fix is `read_transcript_page`'s
+    /// soft-closed arm, and the distinction is the useful part: that arm windowed
+    /// a record it could not see past, so OR-ing this flag into its `has_more`
+    /// would have promised a next page the same record can never produce — a
+    /// client replaying the cursor gets an empty page still claiming more, which
+    /// trades a silent stop for a loop that never advances. A marker says rows are
+    /// missing; only a query returns them, which is why that arm now goes to the
+    /// store's rows through
+    /// [`transcript_page_including_closed`](SqliteRoomStore::transcript_page_including_closed).
     pub transcript_has_more: bool,
 }
 
@@ -2141,17 +2145,54 @@ impl SqliteRoomStore {
         self.load_record(key, true)
     }
 
+    /// Like [`RoomStore::transcript_page`] but also serves soft-closed rooms
+    /// (audit view).
+    ///
+    /// The forward twin of
+    /// [`transcript_tail_page_including_closed`](Self::transcript_tail_page_including_closed),
+    /// and it exists for the same reason. The daemon used to answer a frozen room's
+    /// forward page by re-paging the record from
+    /// [`get_including_closed`](Self::get_including_closed) in memory, but that
+    /// record IS the oldest [`MAX_TRANSCRIPT_LIMIT`] rows: a window over it cannot
+    /// see past the cap, so a soft-closed room holding twelve thousand messages
+    /// answered `has_more: false, next_seq: None` on row 999 and a client paging
+    /// forward stopped there believing it had the whole log.
+    ///
+    /// [`RoomRecord::transcript_has_more`] is not the repair. It can say that
+    /// answer is short, but the record it rides on still holds only those first
+    /// thousand rows, so a client replaying `after_seq = 999` gets an empty page
+    /// that still claims more — a loop that never advances in place of a stop that
+    /// at least terminated. Making the flag true without making the next page
+    /// reachable is worse than the bug.
+    ///
+    /// A room that never existed is still [`RoomStoreError::UnknownRoom`]: this
+    /// widens visibility from open rooms to closed ones, never to absent ones.
+    pub fn transcript_page_including_closed(
+        &self,
+        key: &RoomKey,
+        after_seq: Option<u64>,
+        limit: Option<usize>,
+    ) -> Result<TranscriptPage> {
+        if !self.room_exists(key)? {
+            return Err(RoomStoreError::UnknownRoom(key.clone()));
+        }
+        let effective_limit = clamp_transcript_limit(limit);
+        self.load_transcript_page(key, after_seq, effective_limit)
+    }
+
     /// Like [`RoomStore::transcript_tail_page`] but also serves soft-closed rooms
     /// (audit view).
     ///
-    /// The tail is the one read the record-level audit view cannot supply.
+    /// The backward half of the pair the record-level audit view cannot supply.
     /// [`get_including_closed`](Self::get_including_closed) hydrates the OLDEST
     /// [`MAX_TRANSCRIPT_LIMIT`] rows, so windowing that record in memory answers
     /// the newest page of the FIRST THOUSAND and calls it the tail. The record does
-    /// now admit that it is a prefix ([`RoomRecord::transcript_has_more`]), but a
+    /// admit that it is a prefix ([`RoomRecord::transcript_has_more`]), but a
     /// marker only says the newest rows are absent — it cannot produce them.
     /// Going to the rows is what lets a frozen call room and a live one hydrate to
-    /// the same screen however long either got.
+    /// the same screen however long either got, and
+    /// [`transcript_page_including_closed`](Self::transcript_page_including_closed)
+    /// is the same argument run forward.
     ///
     /// A room that never existed is still [`RoomStoreError::UnknownRoom`]: this
     /// widens visibility from open rooms to closed ones, never to absent ones.
@@ -10796,10 +10837,88 @@ mod tests {
     }
 
     #[test]
+    fn transcript_page_including_closed_answers_past_the_record_cap() {
+        // The forward defect, and the reason this method exists rather than a window
+        // over `get_including_closed`: that record holds the OLDEST
+        // MAX_TRANSCRIPT_LIMIT rows, so `msgs.len() > effective_limit` cannot ever be
+        // true at the cap — a frozen 1005-row room answered its first full page with
+        // `has_more: false` and a null cursor at seq 999, and a client paging forward
+        // stopped there with rows 1000..1004 reachable by nothing on the wire.
+        let total = MAX_TRANSCRIPT_LIMIT + 5;
+        let (mut s, key) = store_with_messages(total);
+        s.close(&key).unwrap();
+        let cap_edge = MAX_TRANSCRIPT_LIMIT as u64 - 1;
+        let record = s.get_including_closed(&key).unwrap().expect("audit view");
+        assert_eq!(
+            record.transcript.last().map(|m| m.seq),
+            Some(cap_edge),
+            "the record itself stops at the cap"
+        );
+
+        // The page the window got exactly backwards: full, and with more behind it.
+        let head = s
+            .transcript_page_including_closed(&key, None, Some(MAX_TRANSCRIPT_LIMIT))
+            .unwrap();
+        assert_eq!(head.messages.len(), MAX_TRANSCRIPT_LIMIT);
+        assert!(head.has_more, "five rows lie past the record's last one");
+        assert_eq!(head.next_seq, Some(cap_edge));
+
+        // And replaying that cursor progresses instead of repeating: a flag on the
+        // record could have said "more", but only the query returns the rows.
+        let next = s
+            .transcript_page_including_closed(&key, head.next_seq, Some(4))
+            .unwrap();
+        assert_eq!(
+            seqs(&next.messages),
+            (cap_edge + 1..=cap_edge + 4).collect::<Vec<u64>>()
+        );
+        assert_eq!(next.next_seq, Some(cap_edge + 4));
+        assert!(next.has_more);
+
+        let last = s
+            .transcript_page_including_closed(&key, next.next_seq, Some(4))
+            .unwrap();
+        assert_eq!(seqs(&last.messages), vec![(total - 1) as u64]);
+        assert!(!last.has_more, "the walk reaches the room's true end");
+        assert_eq!(last.next_seq, None);
+    }
+
+    #[test]
+    fn transcript_page_including_closed_serves_an_open_room_identically() {
+        // Openness is not a second contract, exactly as on the backward read: the
+        // daemon needs one call and no fallback pair, and a room closing mid-session
+        // cannot change the page a client is walking.
+        let (mut s, key) = store_with_messages(10);
+        let open = s
+            .transcript_page_including_closed(&key, None, Some(4))
+            .unwrap();
+        assert_eq!(seqs(&open.messages), vec![0, 1, 2, 3]);
+        s.close(&key).unwrap();
+        let closed = s
+            .transcript_page_including_closed(&key, None, Some(4))
+            .unwrap();
+        assert_eq!(seqs(&closed.messages), seqs(&open.messages));
+        assert_eq!(closed.next_seq, open.next_seq);
+        assert_eq!(closed.has_more, open.has_more);
+    }
+
+    #[test]
+    fn transcript_page_including_closed_on_an_absent_room_is_unknown() {
+        // Visibility widens from open rooms to closed ones and no further. A room
+        // that never existed is what keeps the daemon's 404 on this path.
+        let (s, _key) = store_with_messages(3);
+        assert!(matches!(
+            s.transcript_page_including_closed(&RoomKey::new("never-created"), None, Some(10)),
+            Err(RoomStoreError::UnknownRoom(_))
+        ));
+    }
+
+    #[test]
     fn transcript_page_on_closed_room_is_unknown() {
         // The open-room precondition is unchanged: a closed room is UnknownRoom on
-        // the page API too (the daemon handler is what falls back to the audit
-        // view). Pins that transcript_page didn't accidentally widen visibility.
+        // the page API too — the daemon reads a closed room through
+        // `transcript_page_including_closed`, never through this method. Pins that
+        // transcript_page didn't accidentally widen visibility.
         let (mut s, key) = store_with_messages(2);
         s.close(&key).unwrap();
         assert!(matches!(

@@ -9426,3 +9426,126 @@ cut a detached worktree at pristine bcf5222c and reproduced the identical exit 1
 advisory is a real workspace-wide blocker and wants its own slice; it is not
 mine to fix from inside ocean-store. No deploy, no migration.
 _________________________________________________________________________________ 09:30 loop/os-roomrecord-transcript-prefix
+
+time:      [11:48] [01-09-26]
+agent:     [claude code], [opus 5], [ocean-loop builder]
+worktree:  loop/os-transcript-page-including-closed
+type:      [bug report]
+area:      [backend]
+
+A soft-closed room past MAX_TRANSCRIPT_LIMIT told every forward-paging client it
+had the whole log at row 999. `read_transcript_page`'s closed arm windowed the
+record from `get_including_closed` in memory, and that record IS the oldest 1000
+rows, so `has_more = msgs.len() > effective_limit` could never be true at the cap
+however long the room was. A frozen 12,000-message call room answered
+`has_more: false, next_seq: null` on its thousandth row and rows 1000+ were
+reachable by nothing on `/transcript`, `/snapshot`'s forward read, or
+`room_summary.rs` — one arm, three routes.
+
+The obvious repair is worse than the bug and I did not take it. OR-ing
+`RoomRecord::transcript_has_more` into that `has_more` makes the flag truthful
+while leaving the page unreachable: `get_including_closed` hands back the same
+oldest 1000 every time, so a client replaying `after_seq=999` gets an empty page
+that still claims more, and a silent stop becomes a loop that never advances. A
+marker says rows are missing; only a query returns them.
+
+So the fix went to the store, where the shape already existed one function away.
+`transcript_page_including_closed` is `room_exists()` + `load_transcript_page`,
+the exact mirror of `transcript_tail_page_including_closed` — an absent room is
+still `UnknownRoom`, so every handler keeps its 404 — and `read_transcript_page`
+is now a single call to it. The closed arm is gone entirely and the two
+directions are symmetric, which is what the tail read's own doc comment has
+argued for since it landed. Signature unchanged, so `room_summary.rs` (read-only
+for this slice) still shares the one paging implementation.
+
+Closed the second defect in the same pass: `room_get`'s WHY-block accepted
+decoding up to the cap TWICE and justified it two ways that are both false now —
+"only the page can tell 'exactly the cap' from 'the cap, with more behind it'"
+(`transcript_has_more` tells exactly that) and "the call ocean-surface makes
+every time a room is opened" (ocean-surface hydrates through `/snapshot`). Took
+the cheap form: the record `reg.get` already loaded IS the page — `load_record`
+builds it from `load_transcript_page(key, None, MAX_TRANSCRIPT_LIMIT)`, the same
+rows and clamp the route asked for — so it now serves `record.transcript`,
+`record.transcript_has_more`, and `transcript.last()` as the cursor. One decode
+instead of two, and `transcript_has_more` finally has a reader; before this it
+had none outside the store's own tests. The existence guard stays `reg.get`, and
+the 404-on-closed test still pins it.
+
+The test that is the point is the daemon's
+`transcript_of_a_closed_room_pages_forward_past_the_record_cap`: it seeds 1005
+rows, closes the room, and walks `/transcript` forward to 1004. Verified it
+discriminates by restoring the old windowing body underneath it — FAILED on the
+first page's `has_more` (left `false`, right `true`) — then restored the fix and
+it passes. The store side adds the forward twin of the existing tail trio,
+including the two-hop walk that proves the cursor progresses rather than
+repeating.
+
+Scope note for the reviewer: the slice named persistent_rooms.rs, ocean-store's
+lib.rs + AGENTS.md, and events.md. I also edited `crates/ocean-daemon/AGENTS.md`,
+which is OUTSIDE that list. Three of its sentences described the defect as
+current behaviour — that the backward arm reads store rows "instead of windowing
+`rec.transcript` the way the forward arm does", that `room_get` serves
+`read_transcript_page`, and that the `reg.get` guard matters because
+`read_transcript_page` falls through to `get_including_closed`. All three are
+false after this change and leaving them would have documented the bug as the
+contract. The loop's scoping was wrong, not the edit.
+
+Gate: `OCEAN_ALLOW_REPO_CWD=1 cargo xtask ci` — docs-check PASS (30 packages,
+157 files, 179 links), workspace build, every test lane green including
+ocean-daemon 875/875, ocean-store 214/214, ocean-tui 496/496, then Clippy
+(--workspace --all-targets -D warnings) and fmt both clean. `cargo deny check`
+is the one red stage and is UNCHANGED from origin/main: reproduced the identical
+exit 1 in a detached worktree at pristine 04e2d368 (RUSTSEC-2026-0274 rtrb
+`ReadChunk::commit` double-free, plus yanked spin 0.9.8), against a diff touching
+no Cargo.toml, Cargo.lock or deny.toml. One flake seen on the first gate run —
+`ocean-tui`'s `resume_session_reports_agent_session_id_with_resume_source`, whose
+own comment records it flaking under full-suite parallel load; it passes alone
+and in-suite on both pristine main and this branch, and it is unrelated to this
+diff. No deploy, no migration.
+_________________________________________________________________________________ 11:48 loop/os-transcript-page-including-closed
+
+time:      [12:16] [01-09-26]
+agent:     [claude code], [opus 5], [ocean-loop refiner]
+worktree:  loop/os-transcript-page-including-closed
+type:      [review]
+area:      [docs]
+
+Review held the slice on its own stated standard turned around. The build commit
+went OUT of scope into `crates/ocean-daemon/AGENTS.md` because three sentences
+there described the deleted in-memory fallback and leaving them would have
+documented the bug — and then left three more sentences saying the same departed
+thing inside `persistent_rooms.rs`, the file the diff already owned and rewrote
+around. This pass is prose only: no code, no test, no behaviour.
+
+`room_snapshot`'s inline comment claimed "Both reads prefer the live room and
+fall back to the soft-closed audit view", which is now half false ten lines above
+the code. The metadata read still does exactly that — `reg.get`, then
+`get_including_closed`, and WHICH arm answers is the `closed` boolean. The
+transcript read does not fall back at all; it is one existence-gated query. The
+comment now says which is which, because the distinction is the whole reason
+`closed` is derived from the metadata arm and not from a second query.
+
+`room_transcript`'s and `room_snapshot`'s docstrings both named the mechanism as
+a fallback serving rows from the frozen record — the precise thing this slice
+removed, and serving rows from that record IS the bug, since the record is only
+the oldest `MAX_TRANSCRIPT_LIMIT` rows. Both now say a closed room is served
+through the same store query as an open one, and `room_transcript`'s says
+explicitly that the rows never come from the record, so a reader repairing this
+route later is not sent back to it. `room_snapshot`'s "Like `room_get`" clause
+went with the rewrite: `room_get` 404s on a closed room, so it was never the
+route to be like here.
+
+One instance beyond the three the review listed, same category, same slice:
+`transcript_page_on_closed_room_is_unknown` in `ocean-store/src/lib.rs` explained
+its own assertion with "(the daemon handler is what falls back to the audit
+view)". It does not any more, and that comment sits directly under the
+`transcript_page_including_closed` tests this slice added — a stale claim beside
+its own replacement. It now names the method the daemon actually calls.
+
+Gate re-run at the refined tree: docs-check PASS (30 packages, 157 files, 179
+links), ocean-daemon 875/875, ocean-store 214/214, ocean-tui 496 passed 4
+ignored, Clippy clean, format clean. `cargo deny` still fails on
+RUSTSEC-2026-0274 (`rtrb` double-free) and yanked `spin`, unchanged and
+pre-existing: the branch touches no `Cargo.toml`, `Cargo.lock` or `deny.toml` at
+all, and every line this pass changed is a comment. No deploy, no migration.
+_________________________________________________________________________________ 12:16 loop/os-transcript-page-including-closed
