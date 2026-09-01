@@ -3326,7 +3326,10 @@ pub(super) async fn room_transcript(
 ///
 /// Like `room_get`/`room_transcript`, falls back to the soft-closed audit view so
 /// a finished call's frozen room (closed on `CallEnded`, OCEAN-170) stays
-/// hydratable for replay.
+/// hydratable for replay. The body says which view answered via `closed`: without
+/// it a hydrating client cannot tell a frozen room from a live one, so it opens a
+/// tail that the events route will never feed and a composer whose every send is
+/// rejected.
 pub(super) async fn room_snapshot(
     State(state): State<AppState>,
     Path(key): Path<String>,
@@ -3349,12 +3352,18 @@ pub(super) async fn room_snapshot(
     // to the soft-closed audit view (OCEAN-170). The std mutex guard is dropped
     // inside `with_rooms`; it is never held across an `.await`.
     let result = with_rooms(&state, |reg| {
-        // Room metadata: live first, then audit for a soft-closed room.
-        let record = match reg.get(&key) {
-            Ok(Some(rec)) => Ok(Some(rec)),
-            Ok(None) => reg.get_including_closed(&key),
-            Err(e) => Err(e),
-        }?;
+        // Room metadata: live first, then audit for a soft-closed room. WHICH arm
+        // answered is the closedness signal — `get` filters on `closed_at IS NULL`
+        // and `get_including_closed` does not — and taking it here, under the same
+        // lock as the read, is why the flag cannot disagree with the record it
+        // describes. Asking separately would mean a second `with_rooms` call, and a
+        // close landing between the two would answer with a flag that contradicts
+        // the transcript beside it.
+        let (record, closed) = match reg.get(&key) {
+            Ok(Some(rec)) => (Some(rec), false),
+            Ok(None) => (reg.get_including_closed(&key)?, true),
+            Err(e) => return Err(e),
+        };
         let Some(record) = record else {
             return Ok(None);
         };
@@ -3363,10 +3372,10 @@ pub(super) async fn room_snapshot(
         // Access projection (S2-P1): the room's federated state, outbox, and
         // member roster (Local if no access row exists).
         let access = reg.room_access(&key)?;
-        Ok(Some((record, page, access)))
+        Ok(Some((record, page, access, closed)))
     });
     match result {
-        Ok(Some((rec, page, access))) => {
+        Ok(Some((rec, page, access, closed))) => {
             let last_seq = page.messages.last().map(|m| m.seq);
             (
                 StatusCode::OK,
@@ -3379,6 +3388,7 @@ pub(super) async fn room_snapshot(
                     "next_seq": page.next_seq,
                     "has_more": page.has_more,
                     "access": access,
+                    "closed": closed,
                 })),
             )
         }
@@ -8995,6 +9005,43 @@ env = { FIXTURE = "1" }
         .unwrap();
         assert_eq!(body["ok"], json!(true));
         assert_eq!(body["access"], json!({"state": "local"}));
+        assert_eq!(body["closed"], json!(true));
+    }
+
+    /// The mirror of the test above: identical fixture minus the `close`, so the
+    /// only thing that can move `closed` is closedness itself. Alone, either test
+    /// passes against a hardcoded constant; the pair is what makes the field a
+    /// discriminator, and a hydrating client is trusting it to be one.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn snapshot_open_room_reports_closed_false() {
+        let _guard = AUTO_CONVENE_ENV_LOCK.lock().await;
+        let tmp = tempfile::TempDir::new().unwrap();
+        let state = fake_convene_state(&tmp);
+        let key = RoomKey::new("s2-snap-not-closed");
+        with_rooms(&state, |store| {
+            store
+                .create(key.clone(), "Open", None, Utc::now())
+                .expect("create");
+        });
+
+        let app = room_routes().with_state(state.clone());
+        let resp = app
+            .oneshot(
+                axum::http::Request::get(format!("/v1/rooms/persistent/{key}/snapshot"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body: serde_json::Value = serde_json::from_slice(
+            &axum::body::to_bytes(resp.into_body(), 1024 * 1024)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(body["ok"], json!(true));
+        assert_eq!(body["closed"], json!(false));
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

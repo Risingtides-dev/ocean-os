@@ -8926,3 +8926,102 @@ a required status check there: red is information, not a lock. Three backlog
 entries and one earlier wave's lesson said otherwise; ci.yml's own comment is
 the authority and it says the opposite.
 _________________________________________________________________________________ 02:51 loop/os-ledger-needs-the-per-entry-identity-separator-too
+
+time:      [04:49] [01-09-26]
+agent:     [claude code], [claude-opus-5], [ocean-loop builder]
+worktree:  loop/os-snapshot-closed-marker
+type:      [bug report]: /snapshot could not say a room was closed
+area:      [backend]: persistent rooms HTTP
+
+`GET /v1/rooms/persistent/{key}/snapshot` served a soft-closed room exactly like
+an open one. It has always fallen back to the audit view (OCEAN-170) so a
+finished call stays replayable, but the body never said which view answered —
+ok/room/participants/transcript/last_seq/next_seq/has_more/access, nothing about
+closedness. That was survivable while the surface hydrated through `room_get`,
+whose 404 on a closed room WAS the signal. ocean-surface#185 moved hydration onto
+`/snapshot` and the signal went with it: the surface now paints a transcript
+above an EventSource it rebuilds every few seconds forever, and a composer whose
+every send 404s.
+
+Added `"closed"` to the snapshot body, derived from which arm of the existing
+fallback produced the record — `get` filters on `closed_at IS NULL`,
+`get_including_closed` does not, so the arm IS the answer and no store or core
+change is needed to read it. Taken inside the same `with_rooms` closure as the
+record, which is why the flag cannot disagree with the transcript beside it. The
+hazard that guards against is a SECOND `with_rooms` call — the obvious wrong
+implementation — where a close could land between the two acquisitions. A second
+query inside THIS closure could not race one: `with_rooms` holds `state.rooms`
+for the whole closure and a close needs that same lock. It would simply buy
+nothing, because the arm already is the answer.
+
+Deliberately NOT a `closed_at` on `ocean_core::Room`: that struct is serialized
+by room_get, room_create, the PATCH route, the list route and the federation
+payloads, so a field there is a wire change across six surfaces to serve one.
+`room_get`'s 404 contract is untouched — widening it would turn room_get into
+room_snapshot, which persistent_rooms.rs spells out in its own words and two
+tests pin.
+
+`snapshot_soft_closed_room_returns_200_with_local_access` was named for
+closedness and asserted nothing about it; deleting its `store.close()` line left
+it green. It now asserts `closed == true`, and a new
+`snapshot_open_room_reports_closed_false` mirrors it — identical fixture minus
+the close — so the pair discriminates rather than agreeing with a constant. Both
+new assertions were reverted individually and each went red on its own.
+
+One file outside the slice's scope had to move, and it is worth naming because
+the scoping missed it: `crates/ocean-daemon/src/main.rs`. The slice was scoped on
+a grep of persistent_rooms.rs for body-shape assertions, which found only the
+invite body — but `closed_persistent_room_preserves_audit_http_asymmetry` pins
+the snapshot's EXACT key set through `assert_json_object_keys`, and it lives in
+main.rs. So "additive is safe" held for the shipped ocean-surface client and not
+for this repo's own characterization test; the field cannot be added without it.
+That test is the natural home for the assertion anyway — it is the one that
+freezes the whole soft-close asymmetry — so it now also asserts `closed == true`
+beside the key set it already froze.
+
+Gate: `cargo test -p ocean-daemon` 863 passed / 0 failed, `cargo clippy -p
+ocean-daemon --all-targets -- -D warnings` clean, `cargo fmt --check` clean,
+`cargo xtask docs-check` PASS, `node scripts/check-ledger.mjs events.md` 546
+entries every one closed. No migration, no deploy. The ocean-surface half —
+reading the flag and refusing to open a tail on a closed room — is filed
+separately and lands after this.
+
+Review round two rejected this on the record it left behind, not the code: a wire
+contract grew a field and none of the three places this repo keeps route contracts
+learned about it. Fixed here. `crates/ocean-daemon/AGENTS.md` already argued at
+length about this exact two-arm fallback — the `room_get` vs `room_snapshot` split
+and the ruling that widening `room_get`'s existence test to `get_including_closed`
+converts its 404-on-closed contract into a 200 — so the paragraph now also says
+that the same fallback in `room_snapshot` is a WIRE source, and that serving
+`closed` from a separate `with_rooms` call would let a close land between the two
+reads. `docs/OCEAN_ECOSYSTEM_CONTRACT.md` gets `closed` on the route line and its
+own paragraph beside `access`, the last additive field this route grew, because
+that doc — not this diff — is what the ocean-surface half will be written against.
+
+The comment on the main.rs assertion said "every OTHER route here hides the room",
+which the test it annotates disproves seventy lines up: `/transcript` answers 200
+with all three rows for the closed room, twice. Of the four other routes, list
+returns `[]`, `room_get` 404s and `/events` 404s, but transcript serves. Reworded
+to "either hides the room or, like `/transcript` above, serves it without saying
+so" — the point stands, the sentence supporting it did not.
+
+Two further findings the reviewer described in prose but that did not reach the
+builder as list items were fixed too, and the overreach is deliberate and named
+here rather than left for a third round. `docs/OCEAN_RUNTIME_OPERATOR_GUIDE.md`
+is the THIRD place this repo keeps route contracts — its snapshot line enumerates
+the body field-by-field, so it went stale the moment the field landed; it now
+lists `closed` and says the route serves a soft-closed room where room detail and
+the SSE tail refuse one. And the comment on the fallback justified taking the flag
+under the lock against a race that the surrounding mutex already excludes: both
+reads sit inside one `with_rooms` closure holding `state.rooms`, and a close would
+need that same lock, so nothing can land between them. The risk it should have
+named is a SECOND `with_rooms` call, which is the obvious wrong implementation;
+reworded to say that. The operator guide's separate, older omission of `access`
+from the same line predates this slice and was left alone.
+
+Gate re-run after the doc pass: `cargo test -p ocean-daemon` 863 passed / 0 failed,
+`cargo clippy -p ocean-daemon --all-targets -- -D warnings` clean, `cargo fmt
+--check` clean, `cargo xtask docs-check` PASS (30 packages, 157 active Markdown
+files, 179 local links), `node scripts/check-ledger.mjs events.md` 546 entries
+every one closed.
+_________________________________________________________________________________ 04:49 loop/os-snapshot-closed-marker

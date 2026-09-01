@@ -21364,8 +21364,10 @@ mod tests {
 
     /// Soft close intentionally creates an HTTP asymmetry: ordinary list/detail
     /// and the live SSE endpoint hide the room, while transcript/snapshot retain
-    /// a bounded audit view. Freeze the audit fallback's `limit=0` floor and
-    /// cursor semantics, not `ocean-store`'s underlying SQL implementation.
+    /// a bounded audit view — which the snapshot body now labels `closed`, since
+    /// a caller that hydrates here has no other route left to learn it from.
+    /// Freeze the audit fallback's `limit=0` floor and cursor semantics, not
+    /// `ocean-store`'s underlying SQL implementation.
     #[tokio::test]
     async fn closed_persistent_room_preserves_audit_http_asymmetry() {
         use ocean_store::RoomStore as _;
@@ -21504,9 +21506,16 @@ mod tests {
                 "last_seq",
                 "next_seq",
                 "has_more",
+                "closed",
             ],
         );
         assert_eq!(snapshot["ok"], true);
+        // The asymmetry this test freezes is only safe to serve because the body
+        // admits to it: every other route here either hides the room or, like
+        // `/transcript` above, serves it without saying so, leaving `closed` as
+        // the one thing telling a hydrating client that the 200 it just got is an
+        // audit view and not a room it may tail or post to.
+        assert_eq!(snapshot["closed"], true);
         assert_eq!(snapshot["room"]["id"], "closed-audit");
         assert_eq!(snapshot["room"]["name"], "Closed Audit");
         // Closed room shows exact Local access projection (no extra keys).

@@ -158,7 +158,7 @@ POST /v1/rooms/persistent/{key}/participants               # join (add participa
 DEL  /v1/rooms/persistent/{key}/participants/{participant_id}  # leave
 POST /v1/rooms/persistent/{key}/messages                   # append a transcript entry
 GET  /v1/rooms/persistent/{key}/transcript                 # read transcript (after_seq tail)
-GET  /v1/rooms/persistent/{key}/snapshot                   # hydrate durable room state (includes access)
+GET  /v1/rooms/persistent/{key}/snapshot                   # hydrate durable room state (includes access + closed)
 GET  /v1/rooms/persistent/{key}/events                     # merged SSE tail (access + messages)
 POST /v1/rooms/persistent/{key}/outbox/retry               # retry a failed outbox item
 POST /v1/rooms/{room_id}/livekit-token                     # mint voice/video join token
@@ -186,6 +186,8 @@ is the seed for auto-convene; the daemon evaluates it at the transcript/
 component-event wiring point.
 
 **Access projection** is a typed, store-owned `RoomAccessProjection` (a struct, not a tagged variant) returned on room detail (`GET /v1/rooms/persistent/{key}`) and snapshot (`GET /v1/rooms/persistent/{key}/snapshot`). Access states are exact `local`, `connecting`, `live`, `recovering`, and `revoked`. `members` and `outbox` are skip-when-empty struct fields, not variant-confined fields. `self_member_id` is a skip-when-empty room-level field naming the daemon's own authenticated member id, derived at read time from the private credential row; absent on local rooms and pre-field daemons. Outbox stays separate and never enters the confirmed transcript before Bedrock confirmation. Rooms without an access row (including the frozen soft-closed fixture) default exact `local`.
+
+**Closed marker** is a plain `closed` boolean on the snapshot body only (`GET /v1/rooms/persistent/{key}/snapshot`), deliberately not a field on `Room` — that struct is serialized by room create, detail, PATCH, and list as well as the federation payloads, so a field there would be a wire change across all of them to serve one route. It is true exactly when the open-room read missed and the soft-closed audit view answered — the room is frozen and replayable, not live — and it is derived from that same read, so it cannot disagree with the transcript beside it. `GET /v1/rooms/persistent/{key}` still 404s on a closed room and the `/events` SSE tail still refuses one, so a client that hydrates through `/snapshot` has no other signal: on `closed: true` it must present an audit view rather than open a tail nothing will ever feed and a composer whose every send 404s. The field is additive and absent from pre-field daemons, where a missing key reads as open.
 
 **Pending outbox** is durable per-room storage of locally-authored federated events awaiting Bedrock confirmation. `POST /v1/rooms/persistent/{key}/outbox/retry` accepts `{ "client_event_id": "<id>" }` and returns 202 on successful durable requeue, 403 revoked, 404 for an unknown room or item, 409 pending/local, 400 for malformed/non-object body, or sanitized store 500 on internal error. Outbox durability lives in `ocean-store`; the retry route still owns only HTTP validation, store lookup, and wake publication — it performs no network call itself.
 
