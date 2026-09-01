@@ -3221,6 +3221,30 @@ pub(super) struct TranscriptQuery {
     pub(super) limit: Option<usize>,
 }
 
+/// `/snapshot`'s query — [`TranscriptQuery`] plus the backward cursor.
+///
+/// The field lives here rather than on `TranscriptQuery` because only
+/// `/snapshot` serves a backward page; putting it on the shared struct would
+/// advertise a parameter `/transcript` silently drops. The two cursors are
+/// mutually exclusive and the handler rejects them together rather than
+/// inventing a precedence rule a caller would have to know.
+#[derive(serde::Deserialize)]
+pub(super) struct SnapshotQuery {
+    /// Forward cursor: return only entries with `seq > after_seq`.
+    #[serde(default)]
+    pub(super) after_seq: Option<u64>,
+    /// Backward cursor: return the NEWEST `limit` entries with `seq < before_seq`,
+    /// still ascending. Present at all ⇒ the read runs from the newest end. A
+    /// `before_seq` above every stored seq is therefore how a client opens a room
+    /// at its tail without first knowing the last seq — that is the literal
+    /// meaning of the parameter, not a sentinel.
+    #[serde(default)]
+    pub(super) before_seq: Option<u64>,
+    /// Max rows to return in this page; same clamping as [`TranscriptQuery`].
+    #[serde(default)]
+    pub(super) limit: Option<usize>,
+}
+
 /// Read one bounded transcript page for a room, transparently falling back to the
 /// soft-closed audit view (OCEAN-249 + OCEAN-170).
 ///
@@ -3279,6 +3303,67 @@ pub(super) fn read_transcript_page(
     }
 }
 
+/// Read one bounded transcript page from the NEWEST end, with the same
+/// soft-closed audit fallback [`read_transcript_page`] applies to the forward read.
+///
+/// The fallback is the whole reason this exists as a sibling rather than living
+/// inside the handler. A finished call's room is closed but still replayable, and
+/// if only the open path learned to read from the tail then a frozen call room
+/// would paint its OLDEST page while a live one painted its newest — the same
+/// hydration, two different screens, decided by whether the call had ended. So the
+/// audit arm applies the identical window to the frozen record's rows: keep those
+/// with `seq < before_seq`, then take the LAST `limit` of them.
+///
+/// One inherited ceiling, shared with the forward arm and not introduced here:
+/// `get_including_closed` loads the frozen transcript as the OLDEST
+/// `MAX_TRANSCRIPT_LIMIT` rows, so a closed room longer than that cannot serve its
+/// true newest page from the audit view — its "newest" is the newest of the first
+/// thousand. Lifting that means paging the store's closed-room read, a change to
+/// `load_record` rather than to this window.
+pub(super) fn read_transcript_tail_page(
+    reg: &ocean_store::SqliteRoomStore,
+    key: &RoomKey,
+    before_seq: Option<u64>,
+    limit: Option<usize>,
+) -> Result<ocean_store::TranscriptTailPage, ocean_store::RoomStoreError> {
+    use ocean_store::RoomStore as _;
+    match reg.transcript_tail_page(key, before_seq, limit) {
+        Ok(page) => Ok(page),
+        Err(ocean_store::RoomStoreError::UnknownRoom(_)) => {
+            match reg.get_including_closed(key) {
+                Ok(Some(rec)) => {
+                    let effective_limit = ocean_store::clamp_transcript_limit(limit);
+                    let mut msgs: Vec<_> = rec
+                        .transcript
+                        .into_iter()
+                        .filter(|m| before_seq.is_none_or(|before| m.seq < before))
+                        .collect();
+                    // Overflow is at the OLDEST end here, the mirror of the forward
+                    // arm dropping its newest sentinel: drain from the front so the
+                    // newest `effective_limit` rows are what survives.
+                    let has_more = msgs.len() > effective_limit;
+                    if has_more {
+                        msgs.drain(..msgs.len() - effective_limit);
+                    }
+                    let prev_seq = if has_more {
+                        msgs.first().map(|m| m.seq)
+                    } else {
+                        None
+                    };
+                    Ok(ocean_store::TranscriptTailPage {
+                        messages: msgs,
+                        prev_seq,
+                        has_more,
+                    })
+                }
+                Ok(None) => Err(ocean_store::RoomStoreError::UnknownRoom(key.clone())),
+                Err(e) => Err(e),
+            }
+        }
+        Err(e) => Err(e),
+    }
+}
+
 /// `GET /v1/rooms/persistent/{key}/transcript?after_seq=N&limit=M` — read one
 /// bounded page of a room's transcript, optionally only entries after a given seq.
 ///
@@ -3314,26 +3399,56 @@ pub(super) async fn room_transcript(
     }
 }
 
+/// The two paging directions collapsed to what the snapshot body needs, so the
+/// response builder answers "which cursors does this page carry?" once instead
+/// of branching on direction a second time.
+struct SnapshotTranscript {
+    messages: Vec<RoomMessage>,
+    /// Forward cursor. `None` on a backward read: that read computes no forward
+    /// cursor, and `last_seq` is what a tail-opened client replays as `after_seq`
+    /// to walk toward the present or to open `/events`.
+    next_seq: Option<u64>,
+    /// Backward cursor — the oldest row on the page, replayed as `before_seq`.
+    /// `None` on a forward read.
+    prev_seq: Option<u64>,
+    /// Whether more rows exist IN THE DIRECTION THIS PAGE WAS PAGING: newer ones
+    /// for a forward read, older ones for a backward one. The direction is set by
+    /// which cursor the caller supplied, so a client that knows what it asked for
+    /// knows what the flag means.
+    has_more: bool,
+}
+
 /// `GET /v1/rooms/persistent/{key}/snapshot` — full room hydration in one read:
-/// the room entity (id, name, roster, timestamps, trigger policy), its complete
-/// transcript, and `last_seq` so the caller can immediately tail live updates via
-/// `GET /v1/rooms/persistent/{key}/events?after_seq=last_seq`.
+/// the room entity (id, name, roster, timestamps, trigger policy), one bounded
+/// transcript page, and `last_seq` so the caller can immediately tail live updates
+/// via `GET /v1/rooms/persistent/{key}/events?after_seq=last_seq`.
 ///
 /// This is the store-backed realization of the collaboration model's "Room
 /// hydration / snapshot" step (OCEAN-232): switching into a room must load full
 /// state, not just subscribe to future events. Persistent rooms carry everything
 /// hydration needs, so this endpoint serves the durable snapshot directly.
 ///
+/// `before_seq` chooses which END of the log that page comes from. Without it the
+/// read runs forward from the start, as it always has — which for a room with
+/// 12,000 messages means hydration opens at message #1 and the tail, the only part
+/// anyone wanted, is reachable only by transferring the whole log. With it the
+/// page is the NEWEST `limit` rows before that cursor, still ascending, and
+/// `prev_seq` pages further back. A `before_seq` above every stored seq is how a
+/// client opens at the tail before it knows the last seq. Supplying both cursors
+/// is a typed 400 rather than a precedence rule, because a caller that sent both
+/// has two different pages in mind and neither answer would be the one it meant.
+///
 /// Like `room_get`/`room_transcript`, falls back to the soft-closed audit view so
 /// a finished call's frozen room (closed on `CallEnded`, OCEAN-170) stays
-/// hydratable for replay. The body says which view answered via `closed`: without
-/// it a hydrating client cannot tell a frozen room from a live one, so it opens a
-/// tail that the events route will never feed and a composer whose every send is
-/// rejected.
+/// hydratable for replay — in BOTH directions, so a frozen room and a live one
+/// hydrate to the same screen. The body says which view answered via `closed`:
+/// without it a hydrating client cannot tell a frozen room from a live one, so it
+/// opens a tail that the events route will never feed and a composer whose every
+/// send is rejected.
 pub(super) async fn room_snapshot(
     State(state): State<AppState>,
     Path(key): Path<String>,
-    Query(q): Query<TranscriptQuery>,
+    Query(q): Query<SnapshotQuery>,
 ) -> (StatusCode, Json<serde_json::Value>) {
     let trimmed = key.trim();
     if trimmed.is_empty() {
@@ -3342,15 +3457,26 @@ pub(super) async fn room_snapshot(
             Json(json!({ "ok": false, "error": "invalid room key; must be non-empty" })),
         );
     }
+    if q.after_seq.is_some() && q.before_seq.is_some() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({
+                "ok": false,
+                "code": "conflicting_transcript_cursors",
+                "error": "after_seq and before_seq page in opposite directions; supply at most one",
+            })),
+        );
+    }
     let key = RoomKey::new(trimmed);
-    // Hydrate room metadata (entity + roster) and the FIRST bounded transcript page
-    // under one lock. The transcript is no longer the room's entire log poured into
-    // one response (OCEAN-249): a long-lived call room would make every hydration a
-    // full-table read. We serve `limit` rows + a `next_seq` cursor so the client
-    // immediately knows whether to page (`/transcript?after_seq=next_seq`) or tail
-    // (`/events?after_seq=last_seq`). Both reads prefer the live room and fall back
-    // to the soft-closed audit view (OCEAN-170). The std mutex guard is dropped
-    // inside `with_rooms`; it is never held across an `.await`.
+    // Hydrate room metadata (entity + roster) and ONE bounded transcript page under
+    // one lock. The transcript is not the room's entire log poured into one response
+    // (OCEAN-249): a long-lived call room would make every hydration a full-table
+    // read. We serve `limit` rows plus the cursor for the direction asked for, so the
+    // client immediately knows whether to page (`/transcript?after_seq=next_seq`, or
+    // `/snapshot?before_seq=prev_seq` going back) or tail (`/events?after_seq=last_seq`).
+    // Both reads prefer the live room and fall back to the soft-closed audit view
+    // (OCEAN-170). The std mutex guard is dropped inside `with_rooms`; it is never
+    // held across an `.await`.
     let result = with_rooms(&state, |reg| {
         // Room metadata: live first, then audit for a soft-closed room. WHICH arm
         // answered is the closedness signal — `get` filters on `closed_at IS NULL`
@@ -3367,8 +3493,26 @@ pub(super) async fn room_snapshot(
         let Some(record) = record else {
             return Ok(None);
         };
-        // First bounded page of the transcript (from the start of the log).
-        let page = read_transcript_page(reg, &key, q.after_seq, q.limit)?;
+        let page = match q.before_seq {
+            Some(before) => {
+                let tail = read_transcript_tail_page(reg, &key, Some(before), q.limit)?;
+                SnapshotTranscript {
+                    messages: tail.messages,
+                    next_seq: None,
+                    prev_seq: tail.prev_seq,
+                    has_more: tail.has_more,
+                }
+            }
+            None => {
+                let forward = read_transcript_page(reg, &key, q.after_seq, q.limit)?;
+                SnapshotTranscript {
+                    messages: forward.messages,
+                    next_seq: forward.next_seq,
+                    prev_seq: None,
+                    has_more: forward.has_more,
+                }
+            }
+        };
         // Access projection (S2-P1): the room's federated state, outbox, and
         // member roster (Local if no access row exists).
         let access = reg.room_access(&key)?;
@@ -3386,6 +3530,7 @@ pub(super) async fn room_snapshot(
                     "transcript": projected_transcript(page.messages),
                     "last_seq": last_seq,
                     "next_seq": page.next_seq,
+                    "prev_seq": page.prev_seq,
                     "has_more": page.has_more,
                     "access": access,
                     "closed": closed,
@@ -3399,7 +3544,6 @@ pub(super) async fn room_snapshot(
         Err(e) => room_store_error_response(e),
     }
 }
-
 #[derive(Debug, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(super) struct RoomReadCursorPatchRequest {
@@ -9042,6 +9186,222 @@ env = { FIXTURE = "1" }
         .unwrap();
         assert_eq!(body["ok"], json!(true));
         assert_eq!(body["closed"], json!(false));
+    }
+
+    // ── Snapshot tail paging (`before_seq`) ──────────────────────────────────
+
+    /// GET a snapshot with a raw query string and return `(status, body)`.
+    async fn snapshot_response(
+        state: &AppState,
+        key: &RoomKey,
+        query: &str,
+    ) -> (StatusCode, serde_json::Value) {
+        let app = room_routes().with_state(state.clone());
+        let resp = app
+            .oneshot(
+                axum::http::Request::get(format!("/v1/rooms/persistent/{key}/snapshot{query}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let status = resp.status();
+        let body: serde_json::Value = serde_json::from_slice(
+            &axum::body::to_bytes(resp.into_body(), 1024 * 1024)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        (status, body)
+    }
+
+    /// Seq values in a snapshot's `transcript` array, in the order served.
+    fn transcript_seqs(body: &serde_json::Value) -> Vec<u64> {
+        body["transcript"]
+            .as_array()
+            .expect("transcript array")
+            .iter()
+            .map(|m| m["seq"].as_u64().expect("seq"))
+            .collect()
+    }
+
+    /// A `before_seq` above every storable seq: "before the end of everything",
+    /// which is how a client opens at the tail without knowing the last seq.
+    const BEYOND_END: u64 = u64::MAX;
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn snapshot_before_seq_serves_the_newest_page() {
+        // The bug this slice closes: a 12-message room hydrated at message #1. With
+        // before_seq the same room opens at its last four, ascending.
+        let _guard = AUTO_CONVENE_ENV_LOCK.lock().await;
+        let tmp = tempfile::TempDir::new().unwrap();
+        let state = fake_convene_state(&tmp);
+        let key = RoomKey::new("s2-snap-tail");
+        seed_access(&state, &key, local_access());
+        seed_transcript(&state, &key, 12);
+
+        let (status, body) =
+            snapshot_response(&state, &key, &format!("?before_seq={BEYOND_END}&limit=4")).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(transcript_seqs(&body), vec![8, 9, 10, 11]);
+        assert_eq!(body["last_seq"], json!(11), "the tail is the newest row");
+        assert_eq!(body["has_more"], json!(true), "older rows remain");
+        // Backward cursor is the OLDEST row on the page, replayed as before_seq.
+        assert_eq!(body["prev_seq"], json!(8));
+        // A backward read computes no forward cursor; last_seq is that cursor.
+        assert_eq!(body["next_seq"], json!(null));
+    }
+
+    /// The mirror of the test above: the identical fixture read WITHOUT
+    /// `before_seq` must still open at the oldest page. Alone, either test passes
+    /// against a handler hardwired to one end of the log; the pair is what makes
+    /// the parameter a discriminator.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn snapshot_without_before_seq_still_serves_the_oldest_page() {
+        let _guard = AUTO_CONVENE_ENV_LOCK.lock().await;
+        let tmp = tempfile::TempDir::new().unwrap();
+        let state = fake_convene_state(&tmp);
+        let key = RoomKey::new("s2-snap-head");
+        seed_access(&state, &key, local_access());
+        seed_transcript(&state, &key, 12);
+
+        let (status, body) = snapshot_response(&state, &key, "?limit=4").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(transcript_seqs(&body), vec![0, 1, 2, 3]);
+        assert_eq!(body["next_seq"], json!(3), "forward cursor is unchanged");
+        assert_eq!(body["prev_seq"], json!(null));
+        assert_eq!(body["has_more"], json!(true));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn snapshot_before_seq_pages_backward_to_the_start() {
+        // Replaying prev_seq walks toward the oldest page and terminates there with
+        // has_more false and no cursor — a client scrolling up has an end.
+        let _guard = AUTO_CONVENE_ENV_LOCK.lock().await;
+        let tmp = tempfile::TempDir::new().unwrap();
+        let state = fake_convene_state(&tmp);
+        let key = RoomKey::new("s2-snap-tail-page");
+        seed_access(&state, &key, local_access());
+        seed_transcript(&state, &key, 9);
+
+        let (_, first) =
+            snapshot_response(&state, &key, &format!("?before_seq={BEYOND_END}&limit=4")).await;
+        assert_eq!(transcript_seqs(&first), vec![5, 6, 7, 8]);
+        assert_eq!(first["prev_seq"], json!(5));
+
+        let (_, second) = snapshot_response(&state, &key, "?before_seq=5&limit=4").await;
+        assert_eq!(transcript_seqs(&second), vec![1, 2, 3, 4]);
+        assert_eq!(second["prev_seq"], json!(1));
+        assert_eq!(second["has_more"], json!(true));
+
+        let (_, third) = snapshot_response(&state, &key, "?before_seq=1&limit=4").await;
+        assert_eq!(transcript_seqs(&third), vec![0]);
+        assert_eq!(third["has_more"], json!(false));
+        assert_eq!(
+            third["prev_seq"],
+            json!(null),
+            "the oldest page has no cursor"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn snapshot_before_seq_zero_is_an_empty_page() {
+        // Nothing precedes the first message (seq 0). The answer this rules out is
+        // the whole log, which is what a 0 read as "no bound" would return.
+        let _guard = AUTO_CONVENE_ENV_LOCK.lock().await;
+        let tmp = tempfile::TempDir::new().unwrap();
+        let state = fake_convene_state(&tmp);
+        let key = RoomKey::new("s2-snap-before-zero");
+        seed_access(&state, &key, local_access());
+        seed_transcript(&state, &key, 12);
+
+        let (status, body) = snapshot_response(&state, &key, "?before_seq=0&limit=4").await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(transcript_seqs(&body).is_empty());
+        assert_eq!(body["has_more"], json!(false));
+        assert_eq!(body["prev_seq"], json!(null));
+        assert_eq!(body["last_seq"], json!(null));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn snapshot_rejects_both_cursors_together() {
+        // Two directions in one request: a caller that sent both has two different
+        // pages in mind, so neither silent precedence would be the one it meant.
+        let _guard = AUTO_CONVENE_ENV_LOCK.lock().await;
+        let tmp = tempfile::TempDir::new().unwrap();
+        let state = fake_convene_state(&tmp);
+        let key = RoomKey::new("s2-snap-both-cursors");
+        seed_access(&state, &key, local_access());
+        seed_transcript(&state, &key, 5);
+
+        let (status, body) =
+            snapshot_response(&state, &key, "?after_seq=1&before_seq=4&limit=2").await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(body["ok"], json!(false));
+        assert_eq!(body["code"], json!("conflicting_transcript_cursors"));
+        assert!(body["transcript"].is_null(), "no page is served either way");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn snapshot_before_seq_serves_a_soft_closed_room_identically() {
+        // A frozen call room must paint the SAME screen a live one paints. Before
+        // the audit arm mirrored the window, this room answered its oldest page
+        // while `snapshot_before_seq_serves_the_newest_page` answered its newest —
+        // the same hydration, two screens, decided by whether the call had ended.
+        let _guard = AUTO_CONVENE_ENV_LOCK.lock().await;
+        let tmp = tempfile::TempDir::new().unwrap();
+        let state = fake_convene_state(&tmp);
+        let key = RoomKey::new("s2-snap-tail-closed");
+        seed_access(&state, &key, local_access());
+        seed_transcript(&state, &key, 12);
+        with_rooms(&state, |store| store.close(&key).expect("close"));
+
+        let (status, body) =
+            snapshot_response(&state, &key, &format!("?before_seq={BEYOND_END}&limit=4")).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["closed"], json!(true), "still the audit view");
+        assert_eq!(transcript_seqs(&body), vec![8, 9, 10, 11]);
+        assert_eq!(body["has_more"], json!(true));
+        assert_eq!(body["prev_seq"], json!(8));
+        assert_eq!(body["last_seq"], json!(11));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn snapshot_closed_room_backward_paging_terminates_at_the_start() {
+        // The audit arm's own boundary: replaying prev_seq into a frozen room must
+        // reach a final page with no cursor, not repeat the same window forever.
+        let _guard = AUTO_CONVENE_ENV_LOCK.lock().await;
+        let tmp = tempfile::TempDir::new().unwrap();
+        let state = fake_convene_state(&tmp);
+        let key = RoomKey::new("s2-snap-closed-page");
+        seed_access(&state, &key, local_access());
+        seed_transcript(&state, &key, 6);
+        with_rooms(&state, |store| store.close(&key).expect("close"));
+
+        let (_, first) =
+            snapshot_response(&state, &key, &format!("?before_seq={BEYOND_END}&limit=4")).await;
+        assert_eq!(transcript_seqs(&first), vec![2, 3, 4, 5]);
+        assert_eq!(first["prev_seq"], json!(2));
+
+        let (_, second) = snapshot_response(&state, &key, "?before_seq=2&limit=4").await;
+        assert_eq!(transcript_seqs(&second), vec![0, 1]);
+        assert_eq!(second["has_more"], json!(false));
+        assert_eq!(second["prev_seq"], json!(null));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn snapshot_before_seq_on_unknown_room_is_still_404() {
+        // The tail read must not widen visibility: a room that never existed is a
+        // 404 on this path exactly as it is on the forward one.
+        let _guard = AUTO_CONVENE_ENV_LOCK.lock().await;
+        let tmp = tempfile::TempDir::new().unwrap();
+        let state = fake_convene_state(&tmp);
+        let key = RoomKey::new("s2-snap-tail-missing");
+
+        let (status, body) =
+            snapshot_response(&state, &key, &format!("?before_seq={BEYOND_END}&limit=4")).await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert_eq!(body["ok"], json!(false));
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

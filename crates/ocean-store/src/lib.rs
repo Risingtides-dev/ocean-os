@@ -13,9 +13,11 @@
 //! `add_participant` / `remove_participant` (with the same auto join/leave
 //! transcript markers the in-memory store writes), `append_message`,
 //! `transcript` / `transcript_page` (bounded `after_seq` tailing with a
-//! `LIMIT` + cursor, OCEAN-249), and `trigger_policy`. The
-//! [`RoomStore`] trait captures that shared shape so the in-memory registry and
-//! this SQLite store are interchangeable behind a `dyn RoomStore`.
+//! `LIMIT` + cursor, OCEAN-249), `transcript_tail_page` (the same bounded window
+//! read from the newest end, with a backward `before_seq` cursor), and
+//! `trigger_policy`. The [`RoomStore`] trait captures that shared shape so the
+//! in-memory registry and this SQLite store are interchangeable behind a
+//! `dyn RoomStore`.
 //!
 //! Operations are **synchronous** and the store is held behind its own
 //! `rusqlite::Connection`. This deliberately matches the daemon's room registry,
@@ -163,6 +165,31 @@ pub struct TranscriptPage {
     /// Cursor for the next page (`after_seq`), or `None` at the end.
     pub next_seq: Option<u64>,
     /// Whether at least one more row exists beyond this page.
+    pub has_more: bool,
+}
+
+/// One bounded page of a room transcript read from the NEWEST end backwards.
+///
+/// `messages` holds at most the effective limit of rows in ascending `seq`
+/// order — the same orientation [`TranscriptPage`] uses, so every renderer
+/// downstream is identical either way — but the window is the LAST rows before
+/// the cursor rather than the first after it. The cursor walks the other way:
+/// `prev_seq` is `Some(first_returned_seq)`, replayed as the next `before_seq`
+/// to fetch the page of OLDER rows, and `None` once the page reached the start
+/// of the log. `has_more` accordingly means "older rows exist" — the mirror of
+/// [`TranscriptPage::has_more`], which means newer ones do.
+///
+/// This is a distinct type from [`TranscriptPage`] rather than a reuse of it so
+/// that a backward cursor has no field named `next_seq` to be replayed into an
+/// `after_seq` by a caller that did not read this comment.
+#[derive(Debug, Clone, PartialEq)]
+pub struct TranscriptTailPage {
+    /// This page's messages, ascending by `seq`, at most the effective limit.
+    pub messages: Vec<RoomMessage>,
+    /// Cursor for the next page of OLDER rows (`before_seq`), or `None` once the
+    /// page reached the start of the transcript.
+    pub prev_seq: Option<u64>,
+    /// Whether at least one OLDER row exists before this page.
     pub has_more: bool,
 }
 
@@ -1095,6 +1122,34 @@ pub trait RoomStore {
         after_seq: Option<u64>,
         limit: Option<usize>,
     ) -> Result<TranscriptPage>;
+
+    /// Read one bounded page of a room's transcript from the NEWEST end.
+    ///
+    /// [`RoomStore::transcript_page`] can only walk forward from the start, so a
+    /// caller that wants the tail of a 12,000-row room has to transfer the whole
+    /// log to reach it. This is the mirror-image read: entries with
+    /// `seq < before_seq` (or the newest rows in the room when `None`), still in
+    /// ascending `seq` order, at most `limit` of them — the LAST `limit` that
+    /// qualify, not the first. `limit` is clamped by [`clamp_transcript_limit`]
+    /// exactly as the forward read clamps it.
+    ///
+    /// The cursor in the returned [`TranscriptTailPage`] runs backward:
+    /// `prev_seq` is the FIRST (oldest) row returned, replayed as the next
+    /// `before_seq`, and `has_more` means older rows still exist. Page to the
+    /// start by repeating with `before_seq = prev_seq` until `has_more` is false.
+    /// The newest row of the page is a valid forward cursor for
+    /// `transcript_page`'s `after_seq`, which is how a client that opened at the
+    /// tail then follows the room live.
+    ///
+    /// `before_seq` is exclusive, so `Some(0)` — nothing precedes the first
+    /// message, whose seq is 0 — is a terminal empty page, and a `before_seq`
+    /// above every stored seq is the newest page rather than an error.
+    fn transcript_tail_page(
+        &self,
+        key: &RoomKey,
+        before_seq: Option<u64>,
+        limit: Option<usize>,
+    ) -> Result<TranscriptTailPage>;
 
     /// The room's current trigger policy, if any.
     fn trigger_policy(&self, key: &RoomKey) -> Result<Option<RoomTriggerPolicy>>;
@@ -3275,6 +3330,64 @@ impl SqliteRoomStore {
         })
     }
 
+    /// Read a bounded slice of the transcript ending at the newest end and report
+    /// whether OLDER rows exist.
+    ///
+    /// The mirror of [`SqliteRoomStore::load_transcript_page`]: same `LIMIT` and
+    /// same `limit + 1` sentinel trick, but `seq <` with `ORDER BY seq DESC` so
+    /// SQLite hands back the LAST qualifying rows instead of the first. The rows
+    /// are reversed back to ascending before they leave, because every renderer
+    /// downstream reads a transcript oldest-first and the direction of the read
+    /// is a paging concern, not a presentation one. `effective_limit` is already
+    /// clamped by the caller, matching the forward helper's contract.
+    fn load_transcript_tail_page(
+        &self,
+        key: &RoomKey,
+        before_seq: Option<u64>,
+        effective_limit: usize,
+    ) -> Result<TranscriptTailPage> {
+        // Mirror image of the forward guard, and it lands the opposite way. There
+        // the cast had to be checked because a `u64` cursor above `i64::MAX` wrapped
+        // negative and replayed the ENTIRE transcript for a caller asking for rows
+        // after the end. Here such a cursor is above every storable seq, so every
+        // row genuinely IS before it: saturating to `i64::MAX` answers the newest
+        // page, which is what "before a number past the end" means. `None` is the
+        // same unbounded ceiling — no cursor yet, start at the tail.
+        let before = match before_seq {
+            None => i64::MAX,
+            Some(s) => i64::try_from(s).unwrap_or(i64::MAX),
+        };
+        let fetch = effective_limit.saturating_add(1) as i64;
+        let mut stmt = self.conn.prepare(&format!(
+            "SELECT {MESSAGE_ROW_COLUMNS}
+             FROM messages WHERE room_id = ?1 AND seq < ?2 ORDER BY seq DESC LIMIT ?3"
+        ))?;
+        let rows = stmt.query_map(params![key.as_str(), before, fetch], |row| {
+            RawMessageRow::read(row)
+        })?;
+        let mut out = Vec::new();
+        for r in rows {
+            out.push(r?.decode()?);
+        }
+        // Descending, so the sentinel is the OLDEST row we fetched and truncation
+        // drops it — the newest `effective_limit` rows survive.
+        let has_more = out.len() > effective_limit;
+        if has_more {
+            out.truncate(effective_limit);
+        }
+        out.reverse();
+        let prev_seq = if has_more {
+            out.first().map(|m| m.seq)
+        } else {
+            None
+        };
+        Ok(TranscriptTailPage {
+            messages: out,
+            prev_seq,
+            has_more,
+        })
+    }
+
     /// Assign the next per-room seq and insert a message in one go. Caller must
     /// ensure the room exists.
     ///
@@ -3716,6 +3829,21 @@ impl RoomStore for SqliteRoomStore {
         }
         let effective_limit = clamp_transcript_limit(limit);
         self.load_transcript_page(key, after_seq, effective_limit)
+    }
+
+    fn transcript_tail_page(
+        &self,
+        key: &RoomKey,
+        before_seq: Option<u64>,
+        limit: Option<usize>,
+    ) -> Result<TranscriptTailPage> {
+        // Same open-room precondition as the forward read: a closed room is still
+        // `UnknownRoom` here, and the audit fallback stays the daemon handler's job.
+        if !self.room_is_open(key)? {
+            return Err(RoomStoreError::UnknownRoom(key.clone()));
+        }
+        let effective_limit = clamp_transcript_limit(limit);
+        self.load_transcript_tail_page(key, before_seq, effective_limit)
     }
 
     fn trigger_policy(&self, key: &RoomKey) -> Result<Option<RoomTriggerPolicy>> {
@@ -10323,6 +10451,162 @@ mod tests {
         assert_eq!(page.messages[2].seq, 4);
         assert!(page.has_more);
         assert_eq!(page.next_seq, Some(4));
+    }
+
+    /// The seq values of a page's rows, in the order served.
+    fn seqs(messages: &[RoomMessage]) -> Vec<u64> {
+        messages.iter().map(|m| m.seq).collect()
+    }
+
+    #[test]
+    fn transcript_tail_page_serves_the_newest_rows_not_the_oldest() {
+        // The whole point of the slice: 10 messages (seq 0..=9), ask for 4 and get
+        // 6,7,8,9 — the forward read on the same arguments answers 0,1,2,3. The
+        // rows leave ascending even though the query ran descending.
+        let (s, key) = store_with_messages(10);
+        let page = s.transcript_tail_page(&key, None, Some(4)).unwrap();
+        assert_eq!(seqs(&page.messages), vec![6, 7, 8, 9]);
+        assert!(page.has_more, "6 older rows remain");
+        // Backward cursor is the FIRST row returned, replayed as before_seq.
+        assert_eq!(page.prev_seq, Some(6));
+    }
+
+    #[test]
+    fn transcript_tail_page_paging_backward_retrieves_all_rows() {
+        // Walk the whole transcript from the newest end in pages of 3 and assert we
+        // see every seq exactly once. Pages arrive newest-window-first, so each new
+        // page is prepended to reconstruct the log in order.
+        let total = 17;
+        let (s, key) = store_with_messages(total);
+
+        let mut collected: Vec<u64> = Vec::new();
+        let mut before: Option<u64> = None;
+        let mut pages = 0;
+        loop {
+            let page = s.transcript_tail_page(&key, before, Some(3)).unwrap();
+            pages += 1;
+            assert!(pages <= total + 2, "paging must terminate");
+            let mut rows = seqs(&page.messages);
+            rows.extend(collected.iter().copied());
+            collected = rows;
+            if page.has_more {
+                before = Some(page.prev_seq.expect("has_more implies a cursor"));
+            } else {
+                assert_eq!(page.prev_seq, None, "the oldest page has no cursor");
+                break;
+            }
+        }
+        let expected: Vec<u64> = (0..total as u64).collect();
+        assert_eq!(
+            collected, expected,
+            "every row retrieved once, in seq order"
+        );
+    }
+
+    #[test]
+    fn transcript_tail_page_exact_boundary_page_has_no_cursor() {
+        // Exactly `limit` rows total: the single page must NOT claim has_more even
+        // though it is full — the +1 sentinel row simply doesn't exist behind it.
+        let (s, key) = store_with_messages(5);
+        let page = s.transcript_tail_page(&key, None, Some(5)).unwrap();
+        assert_eq!(
+            seqs(&page.messages),
+            vec![0, 1, 2, 3, 4],
+            "the window reached the start"
+        );
+        assert!(!page.has_more, "a full oldest page is not 'has_more'");
+        assert_eq!(page.prev_seq, None);
+    }
+
+    #[test]
+    fn transcript_tail_page_on_an_empty_room_is_an_empty_page() {
+        let (s, key) = store_with_messages(0);
+        let page = s.transcript_tail_page(&key, None, Some(10)).unwrap();
+        assert!(page.messages.is_empty());
+        assert!(
+            !page.has_more,
+            "an empty page must not send a client paging"
+        );
+        assert_eq!(page.prev_seq, None, "nor hand it a cursor to page with");
+    }
+
+    #[test]
+    fn transcript_tail_page_before_zero_is_a_terminal_empty_page() {
+        // `before_seq` is exclusive and the first message's seq is 0, so nothing
+        // precedes it. The failure this pins is the opposite answer: a 0 cursor
+        // read as "no bound" and the whole log poured back.
+        let (s, key) = store_with_messages(10);
+        let page = s.transcript_tail_page(&key, Some(0), Some(4)).unwrap();
+        assert!(
+            page.messages.is_empty(),
+            "nothing is older than the first message"
+        );
+        assert!(!page.has_more, "and there is nothing left to page toward");
+        assert_eq!(page.prev_seq, None);
+    }
+
+    #[test]
+    fn transcript_tail_page_cursor_above_i64_max_is_the_newest_page() {
+        // The mirror image of the forward guard. Forward, a cursor above i64::MAX
+        // is after every row, so the truthful answer is empty; backward, it is
+        // before every row, so the truthful answer is the newest page. What neither
+        // may do is what the unchecked `as` cast did — wrap negative and read as a
+        // bound at the wrong end of the log.
+        let (s, key) = store_with_messages(10);
+        let above = u64::try_from(i64::MAX).expect("i64::MAX fits u64") + 1;
+        let page = s.transcript_tail_page(&key, Some(above), Some(4)).unwrap();
+        assert_eq!(
+            seqs(&page.messages),
+            vec![6, 7, 8, 9],
+            "the newest page — not the oldest, and not empty"
+        );
+        assert!(page.has_more);
+        assert_eq!(page.prev_seq, Some(6));
+        // The same request said two ways: a cursor past the end IS "no cursor".
+        assert_eq!(page, s.transcript_tail_page(&key, None, Some(4)).unwrap());
+    }
+
+    #[test]
+    fn transcript_tail_page_before_seq_combines_with_limit() {
+        // before_seq and limit compose: the 3 newest rows strictly older than 7.
+        let (s, key) = store_with_messages(10); // seq 0..=9
+        let page = s.transcript_tail_page(&key, Some(7), Some(3)).unwrap();
+        assert_eq!(
+            seqs(&page.messages),
+            vec![4, 5, 6],
+            "before_seq is exclusive"
+        );
+        assert!(page.has_more, "seq 0..=3 are still older");
+        assert_eq!(page.prev_seq, Some(4));
+    }
+
+    #[test]
+    fn transcript_tail_page_omitted_limit_takes_the_default_cap() {
+        // The tail read has to go through `clamp_transcript_limit` like the forward
+        // one does, or `before_seq` with no limit is the unbounded scan OCEAN-249
+        // removed, just entered from the other end.
+        let over = DEFAULT_TRANSCRIPT_LIMIT + 25;
+        let (s, key) = store_with_messages(over);
+        let page = s.transcript_tail_page(&key, None, None).unwrap();
+        assert_eq!(page.messages.len(), DEFAULT_TRANSCRIPT_LIMIT);
+        assert_eq!(
+            page.messages.last().map(|m| m.seq),
+            Some(over as u64 - 1),
+            "and the capped window still ends at the newest row"
+        );
+        assert!(page.has_more, "rows before the default window remain");
+    }
+
+    #[test]
+    fn transcript_tail_page_on_closed_room_is_unknown() {
+        // Same open-room precondition as the forward read: the audit fallback is
+        // the daemon handler's job, not a widening of store visibility.
+        let (mut s, key) = store_with_messages(2);
+        s.close(&key).unwrap();
+        assert!(matches!(
+            s.transcript_tail_page(&key, None, Some(10)),
+            Err(RoomStoreError::UnknownRoom(_))
+        ));
     }
 
     #[test]

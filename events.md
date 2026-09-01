@@ -9088,3 +9088,69 @@ Gate: `cargo xtask docs-check` PASS, `node scripts/check-ledger.mjs events.md`
 547 entries every one closed on the rebased tree this lands as, ci.yml re-parsed
 clean and the `ledger` job still carries its steps. No Rust touched, no deploy, no migration.
 _________________________________________________________________________________ 04:49 loop/os-ledger-date-format-is-ruled-dd-mm-yy-by-the-schema-and-mm-dd-yy-by-ci
+
+time:      07:10 01-09-26
+agent:     claude-code, claude-opus-5, ocean-loop builder
+worktree:  loop/os-no-route-can-serve-the-newest-page-of-a-transcript-only-the-oldest
+type:      feature-request
+area:      backend
+
+Every transcript read in this repo started at the beginning. `transcript_page`'s
+SQL is `WHERE seq > ?2 ORDER BY seq`, so a room with 12,000 messages hydrated at
+message #1 and the tail — the only part anyone opens a room to see — was
+reachable only by transferring the whole log. The proof the shape was missing is
+already in the tree: `ContextPolicy::RoomRecent` reads `MAX(seq)` and does
+`latest.saturating_sub(ROOM_CONTEXT_TAIL)` to fake a window, which quietly hands
+a woken agent fewer than 20 rows the moment seq has a gap.
+
+Added `RoomStore::transcript_tail_page(key, before_seq, limit)` beside the
+forward read rather than widening it — a fourth parameter on `transcript_page`
+would have dragged ten call sites plus `room_summary.rs` into the diff for a
+window only `/snapshot` serves. Its rows stay ASCENDING so no renderer
+downstream changes; only the cursor runs the other way, and it is a separate
+`TranscriptTailPage` type whose cursor is named `prev_seq` precisely so a
+backward cursor has no field called `next_seq` to be replayed into an
+`after_seq`. `has_more` means "older rows exist" there, the mirror of what it
+means forward.
+
+The bounds are the mirror image of the guard `load_transcript_page` already
+carries. Forward, a `u64` cursor above `i64::MAX` is after every row, so the
+honest answer is an empty page — the comment there records an `as` cast that
+once wrapped such a cursor negative and replayed the entire transcript.
+Backward, that same cursor is BEFORE every row, so the honest answer is the
+newest page: it saturates to `i64::MAX`. That is not a sentinel bolted on, it is
+what "rows before a number past the end" means, and it is how a client opens at
+the tail before it knows the last seq. `before_seq = 0` is a terminal empty page,
+since the first message's seq is 0 and nothing precedes it.
+
+On the wire: `GET /v1/rooms/persistent/{key}/snapshot?before_seq=N&limit=M`.
+Forward behaviour is untouched when the parameter is absent, so the existing
+surface client sees no change. `after_seq` and `before_seq` together are a typed
+400 (`conflicting_transcript_cursors`) — a caller that sent both has two
+different pages in mind and no precedence rule would answer the one it meant.
+The parameter is on a new `SnapshotQuery` rather than the shared
+`TranscriptQuery`, so `/transcript` does not advertise a cursor it would drop.
+
+The soft-closed audit arm mirrors the window. Without that, a frozen call room
+would paint its OLDEST page while a live one painted its newest — the same
+hydration, two different screens, decided by whether the call had ended. One
+ceiling is inherited and recorded in the code rather than hidden: the frozen
+record `get_including_closed` loads is itself the oldest `MAX_TRANSCRIPT_LIMIT`
+rows, so a closed room longer than that serves the newest of its first thousand.
+Lifting that is a change to `load_record`, not to this window.
+
+Outside the declared scope, and flagged: `crates/ocean-daemon/src/main.rs`. Two
+of its tests construct `Query(TranscriptQuery { .. })` to call `room_snapshot`
+directly, so the handler's new query type forced them to change. Test-only, two
+literals, no behaviour touched — but the loop's scoping was wrong to omit it.
+
+Gate: `cargo xtask ci` PASS. Beyond it, 30 individual mutations run against the
+new assertions one at a time (Wave 52's lesson: one run per test function only
+proves the first assertion bites). Every new assertion is a proven first-failure
+except six, named here rather than glossed: the paging loop's own
+`pages <= total + 2` tripwire, `is_empty()` on a genuinely empty table and
+`last_seq == null` on an empty page (no mutation of this code can fabricate rows
+into them), the two `status == OK` preconditions, and two mid-walk spot checks on
+pages 2 and 3 that evaluate the same expressions page 1 already pins. No deploy,
+no migration.
+_________________________________________________________________________________ 07:10 loop/os-no-route-can-serve-the-newest-page-of-a-transcript-only-the-oldest
