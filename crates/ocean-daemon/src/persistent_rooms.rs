@@ -3325,9 +3325,11 @@ pub(super) fn read_transcript_tail_page(
 /// a client can page through a long transcript instead of forcing a full-table
 /// read on every call. The `transcript` array shape is unchanged.
 ///
-/// Falls back to the audit (soft-closed) view when the room is closed: a finished
-/// call closes its room on `CallEnded` (OCEAN-170), but its transcript must stay
-/// queryable afterwards — that frozen record is the whole reason it was persisted.
+/// Serves a soft-closed room through the same query as an open one: a finished call
+/// closes its room on `CallEnded` (OCEAN-170), but its transcript must stay
+/// queryable afterwards — that is the whole reason it was persisted. The rows come
+/// from the store in both cases and never from the frozen record, which holds only
+/// the oldest `MAX_TRANSCRIPT_LIMIT` of them and so cannot answer a page past that.
 pub(super) async fn room_transcript(
     State(state): State<AppState>,
     Path(key): Path<String>,
@@ -3390,13 +3392,12 @@ struct SnapshotTranscript {
 /// is a typed 400 rather than a precedence rule, because a caller that sent both
 /// has two different pages in mind and neither answer would be the one it meant.
 ///
-/// Like `room_get`/`room_transcript`, falls back to the soft-closed audit view so
-/// a finished call's frozen room (closed on `CallEnded`, OCEAN-170) stays
-/// hydratable for replay — in BOTH directions, so a frozen room and a live one
-/// hydrate to the same screen. The body says which view answered via `closed`:
-/// without it a hydrating client cannot tell a frozen room from a live one, so it
-/// opens a tail that the events route will never feed and a composer whose every
-/// send is rejected.
+/// Like `room_transcript`, serves a finished call's frozen room (closed on
+/// `CallEnded`, OCEAN-170) so it stays hydratable for replay — in BOTH directions,
+/// so a frozen room and a live one hydrate to the same screen. `closed` in the body
+/// says which of the two it was: without it a hydrating client cannot tell a frozen
+/// room from a live one, so it opens a tail that the events route will never feed
+/// and a composer whose every send is rejected.
 ///
 /// `agent_owners` is the same projection `room_get` serves, for the same reason
 /// `closed` is here: ocean-surface#185 moved hydration onto this route, and a
@@ -3432,9 +3433,10 @@ pub(super) async fn room_snapshot(
     // read. We serve `limit` rows plus the cursor for the direction asked for, so the
     // client immediately knows whether to page (`/transcript?after_seq=next_seq`, or
     // `/snapshot?before_seq=prev_seq` going back) or tail (`/events?after_seq=last_seq`).
-    // Both reads prefer the live room and fall back to the soft-closed audit view
-    // (OCEAN-170). The std mutex guard is dropped inside `with_rooms`; it is never
-    // held across an `.await`.
+    // The metadata read prefers the live room and falls back to the soft-closed
+    // audit view (OCEAN-170); the transcript read does not fall back at all, being a
+    // single query gated on existence rather than openness. The std mutex guard is
+    // dropped inside `with_rooms`; it is never held across an `.await`.
     let result = with_rooms(&state, |reg| {
         // Room metadata: live first, then audit for a soft-closed room. WHICH arm
         // answered is the closedness signal — `get` filters on `closed_at IS NULL`

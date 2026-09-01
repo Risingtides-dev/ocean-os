@@ -9503,3 +9503,49 @@ own comment records it flaking under full-suite parallel load; it passes alone
 and in-suite on both pristine main and this branch, and it is unrelated to this
 diff. No deploy, no migration.
 _________________________________________________________________________________ 11:48 loop/os-transcript-page-including-closed
+
+time:      [12:16] [01-09-26]
+agent:     [claude code], [opus 5], [ocean-loop refiner]
+worktree:  loop/os-transcript-page-including-closed
+type:      [review]
+area:      [docs]
+
+Review held the slice on its own stated standard turned around. The build commit
+went OUT of scope into `crates/ocean-daemon/AGENTS.md` because three sentences
+there described the deleted in-memory fallback and leaving them would have
+documented the bug — and then left three more sentences saying the same departed
+thing inside `persistent_rooms.rs`, the file the diff already owned and rewrote
+around. This pass is prose only: no code, no test, no behaviour.
+
+`room_snapshot`'s inline comment claimed "Both reads prefer the live room and
+fall back to the soft-closed audit view", which is now half false ten lines above
+the code. The metadata read still does exactly that — `reg.get`, then
+`get_including_closed`, and WHICH arm answers is the `closed` boolean. The
+transcript read does not fall back at all; it is one existence-gated query. The
+comment now says which is which, because the distinction is the whole reason
+`closed` is derived from the metadata arm and not from a second query.
+
+`room_transcript`'s and `room_snapshot`'s docstrings both named the mechanism as
+a fallback serving rows from the frozen record — the precise thing this slice
+removed, and serving rows from that record IS the bug, since the record is only
+the oldest `MAX_TRANSCRIPT_LIMIT` rows. Both now say a closed room is served
+through the same store query as an open one, and `room_transcript`'s says
+explicitly that the rows never come from the record, so a reader repairing this
+route later is not sent back to it. `room_snapshot`'s "Like `room_get`" clause
+went with the rewrite: `room_get` 404s on a closed room, so it was never the
+route to be like here.
+
+One instance beyond the three the review listed, same category, same slice:
+`transcript_page_on_closed_room_is_unknown` in `ocean-store/src/lib.rs` explained
+its own assertion with "(the daemon handler is what falls back to the audit
+view)". It does not any more, and that comment sits directly under the
+`transcript_page_including_closed` tests this slice added — a stale claim beside
+its own replacement. It now names the method the daemon actually calls.
+
+Gate re-run at the refined tree: docs-check PASS (30 packages, 157 files, 179
+links), ocean-daemon 875/875, ocean-store 214/214, ocean-tui 496 passed 4
+ignored, Clippy clean, format clean. `cargo deny` still fails on
+RUSTSEC-2026-0274 (`rtrb` double-free) and yanked `spin`, unchanged and
+pre-existing: the branch touches no `Cargo.toml`, `Cargo.lock` or `deny.toml` at
+all, and every line this pass changed is a comment. No deploy, no migration.
+_________________________________________________________________________________ 12:16 loop/os-transcript-page-including-closed

@@ -10916,8 +10916,9 @@ mod tests {
     #[test]
     fn transcript_page_on_closed_room_is_unknown() {
         // The open-room precondition is unchanged: a closed room is UnknownRoom on
-        // the page API too (the daemon handler is what falls back to the audit
-        // view). Pins that transcript_page didn't accidentally widen visibility.
+        // the page API too — the daemon reads a closed room through
+        // `transcript_page_including_closed`, never through this method. Pins that
+        // transcript_page didn't accidentally widen visibility.
         let (mut s, key) = store_with_messages(2);
         s.close(&key).unwrap();
         assert!(matches!(
