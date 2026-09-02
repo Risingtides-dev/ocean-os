@@ -9962,3 +9962,39 @@ on the pre-existing yanked `spin` advisory — red on `main` at 616293e too, whi
 is this branch's base — reported and not fixed, and this branch still touches no
 `Cargo.toml`, `Cargo.lock` or `deny.toml`.
 _________________________________________________________________________________ 23:51 cloud/rooms-workspace-root-daemon
+time:      [23:06] [01-09-26]
+agent:     [claude-code], [claude-fable-5-1]
+worktree:  cloud/os-federation-login-loader
+type:      [feature-request]
+area:      [infra]
+
+Spec line 0.6 (#440) asks for a supported, untracked, owner-only, daemon-specific
+launcher that restores OCEAN_FEDERATION_URL and OCEAN_FEDERATION_OWNER_TOKEN only
+in the daemon's process environment before it execs the daemon, never calls
+domain-wide `launchctl setenv`, and never places either value in the tracked or
+rendered plist; until now nothing shipped that, so enablement stopped at the
+runbook's step 3. The launcher that launchd already runs on every start,
+deploy/ocean-daemon.sh installed as launch.sh, now reads
+${OCEAN_CONFIG_DIR:-~/.config/ocean-rs}/federation.env right before exec: the
+file must be a regular 0600 file owned by the daemon's user, may hold only the
+two keys or a Keychain reference, and its URL must be an https origin with
+nothing after the host (loopback http allowed for a local Bedrock). Any custody
+failure refuses the file whole, starts the daemon with federation off, and logs
+the reason and never the contents; inherited OCEAN_FEDERATION_* values are
+dropped so the file is the one channel. ops/set-ocean-federation.sh is the
+reviewed activation: it writes the file atomically under umask 077 from
+--token-file, --token-stdin or a --keychain reference (the bearer is never an
+argument), lints both plists and proves neither carries a federation key, then
+restarts the job through the installer's guarded bootout, wait, bootstrap,
+enable, kickstart sequence, waits for /health, and with --verify-room polls one
+room's snapshot until access.state is live, reading nothing else. --off removes
+the file. scripts/federation-loader.test.mjs (ten tests, wired into the ledger
+job) runs the launcher against a fake daemon that records which variables
+reached its process and a digest of the bearer, and covers the mode, owner,
+unexpected-line, URL, inherited-value, keychain and plist guards plus the
+setter's file half; the launchd half is verified on the operated machine by a
+room reaching live. Not touched: docs/OPERATIONS.md, whose Enable federation
+step 3 lives on #441 and still says `launchctl setenv`, which 0.6 forbids; the
+replacement text is in this PR's body for that branch. Nothing here was run
+against production or the operated daemon.
+_________________________________________________________________________________ 23:06 cloud/os-federation-login-loader

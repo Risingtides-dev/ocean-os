@@ -103,6 +103,49 @@ tail -f /private/tmp/ocean-daemon.log
 > on disk and can resume after restart, but the active turn itself is interrupted.
 > Don't restart a live daemon mid-turn unless you mean to.
 
+### Federation credentials (the daemon's secret loader)
+
+The two federation values, `OCEAN_FEDERATION_URL` and
+`OCEAN_FEDERATION_OWNER_TOKEN`, reach the daemon through exactly one channel:
+an untracked, owner-only (`0600`) file that the launcher
+(`deploy/ocean-daemon.sh`, installed as `~/.local/libexec/ocean-daemon/launch.sh`)
+reads right before it execs the daemon. They live in the daemon's process
+environment and nowhere else — not in the tracked plist template, not in the
+rendered plist, not in the launchd domain (the launcher never calls
+`launchctl setenv`), not in the log. launchd runs the launcher on every start,
+so a fresh login or reboot takes the same path as an installer run. A file that
+fails any custody check (mode, owner, an unexpected line, a URL with anything
+after the host) is refused whole and the daemon starts with federation off; the
+refusal in `/private/tmp/ocean-daemon.log` names the reason, never the contents.
+
+Set it with the reviewed procedure, after turns drain (the restart drops any turn
+in flight). The bearer is never accepted on the command line:
+
+```bash
+# bearer in the file (read from a file you already hold, or from stdin):
+ops/set-ocean-federation.sh --url https://bedrock.example --token-file /path/to/bearer.txt
+printf '%s\n' "$BEARER" | ops/set-ocean-federation.sh --url https://bedrock.example --token-stdin
+
+# bearer left in the login Keychain; the file only references the item:
+security add-generic-password -a "$USER" -s ocean-federation -w
+ops/set-ocean-federation.sh --url https://bedrock.example --keychain ocean-federation
+
+# verify a real federated room from the daemon's own snapshot (reads access.state only):
+ops/set-ocean-federation.sh --url https://bedrock.example --keychain ocean-federation --verify-room <key>
+
+# turn it off again:
+ops/set-ocean-federation.sh --off
+```
+
+The script writes `${OCEAN_CONFIG_DIR:-~/.config/ocean-rs}/federation.env`
+atomically with `umask 077`, lints both plists and proves neither carries a
+federation key, then restarts the job through the same guarded
+`bootout` → wait → `bootstrap` → `enable` → `kickstart` sequence as the
+installer and waits for `/health`. `--no-restart` writes and lints only.
+`node --test scripts/federation-loader.test.mjs` exercises the launcher and
+the file-writing half against a fake daemon; the launchd half is verified on
+the operated machine by the room reaching `live`.
+
 ### Uninstall / stop supervision
 
 ```bash
