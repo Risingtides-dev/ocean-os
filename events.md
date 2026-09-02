@@ -10400,3 +10400,20 @@ failures exposed by the run were fixed and rerun green. Both Node suites passed
 28/28, docs-check passed (30 packages, 158 active Markdown files, 182 links),
 format and diff checks passed, and the ledger was clean before this append.
 _________________________________________________________________________________ 15:23 codex/ocean-rooms-integration-20260902
+
+time:      [15:46] [09-02-26]
+agent:     [codex] [gpt-5]
+worktree:  codex/ocean-rooms-integration-20260902
+type:      [bug report]
+area:      [backend]
+
+Closed a federation-source precedence edge found in the exact-head security
+audit for PR #450. The Rust daemon already treated an empty-but-present process
+variable as an explicit process source, but the supervised launcher tested only
+for a nonempty value and could load ambient disk credentials when both process
+variables were explicitly empty. The launcher now uses presence semantics too,
+so the native validator sees and rejects that explicit empty pair instead of
+silently replacing it. The focused launcher suite passed 11/11, including the
+new empty-pair regression; shell syntax and diff checks also passed. No daemon
+was restarted and production was not changed.
+_________________________________________________________________________________ 15:46 codex/ocean-rooms-integration-20260902

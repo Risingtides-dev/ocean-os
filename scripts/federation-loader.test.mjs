@@ -106,6 +106,16 @@ test('an explicit process pair wins wholesale over the file fallback', async () 
   assert.ok(!log.includes('process-secret'));
 });
 
+test('empty but present process variables suppress the disk fallback', async () => {
+  const h = await harness();
+  await writeFile(h.envFile, `OCEAN_FEDERATION_URL=https://disk.example\nOCEAN_FEDERATION_OWNER_TOKEN=${TOKEN}\n`, { mode: 0o600 });
+  const { seen, log } = await launch(h, { OCEAN_FEDERATION_URL: '', OCEAN_FEDERATION_OWNER_TOKEN: '' });
+  assert.equal(seen.URL, '', 'the disk URL must not replace an explicit empty process pair');
+  assert.equal(seen.TOKEN_SET, '', 'the disk bearer must not replace an explicit empty process pair');
+  assert.match(log, /federation=on \(process\)/);
+  assert.ok(!log.includes(TOKEN));
+});
+
 test('a token and a keychain reference together are refused; a keychain reference alone defers to the Keychain', async () => {
   const h = await harness();
   await writeFile(h.envFile, `OCEAN_FEDERATION_URL=https://bedrock.example\nOCEAN_FEDERATION_OWNER_TOKEN=${TOKEN}\nOCEAN_FEDERATION_OWNER_TOKEN_KEYCHAIN=ocean-federation\n`, { mode: 0o600 });

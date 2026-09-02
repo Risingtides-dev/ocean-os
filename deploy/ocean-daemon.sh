@@ -125,7 +125,10 @@ federation_load() {
   if [[ -z "$token" || "$token" =~ [[:space:]] ]]; then federation_refuse "credential is invalid"; return; fi
   export OCEAN_FEDERATION_URL="$url" OCEAN_FEDERATION_OWNER_TOKEN="$token"
 }
-if [[ -n "${OCEAN_FEDERATION_URL:-}" || -n "${OCEAN_FEDERATION_OWNER_TOKEN:-}" ]]; then
+# Presence selects the process source, including an explicitly empty value.
+# The native daemon will reject an empty or partial pair; the launcher must not
+# silently replace that explicit choice with ambient disk credentials first.
+if [[ -n "${OCEAN_FEDERATION_URL+x}" || -n "${OCEAN_FEDERATION_OWNER_TOKEN+x}" ]]; then
   federation="on (process)"
 elif [[ -e "$OCEAN_FEDERATION_ENV_FILE" ]]; then
   federation_load "$OCEAN_FEDERATION_ENV_FILE"
