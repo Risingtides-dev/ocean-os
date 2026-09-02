@@ -195,6 +195,64 @@ Two additional SQLite databases live alongside sessions and the config dir:
 - `rooms.db` — persistent room store (`SqliteRoomStore`). Survives daemon restarts; override the full path with `OCEAN_DB_PATH`.
 - `titles.db` — Longhouse title/escrow registry (firekeeper titles, recall tallies). Survives daemon restarts; override the full path with `OCEAN_TITLES_DB_PATH`.
 
+### Federated-room Bedrock bridge
+
+Set `OCEAN_FEDERATION_URL` to the Bedrock **origin only** (for example
+`https://bedrock.example.com` or trusted-loopback diagnostics such as
+`http://127.0.0.1:8787`). The daemon rejects userinfo, paths, query strings,
+fragments, non-HTTPS remote origins, and redirects. A loopback origin still
+federates, but a minted invite carries no `onboard_url` on it: that address
+means this machine, not the invitee's. Loopback is the only base suppressed —
+any other origin composes a link, so a LAN-only Bedrock hands out a link that
+resolves only for an invitee already on that LAN. Each room bearer remains in
+owner-only `rooms.db`; requests use the Authorization header and never a query
+token. Missing or invalid configuration moves every credentialed, non-revoked
+room to `recovering` instead of leaving stale `live` chrome.
+
+Set daemon-only `OCEAN_FEDERATION_OWNER_TOKEN` when this daemon may bootstrap
+an existing Local room as its Bedrock owner and mint invites. The value is read
+once at startup, never accepted from a surface request, and after registration
+is retained only in owner-only `rooms.db`. Missing owner token disables Local
+bootstrap only; existing credentialed rooms and invite redemption still work.
+
+At startup, the AppState-owned federation supervisor enumerates durable room
+credentials and starts one cancellable task tree per room. The receiver
+reconnects the Bedrock room SSE from the persisted cursor, commits the roster
+before the first event, and treats ordered SSE as the **only** confirmation
+rail: a ledger POST `201` does not append a transcript row or remove outbox
+state. The sender scans durable Pending rows periodically (Notify only reduces
+latency), posts one row at a time, and suppresses immediate reposts while the
+same connection awaits SSE confirmation. Restart safely retries the exact
+producer tuple. Existing rooms start before a background recovery worker
+replays every durable pending-redemption triple once per boot with at most four
+network exchanges in flight; terminal redeem 403 or self-join 401/403 removes
+the triple, while retryable failures retain it.
+
+Operator-visible access states are `connecting`, `recovering`, `live`, and
+`revoked` for credentialed rooms (`local` for unfederated rooms). Presence
+follows the authenticated SSE lease: during healthy catch-up, the local human
+and locally-bound owned agents remain Live even while the state label is
+`recovering`; disconnect/resync/auth failure downgrades all projected members
+to Unavailable in the same access commit/wake. A room-level revoke closes new
+sender admission, fails local Pending rows, persists `revoked` last, emits one
+access wake, and stops retries. A Local message keeps the existing immediate
+201 transcript/trigger path. Once a room credential is installed, human posts
+and bound-agent replies return/enter a 202 Pending outbox only; browser author
+claims are ignored, and only ordered SSE appends the confirmed transcript.
+Confirmed mentions dispatch only under local policy with positive current User
+evidence and a current safe locally-owned Agent roster member plus private
+member→folder-agent binding. Claims commit before
+nonblocking local dispatch, so replay is at-most-once; federated auto-convene
+and failure rows never create divergent unconfirmed transcript entries.
+
+The daemon exposes owner invite creation, restart-safe idempotent redemption,
+and safe local-agent registration under `/v1/rooms/persistent`. Invite success
+is the only response that carries an invite code. Bearers cross only in
+Bedrock-bound daemon requests (Authorization or the durable redeem exchange),
+and deterministic registration keys cross only in the Bedrock agent batch.
+Neither enters a surface request, projection, transcript, log, or error; local
+paths, tools, provider credentials, and permission posture never cross Bedrock.
+
 Room attachment BYTES live in `room-attachments/` beside `rooms.db` — one
 subdirectory per room, named by a one-way hash of the room key — so
 `OCEAN_DB_PATH` moves a room's metadata and its files together.
@@ -270,64 +328,6 @@ other count looks healthy while disk never comes back. The
 configuration is on the card deliberately: `rooms_cut: 0` on its own cannot tell
 you whether retention swept and found nothing or was never turned on, and those
 two have opposite remedies.
-
-### Federated-room Bedrock bridge
-
-Set `OCEAN_FEDERATION_URL` to the Bedrock **origin only** (for example
-`https://bedrock.example.com` or trusted-loopback diagnostics such as
-`http://127.0.0.1:8787`). The daemon rejects userinfo, paths, query strings,
-fragments, non-HTTPS remote origins, and redirects. A loopback origin still
-federates, but a minted invite carries no `onboard_url` on it: that address
-means this machine, not the invitee's. Loopback is the only base suppressed —
-any other origin composes a link, so a LAN-only Bedrock hands out a link that
-resolves only for an invitee already on that LAN. Each room bearer remains in
-owner-only `rooms.db`; requests use the Authorization header and never a query
-token. Missing or invalid configuration moves every credentialed, non-revoked
-room to `recovering` instead of leaving stale `live` chrome.
-
-Set daemon-only `OCEAN_FEDERATION_OWNER_TOKEN` when this daemon may bootstrap
-an existing Local room as its Bedrock owner and mint invites. The value is read
-once at startup, never accepted from a surface request, and after registration
-is retained only in owner-only `rooms.db`. Missing owner token disables Local
-bootstrap only; existing credentialed rooms and invite redemption still work.
-
-At startup, the AppState-owned federation supervisor enumerates durable room
-credentials and starts one cancellable task tree per room. The receiver
-reconnects the Bedrock room SSE from the persisted cursor, commits the roster
-before the first event, and treats ordered SSE as the **only** confirmation
-rail: a ledger POST `201` does not append a transcript row or remove outbox
-state. The sender scans durable Pending rows periodically (Notify only reduces
-latency), posts one row at a time, and suppresses immediate reposts while the
-same connection awaits SSE confirmation. Restart safely retries the exact
-producer tuple. Existing rooms start before a background recovery worker
-replays every durable pending-redemption triple once per boot with at most four
-network exchanges in flight; terminal redeem 403 or self-join 401/403 removes
-the triple, while retryable failures retain it.
-
-Operator-visible access states are `connecting`, `recovering`, `live`, and
-`revoked` for credentialed rooms (`local` for unfederated rooms). Presence
-follows the authenticated SSE lease: during healthy catch-up, the local human
-and locally-bound owned agents remain Live even while the state label is
-`recovering`; disconnect/resync/auth failure downgrades all projected members
-to Unavailable in the same access commit/wake. A room-level revoke closes new
-sender admission, fails local Pending rows, persists `revoked` last, emits one
-access wake, and stops retries. A Local message keeps the existing immediate
-201 transcript/trigger path. Once a room credential is installed, human posts
-and bound-agent replies return/enter a 202 Pending outbox only; browser author
-claims are ignored, and only ordered SSE appends the confirmed transcript.
-Confirmed mentions dispatch only under local policy with positive current User
-evidence and a current safe locally-owned Agent roster member plus private
-member→folder-agent binding. Claims commit before
-nonblocking local dispatch, so replay is at-most-once; federated auto-convene
-and failure rows never create divergent unconfirmed transcript entries.
-
-The daemon exposes owner invite creation, restart-safe idempotent redemption,
-and safe local-agent registration under `/v1/rooms/persistent`. Invite success
-is the only response that carries an invite code. Bearers cross only in
-Bedrock-bound daemon requests (Authorization or the durable redeem exchange),
-and deterministic registration keys cross only in the Bedrock agent batch.
-Neither enters a surface request, projection, transcript, log, or error; local
-paths, tools, provider credentials, and permission posture never cross Bedrock.
 
 ## Common commands
 
@@ -634,7 +634,6 @@ GET    /v1/rooms/persistent               list persistent rooms
 POST   /v1/rooms/persistent               create a room { key, name, trigger_policy?, workspace_root? }; blank workspace_root is unbound, while a nonblank value must resolve to an existing absolute directory and is persisted canonically (400 invalid_workspace_root otherwise). Agent execution revalidates the stored canonical directory and returns 503 workspace_unavailable instead of inheriting daemon cwd when it is missing, symlink-replaced, relative, or noncanonical.
 GET    /v1/rooms/persistent/{key}         room + transcript + access + agent_owners; the transcript is a BOUNDED first page like `/transcript` and `/snapshot` — at most 1000 rows from the START of the log, with next_seq/has_more beside it, so replay the rest as `/transcript?after_seq=next_seq` rather than reading the array as the whole history. Open rooms only; unknown/closed room 404
 PATCH  /v1/rooms/persistent/{key}         update mutable metadata { name?, trigger_policy? }; an absent field is unchanged, trigger_policy: null clears the policy, an unknown field is a 400; 200 { room }, 404 unknown/closed room
-POST   /v1/rooms/persistent/{key}/close                   freeze the room. Two authorities: ?actor_id= naming a roster member (roster-checked in the closing transaction; an Agent's or System's identity claimed off the wire is 403 forged_closer), or an X-Ocean-Operator credential, which is NOT roster-checked and whose presence selects that lane outright — a presented-and-invalid credential is refused, never downgraded to the member lane. One IMMEDIATE transaction appends a System marker naming the closer and sets closed_at, so a frozen room always explains itself. 200 { room, closed: true, marker_seq }, 404 unknown or already-closed room, 400 with neither authority. Afterwards: detail 404s, writes refuse, live /events tails flush the marker and END, and /snapshot answers closed: true with the transcript pageable both ways and the roster and agent_owners intact. Bedrock is untouched.
 POST   /v1/rooms/persistent/{key}/participants            join { id, display_name, kind? }
 DELETE /v1/rooms/persistent/{key}/participants/{participant_id}  leave
 POST   /v1/rooms/persistent/{key}/messages                post message { author_id, author_kind?, body }
@@ -650,6 +649,7 @@ DELETE /v1/rooms/persistent/{key}/attachments/{attachment_id}  remove the row an
 POST   /v1/rooms/persistent/{key}/summarize               summarize the newest `limit` transcript rows into the room's single well-known `room-summary` note { requested_by, limit?, after_seq? }; ONE model turn on roles.summarize -> roles.fast -> the bound model, created at v1 then amended in place. 200 { summarized: true, artifact, created, model, messages_summarized, from_seq, to_seq, has_more }; 200 { summarized: false, code: no_messages | empty_summary | unchanged } are clean answers, not errors; 403 forged_artifact_author / non-roster requested_by; 404 unknown OR soft-closed room (a frozen room must not gain artifacts); 429 at_capacity; 502 summary_provider_error; 504 summary_timeout. Local-only: a Live room's summary does not propagate to peers.
 GET    /v1/rooms/persistent/{key}/snapshot                hydrate: room+participants+transcript+last_seq+next_seq+prev_seq+has_more+closed+agent_owners (?after_seq=N&limit=M forward, or ?before_seq=N&limit=M backward). `before_seq` picks which END of the log the page comes from: without it the page runs forward from the start with next_seq as the cursor — which for a 12,000-message room opens hydration at message #1 — and with it the page is the newest `limit` rows whose seq is strictly less than the cursor, still ascending, with prev_seq (the oldest row returned) to page further back. A before_seq above every stored seq is how a client opens at the tail before it knows the last seq; before_seq=0 is a terminal empty page; both cursors at once is a 400 conflicting_transcript_cursors rather than a precedence rule. has_more always means more rows exist in the direction that page was paging. Backward paging is THIS route only — `/transcript` and room detail stay forward-only. Unlike room detail and the SSE tail, this route SERVES a soft-closed room (OCEAN-170 audit replay), in both directions and at any length — `closed` is true exactly when it did, and a hydrating client must read it and present an audit view instead of opening a tail nothing will feed and a composer whose every send 404s. `agent_owners` is the same [{agent_id, owner_id, owner_present}] projection room detail serves — which WORKER owns which agent participant, and whether that worker is still on the roster — carried here because hydration goes through this route, so a field only room detail sent could not reach a client at all; empty for a room with no owned agents
 GET    /v1/rooms/persistent/{key}/events                  SSE: initial full room_access projection (no id) + id-bearing room_message frames via ?after_seq=N / Last-Event-ID replay, then post-commit access-update + message tail; open non-call rooms only
+POST   /v1/rooms/persistent/{key}/close                   freeze the room. Two authorities: ?actor_id= naming a roster member (roster-checked in the closing transaction; an Agent's or System's identity claimed off the wire is 403 forged_closer), or an X-Ocean-Operator credential, which is NOT roster-checked and whose presence selects that lane outright — a presented-and-invalid credential is refused, never downgraded to the member lane. One IMMEDIATE transaction appends a System marker naming the closer and sets closed_at, so a frozen room always explains itself. 200 { room, closed: true, marker_seq }, 404 unknown or already-closed room, 400 with neither authority. Afterwards: detail 404s, writes refuse, live /events tails flush the marker and END, and /snapshot answers closed: true with the transcript pageable both ways and the roster and agent_owners intact. Bedrock is untouched.
 GET    /v1/rooms/persistent/{key}/read-cursor             fetch the daemon-owned read cursor projection for Local/Live rooms; closed/pending/revoked return typed unsupported
 PATCH  /v1/rooms/persistent/{key}/read-cursor             advance the daemon-owned read cursor { read_seq }; Local/Live only, monotonic, publishes room_read_cursor wake on success
 POST   /v1/rooms/persistent/{key}/outbox/retry            retry a locally-authored federated event awaiting Bedrock confirmation { client_event_id }; 202 on success, 403 revoked, 404 unknown room/item, 409 pending/local, 400 malformed body, 500 sanitized store error
