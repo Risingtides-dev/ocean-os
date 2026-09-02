@@ -341,6 +341,24 @@ outbox, and the restart-safe federation core (S2 P2-A). One database file
   are what the server measured; a negative stored `byte_len` fails closed on
   read.
 
+- **The room-metrics projection is read-only, transcript-free, and open-room
+  only.** `room_metrics_projection` answers the daemon's §4.1 metrics sample in
+  two aggregate queries: per-room access state (LEFT JOIN `room_access`, so an
+  absent row projects `Local` — the same answer `room_access` gives for that
+  absence, which is what stops the projection and the per-room read disagreeing
+  about what "no row" means), and per-room outbox depth by state plus the
+  `client_event_id` of the lowest-`position` row. It exists because the obvious
+  enumeration cannot serve a scrape: `list`/`list_page` call `load_record` per
+  room, and that loads the roster plus the oldest `MAX_TRANSCRIPT_LIMIT`
+  transcript rows, so counting five access states over a hundred rooms would
+  decode up to a hundred thousand messages. Both halves filter
+  `closed_at IS NULL`: a closed room is not a live access state and its outbox
+  is not a backlog anyone is draining. `MIN(position)`/`ORDER BY position` is
+  legal numeric ordering here because `position` is a real INTEGER column — this
+  is NOT an exception to the canonical-decimal u64 TEXT rule above, which still
+  bans ordering and `MAX()` on those TEXT columns. Only the row's id travels,
+  never its payload; an outbox payload is a room message.
+
 ## Work Guidance
 
 - Add new durable state to this crate; do not let the daemon or a network

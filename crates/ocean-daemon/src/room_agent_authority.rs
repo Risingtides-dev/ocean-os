@@ -1337,6 +1337,15 @@ fn append_admission_audit(
     outcome: &str,
     reason_code: &str,
 ) -> Result<(), ApiError> {
+    // §4.1 admission refusals. Counted here rather than in each refusal arm
+    // because every arm already funnels through this one audit call with
+    // `outcome = "refused"`, so one site covers all of them — including an arm
+    // added later, which would otherwise land uncounted and silent.
+    if outcome == "refused" {
+        state
+            .room_metrics
+            .record_admission_refusal(crate::metrics::AdmissionRefusal::classify(reason_code));
+    }
     let message = with_rooms(state, |store| {
         store.append_room_agent_admission_audit(
             room,
@@ -1369,6 +1378,13 @@ fn append_unresolved_package_audit(
     member_id: &str,
     reason_code: &str,
 ) -> Result<(), ApiError> {
+    // §4.1: this audit's outcome is unconditionally `refused`. Its reason code
+    // is an `ApiError::code()` rather than one of the refusal arms' literals —
+    // an open-ended vocabulary — so it is counted under the single
+    // `package_unresolved` label rather than being classified.
+    state
+        .room_metrics
+        .record_admission_refusal(crate::metrics::AdmissionRefusal::PackageUnresolved);
     let message = with_rooms(state, |store| {
         store.append_room_agent_admission_audit(
             room,

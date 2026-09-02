@@ -397,29 +397,79 @@ pub(super) fn room_db_path() -> std::path::PathBuf {
 /// dropped before this returns, so no `await` is ever held across the lock. Takes
 /// the handle directly (rather than `&AppState`) so the call sink — which only
 /// holds the `rooms` handle, not the whole state — can write through.
+///
+/// Records the acquisition into the room-metrics store-lock family (§4.1). This
+/// adapter takes only the handle, so it has no `AppState` to reach a registry
+/// through and records via the process-global install point instead; see
+/// [`crate::metrics::with_process_room_metrics`] for why that indirection
+/// exists and what it costs.
 pub(super) fn with_rooms_handle<T>(
     rooms: &RoomStoreHandle,
     f: impl FnOnce(&mut ocean_store::SqliteRoomStore) -> T,
 ) -> T {
+    let waiting_since = std::time::Instant::now();
     let mut guard = match rooms.lock() {
         Ok(g) => g,
         Err(poisoned) => poisoned.into_inner(),
     };
+    let waited = waiting_since.elapsed();
+    crate::metrics::with_process_room_metrics(|metrics| metrics.record_store_lock_wait(waited));
     f(&mut guard)
 }
 
 /// Run a closure with the locked room store, recovering a poisoned lock the same
 /// way the longhouse handlers do (`into_inner`). Synchronous: the guard is
 /// dropped before this returns, so no `await` is ever held across the lock.
+///
+/// Records the acquisition into the room-metrics store-lock family (§4.1).
+/// Unlike [`with_rooms_handle`] this one holds an `AppState`, so it records
+/// straight into that state's own registry rather than through the process
+/// global — which is what makes the store-lock family exact per-`AppState`
+/// wherever a caller has one.
 pub(super) fn with_rooms<T>(
     state: &AppState,
     f: impl FnOnce(&mut ocean_store::SqliteRoomStore) -> T,
 ) -> T {
+    let waiting_since = std::time::Instant::now();
     let mut guard = match state.rooms.lock() {
         Ok(g) => g,
         Err(poisoned) => poisoned.into_inner(),
     };
+    state
+        .room_metrics
+        .record_store_lock_wait(waiting_since.elapsed());
     f(&mut guard)
+}
+
+/// Sample the room store WITHOUT blocking on its mutex.
+///
+/// The `GET /health` liveness probe reads the room-metrics card, and that card's
+/// room-derived numbers come from the store. Taking the daemon-wide mutex on the
+/// liveness path would make a long store operation able to stall the one probe
+/// whose documented contract is that it answers 200 whenever the process is
+/// serving HTTP. So the sampler tries, and on contention reports the previous
+/// sample as stale rather than waiting. Contributes nothing to the store-lock
+/// wait family by construction: a `try_lock` never waits.
+pub(super) fn sample_room_metrics(state: &AppState) {
+    let guard = match state.rooms.try_lock() {
+        Ok(guard) => guard,
+        // Poison recovery matches the blocking adapters above: a panicked
+        // writer must not also cost the operator their metrics.
+        Err(std::sync::TryLockError::Poisoned(poisoned)) => poisoned.into_inner(),
+        Err(std::sync::TryLockError::WouldBlock) => {
+            state.room_metrics.note_sample_skipped();
+            return;
+        }
+    };
+    match guard.room_metrics_projection() {
+        Ok(projection) => state
+            .room_metrics
+            .observe_store_sample(&projection, std::time::Instant::now()),
+        Err(error) => {
+            tracing::warn!(%error, "room metrics sample failed to read the store");
+            state.room_metrics.note_sample_skipped();
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -2175,6 +2225,27 @@ impl From<ocean_store::RoomStoreError> for LocalPostError {
 /// Map a [`PostRejection`] onto its frozen `(status, body)` pair. The body
 /// carries a stable machine code and never echoes the rejected author id,
 /// claimed kind, or message body.
+/// [`post_rejection_response`] plus the §4.1 admission-refusal counter.
+///
+/// The member-level refusals belong in the same family as the room-agent
+/// admission arms: both are "this speaker was refused entry to this room", and
+/// an operator watching one wants the other. Counted here rather than inside
+/// `post_rejection_response` because that function has no `AppState` and is also
+/// called from tests; this wrapper is the production door.
+fn refuse_local_post(
+    state: &AppState,
+    rejection: PostRejection,
+) -> (StatusCode, Json<serde_json::Value>) {
+    let refusal = match rejection {
+        PostRejection::ForgedAuthorKind => crate::metrics::AdmissionRefusal::ForgedAuthorKind,
+        PostRejection::AuthorNotInRoster => crate::metrics::AdmissionRefusal::AuthorNotInRoster,
+        PostRejection::InvalidThreadParent => crate::metrics::AdmissionRefusal::InvalidThreadParent,
+        PostRejection::BodyTooLarge => crate::metrics::AdmissionRefusal::BodyTooLarge,
+    };
+    state.room_metrics.record_admission_refusal(refusal);
+    post_rejection_response(rejection)
+}
+
 pub(super) fn post_rejection_response(
     rejection: PostRejection,
 ) -> (StatusCode, Json<serde_json::Value>) {
@@ -2280,7 +2351,7 @@ pub(super) async fn room_post_message(
     // for a local room and a federated one, and a local room can be federated
     // later, so an oversized row must not reach the transcript either way.
     if req.body.len() > crate::room_federation::OUTBOUND_MESSAGE_BODY_LIMIT {
-        return post_rejection_response(PostRejection::BodyTooLarge);
+        return refuse_local_post(&state, PostRejection::BodyTooLarge);
     }
     // Classification and the Local append share one store guard. Credential
     // installation can therefore linearize only before or after this commit,
@@ -2354,7 +2425,7 @@ pub(super) async fn room_post_message(
                 Err(error) => intent_error_response(error),
             };
         }
-        Err(LocalPostError::Rejected(rejection)) => return post_rejection_response(rejection),
+        Err(LocalPostError::Rejected(rejection)) => return refuse_local_post(&state, rejection),
         Err(LocalPostError::Store(ocean_store::RoomStoreError::UnknownRoom(_))) => {
             return intent_error_response(IntentError::NotFound)
         }
@@ -2747,14 +2818,45 @@ pub(super) async fn room_create_invite(
     }
 }
 
+/// Map one `IntentError` onto its metrics label (§4.1). Kept beside the route
+/// that renders the same error to the wire so the counter's reason and the
+/// response's error code can never drift apart.
+fn redemption_failure_reason(error: IntentError) -> crate::metrics::RedemptionFailure {
+    use crate::metrics::RedemptionFailure as R;
+    match error {
+        IntentError::Invalid => R::Invalid,
+        IntentError::NotFound => R::NotFound,
+        IntentError::Conflict => R::Conflict,
+        IntentError::Forbidden => R::Forbidden,
+        IntentError::InviteForbidden => R::InviteForbidden,
+        IntentError::Unavailable => R::Unavailable,
+        IntentError::Protocol => R::Protocol,
+        IntentError::Store => R::Store,
+    }
+}
+
 pub(super) async fn room_redeem_invite(
     State(state): State<AppState>,
     body: Result<Json<RedeemInviteBody>, JsonRejection>,
 ) -> (StatusCode, Json<serde_json::Value>) {
+    // NOTE (§4.1): the redemption-failure counter is bumped HERE and not on
+    // `FederationSupervisor::redeem_invite`'s return, because this route refuses
+    // two cases before that call is ever made — a malformed body, and a blank
+    // code. Both render the identical `400 {"ok":false,"error":"invalid_request"}`
+    // that `IntentError::Invalid` renders through `intent_error_response`, so a
+    // counter attached to the supervisor alone would read zero for exactly the
+    // refusal an operator is most likely to see. They are counted as `invalid`
+    // for the same reason: the wire cannot tell them apart either.
     let Ok(Json(body)) = body else {
+        state
+            .room_metrics
+            .record_redemption_failure(crate::metrics::RedemptionFailure::Invalid);
         return invalid_request_response();
     };
     if body.code.trim().is_empty() {
+        state
+            .room_metrics
+            .record_redemption_failure(crate::metrics::RedemptionFailure::Invalid);
         return invalid_request_response();
     }
     match state.room_federation.redeem_invite(&body.code).await {
@@ -2762,7 +2864,12 @@ pub(super) async fn room_redeem_invite(
             StatusCode::OK,
             Json(serde_json::to_value(redeemed).expect("RoomRedeemResponse serializes")),
         ),
-        Err(error) => intent_error_response(error),
+        Err(error) => {
+            state
+                .room_metrics
+                .record_redemption_failure(redemption_failure_reason(error));
+            intent_error_response(error)
+        }
     }
 }
 

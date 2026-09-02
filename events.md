@@ -9550,6 +9550,82 @@ pre-existing: the branch touches no `Cargo.toml`, `Cargo.lock` or `deny.toml` at
 all, and every line this pass changed is a comment. No deploy, no migration.
 _________________________________________________________________________________ 12:16 loop/os-transcript-page-including-closed
 
+time:      [05:04] [02-09-26]
+agent:     [claude-code], [claude-opus-5], [cloud loop]
+worktree:  [cloud/os-room-metrics]
+type:      [feature-request]
+area:      [backend]
+
+Ocean Rooms definition-of-done line 4.1 asked for room and federation metrics —
+access state by room, outbox depth and age, SSE reconnects and lag, redemption
+failures, admission refusals, store lock wait — and said there are none today.
+Re-derived on main 616293e: true of those six families, not of the surface.
+`GET /metrics` already renders `TurnMetrics` plus four daemon-wide atomics, and
+`GET /health` returns the `HealthEnvelope`; none of it is room- or
+federation-scoped, and `sse_lag_events` counts the daemon's own SSE rails rather
+than the federation receiver.
+
+Added one `RoomMetrics` registry beside `TurnMetrics` in `metrics.rs`, held on
+`AppState` like it, carrying exactly those six families and nothing else. Rooms
+by access state is one gauge per `RoomAccessState` variant; outbox depth is
+pending and failed; the rest are reconnect count, lag, redemption failures by
+`IntentError` variant, admission refusals by refusal code, and lock-wait count
+plus summed wait. Every label comes from a closed enum declared in that file, so
+a room id, member id or invite code can never become one — per-room detail rides
+the JSON card instead.
+
+The surface is a `rooms` section on the `/health` card, additive on the daemon's
+own envelope the way `rev` is, plus the same registry rendered as Prometheus
+lines appended to `/metrics`. A section rather than a route on purpose: PR #445
+pins the room-route table against the router at 40 routes with a parity test,
+and a new route would owe that table an entry.
+
+Two things the re-derivation changed. The blank redeem code the spec names as
+`IntentError::Invalid` never reaches that return — `room_redeem_invite` refuses
+it at the route, before the supervisor call — so a counter on the supervisor
+alone would have read zero for exactly the refusal the test asserts; it is
+counted at the route, covering the malformed body too, since the wire cannot
+tell those apart either. And the outbox has no timestamp column, so age is an
+in-process first-sighting clock keyed on the head row's `(room, client_event_id)`
+rather than a nullable `enqueued_at` migration: it under-reports across a restart
+and never over-reports, and it keeps this slice out of `ocean-store`'s open path
+and migration block, which PRs #442 and #446 are both editing.
+
+Sampling the two store-derived families needed a read `list`/`list_page` cannot
+give: those call `load_record` per room, which loads the roster and the oldest
+thousand transcript rows, so counting five access states over a hundred rooms
+would decode a hundred thousand messages. Added one read-only
+`room_metrics_projection` to `ocean-store` — two aggregate queries, open rooms
+only, no transcript, only the head row's id. `/health` samples it through
+`try_lock` and reports `sampled: false` with the previous numbers rather than
+blocking the one probe whose contract is that it answers whenever the process
+serves HTTP.
+
+Named gaps, all deliberate: the lock-wait family times `with_rooms` and
+`with_rooms_handle` only, and the direct `.lock()` sites in `main.rs`,
+`persistent_rooms.rs` and `room_federation.rs` stay uncounted; the two push sites
+holding no `AppState` record through a process-global install point that the real
+startup path alone installs, so a test process leaves it unset and one test's
+state cannot collect another's counts.
+
+Tests: one reads both surfaces and asserts all six families by name plus that no
+room id reached a label; one posts from a non-roster author (403
+`author_not_in_roster`) and asserts admission refusals 0 to 1; one POSTs a blank
+redeem code (400 `invalid_request`) and asserts redemption failures 0 to 1.
+Mutation proved on the third — deleting the increment reds it at `left: 0, right:
+1` while the status and body assertions still pass — and recorded in its doc
+comment. Four registry unit tests cover the sample, the per-row age reset, the
+closed-label fallback and the stale-sample card; one store test pins the
+projection.
+
+Gates: docs-check PASS, workspace build PASS, workspace tests PASS (3247 passed,
+0 failed, across 93 suites; ocean-daemon 881/881, ocean-store 215/215), Clippy
+clean, format clean. Dependency policy DID NOT RUN — `cargo deny` is not
+installed in this environment, so that lane could not execute and is not
+reported as passing. Expected rebase against #442 on `events.md`. No deploy, no
+migration.
+_________________________________________________________________________________ 05:04 cloud/os-room-metrics
+
 time:      [05:08] [02-09-26]
 agent:     [claude-code], [claude-opus-5], [cloud]
 worktree:  [cloud/os-room-lifecycle]

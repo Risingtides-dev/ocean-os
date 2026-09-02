@@ -209,7 +209,7 @@ use longhouse_governance_control::{
 use longhouse_preparation::{longhouse_inspect, longhouse_prepare, workflows_prepare};
 use longhouse_topics::{longhouse_demo, longhouse_topic, longhouse_topics};
 use longhouse_turn_preparation::{apply_longhouse_prep, longhouse_prep_for_turn};
-use metrics::{InFlightGuard, TurnMetrics};
+use metrics::{InFlightGuard, RoomMetrics, TurnMetrics};
 use ocean_buddy::ocean_buddy_event;
 
 use model_catalog::{model_get, model_set, models_list};
@@ -438,6 +438,16 @@ struct AppState {
     /// `/metrics` handler reads it straight off [`AppState::persist_failures`] so
     /// there is a single source of truth for that count. See [`TurnMetrics`].
     metrics: Arc<TurnMetrics>,
+    /// Room and federation observability counters (Ocean Rooms definition-of-done
+    /// §4.1): the six families an operator needs to tell a healthy Rooms daemon
+    /// from a stuck one — rooms by access state, outbox depth and oldest-item
+    /// age, federation SSE reconnects and lag, redemption failures, admission
+    /// refusals, and store lock wait. Held here beside [`AppState::metrics`] for
+    /// the same reason and with the same relaxed-atomic discipline. Rendered onto
+    /// BOTH shipped surfaces: Prometheus lines appended to `GET /metrics`, and
+    /// the JSON `rooms` card on `GET /health` which additionally carries the
+    /// per-room detail that may never become a fixed-cardinality label.
+    room_metrics: Arc<RoomMetrics>,
     /// Bounded permit pool capping concurrently-running turns (OCEAN-304). Both
     /// turn-intake handlers (`agent_turn`, `create_request`) take a permit before
     /// running a turn and reject with 429 / `ok:false` when the pool is exhausted,
@@ -1189,11 +1199,22 @@ async fn main() -> anyhow::Result<()> {
         shutdown,
         // OCEAN-303: daemon-wide turn metrics behind `GET /metrics`.
         metrics: Arc::new(TurnMetrics::default()),
+        // Ocean Rooms DoD 4.1: room + federation metrics, rendered onto
+        // `GET /metrics` (Prometheus) and `GET /health` (the JSON rooms card).
+        room_metrics: Arc::new(RoomMetrics::default()),
         // OCEAN-304: concurrent-turn ceiling. One permit per running turn;
         // exhaustion → 429/busy at intake instead of unbounded provider fan-out.
         turn_limiter: Arc::new(tokio::sync::Semaphore::new(max_concurrent_turns())),
         advisor_limiter: Arc::new(tokio::sync::Semaphore::new(ADVISOR_CONCURRENCY_LIMIT)),
     };
+
+    // §4.1: publish this state's room registry as the process-global one, so the
+    // two push sites that hold no `AppState` — the handle-only store-lock adapter
+    // and the federation supervisor's room loop — record into the same registry
+    // the surfaces read. Installed only here, on the real startup path: a test
+    // process leaves it unset so one test's `AppState` can never collect
+    // another's counts.
+    metrics::install_process_room_metrics(state.room_metrics.clone());
 
     // The sovereign trigger receiver must exist before federation startup can
     // ingest and claim a confirmed mention. It only validates and spawns; agent
@@ -1726,6 +1747,14 @@ struct HealthEnvelope {
     #[serde(flatten)]
     health: HealthResponse,
     rev: String,
+    /// Ocean Rooms §4.1: the room + federation metrics card. Added here on the
+    /// envelope rather than on `ocean_core::HealthResponse` for the same reason
+    /// `rev` is — the wire shape stays additive and existing clients that
+    /// deserialize into `HealthResponse` still parse — and as a section of this
+    /// existing card rather than as a new route, because the router's method/path
+    /// set is pinned in three places at once (`app_router`, `banner_routes()`,
+    /// and the operator guide's HTTP quick reference).
+    rooms: metrics::RoomMetricsCard,
     /// What the room maintenance loop last did, and the configuration it did it
     /// under: sweep interval, retention window in days (`0` = off), orphan
     /// grace, when the last sweep finished and how long it took, and its counts
@@ -1747,6 +1776,11 @@ struct HealthEnvelope {
 }
 
 async fn health(State(state): State<AppState>) -> Json<HealthEnvelope> {
+    // Refresh the room-derived families before projecting the card. This is a
+    // `try_lock` sampler: it never blocks the liveness probe on the daemon-wide
+    // room-store mutex, and reports `rooms.sampled: false` with the previous
+    // numbers when it loses the race. See `persistent_rooms::sample_room_metrics`.
+    persistent_rooms::sample_room_metrics(&state);
     Json(HealthEnvelope {
         health: HealthResponse {
             ok: true,
@@ -1770,6 +1804,7 @@ async fn health(State(state): State<AppState>) -> Json<HealthEnvelope> {
         // could not be run). Lets an operator confirm the supervised daemon is
         // actually running the main commit they expect.
         rev: env!("OCEAN_BUILD_REV").into(),
+        rooms: state.room_metrics.card(),
         // Read through the poison-recovering snapshot: a maintenance mutex
         // poisoned by a panicked sweep must never be what takes `/health` down,
         // since this card is how that panic becomes visible in the first place.
@@ -1795,6 +1830,9 @@ async fn health(State(state): State<AppState>) -> Json<HealthEnvelope> {
 ///   * `ocean_sse_events_dropped_total` — events dropped by lagging SSE
 ///     subscribers (OCEAN-372).
 async fn metrics(State(state): State<AppState>) -> impl axum::response::IntoResponse {
+    // §4.1: refresh the sampled room families (access state, outbox) before
+    // rendering. Same non-blocking sampler `GET /health` uses.
+    persistent_rooms::sample_room_metrics(&state);
     let persist_failures = state
         .persist_failures
         .load(std::sync::atomic::Ordering::Relaxed);
@@ -1805,12 +1843,16 @@ async fn metrics(State(state): State<AppState>) -> impl axum::response::IntoResp
     let sse_events_dropped = state
         .sse_events_dropped
         .load(std::sync::atomic::Ordering::Relaxed);
-    let body = state.metrics.render_prometheus(
+    let mut body = state.metrics.render_prometheus(
         persist_failures,
         gc_failures,
         sse_lag_events,
         sse_events_dropped,
     );
+    // §4.1 room + federation families, appended as their own registry's render.
+    // Kept a separate `render_prometheus` rather than folded into `TurnMetrics`
+    // so the two registries stay independently ownable and testable.
+    body.push_str(&state.room_metrics.render_prometheus());
     (
         StatusCode::OK,
         // The Prometheus text exposition content type. `text/plain; version=0.0.4`
@@ -14442,6 +14484,7 @@ mod tests {
             canvas_fulfillments: Arc::new(Mutex::new(HashMap::new())),
             shutdown,
             metrics: Arc::new(TurnMetrics::default()),
+            room_metrics: Arc::new(RoomMetrics::default()),
             // OCEAN-304: generous cap in test helpers so existing concurrency
             // behavior is unchanged; the backpressure tests build their own state
             // with a deliberately small cap to exercise rejection/release.
@@ -16316,6 +16359,7 @@ mod tests {
             canvas_fulfillments: Arc::new(Mutex::new(HashMap::new())),
             shutdown,
             metrics: Arc::new(TurnMetrics::default()),
+            room_metrics: Arc::new(RoomMetrics::default()),
             // OCEAN-304: generous cap in test helpers so existing concurrency
             // behavior is unchanged; the backpressure tests build their own state
             // with a deliberately small cap to exercise rejection/release.
@@ -16776,6 +16820,7 @@ mod tests {
             canvas_fulfillments: Arc::new(Mutex::new(HashMap::new())),
             shutdown,
             metrics: Arc::new(TurnMetrics::default()),
+            room_metrics: Arc::new(RoomMetrics::default()),
             turn_limiter: Arc::new(tokio::sync::Semaphore::new(256)),
             advisor_limiter: Arc::new(tokio::sync::Semaphore::new(ADVISOR_CONCURRENCY_LIMIT)),
         };
@@ -18886,6 +18931,7 @@ mod tests {
             canvas_fulfillments: Arc::new(Mutex::new(HashMap::new())),
             shutdown,
             metrics: Arc::new(TurnMetrics::default()),
+            room_metrics: Arc::new(RoomMetrics::default()),
             // OCEAN-304: generous cap in test helpers so existing concurrency
             // behavior is unchanged; the backpressure tests build their own state
             // with a deliberately small cap to exercise rejection/release.
@@ -25231,6 +25277,309 @@ mod tests {
 
         assert_eq!(status, StatusCode::BAD_REQUEST, "an empty number must 400");
         assert_eq!(body["ok"], json!(false));
+    }
+
+    // ── Ocean Rooms DoD §4.1: room + federation metrics ─────────────────────
+
+    /// Both shipped surfaces carry all six §4.1 families, by name.
+    ///
+    /// Driven through the REAL `/health` and `/metrics` handlers via `oneshot`
+    /// on a real `AppState`, in the pattern of
+    /// [`metrics_endpoint_serves_prometheus_with_live_counters`]. The point is
+    /// the spec's own completion rule: a family is not delivered until an
+    /// operator can read it off something the daemon ships, so this asserts the
+    /// Prometheus metric names AND the JSON card's keys rather than poking the
+    /// registry. It also pins the two rules the families must not break — every
+    /// Prometheus line carries `# HELP`/`# TYPE`, and no room id reaches a label
+    /// (per-room detail is on the JSON card, where `rooms` is an array).
+    #[tokio::test]
+    async fn room_metrics_families_are_readable_on_health_and_metrics() {
+        use http_body_util::BodyExt;
+        use tower::ServiceExt;
+
+        let state = {
+            let _g = yolo_env_guard_async().await;
+            permission_test_state()
+        };
+
+        // A room the sampler will actually find, so the access-state family is
+        // exercised against a real store read rather than an empty projection.
+        let key = RoomKey::new("metrics-surface-room");
+        with_rooms(&state, |reg| {
+            reg.create(key.clone(), "Metrics Surface Room", None, Utc::now())
+                .unwrap();
+        });
+
+        // ── Prometheus surface ──
+        let app = Router::new()
+            .route("/metrics", get(metrics))
+            .with_state(state.clone());
+        let resp = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .method(axum::http::Method::GET)
+                    .uri("/metrics")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+        let body = String::from_utf8(bytes.to_vec()).unwrap();
+
+        // One stem per family; the six families, named.
+        for stem in [
+            // 1. rooms by access state
+            "ocean_room_access_state",
+            // 2. outbox depth by state, and oldest-item age
+            "ocean_room_outbox_depth",
+            "ocean_room_outbox_oldest_age_seconds",
+            // 3. federation SSE reconnects and lag
+            "ocean_room_federation_sse_reconnects_total",
+            "ocean_room_federation_lag_events",
+            // 4. redemption failures
+            "ocean_room_redemption_failures_total",
+            // 5. admission refusals
+            "ocean_room_admission_refusals_total",
+            // 6. store lock wait
+            "ocean_room_store_lock_waits_total",
+            "ocean_room_store_lock_wait_seconds_total",
+        ] {
+            assert!(
+                body.contains(&format!("# HELP {stem} ")),
+                "missing # HELP for {stem}\n{body}"
+            );
+            assert!(
+                body.contains(&format!("# TYPE {stem} ")),
+                "missing # TYPE for {stem}\n{body}"
+            );
+        }
+
+        // Every access-state variant is emitted, so a state with no rooms reads
+        // an explicit 0 rather than vanishing from the scrape.
+        for label in ["local", "connecting", "live", "recovering", "revoked"] {
+            assert!(
+                body.contains(&format!("ocean_room_access_state{{state=\"{label}\"}} ")),
+                "missing access-state gauge for {label}\n{body}"
+            );
+        }
+        assert!(
+            body.contains("ocean_room_outbox_depth{state=\"pending\"}")
+                && body.contains("ocean_room_outbox_depth{state=\"failed\"}"),
+            "outbox depth must be emitted for both states\n{body}"
+        );
+        // The room we created is unfederated, so it projects `Local` — the same
+        // answer `room_access` gives for an absent access row.
+        assert_eq!(
+            labelled_value(&body, "ocean_room_access_state{state=\"local\"}"),
+            Some(1),
+            "the sampled room must land in the local gauge\n{body}"
+        );
+        // Fixed cardinality: the room id may never become a label.
+        assert!(
+            !body.contains("metrics-surface-room"),
+            "a room id must never reach a Prometheus label\n{body}"
+        );
+
+        // ── JSON surface ──
+        let app = Router::new()
+            .route("/health", get(health))
+            .with_state(state.clone());
+        let resp = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .method(axum::http::Method::GET)
+                    .uri("/health")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+        let card: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+
+        // The pre-existing envelope is untouched: this section is additive.
+        assert_eq!(card["ok"], json!(true));
+        assert_eq!(card["service"], json!("ocean-daemon"));
+
+        let rooms = &card["rooms"];
+        for family_key in [
+            "rooms_by_access_state",
+            "outbox_pending",
+            "outbox_failed",
+            "federation_sse_reconnects_total",
+            "federation_lag_events_max",
+            "redemption_failures",
+            "admission_refusals",
+            "store_lock_waits_total",
+            "store_lock_wait_seconds_total",
+        ] {
+            assert!(
+                rooms.get(family_key).is_some(),
+                "the /health rooms card is missing {family_key}: {rooms}"
+            );
+        }
+        assert_eq!(rooms["sampled"], json!(true), "card: {rooms}");
+        assert_eq!(rooms["rooms_by_access_state"]["local"], json!(1));
+
+        // The per-room list is the whole reason this surface exists beside the
+        // Prometheus one: it is where room identity is allowed to appear.
+        let per_room = rooms["rooms"].as_array().expect("rooms array");
+        assert_eq!(per_room.len(), 1, "card: {rooms}");
+        assert_eq!(per_room[0]["room_id"], json!("metrics-surface-room"));
+        assert_eq!(per_room[0]["access_state"], json!("local"));
+
+        // The store-lock family counted the real acquisitions this test made
+        // through `with_rooms`, which takes the state's own registry.
+        assert!(
+            rooms["store_lock_waits_total"].as_u64().unwrap_or(0) > 0,
+            "with_rooms acquisitions must be counted: {rooms}"
+        );
+    }
+
+    /// A post from an author the room's roster does not carry is refused
+    /// `403 author_not_in_roster`, and that refusal moves the §4.1 admission
+    /// refusal family from 0 to 1 under its own label.
+    ///
+    /// This is the member-level half of the admission family; the room-agent
+    /// half funnels through `append_admission_audit`'s `outcome == "refused"`.
+    /// Both are counted because both answer the same operator question — who is
+    /// being turned away from this room, and why.
+    #[tokio::test]
+    async fn a_non_roster_author_is_refused_and_counted_as_an_admission_refusal() {
+        let state = {
+            let _g = yolo_env_guard_async().await;
+            permission_test_state()
+        };
+
+        let key = RoomKey::new("refusal-metrics-room");
+        with_rooms(&state, |reg| {
+            reg.create(key.clone(), "Refusal Metrics Room", None, Utc::now())
+                .unwrap();
+            reg.add_participant(
+                &key,
+                RoomParticipant {
+                    id: "john".into(),
+                    kind: RoomParticipantKind::Human,
+                    display_name: "John".into(),
+                },
+                Utc::now(),
+            )
+            .unwrap();
+        });
+
+        let before = state.room_metrics.card();
+        assert_eq!(before.admission_refusals["author_not_in_roster"], 0);
+        assert_eq!(before.admission_refusals_total, 0);
+
+        let (status, body) = room_post_message(
+            State(state.clone()),
+            Path("refusal-metrics-room".to_string()),
+            Json(RoomMessageRequest {
+                // Never joined this room.
+                author_id: "stranger".into(),
+                author_kind: RoomParticipantKind::Human,
+                body: "let me in".into(),
+                thread_parent_seq: None,
+            }),
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        assert_eq!(body.0["error"], json!("author_not_in_roster"));
+
+        let after = state.room_metrics.card();
+        assert_eq!(
+            after.admission_refusals["author_not_in_roster"], 1,
+            "the refusal must be counted under its own code: {after:?}"
+        );
+        assert_eq!(
+            after.admission_refusals_total, 1,
+            "and must not also land in another bucket: {after:?}"
+        );
+
+        // A refusal writes nothing, so the counter is the only evidence there is.
+        let transcript = with_rooms(&state, |reg| reg.transcript(&key, None)).unwrap();
+        assert!(
+            transcript.iter().all(|m| m.author_id != "stranger"),
+            "a refused post must not reach the transcript"
+        );
+    }
+
+    /// A blank invite code is refused `400 invalid_request`, and that refusal
+    /// moves the §4.1 redemption-failure family from 0 to 1 under `invalid`.
+    ///
+    /// MUTATION PROVED (2026-09-02). Deleting the `record_redemption_failure`
+    /// call from the blank-code arm of `persistent_rooms::room_redeem_invite`
+    /// and re-running turns this test red at the
+    /// `after.redemption_failures["invalid"]` assertion:
+    ///
+    /// ```text
+    /// assertion `left == right` failed: the blank code must be counted as a
+    /// redemption failure
+    ///   left: 0
+    ///  right: 1
+    /// ```
+    ///
+    /// The status and body assertions above it still pass under that mutation,
+    /// so this test is pinned to the increment and not merely to the route's
+    /// pre-existing 400. Restoring the call returns it to green.
+    ///
+    /// The counter lives on the ROUTE and not on
+    /// `FederationSupervisor::redeem_invite` for a reason this test is the proof
+    /// of: the route refuses a blank code itself, before that call is made, so a
+    /// counter on the supervisor's `IntentError::Invalid` return would still
+    /// read 0 here.
+    #[tokio::test]
+    async fn a_blank_redeem_code_is_refused_and_counted_as_a_redemption_failure() {
+        use http_body_util::BodyExt;
+        use tower::ServiceExt;
+
+        let state = {
+            let _g = yolo_env_guard_async().await;
+            permission_test_state()
+        };
+
+        let before = state.room_metrics.card();
+        assert_eq!(before.redemption_failures["invalid"], 0);
+        assert_eq!(before.redemption_failures_total, 0);
+
+        // Through the real route with a real body: `RedeemInviteBody::code` is
+        // module-private, and a genuine POST is what the spec line asks for.
+        let app = Router::new()
+            .route(
+                "/v1/rooms/persistent/invites/redeem",
+                post(persistent_rooms::room_redeem_invite),
+            )
+            .with_state(state.clone());
+        let resp = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .method(axum::http::Method::POST)
+                    .uri("/v1/rooms/persistent/invites/redeem")
+                    .header(axum::http::header::CONTENT_TYPE, "application/json")
+                    .body(axum::body::Body::from(r#"{"code":"   "}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+        let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(body["error"], json!("invalid_request"));
+
+        let after = state.room_metrics.card();
+        assert_eq!(
+            after.redemption_failures["invalid"], 1,
+            "the blank code must be counted as a redemption failure"
+        );
+        assert_eq!(
+            after.redemption_failures_total, 1,
+            "and must not also land in another bucket: {after:?}"
+        );
     }
 
     // ── OCEAN-303: /metrics endpoint ────────────────────────────────────────

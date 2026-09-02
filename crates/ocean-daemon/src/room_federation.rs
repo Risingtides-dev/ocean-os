@@ -2436,6 +2436,12 @@ async fn run_room(
             }
         }
         attempt = attempt.saturating_add(1);
+        // §4.1 federation SSE reconnects: an epoch ended and this loop is going
+        // back around to redial. Counted at the point the backoff is computed,
+        // so it counts redials and not the initial dial. Recorded through the
+        // process-global registry because the supervisor is constructed
+        // independently of `AppState`.
+        crate::metrics::with_process_room_metrics(|metrics| metrics.record_federation_reconnect());
         let delay = reconnect_delay(attempt, generation);
         tokio::select! {
             _ = cancel.cancelled() => return,
@@ -2519,6 +2525,14 @@ async fn run_epoch(
         Err(EpochOutcome::Revoked) => return EpochOutcome::Revoked,
         Err(outcome) => return outcome,
     };
+    // §4.1 federation SSE lag: the epoch's announced snapshot high-water minus
+    // what this daemon has accepted. Reported once at hello (the backlog this
+    // epoch opens with) and again on every accepted row below, so the gauge
+    // falls to zero as the room catches up instead of only being sampled.
+    crate::metrics::with_process_room_metrics(|metrics| {
+        metrics.set_federation_lag(key.as_str(), high_water.saturating_sub(cursor))
+    });
+
     let state = access_state_for_hello(cursor, high_water);
     if !commit_access(&inner, &key, state, Some(&members), None) {
         return EpochOutcome::Recover;
@@ -2649,6 +2663,12 @@ async fn run_epoch(
                         match result {
                             Ok(IngestDisposition::Committed) => {
                                 last_accepted = sequence;
+                                crate::metrics::with_process_room_metrics(|metrics| {
+                                    metrics.set_federation_lag(
+                                        key.as_str(),
+                                        high_water.saturating_sub(last_accepted),
+                                    )
+                                });
                                 if last_accepted >= high_water
                                     && ensure_live_with(
                                         durable_state(&inner.rooms, &key),
