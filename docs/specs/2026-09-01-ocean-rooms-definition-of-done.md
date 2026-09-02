@@ -134,7 +134,10 @@ ocean-os 616293e, ocean-surface d58a145.
   16 GiB, and the classifier refuses reclaim to every agent), so surface work
   is scheduled by priority, not by free space; and "landed" is verified on
   GitHub, never inferred from a wave record, because a wave can die mid-land
-  with finished work stranded in a worktree (wave 55). [loop, user]
+  with finished work stranded in a worktree (wave 55). `git log trunk..branch`
+  is not evidence either: these repos squash-merge, so a merged branch reads as
+  commits ahead forever; `gh pr list --head <branch> --state all` is the only
+  honest test, for loop/* and worktree-* alike. [loop, user]
 
 ## 5. Contracts held by checks, not prose
 - 5.1 openapi parity green, and API.md plus OCEAN-ROOM-COMPUTE.md cover every
