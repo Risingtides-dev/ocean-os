@@ -9609,3 +9609,16 @@ guarded installer bootstraps the daemon. Verification must not print or retain
 the launchd environment. Docs only; no secret, launchd environment, daemon,
 deployment, or production state changed.
 _________________________________________________________________________________ 21:59 docs/rooms-definition-of-done
+
+time:      [22:16] [01-09-26]
+agent:     [codex] [gpt-5]
+worktree:  docs/rooms-definition-of-done
+type:      [bug report]
+area:      [review]
+
+Closed the latest Codex documentation-index finding. The docs-local owning
+contract now indexes the active cross-repository Rooms definition of done,
+names its acceptance and ownership role, and preserves that it authorizes no
+implementation by itself. Docs only; no daemon, launchd, deployment, migration,
+or production state changed.
+_________________________________________________________________________________ 22:16 docs/rooms-definition-of-done
