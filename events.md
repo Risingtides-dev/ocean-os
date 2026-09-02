@@ -10031,3 +10031,137 @@ Three checks pin it. `a_production_store_opens_in_wal_with_the_chosen_durability
 
 Gates: `cargo xtask ci` — docs/index integrity PASS, workspace build PASS, workspace tests PASS (ocean-store 217/217, ocean-daemon 874/874), Clippy clean, format clean. The dependency-policy lane DID NOT RUN — `cargo-deny` is not installed in this environment (`error: no such command: deny`) — and never passed; it is unclaimed, not green. The branch touches no `Cargo.toml`, `Cargo.lock` or `deny.toml`. Expected rebase against the user's open PR #442 (`codex/review-sweep-20260901`), which also edits `crates/ocean-store/src/lib.rs` and this crate's `AGENTS.md`: its hunks are `marker_prose` and `transcript_tail_page` and its doc edits sit at the tail of the invariant list, while these hunks are the open path, a new appended invariant at the head of that list, and tests past its test regions. No overlap expected, and no deploy or migration.
 _________________________________________________________________________________ 01:08 cloud/os-store-durability-pragmas
+time:      [05:04] [02-09-26]
+agent:     [claude-code], [claude-opus-5], [cloud loop]
+worktree:  [cloud/os-room-metrics]
+type:      [feature-request]
+area:      [backend]
+
+Ocean Rooms definition-of-done line 4.1 asked for room and federation metrics —
+access state by room, outbox depth and age, SSE reconnects and lag, redemption
+failures, admission refusals, store lock wait — and said there are none today.
+Re-derived on main 616293e: true of those six families, not of the surface.
+`GET /metrics` already renders `TurnMetrics` plus four daemon-wide atomics, and
+`GET /health` returns the `HealthEnvelope`; none of it is room- or
+federation-scoped, and `sse_lag_events` counts the daemon's own SSE rails rather
+than the federation receiver.
+
+Added one `RoomMetrics` registry beside `TurnMetrics` in `metrics.rs`, held on
+`AppState` like it, carrying exactly those six families and nothing else. Rooms
+by access state is one gauge per `RoomAccessState` variant; outbox depth is
+pending and failed; the rest are reconnect count, lag, redemption failures by
+`IntentError` variant, admission refusals by refusal code, and lock-wait count
+plus summed wait. Every label comes from a closed enum declared in that file, so
+a room id, member id or invite code can never become one — per-room detail rides
+the JSON card instead.
+
+The surface is a `rooms` section on the `/health` card, additive on the daemon's
+own envelope the way `rev` is, plus the same registry rendered as Prometheus
+lines appended to `/metrics`. A section rather than a route on purpose: PR #445
+pins the room-route table against the router at 40 routes with a parity test,
+and a new route would owe that table an entry.
+
+Two things the re-derivation changed. The blank redeem code the spec names as
+`IntentError::Invalid` never reaches that return — `room_redeem_invite` refuses
+it at the route, before the supervisor call — so a counter on the supervisor
+alone would have read zero for exactly the refusal the test asserts; it is
+counted at the route, covering the malformed body too, since the wire cannot
+tell those apart either. And the outbox has no timestamp column, so age is an
+in-process first-sighting clock keyed on the head row's `(room, client_event_id)`
+rather than a nullable `enqueued_at` migration: it under-reports across a restart
+and never over-reports, and it keeps this slice out of `ocean-store`'s open path
+and migration block, which PRs #442 and #446 are both editing.
+
+Sampling the two store-derived families needed a read `list`/`list_page` cannot
+give: those call `load_record` per room, which loads the roster and the oldest
+thousand transcript rows, so counting five access states over a hundred rooms
+would decode a hundred thousand messages. Added one read-only
+`room_metrics_projection` to `ocean-store` — two aggregate queries, open rooms
+only, no transcript, only the head row's id. `/health` samples it through
+`try_lock` and reports `sampled: false` with the previous numbers rather than
+blocking the one probe whose contract is that it answers whenever the process
+serves HTTP.
+
+Named gaps, all deliberate: the lock-wait family times `with_rooms` and
+`with_rooms_handle` only, and the direct `.lock()` sites in `main.rs`,
+`persistent_rooms.rs` and `room_federation.rs` stay uncounted; the two push sites
+holding no `AppState` record through a process-global install point that the real
+startup path alone installs, so a test process leaves it unset and one test's
+state cannot collect another's counts.
+
+Tests: one reads both surfaces and asserts all six families by name plus that no
+room id reached a label; one posts from a non-roster author (403
+`author_not_in_roster`) and asserts admission refusals 0 to 1; one POSTs a blank
+redeem code (400 `invalid_request`) and asserts redemption failures 0 to 1.
+Mutation proved on the third — deleting the increment reds it at `left: 0, right:
+1` while the status and body assertions still pass — and recorded in its doc
+comment. Four registry unit tests cover the sample, the per-row age reset, the
+closed-label fallback and the stale-sample card; one store test pins the
+projection.
+
+Gates: docs-check PASS, workspace build PASS, workspace tests PASS (3247 passed,
+0 failed, across 93 suites; ocean-daemon 881/881, ocean-store 215/215), Clippy
+clean, format clean. Dependency policy DID NOT RUN — `cargo deny` is not
+installed in this environment, so that lane could not execute and is not
+reported as passing. Expected rebase against #442 on `events.md`. No deploy, no
+migration.
+_________________________________________________________________________________ 05:04 cloud/os-room-metrics
+
+time:      [06:13] [02-09-26]
+agent:     [claude-code], [claude-opus-5], [cloud loop]
+worktree:  [cloud/os-room-metrics]
+type:      [bug report]
+area:      [backend]
+
+Codex review round on PR #447. Three P2 findings, all about whether the §4.1
+counters say true things. I verified each against the tree before touching
+anything; all three were real, and all three are fixed.
+
+Reconnects were counted beside the backoff at the bottom of run_room's loop.
+Every path between there and the next dial is a return that never redials —
+cancellation or shutdown winning the backoff select!, a missing client, a
+credential that vanished, a room gone Revoked — so stopping a room or shutting
+the daemon down reported a reconnect that never happened. Codex proposed moving
+the bump into the sleep-wins arm; that still over-counts, because the credential
+and Revoked checks sit after it. The bump now sits immediately before the
+run_epoch call it counts, guarded on attempt > 0 so the task's first dial stays
+out of a counter about REconnects.
+
+A room's lag entry was never removed, and the gauge is the maximum across
+entries, so a room revoked while behind held that backlog forever, outliving the
+room. Rather than clear at each of run_room's seven returns — a metric cleaned
+up by hand at six of them leaks at the seventh — the entry is owned by a
+FederationLagScope held for the task's life, the same RAII shape InFlightGuard
+already uses for the turn gauge. That also closes the closed-room case Codex
+named: closing a room stops its task, so the guard drops the entry. One thing
+the finding did not mention would have bitten: a room can restart, and the old
+task's cleanup can land after the new task reported, blanking a live
+measurement. Entries carry the reporting generation and a clear removes only its
+own; two tests pin the fall-back and the late-clear.
+
+The digest-drift arm of admit_room_agent was the one refusal that never reaches
+append_admission_audit, where I hung the counter: mark_room_agent_stale writes
+its own outcome refused / reason_code binding_stale row inside the authority
+transaction. So the counter and the ledger disagreed on exactly one row — the
+refusal that DISCOVERS drift, the moment a package changed under an approved
+binding, which is the one worth paging on. Every later attempt was already
+counted by the status arm, so the metric would have shown drift refusals
+starting from the second. It bumps itself now, and the asymmetry is recorded in
+the daemon AGENTS.md so the next reader does not assume one site still covers
+every arm.
+
+Also merged the owner's 75a41b7, which relocated the metrics.rs ownership bullet
+past room_agent_authority.rs to clear PR #442's AGENTS.md hunk. My fix commit had
+extended that bullet at its old position, so the two collided; resolved by taking
+both intents — the relocated position (now line 136, clear of #442's 109-125) with
+the updated text. One copy of the bullet remains. Merged rather than rebased, so
+nobody's checkout is invalidated.
+
+Gates on the merged tree: docs-check PASS (30 packages, 157 files, 179 links),
+build PASS, workspace tests PASS (3249 passed, 0 failed; ocean-daemon 883/883),
+Clippy clean, format clean, ledger PASS. Dependency policy DID NOT RUN — cargo
+deny is not installed here. cargo-deny is red in CI for RUSTSEC on rtrb 0.3.4 via
+livekit, identical on main at 616293e and established as the base branch's, not
+this PR's; commented once, not widened into a lockfile bump, and the fix is the
+user's call as its own PR.
+_________________________________________________________________________________ 06:13 cloud/os-room-metrics
