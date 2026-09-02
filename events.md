@@ -9549,3 +9549,30 @@ RUSTSEC-2026-0274 (`rtrb` double-free) and yanked `spin`, unchanged and
 pre-existing: the branch touches no `Cargo.toml`, `Cargo.lock` or `deny.toml` at
 all, and every line this pass changed is a comment. No deploy, no migration.
 _________________________________________________________________________________ 12:16 loop/os-transcript-page-including-closed
+
+time:      [05:55] [02-09-26]
+agent:     [claude code], [claude-fable-5-1]
+worktree:  deps/rtrb-0.3.5-rustsec-2026-0274
+type:      [gh actions]
+area:      [infra]
+
+RUSTSEC-2026-0274 is a double free / use-after-free in `rtrb` 0.3.4, reachable
+from safe Rust: `ReadChunk::commit` and `commit_all` drop the committed elements
+before advancing the consumer head, so an element whose `Drop` panics leaves its
+slot marked live and the ring buffer drops it a second time on the next read or
+on its own drop. It reaches this workspace only transitively, `rtrb` <-
+`libwebrtc` 0.3.35 <- `livekit` 0.7.44 <- `ocean-call` <- `ocean-daemon`, behind
+the opt-in `livekit-tap` feature, but `deny.toml` audits with
+`all-features = true`, so the `cargo-deny` lane has been red on `main` at
+616293e (`advisories FAILED, bans ok, licenses ok, sources ok`) and on every
+open PR that inherits that lockfile. The fix is the one the advisory prescribes
+and nothing more: `cargo update -p rtrb --precise 0.3.5`, the patched 0.3.x
+release (0.4.0 is patched too but changes `is_abandoned()`, so the advisory
+steers 0.3.x users to 0.3.5). libwebrtc 0.3.35 requires `^0.3.3`, so the bump
+is a four-line `Cargo.lock` change, version and checksum, and no `Cargo.toml`
+or `deny.toml` moves. `cargo deny check` in this worktree now answers
+`advisories ok, bans ok, licenses ok, sources ok`, with the yanked `spin` 0.9.8
+still the warning it was under `yanked = "warn"`, so once main carries this
+lockfile the cargo-deny lane is green for every open PR; CI's own run of that
+lane on this branch is the proof. No build, no deploy, no code change.
+_________________________________________________________________________________ 05:55 deps/rtrb-0.3.5-rustsec-2026-0274
