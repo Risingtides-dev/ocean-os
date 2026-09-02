@@ -870,7 +870,7 @@ impl FederationSupervisor {
         };
         for credential in credentials {
             let state = with_rooms_handle(&self.inner.rooms, |store| {
-                let open = store.get(&credential.room_id)?.is_some();
+                let open = store.is_open(&credential.room_id)?;
                 let state = store.room_access(&credential.room_id)?.state;
                 Ok::<_, ocean_store::RoomStoreError>((state, open))
             })
