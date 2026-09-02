@@ -177,6 +177,7 @@ Phase 1 rollout gates remain authoritative in
    kickstart the named job:
 
    ```bash
+   plutil -lint "$HOME/Library/LaunchAgents/dev.risingtides.ocean-daemon.plist"
    launchctl bootout "gui/$(id -u)/dev.risingtides.ocean-daemon" 2>/dev/null || true
    for _ in $(seq 1 50); do
      launchctl print "gui/$(id -u)/dev.risingtides.ocean-daemon" >/dev/null 2>&1 || break
@@ -329,6 +330,7 @@ restores a database without them. The gate remains open until a new
    test -x "$candidate_bin" && test -x "$previous_bin"
    (cd "$rooms_rehearsal_dir" && \
      env -u OCEAN_FEDERATION_URL -u OCEAN_FEDERATION_OWNER_TOKEN \
+       -u OCEAN_TITLES_DB_PATH -u OCEAN_PLUGINS_DIR \
        OCEAN_CONFIG_DIR="$rooms_rehearsal_dir/candidate-config" \
        OCEAN_DB_PATH="$rooms_rehearsal_dir/candidate-config/rooms.db" \
        OCEAN_BIND=127.0.0.1:18791 OCEAN_UNSUPERVISED=1 \
@@ -336,10 +338,11 @@ restores a database without them. The gate remains open until a new
    ```
 
    Keep this process in its own terminal. Only the copied `rooms.db` enters the
-   isolated config root; no production config file is imported. Both federation
-   variables are explicitly removed from the rehearsal process even if the
-   operator shell exported them, so copied credentials, pending outbox rows, or
-   pending redemptions cannot contact Bedrock.
+   isolated config root; no production config file is imported. Federation,
+   title-database, and plugin-directory overrides are explicitly removed from
+   the rehearsal process even if the operator shell exported them, so copied
+   credentials, pending outbox rows, or pending redemptions cannot contact
+   Bedrock, open the live title registry, or launch production plugins.
 3. Through the candidate, list rooms and read one snapshot. Before stopping it,
    require SQLite to report both `room_agent_bindings` and
    `room_agent_decisions`; a clean open alone is not migration proof. Record the
@@ -357,6 +360,7 @@ restores a database without them. The gate remains open until a new
      "SELECT count(*) FROM sqlite_master WHERE type='table' AND name IN ('room_agent_bindings','room_agent_decisions');")" = 0
    (cd "$rooms_rehearsal_dir" && \
      env -u OCEAN_FEDERATION_URL -u OCEAN_FEDERATION_OWNER_TOKEN \
+       -u OCEAN_TITLES_DB_PATH -u OCEAN_PLUGINS_DIR \
        OCEAN_CONFIG_DIR="$rooms_rehearsal_dir/rollback-config" \
        OCEAN_DB_PATH="$rooms_rehearsal_dir/rollback-config/rooms.db" \
        OCEAN_BIND=127.0.0.1:18792 OCEAN_UNSUPERVISED=1 \

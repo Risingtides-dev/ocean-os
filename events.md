@@ -9734,3 +9734,17 @@ commands explicitly remove federation URL and owner-token variables before
 launch. Docs only; no rehearsal, database mutation, daemon restart, launchd
 action, deployment, or production state change occurred.
 _________________________________________________________________________________ 21:58 docs/rooms-federation-runbook
+
+time:      [22:16] [01-09-26]
+agent:     [codex] [gpt-5]
+worktree:  docs/rooms-federation-runbook
+type:      [bug report]
+area:      [review]
+
+Closed the latest Codex runbook findings without overwriting the concurrent
+branch cleanup at 95581a13. The rendered launchd plist is linted before the
+healthy daemon is stopped, and both candidate and rollback rehearsals remove
+title-database and plugin-directory overrides as well as federation authority.
+Docs only; no rehearsal, database mutation, daemon restart, launchd action,
+deployment, or production state changed.
+_________________________________________________________________________________ 22:16 docs/rooms-federation-runbook
