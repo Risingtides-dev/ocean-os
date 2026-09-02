@@ -9622,3 +9622,17 @@ names its acceptance and ownership role, and preserves that it authorizes no
 implementation by itself. Docs only; no daemon, launchd, deployment, migration,
 or production state changed.
 _________________________________________________________________________________ 22:16 docs/rooms-definition-of-done
+
+time:      [22:31] [01-09-26]
+agent:     [codex] [gpt-5]
+worktree:  docs/rooms-definition-of-done
+type:      [bug report]
+area:      [review]
+
+Closed the reboot-persistence finding in criterion 0.6. Federation now requires
+a supported untracked owner-only login loader that restores both variables
+before every fresh GUI-domain daemon start, keeps the bearer out of both plists,
+and survives a fresh login or reboot acceptance check. The criterion remains
+open because no such loader ships. Docs only; no secret, launchd environment,
+daemon, deployment, reboot, login, or production state changed.
+_________________________________________________________________________________ 22:31 docs/rooms-definition-of-done
