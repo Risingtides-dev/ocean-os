@@ -10417,3 +10417,29 @@ silently replacing it. The focused launcher suite passed 11/11, including the
 new empty-pair regression; shell syntax and diff checks also passed. No daemon
 was restarted and production was not changed.
 _________________________________________________________________________________ 15:46 codex/ocean-rooms-integration-20260902
+
+time:      [15:58] [09-02-26]
+agent:     [codex] [gpt-5]
+worktree:  codex/ocean-rooms-integration-20260902
+type:      [bug report]
+area:      [backend]
+
+Closed both P2 findings from the fresh exact-head review of Ocean OS PR #450.
+Review comment 3918056880 found that orphan-directory bytes were credited before
+`remove_dir_all` succeeded. Whole-directory removal now attributes both the byte
+total and removal count only after success; NotFound stays an already-achieved
+no-op, and every other refusal sets the bounded sweep error without claiming
+bytes. A deterministic injected-failure regression proves a directory left on
+disk contributes zero reclaimed bytes, without relying on mode bits that root
+can bypass. Review comment 3918056889 found that the launcher's duplicate-key
+test inferred presence from a nonempty value. The parser now records explicit
+seen state for URL, literal token, and Keychain reference, so an empty first
+assignment cannot conceal a duplicate second assignment and the file is refused
+whole without logging its keys or values.
+
+Focused verification passed: daemon `room_maintenance::tests::` 11/11 and
+ocean-daemon test-target Clippy with denied warnings in the isolated offline
+compile probe (scratch-only rtrb 0.3.4 substitution; tracked Cargo.lock remains
+unchanged), federation launcher 12/12, cargo fmt check, shell syntax, and git
+diff check. No daemon was restarted and production was not changed.
+_________________________________________________________________________________ 15:58 codex/ocean-rooms-integration-20260902

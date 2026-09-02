@@ -116,6 +116,25 @@ test('empty but present process variables suppress the disk fallback', async () 
   assert.ok(!log.includes(TOKEN));
 });
 
+test('duplicate file keys are refused even when their first value is empty', async () => {
+  const cases = [
+    `OCEAN_FEDERATION_URL=\nOCEAN_FEDERATION_URL=https://bedrock.example\nOCEAN_FEDERATION_OWNER_TOKEN=${TOKEN}\n`,
+    `OCEAN_FEDERATION_URL=https://bedrock.example\nOCEAN_FEDERATION_OWNER_TOKEN=\nOCEAN_FEDERATION_OWNER_TOKEN=${TOKEN}\n`,
+    'OCEAN_FEDERATION_URL=https://bedrock.example\nOCEAN_FEDERATION_OWNER_TOKEN_KEYCHAIN=\nOCEAN_FEDERATION_OWNER_TOKEN_KEYCHAIN=unused-reference\n',
+  ];
+  for (const body of cases) {
+    const h = await harness();
+    await writeFile(h.envFile, body, { mode: 0o600 });
+    const { seen, log } = await launch(h);
+    assert.equal(seen.URL_SET, '', 'a duplicate refuses the whole file');
+    assert.equal(seen.TOKEN_SET, '', 'a duplicate cannot leak a credential to the daemon');
+    assert.match(log, /private configuration refused: duplicate_entry/);
+    assert.ok(!log.includes(TOKEN));
+    assert.ok(!log.includes('unused-reference'));
+    assert.ok(!log.includes('OCEAN_FEDERATION_'));
+  }
+});
+
 test('a token and a keychain reference together are refused; a keychain reference alone defers to the Keychain', async () => {
   const h = await harness();
   await writeFile(h.envFile, `OCEAN_FEDERATION_URL=https://bedrock.example\nOCEAN_FEDERATION_OWNER_TOKEN=${TOKEN}\nOCEAN_FEDERATION_OWNER_TOKEN_KEYCHAIN=ocean-federation\n`, { mode: 0o600 });

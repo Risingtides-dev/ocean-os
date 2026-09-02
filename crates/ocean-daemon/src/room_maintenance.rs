@@ -442,10 +442,7 @@ fn run_orphan_gc(
                 if !older_than_grace(&path, config.orphan_grace) {
                     continue;
                 }
-                outcome.bytes_reclaimed += directory_bytes(&path);
-                if std::fs::remove_dir_all(&path).is_ok() {
-                    outcome.orphan_dirs_removed += 1;
-                }
+                remove_orphan_dir_with(&path, outcome, |path| std::fs::remove_dir_all(path));
             }
             Some(key) => {
                 let referenced = match with_rooms_handle(rooms, |store| store.attachments(key)) {
@@ -466,6 +463,33 @@ fn run_orphan_gc(
         }
     }
     Ok(())
+}
+
+/// Remove one whole directory the store cannot name and attribute only bytes
+/// the filesystem confirms are gone.
+///
+/// The remover is injected so the failure path has a deterministic regression:
+/// permission fixtures are not reliable when the test runner is root.
+fn remove_orphan_dir_with(
+    path: &Path,
+    outcome: &mut SweepOutcome,
+    remove_dir_all: impl FnOnce(&Path) -> std::io::Result<()>,
+) {
+    let bytes = directory_bytes(path);
+    match remove_dir_all(path) {
+        Ok(()) => {
+            outcome.orphan_dirs_removed += 1;
+            outcome.bytes_reclaimed += bytes;
+        }
+        // Somebody else removed it between the listing and here. Nothing was
+        // reclaimed by this sweep, but the intended state already holds.
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(_) => {
+            outcome.error.get_or_insert_with(|| {
+                "orphan GC could not remove an unrecognized room directory".to_string()
+            });
+        }
+    }
 }
 
 /// Unlink every file in one room's directory that its row set does not name.
@@ -1080,6 +1104,7 @@ mod tests {
         let outcome = run_sweep(&rooms, &blob_root, &config, now);
         assert_eq!(outcome.error, None);
         assert_eq!(outcome.orphan_dirs_removed, 1);
+        assert_eq!(outcome.bytes_reclaimed, b"nobody's".len() as u64);
         assert!(!stranger.exists(), "a directory no room claims is removed");
         assert_eq!(
             std::fs::read(
@@ -1089,6 +1114,32 @@ mod tests {
             b"frozen",
             "a soft-closed room still owns its files"
         );
+    }
+
+    /// A failed whole-directory removal is visible and never credited as
+    /// reclaimed bytes. The injected error keeps this deterministic under root.
+    #[test]
+    fn an_unknown_directory_that_cannot_be_removed_reclaims_nothing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let stranger = tmp.path().join("unrecognized-room");
+        std::fs::create_dir_all(&stranger).unwrap();
+        std::fs::write(stranger.join("blob"), b"still here").unwrap();
+        let mut outcome = SweepOutcome::default();
+
+        remove_orphan_dir_with(&stranger, &mut outcome, |_| {
+            Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "injected removal refusal",
+            ))
+        });
+
+        assert_eq!(outcome.orphan_dirs_removed, 0);
+        assert_eq!(outcome.bytes_reclaimed, 0);
+        assert_eq!(
+            outcome.error.as_deref(),
+            Some("orphan GC could not remove an unrecognized room directory")
+        );
+        assert!(stranger.exists(), "the failed removal left bytes on disk");
     }
 
     /// The window parse refuses to guess. Every unusable value is OFF, because

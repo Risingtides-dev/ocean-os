@@ -89,6 +89,7 @@ federation_refuse() {
 }
 federation_load() {
   local f="$1" mode owner line n=0 key value url="" token="" keychain=""
+  local url_seen=0 token_seen=0 keychain_seen=0
   if [[ -L "$f" || ! -f "$f" ]]; then federation_refuse "not_regular"; return; fi
   # GNU stat and BSD stat spell this differently, and GNU's `-f` is a
   # filesystem query that would print a block of text into the capture, so
@@ -105,9 +106,9 @@ federation_load() {
     [[ -z "${line// /}" || "$line" == \#* ]] && continue
     key="${line%%=*}"; value="${line#*=}"
     case "$key" in
-      OCEAN_FEDERATION_URL) [[ -z "$url" ]] || { federation_refuse "duplicate_entry"; return; }; url="$value" ;;
-      OCEAN_FEDERATION_OWNER_TOKEN) [[ -z "$token" ]] || { federation_refuse "duplicate_entry"; return; }; token="$value" ;;
-      OCEAN_FEDERATION_OWNER_TOKEN_KEYCHAIN) [[ -z "$keychain" ]] || { federation_refuse "duplicate_entry"; return; }; keychain="$value" ;;
+      OCEAN_FEDERATION_URL) [[ "$url_seen" -eq 0 ]] || { federation_refuse "duplicate_entry"; return; }; url_seen=1; url="$value" ;;
+      OCEAN_FEDERATION_OWNER_TOKEN) [[ "$token_seen" -eq 0 ]] || { federation_refuse "duplicate_entry"; return; }; token_seen=1; token="$value" ;;
+      OCEAN_FEDERATION_OWNER_TOKEN_KEYCHAIN) [[ "$keychain_seen" -eq 0 ]] || { federation_refuse "duplicate_entry"; return; }; keychain_seen=1; keychain="$value" ;;
       *) federation_refuse "unsupported_entry"; return ;;
     esac
   done < "$f"
