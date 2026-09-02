@@ -97,12 +97,20 @@ test('prose after the bar is not an identity separator', () => {
 
 test('entryIdentity reads the minute and the worktree off the entry itself', () => {
   assert.equal(entryIdentity(entry('09:04', 'On a branch.', 'loop/slice-a')), '09:04 loop/slice-a');
+  assert.equal(entryIdentity(entry('9:04', 'A historical one-digit hour.', 'loop/slice-a')), '9:04 loop/slice-a');
   assert.equal(entryIdentity(entry('09:04', 'On the main checkout.', null)), '09:04', 'no branch to name');
   assert.equal(
     entryIdentity(['time:      no clock here', 'worktree:', '', 'Neither field carries a value.']),
     '',
     'an entry naming neither a time nor a branch has no identity to write',
   );
+});
+
+test('a repaired one-digit-hour entry is recognized as closed on the rerun', () => {
+  const open = entry('9:04', 'This entry lost its separator.', 'loop/slice-a').join('\n');
+  const repaired = closeEntries(open).text;
+  assert.match(repaired, /^_{5,} 9:04 loop\/slice-a$/m);
+  assert.equal(openEntries(repaired).length, 0);
 });
 
 test('closeEntries repairs the fold without deleting a line, and the rerun is clean', () => {

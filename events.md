@@ -9571,3 +9571,15 @@ the ledger guard passed 15 tests and confirmed all 555 entries closed, and
 formatting passed. No deployment, migration, daemon restart, or live room action
 occurred.
 _________________________________________________________________________________ 20:54 codex/review-sweep-20260901
+
+time:      [21:13] [09-01-26]
+agent:     [codex] [gpt-5]
+worktree:  codex/review-sweep-20260901
+type:      [bug report]
+area:      [review]
+
+Addressed the fresh Codex finding on PR #442. The separator grammar now accepts
+the same one-digit hour that entryIdentity can extract, and the regression test
+proves a --fix repair is recognized as closed on its next run. No deployment,
+daemon restart, migration, or production state changed.
+_________________________________________________________________________________ 21:13 codex/review-sweep-20260901
