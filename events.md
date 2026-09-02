@@ -9668,6 +9668,8 @@ as NOT yet performed, so the definition-of-done line stays open on an
 executable record rather than on prose. Also records the Bedrock ordering
 this daemon depends on: `db/013` before any deploy carrying ocean-bedrock
 #117. `docs/README.md` no longer says the Phase 1 independent review has not
-run; ROADMAP.md has said since 2026-08-31 that it did. Docs only; no code,
-no deploy, no migration, no rehearsal performed.
+run; ROADMAP.md has said since 2026-08-31 that it did, and ROADMAP.md's own
+"not implied" list no longer names room federation as unapproved, since it
+shipped in room_federation.rs and is operated per the new section. Docs
+only; no code, no deploy, no migration, no rehearsal performed.
 _________________________________________________________________________________ 20:15 docs/rooms-federation-runbook
