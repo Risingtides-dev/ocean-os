@@ -1608,7 +1608,14 @@ fn apply_durability_pragmas(conn: &Connection) -> Result<()> {
     conn.busy_timeout(BUSY_TIMEOUT)?;
     // `PRAGMA journal_mode` RETURNS the resulting mode, so it cannot go through
     // `pragma_update` (which rejects a statement that yields rows).
-    conn.pragma_update_and_check(None, "journal_mode", "WAL", |_row| Ok(()))?;
+    conn.pragma_update_and_check(None, "journal_mode", "WAL", |row| {
+        let actual: String = row.get(0)?;
+        if actual.eq_ignore_ascii_case("wal") {
+            Ok(())
+        } else {
+            Err(rusqlite::Error::InvalidQuery)
+        }
+    })?;
     conn.pragma_update(None, "synchronous", "NORMAL")?;
     conn.pragma_update(None, "foreign_keys", true)?;
     Ok(())
@@ -12246,6 +12253,22 @@ mod tests {
                 foreign_keys: true,
             }
         );
+    }
+
+    /// `PRAGMA journal_mode=WAL` reports the mode SQLite actually retained.
+    /// An in-memory connection answers `memory` rather than erroring, which is
+    /// the deterministic seam proving the production helper checks that row.
+    #[test]
+    fn the_file_durability_helper_rejects_a_non_wal_result() {
+        let conn = Connection::open_in_memory().unwrap();
+        assert!(
+            apply_durability_pragmas(&conn).is_err(),
+            "requesting WAL is not success unless SQLite reports WAL"
+        );
+        let actual: String = conn
+            .query_row("PRAGMA journal_mode", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(actual, "memory", "the test must exercise a retained mode");
     }
 
     /// The in-memory test path keeps its OWN settings and is not dragged into

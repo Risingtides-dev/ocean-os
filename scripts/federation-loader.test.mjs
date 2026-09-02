@@ -93,8 +93,8 @@ test('a line that is not one of the federation keys refuses the file without nam
   assert.ok(!log.includes('OCEAN_YOLO'));
 });
 
-test('a URL with anything after the host, or a plain-http remote, is refused', async () => {
-  for (const url of ['https://bedrock.example/api', 'http://bedrock.example', 'bedrock.example']) {
+test('a URL with anything after the host, a plain-http remote, or an invalid port is refused', async () => {
+  for (const url of ['https://bedrock.example/api', 'http://bedrock.example', 'bedrock.example', 'https://bedrock.example:99999']) {
     const h = await harness();
     await writeFile(h.envFile, `OCEAN_FEDERATION_URL=${url}\nOCEAN_FEDERATION_OWNER_TOKEN=${TOKEN}\n`, { mode: 0o600 });
     const { seen, log } = await launch(h);
@@ -182,6 +182,7 @@ test('set-ocean-federation.sh --no-restart writes a 0600 file from --token-file,
   assert.equal(seen.TOKEN_SHA, sha16(TOKEN), 'the launcher reads what the setter wrote');
   await assert.rejects(run('bash', [SETTER, '--url', 'https://bedrock.example', '--no-restart'], { env }), /exactly one of/);
   await assert.rejects(run('bash', [SETTER, '--url', 'https://bedrock.example/x', '--token-file', tokenFile, '--no-restart'], { env }), /https origin/);
+  await assert.rejects(run('bash', [SETTER, '--url', 'https://bedrock.example:99999', '--token-file', tokenFile, '--no-restart'], { env }), /https origin/);
 });
 
 test('set-ocean-federation.sh --keychain writes only a reference, and --off removes the file', async () => {

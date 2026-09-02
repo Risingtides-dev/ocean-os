@@ -63,8 +63,10 @@ outbox, and the restart-safe federation core (S2 P2-A). One database file
   set, and `open()` — the single file-backed open path — applies it BEFORE
   `migrate`, so the migration itself runs under them and WAL's `-wal`/`-shm`
   sidecars exist by the time the post-migration owner-only enforcement locks
-  them down. `journal_mode = WAL` (readers do not block the writer, and the
-  setting persists in the DB header), `synchronous = NORMAL` (WAL's
+  them down. `journal_mode = WAL` (readers do not block the writer, its setting
+  persists in the DB header, and the pragma's returned mode must decode to
+  `wal` or `open()` fails because SQLite may retain another mode without making
+  the pragma itself an error), `synchronous = NORMAL` (WAL's
   durable-enough level: nothing committed is lost to a process or daemon crash,
   and what NORMAL trades away versus FULL is an OS-crash/power-loss window over
   the most recent commits — the invariants below are ATOMICITY invariants, which

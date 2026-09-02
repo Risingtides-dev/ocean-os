@@ -10484,7 +10484,7 @@ syntax, and diff checks passed with 588 ledger entries closed. No daemon was
 restarted and production was not changed.
 _________________________________________________________________________________ 16:14 codex/ocean-rooms-integration-20260902
 
-time:      [16:55] [02-09-26]
+time:      [16:55] [09-02-26]
 agent:     [codex] [gpt-5]
 worktree:  codex/ocean-rooms-integration-20260902
 type:      [bug report]
@@ -10512,3 +10512,34 @@ the root and crate-parent devlogs remain unchanged because ownership and the
 top-level structure did not move. No daemon was restarted and production was
 not changed.
 _________________________________________________________________________________ 16:55 codex/ocean-rooms-integration-20260902
+
+time:      [18:15] [09-02-26]
+agent:     [codex] [gpt-5]
+worktree:  codex/ocean-rooms-integration-20260902
+type:      [bug report]
+area:      [backend]
+
+Closed all three findings from the fresh exact-head review of Ocean OS PR #450
+at 755db7cf7ef573e49a1181786be7610e9c80e1b7. Review comment 3918637761
+found that a locally closed federated room retained its credential and Live
+projection, so startup could recreate its sender/SSE tasks. Startup now reads
+openness and access state together and starts only an open, non-Revoked room;
+the integration regression proves a closed credentialed room creates no task
+slot and makes no Bedrock subscription after restart.
+
+Review comment 3918637774 found that SQLite may answer a requested
+`journal_mode=WAL` transition with the mode it actually retained rather than
+an error. The file durability helper now decodes that returned value and fails
+to open unless it is exactly WAL; an in-memory connection deterministically
+returns `memory` and proves the rejection branch. Review comment 3918637781
+found that both federation shell validators accepted a syntactically
+five-digit port above 65535. The setup command and supervised launcher now
+share the same explicit numeric range check, with 99999 covered on both paths.
+
+Verification passed: ocean-store 232/232; the closed-room restart and startup
+projection cases; federation loader 13/13; ocean-store and ocean-daemon
+all-target Clippy with denied warnings; shell syntax, cargo fmt, and git diff.
+The daemon and store devlogs record the durable contracts; the root and
+crate-parent docs remain unchanged because no ownership or structure moved.
+No daemon was restarted and production was not changed.
+_________________________________________________________________________________ 18:15 codex/ocean-rooms-integration-20260902

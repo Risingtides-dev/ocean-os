@@ -50,6 +50,17 @@ USAGE
 
 fail() { echo "FATAL: $*" >&2; exit 1; }
 
+valid_federation_origin() {
+  local candidate="$1" authority port
+  if [[ ! "$candidate" =~ ^https://[A-Za-z0-9.-]+(:[0-9]{1,5})?$ && ! "$candidate" =~ ^http://(127\.0\.0\.1|localhost)(:[0-9]{1,5})?$ ]]; then
+    return 1
+  fi
+  authority="${candidate#*://}"
+  [[ "$authority" == *:* ]] || return 0
+  port="${authority##*:}"
+  (( 10#$port <= 65535 ))
+}
+
 url=""; token_file=""; token_stdin=0; keychain=""; off=0; restart=1; verify_room=""
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -67,7 +78,7 @@ done
 
 if [[ $off -eq 0 ]]; then
   [[ -n "$url" ]] || { usage >&2; fail "--url is required"; }
-  if [[ ! "$url" =~ ^https://[A-Za-z0-9.-]+(:[0-9]{1,5})?$ && ! "$url" =~ ^http://(127\.0\.0\.1|localhost)(:[0-9]{1,5})?$ ]]; then
+  if ! valid_federation_origin "$url"; then
     fail "--url must be an https origin with nothing after the host (http is allowed for 127.0.0.1 and localhost only)"
   fi
   n=0; [[ -n "$token_file" ]] && n=$((n+1)); [[ $token_stdin -eq 1 ]] && n=$((n+1)); [[ -n "$keychain" ]] && n=$((n+1))

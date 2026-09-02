@@ -857,9 +857,10 @@ impl FederationSupervisor {
         }
     }
 
-    /// Enumerate durable credentials and start one task tree per non-Revoked
-    /// room. Missing/invalid config downgrades those rooms to Recovering so a
-    /// previous process can never leave stale Live chrome behind.
+    /// Enumerate durable credentials and start one task tree per open,
+    /// non-Revoked room. Missing/invalid config downgrades those rooms to
+    /// Recovering so a previous process can never leave stale Live chrome
+    /// behind. Closed rooms retain credentials for audit but stay frozen.
     pub(super) async fn startup(&self) {
         let credentials =
             with_rooms_handle(&self.inner.rooms, |store| store.list_credentialed_rooms());
@@ -869,7 +870,9 @@ impl FederationSupervisor {
         };
         for credential in credentials {
             let state = with_rooms_handle(&self.inner.rooms, |store| {
-                store.room_access(&credential.room_id).map(|p| p.state)
+                let open = store.get(&credential.room_id)?.is_some();
+                let state = store.room_access(&credential.room_id)?.state;
+                Ok::<_, ocean_store::RoomStoreError>((state, open))
             })
             .map_err(|_| BridgeError::Store);
             match startup_should_start(state) {
@@ -4489,8 +4492,10 @@ fn fail_row_and_wake(inner: &Arc<SupervisorInner>, key: &RoomKey, client_event_i
     }
 }
 
-fn startup_should_start(state: Result<RoomAccessState, BridgeError>) -> Result<bool, BridgeError> {
-    state.map(|state| state != RoomAccessState::Revoked)
+fn startup_should_start(
+    state: Result<(RoomAccessState, bool), BridgeError>,
+) -> Result<bool, BridgeError> {
+    state.map(|(state, open)| open && state != RoomAccessState::Revoked)
 }
 
 fn cursor_or_zero(cursor: Result<Option<u64>, BridgeError>) -> Result<u64, BridgeError> {
@@ -4955,8 +4960,9 @@ mod tests {
             startup_should_start(Err(BridgeError::Store)),
             Err(BridgeError::Store)
         );
-        assert!(!startup_should_start(Ok(RoomAccessState::Revoked)).unwrap());
-        assert!(startup_should_start(Ok(RoomAccessState::Live)).unwrap());
+        assert!(!startup_should_start(Ok((RoomAccessState::Revoked, true))).unwrap());
+        assert!(!startup_should_start(Ok((RoomAccessState::Live, false))).unwrap());
+        assert!(startup_should_start(Ok((RoomAccessState::Live, true))).unwrap());
 
         let commits = std::cell::Cell::new(0);
         assert_eq!(
@@ -8276,6 +8282,55 @@ mod tests {
             live_human_member_ids,
             HashSet::from(["stale-human".to_string()])
         );
+    }
+
+    #[tokio::test]
+    async fn startup_does_not_restart_a_closed_credentialed_room() {
+        let key = RoomKey::new("fed-closed-restart");
+        let human = "11111111-1111-4111-8111-111111111111";
+        let mut store = ocean_store::SqliteRoomStore::open_in_memory().unwrap();
+        store
+            .create(key.clone(), "Closed", None, chrono::Utc::now())
+            .unwrap();
+        store
+            .install_room_credential(&key, "closed-bearer", human)
+            .unwrap();
+        store
+            .update_room_access_safe(&key, Some(RoomAccessState::Live), None, None)
+            .unwrap();
+        store
+            .close_with_marker(
+                &key,
+                ocean_store::RoomCloser::Operator("test"),
+                chrono::Utc::now(),
+            )
+            .unwrap();
+        let rooms = Arc::new(std::sync::Mutex::new(store));
+        let fake = FakeBedrock::new(key.as_str(), "closed-bearer");
+        let (base, server) = start_fake_bedrock(fake.clone()).await;
+        let supervisor = FederationSupervisor::for_test(
+            &base,
+            rooms,
+            RoomWakeBus::default(),
+            RoomAccessWakeBus::default(),
+            RoomReadCursorWakeBus::default(),
+            CancellationToken::new(),
+            Duration::from_millis(20),
+        );
+
+        supervisor.startup().await;
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        assert!(
+            supervisor.inner.slots.lock().await.is_empty(),
+            "a closed room must not regain a task slot after restart"
+        );
+        assert!(
+            fake.request_meta.lock().await.is_empty(),
+            "a closed room must not reconnect its Bedrock SSE stream"
+        );
+        supervisor.shutdown().await;
+        server.abort();
     }
 
     #[tokio::test]

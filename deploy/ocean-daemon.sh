@@ -87,6 +87,16 @@ federation_refuse() {
   unset OCEAN_FEDERATION_URL OCEAN_FEDERATION_OWNER_TOKEN
   federation="off"
 }
+valid_federation_origin() {
+  local candidate="$1" authority port
+  if [[ ! "$candidate" =~ ^https://[A-Za-z0-9.-]+(:[0-9]{1,5})?$ && ! "$candidate" =~ ^http://(127\.0\.0\.1|localhost)(:[0-9]{1,5})?$ ]]; then
+    return 1
+  fi
+  authority="${candidate#*://}"
+  [[ "$authority" == *:* ]] || return 0
+  port="${authority##*:}"
+  (( 10#$port <= 65535 ))
+}
 federation_load() {
   local f="$1" parent parent_mode parent_owner mode owner inode opened_owner opened_inode line n=0 key value url="" token="" keychain=""
   local federation_fd parse_error=""
@@ -140,7 +150,7 @@ federation_load() {
   done <&"$federation_fd"
   exec {federation_fd}<&-
   if [[ -n "$parse_error" ]]; then federation_refuse "$parse_error"; return; fi
-  if [[ ! "$url" =~ ^https://[A-Za-z0-9.-]+(:[0-9]{1,5})?$ && ! "$url" =~ ^http://(127\.0\.0\.1|localhost)(:[0-9]{1,5})?$ ]]; then
+  if ! valid_federation_origin "$url"; then
     federation_refuse "origin is invalid"; return
   fi
   if [[ -n "$token" && -n "$keychain" ]]; then federation_refuse "ambiguous_credential"; return; fi

@@ -161,6 +161,8 @@ This crate owns the long-running Ocean HTTP service on `:4780`, including API ro
 
 - Retention obtains every stored attachment path through `room_attachments::blob_path`, including rows returned by a cut. Imported or corrupt stored ids do not inherit trust from the HTTP path's server-minted ids; malformed ids fail closed, count as unlink failures, and never become filesystem paths. `blob_path` is `pub(super)` only for this reuse.
 - The supervised federation loader requires the credential file's parent directory to be same-owner and not group/world writable. After pathname validation it compares the inode against one open descriptor and parses only that descriptor, so a rename cannot swap credentials between validation and read.
+- Federation startup starts a credentialed room only when one store read says it is both open and non-Revoked. A local close deliberately preserves credentials and access projection for audit; neither may cause the room's SSE or sender task tree to reappear after process restart.
+- Federation origin validation in both the setup command and supervised launcher bounds an explicit numeric port to `0..=65535`; syntax alone is not proof that `Url::parse` will accept the configured origin.
 
 ## Verification
 
