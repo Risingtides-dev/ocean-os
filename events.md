@@ -9586,3 +9586,29 @@ Restored the historical Stage A1 event type instead of rewriting append-only
 history, and corrected this branch's event date to the ledger's DD-MM-YY schema.
 No deployment, daemon restart, migration, or production state changed.
 _________________________________________________________________________________ 21:13 codex/review-sweep-20260901
+
+time:      [22:20] [01-09-26]
+agent:     [codex] [gpt-5]
+worktree:  codex/review-sweep-20260901
+type:      [bug report]
+area:      [review]
+
+Closed the current-head Codex finding on the workspace proxy. The module now
+states that port publication is absent pending an accepted manifest, and the
+unused caller-body path-segment field, port validator, fake routes, and stale
+test prose are removed. The no-port allowlist tripwire remains authoritative.
+No deployment, daemon restart, migration, room, or production state changed.
+_________________________________________________________________________________ 22:20 codex/review-sweep-20260901
+
+time:      [22:23] [01-09-26]
+agent:     [codex] [gpt-5]
+worktree:  codex/review-sweep-20260901
+type:      [bug report]
+area:      [testing]
+
+Closed the GitHub repository-gate failure on both platforms. Removed the dead
+CI-convening helper and stale comments/tests left after the accepted marker-only
+CI contract; the shared red-conclusion predicate remains the marker label and
+chase-link authority. No deployment, daemon restart, migration, room, or
+production state changed.
+_________________________________________________________________________________ 22:23 codex/review-sweep-20260901

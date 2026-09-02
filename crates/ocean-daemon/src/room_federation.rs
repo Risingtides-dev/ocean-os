@@ -3536,10 +3536,9 @@ struct WorkspaceEventPayload {
 /// are a ruling rather than an oversight: `check_run_id`, `title`, `status`,
 /// `event`, `created_at` and `updated_at` say nothing a ONE-LINE marker can
 /// afford room for, and the whole record is already on the ledger and in
-/// ocean-surface's repo panel. `head_sha` and `url` are decoded because a red
-/// `ci_checked` now CONVENES the room's agents, and a convened agent has no
-/// panel to click — the marker is its entire input, so the marker has to
-/// carry which commit went red and where the run is.
+/// ocean-surface's repo panel. `head_sha` and `url` are decoded so the
+/// durable marker identifies which commit went red and where the run is; core
+/// does not convene agents from CI markers.
 #[derive(Debug, Default, Deserialize)]
 struct WorkspaceCiCheck {
     #[serde(default)]
@@ -3898,18 +3897,15 @@ fn compose_workspace_marker(event_type: &str, p: &WorkspaceEventPayload) -> Stri
             if !named.is_empty() {
                 line.push_str(&format!(" — {}", named.join(", ")));
             }
-            // A red result now convenes the room's agents, and a convened
-            // agent's whole input is this line — so it ends with a route to
-            // the run. ONE route: the FIRST RED check's, not the first
-            // check's, because nobody was woken for a green one, and three
-            // URLs would wreck the line the three-check cap exists to protect.
+            // A red result ends with a route to the run. ONE route: the FIRST
+            // RED check's, not the first check's, because a green one needs no
+            // chase link and three URLs would wreck the line the three-check
+            // cap exists to protect.
             // The repo panel links every check (ocean-surface
             // `room_repo::check_row`); the marker links the one that matters.
             //
-            // The predicate is [`conclusion_is_red`], shared with
-            // [`ci_checks_are_red`] so the line and the trigger cannot drift:
-            // the tail is present exactly when the room had grounds to convene
-            // and Bedrock gave something to chase.
+            // The predicate is [`conclusion_is_red`]: the tail is present
+            // exactly when Bedrock gave a failed run to chase.
             if let Some(red) = p
                 .checks
                 .iter()
@@ -3966,36 +3962,12 @@ fn compose_workspace_marker(event_type: &str, p: &WorkspaceEventPayload) -> Stri
     }
 }
 
-/// Whether a `ci_checked` payload carries a result a room should be woken for.
-///
-/// `build_failed` IS the failure; `ci_checked` is one event type carrying both
-/// colors, so this half of the decision has to read the payload. Bedrock lists
-/// only completed runs (`gh run list --status completed`), which makes a null
-/// conclusion a defensive case rather than the normal one — and an unreadable
-/// conclusion is never grounds to convene. Absent or empty `checks` means there
-/// is nothing to judge.
-///
-/// Deduplication is upstream and deliberately NOT repeated here: Bedrock sends
-/// only checks the room has not seen plus re-runs whose conclusion actually
-/// changed, and emits no event at all when there is no news. So a member
-/// polling on a timer does not re-convene on the same red check, and a
-/// green-to-red re-run still arrives as news.
-fn ci_checks_are_red(checks: Option<&[WorkspaceCiCheck]>) -> bool {
-    checks.is_some_and(|checks| {
-        checks
-            .iter()
-            .any(|check| conclusion_is_red(check.conclusion.as_deref()))
-    })
-}
-
 /// The conclusions that mean a human has to look. `cancelled` and `stale` are
 /// superseded runs, `skipped` and `neutral` are not failures, and `success` is
 /// the point.
 ///
-/// One predicate rather than two because both the convening decision and the
-/// marker's run link read it: an agent woken by a red check must find that
-/// check's run named on the line that woke it, which only holds while the two
-/// agree on what red means.
+/// The marker uses this one predicate for both the first-failure label and its
+/// chase link.
 fn conclusion_is_red(conclusion: Option<&str>) -> bool {
     matches!(
         conclusion,
@@ -9166,9 +9138,7 @@ mod tests {
         let line = marker(json!([{"name": "test", "conclusion": "failure", "url": ok}]));
         assert!(line.ends_with(&format!(": {ok}")), "got: {line}");
 
-        // The tail and the trigger read ONE predicate, so an agent woken by a
-        // conclusion always finds that conclusion's run on the line that woke
-        // it, and a conclusion that wakes nobody never grows a tail.
+        // The first-failure label and chase link read ONE predicate.
         for conclusion in [
             "failure",
             "timed_out",
@@ -9183,12 +9153,10 @@ mod tests {
             let checks = json!([
                 {"name": "ci", "conclusion": conclusion, "url": "https://example.test/runs/7"}
             ]);
-            let parsed: Vec<WorkspaceCiCheck> =
-                serde_json::from_value(checks.clone()).expect("checks deserialize");
             assert_eq!(
                 marker(checks).contains("first failure"),
-                ci_checks_are_red(Some(&parsed)),
-                "{conclusion}: the marker's route and the convening trigger disagree"
+                conclusion_is_red(Some(conclusion)),
+                "{conclusion}: the marker's label and chase-link predicate disagree"
             );
         }
     }
@@ -9285,50 +9253,6 @@ mod tests {
             "got: {line}"
         );
         assert!(!line.contains('[') && !line.contains(']'), "got: {line}");
-    }
-
-    #[test]
-    fn ci_conclusions_convene_only_on_a_red_result() {
-        let checks = |value: serde_json::Value| -> Vec<WorkspaceCiCheck> {
-            serde_json::from_value(value).expect("checks deserialize")
-        };
-
-        // The four conclusions that mean a human has to look.
-        for red in ["failure", "timed_out", "action_required", "startup_failure"] {
-            assert!(
-                ci_checks_are_red(Some(&checks(json!([{"name": "ci", "conclusion": red}])))),
-                "{red} must convene"
-            );
-        }
-
-        // Everything else is either green, superseded by a later run, or not a
-        // result at all. `null` is defensive — Bedrock lists only completed
-        // runs — and an unreadable conclusion is never grounds to wake a room.
-        for quiet in [
-            json!([{"name": "ci", "conclusion": "success"}]),
-            json!([{"name": "ci", "conclusion": "skipped"}]),
-            json!([{"name": "ci", "conclusion": "neutral"}]),
-            json!([{"name": "ci", "conclusion": "cancelled"}]),
-            json!([{"name": "ci", "conclusion": "stale"}]),
-            json!([{"name": "ci", "conclusion": null}]),
-            json!([{"name": "ci"}]),
-            json!([{"conclusion": "FAILURE"}]),
-            json!([]),
-        ] {
-            assert!(
-                !ci_checks_are_red(Some(&checks(quiet.clone()))),
-                "{quiet} must convene nobody"
-            );
-        }
-
-        // A row with no checks at all has nothing to judge.
-        assert!(!ci_checks_are_red(None));
-
-        // One red among greens is still news: the whole batch is what arrived.
-        assert!(ci_checks_are_red(Some(&checks(json!([
-            {"name": "lint", "conclusion": "success"},
-            {"name": "test", "conclusion": "failure"}
-        ])))));
     }
 
     #[tokio::test]
