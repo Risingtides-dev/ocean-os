@@ -195,6 +195,33 @@ Two additional SQLite databases live alongside sessions and the config dir:
 - `rooms.db` — persistent room store (`SqliteRoomStore`). Survives daemon restarts; override the full path with `OCEAN_DB_PATH`.
 - `titles.db` — Longhouse title/escrow registry (firekeeper titles, recall tallies). Survives daemon restarts; override the full path with `OCEAN_TITLES_DB_PATH`.
 
+#### Reading `rooms.db`'s durability settings
+
+Every production open of `rooms.db` applies one named set of PRAGMAs
+(`apply_durability_pragmas` in `crates/ocean-store/src/lib.rs`): WAL journaling,
+`synchronous = NORMAL` (WAL's durable-enough level — a process or daemon crash
+loses nothing committed; an OS crash or power cut can lose the most recent
+transactions, which the outbox replays), a 5-second busy timeout so a second
+writer waits for the lock instead of failing `SQLITE_BUSY`, and foreign keys.
+Writes are serialized in-process by the `Mutex` the daemon holds the store
+behind; the busy timeout is what bounds a writer on a SECOND connection.
+
+You do not need `sqlite3` to check any of this. The daemon reads the settings
+back off the live connection at startup and logs them on the
+`persistent rooms store ready` line:
+
+```
+INFO persistent rooms store ready path=/Users/you/.config/ocean-rs/rooms.db
+     journal_mode=wal synchronous=normal busy_timeout_ms=5000 foreign_keys=true
+```
+
+`journal_mode=delete` or `busy_timeout_ms=0` on that line means the store is
+running without the durability posture above. A
+`persistent rooms store ready; durability settings unreadable` warn line means
+the store opened but the read-back query failed — the daemon does not refuse to
+boot over an unreadable diagnostic, so treat that line as the settings being
+unknown, not as them being wrong.
+
 ### Federated-room Bedrock bridge
 
 Set `OCEAN_FEDERATION_URL` to the Bedrock **origin only** (for example
