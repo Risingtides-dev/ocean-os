@@ -139,7 +139,9 @@ tracked plist carries neither, so the operated daemon runs rooms local-only and
 any room that ever held a Bedrock credential sits in `recovering`. The
 mechanics are in `OCEAN_RUNTIME_OPERATOR_GUIDE.md` under "Federated-room
 Bedrock bridge"; this section is the operator's order of operations. The
-finish line it serves is `docs/specs/2026-09-01-ocean-rooms-definition-of-done.md`.
+tracked completion state is the Ocean Rooms section of `../ROADMAP.md`; the
+Phase 1 rollout gates remain authoritative in
+`specs/2026-08-25-ocean-rooms-phase1-room-agent-authorization-manifest.md`.
 
 ### Enable federation
 
@@ -164,8 +166,25 @@ finish line it serves is `docs/specs/2026-09-01-ocean-rooms-definition-of-done.m
    after every reinstall because the installer overwrites it. Teaching the
    installer to merge a local, untracked env file is the follow-up that
    removes this step.
-4. Restart the named LaunchAgent after turns drain, exactly as in the
-   supervised-daemon section above.
+4. Reload the edited plist after turns drain. `kickstart` alone restarts the
+   already-loaded definition and will not load the new environment. Follow the
+   same teardown guard as `ops/install-ocean-daemon.sh`, then bootstrap and
+   kickstart the named job:
+
+   ```bash
+   launchctl bootout "gui/$(id -u)/dev.risingtides.ocean-daemon" 2>/dev/null || true
+   for _ in $(seq 1 50); do
+     launchctl print "gui/$(id -u)/dev.risingtides.ocean-daemon" >/dev/null 2>&1 || break
+     sleep 0.2
+   done
+   ! launchctl print "gui/$(id -u)/dev.risingtides.ocean-daemon" >/dev/null 2>&1
+   launchctl bootstrap "gui/$(id -u)" "$HOME/Library/LaunchAgents/dev.risingtides.ocean-daemon.plist"
+   launchctl enable "gui/$(id -u)/dev.risingtides.ocean-daemon"
+   launchctl kickstart -k "gui/$(id -u)/dev.risingtides.ocean-daemon"
+   ```
+
+   Stop if the teardown assertion or bootstrap fails; the installer documents
+   the recovery command and health check for that state.
 5. Verify, in this order. First the revision:
 
    ```bash
@@ -190,8 +209,9 @@ finish line it serves is `docs/specs/2026-09-01-ocean-rooms-definition-of-done.m
    the transcript only when Bedrock's ordered stream confirms it, and the
    snapshot's `outbox` must drain to empty.
 6. Record the verification in `events.md` with the daemon revision and the
-   room key, as the 2026-08-31 install entry did. Until such an entry exists,
-   line 0.6 of the rooms definition of done stays open.
+   room key, as the 2026-08-31 install entry did. The runbook is not evidence
+   that federation was enabled; keep that operational state explicit in the
+   Ocean Rooms roadmap or its accepted successor contract.
 
 ### The workspace lane
 
@@ -208,8 +228,7 @@ secret value on any route.
 
 ### Reading the bridge without metrics
 
-There are no room or federation counters on `/metrics` yet (definition of done,
-line 4.1). Until there are:
+There are no room or federation counters on `/metrics` yet. Until there are:
 
 - `access.state` on the snapshot is the primary signal: `live` is caught up,
   `recovering` is replaying from the durable cursor or misconfigured, `revoked`
@@ -225,30 +244,40 @@ line 4.1). Until there are:
 
 ### Rollback
 
-Remove the two variables from the rendered plist and kickstart. Local rooms are
-untouched; credentialed rooms sit in `recovering` with honest chrome; nothing
-is deleted. Re-adding the variables resumes from the persisted cursor.
+Remove the two variables from the rendered plist, then repeat the guarded
+`bootout` → wait → `bootstrap` → `enable` → `kickstart` sequence above so
+launchd loads their removal. Local rooms are untouched; credentialed rooms sit
+in `recovering` with honest chrome; nothing is deleted. Re-adding the variables
+and reloading the plist resumes from the persisted cursor.
 
 ### rooms.db migration rehearsal
 
 The Phase 1 manifest's rollout gate 4 asks for a migration rehearsal on a copy
 of a real `rooms.db`, including rollback. **As of 2026-09-01 this has not been
 performed**: the only rehearsal entries in `events.md` concern `ocean-memory`.
-Line 4.5 of the rooms definition of done stays open until an `events.md` entry
-records one; writing this procedure down is not performing it. Procedure:
+Phase 1 rollout gate 4 remains open until an `events.md` entry records one;
+writing this procedure down is not performing it. Procedure:
 
-1. Copy the live store without stopping the daemon:
-   `cp <config dir>/rooms.db /tmp/rooms-rehearsal.db`, using the config dir
-   the running daemon actually uses (`launchctl print` shows its environment).
+1. Take a transactionally consistent online backup while the daemon is live,
+   using SQLite's backup API rather than copying the main file without its WAL:
+
+   ```bash
+   sqlite3 "<config dir>/rooms.db" ".timeout 10000" ".backup '/tmp/rooms-rehearsal.db'"
+   sqlite3 "/tmp/rooms-rehearsal.db" "PRAGMA quick_check;"
+   ```
+
+   Use the config dir the running daemon actually uses (`launchctl print` shows
+   its environment), require `quick_check` to print `ok`, and use the same
+   online-backup procedure for the pre-upgrade rollback copy.
 2. Run the candidate binary against the copy on a spare port with
    `OCEAN_DB_PATH=/tmp/rooms-rehearsal.db` and `OCEAN_BIND`, from the immutable
    artifact under `~/.local/libexec/ocean-daemon/`.
 3. Through the candidate, list rooms and read one snapshot; the store applies
    its migrations on open, so a clean open plus readable rooms is the pass.
 4. Rollback: stop the candidate and delete the copy. For a real upgrade,
-   rollback is the previous immutable artifact plus the pre-upgrade copy from
-   step 1, because the store's migrations are forward-only; the copy is the
-   rollback.
+   rollback is the previous immutable artifact plus the transactionally
+   consistent pre-upgrade backup from step 1, because the store's migrations
+   are forward-only; that verified backup is the rollback.
 5. Record both revisions and the room and message counts before and after in
    `events.md`.
 

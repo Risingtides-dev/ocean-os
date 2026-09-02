@@ -9673,3 +9673,17 @@ run; ROADMAP.md has said since 2026-08-31 that it did, and ROADMAP.md's own
 shipped in room_federation.rs and is operated per the new section. Docs
 only; no code, no deploy, no migration, no rehearsal performed.
 _________________________________________________________________________________ 20:15 docs/rooms-federation-runbook
+time:      [20:27] [01-09-26]
+agent:     [codex] [gpt-5]
+worktree:  docs/rooms-federation-runbook
+type:      [bug report]
+area:      [docs]
+
+Addressed the three Codex review findings on PR #441. Plist changes now require
+the installer's guarded bootout, teardown wait, bootstrap, enable, and kickstart
+sequence on both enable and rollback. The migration rehearsal uses SQLite's
+online backup API plus quick_check instead of copying a live main file without
+its WAL. References now resolve to the tracked ROADMAP and accepted Phase 1
+manifest rather than an unmerged definition-of-done branch. Docs only; no
+launchd job, database, daemon, deployment, or production state changed.
+_________________________________________________________________________________ 20:27 docs/rooms-federation-runbook
