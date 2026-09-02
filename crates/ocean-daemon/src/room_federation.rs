@@ -2389,6 +2389,11 @@ async fn run_room(
     cancel: CancellationToken,
 ) {
     let mut attempt = 0u32;
+    // §4.1: this room's lag entry lives exactly as long as the task tracking it.
+    // Every `return` below drops it, so a room that was behind when it stopped
+    // cannot leave an obsolete backlog dominating the gauge forever.
+    let _lag_scope =
+        crate::metrics::FederationLagScope::enter(key.as_str().to_string(), generation);
     loop {
         if cancel.is_cancelled() || inner.shutdown.is_cancelled() {
             return;
@@ -2407,6 +2412,19 @@ async fn run_room(
         };
         if state == RoomAccessState::Revoked {
             return;
+        }
+        // §4.1 federation SSE reconnects. Counted HERE — immediately before the
+        // dial that is actually about to happen — rather than beside the backoff
+        // at the bottom of the loop. Every path between the two is a `return`
+        // that never redials: cancellation or shutdown winning the backoff
+        // `select!`, a missing client, a credential that disappeared, or a room
+        // gone Revoked. Counting at the backoff therefore reported a reconnect
+        // for every task that was stopped while sleeping. `attempt > 0` is what
+        // keeps the first dial of the task out of a counter about REconnects.
+        if attempt > 0 {
+            crate::metrics::with_process_room_metrics(|metrics| {
+                metrics.record_federation_reconnect()
+            });
         }
         let outcome = run_epoch(
             inner.clone(),
@@ -2519,6 +2537,14 @@ async fn run_epoch(
         Err(EpochOutcome::Revoked) => return EpochOutcome::Revoked,
         Err(outcome) => return outcome,
     };
+    // §4.1 federation SSE lag: the epoch's announced snapshot high-water minus
+    // what this daemon has accepted. Reported once at hello (the backlog this
+    // epoch opens with) and again on every accepted row below, so the gauge
+    // falls to zero as the room catches up instead of only being sampled.
+    crate::metrics::with_process_room_metrics(|metrics| {
+        metrics.set_federation_lag(key.as_str(), generation, high_water.saturating_sub(cursor))
+    });
+
     let state = access_state_for_hello(cursor, high_water);
     if !commit_access(&inner, &key, state, Some(&members), None) {
         return EpochOutcome::Recover;
@@ -2649,6 +2675,13 @@ async fn run_epoch(
                         match result {
                             Ok(IngestDisposition::Committed) => {
                                 last_accepted = sequence;
+                                crate::metrics::with_process_room_metrics(|metrics| {
+                                    metrics.set_federation_lag(
+                                        key.as_str(),
+                                        generation,
+                                        high_water.saturating_sub(last_accepted),
+                                    )
+                                });
                                 if last_accepted >= high_water
                                     && ensure_live_with(
                                         durable_state(&inner.rooms, &key),

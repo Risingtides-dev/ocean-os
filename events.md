@@ -46,7 +46,6 @@ entries only.
 
 ---
 _________________________________________________________________________________
-
 time:      [04:25pm] [16-06-26]
 agent:     [ocean-acp], [unknown-model]
 worktree:  main
@@ -55,7 +54,6 @@ area:      [agent-building]: System prompt project context
 
 Updated `crates/ocean-agent/src/lib.rs` so Ocean project prompt discovery includes `.ocean/AGENTS.md` alongside `AGENTS.md`, `CLAUDE.md`, and `.pi/instructions.md`. Added a unit test proving nested project cwd resolution loads an ancestor `.ocean/AGENTS.md` contract. Migrated from the former `.ocean/events.md` ledger when the canonical repo ledger was established.
 _________________________________________________________________________________
-
 time:      [04:36pm] [16-06-26]
 agent:     [ocean-acp], [unknown-model]
 worktree:  main
@@ -64,7 +62,6 @@ area:      [agent-building]: .ocean instruction loading
 
 Added `.ocean/AGENTS.md` as an Ocean-native project instruction contract, normalized event ledger naming to lowercase `events.md`, and kept the former `.ocean/events.md` ledger updated for the `.ocean/AGENTS.md` loading work and cwd/spawn-root review. Migrated into the canonical repo ledger during devlog protocol cleanup.
 _________________________________________________________________________________
-
 time:      [07:52pm] [16-06-26]
 agent:     [codex cli runtime], [gpt-5]
 worktree:  main
@@ -73,7 +70,6 @@ area:      [skill/mcp]: Stitchpad workspace coordination
 
 Attempted to join the existing `.stitchpad` room as `nancy` through the Stitchpad MCP join tool. This only created an MCP/pad-default presence with no kitty target or visible terminal identity, so it was removed and replaced by an explicit kitty-bound join. Migrated from the former `.ocean/events.md` ledger.
 _________________________________________________________________________________
-
 time:      [07:57pm] [16-06-26]
 agent:     [codex cli runtime], [gpt-5]
 worktree:  main
@@ -82,7 +78,6 @@ area:      [skill/mcp]: Stitchpad workspace coordination
 
 Rejoined the existing `.stitchpad` room as `nancy` with explicit kitty target `unix:/tmp/kitty-thoth-675@@105`, bound session `105` to `nancy`, set this terminal title to `nancy`, and changed the stable Stitchpad color override for `nancy` to cyan so it is visually distinct from Roger. Migrated from the former `.ocean/events.md` ledger.
 _________________________________________________________________________________
-
 time:      [12:10am] [17-06-26]
 agent:     [claude], [claude-sonnet-4-6], [mike/Flux]
 worktree:  main
@@ -91,7 +86,6 @@ area:      [agent-building]: devlog framework
 
 Created repo-root `AGENTS.md` and `events.md`, scoped `.ocean/AGENTS.md` down to runtime artifacts only, and made the cross-harness devlog protocol live in ocean-os.
 _________________________________________________________________________________
-
 time:      [05:03pm] [17-06-26]
 agent:     [pi], [unknown-model], [bob/team-lead]
 worktree:  main
@@ -100,7 +94,6 @@ area:      [agent-building]: devlog framework
 
 Addressed Knox review blockers for the ocean-os devlog rollout: added a top `AGENTS.md` source-of-truth pointer to `CLAUDE.md`, created `crates/AGENTS.md` and six crate child docs, converted `docs/AGENTS.md` to the six-section child shape, migrated historical `.ocean/events.md` entries into the root canonical ledger, removed the secondary `.ocean/events.md` ledger, and updated root `AGENTS.md` to mention the required root `events.md` entry with `worktree:` during devlog closeout.
 _________________________________________________________________________________
-
 time:      [06:34pm] [17-06-26]
 agent:     [pi], [unknown-model], [bob/team-lead]
 worktree:  main
@@ -111,7 +104,6 @@ Coordinated and verified the Ocean workspace-binding milestone: `crates/ocean-tu
 _________________________________________________________________________________
 
 _________________________________________________________________________________
-
 time:  [10:04pm] [06-17-26]
 agent: [pi] [gpt-5.1]* [Thoth/bob]*
 worktree: [main]
@@ -129,7 +121,6 @@ Verification:
 - `curl http://127.0.0.1:4780/health`
 - `POST /v1/prompt` with blank prompt and temp cwd returned that temp cwd; blank prompt with no cwd now returns 400 instead of daemon cwd fallback.
 _________________________________________________________________________________
-
 time:  [10:10pm] [17-06-26]
 agent: [codex cli runtime], [gpt-5]
 worktree: [main]
@@ -140,7 +131,6 @@ Changed the daemon turn path so the caller's launch cwd is the execution cwd on 
 _________________________________________________________________________________
 
 _________________________________________________________________________________
-
 time:  [10:52pm] [06-17-26]
 agent: [pi] [gpt-5.1]* [Thoth/bob]*
 worktree: [main]
@@ -157,7 +147,6 @@ Verification:
 - `cargo build -p ocean-daemon -p ocean-tui --release`
 - `curl http://127.0.0.1:4780/health`
 _________________________________________________________________________________
-
 time:  [03:53am] [06-20-26]
 agent: [codex cli runtime], [gpt-5]
 worktree: [main]
@@ -176,7 +165,6 @@ Verification:
 - `curl http://127.0.0.1:4780/health`
 _________________________________________________________________________________
 _________________________________________________________________________________
-
 time:  [10:05pm] [06-22-26]
 agent: [pi], [gpt-5.1], [Thoth]
 worktree: [main]
@@ -934,7 +922,6 @@ requests, back-compat preserved). Both open PRs; awaiting completion to gate.
 Deferred: OCEAN-337 (explicitly human-gated), web/deploy bugs 125/122 (need live
 repro), voice/obsidian 172/174 (fuzzy/non-repo).
 _________________________________________________________________________________
-
 time:      [01:36pm] [06-24-26]
 agent:     [claude] [opus 4.8]
 worktree:  feat/ocean-40-active-tab-context
@@ -963,7 +950,6 @@ being filtered into "other tabs" and lost. Added SDK tests (back-compat deserial
 + browser-context round-trip) and daemon tests (prompt-fold, fail-open, malicious-title
 sanitization, tabs-only fallback). Full local gate green on toolchain 1.96.0.
 _________________________________________________________________________________
-
 time:      [12:00pm] [24-06-26]
 agent:     [claude-code], [opus 4.8]
 worktree:  docs/ocean-374-longhouse-readme-drift
@@ -980,7 +966,6 @@ ProviderConfigError::NoModelSelected when unset; there is no hardcoded default. 
 wording with docs/OCEAN_RUNTIME_OPERATOR_GUIDE.md. Docs-only; cargo fmt --all --check
 green.
 _________________________________________________________________________________
-
 time:      [03:07pm] [06-24-26]
 agent:     [claude] [opus 4.8]
 worktree:  test/ocean-370-longhouse-daemon-tests
@@ -989,7 +974,6 @@ area:      testing
 
 OCEAN-370 (P2): closed two daemon-level Longhouse test gaps in crates/ocean-daemon/src/main.rs (test module only, no runtime changes). GAP 1: extended the `prep_with()` test helper to accept a workflows param (was skills-only, sops/workflows hardcoded empty) and added `render_longhouse_prep_renders_workflows_alongside_skills`, which pins that workflows render in the same `- {name} — {description}` bullet shape as skills (main.rs:9316-9324) — mirrors the prepare.rs unit-level expectation. GAP 2: added async `workflows_prepare_returns_matching_workflows_from_cwd`, which plants docs/orchestrator/workflows/test.md (YAML frontmatter name+description) in a tempdir, POSTs /v1/workflows/prepare through the real longhouse_routes() table with that cwd + a matching prompt (TTL=0 + cache clear for a cold scan), and asserts the planted workflow surfaces on the wire — the on-disk counterpart to the empty-tmpdir wiring test. Updated the three other `prep_with` callers for the new signature. Full local gate green on toolchain 1.96.0: cargo test -p ocean-daemon (229 passed), cargo clippy -p ocean-daemon -- -D warnings clean, cargo fmt --all -- --check clean.
 _________________________________________________________________________________
-
 time:      [3:06P] [06-24-26]
 agent:     [claude] [opus 4.8]
 worktree:  fix/ocean-368-sse-keepalive
@@ -1008,7 +992,6 @@ single-const wiring is what makes both rails provably equal. Full local gate gre
 1.96.0: cargo build -p ocean-daemon, cargo test -p ocean-daemon (228 passed), cargo clippy
 -p ocean-daemon -- -D warnings, cargo fmt --all -- --check.
 _________________________________________________________________________________
-
 time:      [02:18pm] [06-24-26]
 agent:     [claude] [opus 4.8]
 worktree:  fix/ocean-369-known-models
@@ -1028,7 +1011,6 @@ and reaches its declared provider) and no_routable_production_model_is_missing_f
 (inverse tripwire enumerating all production arms + rejecting any fake leak). Full local
 gate green on toolchain 1.96.0: build, 25 tests, clippy -D warnings, fmt --check.
 _________________________________________________________________________________
-
 time:      [02:34pm] [06-24-26]
 agent:     [claude] [opus 4.8]
 worktree:  feat/ocean-371-gc-failures-metric
@@ -1052,7 +1034,6 @@ each). Full local gate green on toolchain 1.96.0: cargo build -p ocean-daemon,
 cargo test -p ocean-daemon (234 passed), cargo clippy -p ocean-daemon -- -D warnings,
 cargo fmt --all -- --check.
 _________________________________________________________________________________
-
 time:      [3:54P] [06-24-26]
 agent:     [claude] [opus 4.8]
 worktree:  feat/ocean-373-agentevent-relay
@@ -1079,7 +1060,6 @@ split and double-guarding the compile-time exhaustiveness. Full local gate green
 toolchain 1.96.0: cargo build -p ocean-daemon, cargo test -p ocean-daemon,
 cargo clippy -p ocean-daemon -- -D warnings, cargo fmt --all -- --check.
 _________________________________________________________________________________
-
 time:      [04:12pm] [06-24-26]
 agent:     [claude] [opus 4.8]
 worktree:  feat/ocean-372-sse-lag-metrics
@@ -1105,7 +1085,6 @@ HELP/TYPE headers. Full local gate green on 1.96.0: cargo build -p ocean-daemon,
 cargo test -p ocean-daemon (236 passed), cargo clippy -p ocean-daemon -- -D warnings,
 cargo fmt --all -- --check.
 _________________________________________________________________________________
-
 time:      [04:48pm] [06-24-26]
 agent:     [claude] [opus 4.8]
 worktree:  feat/ocean-372-sse-lag-metrics
@@ -1131,7 +1110,6 @@ scope-filtering live closure, and asserts the scoped client gets nothing deliver
 occurrence counter ticks, and the dropped sum stays 0. Full gate green on 1.96.0: build,
 test (235 passed, +1), clippy -D warnings, fmt --check.
 _________________________________________________________________________________
-
 time:      [02:44am] [25-06-26]
 agent:     [pi]
 worktree:  [main]
@@ -1158,7 +1136,6 @@ job bootstrapped). Verified: /health -> {"ok":true}, launchd state=running keepa
 Also reaped an orphaned ocean-tui (PID 96096, ~1d9h old, Jun 14 build); left the active TUI.
 Two tracked files modified, uncommitted pending Knox (merge gate) — see git status.
 _________________________________________________________________________________
-
 time:      [04:53pm] [06-25-26]
 agent:     [pi] [gpt-5]
 worktree:  [main]
@@ -1167,7 +1144,6 @@ area:      backend/writing
 
 Ocean Rooms focus: implemented C Tier-1 read-before-answer context for room auto-convene without using Claude agents/subagents. `spawn_room_agent_turn` now builds the woken agent prompt from the current room roster, resolved workspace/git state (`git_root`, branch, latest head, bounded `git status --short`), and the recent transcript tail instead of transcript-only context. Added a prompt-builder regression test. Also documented that B is handled by folder-as-agent profiles, updated `docs/OCEAN_ROOMS_COLLABORATION_MODEL.md`, and added `docs/specs/ocean-room-execution-isolation.md` as the A plan for worktree-backed room execution/promotion. Verification green: `cargo fmt --all -- --check`, `cargo test -p ocean-daemon` (237 passed), and `cargo check --workspace`.
 _________________________________________________________________________________
-
 time:      [05:08pm] [06-25-26]
 agent:     [pi] [gpt-5]
 worktree:  [main]
@@ -1176,7 +1152,6 @@ area:      backend
 
 Synced local `main` after user-submitted GitHub work. Created safety branch `backup/pre-sync-main-20260625-170651`, saved patch `/tmp/ocean-os-pre-sync-20260625-170651.patch`, stashed dirty local work, fast-forwarded main from 12ea25c to origin/main 789aeee, and reapplied the stash with no conflicts. Pulled in the typed SQLite `ocean-memory` crate from `d5467db` plus later checkpoint/revert commits; updated the root crate map to include `ocean-memory`. Validation after sync stayed green: `cargo check --workspace`, `cargo fmt --all -- --check`, and `cargo test -p ocean-daemon` (237 passed). Kept `stash@{0}` as a recovery copy until the dirty local work is committed or intentionally dropped.
 _________________________________________________________________________________
-
 time:      [11:25pm] [06-26-26]
 agent:     [codex] [gpt-5]
 worktree:  [fix/ocean-daemon-neutral-cwd-supervisor]
@@ -1192,7 +1167,6 @@ ignores invalid values with a warning, and passes the valid override through
 and updated permission-bridge tests for the new parameter. Verification green:
 `cargo fmt --check -p ocean-acp`, `cargo test -p ocean-acp`, and `cargo build -p ocean-acp --release`.
 _________________________________________________________________________________
-
 time:      [12:07pm] [06-26-26]
 agent:     [codex] [gpt-5]
 worktree:  [fix/ocean-daemon-neutral-cwd-supervisor]
@@ -1206,7 +1180,6 @@ runtime, surface, agent-package, and Bedrock/data-plane references before making
 cross-repo claims. This was a docs-only change; verification was link/path review
 and mirrored-file comparison across sibling repos.
 _________________________________________________________________________________
-
 time:      [12:15pm] [06-26-26]
 agent:     [codex] [gpt-5]
 worktree:  [fix/ocean-daemon-neutral-cwd-supervisor]
@@ -1220,7 +1193,6 @@ covering `ocean-surface` <-> `ocean-os`, `ocean-os` <-> `ocean-agents`,
 `ocean-surface` <-> `ocean-bedrock`, `ocean-agents` <-> `ocean-bedrock`, and the
 normal all-four workflow path.
 _________________________________________________________________________________
-
 time:      [12:49pm] [06-26-26]
 agent:     [codex] [gpt-5]
 worktree:  [fix/ocean-daemon-neutral-cwd-supervisor]
@@ -1235,7 +1207,6 @@ artifact from the mirrored `docs/OCEAN_PROJECT_MAP.md` using the sibling-safe
 path `../../ocean-os/docs/OCEAN_PROJECT_MAP_ART.html`. Verified in Playwright on
 desktop and mobile-sized viewports.
 _________________________________________________________________________________
-
 time:      [1:34pm] [06-26-26]
 agent:     [codex] [gpt-5]
 worktree:  [fix/ocean-daemon-neutral-cwd-supervisor]
@@ -1254,7 +1225,6 @@ existing thinking-level metadata changes in this worktree. Checks green:
 smoke test verified initialize returns `sessionCapabilities: { list: {} }` and
 `session/list` returns real sessions for `/Users/risingtidesdev/dev/ocean-agents`.
 _________________________________________________________________________________
-
 time:      [06:01pm] [07-01-26]
 agent:     [claude] [fable 5]
 worktree:  main
@@ -1263,7 +1233,6 @@ area:      [infra]
 
 Phase-0 stabilization complete across the quad (per ocean-discovery/06-orchestration-plan.md). ocean-os: landed the in-flight tree as PR #267 (neutral-cwd supervised-daemon fix — was live-but-unmerged and would have regressed on next deploy — plus docs reorg + ACP session/list + thinking-level), hardened by a max-effort 10-angle review (10 findings fixed incl. session/list→prompt fork-instead-of-resume, case-sensitive thinking-level drop, launcher crash-loop guards, 8 dangling doc refs; review record on the PR). Unblocked the rolling-toolchain fmt gate workspace-wide (PR #268, rustfmt 1.96.1). Stashes: 5→0 — rooms workspace-packet WIP became rescue/ocean-rooms-workspace-packet (recovering the lost ocean-room-execution-isolation spec), the rest archived as patches on backup/stash-archive-20260701. Branches: 13 remote deleted with file-diff proof, 62 boarded (57 near-certain deletable, see ocean-discovery/08-branch-triage-ocean-os.md). Sibling repos: surface pushed+PR#96 (vscode extension pass)+8 branches pruned; agents landed docs+found the missing content-agent design spec on design/content-agent-slack-assistant; bedrock landed docs+HANDOFF refresh+6 branches pruned; longhouse-deck first-pushed to a private origin; swift-widget markdown wip rebased+PR#1. All repos now on main/master, clean trees.
 _________________________________________________________________________________
-
 time:      [07:35pm] [07-01-26]
 agent:     [claude] [fable 5]
 worktree:  main
@@ -1294,7 +1263,6 @@ including the OKF profile registry + loader in src/okf.rs, commits
 plugins, skill packs, theme protocol, Phase 4 OS integration, Longhouse
 validator economics. Docs-only, committed direct to main and pushed.
 _________________________________________________________________________________
-
 time:      [07:45pm] [07-01-26]
 agent:     [claude] [fable 5]
 worktree:  main
@@ -1327,7 +1295,6 @@ area:      [frontend]
 
 Ocean-TUI Phase 2 landed on branch: harvested CTRL's session rail + PTY into the new shell. New modules shell/sessions.rs (Ocean-only discovery, stripped from CTRL — reads ~/.config/ocean-rs/sessions), shell/pty.rs (portable-pty+vt100+tui-term, lifted from CTRL term.rs), shell/components/session_rail.rs + pty_pane.rs. app.rs rewired to two-pane layout: left session rail, right main (native chat default, swaps to embedded PTY running `ocean --project X --session ID` when a rail session is opened). Tab cycles pane focus. Verified with a live discovery test: the exact rail code found 29 real ocean-os-bound sessions with real titles. Builds clean, clippy -D clean, 69 tests pass. NOTE: CTRL repo untouched — only read from. Editor + file-tree harvest queued next per John (keep, don't rebuild — CTRL already has working ones). Native resume-into-chat still deferred (needs daemon history replay).
 _________________________________________________________________________________
-
 time:      [evening] [07-03-26]
 agent:     [claude] [sonnet 5]
 worktree:  feat/ocean-tui-shell-rebuild
@@ -1336,7 +1303,6 @@ area:      [frontend]
 
 Ocean-TUI Phase 3 landed: harvested CTRL's editor, file tree, AND graph into the shell (John: keep all three, don't rebuild). New pure modules shell/{highlight,git,editor,tree,graph}.rs lifted from CTRL (editor's crate::git/highlight paths rewired to crate::shell::). New components file_tree.rs (Tree wrapper), editor.rs (syntect-highlighted EditorTab + debounced re-highlight + Ctrl-S save + cursor), graph.rs (ProjectGraph on a ratatui Canvas, braille nodes/edges, zoom/pan/select). app.rs rewired to full workbench: left rail (F1 sessions / F2 files), main view (F3 chat / F4 editor / F5 graph / F6 term), Ctrl-Q quit (Ctrl-C freed to reach the PTY as SIGINT), Enter-on-file opens editor, Enter-on-session opens PTY. Deps added: syntect, ignore (CTRL versions). Verified: builds clean, clippy -D clean, 71 tests pass; live graph scan of ocean-tui crate = 27 nodes/24 edges. CTRL repo still untouched. Editor is a real buffer editor now; git gutter marks wired but not yet painted (Mark type present). Next candidates: paint git gutter, native session resume-into-chat, oh-my-pi roles/advisor (Phase 4, daemon-side).
 _________________________________________________________________________________
-
 time:      [night] [07-03-26]
 agent:     [claude] [sonnet 5]
 worktree:  feat/ocean-tui-shell-rebuild
@@ -1345,7 +1311,6 @@ area:      [frontend]
 
 Ocean-TUI: closed the two Phase-3 gaps. (1) Git gutter — EditorTab::load_git pulls per-line marks from `git diff HEAD` on open; editor paints colored ▎/▁ (added/modified/deleted) in the gutter. (2) Native session resume — rail Enter now resumes a session INTO the chat (was PTY-only): loads the full transcript from the session's on-disk JSON (sessions::load_transcript, strips [TUI]/[ACP] prefixes), binds future turns to the parsed AgentSessionId, and subscribes its live event stream; 't' still opens the PTY escape hatch. Daemon needs no change — it already resumes by id (monolith did this; unknown_session_id errors test). Verified against real data: transcript loader pulled 8 real messages from the newest ocean-os session ("hey"→"hey. what are we working on?"…). Builds clean, clippy -D clean, 71 tests. Next: oh-my-pi roles/advisor (Phase 4, daemon-side).
 _________________________________________________________________________________
-
 time:      [night] [07-03-26]
 agent:     [claude] [fable 5 + opus agents]
 worktree:  feat/ocean-tui-shell-rebuild
@@ -1354,7 +1319,6 @@ area:      [backend]
 
 Ocean-TUI Phase 4 landed: oh-my-pi-style model roles + advisor observer, built by two parallel opus agents on disjoint crates, integrated + verified by orchestrator. DAEMON: AgentTurnRequest gains additive `role` field; DaemonConfig reads a [roles] table from ocean.toml (role name → model alias) with role_model/advisor_model resolvers; agent_turn resolves role→alias via pure resolve_effective_model_id (explicit model_id always wins, unknown role warns + falls back) feeding the existing per-turn model-override seam; new AgentRuntime::complete_once makes one fresh-context provider call. Advisor observer: when [roles].advisor is configured, a fire-and-forget post-turn task reviews the exchange on its OWN context and emits Extension{extension:"advisor", payload:{note,severity,model}, scope:session} — suppresses empty/NOTHING, severity heuristic blocker/concern/info, never blocks the operator turn. Zero [roles] config = zero behavior change. TUI: chat renders advisor notes as amber cards (⚑ advisor (severity) · model, colored │ gutter; blocker=red, concern=amber, info=blue-gray). Verified: workspace clippy clean, 467 tests green (241 daemon + 103 agent + 75 tui + 48 sdk). Config example: [roles] advisor = "anthropic/claude-sonnet-4".
 _________________________________________________________________________________
-
 time:      [late] [07-03-26]
 agent:     [claude] [fable 5]
 worktree:  feat/ocean-tui-shell-rebuild
@@ -1363,7 +1327,6 @@ area:      [design]
 
 Course-correct on John's call: the harvest had moved CTRL's ORGANS but not its SKIN — every pane was generic bordered ratatui with default colors, when the intent was ocean-tui living inside CTRL's beautiful framing. Reskinned the whole shell in CTRL's visual system: theme.rs harvested verbatim (Tokyo Night + depth-fill palette), new shell/panel.rs generalizing CTRL's panel chrome (slate bed, left light-edge + right shadow columns, ◆ TITLE row with right pill, hairline underline, footer row) so every pane wears it. Session rail now renders CTRL-style for real: OC badge pill on BADGE_OCEAN_BG, green live dot, cyan accent bar on selection, expand-on-select resume preview on the highlight bed, footer tally. Files pane: blue dirs with ▸/▾ carets, accent bar. Chat: ◆ OCEAN panel with model pill, ❯ prompts in cyan, themed tool glyphs, advisor cards on theme colors, composer as highlight-bed row with accent bar + block cursor. Editor: void BG bed, BG_DARK gutter rail w/ themed git marks, cursor pos footer. Terminal + graph: dark-void beds with panel chrome, themed constellation colors. App frame: BG_DARK void behind everything, ◇ OCEAN status bar with lit active-pane hints. clippy -D clean, 75 tests green.
 _________________________________________________________________________________
-
 time:      [late] [07-03-26]
 agent:     [claude] [fable 5]
 worktree:  feat/ocean-tui-shell-rebuild
@@ -1372,7 +1335,6 @@ area:      [design]
 
 Second course-correct on John's call: KILL THE TABS. Read CTRL's actual ui() (main.rs:1844) this time instead of a summary and rebuilt app.rs to its exact frame: title row / body / status row; body = [SESSIONS rail left][splitter][CENTER][splitter][FILE TREE right] — all panels always visible, 1-col edge splitters, deep BG chrome painted first. Center = working surface (chat default; editor when a file opens; graph as a toggle — same swap CTRL does editor↔graph). Terminal DOCKS at the bottom of center (TERM_H=14) when a session is hydrated, exactly like CTRL's Dock::Bottom. Tab cycles focus across visible panes; ⌃⌥1-6 are focus jumps not view switches. Also restored the OCEAN splash loader into the shell startup (was legacy-path only). clippy -D clean, 75 tests green.
 _________________________________________________________________________________
-
 time:      [late] [07-03-26]
 agent:     [claude] [fable 5]
 worktree:  feat/ocean-tui-shell-rebuild
@@ -1381,7 +1343,6 @@ area:      [frontend]
 
 Full-bake pass on the shell after John's "stop half baking" call — closed every gap between the shell and legacy-PM/CTRL in one push. (1) MOUSE: EnableMouseCapture in tui init; clicks focus the pane under the cursor, click-selected-row opens (rail resume / tree activate), wheel scrolls rail/tree/chat — CTRL behavior. (2) PERMISSIONS + OCEAN-185 tokens restored (was a real security regression: shell sent decision_token None): every turn mints mint_decision_token, the turn's first PermissionRequest claims it (request_id→token map), chat renders approval cards (⚠ tool/reason, ⌃Y allow / ⌃N deny, resolves to ✓/✗ on the daemon's decision event), decision POST replays the token. New client surface: spawn_global_event_stream (/v1/events SSE → Action::OceanEvent) + permission_decision POST. (3) CHAT: markdown-lite rendering (fences on dark bed, headings, bullets, inline code), ⌃J multi-line composer that grows to 5 lines, wheel/PgUp scrollback with "N lines back" footer + snap-to-tail on send. (4) Breadcrumb row in center (chat›session / editor›relpath / graph), CTRL's crumb row. Editor gains crumb(). 77 tests green (2 new: permission card lifecycle, md fence toggling), clippy -D clean.
 _________________________________________________________________________________
-
 time:      [late] [07-03-26]
 agent:     [claude] [fable 5]
 worktree:  feat/ocean-tui-shell-rebuild
@@ -1390,7 +1351,6 @@ area:      [design]
 
 CTRL's UPPER model adopted, per John (the actual original ask): the title bar is now the primary control surface — clickable icon toggles at top-right exactly like CTRL's draw_title (⊞ sessions rail · ❯ chat · ✎ editor · ⟠ graph · ⊟ terminal · ◨ file tree), each lit in its color when active, with hit rects checked before pane routing. Rails and the terminal dock TOGGLE visibility (collapse to 0 like CTRL's sess_w/tree_w); terminal button spawns a plain shell at the project root on first press (CTRL's ensure_terminal). Project label left, live status pill center. Hotkeys demoted to secondary — the app is fully mouse-drivable. Lesson recorded three corrections deep: John's "get rid of the lower tab model, use the upper tab model from CTRL" meant THIS from the start. 77 tests green, clippy -D clean.
 _________________________________________________________________________________
-
 time:      [late] [07-03-26]
 agent:     [claude] [fable 5 + 5 scout agents]
 worktree:  feat/ocean-tui-shell-rebuild
@@ -1399,7 +1359,6 @@ area:      [research]
 
 OMP → Ocean port map complete: 5 parallel agents read oh-my-pi's actual source (tools layer, Rust crates, agent runtime, terminal UI, config/routing) and the synthesis landed at docs/specs/2026-07-03-omp-port-map.md. Organizing principle per John: harness PROFILES keyed on client_type (tui=full IDE harness, web=lean, voice=minimal) — features attach to profiles, never global. Proposed crates: ocean-hashline, ocean-ast, ocean-walker, ocean-search, ocean-minimizer, ocean-iso + extensions to daemon/agent/context/tui/acp. Headline findings: pi-walker/pi-iso/pi-ast/pi-uu-grep are MIT lift-as-is (pi-walker hand-rolls getattrlistbulk on macOS; pi-iso does APFS clonefile CoW isolation); pi-shell forks and splits (25k-LOC output minimizer first); TTSR decoded (abort→truncate messages→hidden rule injection→regenerate); compaction is promote→prune→shake→summarize with protection matchers; session store is a branching tree (enables checkpoint/rewind); three-tier rule delivery (inline/indexed rule:///TTSR) maps onto OKF; append-only native-scrollback rendering is the streaming-stability architecture for the TUI. 8 build waves W0-W7, W0 = the HarnessProfile seam. This doc is the standing backlog — features never need re-naming.
 _________________________________________________________________________________
-
 time:      [late] [07-03-26]
 agent:     [claude] [opus 4.8 + 3 opus agents]
 worktree:  feat/ocean-tui-shell-rebuild
@@ -1408,7 +1367,6 @@ area:      [backend]
 
 OMP port W0+W1 foundation landed, 3 parallel opus agents on disjoint crates, integrated clean. W0: crates/ocean-daemon/src/harness_profile.rs — HarnessProfile{Tui,Web,Voice,Cli,Acp} resolved from client_type in agent_turn, HarnessCapabilities{lsp,hashline_edits,stream_rules,rich_context,memory,artifacts,minimizer} bundle per profile (Tui/Acp=all, Web=memory+artifacts, Voice=memory, Cli=hashline+minimizer+artifacts; unknown→Cli conservative). Seam only — logs, doesn't gate yet. W1 crown jewel: crates/ocean-hashline/ — faithful Rust port of OMP's hashline (twox-hash xxHash32&0xFFFF 4-hex file tag over trailing-ws-stripped LF; Patch::parse [path#HASH] + SWAP/DEL/INS.PRE|POST|HEAD|TAIL with +-sigil bodies; apply+stale MismatchError{hash_recognized}; SnapshotStore LRU realpath-keyed w/ seen_lines; Recovery 3 ordered zero-fuzz strategies; NoopLoopGuard). 54 tests, block/file ops parse-rejected (need ocean-ast, later wave). TUI: shell/slash.rs — real / command palette (fuzzy, ↑↓/⏎, /clear+/help wired, rest status-stubbed). Workspace clippy clean, all tests green. NEXT (orchestrator owns): wire ocean-hashline into read/edit tools with session-scoped snapshot store, gated on profile.capabilities().hashline_edits.
 _________________________________________________________________________________
-
 time:      [early] [07-04-26]
 agent:     [claude] [opus 4.8]
 worktree:  feat/ocean-tui-shell-rebuild
@@ -1417,7 +1375,6 @@ area:      [backend]
 
 W1 hashline WIRED end-to-end through the real tool path (the delicate integration, done by orchestrator not a fanned agent). SessionContext gains `hashline: bool`; ReadTool::for_cwd_with_snapshots emits a `[path#HASH]` tag + records a session snapshot; new tools/hashline_edit.rs applies patches with 3-strategy recovery + stale rejection; BuiltinProvider holds a session-keyed SnapshotStore map (shared read↔edit across turns) and injects the hashline read + hashline_edit tool only when ctx.hashline. Plumbed via PromptControl::with_hashline_edits (default false — every legacy caller unchanged) set in the daemon agent_turn from harness_caps.hashline_edits — so ONLY tui/acp/cli profiles get it; web/voice keep the plain read contract untouched. ocean-runtime now deps ocean-hashline. Verified: new tests/hashline_wiring.rs drives read→tag→hashline_edit→file-rewritten + stale-tag-rejected + profile-gate-off (no tag, no edit tool); workspace clippy -D clean, all touched-crate tests green (runtime 103+2, agent 248, daemon, hashline 61, longhouse). NOTE: branch stays PR-gated to main (John's drive-test + Codex review) — not merged; daemon deploys from main only.
 _________________________________________________________________________________
-
 time:      [morning] [07-04-26]
 agent:     [claude] [fable 5 + opus agent]
 worktree:  feat/ocean-tui-shell-rebuild
@@ -1426,7 +1383,6 @@ area:      [frontend]
 
 W2 part 1 landed: shell/markdown.rs — streaming markdown renderer with OMP's prefix-freeze (fence-aware block splitting, frozen blocks served from a content-hash cache, only the growing tail re-renders; CacheStats proven by test: streaming a tail keeps misses==1). Syntect code fences on the dark bed, headings/lists/quotes/inline styles; `_` deliberately not italic so snake_case survives. Chat: assistant text streams through it; tool cards get args summaries + collapsed 3-line tail window + ⌃O global expand toggle. 107 tui tests green, clippy -D clean. Skipped for later: read-coalescing, phase-locked spinners.
 _________________________________________________________________________________
-
 time:      [midday] [07-04-26]
 agent:     [claude] [fable 5 + 3 opus agents]
 worktree:  feat/ocean-tui-shell-rebuild
@@ -1435,7 +1391,6 @@ area:      [backend]
 
 W2 complete + W3 opened, 3 parallel opus lanes integrated clean (workspace: 1412 tests, 0 failed, clippy -D clean). W2 TUI: shell/diff.rs — edit/write/hashline_edit tool calls render as diff cards (similar line diff, word-level REVERSED runs on paired lines ≥0.5 ratio, hashline patches rendered natively, 12-row truncation on the ⌃O toggle); shell/history.rs — persisted prompt history (~/.config/ocean-rs/tui_history, cap 200, JSON-lines, non-fatal I/O) with ↑/↓ recall + draft restore, ⌃R fuzzy overlay reusing the palette scorer, ⌃U/⌃K/⌃Y kill ring (permission-allow beats yank, tested). W3a: ocean-runtime artifacts.rs — session ArtifactStore (8MiB/64-entry evict-oldest) + SpillingTool decorator at the REGISTRY level (catches MCP tools too): >24KB tool output keeps a 16KB line-bounded head + '[output truncated… read artifact://<id>]' notice, full bytes retrievable via read artifact:// (decorator-bypassed, no circular spill); gated on harness_caps.artifacts via PromptControl.artifact_spill (hashline pattern). W3b: NEW crates/ocean-ast — pi-ast summarize_code port (MIT attributed): 9 grammars (rust/ts/tsx/js/py/go/bash/toml/json, tree-sitter 0.26.9), elidable-span forest + BFS unfold to a 120-line budget, min_body_lines 4, panic-free passthrough on parse failure, 24 tests. Remaining W3 for next cycle: BM25 tool discovery, ocean-minimizer, prune/shake compaction, wiring ocean-ast summarization into read.
 _________________________________________________________________________________
-
 time:      [midday] [07-05-26]
 agent:     [claude] [fable 5]
 worktree:  feat/ocean-tui-shell-rebuild
@@ -1444,7 +1399,6 @@ area:      [frontend]
 
 First self-driven TUI verification pass (new definition-of-done: drive the real binary in a tmux PTY, inspect frames). REPRODUCED John's "text coming in" bug live: submitted a turn on a session whose SSE stream had died — daemon ran it, reply streamed into the void, chat showed nothing. ROOT CAUSE: reqwest client's 120s TOTAL timeout applies to SSE bodies → every stream was guaranteed dead after 2 minutes, and the client never reconnected (submit_turn didn't resubscribe). FIXED: per-request ~infinite timeout on SSE; agent stream is now a self-healing reconnect loop with Last-Event-ID replay (OCEAN-129) + replay=1 on the mint path only (OCEAN-305 race; resume loads from disk so no replay → no duplicates); global /v1/events stream got the same loop; App now holds the stream JoinHandle, aborts superseded streams on session switch, and DROPS agent events whose session_id ≠ bound session (stale-stream pollution guard). RE-VERIFIED live in tmux: same scenario now streams (thinking pill + reply + 'stream connected'). Punch list from the drive (not yet fixed): keyboard trap — ⌃⌥1/2/3 dead in legacy-encoding terminals (ctrl-3 IS ESC) so editor/dock can strand a keyboard-only user (mouse title buttons rescue, verified via injected SGR click); palette pane-focus commands are status stubs and the palette only opens from chat; doubled splitter columns (▏▏▏) vs CTRL's single edge; palette descriptions truncate; [TUI] prefix leaks in single-line resumed history; hydrating 't' runs the release `ocean` (legacy) inside the dock — post-merge that recurses the workbench. 133 tui tests green, clippy -D clean.
 _________________________________________________________________________________
-
 time:      [03:18pm] [05-07-26]
 agent:     [pi] [gpt-5.5] [Daemon session API engineer]
 worktree:  feat/ocean-tui-shell-rebuild
@@ -1453,7 +1407,6 @@ area:      [backend]
 
 Enriched the daemon session-list contract so `GET /v1/agent/sessions` keeps the existing `cwd` field unchanged while also exposing optional `workspace_root`, `git_branch`, and `owning_project { id, name }`. Added `AgentRuntime::owning_project_for_root`, which first exact-matches the session workspace root and then resolves linked git worktrees through `git -C <root> rev-parse --path-format=absolute --git-common-dir` back to the main checkout before matching project ownership. Verified the new worktree resolver test, full `ocean-agent` tests, SDK check, and daemon build; did not restart the daemon.
 _________________________________________________________________________________
-
 time:      [ 5:27PM] [07-05-26]
 agent:     [claude] [opus 4.8]
 worktree:  feat/ocean-tui-shell-rebuild
@@ -1480,7 +1433,6 @@ palette, /graph+/terminal nav, Esc + double-Esc + disarm, clean rail titles.
 -rebuild; left for John's drive + review before main. Surface files (ci.yml,
 ocean-daemon, ocean-agent, ocean-runtime, bus.rs) untouched.
 _________________________________________________________________________________
-
 time:      [ 5:55PM] [07-05-26]
 agent:     [claude] [opus 4.8]
 worktree:  feat/ocean-tui-shell-rebuild
@@ -1503,7 +1455,6 @@ request. Verified in a tmux drive: all 19 render correctly, /compact hint,
 /model sets the override, /new resets. 144 tests green, clippy -D clean. Pushed
 to feat/ocean-tui-shell-rebuild for John's drive.
 _________________________________________________________________________________
-
 time:      [ 5:20PM] [07-06-26]
 agent:     [claude] [opus 4.8]
 worktree:  feat/ocean-tui-shell-rebuild
@@ -1545,7 +1496,6 @@ area:      [backend]
 
 POST /v1/projects now creates the workspace directory on disk and stores a canonical path. expand_tilde() resolves leading ~ to $HOME; create_dir_all runs on the expanded path before canonicalize; the canonical path is stored in Project.workspace_root. Empty workspace_root passes through unchanged (existing behavior). On mkdir or canonicalize failure, returns 400 with a concise error. Added GET /v1/fs/dirs?path=<abs-or-~path>: sandboxed to $HOME (403 outside), skips dot-directories, dirs only, alphabetical, git flag when child/.git exists. Response includes home, parent (null at $HOME), and per-entry path+name+git. 5 new unit tests (expand_tilde, path_is_under, mkdir+canonicalize, empty root passthrough, banner well-formed). Verification: cargo test (253 passed), live smoke test through proxy confirmed ~/dev/... expanded, directory created on disk, canonical path stored.
 _________________________________________________________________________________
-
 time:      [ 6:40PM] [07-06-26]
 agent:     [claude] [opus 4.8]
 worktree:  feat/ocean-tui-shell-rebuild
@@ -1573,7 +1523,6 @@ Committed ea96a3a. TUI-only (no daemon redeploy); ocean binary rebuilt so it's
 live on next launch. Separately, the concurrent fs/dirs session landed its work
 as 0000549 on this branch. main stays at f123ae3 (the deployed daemon).
 _________________________________________________________________________________
-
 time:      [ 4:42PM] [07-07-26]
 agent:     [codex] [gpt-5.5]
 worktree:  feat/ocean-tui-shell-rebuild
@@ -1582,7 +1531,6 @@ area:      backend
 
 Extended provider auth/model routing for Ocean. Added GLM/Zhipu as an OpenAI-compatible provider (`glm-4.6`, `glm-4.5`, `glm-4.5-flash`) with GLM/Zhipu/ZAI env-key support. Added Claude Code plan OAuth as a separate `claude-code` provider: Ocean auth-file OAuth blocks (`claude-code`, `anthropic-oauth`) and Claude Code bearer env tokens resolve to bearer credentials, the agent maps public `claude-code-*` aliases onto Anthropic Messages API model ids, and ocean-protocol now switches Anthropic auth between `x-api-key` and `Authorization: Bearer`. Hardened Codex OAuth by rejecting expired Ocean `openai-codex` blocks and falling back to Codex CLI auth JSON (`OCEAN_CODEX_AUTH_FILE` or `$HOME/.codex/auth.json`) for token/account id. Fixed the Anthropic registry base URL to the host root so protocol appends `/v1/messages` exactly once. Verification: `cargo test -p ocean-providers` 33 passed, `cargo test -p ocean-protocol` 115 passed, `cargo test -p ocean-agent` 112 passed, `cargo check --workspace` OK. `cargo fmt --check` is still blocked by broad pre-existing formatting diffs across unrelated files on this branch.
 _________________________________________________________________________________
-
 time:      [10:14pm] [07-07-26]
 agent:     [claude] [fable-5]
 worktree:  feat/ocean-tui-shell-rebuild
@@ -1616,7 +1564,6 @@ ocean-tui `mentions` work in the tree. Next arcs scoped: LSP tool (Diagnostics
 Ledger + writethrough), steering (steer-queue + between-tool interrupt), in-loop
 classified retry, wire the dead NoopLoopGuard.
 _________________________________________________________________________________
-
 time:      [10:35pm] [07-07-26]
 agent:     [claude] [fable-5]
 worktree:  feat/ocean-tui-shell-rebuild
@@ -1650,7 +1597,6 @@ elsewhere). A scout is concurrently hunting the next batch of harness defects
 (incl. URGENT check: does the TUI chat render interleaved Start/Start/End/End
 correctly now that tools parallelize).
 _________________________________________________________________________________
-
 time:      [10:45pm] [07-07-26]
 agent:     [claude] [fable-5]
 worktree:  feat/ocean-tui-shell-rebuild
@@ -1676,7 +1622,6 @@ URGENT parallel-tools question from the last entry: the shell chat keys tool
 cards by call_id (chat.rs tool_by_id), so interleaved concurrent Start/End
 events render correctly — no TUI fix needed.
 _________________________________________________________________________________
-
 time:      [10:55pm] [07-07-26]
 agent:     [claude] [fable-5]
 worktree:  feat/ocean-tui-shell-rebuild
@@ -1698,7 +1643,6 @@ addition. 3 new tests (regex matches, literal fallback w/ note, giant-line
 clip). tools_smoke 12/12, full runtime suite 11/11 targets green, workspace
 check clean.
 _________________________________________________________________________________
-
 time:      [11:25PM] [07-07-26]
 agent:     [claude] [fable 5]
 worktree:  feat/ocean-tui-shell-rebuild
@@ -1723,7 +1667,6 @@ diffs — verified all features on real frames with it. Commits be93c29,
 48455da; 147 tests; binary rebuilt. Interleaved cleanly with the other agent's
 runtime lane (9fa43fa, 5319a0f, 21eefdf — no file overlap).
 _________________________________________________________________________________
-
 time:      [11:59pm] [07-07-26]
 agent:     [claude] [fable-5]
 worktree:  feat/ocean-tui-shell-rebuild
@@ -1763,7 +1706,6 @@ deferred: TodoTool/web_fetch session-rebind bleed (capability.rs is the other
 lane's file tonight), per-profile lsp gating via SessionContext (same file),
 TUI cancel in the new shell.
 _________________________________________________________________________________
-
 time:      [11:38pm] [07-07-26]
 agent:     [claude] [fable-5]
 worktree:  feat/ocean-tui-shell-rebuild
@@ -1786,7 +1728,6 @@ including its own retry/bash/grep tests). Its landed work was never at risk
 intent lives in stash@{0}; inspect before reusing — the stash by itself is a
 test-breaking half-state.
 _________________________________________________________________________________
-
 time:      [11:44pm] [07-07-26]
 agent:     [claude] [fable-5]
 worktree:  feat/ocean-tui-shell-rebuild
@@ -1807,7 +1748,6 @@ NOT sufficient evidence a concurrent session is dead — verify with John
 before touching another lane's uncommitted state; stash-not-discard is the
 right instinct but even a stash yanks files out from under a live session.
 _________________________________________________________________________________
-
 time:      [11:40PM] [07-07-26]
 agent:     [claude] [fable 5]
 worktree:  feat/ocean-tui-shell-rebuild
@@ -1816,7 +1756,6 @@ area:      frontend
 
 Added a live `/login` slash command to the ocean-tui shell. Registry gains `/login` in the session group; `run_slash` routes bare `/login` (and `claude|claude-code|anthropic`) to `Action::Login(LoginTarget::Claude)` and `codex|openai-codex|chatgpt|openai` to `LoginTarget::Codex`, unknown args get a usage hint; `App::dispatch` opens the provider login URL in the default browser off-thread via the new `open` dependency (same async pattern as `/copy`) and reports success/failure in the status line with a post-auth readiness hint. TUI-only slice — no daemon endpoint; credentials still land via provider CLI/auth-file flows resolved by ocean-providers. TDD: three RED tests first (`login_is_registered_and_log_ranks_it_first`, `slash_login_without_args_routes_claude_login`, `typed_login_codex_routes_login_action_not_user_turn`). Verification: `cargo test -p ocean-tui` 150 passed, `cargo build -p ocean-tui --release` OK, `cargo check --workspace` OK. Cargo.lock delta is the `open` dep only. Concurrent runtime-lane files left untouched.
 _________________________________________________________________________________
-
 time:      [11:58pm] [07-07-26]
 agent:     [claude] [fable-5]
 worktree:  feat/ocean-tui-shell-rebuild
@@ -1846,7 +1785,6 @@ pairing-intact; immediate second pass rewrites 0 (cache stability). ocean-agent
 123 green, workspace check clean. LLM summarize tier + tiktoken-real counts
 remain W3 follow-ups.
 _________________________________________________________________________________
-
 time:      [12:14am] [07-08-26]
 agent:     [claude] [fable-5]
 worktree:  feat/ocean-tui-shell-rebuild
@@ -1874,7 +1812,6 @@ parse/error-hygiene/empty-token (3, protocol, vs fake endpoint), needs-refresh
 matrix + atomic-write key preservation + e2e rewrite via endpoint override
 (3, agent). ocean-agent 126 + ocean-protocol 113 green, workspace clean.
 _________________________________________________________________________________
-
 time:      [12:26am] [07-08-26]
 agent:     [claude] [fable-5]
 worktree:  feat/ocean-tui-shell-rebuild
@@ -1896,7 +1833,6 @@ guard never across an await, per the crate's own discipline. Tests: retain→
 recall round-trip (substring hit, newest-first order, clean miss), oversized-
 retain rejection. ocean-agent 128 green, workspace check clean.
 _________________________________________________________________________________
-
 time:      [12:20AM] [07-08-26]
 agent:     [claude] [fable 5]
 worktree:  feat/ocean-tui-shell-rebuild
@@ -1915,7 +1851,6 @@ real failure in the pyte harness: dead port → send → retries → stub daemon
 mid-window → session+turn POSTs land, no error wall; and the give-up path shows
 the note + restored prompt after 7 attempts. 150 tests. Binary rebuilt.
 _________________________________________________________________________________
-
 time:      [12:55AM] [07-08-26]
 agent:     [claude] [fable 5]
 worktree:  main
@@ -1961,7 +1896,6 @@ area:      frontend
 
 Fixed John's "tool calls printing massive outputs": collapsed tool cards capped line COUNT (3-row tail) but not line LENGTH, and the transcript Paragraph wraps — so a tool returning one giant single-line blob (JSON from recall/lsp/MCP results) wrapped into hundreds of rows, defeating the tail window. Collapsed cards now clamp each tail line to one screen row (char-truncate + ellipsis, whitespace preserved — new clamp_line, distinct from one_line which flattens indentation); ⌃O still opts into full wrapped output. Suite 157/0.
 _________________________________________________________________________________
-
 time:      [2:33PM] [07-08-26]
 agent:     [claude] [fable 5]
 worktree:  feat/ocean-tui-shell-rebuild
@@ -2026,7 +1960,6 @@ area:      backend
 
 Claude model refresh + in-TUI-agent guardrails. John's "old anthropic models don't work": probed api.anthropic.com live with his subscription token — the wire/auth is CORRECT (bare Bearer, no beta header needed; claude-haiku-4-5 returned 200 OK), the registry ids were just stale (sonnet-4-6 connection-resets at the edge now; opus-4-7 is last-gen; the 429s on big models are his sub quota window, all new ids are recognized). Registry moved to the current generation: claude-opus-4-8 / claude-sonnet-5 / claude-haiku-4-5 (anthropic) + claude-code-fable-5/opus-4-8/sonnet-5/haiku-4-5 (subscription), aliases (opus/sonnet/haiku/fable, cc-*) repointed, DEFAULT_FALLBACK_ORDER → claude-sonnet-5, old ids retired from the menu but kept routable for pinned sessions; Model constructors added in ocean-protocol, claude-code→API mapping extended in ocean-agent, example agent + docs updated. Slash palette now scrolls to keep the selection visible (bare / overflowed the overlay and stranded the cursor offscreen — John's screenshot). ocean-tui/AGENTS.md gained Hard Rules from tonight's real failures (enums additive-only + grep call sites, compile before finishing, re-read before edit in concurrent lanes, sanitize_line for any rendered output, Elm loop is the only mutation channel). Suites: providers 34, agent 128, tui 164, daemon 264 — green.
 _________________________________________________________________________________
-
 time:      [5:51PM] [07-08-26]
 agent:     [claude] [fable 5]
 worktree:  feat/ocean-tui-shell-rebuild
@@ -2067,7 +2000,6 @@ area:      frontend
 
 Markdown renderer completeness (John: "should handle everything an agent throws at it"): tables now render as padded columns with │ dividers and a ─┼─ header rule (was raw pipe soup — his screenshot), inline styles work inside cells, one long cell can't blow out the layout (48-char cap). Also landed: horizontal rules (---/***/___ → dim line), links ([text](url) → cyan-underline label + dim copyable url), ~~strikethrough~~ (CROSSED_OUT), and task lists (- [x] → green ☑, - [ ] → dim ☐). 4 new unit tests; suite 168/0. Still open on this thread: inline images/screenshots via kitty graphics (ratatui-image + placeholder-row overlay architecture) — next block.
 _________________________________________________________________________________
-
 time:      [9:54PM] [07-08-26]
 agent:     [claude] [fable 5]
 worktree:  feat/ocean-tui-shell-rebuild
@@ -2100,7 +2032,6 @@ area:      backend
 
 /memory surfaced (port item 2 of 3). The retain/recall store was wired for the AGENT but had no operator-facing surface. Added ocean_agent::list_memories(path, cap) → Vec<MemoryView{id,kind,text,updated_at}> (paged read over the operator's SqliteMemoryStore, fail-soft on missing store), daemon GET /v1/memory (spawn_blocking, read-only), TUI client.memory() + MemoryEntry, and a /memory browser overlay: search box (type to filter, client-side substring), ↑↓ scroll, ⏎ copies the selected memory's text to clipboard, esc closes; kind badge per row. /memory flipped soon→live. Fixed a menu-ordering test the flip exposed: /memory is a live command in the roadmap-tier 'agent' group, so "all live before all soon on the bare menu" is obsolete — the menu is topically grouped; replaced with a group-contiguity invariant + a ranked live-before-soon test. Suites: tui 174, agent 128; workspace 0 errors. Daemon changed → redeploy.
 _________________________________________________________________________________
-
 time:      [10:30am] [07-09-26]
 agent:     [claude] [opus 4.8]
 worktree:  feat/ocean-tui-shell-rebuild
@@ -2148,7 +2079,6 @@ verified: mint 502s clean without a key, append round-trips + shows as
 configured anywhere yet - realtime voice needs one (openai api_key block in
 ~/.config/ocean-rs/auth.json or OPENAI_API_KEY in the daemon env).
 _________________________________________________________________________________
-
 time:      [6:50PM] [07-09-26]
 agent:     [claude] [fable 5]
 worktree:  feat/ocean-tui-shell-rebuild
@@ -2291,7 +2221,6 @@ area:      [backend]
 
 Completed voice phase 4: the daemon now owns the xAI speech credential. Added POST /v1/voice/stt (raw audio bytes -> multipart grok-stt relay -> {text}) and POST /v1/voice/tts ({text,voice?} -> grok-tts -> audio bytes) in a new voice_speech module (pure body builders + normalizers unit-tested; shared LazyLock bounded client, connect 10s / request 60s). Credential resolves per-request via ocean-providers resolve_xai_api_key (env XAI_API_KEY -> auth.json xai block), so key rotation needs no restart; errors never carry the key. Empty transcripts stay valid empty text, mirroring the legacy proxy contract for silence utterances. Also drove the realtime upstream-body test from DEFAULT_REALTIME_MODEL instead of a stale hardcoded id. The surface proxy's /api/stt and /api/tts forward here as of the paired ocean-surface landing; the proxy no longer reads any xAI key.
 _________________________________________________________________________________
-
 time:      [05:23am] [10-07-26]
 agent:     [omp] [openai-codex/gpt-5.6-sol]
 worktree:  feat/ocean-tui-shell-rebuild
@@ -2329,7 +2258,6 @@ and added the paragraph noting the surface /api/stt|/api/tts forwards to the dae
 and that provider keys (xAI, OpenAI) resolve only inside ocean-os. Map edit only;
 no code touched.
 _________________________________________________________________________________
-
 time:      [08:25pm] [07-10-26]
 agent:     [claude] [fable-5]
 worktree:  fix/immediate-provider-halt
@@ -2360,7 +2288,6 @@ area:      [backend]
 
 Added compile-time provenance to ocean-daemon: build.rs embeds the 12-character git HEAD, appends -dirty for uncommitted worktrees, and falls back to unknown when git cannot verify the checkout. GET /health and GET /ready now surface that value as rev while preserving the existing health wire shape, and the focused handler test asserts rev is present and non-empty. The release was rebuilt from the pushed clean main commit into the launchd-managed target path, the ocean TUI binary was refreshed from the same tree, and dev.risingtides.ocean-daemon was restarted so the live health endpoint proves the exact deployed revision.
 _________________________________________________________________________________
-
 time:      [11:15pm] [10-07-26]
 agent:     [omp], [claude-fable-5]
 worktree:  main
@@ -2369,7 +2296,6 @@ area:      [analysis]
 
 Branch-state triage after multi-agent confusion: verified feat/ocean-tui-shell-rebuild is FULLY merged into origin/main (merge 892866e8, 0 unique commits remain) and the "behind by 31" was only a stale local main — fast-forwarded local main 32 commits to 38da7e03. The stash taken on the feature tip (80ac2d04) was preserved durably as branch wip/stash-readline-era-refactor (db5d9f89) and adjudicated as a CONTAMINATED working tree, not a resumable refactor: its runtime files (agent_loop.rs, bash/grep/edit/hashline_edit.rs) are byte-identical to pre-508085d7 versions, so applying it would revert the landed round-retry + noop-guard feature; its headline additions (agent_session_message_append, voice_realtime_client_secret) already landed on main in reworked form. Possibly-unique crumbs on that branch: two tools_smoke read-window tests + small capability.rs/hashline_wiring.rs deltas. An untracked older voice_realtime.rs draft (pinned gpt-realtime-2.1; main deliberately pins gpt-realtime-2) was backed up to /tmp/voice_realtime.local-backup.rs before the ff. Awaiting operator call on salvage-vs-freeze of the wip branch.
 _________________________________________________________________________________
-
 time:      [11:40pm] [10-07-26]
 agent:     [omp], [claude-fable-5]
 worktree:  main
@@ -2378,7 +2304,6 @@ area:      [infra]
 
 Daemon provenance cleanup + redeploy: live /health had been reporting rev 38da7e03-dirty. Root cause of the dirty flag: build.rs uses plain `git status --porcelain`, and untracked scaffolding (.superpowers/, 5.1GB stale target-ci/) polluted it. Deleted both, gitignored them, committed the stray 07-09 handoff + shell-completion spec docs (e7cb268a). Rebuilt ocean-daemon release from clean main and kickstarted dev.risingtides.ocean-daemon — /health now proves rev e7cb268afa50 with no dirty suffix. Also this session: deleted stash@{0}, wip/stash-readline-era-refactor, and feat/ocean-tui-shell-rebuild (local+remote) per operator; flagged wip/room-execution-isolation-local and origin/backup/codex-models-wip-20260710 as UNLANDED real work (room isolation spec+daemon code; codex models-cache providers feature) awaiting operator decision.
 _________________________________________________________________________________
-
 time:      [12:05am] [11-07-26]
 agent:     [omp], [claude-fable-5]
 worktree:  main
@@ -2387,7 +2312,6 @@ area:      [infra]
 
 Branch graveyard purge: triaged all 83 stray refs (local + origin). 57 were fully merged or patch-equivalent to landed main content; the stale remainder (May/June PR lanes, backup-before-sync refs, abandoned rescues incl. rescue/ocean-rooms-workspace-packet, backup/stash-archive-20260701, backup/device-local-20260709, ops/prod-hardening, feat/ocean-voice, mobile-webui-base, the ocean-3xx context lanes) was deleted per operator directive — 77 remote + 6 local branches removed. Also nuked earlier at operator request: wip/room-execution-isolation-local and origin/backup/codex-models-wip-20260710 (codex models-cache WIP). Survivors: feat/slack-quality-rooms-core (dated today, possibly a live lane) and fix/immediate-provider-halt-b (checked out in ~/dev/ocean-os-halt2 with UNCOMMITTED agent_loop.rs edits — left untouched, likely a live session). gitbutler/* internals untouched.
 _________________________________________________________________________________
-
 time:      [03:30am] [11-07-26]
 agent:     [omp], [claude-fable-5]
 worktree:  main
@@ -2396,7 +2320,6 @@ area:      [backend]
 
 Three-bug night, all diagnosed from john live TUI failures and fixed by three parallel subagents, landed as ed2c9fa8: (1) tui/errfmt — reqwest timeout strings matched is_connect_shaped, so >120s turn-ack waits rendered as fake "couldn't reach the daemon" with a press-enter-to-retry affordance that double-submitted turns; timeouts now classify separately, honest message, no prompt restore. Turn POST confirmed fire-and-ack (SSE carries output), 120s ack timeout retained. (2) agent/system_prompt — the prompt never stated the session cwd, so models hallucinated paths (/home/ubuntu/agent-0, /Users/pietro/...); a compact ## Environment block now grounds cwd, workspace root, git branch@commit. (3) agent/session — split-brain: bind_workspace rebind left the old workspace-bucket file orphaned and load_resumable short-circuited on first exists() in unsorted read_dir order, so turns nondeterministically loaded an empty stub vs real history (live repro: session fd0d47d4 had a 0-message stub in the AI-memo bucket and 11 messages in the home bucket; 7 more ids affected). save() now purges duplicates (fsync+rename), load picks deterministic winner and self-heals. Gates: ocean-agent 144/0, ocean-tui 301/0, clippy -D warnings, fmt, cargo check --workspace all green. Daemon rebuilt and kickstarted at rev ed2c9fa8 (clean stamp); TUI release binary rebuilt — john must restart his TUI to pick it up. Remaining duplicates self-heal lazily on first session access.
 _________________________________________________________________________________
-
 time:      [04:25am] [11-07-26]
 agent:     [omp], [claude-fable-5]
 worktree:  main
@@ -2405,7 +2328,6 @@ area:      [backend]
 
 Ocean memory made usable (85c27ccd, deployed): the retain/recall tools existed since the port-map win but nothing advertised them and the store was empty, so no model ever used memory. build_system_prompt_from now takes a memory_db seam (production: <config>/memory.sqlite): a "## Memory" section teaches recall-at-task-start / retain-durable-facts, and a "## What you already know" block injects the newest 10 retained facts via list_memories (200-char clip, fail-soft on missing/unopenable store). New examples/seed_memory.rs idempotently seeds the operator store; ran it live - 8 curated facts inserted (repo map, port+health path, build/deploy commands, session store location, ledger discipline, operator conventions). Gates: ocean-agent 148/0, clippy -D warnings, fmt all green. Daemon rebuilt + kickstarted at rev 85c27ccd4026; live smoke turn proved injection (model cited the system-prompt fact verbatim and answered port/health correctly with zero tool calls). Also in flight: FleetCockpitBlueprint spec for OMP-style subagents + todo + live fleet TUI.
 _________________________________________________________________________________
-
 time:      [05:25am] [11-07-26]
 agent:     [omp], [claude-fable-5]
 worktree:  main
@@ -2456,7 +2378,6 @@ area:      [backend]
 
 Fixed Ocean's GPT-5.6 Codex prompt-cache identity after an exact Luna/high benchmark showed Ocean at 83,159 fresh input tokens and only 15,360 cache-read tokens versus Codex CLI at 28,566 fresh and 173,312 cached. The runtime now threads its stable `AgentConfig::session_id` into every provider round; the Codex provider sends that id as both `prompt_cache_key` and the HTTP `session_id`, retaining a random UUID only for ad-hoc calls. Focused protocol/runtime regressions cover request serialization and runtime propagation. The exact rerun stayed 6/6 and improved Ocean to 17,926 fresh input with 118,272 cached (86.8% hit rate), beating Codex CLI's 24,763 fresh input and estimated API-equivalent cost while retaining a 63.8MB versus 381.7MB marginal-memory advantage. Ocean remained slower on this sample (87.662s versus 55.958s). Verification: 283 protocol/runtime tests, `cargo check --workspace`, and `cargo fmt --check`.
 _________________________________________________________________________________
-
 time:      [07:39pm] [12-07-26]
 agent:     [omp], [gpt-5.6-sol]
 worktree:  main
@@ -2465,7 +2386,6 @@ area:      [backend]
 
 Removed the competing legacy `edit` tool from hashline-enabled Ocean sessions while preserving it for plain Web/Voice and unbound profiles; `write` remains universal. TUI, CLI/default, and future ACP sessions now receive one coherent surgical editor, `hashline_edit`, so the model cannot stochastically downgrade to repeated single-replacement edits instead of a batched multi-file patch. Added red/green capability tests for both profile contracts and retained the existing read-to-hashline integration coverage. Verification: 162 ocean-runtime tests, three hashline wiring tests, `cargo check --workspace`, and `cargo fmt --check`.
 _________________________________________________________________________________
-
 time:      [09:11pm] [12-07-26]
 agent:     [omp], [gpt-5.6-sol]
 worktree:  fix/restore-dual-editors
@@ -2474,7 +2394,6 @@ area:      [backend]
 
 Restored legacy `edit` alongside `hashline_edit` for hashline-enabled sessions after a controlled alternating GPT-5.6 Terra benchmark isolated a severe model-behavior regression from the hashline-only tool surface. Both-editor runs completed 6/6 in 29.57s and 21.69s; hashline-only runs completed 6/6 in 57.06s and 60.10s. The restoration reran 6/6 in 31.77s and 26.82s, with runtime CPU remaining negligible. Added a capability regression for dual-editor exposure; all 162 ocean-runtime tests, `cargo check --workspace`, and `cargo fmt --check` pass. The benchmark harness itself was not modified.
 _________________________________________________________________________________
-
 time:      [09:44pm] [12-07-26]
 agent:     [omp], [gpt-5.6-sol]
 worktree:  perf/tighten-agent-prompt
@@ -2587,7 +2506,6 @@ Fixed stale daemon build provenance discovered during deployment closeout. `crat
 
 Verification: emitted Cargo directives named the real `.git/HEAD`, `.git/refs/heads/main`, and `.git/packed-refs`; dirty pre-commit output reported `e3c181219352-dirty` honestly. `cargo check -p ocean-daemon`, strict daemon Clippy, all 294 daemon tests, format/diff checks, main/branch-linked/detached path inspection, and fresh independent review passed. The supervised binary is rebuilt from the committed fix after this ledger entry so `/health` can again track exact main.
 _________________________________________________________________________________
-
 time:      [05:35am] [11-07-26]
 agent:     [pi], [claude-fable-5], [orchestrator]
 worktree:  [main]
@@ -2685,7 +2603,6 @@ area:      [backend]
 Audited the whole ocean-providers/ocean-protocol call surface, focused on DeepSeek. Established that DeepSeek (like MiniMax/Kimi/GLM) has no provider impl of its own — it's a base_url plus a `provider == "deepseek"` string on the shared OpenAI chat-completions adapter, so every DeepSeek-specific behavior lives in one branch of openai.rs. Probed api.deepseek.com live rather than trusting the docs, which turned out to matter: two confidently-documented claims did not reproduce and were dropped instead of shipped (DeepSeek does NOT 400 when reasoning_content is stripped from a tool-calling assistant turn, so OCEAN-140's explicit drop stands; and cache tokens do decode — a live turn reported cache_read=9856). Four real defects did land: reasoning_effort was being sent as a top-level field when DeepSeek nests it inside `thinking`, and since DeepSeek silently drops unknown top-level fields, that failed open with no error and the user's thinking level likely never applied; ThinkingLevel::Off returned early and sent nothing, but DeepSeek thinks BY DEFAULT, so "thinking off" was still burning ~2-3k reasoning tokens a turn until the code started sending an explicit {"type":"disabled"}; deepseek-chat/deepseek-reasoner are hard-retired by DeepSeek on 2026-07-24 and are already gone from GET /models, so they now resolve forward onto v4-flash (pinned sessions survive the cutover) and are dropped from the picker; and the shared adapter's OPENAI_API_KEY env fallback was ungated by provider, meaning a keyless DeepSeek/MiniMax/Kimi/GLM turn would bearer-auth John's OpenAI secret to that vendor's host — a genuine cross-provider credential leak, now gated and reporting the right provider on failure. Also corrected the registry's V3-era 64k/8k capacity for models that actually hold 1M and emit up to 393,216, which had history eliding at 6% of the real window. 317 tests green, 8 new; deployed from main and verified by driving a real 2-round tool-using DeepSeek turn through the daemon (ok=true).
 _________________________________________________________________________________
 _________________________________________________________________________________
-
 time:  [12:54am] [07-13-26]
 agent: [pi] [gpt-5.2-pro]
 worktree: [main]
@@ -2695,7 +2612,6 @@ area:  [testing]: Remove retired dead surfaces and apply behavior-neutral Clippy
 The post-retirement main baseline passed tests but failed the repository's strict all-target Clippy gate on twelve ocean-tui findings. I removed unused graph/session/PTY/status surfaces, test-gated test-only helpers, and applied equivalent iterator/if-let forms. `cargo clippy -p ocean-tui --all-targets -- -D warnings`, 272 TUI tests (4 ignored), and the release build pass.
 _________________________________________________________________________________
 _________________________________________________________________________________
-
 time:  [12:54am] [07-13-26]
 agent: [pi] [gpt-5.2-pro]
 worktree: [main]
@@ -2705,7 +2621,6 @@ area:  [testing]: PID characterization and Unix process-group termination
 Phase 0B-2 proved the existing direct-child `kill_on_drop` path passed but a signal-resistant background descendant survived Halt (baseline PID 20796). BashTool now launches a child-owned Unix process group and uses an RAII SIGKILL guard on cancellation/timeout, draining inherited pipes before reaping to prevent PGID reuse. Direct/descendant PID regressions pass; immediate abort-on-drop test cleanup covers marker failures. The full `cargo xtask ci` gate, supported daemon feature checks, workspace test check, and two independent process/test reviews pass on macOS. Linux CI remains the completion gate.
 _________________________________________________________________________________
 _________________________________________________________________________________
-
 time:  [12:59am] [07-13-26]
 agent: [pi] [gpt-5.2-pro]
 worktree: [main]
@@ -2715,7 +2630,6 @@ area:  [testing]: CI run 29225077002 passed Ubuntu, macOS, and cargo-deny
 GitHub Actions validated commit 5f9d82b8 on ubuntu-latest and macos-latest, including the Unix direct-child and descendant Halt regressions in the full repository gate. The cargo-deny lane also passed. Phase 0B-2/1B-2 is complete; the only workflow annotation is GitHub's non-blocking Node 20 deprecation warning for actions/checkout@v4.
 _________________________________________________________________________________
 _________________________________________________________________________________
-
 time:  [01:04am] [07-13-26]
 agent: [pi] [gpt-5.2-pro]
 worktree: [main]
@@ -2725,7 +2639,6 @@ area:  [backend]: Rebuild clean main and restart supervised ocean-daemon
 After final-tip CI run 29225232240 passed, I confirmed a clean synchronized main and zero turns in flight, built the release workspace, and restarted only `dev.risingtides.ocean-daemon` through launchd. Health returned revision 2cdf34f15f4e with zero persistence/GC failures; neutral cwd `/Users/risingtidesdev`, PID 71451, and zero active turns were verified.
 _________________________________________________________________________________
 _________________________________________________________________________________
-
 time:  [01:36am] [07-13-26]
 agent: [pi] [gpt-5.2-pro]
 worktree: [main]
@@ -2735,7 +2648,6 @@ area:  [testing]: Injected concurrency seams, retry safety, and launch PID clean
 Phase 0B-3 confirmed the existing LazyBrowser mutex already enforced exactly one launch and cancellation-safe partial-cache behavior, but lock wait, liveness, and full attach/launch could stall until the much larger turn deadline. The state machine now bounds those phases at 40/3/30 seconds, preserves a cached handle on liveness timeout, and lets existing waiters consume a completed flight without serial re-probes. Eight deterministic runtime tests plus a real chromiumoxide fake-executable PID cancellation regression pass. Full local CI, supported daemon features, complete browser/runtime suites, and independent concurrency/process reviews pass; Linux CI remains.
 _________________________________________________________________________________
 _________________________________________________________________________________
-
 time:  [01:43am] [07-13-26]
 agent: [pi] [gpt-5.2-pro]
 worktree: [main]
@@ -2745,7 +2657,6 @@ area:  [testing]: CI run 29226786986 passed Ubuntu, macOS, and cargo-deny
 GitHub Actions validated f45a65df on ubuntu-latest and macos-latest, including the injected browser state-machine matrix and real chromiumoxide launch-cancellation PID test. The cargo-deny lane passed. Phase 0B-3/1B-3 is complete; the only annotation is GitHub's non-blocking Node 20 deprecation notice for actions/checkout@v4.
 _________________________________________________________________________________
 _________________________________________________________________________________
-
 time:  [01:52am] [07-13-26]
 agent: [pi] [gpt-5.2-pro]
 worktree: [main]
@@ -2755,7 +2666,6 @@ area:  [testing]: Fixed matrix, wall time, allocation traffic, and machine metad
 Implemented a release-only benchmark example for the real per-provider-round history preparation kernel (`trim_to_context_window` plus valid intermediate tool-pair appends). The fixed 10/100/1,000-message × 1/5/20-round matrix records raw and summarized wall-time/allocation samples after five warm-ups, along with clean-revision/toolchain/machine metadata and a defined regression threshold. A 1-warm-up/2-sample nine-cell smoke run and strict example Clippy pass; the clean-revision 30-sample baseline is next.
 _________________________________________________________________________________
 _________________________________________________________________________________
-
 time:  [02:06am] [07-13-26]
 agent: [pi] [gpt-5.2-pro]
 worktree: [main]
@@ -2765,7 +2675,6 @@ area:  [testing]: Release matrix, allocation evidence, and independent methodolo
 Ran the Phase 0B-4 history kernel benchmark from clean revision 7ad3bd8d on an Apple M4 with five warm-ups and thirty samples across all nine 10/100/1,000-message × 1/5/20-round cells. The largest median was 9.316 ms with 29.4 MB cumulative allocation traffic; this M4 kernel result does not justify a runtime redesign and is not an end-to-end latency claim. Independent review caught missing machine-readable metadata for the 10µs absolute timing floor and an overbroad scaling interpretation; both were fixed, the artifact was regenerated from a clean revision, and second-pass review passed. Artifact invariants, `cargo xtask ci`, workspace test check, formatting, docs integrity, and diff checks pass locally; the hosted macOS/Ubuntu matrix remains the completion gate.
 _________________________________________________________________________________
 _________________________________________________________________________________
-
 time:  [02:13am] [07-13-26]
 agent: [pi] [gpt-5.2-pro]
 worktree: [main]
@@ -2775,7 +2684,6 @@ area:  [backend]: Hosted validation and supervised daemon restart
 GitHub Actions run 29228061344 passed the full repository gate on macOS and Ubuntu plus cargo-deny for the clean history-cost baseline checkpoint. From clean synchronized main at 6459b7907c60, I reconfirmed zero turns in flight, built the release workspace, and restarted only `dev.risingtides.ocean-daemon`. Health reports revision 6459b7907c60 with zero persistence/GC failures; PID changed from 96905 to 44616, cwd remains neutral at `/Users/risingtidesdev`, and the post-restart in-flight gauge is zero. The browser single-flight fix is now live and Phase 0B-4 is complete.
 _________________________________________________________________________________
 _________________________________________________________________________________
-
 time:  [02:22am] [07-13-26]
 agent: [pi] [gpt-5.2-pro]
 worktree: [main]
@@ -2785,7 +2693,6 @@ area:  [testing]: Raw diagnostics, machine-readable sites, and bounded interpret
 Ran the exact warning-level production lint command from the approved plan on clean revision 546287bd across workspace library, binary, and example targets with default features. It exited 0 and recorded 16 unwrap, 57 expect, 0 panic, 6 unreachable, and 0 await-holding-lock diagnostics (79 total). The report, JSON, and 10,259-byte raw output retain scope/exclusions, toolchain/machine metadata, all source sites, counting rules, and SHA-256. Independent rerun reproduced the exact set and passed review; artifact invariants, full local CI, workspace test check, docs integrity, and diff checks pass. These remain invariant sites rather than defects, and no blanket denial was enabled; hosted validation remains.
 _________________________________________________________________________________
 _________________________________________________________________________________
-
 time:  [02:32am] [07-13-26]
 agent: [pi] [gpt-5.2-pro]
 worktree: [main]
@@ -2795,7 +2702,6 @@ area:  [testing]: CI run 29228821337 passed Ubuntu, macOS, and cargo-deny
 GitHub Actions validated the strict production lint inventory artifacts on ubuntu-latest and macos-latest, with cargo-deny also passing. The warning-level command, exact 79-site set, scope/exclusions, raw evidence, machine-readable counts, independent reproduction, local gate, and hosted gate are complete. Phase 0B is closed without treating invariant sites as bugs or enabling blanket unwrap/expect denial; supported feature, release-profile, and truthful MSRV compatibility is next.
 _________________________________________________________________________________
 _________________________________________________________________________________
-
 time:  [03:07] [13-07-26]
 agent: [pi] [gpt-5.2-pro]
 worktree: [pi/build-compat-20260713]
@@ -2806,7 +2712,6 @@ Characterization proved the declared Rust 1.80 floor was already impossible: Car
 _________________________________________________________________________________
 _________________________________________________________________________________
 _________________________________________________________________________________
-
 time:  [03:53] [13-07-26]
 agent: [pi] [gpt-5.2-pro]
 worktree: [pi/build-compat-20260713]
@@ -2816,7 +2721,6 @@ area:  [testing]: Hosted feature, release, MSRV, and policy validation
 Corrected GitHub Actions run 29231934039 passed macOS stable, Ubuntu stable, pinned Rust 1.88, and cargo-deny after the workflow made Ubuntu's required libglib2.0-dev prerequisite explicit. The stable jobs verified strict supported-feature Clippy and release all-target compilation; the MSRV job verified default and supported-feature compilation at the enforced floor. The slowest hosted job completed in 8m51s, within the retained 40-minute ceiling. The characterization and approved code-health/agent-readiness foundation plan now record this checkpoint complete.
 _________________________________________________________________________________
 _________________________________________________________________________________
-
 time:      [04:01] [13-07-26]
 agent:     [ocean-tui], [OpenAI API assistant]
 worktree:  [ocean/tui-launch-chooser-20260713]
@@ -2827,7 +2731,6 @@ Changed ocean-tui normal startup to a clean chat-only workbench with a centered 
 _________________________________________________________________________________
 _________________________________________________________________________________
 _________________________________________________________________________________
-
 time:  [04:21] [13-07-26]
 agent: [pi] [gpt-5.2-pro]
 worktree: [main]
@@ -2838,7 +2741,6 @@ PR #275 and PR #276 merged after their macOS, Ubuntu, pinned-Rust-1.88, and carg
 _________________________________________________________________________________
 _________________________________________________________________________________
 _________________________________________________________________________________
-
 time:  [04:38] [13-07-26]
 agent: [pi] [gpt-5.2-pro]
 worktree: [pi/shell-halt-ci-startup-window-20260713]
@@ -2848,7 +2750,6 @@ area:  [testing]: Hosted Unix process-cleanup regression reliability
 Main CI run 29235174509 first failed on Ubuntu because both Shell Halt smoke fixtures could not write their PID markers inside the nominal two-second startup probe while the runner was saturated; the same job passed unchanged on rerun. I bounded marker discovery with a hard five-second timeout while leaving the stricter two-second post-Halt process-termination deadline and all survivor assertions unchanged. Ten parallel focused repetitions, the focused/full runtime suites, strict runtime Clippy, workspace check, formatting, and diff checks pass. Independent read-only review confirmed the change is finite, cleanup-safe, test-only, and does not weaken the descendant-kill contract.
 _________________________________________________________________________________
 _________________________________________________________________________________
-
 time:      [06:06am] [13-07-26]
 agent:     [ocean], [deepseek-v4-pro]
 worktree:  [main]
@@ -2861,7 +2762,6 @@ Verification:
 - `cargo fmt --check`
 - `cargo test -p ocean-daemon convene_rejects_aliases_missing_from_live_ready_registry -- --nocapture`
 _________________________________________________________________________________
-
 time:      [03:03pm] [13-07-26]
 agent:     [ocean], [deepseek-v4-pro]
 worktree:  [main]
@@ -2875,7 +2775,6 @@ Verification:
 - `cargo test -p ocean-protocol prompt_capture -- --nocapture`
 - `cargo check --workspace`
 _________________________________________________________________________________
-
 time:      [06:58pm] [13-07-26]
 agent:     [pi], [gpt-5.2-pro]
 worktree:  [main]
@@ -2891,7 +2790,6 @@ Verification:
 - `cargo fmt --all -- --check`
 _________________________________________________________________________________
 _________________________________________________________________________________
-
 time:      [07:10pm] [13-07-26]
 agent:     [pi], [gpt-5.2-pro]
 worktree:  [main]
@@ -2906,7 +2804,6 @@ Verification:
 - `git diff --check`
 _________________________________________________________________________________
 _________________________________________________________________________________
-
 time:      [07:15am] [14-07-26]
 agent:     [pi], [gpt-5.6-sol]
 worktree:  [main]
@@ -2916,7 +2813,6 @@ area:      [frontend]: ocean-tui shell layout and editor
 Checkpointed the pending TUI work before the session-component tray: both side rails now resize by mouse while preserving the minimum center workspace and ignoring hidden opposite-rail widths. The editor soft-wraps prose, horizontally scrolls source, keeps mouse-wheel position until keyboard movement resumes cursor-following, and aligns cursor/render geometry through control-byte sanitization and Unicode cell widths. Review found and fixed incorrect rail clamp math, viewport snapback, an eager `then_some` underflow, unsanitized file text, tab/caret disagreement, and half-clipped wide-glyph drift. Added focused rail-drag, manual-scroll, sanitization, and wide-character regressions. The operator-owned deploy/dev.risingtides.ocean-daemon.plist remained untouched.
 _________________________________________________________________________________
 _________________________________________________________________________________
-
 time:      [06:11am] [14-07-26]
 agent:     [pi], [gpt-5.6-sol], [orchestrator]
 worktree:  [main]
@@ -2926,7 +2822,6 @@ area:      [backend]: ocean-daemon Phase 2C router foundation
 Began the approved behavior-neutral daemon leaf-extraction sequence with its required safety checkpoint. Extracted the complete Axum assembly into a reusable private `app_router` seam without moving handlers or changing state, route, fallback, or middleware behavior. Characterization found the live router already had 72 explicit method/path pairs while GET / discovery omitted four and the operator guide omitted thirteen; corrected those discovery inventories before the mechanical seam. Five focused contract tests now compare the live registration source bidirectionally with the banner and guide, construct and probe the full router, preserve default 404/405 and trailing-slash behavior, exercise global CORS/preflights and representative implicit HEAD, and freeze the existing static/dynamic persistent-room/LiveKit precedence edge. The operator-owned deploy plist remained excluded.
 _________________________________________________________________________________
 _________________________________________________________________________________
-
 time:      [07:32am] [14-07-26]
 agent:     [pi], [gpt-5.6-sol], [orchestrator]
 worktree:  [main]
@@ -2936,7 +2831,6 @@ area:      [frontend]: ocean-tui Files rail; [backend]: ocean-runtime tool lifec
 Added a separate SESSION COMPONENT tray beneath the file tree rather than coupling todo rendering to FileTreeComponent. The first adapter correlates canonical todo ToolCallStarted/ToolCallFinished events, mutates only after successful finishes, displays sanitized run-local items, clears at turn/session boundaries, ignores stale-session events, and returns all vertical space to Files when inactive or too short. The context meter remains absent because the daemon still lacks truthful current occupancy, capacity, provenance, and measurement time. Recon found the long-lived BuiltinProvider was accidentally sharing one TodoTool Arc across all turns/sessions despite the tool's single-run contract; it now rebuilds TodoTool for every agent-run tool query, with a regression proving no cross-run bleed. Layout, stale-event isolation, tiny-height fallback, pane-bounded selection, failed-effect, incomplete-stream, and terminal-safety tests were added. The operator-owned deploy/dev.risingtides.ocean-daemon.plist remained untouched.
 _________________________________________________________________________________
 _________________________________________________________________________________
-
 time:      [06:23am] [14-07-26]
 agent:     [pi], [gpt-5.6-sol]
 worktree:  [main]
@@ -2950,7 +2844,6 @@ Verification:
 - `git diff --check`
 _________________________________________________________________________________
 _________________________________________________________________________________
-
 time:      [06:24am] [14-07-26]
 agent:     [pi], [gpt-5.6-sol], [orchestrator]
 worktree:  [main]
@@ -2961,7 +2854,6 @@ Moved the complete browser-origin trust policy, normalized operator allowlist pa
 _________________________________________________________________________________
 _________________________________________________________________________________
 _________________________________________________________________________________
-
 time:      [06:42am] [14-07-26]
 agent:     [pi], [gpt-5.6-sol], [orchestrator]
 worktree:  [main]
@@ -2972,7 +2864,6 @@ Moved the relaxed-atomic turn counters, cumulative latency histogram, byte-stabl
 _________________________________________________________________________________
 _________________________________________________________________________________
 _________________________________________________________________________________
-
 time:      [06:51am] [14-07-26]
 agent:     [pi], [gpt-5.6-sol]
 worktree:  [main]
@@ -2982,7 +2873,6 @@ area:      [documentation]: GitHub-visible refactor course
 Added docs/DAEMON_REFACTOR_MISSION.md as the durable GitHub-facing statement of mission, non-negotiable invariants, completed foundation and Phase 2C checkpoints, current 19.9k-line composition baseline, ordered extraction course, final target, and completion gate. Linked it from the root and docs contracts so a cold contributor can find the current objective without reconstructing it from events or manifests.
 _________________________________________________________________________________
 _________________________________________________________________________________
-
 time:  [18:09] [14-07-26]
 agent: [pi] [gpt-5]
 worktree: [docs/current-state-reset-reconciled-20260714]
@@ -2997,7 +2887,6 @@ route/CORS/metrics, model-inventory, and TUI component-tray claims. Verified doc
 integrity plus executable daemon router and CORS contracts; fresh semantic review drove the
 remaining source-backed corrections before closeout.
 _________________________________________________________________________________
-
 time:      [06:12pm] [14-07-26]
 agent:     [pi], [gpt-5.6-sol], [orchestrator]
 worktree:  [main]
@@ -3006,7 +2895,6 @@ area:      [backend]: ocean-daemon Phase 2C leaf extraction
 
 Moved the exhaustive SDK-to-legacy-core event mirror and SDK SSE event-name helpers into private `src/event_adapter.rs`, preserving both production match bodies except for minimal parent visibility. Added three focused tests covering every current SDK wire tag, every intentionally agent-only event, all mirrored payload classes, placeholder tool behavior, error polarity, completion semantics, and wall-time fallback. Bus publication order, legacy envelope session/provenance stamping, runtime relay and TurnCheckpoint filtering, SSE scoping/serialization/replay/lag behavior, routes, and state remain in composition unchanged. Focused, router, full daemon, workspace-test compilation, both supported feature checks, formatting, docs, diff checks, and independent review passed. Concurrent ACP documentation and the operator deploy plist remained excluded.
 _________________________________________________________________________________
-
 time:  [18:31] [14-07-26]
 agent: [pi] [gpt-5.2-pro]
 worktree: [pi/extension-subagent-ownership-20260713]
@@ -3015,7 +2903,6 @@ area:  [agent-building]: Core/Longhouse ownership boundary and stale-design clea
 
 Recorded the operator decision that general subagent definitions, prompts, model/tool policy, spawn/join lifecycle, budgets, and orchestration belong to separately shipped/runtime-loaded extensions rather than ocean-daemon, ocean-runtime, or Longhouse core. Core remains limited to generic permission-gated turn, cancellation, capability-provider, and extension event/tool seams. Current /v1/subagents/spec and folder-agent subagent metadata are documented as compatibility surfaces pending a separate migration. Active factory, Longhouse, folder-agent, operator, and workspace contracts now agree; the obsolete core TaskTool/fleet design and stale Longhouse work order moved to the opt-in archive. After rebasing onto the current documentation hierarchy, `cargo xtask docs-check` passes with 25 packages, 99 active Markdown files, and 106 local links.
 _________________________________________________________________________________
-
 time:      [06:44pm] [14-07-26]
 agent:     [pi], [gpt-5.6-sol], [orchestrator]
 worktree:  [main]
@@ -3025,7 +2912,6 @@ area:      [backend]: ocean-daemon Phase 2C leaf extraction
 Moved the lexical parent-traversal guard, caller-cwd pass-through, session-detail workspace-scope policy, shared error vocabulary, and all nine existing focused tests into private `src/workspace_policy.rs`, preserving every production and test body except for minimal parent visibility. Ordinary turns still rebind to the caller's cwd across subdirectories and workspaces, while scoped detail reads still reject only when both raw workspace roots exist and differ. Startup repo-cwd enforcement and placement, persisted-session lookup/fallback, query precedence, HTTP error mapping, runtime rebinding/persistence, and room/call cwd fallbacks remain in composition unchanged. Focused policy/session/rebinding tests, full agent/runtime/daemon suites, router contracts, workspace-test compilation, both supported feature checks, formatting, docs, diff checks, and independent review passed. Concurrent ACP documentation and the operator deploy plist remained excluded.
 _________________________________________________________________________________
 _________________________________________________________________________________
-
 time:      [06:54pm] [14-07-26]
 agent:     [pi], [gpt-5.6-sol], [orchestrator]
 worktree:  [main]
@@ -3035,7 +2921,6 @@ area:      [backend]: ocean-daemon Phase 2C catalog foundation
 Added four direct-handler contract tests before moving model catalog ownership. The tests freeze exact get/list/set top-level JSON keys, current provider/model projection, flat ordered readiness-entry fields, successful selection mutation, invalid-selection error shape, and no mutation on rejection. The characterization reuses the existing broad AppState fixture and will remain in composition rather than introducing a test-only substate. Focused catalog tests, router contracts, the full 292-test daemon suite, formatting, docs, and diff checks pass. Provider routing, readiness, persistence, `/ready`, roles, Longhouse filtering, YOLO settings, concurrent ACP documentation, and the operator deploy plist remain unchanged.
 _________________________________________________________________________________
 _________________________________________________________________________________
-
 time:      [07:04pm] [14-07-26]
 agent:     [pi], [gpt-5.6-sol], [orchestrator]
 worktree:  [main]
@@ -3045,7 +2930,6 @@ area:      [backend]: ocean-daemon Phase 2C catalog leaf
 Moved `ModelSetRequest` and the GET current-model, GET model-list, and POST model-selection handlers into private `src/model_catalog.rs`, preserving all production bodies except minimal parent visibility. The retained full-shape characterization now compares the complete picker payload against the canonical owner under the established shared environment-lock order, freezing ordered IDs, labels, readiness values, and credential provenance; success/error shapes and no-mutation rejection remain pinned. Provider alias/routing/readiness/persistence authority, `/ready`, Longhouse filtering, roles/advisor, turn overrides, router/middleware, AppState, and all YOLO settings/locks remain unchanged. Focused catalog, provider, agent, router, daemon, workspace-test compilation, supported feature, formatting, docs, diff checks, and fresh re-review passed with no medium-or-higher issue. Concurrent ACP documentation and the operator deploy plist remained excluded.
 _________________________________________________________________________________
 _________________________________________________________________________________
-
 time:      [07:10pm] [14-07-26]
 agent:     [pi], [gpt-5.6-sol], [orchestrator]
 worktree:  [main]
@@ -3055,7 +2939,6 @@ area:      [backend]: ocean-daemon Phase 2C settings foundation
 Added direct GET/POST settings tests under the established YOLO-then-auto-convene environment-lock order. They freeze exact persisted/effective/env-override response values, nullable override fields, explicit env-off masking of persisted true, persistence-before-effective resolution, and persisted overwrite behavior. Corrected stale documentation that still implied an untrusted per-request wire flag could opt into YOLO; current and required behavior discards that flag and uses operator env → persisted preference → safe-off only. Focused settings, precedence, inert-wire, voice, router, and full 294-test daemon gates plus formatting, docs, and diff checks pass. Permission gates/tokens/call sites, concurrent ACP documentation, and the operator deploy plist remain unchanged.
 _________________________________________________________________________________
 _________________________________________________________________________________
-
 time:      [07:33pm] [14-07-26]
 agent:     [pi], [gpt-5.6-sol], [orchestrator]
 worktree:  [main]
@@ -3065,7 +2948,6 @@ area:      [backend]: ocean-daemon Phase 2C security-sensitive settings leaf
 Moved the test-only env parser target, env preference parser, effective precedence resolver, inert-wire resolver, request body, and GET/POST settings adapters into private `src/yolo_settings.rs`. All seven definitions remain byte-identical to characterization commit `529e0ed` after normalizing only minimal parent visibility. Operator env → persisted preference → safe-off, explicit env-off masking, request-wire inertness, exact response shapes, persistence-before-resolution, permission and decision-token authority, call sites, voice fail-fast behavior, router/middleware, and shared YOLO-then-auto-convene lock order remain unchanged. Focused settings/precedence/wire/voice, agent, runtime, router, full 294-test daemon, workspace-test compilation, supported-feature, formatting, docs, and diff gates passed; fresh security review found no medium-or-higher issue. Concurrent ACP, agent/CLI/core/protocol/runtime work and the operator deploy plist remained excluded.
 _________________________________________________________________________________
 _________________________________________________________________________________
-
 time:      [07:46pm] [14-07-26]
 agent:     [pi], [gpt-5.6-sol], [orchestrator]
 worktree:  [main]
@@ -3075,7 +2957,6 @@ area:      [backend]: ocean-daemon Phase 2C filesystem foundation
 Added three direct-handler tests for the home-sandboxed directory and file endpoints. They freeze canonicalization-based rejection of directory and file symlink escapes, the null-parent canonical HOME boundary, distinct missing/outside status codes, exact directory error bodies, and every key/default in the uniform no-`ok` file-error envelope. Existing tests continue pinning tilde expansion, separator-bounded containment, text/binary/cap/size behavior, sorting, hidden-directory and dotfile policy, git fields, and optional files omission. All nine filesystem tests, all three retained project-helper callers, five router contracts, all 297 daemon tests, formatting, docs, and diff checks pass from an isolated clean-main verification tree; concurrent ACP, agent/CLI/core/protocol/runtime work and the operator deploy plist remained excluded.
 _________________________________________________________________________________
 _________________________________________________________________________________
-
 time:      [current]
 agent:     [claude], [ocean-tui]
 worktree:  [main]
@@ -3097,7 +2978,6 @@ Verification:
 Concurrent daemon refactor/extension characterization, ACP, agent/CLI/core/protocol/runtime work, and the operator deploy plist remained excluded.
 _________________________________________________________________________________
 _________________________________________________________________________________
-
 time:      [07:55pm] [14-07-26]
 agent:     [pi], [gpt-5.6-sol], [orchestrator]
 worktree:  [main]
@@ -3123,7 +3003,6 @@ plugin/hooks/agent tests, workspace check, strict touched-crate Clippy, docs-che
 and fresh code/security/architecture review passed after removing a normal-binary test probe
 and correcting the characterization evidence count. Phase 0 is accepted; Phase 1 is next.
 _________________________________________________________________________________
-
 time:      [08:08pm] [14-07-26]
 agent:     [pi], [gpt-5.6-sol], [orchestrator]
 worktree:  [main]
@@ -3133,7 +3012,6 @@ area:      [backend]: ocean-daemon Phase 2C project foundation
 Added five direct-handler tests covering the project list, create, get, patch, and delete adapters before ownership moves. They freeze sequential git enrichment and failure fallbacks, persistence-error list shape, exact workspace-session association and fail-open session listing, un-enriched detail, partial-update identity/root/config/created-time preservation with runtime-stamped updates, delete-without-session-deletion, tilde/canonical create payloads with equal initial timestamps, and success/not-found/path/persistence response contracts. Existing pagination, create-path, and worktree-parser coverage remains intact. Focused project tests, all five router contracts, all 302 daemon tests, formatting, docs, and diff checks pass from isolated clean main; runtime persistence, cwd/project turn resolution, filesystem policy, concurrent ACP and agent/CLI/core/protocol/runtime work, and the operator deploy plist remain unchanged.
 _________________________________________________________________________________
 _________________________________________________________________________________
-
 time:      [08:15pm] [14-07-26]
 agent:     [pi], [gpt-5.6-sol], [orchestrator]
 worktree:  [main]
@@ -3143,7 +3021,6 @@ area:      [backend]: ocean-daemon Phase 2C project leaf
 Moved project create/patch/list request types, all five CRUD/list handlers, live git enrichment, and worktree parsing into private `src/project_registry.rs`. All ten definitions remain byte-identical to characterization commit `cec944e` after normalizing only minimal parent visibility. Runtime-owned persistence, atomic writes, order/pagination, timestamps, workspace association, and sessions remain authoritative; sequential HEAD/status/worktree enrichment, timeout/fallbacks, create path semantics, exact responses/statuses, fail-open detail session listing, partial PATCH preservation, and delete-without-session-deletion remain unchanged. Router/banner/middleware, turn cwd/project resolution, filesystem policy, AppState, and tests stay in composition. Focused project, agent, router, full 302-test daemon, workspace-test compilation, supported-feature, formatting, docs, and diff gates passed from isolated clean main; fresh review found no medium-or-higher issue. Concurrent ACP, agent/CLI/core/protocol/runtime work and the operator deploy plist remained excluded.
 _________________________________________________________________________________
 _________________________________________________________________________________
-
 time:      [08:37pm] [14-07-26]
 agent:     [pi], [gpt-5.6-sol]
 worktree:  [main]
@@ -3167,7 +3044,6 @@ Verification:
 - `cargo xtask docs-check`
 - `git diff --check`
 _________________________________________________________________________________
-
 time:      [08:48pm] [14-07-26]
 agent:     [pi], [gpt-5.6-sol], [orchestrator]
 worktree:  [main]
@@ -3178,7 +3054,6 @@ Added all-op daemon/runtime canvas-key parity, injected-cap oldest-first evictio
 _________________________________________________________________________________
 _________________________________________________________________________________
 _________________________________________________________________________________
-
 time:  [21:31] [14-07-26]
 agent: [pi]
 worktree: [feat/extensions-phase1-schema-tool-lane]
@@ -3187,7 +3062,6 @@ area:  [backend]
 
 Implemented the Phase 1 extension schema/tool-lane checkpoint; it is not accepted yet. Schema v1 now parses supported discriminator kinds fail-closed, validates typed host-resolvable secret references instead of retaining raw secret strings in validated manifests, confines declared resources, and preserves the no-execution boundary. The plugin and folder-agent subprocess lane uses explicit minimal environment and canonical cwd/PWD. Installed/trusted/enabled state separation and extension inspect/doctor remain pending. Completed validation: cargo fmt --all; ocean-extension, ocean-plugin, and ocean-agent tests; workspace test compilation; strict all-target Clippy for those three packages; cargo xtask docs-check; git diff --check; and the full cargo xtask ci local gate.
 _________________________________________________________________________________
-
 time:  [23:28] [14-07-26]
 agent: [pi] [gpt-5.2-pro]
 worktree: [pi/longhouse-bounds-doc-fix-20260714]
@@ -3196,7 +3070,6 @@ area:  [writing]: Source-backed orchestration boundary and historical archive
 
 A late semantic review of merged PR #278 found that active Longhouse docs still described planned controls as shipped, including a hard deadline timer, aggregate token ceiling, domain/subsidiarity routing, validator veto, session rebinding, and revoke-driven cancellation. Replaced the stale orchestration design with a concise source-backed current reference, retained the former design under the opt-in archive, corrected HTTP/capability/standalone model behavior and skill ranking, and preserved extension-owned general subagent orchestration. `cargo test -p ocean-longhouse` passed with 113 tests and one ignored; `cargo xtask docs-check`, `git diff --check`, and fresh semantic review passed.
 _________________________________________________________________________________
-
 time:      [11:53pm] [14-07-26]
 agent:     [pi], [gpt-5.6-sol], [orchestrator]
 worktree:  [/tmp/ocean-slack-canvas-extract]
@@ -3206,7 +3079,6 @@ area:      [backend]: ocean-daemon Phase 2C stateful domain
 Moved the ten characterized host-fulfillment definitions together into private `src/slack_canvas_fulfillment.rs`: local ingress/query storage, daemon/runtime key and result bridging, fulfilled session SSE re-emission, and coupled TTL/cap GC. State assembly, router mounting, generic scheduling, initial pending runtime-event relay, and parent integration tests remain in composition. This is explicitly the temporary typed session/permission/runtime/event compatibility seam for future `ocean-slack`; Socket Mode, Slack API/credentials, reconnect, replies, files, and real Canvas delivery remain extension-owned. Eleven fulfillment, two pending-relay, ten GC, 25 runtime-canvas, all 122 runtime tests plus integrations, 154 agent tests, five router contracts, all 305 daemon tests, workspace-test compilation, both supported-feature checks, formatting, docs, and diff gates passed from this isolated worktree. Fresh security/architecture review verified characterization parity and found no unresolved medium-or-higher issue. The dirty primary worktree was not modified.
 _________________________________________________________________________________
 _________________________________________________________________________________
-
 time:      [12:52am] [15-07-26]
 agent:     [pi], [gpt-5.6-sol], [orchestrator]
 worktree:  [/tmp/ocean-daemon-registries]
@@ -3271,7 +3143,6 @@ area:      [backend]: ocean-daemon Phase 2C control-plane leaf
 
 Introduced and characterized a behavior-neutral startup helper, then moved once-at-startup fail-open `[roles]` loading plus pure turn/advisor role resolution into private `src/model_roles.rs`. Missing, malformed, and whole-config-invalid fallbacks, exact/case-sensitive keys, verbatim and blank aliases, explicit-model precedence, unknown-role warning signals, and advisor override/global precedence remain fixed. `AppState`, startup/caller order, warnings, provider routing/readiness, persisted selection, advisor execution, and event emission stay in composition or their existing owners. Focused role checks, ten agent-config tests, all 155 agent tests, five router contracts, workspace-test compilation, both feature checks, formatting, docs, and diff gates passed; all 320 daemon tests passed serialized. Default-parallel local runs exposed the inherited upstream `OCEAN_CONFIG_DIR` test race between permission fixtures and YOLO precedence; this change adds no environment mutation, and fresh review found no unresolved medium-or-higher extraction issue. The dirty primary checkout remained untouched.
 _________________________________________________________________________________
-
 time:      [03:09am] [15-07-26]
 agent:     [pi], [gpt-5.6-sol], [orchestrator]
 worktree:  [pi/daemon-request-control-20260715]
@@ -3280,7 +3151,6 @@ area:      [backend]: ocean-daemon Phase 2C control-plane registry
 
 Added direct characterization for status-only snapshots and token secrecy, exact identity/cancellation/timestamp initialization, live duplicate replacement, missing-handle detachment, matching and mismatched waiter consumption, exact permission/finish transitions, terminal helpers, session merging, and handle ownership. Then moved the two private registry aliases, request/permission records, terminal helpers, snapshots, registration/attachment mechanics, waiter cancellation, and status transitions into the 238-line private `src/request_control.rs`. `AppState`, permission policy and orchestration, decision-token verification, HTTP/event mapping, active-turn projection, GC scheduling/failure accounting, shutdown draining, and turn execution remain in composition with unchanged lock/await ordering. Focused request/permission/finish/decision/GC tests, all 122 runtime tests plus integrations, all 155 agent tests, five router contracts, all 329 daemon tests serialized, workspace-test compilation, both supported feature checks, formatting, docs, and diff gates passed in a dedicated target. Two fresh security/concurrency reviews found no unresolved medium-or-higher issue; the first strengthened characterization before commit, and the second verified moved bodies against `133a18b`. The dirty primary checkout remained untouched.
 _________________________________________________________________________________
-
 time:      [current]
 agent:     [claude], [ocean-tui]
 worktree:  [main]
@@ -3300,7 +3170,6 @@ Verification:
 Concurrent daemon refactor/extension work and operator-owned deploy configuration remained excluded.
 _________________________________________________________________________________
 _________________________________________________________________________________
-
 time:      [01:54am] [15-07-26]
 agent:     [pi], [gpt-5.4]
 worktree:  [main]
@@ -3349,7 +3218,6 @@ Verification:
 
 Worker sessions were ordinary daemon sessions (`fd271f4b-13fd-4a63-9b85-2be61a94bf09`, `5bb719e3-6724-413d-aeb3-f377dd33e9ca`, and `ace7e2af-0101-42ae-86f9-ca2ecd8efeec`); no core task/spawn-worker/fleet scheduler was introduced.
 _________________________________________________________________________________
-
 time:      [06:01pm] [15-07-26]
 agent:     [pi], [gpt-5.6-sol], [orchestrator]
 worktree:  [pi/daemon-phase2c-next-20260715]
@@ -3371,7 +3239,6 @@ Verification:
 
 Implementation commits: `aea7044`, `df09399`. Hosted CI and merge remain; live daemon deployment/supervision is left to the concurrent operator workstream.
 _________________________________________________________________________________
-
 time:      [06:28pm] [15-07-26]
 agent:     [pi], [gpt-5.6-sol], [orchestrator]
 worktree:  [pi/daemon-phase2c-next-20260715]
@@ -3388,7 +3255,6 @@ Verification:
 - `cargo fmt --all -- --check`
 - `git diff --check`
 _________________________________________________________________________________
-
 time:      [07:14pm] [15-07-26]
 agent:     [pi], [gpt-5.6-sol], [orchestrator]
 worktree:  [/tmp/ocean-omp-program-20260715]
@@ -3402,7 +3268,6 @@ Verification:
 - `git diff --check` passed
 - fresh source-backed documentation review found no factual, classification, or ownership-boundary issue
 _________________________________________________________________________________
-
 time:      [07:19pm] [15-07-26]
 agent:     [pi], [gpt-5.6-sol], [orchestrator]
 worktree:  [pi/daemon-persistent-rooms-20260715]
@@ -3420,7 +3285,6 @@ Verification:
 - `git diff --check`
 - two fresh characterization/boundary re-reviews: PASS, no unresolved medium-or-higher issue
 _________________________________________________________________________________
-
 time:      [07:37pm] [15-07-26]
 agent:     [pi], [gpt-5.6-sol], [orchestrator]
 worktree:  /tmp/ocean-advisor-bounds-20260715
@@ -3436,7 +3300,6 @@ Verification:
 - `cargo check --workspace --tests`, `cargo fmt --all`, `cargo xtask docs-check`, and `git diff --check` passed
 - fresh async/protocol review found no correctness or compatibility issue; fresh metrics/privacy review's provider-error logging blocker was fixed, with its two requested regression gaps closed
 _________________________________________________________________________________
-
 time:      [07:56pm] [15-07-26]
 agent:     [pi], [gpt-5.6-sol], [orchestrator]
 worktree:  /tmp/ocean-advisor-bounds-20260715
@@ -3450,7 +3313,6 @@ Verification:
 - `cargo clippy --workspace --all-targets -- -D warnings` passed
 - `cargo fmt --all`, `cargo xtask docs-check`, and `git diff --check` passed
 _________________________________________________________________________________
-
 time:      [08:07pm] [15-07-26]
 agent:     [codex], [gpt-5.6], [worker]
 worktree:  pi/consult-inspect-20260715
@@ -3459,7 +3321,6 @@ area:      [backend]: explained deterministic consult ranking
 
 Added serializable explained skill/workflow ranking inspection as a projection of the existing scorer, relevance floor, de-duplication, and tie-break path, retaining the exact ordinary `TurnPrep` internally. Mounted read-only `POST /v1/longhouse/inspect` with the prepare request/cwd/cache/top-N behavior, consult-enabled state, indexed/candidate counts, and path-redacted compact selected evidence; the wire response returns only contributing terms, not the raw prompt, session, cwd, source paths, or bodies. Kept ordinary automatic preparation on its original lightweight allocation path and updated route contracts and operator/Longhouse documentation without changing prompt injection or ranking policy.
 _________________________________________________________________________________
-
 time:      [07:54pm] [15-07-26]
 agent:     [pi], [gpt-5.6-sol], [orchestrator]
 worktree:  [/tmp/ocean-daemon-phase2c-next]
@@ -3500,7 +3361,6 @@ area:      [backend]: ocean-daemon Phase 2C durable rooms
 
 PR #293 merged the reviewed persistent-room extraction as `92e03bf` after hosted run `29463198497` passed macOS, Ubuntu, pinned Rust 1.88 MSRV, and cargo-deny. Updated the living mission, code-health plan, and extraction manifest from ready-for-publication to published. The inherited best-effort audit interleaving residual remains documented, and live daemon deployment/supervision remains outside this workstream.
 _________________________________________________________________________________
-
 time:      [09:22pm] [15-07-26]
 agent:     [codex], [gpt-5.6], [reviewer]
 worktree:  pi/harness-profile-truth-20260715
@@ -3558,7 +3418,6 @@ area:      [backend]: ocean-daemon Phase 2C advisory HTTP adapters
 PR #296 merged the reviewed Longhouse preparation extraction as `29d65f8` after hosted run `29466034956` passed macOS, Ubuntu, pinned Rust 1.88 MSRV, and cargo-deny. Updated the living mission, code-health plan, and extraction manifest from ready-for-publication to published, and advanced the next bounded wave to separately manifested turn-time Longhouse preparation/presentation. The cached skill-path symlink-retarget finding remains a separate security disposition before any librarian extraction; live daemon deployment/supervision remains outside this workstream.
 _________________________________________________________________________________
 _________________________________________________________________________________
-
 time:      [10:17pm] [15-07-26]
 agent:     [codex], [gpt-5.6], [worker]
 worktree:  pi/omp-minimizer-m1-20260715
@@ -3634,7 +3493,6 @@ area:      [backend]: ocean-daemon Phase 2C advisory turn seam
 
 PR #299 merged the reviewed Longhouse turn-preparation extraction as `9095d5a` after hosted run `29475103379` passed macOS, Ubuntu, pinned Rust 1.88 MSRV, and cargo-deny. Updated the living mission, code-health plan, and extraction manifest from ready-for-publication to published, corrected the final rustfmt-expanded module size from the pre-format 239-line estimate to the actual 246 lines, and advanced the next bounded wave to separately manifested Longhouse governance. Delegated loader path logs, unsanitized advisory text, uncancelled timed-out work/cache-lock amplification, and the librarian symlink-retarget finding remain separate; live daemon deployment/supervision remains outside this workstream.
 _________________________________________________________________________________
-
 time:      [00:14] [16-07-26]
 agent:     [codex], [gpt-5], [primary]
 worktree:  [main]
@@ -3643,7 +3501,6 @@ area:      [backend]: ocean-longhouse convergence and council spending
 
 Replaced the algebraically redundant sigmoid quorum path with validated correlation-aware sequential evidence as the Longhouse default. Daemon-owned reviewer reliability priors become log-likelihood evidence, exact provider/model replicas share a capped group budget, and convergence now records an evidence-error or value-of-information cost basis. Later-round reviewers are queried sequentially with distinct model groups first so stopping avoids the next provider call; unresolved sequential topics abort at the deadline instead of manufacturing a winner. Legacy net-weight quorum remains explicit compatibility behavior. Replay recordings and `lh-tune` now preserve and sweep reviewer correlation metadata, and the source-backed Longhouse docs and crate ownership index describe the shipped contract.
 _________________________________________________________________________________
-
 time:      [00:24] [16-07-26]
 agent:     [codex], [gpt-5], [primary]
 worktree:  [main]
@@ -3773,7 +3630,6 @@ Fixed Fable 5 and other Anthropic/Claude Code high-thinking turns failing after 
 
 Verification: all 132 ocean-protocol tests passed; `cargo check --workspace`, formatting, and diff checks passed. Focused regression coverage exercises unsigned and empty signatures, thinking-only messages, signed replay, chain-of-thought non-leakage, and converted-history cache indexing. A fresh final reviewer approved the change with no findings.
 _________________________________________________________________________________
-
 time:      [02:05] [07-16-26]
 agent:     [claude] [fable-5]
 worktree:  main
@@ -3806,7 +3662,6 @@ reviews approved the implementation after the tie and documentation additions.
 `cargo test -p ocean-longhouse` passed 132 tests with one ignored; all-target
 Clippy with denied warnings, formatting, and diff checks passed.
 _________________________________________________________________________________
-
 time:      [03:02] [16-07-26]
 agent:     [codex] [gpt-5]
 worktree:  [main]
@@ -3826,7 +3681,6 @@ fresh live assessment, budget exhaustion, and deterministic reviewer choice.
 `cargo test -p ocean-longhouse` passed 140 tests with one ignored; all-target
 Clippy with denied warnings, formatting, and diff checks passed.
 _________________________________________________________________________________
-
 time:      [03:18] [16-07-26]
 agent:     [codex] [gpt-5]
 worktree:  [main]
@@ -3917,7 +3771,6 @@ area:      backend
 
 Correction to prior entry: the /v1/longhouse/topics 'read-model gap' was a false alarm — the endpoint serves state=="converged" (verified by codex: topic 488d0579 has state, decision, firekeeper, tallies); my inspection script read a nonexistent 'converged' boolean. No ingestion bug, no TASK-6 dependency. Longhouse live acceptance closed by codex: mechanism production-proven; 67% ANSWER-contract compliance is an n=3 baseline, counters accumulating.
 _________________________________________________________________________________
-
 time:      [05:58] [07-16-26]
 agent:     [claude] [fable 5]
 type:      review
@@ -3992,7 +3845,6 @@ area:      [backend]: OpenAI Realtime voice model
 
 Corrected Ocean's Realtime default to the exact operator-provided model ID `gpt-realtime-2.1`. The prior change to `gpt-realtime` was an erroneous override based on a mismatched docs catalog page despite the operator supplying the current Agents SDK example. The owning daemon contract and upstream mint-body regression now pin `gpt-realtime-2.1`; explicit surface overrides remain supported. Verification: all 11 voice_realtime tests, workspace check, denied-warning daemon Clippy, docs-check, and diff-check pass.
 _________________________________________________________________________________
-
 time:      [21:27] [16-07-26]
 agent:     [claude] [fable 5]
 worktree:  [detached @ origin/main (5b9e23a8)]
@@ -4017,7 +3869,6 @@ area:      [review]
 
 Reconciled the six committed S2-P1 federation core/store commits from local base 4712fdbe onto GitHub main 5b9e23a8 in an isolated worktree while preserving the actively edited daemon producer-contract files in the primary checkout. The rebase was conflict-free; git range-diff and identical patch hashes proved semantic identity across all six commits. Pushed the reconciled branch to origin as feat/s2-p1-room-producer-contracts at 2cdc7163 (six ahead, zero behind main). Verification passed: ocean-core 48 tests, ocean-store 63 tests, ocean-agent 163 tests, cargo check --workspace, cargo fmt --check, docs-check, and diff-check. A backup branch and checksummed tracked-worktree patch were created before reconciliation; .wrangler remained untouched. The primary worktree branch ref and live daemon edits remain intentionally unchanged pending their active owner's checkpoint.
 _________________________________________________________________________________
-
 time:      [00:13] [17-07-26]
 agent:     [claude] [fable 5]
 type:      [merge]
@@ -4025,7 +3876,6 @@ area:      [backend]
 
 Coordination gate cleared by smaths: rebased feat/s2-p1-room-producer-contracts (P1 producer contracts, 8 commits) conflict-free onto the moved main, re-ran gates green (cargo fmt --check, 39/39 persistent_rooms with --test-threads=1, denied-warning workspace clippy), cherry-picked pi's S2-P1 reconciliation checkpoint entry across the rebase so the append-only ledger lost nothing, and pushed main 5b9e23a8 -> ee6b698f. The pre-rebase remote checkpoint branch was left in place rather than force-pushed.
 _________________________________________________________________________________
-
 time:      [02:58] [17-07-26]
 agent:     [pi] [kimi-k2.5] [thoth]
 worktree:  [feat/s2-p2a-store-core] ~/.worktrees/ocean-os-p2a-store-20260717
@@ -4034,7 +3884,6 @@ area:      [backend]
 
 P2-A restart-safe federation core in ocean-store per gate2-s2-bridge-freeze-v1, base 9c8cdbec. Added six private tables (federation_instance, room_federation, room_member_bindings, producer_counters, federated_events, processed_room_triggers) and atomic APIs: instance id create-once, credential install/read/revoke/list with redacting Debug and no Serialize, update_room_access_safe (outbox-preserving, cursor monotonic), agent bindings (name unique per room, registration_key private), allocate_outbox_pending (transactional counter + outbox insert, source_id room:<r>:member:<m>:producer:<instance>, u64::MAX fail-closed), pending/fail outbox transitions, and ingest_confirmed_event (one IMMEDIATE tx: dedup, strict monotonic global_sequence via local_seq ordering, transcript append, dedup index, full-producer-tuple outbox removal, cursor advance, at-most-once locally-bound trigger claims, agent-authored rows claim nothing). open() enforces 0600 on rooms.db + sidecars every open (unix). Three new RoomStoreError variants forced one mechanical arm in daemon room_store_error_response (scope extension ruled by fable, mapping approved by codex: RoomNotFederated→409, FederationCorruption|Io→500). Two initial test failures were fixture bugs, not implementation: credential test used two separate in-memory stores (independent DBs), fail_outbox test lacked an access row so the Local projection legitimately hides outbox. Gates: ocean-store 78/78, daemon persistent_rooms 39/39 (--test-threads=1), workspace check, clippy -D warnings, fmt, docs-check all green. New crates/ocean-store/AGENTS.md; crates/AGENTS.md row + child index updated. Uncommitted, holding for codex pre-commit gate; no push.
 _________________________________________________________________________________
-
 time:      [03:16] [17-07-26]
 agent:     [pi] [kimi-k2.5] [thoth]
 worktree:  [feat/s2-p2a-store-core] ~/.worktrees/ocean-os-p2a-store-20260717
@@ -4043,7 +3892,6 @@ area:      [backend]
 
 P2-A gate corrections (codex review, 5 items) plus freeze v1.2 amendment applied atop the uncommitted tree. (1) Table 7 pending_redemptions per v1.2: invite_code UNIQUE, atomic get-or-insert by code returning the stored triple (a code never forks), exact-input promote (redemption_id, room, bearer, member) all-or-nothing with idempotent response-loss replay and fail-closed corruption matrix, list for startup recovery, remove without credential contact; PendingRedemption redacts bearer AND invite code. Binding semantics per v1.1 §1b: identical-tuple re-registration is a no-op, divergent (room, member) fails closed; key derivation deferred to P2-C per v1.2 §3, column stored opaquely. (2) Ingest dedup now compares the parsed persisted transcript FederatedMessageMeta — all fields; divergent origin metadata or a missing/unreadable indexed transcript row is corruption. (3) Ordering baseline is max(last indexed gs, persisted room_access cursor); bootstrap cursor ahead of an empty index rejects stale sequences; cursor regression impossible. (4) 0600 enforcement moved BEFORE any DB work (and re-run after create); metadata errors fail closed except NotFound; loosened sidecars repaired. (5) New pins: federated index u64::MAX reopen, corrupt index/cursor text fail closed, sidecar repair, full-meta dedup matrix, cursor-baseline upgrade case. Gates: ocean-store 86/86, daemon persistent_rooms 39/39, clippy -D warnings, fmt, workspace check, docs-check green. Still uncommitted, holding for codex gate; no push.
 _________________________________________________________________________________
-
 time:      [03:23] [17-07-26]
 agent:     [pi] [kimi-k2.5] [thoth]
 worktree:  [feat/s2-p2a-store-core] ~/.worktrees/ocean-os-p2a-store-20260717
@@ -4052,7 +3900,6 @@ area:      [backend]
 
 P2-A re-gate round 2 (codex, 3 surgical misses). (1) Ingest dedup now loads the full federated_events index tuple and requires three-way equality: index == parsed transcript meta == incoming; a corrupt index column with intact transcript metadata is FederationCorruption, never Duplicate (pinned per-column: gs, source_id, source_sequence, client_event_id). (2) Promote all-or-nothing proven under injected mid-transaction failure: a TEMP BEFORE-DELETE trigger RAISE(ABORT) between the credential insert and the pending delete rolls back the credential and retains the pending row; dropping the trigger lets the identical promote commit (pinned). (3) Stale docs refreshed: lib.rs header no longer claims the daemon is unwired/untouched — documents the live AppState Mutex adoption, the exhaustive error-response mapping, and the federation core; RoomStoreError intro now names RoomNotFederated/FederationCorruption/Io with their HTTP mappings. Gates rerun green: ocean-store 88/88, daemon persistent_rooms 39/39, clippy -D warnings, fmt, workspace check, docs-check. Uncommitted, holding.
 _________________________________________________________________________________
-
 time:      [03:28] [17-07-26]
 agent:     [claude] [fable 5]
 type:      [merge]
@@ -4095,7 +3942,6 @@ area:      [design]
 
 Recorded Smaths's explicit Ocean Observatory Gate 1 acceptance after the operator replied “ready” to the manifest gate and coordination lead WildDragon confirmed authorization. Marked the implementation manifest accepted on 2026-07-17, completed its sign-off, corrected the stale Gate 0 reference filename, and updated root/docs contracts, the documentation index, and ROADMAP. Tasks 2–9 are authorized only under the manifest's strict dependency order and stop conditions; the authenticated metadata-safe snapshot/replay/live contract still precedes production Ocean Floor renderer work.
 _________________________________________________________________________________
-
 time:      [04:54] [17-07-26]
 agent:     [pi] [kimi-k2.5] [thoth]
 worktree:  [feat/s2-p2b-federation-client] ~/.worktrees/ocean-os-p2b-fed-20260717
@@ -4104,7 +3950,6 @@ area:      [backend]
 
 S2 P2-B outbound Bedrock room client/supervisor per approved gate2-s2-p2b-freeze-v2 + v2.1 + v2.2, base f51d9dd3. Added AppState-owned FederationSupervisor with idempotent start/wake/stop/shutdown+join, one serialized task epoch per credentialed room, header-bearer eventsource-stream SSE reconnect from durable cursor, roster-first lease-derived presence, canonical-u64 exact row validation, atomic confirmed ingest through ocean-store, and post-commit transcript/access wake matrix. Sender selects Notify + jittered bounded periodic durable scan + cancellation, validates exact durable message payload, builds the B2 wire body, accepts exact 201 only, suppresses immediate repost while awaiting SSE, and applies the frozen row-fail/recover/revoke status matrix. Revoke closes local admission, joins sender, fails Pending rows, persists Revoked last, publishes one access wake; presence downgrade shares the state commit/wake. Strict origin-only OCEAN_FEDERATION_URL boundary (HTTPS except loopback HTTP, no path/userinfo/query/fragment, redirects off, bounded requests/error bodies, no total SSE deadline); missing/invalid config downgrades credentialed rooms from stale Live to Recovering. P2-B adds no routes and deliberately leaves pending-redemption/redeem and trigger dispatch to P2-C. Fake-Bedrock tests pin header/path/body/no-query, Last-Event-ID 0, POST-cannot-create-transcript, periodic lost-notify healing, exact 201 suppression, two producer sequence-1 streams, SSE-only confirmation/removal, duplicate no-wake, non-message cursor-only ingest, inherited control ids, >2^53 sequence, roster refresh/author mapping, lease presence transitions, revoke ordering/wake count, and start/stop epoch serialization. Narrow gates green: federation 13 tests, persistent_rooms 39, ocean-store 88, denied-warning daemon Clippy, fmt, workspace check, docs-check, diff-check. Full daemon has one unrelated baseline failure: longhouse_inspect_is_advisory_bounded_and_does_not_echo_sensitive_text observes 6 matches vs expected 2 and reproduces on clean f51d9dd3 with the entire P2-B diff stashed; gate rerun excludes exactly that baseline test. Uncommitted, holding for codex pre-commit review; no push.
 _________________________________________________________________________________
-
 time:      [05:14] [17-07-26]
 agent:     [pi] [kimi-k2.5] [thoth]
 worktree:  [feat/s2-p2b-federation-client] ~/.worktrees/ocean-os-p2b-fed-20260717
@@ -4113,7 +3958,6 @@ area:      [testing]
 
 P2-B pre-commit hardening complete under freeze v2.2. Added synchronized revoke admission so post-gate responses cannot mutate local state, globally bounded concurrent supervisor shutdown joins, strict roster uniqueness and exact control/envelope parsing, 64 KiB SSE JSON cap, no redundant Live-to-Live state commit, cursor>H no-regression helper, and fail-closed revoke cleanup when Pending enumeration fails. Fake Bedrock coverage expanded to 17 focused tests: sender and members GET status matrices (400/409/mismatch-403 row-fail; auth 401/403 revoke; 429/5xx/unexpected 2xx recover), held in-flight POST released after revoke with no local mutation/new request, jittered periodic lost-Notify healing, stop/join/start epoch serialization, two producer sequence-1 streams plus byte-identical restart replay, durable >2^53 cursor reconnect, duplicate no-wake, non-message cursor-only, inherited control ids, heartbeat both-direction mismatch, resync divergence, unknown frame, room-event id mismatch, unknown-author refresh, lease-derived presence/downgrade, and invalid-config stale-Live repair. Final gates: federation 17/17, persistent_rooms 39/39, ocean-store 88/88, daemon 408/408 with one exact baseline Longhouse inspect test excluded (clean f51d9dd3 independently reproduces 6 vs expected 2), daemon all-target Clippy with denied warnings, workspace check, fmt, docs-check, diff-check, compatibility lane, and Rust 1.88 daemon check all green. Exact ten-file scope, uncommitted, no push, awaiting codex gate.
 _________________________________________________________________________________
-
 time:      [05:35] [17-07-26]
 agent:     [pi] [kimi-k2.5] [thoth]
 worktree:  [feat/s2-p2b-federation-client] ~/.worktrees/ocean-os-p2b-fed-20260717
@@ -4122,7 +3966,6 @@ area:      [backend]
 
 P2-B codex corrective round closed (5 contract gaps). Startup with a valid client now atomically commits Connecting + all-Unavailable before subscribe, pinned against a valid fake origin whose first response hangs. Durable-cursor errors no longer fall back to Last-Event-ID 0, and failed Recovering-to-Live promotion ends the epoch; pure authority tests pin both. Revoke admission is linearized: one AdmissionGate owns close, first-poll request initiation, and post-response local mutation; close-before-admit fake barrier proves zero POSTs, while the existing held in-flight response test still proves no post-gate mutation. RawSseEventBound counts bytes across chunks and rejects an incomplete event above 64 KiB before eventsource-stream accumulation; fake oversized streaming response forces Recovering at the cap. Unknown-author roster refresh is fetched but deferred: Duplicate commits/wakes nothing; Ingested optionally commits roster after atomic message ingest and publishes exactly one message + one access wake. Focused gates green: federation 21/21, persistent_rooms 39/39, ocean-store 88/88, daemon 412/412 with the same one clean-base Longhouse test excluded, daemon denied-warning Clippy, workspace check, Rust 1.88 daemon check, fmt, docs-check, diff-check. Exact ten-file scope remains uncommitted/no push, TASK-18 in_review.
 _________________________________________________________________________________
-
 time:      [05:42] [17-07-26]
 agent:     [pi] [kimi-k2.5] [thoth]
 worktree:  [feat/s2-p2b-federation-client] ~/.worktrees/ocean-os-p2b-fed-20260717
@@ -4131,7 +3974,6 @@ area:      [backend]
 
 P2-B final store-authority corrective: lease-loss persistence now returns Result and reads the full RoomAccessProjection fail-closed; any decode/read error performs no update, no wake, and no empty-roster substitution. Startup converts room_access failure to BridgeError, skips that room, and never starts its task. Valid-client startup starts only after the atomic Connecting + Unavailable transition succeeds. Reconnect continuation stops if Recovering/lease-loss commit fails; heartbeat ends the epoch on durable-state read error; revoke Pending-enumeration fallback cannot overwrite a corrupt projection. Helper injection pin proves a projection Err invokes neither startup eligibility nor the commit/wake closure and preserves a valid one-member roster when successful. Focused re-gate: federation 22/22, denied-warning daemon Clippy, fmt, diff-check green. Exact ten-file scope remains uncommitted/no push, TASK-18 in_review.
 _________________________________________________________________________________
-
 time:      [05:50] [17-07-26]
 agent:     [claude] [fable 5]
 worktree:  feat/s2-p2b-federation-client ~/.worktrees/ocean-os-p2b-fed-20260717 (ref-push; canonical checkout occupied by Observatory lane)
@@ -4140,7 +3982,6 @@ area:      [backend]
 
 Shipped S2 P2-B to main: pushed 435c7260 (c8bdd024..435c7260 ff) via ref from thoth's worktree — canonical checkout deliberately untouched, it carries the Observatory lane's unpushed commits + dirty tree. 435c7260 is thoth's approved c84e4f99 rebased onto the Observatory docs delta (9 blobs byte-identical, events.md append byte-identical, ledger separator restored), parity-approved by codex. Slice: outbound Bedrock room supervisor per gate2-s2-p2b-freeze-v2.2 — origin-only client, epoch-locked per-room receiver/sender, lease-derived presence, fail-closed store authority, admission-linearized revoke, raw SSE byte cap. Gates: federation 22/22, persistent_rooms 39/39, store 88/88, clippy -D, fmt, diff-check. Next: P2-C (intents/message split/trigger dispatch) closes the two-machine bridge; config-rpc + Observatory lanes rebase onto this main.
 _________________________________________________________________________________
-
 time:      [04:26] [07-17-26]
 agent:     [claude] [fable 5]
 worktree:  feat/session-config-rpc
@@ -4158,7 +3999,6 @@ area:      [backend]
 
 Completed the Ocean Observatory Gate 1 task-2 landing checkpoint. Added the ocean-observatory workspace crate with a closed metadata-only event schema, decimal-string monotonic cursors, structural redaction allow-list, SQLite/WAL event and topology persistence, replay/snapshot pagination, and terminal-only retention enforcement at the accepted 7-day/1-GiB bounds with durable boundary records. Redaction regressions cover prompts/reasoning, tool arguments/output, errors/paths/environment, credentials/permission rationale, and decimal cursor encoding; no raw runtime AgentEvent derives Serialize or maps implicitly. Recorded lead-approved Deviation D1: the V1 structural allow-list replaces the #[observer_safe] proc-macro gate, with macro hardening optional later. Updated the canonical workspace index and parent count to 28 packages. Verification passed: cargo test -p ocean-observatory (21/21 integration tests), cargo xtask docs-check (28 packages, 150 active Markdown files, 133 local links), and git diff --check.
 _________________________________________________________________________________
-
 time:      [10:10] [17-07-26]
 agent:     [pi] [kimi-k2.5] [thoth]
 worktree:  [feat/p2c-federation-20260717] ~/.worktrees/ocean-os-p2c-fed-20260717
@@ -4167,7 +4007,6 @@ area:      [backend]
 
 Implemented S2 P2-C from approved gate2-s2-p2c-freeze-v3 on exact base 8967fedc. Added the Local/federated message linearization and outbox-only federated intent path; owner bootstrap and invite creation; durable idempotent redemption, bodyless self-join, and all-row concurrency-four startup recovery; safe deterministic agent registration and private opaque-member bindings; positive-current-User confirmed-trigger claims; and an unbounded sovereign dispatcher whose bound-agent replies re-enter the federated outbox. Installed-credential control mutations use stable generation-gated admission, revocation closes admission before crash-ordered cleanup, response bodies/statuses remain bounded and redacted, and shutdown cancels/joins recovery, room producers, and the retained dispatcher. Final review corrections give missing/closed messages stable `room_not_found`, fail closed on non-Local/no-credential corruption, preflight invite keys before allocating lifetime supervisor slots, and revalidate each dispatch target as a current safe locally-owned Agent roster member with the same private binding. Router-level raw success envelopes, agent 1/32/33 boundaries, bootstrap-vs-redeem install serialization, invite/agent/roster response-vs-revoke, conversion/revoke races, and policy/human/remote/unbound/stale/unresolved suppression are pinned. Added the three frozen routes, direct production crypto dependencies, route/banner parity, operator/ecosystem custody docs, and daemon/parent ownership updates. Final gates: federation 50/50, persistent_rooms 49/49, ocean-store 88/88, daemon 451/451 with only the exact known Longhouse inspect test excluded; that test independently reproduces 6 vs expected 2 on clean 8967fedc. Daemon all-target Clippy with denied warnings, workspace check, Rust 1.88 workspace/MSRV lanes, compatibility lane, fmt, docs-check, and diff-check pass. Exact ten-file ceiling, uncommitted and unpushed, held for codex pre-commit review.
 _________________________________________________________________________________
-
 time:      [13:33] [17-07-26]
 agent:     [claude] [fable 5]
 worktree:  /private/tmp/ocean-p2c-release (release worktree; canonical checkout still occupied by Observatory lane)
@@ -4193,7 +4032,6 @@ area:      [backend]
 
 Closed the Kimi K3 dynamic-tool lifecycle review blockers. Request context now carries ordered, nonempty declaration epochs at validated transcript indices instead of one aggregate declaration. Every runtime invocation reconstructs loaded names and epoch membership from durable, K3-attributed search_tools ToolResults; resumed turns restore declarations on their first request, descriptions remain absent from persistence, multiple search epochs remain separate and position-stable, and compacted search evidence falls back immediately before the first surviving same-provider K3 call. The 16-tool/512-KiB bounds remain enforced. Final synthesis retains historical declarations for provider-valid replay, emits tool_choice:none, exposes no globally callable tool, and rejects a disobedient real-tool call before permission or execution. Added protocol validation/serialization and runtime resume, multi-epoch, compacted-anchor, final-synthesis, schema-budget, and no-description regressions. Focused provider/protocol/runtime/agent tests, workspace test compilation, strict touched-crate Clippy, formatting, docs-check, and diff-check pass. `cargo xtask ci` reaches the pre-existing host-sensitive daemon Longhouse inspect assertion (expected 2, observed 6); the exact focused test reproduces unchanged on clean `origin/main@5b9e23a8`, proving it is not caused by this feature.
 _________________________________________________________________________________
-
 time:      [14:10] [17-07-26]
 agent:     [pi], [gpt-5.4]
 worktree:  [main]
@@ -4216,7 +4054,6 @@ Verification:
 _________________________________________________________________________________
 _________________________________________________________________________________
 _________________________________________________________________________________
-
 time:  [13:38] [17-07-26]
 agent: [pi] [claude-opus-4-5] [DarkEagle]
 worktree: [main]
@@ -4234,7 +4071,6 @@ no core orchestration per root AGENTS.md invariant. Coordinated a mid-task
 write collision with NiceQuartz; reconciled tree passes cargo test -p
 ocean-observatory (45 tests) and cargo check --workspace.
 _________________________________________________________________________________
-
 time:  [13:51] [17-07-26]
 agent: [pi] [claude-opus-4-5] [SageTiger]
 worktree: [main]
@@ -4268,7 +4104,6 @@ in WildDragon's working tree pending their commit. main diverged from
 origin/main via the rebase; push/force-with-lease decision flagged to
 WildDragon as coordination lead.
 _________________________________________________________________________________
-
 time:  [14:22] [17-07-26]
 agent: [pi] [claude-opus-4-5] [SageTiger]
 worktree: [main]
@@ -4295,7 +4130,6 @@ router_contract 5/5, ocean-observatory 48/48, workspace check, clippy,
 fmt, docs-check all clean; full daemon suite 408/409 with only the
 known env-sensitive longhouse_inspect failure.
 _________________________________________________________________________________
-
 time:  [14:41] [17-07-26]
 agent: [pi] [claude-opus-4-5] [SageTiger]
 worktree: [main]
@@ -4318,7 +4152,6 @@ event → adapter → store → SSE subscriber. Verification: observatory
 suites 27/27 + 48/48, workspace check, clippy, fmt, docs-check clean;
 daemon suite 418/419 (known env-sensitive longhouse_inspect only).
 _________________________________________________________________________________
-
 time:  [14:48] [17-07-26]
 agent: [pi] [claude-opus-4-5] [SageTiger]
 worktree: [main]
@@ -4346,7 +4179,6 @@ area:      [backend]
 
 Consolidated the Ocean Observatory backend after ending the multi-writer Crew run. Rebased the 12-task implementation stack onto current origin/main, rebuilt ocean-daemon composition from the current P2-C/session-config main instead of preserving stale worker conflict resolutions, restored room federation alongside the Observatory, and mapped the new SessionConfigChanged event safely out of the metadata bridge. The daemon now opens the SQLite/WAL Observatory store, runs restart interruption recovery, appends daemon/runtime lifecycle facts, exposes authenticated snapshot/live/replay routes, and records graceful shutdown without blocking runtime authority. Closed the first-party credential gap: daemon startup now atomically mints a mode-0600, boot-bound `.ocean/observatory-token`, rotates it every ten minutes with thirty-minute overlap, and never distributes the HMAC signing secret or injects credentials into arbitrary subprocess environments. Hardened the environment-dependent Longhouse inspection test to preserve its two planted-candidate invariant without assuming empty operator home-skill roots. Verification: ocean-observatory 49/49 tests, ocean-daemon 479/479 tests, workspace check, daemon/observatory Clippy -D warnings, docs-check (28 packages / 157 active Markdown files / 133 links), format, and diff-check pass. Removed the worker's accidentally tracked `.wrangler/cache/wrangler-account.json` and ignored `.wrangler/` as local Cloudflare state. Next authority: implement Ocean Floor in ocean-surface against these real read-only routes; the Claude Design export is visual reference only.
 _________________________________________________________________________________
-
 time:      [16:59] [17-07-26]
 agent:     [pi] [unknown] [thoth]
 worktree:  [fix/config-rpc-corrective-20260717] ~/.worktrees/ocean-os-config-rpc-corrective-20260717
@@ -4413,7 +4245,6 @@ area:      [backend]
 
 Corrective pass over the initial compact commit (c144c344), left uncommitted for review. CompactResponse now reports elided_messages. compact_session gained the missing production wiring: provider readiness preflight (fail closed), full credential options (base_url, auth method, codex account header, stable session_id for prompt caching), thinking-strip history shaping via the shared route predicate, a trailing user instruction for providers requiring user-last requests, and a 300-second wall-clock bound matching the turn budget. The protected window is computed before any model call (a fully-protected transcript is an ok no-op with zero provider spend), is bounded by 20 messages and 20% of context with always-keep-last, and never begins on an orphan tool result. Daemon handler now returns 429 at capacity, 404 only for genuine absence, sanitized 500 for unreadable storage, and 200 otherwise; the route baseline is 86 and the operator guide quick reference documents the route. Added six ocean-agent tests (split bounds, orphan pairing, scripted-provider happy path with on-disk verification, unknown session, corrupt-never-wiped, short-session no-op without model call, provider-error leaves transcript untouched) and two daemon route tests (404 unknown, 429 at capacity).
 _________________________________________________________________________________
-
 time:  [09:12] [18-07-26]
 agent: [codex] [gpt-5]
 worktree: [main]
@@ -4422,7 +4253,6 @@ area:  [design]
 
 Rendered two X-ready Ocean product comparison images from locally measured active harness install footprints. The comparison counts both Ocean runtime binaries, preserves editable SVG sources and measurement evidence, and keeps all exact text outside the generated product backplates.
 _________________________________________________________________________________
-
 time:  [08:45am] [18-07-26]
 agent: ocean-surface-tauri, claude, Ocean agent
 worktree: [main]
@@ -4430,7 +4260,6 @@ type:  [workflow]
 
 Two-machine + GitHub alignment sweep. Pushed the Air's 5 stranded branches to origin via Mac SSH relay (voice-planner-control/surface pair, offshore, tui-compact-interrupt, integrate/dirty-main). Rescued both Air dirty mains to pushed rescue/* branches (os: kimi oauth + apply_patch WIP; surface: Dynamic Island WIP). Committed and pushed Mac's uncommitted halt2 cancel-race diff and the docs-reset overhaul. All four mains fast-forwarded to origin (os 428a9e21, surface 1ccd5ce). Pruned 10 dead worktrees across both machines; removed merged config-rpc/compact worktrees. Air gh token is expired — relay pushes went through the Mac.
 _________________________________________________________________________________
-
 time:  [05:05pm] [18-07-26]
 agent: ocean-tui, claude, ocean-prs
 worktree: [main]
@@ -4438,7 +4267,6 @@ type:  [workflow]
 
 Landed the Air's Dynamic Island rescue into ocean-surface main (1ccd5ce → 4b7ad46). Merged rescue/air-surface-dirty-main-20260718, resolved 11 conflict hunks (daemon.rs planner/EventSource/Island unions; Island added to typed topmost_reveal Escape rail with tests; sessions.rs TUI-parity grouping + cwd helper retained; island.css wired in index.html/sidepanel/build-extension). Fixed island.rs test for active_turn/active_state. Gates: wasm, 417 tests, proxy, tauri, fmt, detached standalone verify. Scrubbed accidentally-staged .stitchpad/ from the commit pre-push and gitignored .stitchpad/ + .pi-subagents/. Air surface main synced to 4b7ad46. Joined stitchpad as @ocean-prs and posted lane status + app.rs rebase note.
 _________________________________________________________________________________
-
 time:  [05:25pm] [18-07-26]
 agent: ocean-tui, claude, ocean-prs
 worktree: [main]
@@ -4446,7 +4274,6 @@ type:  [bug report]
 
 Operator observed raw DeepSeek DSML tool-call markup (<｜DSML｜tool_calls> invoke/parameter blocks) leaking as literal text from a gpt-5.6-sol codex turn — serving-side DSML parse failure. Ocean exposure: deepseek workers are the Longhouse default; a leaked call would render as garbage and silently drop the tool intent. Landed fix/deepseek-dsml-salvage on main: stream-end salvage in the OpenAI-compat collector (deepseek-only, zero-structured-calls gate, tail-block-only so quoted markup never fires, unicode+ASCII tokens, truncation-tolerant, ToolUse stop promotion). 5 unit tests; workspace check, 146 protocol tests, fmt, clippy all green. Daemon restart required to pick up: launchctl kickstart -k gui/$(id -u)/dev.risingtides.ocean-daemon after rebuild.
 _________________________________________________________________________________
-
 time:  [05:40pm] [18-07-26]
 agent: ocean-tui, claude, ocean-prs
 worktree: [main]
@@ -4454,7 +4281,6 @@ type:  [bug report]
 
 Follow-up on the DSML leak: operator confirmed it is exclusive to gpt-5.6-sol; codex config verified clean (official endpoint, no base-url override) → model-side training contamination, Sol imitating DeepSeek DSML tool syntax. Ocean drives the gpt-5.6 family via the openai-codex provider whose collector had no salvage — the deepseek-only gate missed the actual leaker. Landed fix/dsml-salvage-codex-sol on main (12cf4eb4 → e3035161): codex.rs stream-end salvage gated on model_id gpt-5.6*, openai.rs gate widened to deepseek || gpt-5.6*, shared pub(crate) parser, stream-ordered salvage block indexes. Gates green incl. clippy -D warnings. Air synced. Daemon kickstart still pending operator go-ahead.
 _________________________________________________________________________________
-
 time:  [06:20pm] [18-07-26]
 agent: ocean-tui, claude
 worktree: [main]
@@ -4535,7 +4361,6 @@ Operator accepted Phase 1 of docs/specs/2026-07-19-cross-device-approval-and-att
 - `skills/ocean-coworker-onboarding/` flagged for relocation to the private Bedrock repo in a later slice (no secrets present; it is internal onboarding for a private service).
 - Verified: `cargo xtask docs-check` PASS; no remaining `github.com/Risingtides-dev/ocean-bedrock` references in active docs.
 _________________________________________________________________________________
-
 time:  [03:01pm] [19-07-26]
 agent: ocean-tauri, codex
 worktree: [main]
@@ -4543,7 +4368,6 @@ type:  [feature]
 
 Expanded the pre-session Voice Planner from proposal-only context blindness to bounded read-only project inspection. Realtime planner mint now advertises list_workspace and read_workspace_file alongside propose_handoff with closed schemas and explicit untrusted-data/non-execution instructions. Surface fulfillment normalizes relative paths, rejects absolute/~/'..', requires each daemon-canonicalized response target to remain under the frozen validated workspace (including symlink escape), caps listings and file payloads, rejects binary reads, and preserves Create draft/Create & start as the only session/turn mutation boundary. Verification: cargo fmt checks in ocean-os and ocean-surface; cargo test -p ocean-daemon voice_realtime (11 passed); cargo test -p ocean-surface-ui voice::realtime::tests (16 passed); cargo check -p ocean-surface-ui --target wasm32-unknown-unknown; LSP diagnostics clean.
 _________________________________________________________________________________
-
 time:  [03:01pm] [19-07-26]
 agent: ocean-tauri, codex
 worktree: [main]
@@ -4562,7 +4386,6 @@ Ported the pinned MIT `can1357/oh-my-pi` `crates/pi-walker` implementation at `0
 
 Verification: 51 tests passed with three explicit performance ignores on current Rust and pinned Rust 1.88; denied-warning all-target Clippy, workspace test compilation, Windows GNU all-target cross-check, docs-check, formatting, and diff checks passed. Three fresh review lanes drove cache/path/Windows/security corrections; final acceptance found no medium-or-higher issues in the standalone unwired boundary.
 _________________________________________________________________________________
-
 time:      [08:32] [19-07-26]
 agent:     [claude] [fable 5]
 worktree:  lane-c-landing
@@ -4686,7 +4509,6 @@ Verification:
 - `cargo fmt --all -- --check`
 - `git diff --check`
 _________________________________________________________________________________
-
 time:      [19:15] [19-07-26]
 agent:     [claude] [fable 5]
 worktree:  task-57-save-dir-fsync (fable builder sub, fable landed)
@@ -4723,7 +4545,6 @@ Implemented standalone `crates/ocean-search` over `ocean-walker` from pinned MIT
 
 Verification: 22 tests passed on current Rust and pinned Rust 1.88; denied-warning all-target Clippy, workspace test compilation, current-toolchain Windows GNU all-target cross-check, `cargo deny check`, docs-check, formatting, and diff checks passed. Three fresh final review lanes accepted the corrected standalone boundary with no medium-or-higher findings; Windows compiled but was not runtime-tested on this macOS host.
 _________________________________________________________________________________
-
 time:      [04:38] [20-07-26]
 agent:     [claude] [fable 5]
 worktree:  fix/flaky-at-mention-trigger-test
@@ -4765,7 +4586,6 @@ area:      backend
 TASK-61 landed a8c0e3d6 (daemon-core #4, codex cut A) — and the sub upgraded the spec: not emit-before but ATOMIC. update_request_finished now takes an on_finalize closure that runs UNDER the registry write guard, only when this call performs the terminal transition; the agent-bus TurnFinished emits inside that scope (both buses verified sync, no await, no re-entry — no lock hazard). A reader observing registry-terminal is thereby GUARANTEED the frame is already in the ring — the stale-projection window GET /v1/agent/sessions kept exposing is closed at the source, and the inverted window never opens. Normal completion and the TASK-56 orphan guard both funnel through the hook; a latent unconditional double-emit in the old normal path is now gated. 8-reader race test fails under the old order, passes now. Post-rebase over TASK-62: 532/0 + fmt + clippy raw-exit 0. Daemon-core audit slate now FULLY closed (#1 56, #2 57, #3+#5 62, #4 61, #6 hygiene-non-blocking via premise check). Batched daemon bounce (61+62) follows.
 
 _________________________________________________________________________________
-
 time:  [21:24] [07-19-26]
 agent: [pi] [gpt-5.4] [thoth]
 worktree: [fix/tui-resumed-turn-busy-409]
@@ -4831,7 +4651,6 @@ area:      [testing]
 
 Fixed a real CI flake in ocean-walker that failed PR #324 on a crate that PR does not touch. wait_for_nonzero_cache_age busy-waited a flat 1ms and the test then asserted cache_age_ms > 0; because that field has millisecond resolution, on a loaded runner the cache write and the subsequent read can land in the same millisecond bucket and the age rounds to zero. The helper now sleeps past a full tick and confirms the OBSERVABLE SystemTime clock advanced at least 2ms rather than trusting a duration — the assertion and the wait now measure the same thing. Previously-failing test stress-run 8x locally, 51 walker tests green, clippy zero, fmt clean. Filed separately from TASK-21 rather than bundled, so the daemon fix and this test fix stay independently reviewable.
 _________________________________________________________________________________
-
 time:      [06:05] [20-07-26]
 agent:     [claude] [fable 5]
 worktree:  fix/task21-bound-detached-prep
@@ -4856,7 +4675,6 @@ area:      [testing]
 
 Closed the walker cache flake's second mode (pad TASK-24): #325 fixed the age-bucket race, but today's #326 run failed the backend==Cached assert instead — SCAN_CACHE is process-global with a 1s default TTL and 16-entry cap, so parallel walker tests can evict the primed entry and any >1s runner stall expires it; either way the test observed Fresh with zero product regression. The stale-cache observation now re-establishes its precondition (invalidate_path + remove created.txt) and retries bounded (5 attempts), requiring Cached AND nonzero age — which also closes the residual Instant-vs-SystemTime clock mismatch in the #325 helper by retrying instead of failing on a zero-age edge. A genuine cache regression still fails all five attempts. 51 walker tests green, 8x stress on the target test, clippy zero, fmt clean. Merging via gh pr merge --auto per the new watchers-notify-never-authorize practice.
 _________________________________________________________________________________
-
 time:      [13:55] [20-07-26]
 agent:     [claude] [fable 5]
 worktree:  fix/task23-daemon-supervision-guard
@@ -4865,7 +4683,6 @@ area:      [backend]
 
 Implemented the daemon-side supervision invariant (pad TASK-23, from the 07-20 orphan evidence): long-lived TUIs keep old autostart code in memory, so the orphan race cannot be closed client-side. At boot, before binding, the daemon probes launchctl for dev.risingtides.ocean-daemon in the caller's GUI domain — if the job exists (running OR registered-idle, since launchd can kickstart onto the port at any moment) and this process is not the one it launched, the daemon prints a clear line and exits 0: on a supervised box a second daemon is an intentional no-op, not an error. OCEAN_UNSUPERVISED=1 is the explicit escape hatch; probe failures fail OPEN so a broken launchctl can't brick a dev box; non-macOS is a no-op. Verdict logic is a pure function exhaustively unit-tested (no job / own pid / foreign pid / idle job / override), launchctl pid parsing pinned incl. lookalike keys. Guard is main()-only so the 523-test daemon suite is untouched by construction; startup tests 17/17, clippy zero, fmt clean. CI is the full gate; merge only after all four rows report green, verified in a separate command.
 _________________________________________________________________________________
-
 time:      [03:05] [20-07-26]
 agent:     [claude] [fable 5]
 worktree:  [detached deploy worktree; ledger append only]
@@ -4874,7 +4691,6 @@ area:      [infra]
 
 TASK-15 closed end to end. #321 merged (f91a6acc): machine-neutral plist template (killed three fossilized smathdaddy-box paths that would have broken any reinstall), launcher published to ~/.local/libexec/ocean-daemon/launch.sh, installer renders the plist and accepts clean detached worktrees at origin/main content. Cutover run succeeded but exposed a supervision SPLIT-BRAIN: during the installer's bootout window an ocean TUI process spawned its own daemon (dirty-stamped first build), won the port, and left launchd crashlooping on EADDRINUSE — the source of the stubborn -dirty health rev. Evicted the orphan in an idle window; launchd took over within its 10s respawn. Final proof: pid 56968, ppid 1 (launchd), /health rev f91a6accc810 CLEAN, serving through the libexec artifact chain. Supervision is now fully checkout-independent with honest provenance. Filed TASK-20: the TUI's spawn-if-down fallback must defer to the launchd job or this race recurs every maintenance window.
 _________________________________________________________________________________
-
 time:      [04:22] [20-07-26]
 agent:     [claude] [fable 5]
 worktree:  [detached; ledger append only]
@@ -4923,7 +4739,6 @@ area:      [backend]
 
 Fixed the landed P2 codex flagged on #330: SessionContext derived Default, so code_intelligence defaulted false and every SessionContext::default() caller silently lost the lsp tool — the exact opposite of the field's documented contract (the field itself entered #330 via an over-broad git add -A sweeping a sibling lane's edit; process note recorded, explicit-path staging from here). Manual Default impl now keeps code_intelligence true while harness gates (hashline/artifacts) stay opt-in as daemon-granted capabilities. Codex's P1 on the same PR was stale — it reviewed an intermediate commit; merged code compiles green on all four rows. runtime+lsp+plugin suites 237 green, clippy zero, fmt clean.
 _________________________________________________________________________________
-
 time:      [19:15] [20-07-26]
 agent:     [claude] [fable 5]
 worktree:  fix/task27-p2c-deadline
@@ -4932,7 +4747,6 @@ area:      [testing]
 
 Third shared-CI-tax flake closed (pad TASK-27, failed #331's ubuntu row from a diff touching only ocean-runtime): p2c_startup_attempts_every_pending_row_beyond_128 gave 5s for 129 sequential redeem round-trips — sub-second solo, starved on a saturated runner. Deadline raised to 60s with rationale pinned in-comment; the poll loop is progress-guaranteed so the generous budget costs nothing when healthy. Test green, fmt clean.
 _________________________________________________________________________________
-
 time:      [01:21] [20-07-26]
 agent:     [ocean] [gpt-5.6]
 worktree:  feat/voice-conversation-project-tools
@@ -4965,7 +4779,6 @@ area:      [testing]
 
 Flake-audit pass 1 (pad TASK-28): all 35 tight timeouts in room_federation's test module widened 1-2s -> 60s after programmatic classification proved every one is a POSITIVE wait (poll loop or must-arrive channel recv, sub-second solo); the five my scanner first flagged negative were artifacts of adjacent try_recv asserts — the real negative class, correctly deadline-free and untouched (their synchronicity audit is TASK-29 per-case work). Deadline policy documented once at the shared wait helper; TASK-27 already proved this file fails unrelated PRs under runner saturation. Federation suite 50/50, fmt clean. Note: first attempt's worktree was swept mid-flight by a parallel scratchpad cleanup — moved lane worktrees to ~/.worktrees, and the half-executed command chain pushed an empty branch that has been deleted.
 _________________________________________________________________________________
-
 time:      [06:10pm] [07-20-26]
 agent:     [ocean] [gpt-5]
 worktree:  [agents-split-closeout-20260720]
@@ -4978,7 +4791,6 @@ private risingtides-agents owns Rising Tides production assistants, couriers,
 Slack intake, internal skills, and factory workflows. Updated the canonical
 project map and active extension/Crew path references. No runtime behavior changed.
 _________________________________________________________________________________
-
 time:      [00:17] [21-07-26]
 agent:     [pi] [unknown-model]
 worktree:  [main]
@@ -5009,7 +4821,6 @@ area:      public launch licensing and attribution
 
 Applied the operator-approved public launch posture: Ocean OS code and project-authored non-brand documentation/assets are MIT OR Apache-2.0, copyright © 2026 Rising Tides, while Ocean names and logos remain outside the open-source grants under a nominative-use trademark policy. Added root license texts, scope, contribution terms, human credits, and expanded donor notices for Pi, Oh My Pi, inertia-tui's 3D terminal graph mathematics, and RTK. Corrected the pinned RTK minimizer provenance from MIT to Apache-2.0 and bundled that license with the standalone minimizer crate. Updated Cargo package metadata and README discoverability; no runtime behavior changed.
 _________________________________________________________________________________
-
 time:      [23:55] [20-07-26]
 agent:     [claude] [fable 5]
 worktree:  feat/task30-nofollow-relative-root
@@ -5035,7 +4846,6 @@ area:      [backend]
 Added the Kimi CODING SUBSCRIPTION provider (TASK-16/19) — the real fix for smaths' 'insufficient balance' 429. Root cause (correcting my earlier wrong 'account suspended' call): Ocean routed Kimi to api.moonshot.ai/v1 (raw metered OpenAI API) but smaths is on the kimi-code PLAN, which lives at api.kimi.com/coding speaking Anthropic-messages. Built to a LIVE-VERIFIED contract: probed the endpoint with the key first (HTTP 200, x-api-key, no KimiCLI UA needed, returns signed thinking), so no guessing. Implementation reuses Ocean's existing Claude/anthropic-messages path — ProviderId::KimiCoding → base api.kimi.com/coding, model 'k3', aliases kimi-coding/kimi-code/k3/kimi-for-coding; Model::kimi_coding_k3; auth resolves the 'kimi-coding' auth.json block (subscription key wired in, old auth.json backed up). Raw metered kimi-k3 path untouched — both coexist. VERIFIED END TO END: ephemeral daemon (port 4788) drove a real kimi-coding turn — status completed, 60 output tokens, 4.2s, response 'KIMI-CODING-LIVE-OK', k3 shows ready=True resolving from auth.json. Prod daemon untouched during test. Provider+protocol+agent tests green, clippy zero, routing unit-tested (kimi-coding→subscription, kimi-k3→moonshot).
 _________________________________________________________________________________
 _________________________________________________________________________________
-
 time:      [00:20] [21-07-26]
 agent:     [pi] [claude-opus-4.5] [thoth]
 worktree:  [main]
@@ -5067,7 +4877,6 @@ area:      [docs]
 
 Refreshed the Ocean Surface architecture page as one bounded honesty/freshness slice. Corrected the canonical Leptos/Tauri/legacy-GPUI boundary, documented proxy-forwarded daemon-owned STT/TTS, and made the transcript-only POST /v1/agent/voice contract explicit without implying microphone capture, daemon STT, wake word, TTS, or a completed voice UX. Verified the live proxy health response, local file page, HTML parse, diff hygiene, and docs-check; no media assets were fabricated.
 _________________________________________________________________________________
-
 time:      [04:28] [21-07-26]
 agent:     [claude] [fable 5]
 worktree:  [detached @ origin/main (ca29a36a); ledger append only]
@@ -5077,7 +4886,6 @@ area:      [backend]
 Deployed the merged skills-fetch symlink fix (#336, smaths-merged as ca29a36a) so it actually runs. Full verification, all clean: hardened installer exit 0, /health rev ca29a36ac4e3, single daemon pid 58780 ppid 1 (launchd-supervised), ZERO orphans (TASK-20/23 held through the deploy), and the supervision guard proved live by hand-run — the binary printed "launchd owns the job — refusing to bind" and exited. The symlink vulnerability is now closed on the running daemon, not just on main: an untrusted repo can no longer exfiltrate an out-of-root file through a retargeted <cwd>/skills path (macOS O_NOFOLLOW_ANY, both-platform-verified). Closes the arc: 6 review rounds, 4 genuine bugs caught before merge (2 Codex P1s, a Linux security-theater gap, a CLOEXEC fd-leak regression), every one caught by a test or reviewer.
 _________________________________________________________________________________
 _________________________________________________________________________________
-
 time:      [00:35] [21-07-26]
 agent:     [pi] [claude-opus-4.5] [thoth]
 worktree:  [main]
@@ -5120,7 +4928,6 @@ lease drops. Verified as a real regression guard by mutating `session_lock` to
 key every session to one nil id — the new test fails under that mutation and
 passes once reverted.
 _________________________________________________________________________________
-
 time:      [14:02] [24-07-26]
 agent:     [claude] [opus 5]
 worktree:  test/task31-browser-wait-for-pid-flake
@@ -5142,7 +4949,6 @@ feature — the flake is dormant on default CI rather than gone. Verified with
 `cargo test -p ocean-browser --features legacy-chromium`: 12 passed,
 including `cancelled_browser_launch_does_not_orphan_spawned_process`.
 _________________________________________________________________________________
-
 time:      [13:54] [24-07-26]
 agent:     [claude] [opus 5]
 worktree:  deps/ratatui-0.30-lru-advisory
@@ -5166,7 +4972,6 @@ that underflow. ocean-tui's 409 tests, the full local `cargo xtask ci` gate, and
 `cargo deny check` are all green, and ratatui 0.30's MSRV is exactly our
 1.88 CI floor.
 _________________________________________________________________________________
-
 time:      [13:58] [24-07-26]
 agent:     [claude] [opus 5]
 worktree:  feat/tui-cd-slash-command
@@ -5457,7 +5262,6 @@ this ratification.
 _________________________________________________________________________________
 
 ---
-
 time:      [22:11] [27-07-26]
 agent:     [api], [gpt-5.4], [worker]
 worktree:  [feat/extensions-stage-a1]
@@ -5520,7 +5324,6 @@ normal/orphan/panic convergence, and bounded boot retention. The 2,305-request
 proof removes the former cumulative terminal cliff. A1 remains intentionally
 unwired and launches nothing; A2a is the next authorized slice.
 _________________________________________________________________________________
-
 time:  [22:28] [27-07-26]
 agent: [pi] [gpt-5.4] [Thoth]
 worktree: [detached origin/main integration at /private/tmp/ocean-consolidate]
@@ -5531,7 +5334,6 @@ Consolidated the recovered Ocean Buddy iPhone/watchOS app, typed SDK contract, a
 _________________________________________________________________________________
 
 _________________________________________________________________________________
-
 time:  [22:53] [27-07-26]
 agent: [pi] [gpt-5.4] [Thoth]
 worktree: [detached origin/main integration at /private/tmp/ocean-consolidate]
@@ -5542,7 +5344,6 @@ Consolidated the signed local iMessage adapter source with the exact 571-to-703 
 _________________________________________________________________________________
 
 _________________________________________________________________________________
-
 time:  [23:22] [27-07-26]
 agent: [pi] [gpt-5.4] [Thoth]
 worktree: [detached origin/main integration at /private/tmp/ocean-consolidate]
@@ -5553,7 +5354,6 @@ Consolidated unknown-ack reconciliation, exact-request Esc cancellation, tool-lo
 _________________________________________________________________________________
 
 _________________________________________________________________________________
-
 time:  [23:33] [27-07-26]
 agent: [pi] [gpt-5.4] [Thoth]
 worktree: [detached origin/main integration at /private/tmp/ocean-consolidate]
@@ -5564,7 +5364,6 @@ Established the public-evidence contract. Retained two synthetic captures as con
 _________________________________________________________________________________
 
 _________________________________________________________________________________
-
 time:  [23:39] [27-07-26]
 agent: [pi] [gpt-5.4] [Thoth]
 worktree: [detached origin/main integration at /private/tmp/ocean-consolidate]
@@ -5575,7 +5374,6 @@ Recovered the post-PR community documents, vulnerability/support routes, contrib
 _________________________________________________________________________________
 
 _________________________________________________________________________________
-
 time:  [23:52] [27-07-26]
 agent: [pi] [gpt-5.4] [Thoth]
 worktree: [detached origin/main integration at /private/tmp/ocean-consolidate]
@@ -5625,7 +5423,6 @@ area:      [testing]: ocean-daemon Phase 2C governance control
 Corrected only the extraction-aware test's future parent import expectation: the five route handlers remain one production import block while parent-test-only `with_titles` uses a separate `#[cfg(test)]` import, avoiding a denied-warning release unused import without broadening request fields or production authority. Focused source-boundary characterization passed. Rollback and extraction authorization now bind to `0e7a4dc`, which contains the accepted seven-test characterization `f1971c0` plus this test-only correction. No production behavior, handler, route, response, schema, credential, process, or deployment changed.
 
 _________________________________________________________________________________
-
 time:  [00:04] [28-07-26]
 agent: [pi] [gpt-5.4] [Thoth]
 worktree: [detached origin/main integration at /private/tmp/ocean-consolidate]
@@ -5636,7 +5433,6 @@ Reconciled the authorized exact 13-definition claim/revoke/recall/breach/board a
 _________________________________________________________________________________
 
 _________________________________________________________________________________
-
 time:  [00:17] [28-07-26]
 agent: [pi] [gpt-5.4] [Thoth]
 worktree: [detached origin/main integration at /private/tmp/ocean-consolidate]
@@ -5645,7 +5441,6 @@ area:  [backend]: Call dependency transport
 
 Recovered the focused LiveKit feature correction from the divergent Mini main. `livekit-api` now uses rustls native roots, removing `native-tls`, `hyper-tls`, and `openssl-sys` from the supported workspace graph. All 160 ocean-call tests, workspace test compilation, compatibility feature Clippy lanes, release all-target compilation, docs-check, and dependency-tree assertions pass.
 _________________________________________________________________________________
-
 time:      [23:50] [27-07-26]
 agent:     [pi] [gpt-5.4] [worker]
 worktree:  [feat/extensions-stage-a2a]
@@ -5668,7 +5463,6 @@ independent acceptance; A2b is not authorized to start before that gate.
 _________________________________________________________________________________
 
 _________________________________________________________________________________
-
 time:  [00:23] [28-07-26]
 agent: [pi] [gpt-5.4] [Thoth]
 worktree: [detached origin/main integration at /private/tmp/ocean-consolidate]
@@ -5679,7 +5473,6 @@ Recovered the Surface-site honesty pass while preserving the new public-evidence
 _________________________________________________________________________________
 
 _________________________________________________________________________________
-
 time:  [00:36] [28-07-26]
 agent: [pi] [gpt-5.4] [Thoth]
 worktree: [detached origin/main integration at /private/tmp/ocean-consolidate]
@@ -5688,7 +5481,6 @@ area:  [design]: Public evidence and measurement graphics
 
 Recovered the 2026-07-18 local harness-footprint measurement as two editable SVG/PNG social graphics with AI-generated text-free backplates. Review prep verified all arithmetic, dimensions, visible text, and absence of personal/local identifiers. The daemon-accounting graphic now names its OpenCode 1.17.15 baseline instead of making an unsupported standalone comparison, and the README binds the assets to the public-evidence policy and reproducible Chrome SVG rendering.
 _________________________________________________________________________________
-
 time:      [00:40] [28-07-26]
 agent:     [pi], [gpt-5.4], [worker]
 worktree:  [feat/extensions-stage-a2a]
@@ -5738,7 +5530,6 @@ appear as third-party packages. Binary-section headers, cargo-about version,
 full NOTICE evidence, exact twelve-file payload, legal-file identity, npm/Bun
 installation, and dependency-free wrapper checks remain unchanged.
 _________________________________________________________________________________
-
 time:      [01:08] [28-07-26]
 agent:     [api] [gpt-5.4] [worker]
 worktree:  [feat/extensions-stage-a2a]
@@ -6009,7 +5800,6 @@ captured on /v1/events SSE. Fix: route `claude-fable-5` through the existing
 ocean-agent's ClaudeCode match, and add a round-trip regression test covering
 every fable spelling. cargo test -p ocean-providers green (46 passed).
 _________________________________________________________________________________
-
 time:      13:44 30-07-26
 agent:     [ocean], [gpt-5.6-sol], [@pm]
 worktree:  [fix/tui-picker-session-authority]
@@ -6034,7 +5824,6 @@ the pre-existing rustfmt drift in ocean-providers so the repository formatting
 gate can pass. The full 459-test TUI suite, TUI check/release build, workspace
 check, docs-check, and independent review all passed.
 _________________________________________________________________________________
-
 time:      [19:25] [07-30-26]
 agent:     [claude] [pm]
 worktree:  feat/rooms-g1-integrity
@@ -6065,7 +5854,6 @@ area:      [backend]
 
 Completed the rooms federated cursor/presence closeout in ocean-daemon. Wired RoomReadCursorWakeBus through FederationSupervisor init/test fixtures and persistent-room fake state, added federated SSE handling for explicit `presence` and `room_read_cursor` events, and published read-cursor wakes after authoritative mirrored cursor commits. Persistent room events SSE now includes Local-room read-cursor bootstrap/live tail support without breaking existing transcript replay semantics; HTTP tests were updated to tolerate the new bootstrap ordering. Verified targeted daemon/store cursor tests, full daemon tests, daemon clippy -D warnings, cargo fmt --check, and diff --check.
 _________________________________________________________________________________
-
 time:      [12:00] [08-08-25]
 agent:     [ocean-subagent], [gpt-5], [daemon-cursor-gate-closer]
 worktree:  feat/rooms-federated-cursor-presence
@@ -6074,7 +5862,6 @@ area:      [backend]: ocean-daemon persistent rooms + operator route guide
 
 Updated `crates/ocean-daemon/src/persistent_rooms.rs` tests so merged room SSE accepts interleaved no-id `room_read_cursor` bootstrap frames while still requiring each subscriber to receive exactly the intended `room_access` update, preserving Last-Event-ID semantics for message replay. Added the missing GET/PATCH `/v1/rooms/persistent/{key}/read-cursor` entries to `crates/ocean-daemon/src/main.rs` banner discovery and `docs/OCEAN_RUNTIME_OPERATOR_GUIDE.md` quick reference, then re-ran focused daemon regressions, full `cargo test -p ocean-daemon`, strict daemon all-target clippy, and fmt/diff checks.
 _________________________________________________________________________________
-
 time:      [14:52] [03-08-26]
 agent:     ocean, claude-code-fable-5, designer
 worktree:  [main]
@@ -6097,7 +5884,6 @@ must implement it before autonomous activation. Verified: cargo xtask
 docs-check PASS. Uncommitted pending pad @reviewer acknowledgement (security
 contract change).
 _________________________________________________________________________________
-
 time:      [15:13] [04-08-26]
 agent:     [ocean], [gpt-5.6-sol]
 worktree:  [main]
@@ -6106,7 +5892,6 @@ area:      [frontend]
 
 Diagnosed the TUI's reported 52 active agents as 50 durable Observatory session-root nodes plus three running turns: FLOW treated every admitted session container as live work. Updated the projection to exclude only fixed `session`-labeled roots while preserving admitted/running turn and extension executions. Also fixed pre-first-message model selections snapping back to the daemon-global GPT model by pinning the newly created session before `SessionBound`, and exposed the separate Kimi K3 coding-plan credential row so coding-plan keys are not confused with Moonshot API keys. Focused workflow graph tests pass (7/7); TUI compile/release verification pending.
 _________________________________________________________________________________
-
 time:      [15:20] [04-08-26]
 agent:     [ocean], [gpt-5.6-sol]
 worktree:  [main]
@@ -6122,7 +5907,6 @@ confirmed the ordering closes the reported normal path. Verified: cargo fmt
 --check; cargo test -p ocean-tui (463 passed, 1 ignored); cargo build -p
 ocean-tui --release; git diff --check.
 _________________________________________________________________________________
-
 time:      [21:04] [08-04-2026]
 agent:     [ocean], [gpt-5.6-sol]
 worktree:  [fix/failure-honesty]
@@ -6337,7 +6121,6 @@ answers. Under concurrent review they get answered by whoever writes the code
 that needs them, which is faster and less deliberate. The mitigation is the
 explicit-statement rule above.
 _________________________________________________________________________________
-
 time:      [23:31] [26-08-26]
 agent:     [claude], [opus 5]
 worktree:  feat/attachments
@@ -6396,7 +6179,6 @@ route count moves 101 -> 104 for that repair and 104 -> 108 for attachments, and
 the comment above the assertion says which is which.
 _________________________________________________________________________________
 _________________________________________________________________________________
-
 time:      [23:35] [26-08-26]
 agent:     [claude-code], [opus-5-1m]
 worktree:  feat/summarize
@@ -6467,7 +6249,6 @@ read-cursor federation slice plus the new absent-route regression, workspace
 check, daemon all-target Clippy with denied warnings, docs-check, formatting,
 and diff hygiene. No daemon was restarted and no production state was changed.
 _________________________________________________________________________________
-
 time:  [01:14] [08-27-26]
 agent: [codex] [gpt-5]
 worktree: [feat/rooms-phase1-agent-binding]
@@ -6491,7 +6272,6 @@ Verification: cargo test -p ocean-store (169 passed), cargo test -p ocean-daemon
 and ocean-daemon, cargo xtask docs-check, format and diff checks, and the full
 cargo xtask ci repository gate all passed.
 _________________________________________________________________________________
-
 time:  [01:25] [08-27-26]
 agent: [codex] [gpt-5]
 worktree: [feat/rooms-phase1-agent-binding]
@@ -6508,7 +6288,6 @@ never overwrite it with active state.
 Verification: cargo test -p ocean-store (170 passed), the focused concurrency
 regression, and strict ocean-store all-target Clippy with denied warnings passed.
 _________________________________________________________________________________
-
 time:  [01:48] [08-27-26]
 agent: [codex] [gpt-5]
 worktree: [feat/rooms-phase1-agent-binding]
@@ -6528,7 +6307,6 @@ Verification: cargo test -p ocean-store (173 passed), cargo test -p ocean-daemon
 cargo xtask docs-check, formatting, diff hygiene, and the full cargo xtask ci
 repository gate all passed.
 _________________________________________________________________________________
-
 time:  [01:56] [08-27-26]
 agent: [codex] [gpt-5]
 worktree: [feat/rooms-phase1-agent-binding]
@@ -6549,7 +6327,6 @@ replay, cross-operation reuse, and no-op decision coverage. Strict Clippy,
 workspace, docs, formatting, diff, and full repository gates follow before
 landing.
 _________________________________________________________________________________
-
 time:  [01:59] [08-27-26]
 agent: [codex] [gpt-5]
 worktree: [feat/rooms-phase1-agent-binding]
@@ -6563,7 +6340,6 @@ with denied warnings, formatting, and dependency policy. Ocean-store passed
 ready for a fresh exact-head independent review; it remains an inert foundation
 with no routes, admission behavior, daemon restart, or production mutation.
 _________________________________________________________________________________
-
 time:  [02:33] [08-27-26]
 agent: [codex desktop] [gpt-5]
 worktree: [codex/rooms-phase1-deploy-record]
@@ -6584,7 +6360,6 @@ cleanly. The user's dirty canonical checkout was not modified. This foundation
 remains deliberately inert: no Room-agent API routes or admission behavior were
 introduced by Phase 1 Stage 1.
 _________________________________________________________________________________
-
 time:      [04:22] [14-08-26]
 agent:     [pi] [gpt-5.6-sol]
 worktree:  [fix/tui-control-recovery]
@@ -6612,7 +6387,6 @@ Fresh independent adversarial reviews approved the final diff.
 _________________________________________________________________________________
 
 _________________________________________________________________________________
-
 time:      [04:34] [14-08-26]
 agent:     [pi] [gpt-5.6-sol]
 worktree:  [fix/tui-control-recovery]
@@ -6632,7 +6406,6 @@ PID.
 _________________________________________________________________________________
 
 _________________________________________________________________________________
-
 time:      [04:46] [14-08-26]
 agent:     [pi] [gpt-5.6-sol]
 worktree:  [fix/tui-control-recovery]
@@ -6654,7 +6427,6 @@ requests or isolated smoke listeners remain.
 _________________________________________________________________________________
 
 _________________________________________________________________________________
-
 time:      [04:47] [14-08-26]
 agent:     [pi] [gpt-5.6-sol]
 worktree:  [fix/tui-control-recovery]
@@ -6667,7 +6439,6 @@ repository/feature/release gates all passed.
 _________________________________________________________________________________
 
 _________________________________________________________________________________
-
 time:      [15:39] [24-08-26]
 agent:     [codex] [gpt-5]
 worktree:  [main]
@@ -6685,7 +6456,6 @@ roadmap. This checkpoint changes no runtime behavior and authorizes no code
 stage until the exact manifest receives operator acceptance after independent
 architecture/security review.
 _________________________________________________________________________________
-
 time:      [23:16] [26-08-26]
 agent:     [claude] [opus 5]
 worktree:  [main]
@@ -6712,7 +6482,6 @@ router parity test that was already red on main: agent CRUD registered POST
 discovery or the operator guide. PR #371, merged. 691/691 daemon tests, clippy
 and fmt clean, workspace check clean.
 _________________________________________________________________________________
-
 time:      [00:04] [27-08-26]
 agent:     [claude] [opus 5]
 worktree:  [main]
@@ -6744,7 +6513,6 @@ had never loaded rooms (surface #121). Bedrock migration 010 is not yet applied
 to production and the Railway service has no GitHub source, so repo-in-room is
 merged but not shipped.
 _________________________________________________________________________________
-
 time:      [22:45] [08-27-26]
 agent:     [claude] [opus 5]
 worktree:  loop/provider-readiness-is-a-lie
@@ -6792,7 +6560,6 @@ and the fallback's reuse_accepted_user invariant holds for the same reason it
 holds against a live provider. Reverting each of the four lines individually now
 fails exactly one test, and a different one each time.
 _________________________________________________________________________________
-
 time:      [17:52] [08-27-26]
 agent:     [claude] [opus 5]
 worktree:  loop/attachments-in-agent-context
@@ -6821,7 +6588,6 @@ too. A room with no attachments produces a byte-identical prompt, and that is a
 test rather than a claim. No ContextPolicy/ContextMount — the Rooms v2 §7 model
 stays unimplemented, as the root contract requires.
 _________________________________________________________________________________
-
 time:      [18:13] [08-27-26]
 agent:     [claude] [opus 5]
 worktree:  loop/attachments-in-agent-context
@@ -6852,7 +6618,6 @@ defensible and the §7 model is genuinely unimplemented, but a builder narrowing
 the prohibition covering its own change is above the builder's level, so both
 bullets are marked NOT YET RATIFIED with the revert named.
 _________________________________________________________________________________
-
 time:      [20:50] [08-27-26]
 agent:     [claude] [opus 5]
 worktree:  loop/attachment-content-sniff
@@ -6899,7 +6664,6 @@ the comment already promises a fall back to the id that the code does not do.
 The docs say the response carries the header rather than that it always does,
 so this change writes no fresh false claim. No migration, no deploy. PR #379.
 _________________________________________________________________________________
-
 time:      [03:36] [08-28-26]
 agent:     [claude] [fable 5]
 worktree:  loop/attachment-marker-has-no-id
@@ -6925,7 +6689,6 @@ toolchain 1.97.0: 226/51/780/177 tests 0 failed, clippy -D warnings clean,
 fmt clean. Unblocks inline-media. No migration of production data, no deploy
 decision. PR #385.
 _________________________________________________________________________________
-
 time:      [08:00] [08-28-26]
 agent:     [claude] [fable 5]
 worktree:  loop/workspace-file-read-lane
@@ -7130,7 +6893,6 @@ surface-roster-marks-your-own-rows next wave. Gate: 54 core + 816 daemon
 + 178 store tests 0 failed, clippy -D warnings clean, fmt clean,
 toolchain 1.97.0. No migration, no deploy step.
 _________________________________________________________________________________
-
 time:      [11:47] [08-30-26]
 agent:     [claude] [opus 5]
 worktree:  loop/os-ci-events-ledger-guard
@@ -7153,7 +6915,6 @@ deny_unknown_fields. The comment had credited the None-skips-serialization
 nicety for both directions, which the second half of the very test it annotates
 disproves.
 _________________________________________________________________________________
-
 time:      [12:51] [08-30-26]
 agent:     [claude] [opus 5]
 worktree:  loop/os-artifact-amend-can-blank-a-title
@@ -7184,7 +6945,6 @@ unmoved; the guide's create and amend rows gained the 400. Gate: 54 core + 179
 store + 817 daemon tests 0 failed, clippy -D warnings clean, fmt clean,
 toolchain 1.97.0. No migration, no deploy step.
 _________________________________________________________________________________
-
 time:      [13:42] [08-30-26]
 agent:     [claude] [opus 5]
 worktree:  loop/os-artifact-amend-can-blank-a-title
@@ -7205,7 +6965,6 @@ it sits ahead of the CAS rather than after it, why an absent title still means
 untouched, and — the boundary the guide got wrong — that `artifact_id` is not
 checked in the store.
 _________________________________________________________________________________
-
 time:      [14:49] [08-30-26]
 agent:     [claude] [opus 5]
 worktree:  loop/os-core-invite-types-are-a-contract-nobody-signed
@@ -7237,7 +6996,6 @@ clippy -D warnings clean, fmt clean, and `cargo check --all-targets` clean
 across the workspace — test targets included, which is where a deleted type's
 last reference would hide. No migration, no deploy step.
 _________________________________________________________________________________
-
 time:      [16:54] [08-30-26]
 agent:     [claude] [opus 5]
 worktree:  loop/os-redeem-answers-without-the-room-key
@@ -7277,7 +7035,6 @@ ocean-daemon tests 0 failed, clippy -D warnings clean, fmt clean, docs-check
 PASS. A follow-up ocean-surface slice deletes `newly_joined_key` and reads
 `room_key` instead. No migration, no deploy step.
 _________________________________________________________________________________
-
 time:      [18:48] [08-30-26]
 agent:     [claude] [opus 5]
 worktree:  loop/os-workspace-markers-narrate-endings-but-not-beginnings
@@ -7329,7 +7086,6 @@ AGENTS.md allowlist enumeration current — it had missed `repo_unbound` and
 failed, clippy -D warnings clean, fmt clean, toolchain 1.97.0. One source file
 plus two records. No migration, no deploy step.
 _________________________________________________________________________________
-
 time:      [21:23] [08-30-26]
 agent:     [claude] [opus 5]
 worktree:  loop/os-invite-response-carries-the-onboard-link
@@ -7366,7 +7122,6 @@ rather than only in a review thread. Gate: fmt clean, ocean-core + ocean-daemon
 check clean, toolchain 1.97.0. Inert until the ocean-surface half consumes the
 field. No migration, no deploy step.
 _________________________________________________________________________________
-
 time:      [23:06] [08-30-26]
 agent:     [claude] [opus 5]
 worktree:  loop/os-marker-allowlist-noise-list-asserts-a-phantom-event
@@ -7428,7 +7183,6 @@ them yet. Gate: fmt clean, clippy
 `-p ocean-daemon --all-targets -D warnings` clean, 821 tests 0 failed, toolchain
 1.97.0. Test-and-docs only — no deploy, no migration.
 _________________________________________________________________________________
-
 time:      [00:56] [08-31-26]
 agent:     [claude] [opus 5]
 worktree:  loop/os-port-closed-marker-ignores-the-route-removed-flag
@@ -7465,7 +7219,6 @@ safe to build ahead of the deploy, and the absent-field case is the live path
 until it ships. Gate: fmt clean, clippy `-p ocean-daemon --all-targets -D
 warnings` clean, 822 tests 0 failed, toolchain 1.97.0. No deploy, no migration.
 _________________________________________________________________________________
-
 time:      [01:26] [08-31-26]
 agent:     [claude] [opus 5]
 worktree:  sweep/wave40-bedrock-audit-action-rename
@@ -7498,7 +7251,6 @@ decorative: adding `file.workspace_write` to the allowlist fails
 clippy `-p ocean-daemon --all-targets -D warnings` clean, 822 tests 0 failed,
 toolchain 1.97.0. Docs and one test literal only -- no deploy, no migration.
 _________________________________________________________________________________
-
 time:      [02:55] [08-31-26]
 agent:     [claude] [opus 5]
 worktree:  loop/os-ci-failure-convenes-nobody
@@ -7547,7 +7299,6 @@ Gate: fmt clean, clippy `-p ocean-core`/`-p ocean-store`/`-p ocean-daemon`
 ocean-daemon 824 passed 0 failed, toolchain 1.97.0. Ships paired with the
 surface half that exposes the toggle. No deploy, no migration.
 _________________________________________________________________________________
-
 time:      [03:22] [08-31-26]
 agent:     [claude] [opus 5]
 worktree:  loop/os-docs-trigger-policy-sweep
@@ -7566,7 +7317,6 @@ assuming: it names `trigger_policy?` in the create/PATCH bodies at :557/:559
 and enumerates no flags, so it did not go stale and was left alone. Docs only,
 no code, no deploy, no migration.
 _________________________________________________________________________________
-
 time:      [14:20] [31-08-26]
 agent:     [claude-code], [claude-opus-5]
 worktree:  loop/os-ledger-checker
@@ -7606,7 +7356,6 @@ because the job is non-blocking, so a red check would not have stopped a merge,
 it would only have been red from birth. No Rust changed, no deploy, no
 migration.
 _________________________________________________________________________________
-
 time:      [05:05] [08-31-26]
 agent:     [claude] [opus 5]
 worktree:  loop/os-ci-marker-run-url
@@ -7647,7 +7396,6 @@ and the line cannot drift. `on_ci_failure`'s dispatch reason string is
 untouched. Gate green: 825 passed, clippy -D warnings clean, fmt clean. No
 deploy, no migration.
 _________________________________________________________________________________
-
 time:      05:27 08-31-26
 agent:     claude opus 5
 worktree:  loop/os-ci-marker-run-url
@@ -7680,7 +7428,6 @@ drops the tail, and widening the named list to four trips the new assertion.
 Gate green on the whole tree: 825 passed, clippy -D warnings exit 0, fmt clean.
 No deploy, no migration.
 _________________________________________________________________________________
-
 time:      [10:35] [31-08-26]
 agent:     [claude] [opus 5]
 worktree:  loop/os-ci-marker-run-url
@@ -7701,7 +7448,6 @@ read beats a rewrite nobody reviewed; the checker then reported 514 entries,
 every one closed. Recorded because "the instrument has never fired" and "the
 failure never happens" look identical until the first time it does.
 _________________________________________________________________________________
-
 time:      [07:41] [08-31-26]
 agent:     [claude] [opus 5]
 worktree:  loop/os-yolo-wire-flag-test-is-flaky-under-the-parallel-runner
@@ -7757,7 +7503,6 @@ toolchain 1.97.0. Also recorded the lock discipline and its acquisition order in
 on `fake_convene_state` was the only statement of the rule and comments do not
 enforce. No deploy, no migration.
 _________________________________________________________________________________
-
 time:      [09:00] [08-31-26]
 agent:     [claude] [opus 5]
 worktree:  loop/os-bounded-quotable-drops-control-characters-and-lets-link-syntax-through
@@ -8181,7 +7926,6 @@ no automated cross-repo check exists -- plus the half that does NOT depend on
 the pin, which is that the off direction is accepted in every access state, so
 no client can be locked out of clearing the flag however its write is composed.
 _________________________________________________________________________________
-
 time:      [14:59] [31-08-26]
 agent:     [codex] [gpt-5.6-sol]
 worktree:  [codex/rooms-phase1-integration-20260831]
@@ -8204,7 +7948,6 @@ at `8320a975a23d03f7e98982ff81d8f793f100b4c6`; `cargo fmt --all` and
 explicit-workspace/fail-closed contract, so no contract text changed. No push,
 merge to main, install, restart, database mutation, or deployment was performed.
 _________________________________________________________________________________
-
 time:      [15:24] [31-08-26]
 agent:     [codex] [gpt-5.6-sol]
 worktree:  [codex/rooms-phase1-integration-20260831]
@@ -8228,7 +7971,6 @@ attribution after the live binding advances to N+1. `cargo fmt --all`,
 review remain required before this repair is accepted. No push, merge to main,
 install, restart, database mutation, or deployment was performed.
 _________________________________________________________________________________
-
 time:      [15:41] [31-08-26]
 agent:     [codex] [gpt-5.6-sol]
 worktree:  [codex/rooms-phase1-integration-20260831]
@@ -8249,7 +7991,6 @@ docs-check, ledger validation, and `git diff --check` also passed. Fresh exact-S
 independent review and workspace release gates remain required. No push, merge
 to main, install, restart, database mutation, or deployment was performed.
 _________________________________________________________________________________
-
 time:      [15:56] [31-08-26]
 agent:     [codex] [gpt-5.6-sol]
 worktree:  [codex/rooms-phase1-integration-20260831]
@@ -8272,7 +8013,6 @@ rehearsal remains valid because the final repair changed no schema. No push,
 merge to main, install, restart, live database mutation, or deployment was
 performed; upstream landing is the next release boundary.
 _________________________________________________________________________________
-
 time:      [14:58] [08-31-26]
 agent:     [claude] [opus 5]
 worktree:  loop/os-vendors-bedrock-events
@@ -8318,7 +8058,6 @@ someone runs that command an action bedrock added is dropped in silence.
 to another slice, so `scripts/vendor-bedrock-room-events.test.mjs` runs by hand
 (`node --test`) and is documented as such in its own header.
 _________________________________________________________________________________
-
 time:      [15:22] [08-31-26]
 agent:     [claude] [opus 5]
 worktree:  loop/os-vendors-bedrock-events
@@ -8357,7 +8096,6 @@ reviewer's own mutations: widened prefix -> the pin fails naming both values,
 emptied sha -> the provenance test fails, prefix edited with no action moved ->
 `--check` exits 1 saying the sets agree but the bytes do not.
 _________________________________________________________________________________
-
 time:      [16:08] [31-08-26]
 agent:     [codex] [gpt-5.6-sol]
 worktree:  [codex/rooms-phase1-integration-20260831]
@@ -8375,7 +8113,6 @@ The MSRV lane retains the two known non-denied dead-code warnings in
 push, merge to main, install, restart, live database mutation, or deployment was
 performed.
 _________________________________________________________________________________
-
 time:      [16:23] [31-08-26]
 agent:     [codex] [gpt-5.6-sol]
 worktree:  [codex/rooms-phase1-closeout-20260831]
@@ -8397,7 +8134,6 @@ landing and keep Stage 2 contributed folders explicitly closed pending its own
 accepted implementation manifest. No local daemon install/restart, live database
 mutation, or Surface served-state claim was made in this closeout.
 _________________________________________________________________________________
-
 time:      [17:33] [31-08-26]
 agent:     [codex] [gpt-5.6-sol]
 worktree:  [codex/rooms-phase1-live-receipt-20260831]
@@ -8424,7 +8160,6 @@ immutable release at `6872181a6f4f535498e3a816020cb197f0ee65dd3c39aafdba57119be4
 and `7846b1c95e915c7899bff104368503ee1aadb78cfa68653f41af84ad24d5d223`.
 Stage 2 contributed folders remains closed pending its own accepted manifest.
 _________________________________________________________________________________
-
 time:      [19:03] [31-08-26]
 agent:     [claude] [opus 5]
 worktree:  loop/os-bounded-prose-is-about-to-exist-in-two-crates-with-no-shared-home
@@ -8473,7 +8208,6 @@ green, `cargo clippy ... --all-targets -- -D warnings` clean, `cargo fmt --check
 clean, `cargo check --workspace` clean. No deploy and no migration; this lands
 to main like any other code change.
 _________________________________________________________________________________
-
 time:      [19:30] [31-08-26]
 agent:     [claude] [opus 5]
 worktree:  loop/os-bounded-prose-is-about-to-exist-in-two-crates-with-no-shared-home
@@ -8548,7 +8282,6 @@ same 64 -- three fields the very next clause names by provenance. A positive
 enumeration missing half its members is the same defect as the false absolute
 this slice exists to fix.
 _________________________________________________________________________________
-
 time:      [21:02] [31-08-26]
 agent:     [claude] [opus 5]
 worktree:  loop/os-audit-json-rows-reach-the-human-transcript-unprojected
@@ -8572,7 +8305,6 @@ row is a ledger and the new test asserts it still holds the poisoned id verbatim
 — and not in `read_transcript_page`, so the projection lands where each response
 is SHAPED.
 _________________________________________________________________________________
-
 time:      [21:21] [31-08-26]
 agent:     [claude] [opus 5]
 worktree:  loop/os-audit-json-rows-reach-the-human-transcript-unprojected
@@ -8602,7 +8334,6 @@ Gate on the amended tree: `cargo test -p ocean-daemon` 855 green,
 ocean-store --all-targets -- -D warnings` exit 0, `cargo fmt --check` exit 0.
 No deploy and no migration.
 _________________________________________________________________________________
-
 time:      [21:38] [08-31-26]
 agent:     [claude] [opus 5]
 worktree:  loop/os-audit-json-rows-reach-the-human-transcript-unprojected
@@ -8623,7 +8354,6 @@ restore the literal. docs-check goes from FAILED (1 issue) to PASS across 30
 packages, 157 active Markdown files, 179 local links. No code, no invariant, no
 deploy.
 _________________________________________________________________________________
-
 time:      [23:48] [08-31-26]
 agent:     [claude] [opus 5]
 worktree:  loop/os-summarize-reads-audit-bodies-raw-into-a-model-and-the-surface-renders-the-result
@@ -8687,7 +8417,6 @@ Gate at land: `cargo test -p ocean-daemon` 857 passed / 0 failed, `cargo clippy
 local links). No route, no schema, no wire field — a prompt rendering and its
 contracts — so no deploy and no migration.
 _________________________________________________________________________________
-
 time:      [01:03] [09-01-26]
 agent:     [claude] [opus 5]
 worktree:  loop/os-owner-member-id-is-an-identity-with-no-shape-and-no-bound
@@ -8779,7 +8508,6 @@ Gate: `cargo test -p ocean-daemon` 859 passed / 0 failed (857 before, +2 new),
 files, 179 local links). New typed 400 codes on two existing routes; no schema,
 no migration, no deploy.
 _________________________________________________________________________________
-
 time:      [02:53] [01-09-26]
 agent:     [claude] [opus 5]
 worktree:  loop/os-room-get-truncates-the-transcript-at-1000-and-never-says-so
@@ -8845,7 +8573,6 @@ Gate: `cargo test -p ocean-daemon` 862 passed / 0 failed (859 before, +3 new),
 --check` exit 0. Additive response fields on one existing route; no schema, no
 migration, no deploy.
 _________________________________________________________________________________
-
 time:      [03:20] [01-09-26]
 agent:     [claude] [opus 5]
 worktree:  loop/os-room-get-truncates-the-transcript-at-1000-and-never-says-so
@@ -8937,7 +8664,6 @@ a required status check there: red is information, not a lock. Three backlog
 entries and one earlier wave's lesson said otherwise; ci.yml's own comment is
 the authority and it says the opposite.
 _________________________________________________________________________________ 02:51 loop/os-ledger-needs-the-per-entry-identity-separator-too
-
 time:      [04:49] [01-09-26]
 agent:     [claude code], [claude-opus-5], [ocean-loop builder]
 worktree:  loop/os-snapshot-closed-marker
@@ -9036,7 +8762,6 @@ Gate re-run after the doc pass: `cargo test -p ocean-daemon` 863 passed / 0 fail
 files, 179 local links), `node scripts/check-ledger.mjs events.md` 546 entries
 every one closed.
 _________________________________________________________________________________ 04:49 loop/os-snapshot-closed-marker
-
 time:      [04:49] [01-09-26]
 agent:     [claude-code], [claude-opus-5]
 worktree:  loop/os-ledger-date-format-is-ruled-dd-mm-yy-by-the-schema-and-mm-dd-yy-by-ci
@@ -9088,7 +8813,6 @@ Gate: `cargo xtask docs-check` PASS, `node scripts/check-ledger.mjs events.md`
 547 entries every one closed on the rebased tree this lands as, ci.yml re-parsed
 clean and the `ledger` job still carries its steps. No Rust touched, no deploy, no migration.
 _________________________________________________________________________________ 04:49 loop/os-ledger-date-format-is-ruled-dd-mm-yy-by-the-schema-and-mm-dd-yy-by-ci
-
 time:      07:10 01-09-26
 agent:     claude-code, claude-opus-5, ocean-loop builder
 worktree:  loop/os-no-route-can-serve-the-newest-page-of-a-transcript-only-the-oldest
@@ -9154,7 +8878,6 @@ into them), the two `status == OK` preconditions, and two mid-walk spot checks o
 pages 2 and 3 that evaluate the same expressions page 1 already pins. No deploy,
 no migration.
 _________________________________________________________________________________ 07:10 loop/os-no-route-can-serve-the-newest-page-of-a-transcript-only-the-oldest
-
 time:      07:44 01-09-26
 agent:     claude-code, claude-opus-5, ocean-loop builder (refinement)
 worktree:  loop/os-no-route-can-serve-the-newest-page-of-a-transcript-only-the-oldest
@@ -9214,8 +8937,6 @@ clean. `cargo deny check advisories` is the one red stage and is unchanged from
 neither reachable from a diff that touches no Cargo.toml, Cargo.lock or
 deny.toml. Both mutation experiments reverted. No deploy, no migration.
 _________________________________________________________________________________ 07:44 loop/os-no-route-can-serve-the-newest-page-of-a-transcript-only-the-oldest
-
-
 time:      [09:31] [01-09-26]
 agent:     [claude code], [opus 5], [ocean-loop builder]
 worktree:  loop/os-snapshot-agent-owners
@@ -9426,7 +9147,6 @@ cut a detached worktree at pristine bcf5222c and reproduced the identical exit 1
 advisory is a real workspace-wide blocker and wants its own slice; it is not
 mine to fix from inside ocean-store. No deploy, no migration.
 _________________________________________________________________________________ 09:30 loop/os-roomrecord-transcript-prefix
-
 time:      [11:48] [01-09-26]
 agent:     [claude code], [opus 5], [ocean-loop builder]
 worktree:  loop/os-transcript-page-including-closed
@@ -9503,7 +9223,6 @@ own comment records it flaking under full-suite parallel load; it passes alone
 and in-suite on both pristine main and this branch, and it is unrelated to this
 diff. No deploy, no migration.
 _________________________________________________________________________________ 11:48 loop/os-transcript-page-including-closed
-
 time:      [12:16] [01-09-26]
 agent:     [claude code], [opus 5], [ocean-loop refiner]
 worktree:  loop/os-transcript-page-including-closed
@@ -9549,7 +9268,6 @@ RUSTSEC-2026-0274 (`rtrb` double-free) and yanked `spin`, unchanged and
 pre-existing: the branch touches no `Cargo.toml`, `Cargo.lock` or `deny.toml` at
 all, and every line this pass changed is a comment. No deploy, no migration.
 _________________________________________________________________________________ 12:16 loop/os-transcript-page-including-closed
-
 time:      [05:55] [02-09-26]
 agent:     [claude code], [claude-fable-5-1]
 worktree:  deps/rtrb-0.3.5-rustsec-2026-0274
@@ -9576,3 +9294,138 @@ still the warning it was under `yanked = "warn"`, so once main carries this
 lockfile the cargo-deny lane is green for every open PR; CI's own run of that
 lane on this branch is the proof. No build, no deploy, no code change.
 _________________________________________________________________________________ 05:55 deps/rtrb-0.3.5-rustsec-2026-0274
+
+time:      [05:04] [02-09-26]
+agent:     [claude-code], [claude-opus-5], [cloud loop]
+worktree:  [cloud/os-room-metrics]
+type:      [feature-request]
+area:      [backend]
+
+Ocean Rooms definition-of-done line 4.1 asked for room and federation metrics —
+access state by room, outbox depth and age, SSE reconnects and lag, redemption
+failures, admission refusals, store lock wait — and said there are none today.
+Re-derived on main 616293e: true of those six families, not of the surface.
+`GET /metrics` already renders `TurnMetrics` plus four daemon-wide atomics, and
+`GET /health` returns the `HealthEnvelope`; none of it is room- or
+federation-scoped, and `sse_lag_events` counts the daemon's own SSE rails rather
+than the federation receiver.
+
+Added one `RoomMetrics` registry beside `TurnMetrics` in `metrics.rs`, held on
+`AppState` like it, carrying exactly those six families and nothing else. Rooms
+by access state is one gauge per `RoomAccessState` variant; outbox depth is
+pending and failed; the rest are reconnect count, lag, redemption failures by
+`IntentError` variant, admission refusals by refusal code, and lock-wait count
+plus summed wait. Every label comes from a closed enum declared in that file, so
+a room id, member id or invite code can never become one — per-room detail rides
+the JSON card instead.
+
+The surface is a `rooms` section on the `/health` card, additive on the daemon's
+own envelope the way `rev` is, plus the same registry rendered as Prometheus
+lines appended to `/metrics`. A section rather than a route on purpose: PR #445
+pins the room-route table against the router at 40 routes with a parity test,
+and a new route would owe that table an entry.
+
+Two things the re-derivation changed. The blank redeem code the spec names as
+`IntentError::Invalid` never reaches that return — `room_redeem_invite` refuses
+it at the route, before the supervisor call — so a counter on the supervisor
+alone would have read zero for exactly the refusal the test asserts; it is
+counted at the route, covering the malformed body too, since the wire cannot
+tell those apart either. And the outbox has no timestamp column, so age is an
+in-process first-sighting clock keyed on the head row's `(room, client_event_id)`
+rather than a nullable `enqueued_at` migration: it under-reports across a restart
+and never over-reports, and it keeps this slice out of `ocean-store`'s open path
+and migration block, which PRs #442 and #446 are both editing.
+
+Sampling the two store-derived families needed a read `list`/`list_page` cannot
+give: those call `load_record` per room, which loads the roster and the oldest
+thousand transcript rows, so counting five access states over a hundred rooms
+would decode a hundred thousand messages. Added one read-only
+`room_metrics_projection` to `ocean-store` — two aggregate queries, open rooms
+only, no transcript, only the head row's id. `/health` samples it through
+`try_lock` and reports `sampled: false` with the previous numbers rather than
+blocking the one probe whose contract is that it answers whenever the process
+serves HTTP.
+
+Named gaps, all deliberate: the lock-wait family times `with_rooms` and
+`with_rooms_handle` only, and the direct `.lock()` sites in `main.rs`,
+`persistent_rooms.rs` and `room_federation.rs` stay uncounted; the two push sites
+holding no `AppState` record through a process-global install point that the real
+startup path alone installs, so a test process leaves it unset and one test's
+state cannot collect another's counts.
+
+Tests: one reads both surfaces and asserts all six families by name plus that no
+room id reached a label; one posts from a non-roster author (403
+`author_not_in_roster`) and asserts admission refusals 0 to 1; one POSTs a blank
+redeem code (400 `invalid_request`) and asserts redemption failures 0 to 1.
+Mutation proved on the third — deleting the increment reds it at `left: 0, right:
+1` while the status and body assertions still pass — and recorded in its doc
+comment. Four registry unit tests cover the sample, the per-row age reset, the
+closed-label fallback and the stale-sample card; one store test pins the
+projection.
+
+Gates: docs-check PASS, workspace build PASS, workspace tests PASS (3247 passed,
+0 failed, across 93 suites; ocean-daemon 881/881, ocean-store 215/215), Clippy
+clean, format clean. Dependency policy DID NOT RUN — `cargo deny` is not
+installed in this environment, so that lane could not execute and is not
+reported as passing. Expected rebase against #442 on `events.md`. No deploy, no
+migration.
+_________________________________________________________________________________ 05:04 cloud/os-room-metrics
+
+time:      [06:13] [02-09-26]
+agent:     [claude-code], [claude-opus-5], [cloud loop]
+worktree:  [cloud/os-room-metrics]
+type:      [bug report]
+area:      [backend]
+
+Codex review round on PR #447. Three P2 findings, all about whether the §4.1
+counters say true things. I verified each against the tree before touching
+anything; all three were real, and all three are fixed.
+
+Reconnects were counted beside the backoff at the bottom of run_room's loop.
+Every path between there and the next dial is a return that never redials —
+cancellation or shutdown winning the backoff select!, a missing client, a
+credential that vanished, a room gone Revoked — so stopping a room or shutting
+the daemon down reported a reconnect that never happened. Codex proposed moving
+the bump into the sleep-wins arm; that still over-counts, because the credential
+and Revoked checks sit after it. The bump now sits immediately before the
+run_epoch call it counts, guarded on attempt > 0 so the task's first dial stays
+out of a counter about REconnects.
+
+A room's lag entry was never removed, and the gauge is the maximum across
+entries, so a room revoked while behind held that backlog forever, outliving the
+room. Rather than clear at each of run_room's seven returns — a metric cleaned
+up by hand at six of them leaks at the seventh — the entry is owned by a
+FederationLagScope held for the task's life, the same RAII shape InFlightGuard
+already uses for the turn gauge. That also closes the closed-room case Codex
+named: closing a room stops its task, so the guard drops the entry. One thing
+the finding did not mention would have bitten: a room can restart, and the old
+task's cleanup can land after the new task reported, blanking a live
+measurement. Entries carry the reporting generation and a clear removes only its
+own; two tests pin the fall-back and the late-clear.
+
+The digest-drift arm of admit_room_agent was the one refusal that never reaches
+append_admission_audit, where I hung the counter: mark_room_agent_stale writes
+its own outcome refused / reason_code binding_stale row inside the authority
+transaction. So the counter and the ledger disagreed on exactly one row — the
+refusal that DISCOVERS drift, the moment a package changed under an approved
+binding, which is the one worth paging on. Every later attempt was already
+counted by the status arm, so the metric would have shown drift refusals
+starting from the second. It bumps itself now, and the asymmetry is recorded in
+the daemon AGENTS.md so the next reader does not assume one site still covers
+every arm.
+
+Also merged the owner's 75a41b7, which relocated the metrics.rs ownership bullet
+past room_agent_authority.rs to clear PR #442's AGENTS.md hunk. My fix commit had
+extended that bullet at its old position, so the two collided; resolved by taking
+both intents — the relocated position (now line 136, clear of #442's 109-125) with
+the updated text. One copy of the bullet remains. Merged rather than rebased, so
+nobody's checkout is invalidated.
+
+Gates on the merged tree: docs-check PASS (30 packages, 157 files, 179 links),
+build PASS, workspace tests PASS (3249 passed, 0 failed; ocean-daemon 883/883),
+Clippy clean, format clean, ledger PASS. Dependency policy DID NOT RUN — cargo
+deny is not installed here. cargo-deny is red in CI for RUSTSEC on rtrb 0.3.4 via
+livekit, identical on main at 616293e and established as the base branch's, not
+this PR's; commented once, not widened into a lockfile bump, and the fix is the
+user's call as its own PR.
+_________________________________________________________________________________ 06:13 cloud/os-room-metrics
