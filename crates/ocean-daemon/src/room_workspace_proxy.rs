@@ -629,55 +629,6 @@ const WORKSPACE_ALLOWLIST: &[(&str, &str, WorkspaceCall)] = &[
             path_from_body: None,
         },
     ),
-    // Port exposure, opened by the same ruling and gated MORE tightly than
-    // Bedrock gates it. Upstream both calls sit behind member write; here both
-    // are owner verbs, because the preview URL expose returns is a routing
-    // label rather than a credential — whatever the room serves on that port
-    // is served to anyone holding it — and publishing a room's compute to the
-    // open internet is the owner's call to make. BOTH run container work, and
-    // that is why they carry the COMMAND budget: each handler drives the
-    // compute driver (`exposePort`/`unexposePort`), which for the cloudflare
-    // driver is a fetch to the room-runtime Worker on a 60s budget of its own,
-    // and upstream only checks that the workspace ROW says ready — so a first
-    // expose after an idle stop pays for a cold container start inside it. At
-    // 15s the daemon would abort while Bedrock went on to register the route,
-    // record the port and emit `room.workspace.port_exposed`: the caller reads
-    // a failure, never receives the `preview_url`, and the port is published
-    // regardless. Expose's upstream body is strict deny-extra (`port` only),
-    // which the unconditional actor strip keeps legal. Close
-    // names its port in the BODY and the daemon moves it into the PATH, which
-    // is what `path_from_body` is for; the upstream DELETE then reads no body
-    // at all, so nothing of the shaped object travels.
-    (
-        "POST",
-        "ports",
-        WorkspaceCall {
-            upstream: UpstreamMethod::Post,
-            segments: &["workspace", "ports"],
-            timeout: WORKSPACE_COMMAND_TIMEOUT,
-            write: false,
-            owner: true,
-            attributed: false,
-            query: &[],
-            reply: UpstreamReply::Json,
-            path_from_body: None,
-        },
-    ),
-    (
-        "POST",
-        "ports/close",
-        WorkspaceCall {
-            upstream: UpstreamMethod::Delete,
-            segments: &["workspace", "ports"],
-            timeout: WORKSPACE_COMMAND_TIMEOUT,
-            write: false,
-            owner: true,
-            attributed: false,
-            query: &[],
-            reply: UpstreamReply::Json,
-            path_from_body: Some("port"),
-        },
-    ),
 ];
 
 /// The allowlist lookup. `None` is the refusal, and it is the default for
@@ -2327,168 +2278,6 @@ mod tests {
         fixture.close();
     }
 
-    /// The exposure pair. Expose carries its port in the BODY and forwards as
-    /// the upstream POST; close carries it in the body too and the daemon
-    /// moves it into the PATH, because that is where Bedrock's DELETE route
-    /// keeps it and the table cannot hold a value the caller supplies.
-    ///
-    /// Both are owner-gated even though Bedrock gates them at member WRITE.
-    /// That is the narrowing the module doc rules on — the preview URL expose
-    /// hands back is world-readable by construction — so an agent with no
-    /// binding and a mapped agent that is not the credential's principal each
-    /// earn their own refusal, and neither spends the bearer.
-    ///
-    /// Mutation: drop the owner gate -> RED; drop `path_from_body` from the
-    /// close row -> RED (the DELETE would land on the collection path, which
-    /// Bedrock does not serve and this fixture does not route).
-    #[tokio::test]
-    async fn an_owner_exposes_a_port_by_body_and_closes_it_by_path() {
-        let tmp = tempfile::tempdir().unwrap();
-        let fixture = federated_room(&tmp).await;
-        let expected_authorization = format!("Bearer {BEARER}");
-
-        let response = room_workspace_command(
-            State(fixture.state.clone()),
-            Path((fixture.key.as_str().to_string(), "ports".to_string())),
-            query(&[("actor_id", "alice")]),
-            Json(json!({
-                "port": 8080,
-                // The forgery attempt: expose's upstream body is strict
-                // deny-extra, so the claim must vanish rather than be replaced.
-                "actor_member_id": "member-somebody-else",
-            })),
-        )
-        .await;
-        assert_eq!(response.status(), StatusCode::OK);
-        let calls = fixture.seen.calls();
-        assert_eq!(calls.len(), 1);
-        let expose = &calls[0];
-        assert_eq!(expose.method, "POST");
-        assert_eq!(expose.path, "/api/v1/rooms/workspace-room/workspace/ports");
-        assert_eq!(
-            expose.authorization.as_deref(),
-            Some(expected_authorization.as_str()),
-            "the room's own credential authenticates the exposure"
-        );
-        assert_eq!(expose.body["port"], json!(8080));
-        assert!(
-            expose.body.get(ACTOR_MEMBER_ID).is_none(),
-            "an expose body carries no actor claim, the client's or the daemon's"
-        );
-
-        let response = room_workspace_command(
-            State(fixture.state.clone()),
-            Path((fixture.key.as_str().to_string(), "ports/close".to_string())),
-            query(&[("actor_id", "alice")]),
-            Json(json!({"port": 8080})),
-        )
-        .await;
-        assert_eq!(response.status(), StatusCode::OK);
-        let calls = fixture.seen.calls();
-        assert_eq!(calls.len(), 2);
-        let close = &calls[1];
-        assert_eq!(close.method, "DELETE");
-        assert_eq!(
-            close.path, "/api/v1/rooms/workspace-room/workspace/ports/8080",
-            "the port the caller named is what becomes the upstream path segment"
-        );
-        assert_eq!(
-            close.body,
-            Value::Null,
-            "the upstream DELETE reads no body, so nothing of the shaped object travels"
-        );
-
-        for leaf in ["ports", "ports/close"] {
-            let response = room_workspace_command(
-                State(fixture.state.clone()),
-                Path((fixture.key.as_str().to_string(), leaf.to_string())),
-                query(&[("actor_id", "researcher")]),
-                Json(json!({"port": 8080})),
-            )
-            .await;
-            let (status, body) = body_of(response).await;
-            assert_eq!(status, StatusCode::FORBIDDEN, "{leaf}");
-            assert_eq!(body["code"], json!("workspace_actor_unmapped"), "{leaf}");
-        }
-
-        with_rooms(&fixture.state, |store| {
-            store
-                .bind_room_agent(&fixture.key, "member-researcher", "researcher", "reg-key")
-                .expect("binding fixture");
-        });
-        for leaf in ["ports", "ports/close"] {
-            let response = room_workspace_command(
-                State(fixture.state.clone()),
-                Path((fixture.key.as_str().to_string(), leaf.to_string())),
-                query(&[("actor_id", "researcher")]),
-                Json(json!({"port": 8080})),
-            )
-            .await;
-            let (status, body) = body_of(response).await;
-            assert_eq!(status, StatusCode::FORBIDDEN, "{leaf}");
-            assert_eq!(
-                body["code"],
-                json!("workspace_not_owner_principal"),
-                "{leaf}"
-            );
-        }
-
-        assert_eq!(
-            fixture.seen.calls().len(),
-            2,
-            "no refusal may spend the bearer"
-        );
-
-        fixture.close();
-    }
-
-    /// A port that is not a port never becomes a path segment. `ports/close`
-    /// is the one row where a caller's value reaches the upstream PATH, so it
-    /// is re-proven here rather than trusted, and every shape that is not a
-    /// port number is refused with nothing forwarded — the string spelling of
-    /// a real port included, because a lane that accepts one string has no
-    /// reason left to refuse another.
-    ///
-    /// WHICH ports a room may expose stays Bedrock's policy: 8080 clears this
-    /// gate, and the 1024 floor and the reserved-port list relay verbatim like
-    /// any other upstream refusal, so the two copies have nowhere to drift.
-    ///
-    /// Mutation: push the raw value into the path, or accept `as_u64()`
-    /// without the range check -> RED.
-    #[tokio::test]
-    async fn a_port_that_is_not_a_port_never_becomes_a_path_segment() {
-        let tmp = tempfile::tempdir().unwrap();
-        let fixture = federated_room(&tmp).await;
-
-        for sent in [
-            json!({}),
-            json!({"port": null}),
-            json!({"port": "8080"}),
-            json!({"port": 0}),
-            json!({"port": -1}),
-            json!({"port": 65536}),
-            json!({"port": 8080.5}),
-            json!({"port": "../../other-room/workspace"}),
-        ] {
-            let response = room_workspace_command(
-                State(fixture.state.clone()),
-                Path((fixture.key.as_str().to_string(), "ports/close".to_string())),
-                query(&[("actor_id", "alice")]),
-                Json(sent.clone()),
-            )
-            .await;
-            let (status, answered) = body_of(response).await;
-            assert_eq!(status, StatusCode::BAD_REQUEST, "{sent}");
-            assert_eq!(answered["code"], json!("invalid_request"), "{sent}");
-        }
-        assert!(
-            fixture.seen.calls().is_empty(),
-            "a body naming no port must not cause an upstream request"
-        );
-
-        fixture.close();
-    }
-
     /// An attributed route sends the actor's RESOLVED member id, and an actor
     /// with none — a Bot here, and Tool and System alike — is refused rather
     /// than silently attributed to the human, which is what this lane did
@@ -2645,8 +2434,7 @@ mod tests {
     /// Which rows may outlast Bedrock's own ceiling. The write verbs, the
     /// lifecycle pair (provision hydrates the container and restores the
     /// checkout before it answers, destroy flushes the workspace back first),
-    /// and the ports pair, whose handlers drive the compute driver on a 60s
-    /// budget of its own before recording a row and emitting a room marker.
+    /// before recording a row and emitting a room marker.
     ///
     /// The line is NOT "reaches the container", which would be the obvious
     /// reading and is wrong: `GET list` and `GET file` reach it too — upstream
@@ -2654,21 +2442,17 @@ mod tests {
     /// and they stay on the read budget deliberately. The line is what an
     /// abort LEAVES BEHIND. A read that the daemon gives up on wrote nothing,
     /// recorded nothing and emitted nothing, so the retry is free and the
-    /// caller's error is honest. An expose the daemon gives up on has already
-    /// published the port, written the row and put `port_exposed` in the
-    /// transcript, and the caller was told it failed — a divergence no retry
-    /// repairs, which is what buys the ports rows the longer budget.
+    /// caller's error is honest.
     ///
     /// The table is where that policy is declared, so the table is where it is
     /// asserted.
     ///
-    /// Mutation: give a write or a ports row `WORKSPACE_READ_TIMEOUT` -> RED;
+    /// Mutation: give a write row `WORKSPACE_READ_TIMEOUT` -> RED;
     /// give an owner row `write: true` or `attributed: true` -> RED.
     #[test]
     fn a_command_may_outlast_bedrocks_ceiling_and_a_read_may_not() {
         for (method, leaf, call) in WORKSPACE_ALLOWLIST {
-            let runs_container_work =
-                call.write || matches!(*leaf, "provision" | "destroy" | "ports" | "ports/close");
+            let runs_container_work = call.write || matches!(*leaf, "provision" | "destroy");
             if runs_container_work {
                 assert!(
                     call.timeout > BEDROCK_EXEC_TIMEOUT_MAX,
@@ -2719,8 +2503,6 @@ mod tests {
                 "POST destroy -> Delete [\"workspace\"]",
                 "POST exec -> Post [\"workspace\", \"exec\"]",
                 "POST execs/purge -> Post [\"workspace\", \"execs\", \"purge\"]",
-                "POST ports -> Post [\"workspace\", \"ports\"]",
-                "POST ports/close -> Delete [\"workspace\", \"ports\"]",
                 "POST provision -> Post [\"workspace\"]",
                 "POST repo/bind -> Put [\"workspace\", \"repo\"]",
                 "POST repo/build -> Post [\"workspace\", \"repo\", \"build\"]",
@@ -2770,22 +2552,12 @@ mod tests {
                 );
             }
         }
-        // Ports were blanket-absent for the same reason and are now pinned the
-        // same way, and this pin carries more weight than the secrets one: the
-        // narrowing it protects is NOT visible upstream. Bedrock gates expose
-        // and close at member write, so a member-level ports row is the easy
-        // thing to add later and would look like it was matching upstream
-        // while quietly handing every roster participant a world-readable
-        // preview URL onto the room's compute.
-        for (method, leaf, call) in WORKSPACE_ALLOWLIST {
-            if call.segments.contains(&"ports") {
-                assert!(
-                    call.owner
-                        && matches!(call.upstream, UpstreamMethod::Post | UpstreamMethod::Delete),
-                    "{method} {leaf}: a ports row is the owner-gated expose or close, and nothing else"
-                );
-            }
-        }
+        assert!(
+            WORKSPACE_ALLOWLIST
+                .iter()
+                .all(|(_, _, call)| !call.segments.contains(&"ports")),
+            "port publication stays unreachable pending an accepted implementation manifest"
+        );
     }
 
     /// The operator guide's lane section is the OTHER copy of this table, and
@@ -2803,7 +2575,7 @@ mod tests {
     /// guide cannot stop naming a call that exists.
     ///
     /// Mutation: delete any leaf's mention from the lane section -> RED; add
-    /// a nineteenth allowlist row without documenting it -> RED.
+    /// a seventeenth allowlist row without documenting it -> RED.
     #[test]
     fn the_operator_guide_names_every_allowlisted_call() {
         let guide = include_str!("../../../docs/OCEAN_RUNTIME_OPERATOR_GUIDE.md");
@@ -2835,7 +2607,7 @@ mod tests {
         }
 
         let spelled = match WORKSPACE_ALLOWLIST.len() {
-            18 => "eighteen",
+            16 => "sixteen",
             n => panic!("the lane now carries {n} calls; respell the guide's count and this match"),
         };
         assert!(
@@ -2927,40 +2699,6 @@ mod tests {
         );
         assert_eq!(call.body[ACTOR_MEMBER_ID], json!(LOCAL_MEMBER));
 
-        // The exposure pair, and with it the only leaf whose upstream path is
-        // not fully known to the table: `ports/close` arrives as one joined
-        // leaf like `repo/clone`, and the port it names has to travel from the
-        // body into the path before the request is built.
-        for (leaf, expected_upstream) in [
-            ("ports", "/api/v1/rooms/workspace-room/workspace/ports"),
-            (
-                "ports/close",
-                "/api/v1/rooms/workspace-room/workspace/ports/8080",
-            ),
-        ] {
-            let response = app
-                .clone()
-                .oneshot(
-                    Request::builder()
-                        .method("POST")
-                        .uri(format!(
-                            "/v1/rooms/persistent/{room}/workspace/{leaf}?actor_id=alice"
-                        ))
-                        .header(axum::http::header::CONTENT_TYPE, "application/json")
-                        .body(Body::from("{\"port\":8080}"))
-                        .unwrap(),
-                )
-                .await
-                .unwrap();
-            assert_eq!(response.status(), StatusCode::OK, "{leaf}");
-            let seen = fixture.seen.calls();
-            assert_eq!(
-                seen.last().map(|call| call.path.as_str()),
-                Some(expected_upstream),
-                "{leaf}"
-            );
-        }
-
         // And a leaf the allowlist does not name still gets the typed refusal
         // rather than an axum 404, which is what proves the wildcard matched.
         let response = app
@@ -2979,7 +2717,7 @@ mod tests {
         assert_eq!(body["code"], json!("workspace_route_not_allowed"));
         assert_eq!(
             fixture.seen.calls().len(),
-            8,
+            6,
             "the refusal added no upstream call"
         );
 

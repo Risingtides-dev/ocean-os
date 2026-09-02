@@ -4022,20 +4022,18 @@ fn conclusion_is_red(conclusion: Option<&str>) -> bool {
 ///   row, so a replayed row rebuilds byte-identical meta and lands in the
 ///   store's Duplicate arm instead of its corruption arm.
 ///
-/// `trigger_targets` is filled for exactly two row kinds, each behind its own
-/// opt-in: `build_failed` under `on_build_failure`, and a `ci_checked` row
-/// whose payload [`ci_checks_are_red`] judges red under `on_ci_failure` (ruled
-/// 2026-08-29: a build failure is a trigger event on the existing convene
-/// path, not a new mechanism; a red check joined it on the same terms). The
-/// two flags are independent, so a room that opted in to build failures before
-/// CI triggers existed convenes on exactly what it opted in to. Targets are
+/// `trigger_targets` is filled only for `build_failed` under the accepted
+/// `on_build_failure` contract. `ci_checked` always remains a marker, even when
+/// its payload is red and the stored policy carries the forward-compatible
+/// `on_ci_failure` field: named-agent CI orchestration is extension-owned and
+/// core has no accepted implementation manifest for dispatching it. Targets are
 /// the roster's Agent members; the store's claim site keeps only the
 /// locally-bound ones and consumes each (row, target) pair once, and the
 /// dispatcher re-validates ownership and binding before queuing a turn — so a
 /// replayed row or a foreign agent can never be convened from here. Every
-/// other workspace row — a green build, a green or in-progress CI run — keeps
-/// empty targets: the marker reaching agents through the transcript on their
-/// NEXT convened turn is the point of this lane.
+/// other workspace row keeps empty targets: the marker reaching agents through
+/// the transcript on their NEXT separately-authorized turn is the point of this
+/// lane.
 fn ingest_workspace_row(
     inner: &Arc<SupervisorInner>,
     key: &RoomKey,
@@ -4048,16 +4046,11 @@ fn ingest_workspace_row(
     let payload: WorkspaceEventPayload =
         serde_json::from_value(row.payload).map_err(|_| BridgeError::Protocol)?;
     let body = compose_workspace_marker(&row.event_type, &payload);
-    // Only a failure consults the policy, and each kind answers to its own
-    // flag. A build row IS the failure; a CI row has to be read, because the
-    // one `ci_checked` event type carries green and red alike. Everything else
-    // stays a pure marker. The over-broad roster read is deliberate — the store
-    // and the dispatcher both re-filter (see the doc above).
+    // Only the accepted build-failure trigger consults core policy. CI rows are
+    // pure markers regardless of color; dispatch belongs behind an extension
+    // seam and has no accepted core implementation manifest.
     let trigger_event = match row.event_type.as_str() {
         "room.workspace.build_failed" => Some(RoomTriggerEvent::BuildFailed),
-        "room.workspace.ci_checked" if ci_checks_are_red(payload.checks.as_deref()) => {
-            Some(RoomTriggerEvent::CiFailure)
-        }
         _ => None,
     };
     let (trigger_targets, trigger_reason) = if let Some(trigger_event) = trigger_event {
@@ -9489,7 +9482,7 @@ mod tests {
         // The opt-in gates the ROW KIND, not the lane: a green build and a CI
         // row with nothing red in it stay pure markers even with
         // on_build_failure enabled. (A RED CI row under this same flag is
-        // pinned in ci_failure_marker_convenes_only_on_a_red_check_and_opt_in.)
+        // pinned in ci_checked_is_always_a_marker_in_core.)
         for (id, sequence, event_type) in [
             ("ledger-ok", "1", "room.workspace.build_finished"),
             ("ledger-ci", "2", "room.workspace.ci_checked"),
@@ -9540,12 +9533,10 @@ mod tests {
         );
     }
 
-    /// A red CI row is a trigger event on the same convene path as a build
-    /// failure, gated by its own flag. This walks the whole matrix in one
-    /// room: the colors that must stay silent, the cross-flag case that proves
-    /// `on_build_failure` was not quietly widened, and the red row that fires.
+    /// CI rows are durable markers only in core. The stored opt-in remains
+    /// forward-compatible, but dispatch requires an accepted extension seam.
     #[tokio::test]
-    async fn ci_failure_marker_convenes_only_on_a_red_check_and_opt_in() {
+    async fn ci_checked_is_always_a_marker_in_core() {
         let key = RoomKey::new("workspace-ci-trigger");
         let human = "11111111-1111-4111-8111-111111111111";
         let agent = "33333333-3333-4333-8333-333333333333";
@@ -9674,7 +9665,8 @@ mod tests {
             "opting in to CI must not opt the room in to build failures"
         );
 
-        // The red row, with one green alongside it: the batch is the news.
+        // A red row remains a marker too. Core must not turn the policy field
+        // into named-agent dispatch without an accepted implementation scope.
         let red = || {
             ci_row(
                 &key,
@@ -9688,15 +9680,9 @@ mod tests {
         };
         let outcome = ingest_workspace_row(&inner, &key, red()).unwrap();
         assert_eq!(outcome, IngestDisposition::Committed);
-        let dispatch = trigger_rx
-            .try_recv()
-            .expect("a red check convenes the bound agent");
-        assert_eq!(dispatch.target_member_id, agent);
-        assert_eq!(dispatch.ledger_event_id, "ledger-ci-red");
-        assert_eq!(dispatch.reason, "on_ci_failure: workspace CI failed");
         assert!(
             trigger_rx.try_recv().is_err(),
-            "only the bound Agent member is dispatched — never the human"
+            "a red CI marker must not dispatch a core named-agent turn"
         );
 
         // SSE replay: the store's consume-once claim leaves nothing to
@@ -9708,7 +9694,7 @@ mod tests {
             "a replayed row must not double-convene"
         );
 
-        // Every row above still landed as a marker; the trigger is additive.
+        // Every row above landed as a marker and no core dispatch was added.
         let transcript = with_rooms_handle(&rooms, |s| s.get(&key))
             .unwrap()
             .unwrap()

@@ -73,21 +73,26 @@ test('a fold leaves the first entry open and names where the next one starts', (
 // All 697 rules this ledger carried before the convention are bare, and it is
 // append-only, so the bare form has to keep closing an entry for as long as the
 // file exists.
-test('both rule forms close an entry, and a rule may carry anything after the bar', () => {
+test('both exact rule forms close an entry', () => {
   const bare = [...entry('10:00', 'First.'), RULE, ''];
   const identity = [...entry('11:00', 'Second.'), `${RULE} 11:00 loop/slice-b`, ''];
   assert.equal(openEntries([...bare, ...identity].join('\n')).length, 0);
 });
 
-test('an entry closed anywhere in its body counts as closed', () => {
-  // 145 entries in this ledger quote a second rule inside their prose, so the
-  // check is "a rule before the next header", never "a rule on the last line".
-  // The first entry's rule is followed by more prose, so a last-line reading
-  // would call it open — which is what makes this fixture discriminate.
+test('an embedded separator does not close an entry', () => {
+  // A separator-shaped quotation in the prose must not conceal a later fold.
+  // Only the final nonblank line before the next entry closes the entry.
   const quoted = [...entry('10:00', 'First.'), RULE, 'Quoting the rule above, not closing on it.', ''];
   const ledger = [...quoted, ...entry('11:00', 'Second.'), RULE].join('\n');
-  assert.equal(openEntries(ledger).length, 0);
+  const open = openEntries(ledger);
+  assert.equal(open.length, 1);
+  assert.equal(open[0].line, 1);
   assert.notEqual(quoted.filter((line) => line.trim()).pop(), RULE, 'the fixture must not end on a rule');
+});
+
+test('prose after the bar is not an identity separator', () => {
+  const ledger = [...entry('10:00', 'First.'), `${RULE} arbitrary prose`, ''].join('\n');
+  assert.equal(openEntries(ledger).length, 1);
 });
 
 test('entryIdentity reads the minute and the worktree off the entry itself', () => {
@@ -190,8 +195,8 @@ test('the fenced schema template parses as an entry, and a rule closes it', () =
   const repaired = closeEntries(withHeader).text.split('\n');
   assert.equal(
     repaired[11],
-    `${RULE} [branch/ref]`,
-    'the rule lands after the --- that already divides header from log, and carries no minute because `[HH:MM]` is not a clock',
+    RULE,
+    'the rule lands after the --- that already divides header from log, and stays bare because `[HH:MM]` is not a clock',
   );
   assert.equal(openEntries(repaired.join('\n')).length, 0);
 });

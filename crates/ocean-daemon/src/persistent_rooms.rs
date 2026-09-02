@@ -439,7 +439,7 @@ fn room_history_row(message: RoomMessage) -> ocean_agent::RoomHistoryRow {
         seq: message.seq,
         author_id: message.author_id,
         author_kind,
-        text: room_history_text(message.body),
+        text: room_history_text(message.body, message.author_kind, message.kind),
     }
 }
 
@@ -453,7 +453,14 @@ fn room_history_row(message: RoomMessage) -> ocean_agent::RoomHistoryRow {
 /// purpose, and every renderer of a room body in this crate is a caller —
 /// `room_history_row`, `projected_room_message`, `summary_user_prompt`, and
 /// `build_room_prompt`. Four renderers must not become four rules.
-pub(super) fn room_history_text(body: String) -> String {
+pub(super) fn room_history_text(
+    body: String,
+    author_kind: RoomParticipantKind,
+    message_kind: RoomMessageKind,
+) -> String {
+    if author_kind != RoomParticipantKind::System || message_kind != RoomMessageKind::System {
+        return body;
+    }
     let audit_type = serde_json::from_str::<serde_json::Value>(&body)
         .ok()
         .and_then(|value| {
@@ -505,7 +512,7 @@ pub(super) fn room_history_text(body: String) -> String {
 /// of those paths with no test going red. Named in
 /// `crates/ocean-store/AGENTS.md`.
 fn projected_room_message(mut message: RoomMessage) -> RoomMessage {
-    message.body = room_history_text(message.body);
+    message.body = room_history_text(message.body, message.author_kind, message.kind);
     message
 }
 
@@ -2922,7 +2929,7 @@ were mentioned.\n\n",
             "[#{seq}] {author}: {body}{marker}\n",
             seq = m.seq,
             author = m.author_id,
-            body = room_history_text(m.body.clone()),
+            body = room_history_text(m.body.clone(), m.author_kind, m.kind),
             marker = marker,
         ));
     }
@@ -4501,6 +4508,27 @@ mod tests {
             ocean_agent::RoomHistoryAuthorKind::Agent
         );
         assert_eq!(projected.text, "durable fact");
+    }
+
+    #[test]
+    fn human_json_that_resembles_an_audit_is_preserved() {
+        let body = r#"{"type":"room.agent.bootstrap","question":"@builder review this"}"#;
+        assert_eq!(
+            room_history_text(
+                body.to_string(),
+                RoomParticipantKind::Human,
+                RoomMessageKind::Message,
+            ),
+            body
+        );
+        assert_eq!(
+            room_history_text(
+                body.to_string(),
+                RoomParticipantKind::System,
+                RoomMessageKind::System,
+            ),
+            "[room agent bootstrap audit]"
+        );
     }
 
     #[test]

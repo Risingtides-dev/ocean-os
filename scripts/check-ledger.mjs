@@ -92,7 +92,7 @@ check could not run — an unreadable file, or one holding no entries at all.`;
 const ENTRY_HEADER = /^time:/;
 // Both forms, and the bare one forever: every rule written before the identity
 // convention is bare, and an append-only ledger never stops carrying them.
-const SEPARATOR_RULE = /^_{5,}(?:[ \t].*)?$/;
+const SEPARATOR_RULE = /^_{5,}(?:[ \t]+(?:[01]\d|2[0-3]):[0-5]\d(?:[ \t]+\S+)?)?$/;
 const RULE_BAR = /^_+/;
 // What makes one entry's rule unlike its neighbours'. `HH:MM` alone is minute
 // resolution and two slices in one wave land in the same minute often enough to
@@ -146,7 +146,11 @@ export function readEntries(text) {
       line: start + 1,
       runsInto: next === undefined ? null : next + 1,
       header: lines[start].trim(),
-      closed: lines.slice(start, end).some((line) => SEPARATOR_RULE.test(line)),
+      closed: (() => {
+        let tail = end - 1;
+        while (tail > start && lines[tail].trim() === '') tail--;
+        return SEPARATOR_RULE.test(lines[tail]);
+      })(),
     };
   });
 }
@@ -162,7 +166,8 @@ export function openEntries(text) {
 export function entryIdentity(lines) {
   const parts = [];
   const time = lines[0]?.match(HEADER_TIME);
-  if (time) parts.push(time[1]);
+  if (!time) return '';
+  parts.push(time[1]);
   const worktree = lines.map((line) => line.match(WORKTREE_FIELD)).find(Boolean);
   if (worktree) parts.push(worktree[1]);
   return parts.join(' ');
