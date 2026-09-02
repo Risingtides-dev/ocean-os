@@ -139,9 +139,12 @@ credential; `OCEAN_FEDERATION_OWNER_TOKEN` separately lets this daemon bootstrap
 an existing Local room as its Bedrock owner. Missing the owner token does not
 disable existing credentialed rooms or invite redemption. Missing or invalid
 transport configuration moves credentialed non-revoked rooms to `recovering`;
-revoked rooms remain revoked. As of 2026-09-01 the tracked plist carries neither
-variable, so the operated daemon cannot bootstrap Local rooms and cannot run
-transport for any credentials already in `rooms.db`. The mechanics are in
+revoked rooms remain revoked. The tracked plist carries neither variable. The
+supervised launcher instead reads the supported untracked owner-only
+`federation.env` immediately before it execs the daemon; an absent or invalid
+file starts the daemon with federation off. The daemon also reads that file
+natively when neither process variable is present; an explicit process pair
+wins wholesale. The mechanics are in
 `OCEAN_RUNTIME_OPERATOR_GUIDE.md` under "Federated-room
 Bedrock bridge"; this section is the operator's order of operations. The
 tracked completion state is the Ocean Rooms section of `../ROADMAP.md`; the
@@ -159,23 +162,24 @@ Phase 1 rollout gates remain authoritative in
    do not constrain an admin token, so it is full-instance authority, and
    ocean-bedrock #117 adds the operator path that will replace it. Treat the
    value as a production secret.
-3. Install a supported untracked owner-only login loader for the supervised
-   daemon. It must set:
+3. After turns drain, run the shipped `ops/set-ocean-federation.sh` procedure.
+   It writes an untracked owner-only (`0600`) `federation.env` containing:
    - `OCEAN_FEDERATION_URL` — the Bedrock origin, nothing after the host.
    - `OCEAN_FEDERATION_OWNER_TOKEN` — the bearer from step 2.
 
-   The loader must read the bearer from an owner-only (`0600`) file or Keychain
-   item, call `launchctl setenv` for both values on every fresh GUI login, and
-   complete before the daemon's `RunAtLoad` start. Neither the tracked template
-   nor the rendered plist may contain either federation value. The repository
-   does not ship that loader yet, so production enablement stops here: do not
-   substitute a manual edit of either plist.
-4. Once that loader exists, use its reviewed install/activation procedure after
-   turns drain. It must lint every plist before stopping the healthy daemon,
-   inject the variables without printing or recording the bearer in shell
-   history or logs, and use the guarded `bootout` → wait → `bootstrap` → `enable` →
-   `kickstart` sequence from `ops/install-ocean-daemon.sh`. Stop if any custody,
-   ordering, teardown, bootstrap, or health assertion fails.
+   Supply the bearer with `--token-file`, `--token-stdin`, or a Keychain item;
+   never put the bearer itself on the command line. The launcher reads the file
+   immediately before daemon exec and never calls `launchctl setenv`, so the
+   bearer is not published into the launchd domain or stored in either plist,
+   shell history, or logs. For direct daemon invocation, a literal-token file
+   is also read natively only when both process variables are absent; it must be
+   same-owner, non-symlink, exactly `0600`, no larger than 16 KiB, and contain
+   only the URL and owner-token entries.
+4. The script lints both the tracked and rendered plists before stopping the
+   healthy daemon, then uses the guarded `bootout` → wait → `bootstrap` →
+   `enable` → `kickstart` sequence and waits for `/health`. `--no-restart`
+   writes and lints only. Stop if any custody, ordering, teardown, bootstrap,
+   or health assertion fails.
 5. Verify, in this order. First the revision:
 
    ```bash

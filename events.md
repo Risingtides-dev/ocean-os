@@ -10354,3 +10354,49 @@ Gates on the fixed tree: docs-check PASS, ocean-store 222 passed, ocean-daemon
 room_maintenance 11 passed, and the full run below. cargo-deny still cannot run
 in this environment and is red on main independently of this branch.
 _________________________________________________________________________________ 06:42 cloud/os-room-lifecycle
+
+time:      [15:23] [09-02-26]
+agent:     [codex] [gpt-5]
+worktree:  codex/ocean-rooms-integration-20260902
+type:      [feature-request]
+area:      [backend]
+
+Integrated the frozen Ocean Rooms PR stack over the post-#449 base in an
+independent clone, then added the daemon-owned unopened-room attention
+projection required by Surface. `GET /v1/rooms/persistent` now returns a sparse
+`attention` array bounded and ordered by the same existing room page. Each row
+contains the room id, optional decimal-string latest/read sequences, and numeric
+unread/mention counts. Identity comes only from the daemon's local-room
+principal or the room credential's authenticated local Human member id; counts
+come only from the local durable transcript, confirmed-event mention rows, and
+the durable read cursor. No client identity is accepted and no list request
+tails Bedrock or scans rooms outside its page. Local message prose is never
+guessed into mentions.
+
+Added a native federation configuration fallback at
+`<config-dir>/federation.env`. Presence of either process variable selects the
+process source wholesale; otherwise the daemon opens the file without following
+symlinks and requires a regular current-owner 0600 file within 16 KiB containing
+only the URL and literal owner token. Invalid partial pairs, origins, tokens,
+ownership, mode, links, duplicates, and unknown entries fail closed without
+logging key names or values. The supervised launcher keeps its Keychain-capable
+loader, uses the same process-first precedence, never publishes the bearer into
+the launchd domain, and the operator docs now describe that single custody
+model instead of the stale `launchctl setenv` instruction.
+
+Ported the shared ledger checker forward to r4. Historical one-digit header
+hours remain readable but repaired rule identities normalize to required
+`HH:MM`; the OS copy's revision/digest witness is now explicit as r4 /
+4762696f29d4 and pinned by the OS regression table.
+
+Verification on the exact change used an isolated offline compile probe because
+the real lock pins rtrb 0.3.5 while this host cache has only 0.3.4 and crates.io
+DNS is unavailable. With only that scratch dependency substitution, ocean-store
+passed all 230 tests; focused daemon attention passed 2/2, federation config
+9/9, and both corrected integration parity regressions passed. The full daemon
+run compiled and passed 805/902; 95 failures require sandbox-denied socket,
+process, or HOME writes and were unrelated, while the two real expectation
+failures exposed by the run were fixed and rerun green. Both Node suites passed
+28/28, docs-check passed (30 packages, 158 active Markdown files, 182 links),
+format and diff checks passed, and the ledger was clean before this append.
+_________________________________________________________________________________ 15:23 codex/ocean-rooms-integration-20260902

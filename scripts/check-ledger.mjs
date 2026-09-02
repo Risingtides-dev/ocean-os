@@ -13,13 +13,10 @@
 // keeps folding for as long as it is history. This is the largest of the three ledgers, so it pays that tax
 // most often.
 //
-// Ported from ocean-bedrock's scripts/check-ledger.mjs, which now carries the
-// identity separator (its PR #98). Every executable line is byte-identical to
-// that copy; only comments and the usage text differ, and the usage text only
-// because it can name no npm script — this repo has no node manifest to hold
-// one. Keeping the code itself identical is deliberate: a fix to either copy
-// ports to the other as a patch, and CI's ledger job claims that identity in so
-// many words.
+// Ported forward from ocean-bedrock's canonical checker through r4. A
+// mechanically verified code stamp replaces the old byte-identity claim:
+// comments and usage text remain repo-specific, while every behavior change
+// must bump CODE_REVISION, CODE_DIGEST, and its regression-table row together.
 //
 // WHAT THIS CHECK OWNS, AND THE THREE NEIGHBOURING THINGS IT DOES NOT:
 //   It owns FUSION — an entry whose rule is gone and whose prose the next
@@ -73,15 +70,131 @@
 // file does not reopen it, and pinned in the test rather than left to be
 // discovered mid-rebase.
 import path from 'node:path';
-import { readFile, writeFile } from 'node:fs/promises';
-import { fileURLToPath, pathToFileURL } from 'node:url';
+import { createHash } from 'node:crypto';
+import { readFile, realpath, writeFile } from 'node:fs/promises';
+import { fileURLToPath } from 'node:url';
 
-const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
+const scriptPath = fileURLToPath(import.meta.url);
+const repoRoot = path.resolve(path.dirname(scriptPath), '..');
+
+// The Bedrock checker is canonical. This stamp names the shared code shape,
+// while comments and usage text remain repository-specific and are excluded.
+export const CODE_REVISION = 'r4';
+export const CODE_DIGEST = '4762696f29d4';
+
+const STAMP_LINE = /^export const CODE_(?:REVISION|DIGEST) = /;
+const USAGE_OPEN = /^const HELP = `/;
+const USAGE_CLOSE = /`;$/;
+
+function leadingLineComments(source) {
+  const comments = new Set();
+  const templateExpressions = [];
+  let mode = 'code';
+  let escaped = false;
+  let line = 0;
+  let lineHasCode = false;
+
+  for (let index = 0; index < source.length; index += 1) {
+    const char = source[index];
+    const next = source[index + 1];
+    if (char === '\n') {
+      if (mode === 'line-comment') mode = 'code';
+      line += 1;
+      lineHasCode = false;
+      escaped = false;
+      continue;
+    }
+    if (mode === 'line-comment') continue;
+    if (mode === 'block-comment') {
+      if (!/\s/.test(char)) lineHasCode = true;
+      if (char === '*' && next === '/') {
+        mode = 'code';
+        index += 1;
+      }
+      continue;
+    }
+    if (mode === 'single' || mode === 'double') {
+      if (!/\s/.test(char)) lineHasCode = true;
+      if (escaped) {
+        escaped = false;
+      } else if (char === '\\') {
+        escaped = true;
+      } else if ((mode === 'single' && char === "'") || (mode === 'double' && char === '"')) {
+        mode = 'code';
+      }
+      continue;
+    }
+    if (mode === 'template') {
+      if (!/\s/.test(char)) lineHasCode = true;
+      if (escaped) {
+        escaped = false;
+      } else if (char === '\\') {
+        escaped = true;
+      } else if (char === '`') {
+        mode = 'code';
+      } else if (char === '$' && next === '{') {
+        templateExpressions.push(1);
+        mode = 'code';
+        index += 1;
+      }
+      continue;
+    }
+
+    if (!lineHasCode && /[ \t\r]/.test(char)) continue;
+    if (!lineHasCode && char === '/' && next === '/') {
+      comments.add(line);
+      mode = 'line-comment';
+      index += 1;
+      continue;
+    }
+    lineHasCode = true;
+    if (char === '/' && next === '/') {
+      mode = 'line-comment';
+      index += 1;
+    } else if (char === '/' && next === '*') {
+      mode = 'block-comment';
+      index += 1;
+    } else if (char === "'") {
+      mode = 'single';
+    } else if (char === '"') {
+      mode = 'double';
+    } else if (char === '`') {
+      mode = 'template';
+    } else if (templateExpressions.length && char === '{') {
+      templateExpressions[templateExpressions.length - 1] += 1;
+    } else if (templateExpressions.length && char === '}') {
+      const top = templateExpressions.length - 1;
+      templateExpressions[top] -= 1;
+      if (templateExpressions[top] === 0) {
+        templateExpressions.pop();
+        mode = 'template';
+      }
+    }
+  }
+  return comments;
+}
+
+export function codeDigest(source) {
+  const body = [];
+  const commentLines = leadingLineComments(source);
+  let inUsage = false;
+  for (const [index, raw] of source.split('\n').entries()) {
+    const line = raw.replace(/\s+$/, '');
+    if (inUsage || USAGE_OPEN.test(line)) {
+      inUsage = !USAGE_CLOSE.test(line);
+      continue;
+    }
+    if (line === '' || commentLines.has(index) || STAMP_LINE.test(line)) continue;
+    body.push(line);
+  }
+  return createHash('sha256').update(body.join('\n')).digest('hex').slice(0, 12);
+}
 
 const HELP = `Usage:
   node scripts/check-ledger.mjs                check this repo's events.md
   node scripts/check-ledger.mjs <path>         check another ledger
   node scripts/check-ledger.mjs [path] --fix   close every open entry in place
+  node scripts/check-ledger.mjs [copy] --digest print a checker copy's code digest
 
 Reports every entry not closed by a \`___\` rule before the next \`time:\`
 header. A rule may be bare or carry the entry's identity (\`___ HH:MM
@@ -167,7 +280,11 @@ export function entryIdentity(lines) {
   const parts = [];
   const time = lines[0]?.match(HEADER_TIME);
   if (!time) return '';
-  parts.push(time[1]);
+  // Historical ledger entries admit a one-digit hour, but new identity rules
+  // use the repository's required HH:MM spelling so repairs do not perpetuate
+  // the old format.
+  const [hour, minute] = time[1].split(':');
+  parts.push(`${hour.padStart(2, '0')}:${minute}`);
   const worktree = lines.map((line) => line.match(WORKTREE_FIELD)).find(Boolean);
   if (worktree) parts.push(worktree[1]);
   return parts.join(' ');
@@ -204,18 +321,24 @@ function report(entries) {
 
 export async function main(argv = process.argv.slice(2)) {
   const fix = argv.includes('--fix');
-  const args = argv.filter((arg) => arg !== '--fix');
+  const digest = argv.includes('--digest');
+  const args = argv.filter((arg) => arg !== '--fix' && arg !== '--digest');
   if (args.some((arg) => arg === '-h' || arg === '--help') || args.length > 1) {
     console.log(HELP);
     return args.length > 1 ? 2 : 0;
   }
-  const file = path.resolve(args[0] || path.join(repoRoot, 'events.md'));
+  const file = path.resolve(args[0] || (digest ? scriptPath : path.join(repoRoot, 'events.md')));
   let text;
   try {
     text = await readFile(file, 'utf8');
   } catch (error) {
     console.error(`check-ledger: cannot read ${file}: ${error.message}`);
     return 2;
+  }
+
+  if (digest) {
+    console.log(`${codeDigest(text)}  ${file}`);
+    return 0;
   }
 
   const entries = readEntries(text);
@@ -249,6 +372,15 @@ export async function main(argv = process.argv.slice(2)) {
   return 1;
 }
 
-if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
+async function invokedAsScript() {
+  if (!process.argv[1]) return false;
+  try {
+    return (await realpath(scriptPath)) === (await realpath(process.argv[1]));
+  } catch {
+    return false;
+  }
+}
+
+if (await invokedAsScript()) {
   process.exitCode = await main();
 }

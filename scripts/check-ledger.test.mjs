@@ -11,8 +11,18 @@ import test from 'node:test';
 import os from 'node:os';
 import path from 'node:path';
 import { mkdtemp, readFile, writeFile } from 'node:fs/promises';
+import { fileURLToPath } from 'node:url';
 
-import { closeEntries, entryIdentity, main, openEntries, readEntries } from './check-ledger.mjs';
+import {
+  CODE_DIGEST,
+  CODE_REVISION,
+  closeEntries,
+  codeDigest,
+  entryIdentity,
+  main,
+  openEntries,
+  readEntries,
+} from './check-ledger.mjs';
 
 const RULE = '_'.repeat(81);
 
@@ -97,7 +107,7 @@ test('prose after the bar is not an identity separator', () => {
 
 test('entryIdentity reads the minute and the worktree off the entry itself', () => {
   assert.equal(entryIdentity(entry('09:04', 'On a branch.', 'loop/slice-a')), '09:04 loop/slice-a');
-  assert.equal(entryIdentity(entry('9:04', 'A historical one-digit hour.', 'loop/slice-a')), '9:04 loop/slice-a');
+  assert.equal(entryIdentity(entry('9:04', 'A historical one-digit hour.', 'loop/slice-a')), '09:04 loop/slice-a');
   assert.equal(entryIdentity(entry('09:04', 'On the main checkout.', null)), '09:04', 'no branch to name');
   assert.equal(
     entryIdentity(['time:      no clock here', 'worktree:', '', 'Neither field carries a value.']),
@@ -109,7 +119,7 @@ test('entryIdentity reads the minute and the worktree off the entry itself', () 
 test('a repaired one-digit-hour entry is recognized as closed on the rerun', () => {
   const open = entry('9:04', 'This entry lost its separator.', 'loop/slice-a').join('\n');
   const repaired = closeEntries(open).text;
-  assert.match(repaired, /^_{5,} 9:04 loop\/slice-a$/m);
+  assert.match(repaired, /^_{5,} 09:04 loop\/slice-a$/m);
   assert.equal(openEntries(repaired).length, 0);
 });
 
@@ -241,4 +251,19 @@ test('main exits 2 when the check could not run at all', async () => {
 
 test('--help exits 0 and names the exit contract', async () => {
   assert.equal(await main(['--help']), 0);
+});
+
+const KNOWN_STAMPS = {
+  r1: 'de98a632f0df',
+  r2: '56adab136337',
+  r3: 'c15369d1f68c',
+  r4: '4762696f29d4',
+};
+
+test('check-ledger.mjs carries the current shared code stamp', async () => {
+  const source = await readFile(fileURLToPath(new URL('check-ledger.mjs', import.meta.url)), 'utf8');
+  assert.equal(codeDigest(source), CODE_DIGEST);
+  assert.equal(KNOWN_STAMPS[CODE_REVISION], CODE_DIGEST);
+  assert.match(CODE_REVISION, /^r\d+$/);
+  assert.ok(source.includes(`'${CODE_DIGEST}'`), 'the digest remains a grep-readable literal');
 });

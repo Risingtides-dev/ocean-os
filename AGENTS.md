@@ -21,6 +21,7 @@ This is the root devlog contract for the `ocean-os` repository. Every agent ente
 - After any meaningful change, do a devlog pass: update the nearest owning `AGENTS.md`, refresh affected child indexes, remove stale text, and append a root `events.md` entry with `worktree:`, closed by the `___ HH:MM <worktree>` rule the fenced schema block at the top of `events.md` defines — that block is the entry contract, and the identity on the rule is what stops a union merge fusing two parallel appends.
 - Project code is `MIT OR Apache-2.0`, copyright © 2026 Rising Tides. Preserve `NOTICE.md` and local donor notices; Ocean names, logos, and distinctive brand assets remain outside the open-source grants under `TRADEMARKS.md`.
 - Rust workspace packages are private distribution inputs, not crates.io releases: `[workspace.package] publish = false`, and every member must inherit it or set `publish = false` explicitly. `cargo xtask docs-check` enforces this for new members.
+- `scripts/check-ledger.mjs` follows Ocean Bedrock's canonical shared checker contract. `CODE_REVISION`, `CODE_DIGEST`, and the matching regression-table row move together on every logic change; `--digest` is the cross-repo witness. Historical one-digit hours may be parsed, but repaired identity separators are normalized to required `HH:MM`.
 
 ## Workspace Routing
 

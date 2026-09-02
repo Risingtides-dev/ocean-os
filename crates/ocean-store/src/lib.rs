@@ -2020,6 +2020,22 @@ impl SqliteRoomStore {
             CREATE UNIQUE INDEX IF NOT EXISTS idx_federated_events_global
                 ON federated_events(room_id, global_sequence);
 
+            -- Exact addressees from Bedrock's validated message payload. This
+            -- normalized private table lets the daemon count mentions without
+            -- parsing prose or loading an unbounded transcript into memory.
+            CREATE TABLE IF NOT EXISTS federated_event_mentions (
+                room_id          TEXT NOT NULL,
+                ledger_event_id  TEXT NOT NULL,
+                member_id        TEXT NOT NULL,
+                PRIMARY KEY (room_id, ledger_event_id, member_id),
+                FOREIGN KEY (room_id, ledger_event_id)
+                    REFERENCES federated_events(room_id, ledger_event_id)
+                    ON DELETE CASCADE
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_federated_event_mentions_member
+                ON federated_event_mentions(room_id, member_id, ledger_event_id);
+
             CREATE TABLE IF NOT EXISTS processed_room_triggers (
                 room_id          TEXT NOT NULL REFERENCES rooms(id) ON DELETE CASCADE,
                 ledger_event_id  TEXT NOT NULL,
@@ -5026,6 +5042,18 @@ pub struct RoomMetricsProjection {
     pub outbox: Vec<RoomOutboxDepth>,
 }
 
+/// Constant-memory unread and direct-mention totals for one room/principal.
+///
+/// The daemon uses this only while projecting its already-bounded persistent
+/// room list page. Local-room mentions are deliberately zero because local
+/// transcript rows do not persist a structured addressee; federated mentions
+/// come only from Bedrock's validated `mention_member_ids` field.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct RoomAttentionCounts {
+    pub unread_count: u64,
+    pub mention_count: u64,
+}
+
 // ── S2-P1 federation: inherent APIs (not on RoomStore trait) ───────────────
 
 impl SqliteRoomStore {
@@ -5517,6 +5545,11 @@ pub struct ConfirmedEvent {
     pub kind: RoomMessageKind,
     /// Message body.
     pub body: String,
+    /// Exact Bedrock addressee member ids from the validated message payload.
+    /// Empty for non-message ledger rows. These are persisted separately from
+    /// trigger claims because a Human mention is attention even though it can
+    /// never convene a local Agent.
+    pub mention_member_ids: Vec<String>,
     /// Candidate opaque target member ids for trigger claims. Only targets
     /// with a current local binding are claimed; agent-authored rows produce
     /// no claims regardless of this list.
@@ -6805,6 +6838,90 @@ impl SqliteRoomStore {
             .map_err(Into::into)
     }
 
+    /// Count unread Local transcript rows without loading any message body.
+    ///
+    /// Local messages have no durable structured addressee field, so their
+    /// mention count is truthfully zero rather than inferred from prose.
+    pub fn local_room_attention(
+        &self,
+        key: &RoomKey,
+        read_seq: Option<u64>,
+    ) -> Result<RoomAttentionCounts> {
+        if !self.room_exists(key)? {
+            return Err(RoomStoreError::UnknownRoom(key.clone()));
+        }
+        let after = match read_seq {
+            None => -1,
+            Some(seq) => match i64::try_from(seq) {
+                Ok(seq) => seq,
+                // A cursor above SQLite's signed sequence range is after every
+                // row this schema can store.
+                Err(_) => return Ok(RoomAttentionCounts::default()),
+            },
+        };
+        let unread: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM messages WHERE room_id = ?1 AND seq > ?2",
+            params![key.as_str(), after],
+            |row| row.get(0),
+        )?;
+        Ok(RoomAttentionCounts {
+            unread_count: u64::try_from(unread)
+                .map_err(|_| RoomStoreError::Encode("negative local unread count".into()))?,
+            mention_count: 0,
+        })
+    }
+
+    /// Count unread confirmed ledger rows and exact direct mentions for one
+    /// daemon-derived federated member id.
+    ///
+    /// Global sequences are canonical decimal TEXT and may contain gaps. The
+    /// length-then-lexicographic predicate is the numeric comparison for that
+    /// representation; subtraction would overcount gaps. Both aggregate
+    /// queries keep memory constant even for a long-lived unopened room.
+    pub fn federated_room_attention(
+        &self,
+        key: &RoomKey,
+        principal_id: &str,
+        read_seq: Option<u64>,
+    ) -> Result<RoomAttentionCounts> {
+        if !self.room_exists(key)? {
+            return Err(RoomStoreError::UnknownRoom(key.clone()));
+        }
+        let read_seq = read_seq.map(write_u64_text);
+        let unread: i64 = self.conn.query_row(
+            "SELECT COUNT(*)
+               FROM federated_events e
+              WHERE e.room_id = ?1
+                AND (?2 IS NULL
+                     OR length(e.global_sequence) > length(?2)
+                     OR (length(e.global_sequence) = length(?2)
+                         AND e.global_sequence > ?2))",
+            params![key.as_str(), read_seq.as_deref()],
+            |row| row.get(0),
+        )?;
+        let mentions: i64 = self.conn.query_row(
+            "SELECT COUNT(*)
+               FROM federated_event_mentions m
+               JOIN federated_events e
+                 ON e.room_id = m.room_id
+                AND e.ledger_event_id = m.ledger_event_id
+              WHERE e.room_id = ?1
+                AND m.member_id = ?2
+                AND (?3 IS NULL
+                     OR length(e.global_sequence) > length(?3)
+                     OR (length(e.global_sequence) = length(?3)
+                         AND e.global_sequence > ?3))",
+            params![key.as_str(), principal_id, read_seq.as_deref()],
+            |row| row.get(0),
+        )?;
+        Ok(RoomAttentionCounts {
+            unread_count: u64::try_from(unread)
+                .map_err(|_| RoomStoreError::Encode("negative federated unread count".into()))?,
+            mention_count: u64::try_from(mentions)
+                .map_err(|_| RoomStoreError::Encode("negative federated mention count".into()))?,
+        })
+    }
+
     pub fn update_room_read_cursor(
         &mut self,
         key: &RoomKey,
@@ -7410,6 +7527,15 @@ impl SqliteRoomStore {
         if !Self::room_is_open_on(&tx, key)? {
             return Err(RoomStoreError::UnknownRoom(key.clone()));
         }
+        let unique_mentions: std::collections::HashSet<_> =
+            event.mention_member_ids.iter().collect();
+        if unique_mentions.len() != event.mention_member_ids.len()
+            || event.mention_member_ids.iter().any(String::is_empty)
+        {
+            return Err(RoomStoreError::Encode(
+                "confirmed event mention ids must be non-empty and unique".into(),
+            ));
+        }
 
         // The access row is the federation marker: no row ⇒ not federated ⇒
         // fail closed before any write. Its persisted cursor also joins the
@@ -7567,6 +7693,19 @@ impl SqliteRoomStore {
                 event.client_event_id,
             ],
         )?;
+
+        // Persist exact Bedrock addressees beside the dedup row. The normalized
+        // relation is intentionally independent of trigger claims: mentions of
+        // the local Human never convene an Agent, but still belong in that
+        // principal's unopened-room attention count.
+        for member_id in &event.mention_member_ids {
+            tx.execute(
+                "INSERT INTO federated_event_mentions
+                   (room_id, ledger_event_id, member_id)
+                 VALUES (?1, ?2, ?3)",
+                params![key.as_str(), event.ledger_event_id, member_id],
+            )?;
+        }
 
         // 5. Delete the matching local outbox row — FULL producer tuple only.
         tx.execute(
@@ -13175,6 +13314,44 @@ mod tests {
         assert_eq!(second.read_seq, Some(0));
     }
 
+    #[test]
+    fn local_room_attention_counts_after_cursor_without_guessing_mentions() {
+        let mut s = store();
+        let key = RoomKey::new("local-attention");
+        s.create(key.clone(), "Local Attention", None, now())
+            .unwrap();
+        for body in ["one", "@principal is still only text", "three"] {
+            s.append_message(
+                &key,
+                "u1",
+                RoomParticipantKind::Human,
+                RoomMessageKind::Message,
+                body,
+                now(),
+            )
+            .unwrap();
+        }
+
+        assert_eq!(
+            s.local_room_attention(&key, None).unwrap(),
+            RoomAttentionCounts {
+                unread_count: 3,
+                mention_count: 0,
+            }
+        );
+        assert_eq!(
+            s.local_room_attention(&key, Some(0)).unwrap(),
+            RoomAttentionCounts {
+                unread_count: 2,
+                mention_count: 0,
+            }
+        );
+        assert_eq!(
+            s.local_room_attention(&key, Some(2)).unwrap(),
+            RoomAttentionCounts::default(),
+        );
+    }
+
     // ── M1: idx_outbox_room_state must exist after migrate ────────────────
     // The outbox index used to be embedded inside the `CREATE TABLE outbox`
     // statement's column list, which produced invalid SQL that failed on
@@ -13901,6 +14078,7 @@ mod tests {
             author_kind: RoomParticipantKind::Human,
             kind: RoomMessageKind::Message,
             body: format!("body-{ledger}"),
+            mention_member_ids: vec![],
             trigger_targets: vec![],
         }
     }
@@ -14468,6 +14646,62 @@ mod tests {
             )
             .unwrap();
         assert_eq!(claims, 1);
+    }
+
+    #[test]
+    fn federated_room_attention_is_identity_scoped_gap_safe_and_cursor_bounded() {
+        let (mut s, key) = fed_store_with_room("r-attention");
+        seed_access_row(&s, &key, "live");
+
+        let mut first = confirmed_event("ledger-a", 9, "src-a", 1, "evt-a");
+        first.mention_member_ids = vec!["m-self".into()];
+        let mut second = confirmed_event("ledger-b", 100, "src-a", 2, "evt-b");
+        second.mention_member_ids = vec!["m-other".into()];
+        let mut third = confirmed_event("ledger-c", 105, "src-a", 3, "evt-c");
+        third.mention_member_ids = vec!["m-self".into(), "m-other".into()];
+        for event in [&first, &second, &third] {
+            assert!(matches!(
+                s.ingest_confirmed_event(&key, event, now()).unwrap(),
+                IngestOutcome::Ingested(_)
+            ));
+        }
+
+        assert_eq!(
+            s.federated_room_attention(&key, "m-self", None).unwrap(),
+            RoomAttentionCounts {
+                unread_count: 3,
+                mention_count: 2,
+            }
+        );
+        assert_eq!(
+            s.federated_room_attention(&key, "m-other", Some(9))
+                .unwrap(),
+            RoomAttentionCounts {
+                unread_count: 2,
+                mention_count: 2,
+            },
+            "global-sequence gaps count rows, never the numeric distance",
+        );
+        assert_eq!(
+            s.federated_room_attention(&key, "m-self", Some(105))
+                .unwrap(),
+            RoomAttentionCounts::default(),
+        );
+    }
+
+    #[test]
+    fn confirmed_event_rejects_ambiguous_mention_targets_atomically() {
+        let (mut s, key) = fed_store_with_room("r-attention-invalid");
+        seed_access_row(&s, &key, "live");
+        let mut event = confirmed_event("ledger-invalid", 1, "src-a", 1, "evt-a");
+        event.mention_member_ids = vec!["m-self".into(), "m-self".into()];
+
+        assert!(matches!(
+            s.ingest_confirmed_event(&key, &event, now()),
+            Err(RoomStoreError::Encode(_))
+        ));
+        assert_eq!(transcript_count(&s, &key), 0);
+        assert_eq!(federated_events_count(&s, &key), 0);
     }
 
     #[test]
@@ -15287,6 +15521,7 @@ mod tests {
             source_sequence: seq,
             origin_principal_id: "principal".into(),
             origin_member_id: "member".into(),
+            mention_member_ids: Vec::new(),
             trigger_targets: Vec::new(),
             author_id: "alice".into(),
             author_kind: RoomParticipantKind::Human,

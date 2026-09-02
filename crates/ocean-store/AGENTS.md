@@ -49,6 +49,8 @@ outbox, and the restart-safe federation core (S2 P2-A). One database file
   (member→agent binding, `registration_key` PRIVATE, agent name unique per
   room), `producer_counters` (next source_sequence per room+member),
   `federated_events` (dedup + monotonic order index),
+  `federated_event_mentions` (normalized exact Bedrock addressees for bounded
+  local attention counts; child rows cascade with their event),
   `processed_room_triggers` (at-most-once trigger-claim journal), and
   `pending_redemptions` (v1.2 amendment table 7: pre-room `{redemption_id,
   bearer, invite_code}` custody, `invite_code` UNIQUE — bearer AND invite
@@ -140,6 +142,13 @@ outbox, and the restart-safe federation core (S2 P2-A). One database file
 - **Trigger claims are at-most-once per (room, ledger event, target).**
   Claims commit inside the ingest transaction, only for locally-bound
   targets, and never for agent-authored rows.
+- **Attention counts never infer identity from prose.** Local unread counts are
+  aggregate message-row counts after the daemon cursor and Local mention counts
+  stay zero because no structured addressee is stored. Federated unread counts
+  aggregate confirmed rows after the mirrored global cursor using canonical
+  decimal numeric ordering (not subtraction: gaps are legal); mention counts
+  join only the exact `federated_event_mentions` rows committed with ingest.
+  These queries load no message body and keep memory constant.
 - **Producer counters never reuse a sequence.** Allocation is transactional
   across connections; exhaustion at `u64::MAX` fails closed.
 - **Credential custody.** `bearer_token`, `registration_key`, and pending

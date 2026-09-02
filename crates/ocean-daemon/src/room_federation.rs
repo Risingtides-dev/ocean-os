@@ -7,7 +7,9 @@
 use std::{
     collections::{HashMap, HashSet},
     future::{poll_fn, Future},
+    io::Read,
     net::IpAddr,
+    path::Path,
     sync::{
         atomic::{AtomicBool, AtomicU64, Ordering},
         Arc,
@@ -43,6 +45,8 @@ use crate::persistent_rooms::{
 
 const FEDERATION_URL_ENV: &str = "OCEAN_FEDERATION_URL";
 const FEDERATION_OWNER_TOKEN_ENV: &str = "OCEAN_FEDERATION_OWNER_TOKEN";
+const FEDERATION_CONFIG_FILE: &str = "federation.env";
+const FEDERATION_CONFIG_MAX_BYTES: u64 = 16 * 1024;
 const RECOVERY_CONCURRENCY: usize = 4;
 const REVOKED_STORE_SENTINEL: &str = "room access revoked";
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
@@ -404,14 +408,6 @@ struct FederationClient {
 }
 
 impl FederationClient {
-    fn from_env() -> Result<Option<Self>, BridgeError> {
-        let raw = match std::env::var(FEDERATION_URL_ENV) {
-            Ok(raw) if !raw.trim().is_empty() => raw,
-            _ => return Ok(None),
-        };
-        Self::new(&raw).map(Some)
-    }
-
     fn new(raw: &str) -> Result<Self, BridgeError> {
         let mut base = Url::parse(raw).map_err(|_| BridgeError::InvalidConfig)?;
         let authority_has_userinfo = raw
@@ -492,6 +488,117 @@ impl FederationClient {
         self.endpoint(&["api", "v1", "invites", code, "onboard"])
             .ok()
             .map(String::from)
+    }
+}
+
+struct FederationConfig {
+    client: Option<FederationClient>,
+    owner_token: Option<String>,
+}
+
+impl FederationConfig {
+    /// Resolve one source pair. Presence of either process variable selects the
+    /// process source wholesale; the private file is only a fallback when both
+    /// are absent, so stale disk state can never replace an explicit launch.
+    fn resolve(config_dir: &Path) -> Result<Self, BridgeError> {
+        let env_url = std::env::var_os(FEDERATION_URL_ENV);
+        let env_token = std::env::var_os(FEDERATION_OWNER_TOKEN_ENV);
+        let pair = if env_url.is_some() || env_token.is_some() {
+            Some((
+                env_url
+                    .and_then(|value| value.into_string().ok())
+                    .ok_or(BridgeError::InvalidConfig)?,
+                env_token
+                    .and_then(|value| value.into_string().ok())
+                    .ok_or(BridgeError::InvalidConfig)?,
+            ))
+        } else {
+            read_federation_config_file(&config_dir.join(FEDERATION_CONFIG_FILE))?
+        };
+        let Some((url, owner_token)) = pair else {
+            return Ok(Self {
+                client: None,
+                owner_token: None,
+            });
+        };
+        if owner_token.is_empty()
+            || owner_token != owner_token.trim()
+            || owner_token.chars().any(char::is_control)
+        {
+            return Err(BridgeError::InvalidConfig);
+        }
+        Ok(Self {
+            client: Some(FederationClient::new(&url)?),
+            owner_token: Some(owner_token),
+        })
+    }
+}
+
+fn parse_federation_config(raw: &str) -> Result<(String, String), BridgeError> {
+    let mut url = None;
+    let mut owner_token = None;
+    for line in raw.lines() {
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let (key, value) = line.split_once('=').ok_or(BridgeError::InvalidConfig)?;
+        let slot = match key {
+            FEDERATION_URL_ENV => &mut url,
+            FEDERATION_OWNER_TOKEN_ENV => &mut owner_token,
+            _ => return Err(BridgeError::InvalidConfig),
+        };
+        if slot.replace(value.to_string()).is_some() {
+            return Err(BridgeError::InvalidConfig);
+        }
+    }
+    Ok((
+        url.ok_or(BridgeError::InvalidConfig)?,
+        owner_token.ok_or(BridgeError::InvalidConfig)?,
+    ))
+}
+
+#[cfg(unix)]
+fn read_federation_config_file(path: &Path) -> Result<Option<(String, String)>, BridgeError> {
+    use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
+
+    let file = match std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(path)
+    {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(_) => return Err(BridgeError::InvalidConfig),
+    };
+    let metadata = file.metadata().map_err(|_| BridgeError::InvalidConfig)?;
+    // SAFETY: geteuid has no preconditions and reads the effective uid of this
+    // process; it is used only to compare file ownership.
+    let effective_uid = unsafe { libc::geteuid() };
+    if !metadata.is_file()
+        || metadata.uid() != effective_uid
+        || metadata.permissions().mode() & 0o777 != 0o600
+        || metadata.len() > FEDERATION_CONFIG_MAX_BYTES
+    {
+        return Err(BridgeError::InvalidConfig);
+    }
+    let mut raw = String::new();
+    file.take(FEDERATION_CONFIG_MAX_BYTES + 1)
+        .read_to_string(&mut raw)
+        .map_err(|_| BridgeError::InvalidConfig)?;
+    if raw.len() as u64 > FEDERATION_CONFIG_MAX_BYTES {
+        return Err(BridgeError::InvalidConfig);
+    }
+    parse_federation_config(&raw).map(Some)
+}
+
+#[cfg(not(unix))]
+fn read_federation_config_file(path: &Path) -> Result<Option<(String, String)>, BridgeError> {
+    match std::fs::symlink_metadata(path) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        // This format is owner-mode-gated. Platforms without Unix ownership
+        // bits must use the explicit process environment until an equivalent
+        // custody proof is implemented.
+        _ => Err(BridgeError::InvalidConfig),
     }
 }
 
@@ -630,7 +737,8 @@ struct RunningRoom {
 }
 
 impl FederationSupervisor {
-    pub(super) fn from_env(
+    pub(super) fn from_config_dir(
+        config_dir: &Path,
         rooms: RoomStoreHandle,
         room_wakes: RoomWakeBus,
         access_wakes: RoomAccessWakeBus,
@@ -638,15 +746,10 @@ impl FederationSupervisor {
         trigger_tx: mpsc::UnboundedSender<FederatedTriggerDispatch>,
         shutdown: CancellationToken,
     ) -> Self {
-        let (client, invalid_config) = match FederationClient::from_env() {
-            Ok(client) => (client, false),
-            Err(_) => (None, true),
+        let (client, owner_token, invalid_config) = match FederationConfig::resolve(config_dir) {
+            Ok(config) => (config.client, config.owner_token, false),
+            Err(_) => (None, None, true),
         };
-        let owner_token = std::env::var(FEDERATION_OWNER_TOKEN_ENV)
-            .ok()
-            .filter(|token| {
-                !token.is_empty() && token == token.trim() && !token.chars().any(char::is_control)
-            });
         Self::new_inner(SupervisorInit {
             client,
             owner_token,
@@ -3281,6 +3384,7 @@ async fn ingest_message_row(
         || origin_principal_id.is_empty()
         || payload.client_event_id.is_empty()
         || payload.author_member_id != actor_member_id
+        || payload.mention_member_ids.iter().any(String::is_empty)
         || unique_mentions.len() != payload.mention_member_ids.len()
     {
         return Err(BridgeError::Protocol);
@@ -3350,6 +3454,7 @@ async fn ingest_message_row(
         author_kind,
         kind: RoomMessageKind::Message,
         body: payload.body,
+        mention_member_ids: payload.mention_member_ids,
         trigger_targets,
     };
     let outcome = with_rooms_handle(&inner.rooms, |store| {
@@ -4097,6 +4202,7 @@ fn ingest_workspace_row(
         author_kind: RoomParticipantKind::System,
         kind: RoomMessageKind::System,
         body,
+        mention_member_ids: Vec::new(),
         trigger_targets,
     };
     let outcome = with_rooms_handle(&inner.rooms, |store| {
@@ -4691,13 +4797,114 @@ mod tests {
     }
 
     #[test]
-    fn env_missing_is_not_invalid_config() {
+    fn config_missing_is_not_invalid() {
         let _guard = ENV_LOCK.lock().unwrap();
-        let old = std::env::var_os(FEDERATION_URL_ENV);
+        let old_url = std::env::var_os(FEDERATION_URL_ENV);
+        let old_token = std::env::var_os(FEDERATION_OWNER_TOKEN_ENV);
         std::env::remove_var(FEDERATION_URL_ENV);
-        assert!(FederationClient::from_env().unwrap().is_none());
-        if let Some(old) = old {
-            std::env::set_var(FEDERATION_URL_ENV, old);
+        std::env::remove_var(FEDERATION_OWNER_TOKEN_ENV);
+        let tmp = tempfile::tempdir().unwrap();
+        let config = FederationConfig::resolve(tmp.path()).unwrap();
+        assert!(config.client.is_none());
+        assert!(config.owner_token.is_none());
+        restore_federation_env(old_url, old_token);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn private_config_file_loads_and_process_pair_wins() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let _guard = ENV_LOCK.lock().unwrap();
+        let old_url = std::env::var_os(FEDERATION_URL_ENV);
+        let old_token = std::env::var_os(FEDERATION_OWNER_TOKEN_ENV);
+        std::env::remove_var(FEDERATION_URL_ENV);
+        std::env::remove_var(FEDERATION_OWNER_TOKEN_ENV);
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join(FEDERATION_CONFIG_FILE);
+        std::fs::write(
+            &path,
+            "# owner-only daemon federation configuration\nOCEAN_FEDERATION_URL=https://disk.example\nOCEAN_FEDERATION_OWNER_TOKEN=disk-secret\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+
+        let disk = FederationConfig::resolve(tmp.path()).unwrap();
+        assert_eq!(disk.client.unwrap().base.as_str(), "https://disk.example/");
+        assert_eq!(disk.owner_token.as_deref(), Some("disk-secret"));
+
+        std::env::set_var(FEDERATION_URL_ENV, "https://process.example");
+        std::env::set_var(FEDERATION_OWNER_TOKEN_ENV, "process-secret");
+        let process = FederationConfig::resolve(tmp.path()).unwrap();
+        assert_eq!(
+            process.client.unwrap().base.as_str(),
+            "https://process.example/"
+        );
+        assert_eq!(process.owner_token.as_deref(), Some("process-secret"));
+
+        std::env::remove_var(FEDERATION_OWNER_TOKEN_ENV);
+        assert!(
+            matches!(
+                FederationConfig::resolve(tmp.path()),
+                Err(BridgeError::InvalidConfig)
+            ),
+            "a partial process pair must fail closed instead of falling back to disk"
+        );
+        restore_federation_env(old_url, old_token);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn private_config_file_refuses_unsafe_mode_symlink_and_unknown_entry() {
+        use std::os::unix::fs::{symlink, PermissionsExt};
+
+        let _guard = ENV_LOCK.lock().unwrap();
+        let old_url = std::env::var_os(FEDERATION_URL_ENV);
+        let old_token = std::env::var_os(FEDERATION_OWNER_TOKEN_ENV);
+        std::env::remove_var(FEDERATION_URL_ENV);
+        std::env::remove_var(FEDERATION_OWNER_TOKEN_ENV);
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join(FEDERATION_CONFIG_FILE);
+        let valid =
+            "OCEAN_FEDERATION_URL=https://disk.example\nOCEAN_FEDERATION_OWNER_TOKEN=disk-secret\n";
+        std::fs::write(&path, valid).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        assert!(matches!(
+            FederationConfig::resolve(tmp.path()),
+            Err(BridgeError::InvalidConfig)
+        ));
+
+        std::fs::remove_file(&path).unwrap();
+        let target = tmp.path().join("target");
+        std::fs::write(&target, valid).unwrap();
+        std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o600)).unwrap();
+        symlink(&target, &path).unwrap();
+        assert!(matches!(
+            FederationConfig::resolve(tmp.path()),
+            Err(BridgeError::InvalidConfig)
+        ));
+
+        std::fs::remove_file(&path).unwrap();
+        std::fs::write(&path, format!("{valid}UNSUPPORTED=value\n")).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        assert!(matches!(
+            FederationConfig::resolve(tmp.path()),
+            Err(BridgeError::InvalidConfig)
+        ));
+        restore_federation_env(old_url, old_token);
+    }
+
+    fn restore_federation_env(
+        old_url: Option<std::ffi::OsString>,
+        old_token: Option<std::ffi::OsString>,
+    ) {
+        match old_url {
+            Some(value) => std::env::set_var(FEDERATION_URL_ENV, value),
+            None => std::env::remove_var(FEDERATION_URL_ENV),
+        }
+        match old_token {
+            Some(value) => std::env::set_var(FEDERATION_OWNER_TOKEN_ENV, value),
+            None => std::env::remove_var(FEDERATION_OWNER_TOKEN_ENV),
         }
     }
 

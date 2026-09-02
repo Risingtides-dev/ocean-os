@@ -1176,7 +1176,8 @@ async fn main() -> anyhow::Result<()> {
 
     let (federated_trigger_tx, federated_trigger_rx) = tokio::sync::mpsc::unbounded_channel();
     let federated_dispatch_cancel = CancellationToken::new();
-    let room_federation = FederationSupervisor::from_env(
+    let room_federation = FederationSupervisor::from_config_dir(
+        &config_dir,
         rooms.clone(),
         room_wakes.clone(),
         room_access_wakes.clone(),
@@ -13322,10 +13323,18 @@ mod tests {
         let list = persistent_room_http_json(&raw);
         assert_json_object_keys(
             &list,
-            &["ok", "rooms", "read_states", "next_cursor", "has_more"],
+            &[
+                "ok",
+                "rooms",
+                "read_states",
+                "attention",
+                "next_cursor",
+                "has_more",
+            ],
         );
         assert_eq!(list["ok"], true);
         assert_eq!(list["rooms"].as_array().unwrap().len(), 1);
+        assert_eq!(list["attention"], json!([]));
         assert_eq!(list["next_cursor"], serde_json::Value::Null);
         assert_eq!(
             list["read_states"],
@@ -27076,8 +27085,8 @@ mod tests {
     ///
     ///        assertion `left == right` failed: ARCHITECTURE.md's room-route
     ///        count must equal the router's own /v1/rooms registrations
-    ///          left: 39
-    ///         right: 40
+    ///          left: 41
+    ///         right: 42
     #[test]
     fn room_route_table_and_architecture_route_counts_are_in_parity() {
         let registered = registered_room_routes();

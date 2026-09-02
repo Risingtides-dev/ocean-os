@@ -1434,10 +1434,22 @@ struct PersistentRoomReadState {
 }
 
 #[derive(Debug, Clone, serde::Serialize, PartialEq, Eq)]
+struct PersistentRoomAttention {
+    room_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    latest_seq: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    read_seq: Option<String>,
+    unread_count: u64,
+    mention_count: u64,
+}
+
+#[derive(Debug, Clone, serde::Serialize, PartialEq, Eq)]
 struct PersistentRoomsListResponse {
     ok: bool,
     rooms: Vec<ocean_core::Room>,
     read_states: Vec<PersistentRoomReadState>,
+    attention: Vec<PersistentRoomAttention>,
     // Deliberately NOT `skip_serializing_if`: pre-existing pollers rely on the
     // key always being present (`"next_cursor": null` on the final page), so
     // omitting the key on a single-page response would be a silent wire
@@ -1456,53 +1468,73 @@ pub(super) async fn rooms_list_persistent(
 ) -> (StatusCode, Json<serde_json::Value>) {
     match with_rooms(&state, |reg| {
         let page = reg.list_page(q.cursor.as_deref(), q.limit)?;
-        let read_states = page
-            .rooms
-            .iter()
-            .map(|room| {
-                let key = room.id.clone();
-                let access = reg.room_access(&key)?;
-                let principal: Option<String> = match access.state {
-                    RoomAccessState::Local => Some(local_room_read_cursor_principal().to_string()),
-                    RoomAccessState::Live
-                    | RoomAccessState::Connecting
-                    | RoomAccessState::Recovering
-                    | RoomAccessState::Revoked => reg
-                        .room_credential(&key)?
-                        .map(|credential| credential.local_human_member_id),
-                };
-                let cursor = match principal.as_deref() {
-                    Some(principal) => reg.room_read_cursor(&key, principal)?,
-                    None => RoomReadCursorProjection {
-                        read_seq: None,
-                        mirrored_upstream_read_seq: None,
-                    },
-                };
-                let latest_seq = match access.state {
-                    RoomAccessState::Local => reg.room_latest_durable_seq(&key)?,
-                    RoomAccessState::Live => access.last_confirmed_global_sequence,
-                    RoomAccessState::Connecting
-                    | RoomAccessState::Recovering
-                    | RoomAccessState::Revoked => access.last_confirmed_global_sequence,
-                };
-                let read_seq = match access.state {
-                    RoomAccessState::Local => cursor.read_seq,
-                    RoomAccessState::Live
-                    | RoomAccessState::Connecting
-                    | RoomAccessState::Recovering
-                    | RoomAccessState::Revoked => cursor.mirrored_upstream_read_seq,
-                };
-                Ok::<_, ocean_store::RoomStoreError>(PersistentRoomReadState {
+        let mut read_states = Vec::with_capacity(page.rooms.len());
+        let mut attention = Vec::new();
+        for room in &page.rooms {
+            let key = room.id.clone();
+            let access = reg.room_access(&key)?;
+            let principal: Option<String> = match access.state {
+                RoomAccessState::Local => Some(local_room_read_cursor_principal().to_string()),
+                RoomAccessState::Live
+                | RoomAccessState::Connecting
+                | RoomAccessState::Recovering
+                | RoomAccessState::Revoked => reg
+                    .room_credential(&key)?
+                    .map(|credential| credential.local_human_member_id),
+            };
+            let cursor = match principal.as_deref() {
+                Some(principal) => reg.room_read_cursor(&key, principal)?,
+                None => RoomReadCursorProjection {
+                    read_seq: None,
+                    mirrored_upstream_read_seq: None,
+                },
+            };
+            let latest_seq = match access.state {
+                RoomAccessState::Local => reg.room_latest_durable_seq(&key)?,
+                RoomAccessState::Live
+                | RoomAccessState::Connecting
+                | RoomAccessState::Recovering
+                | RoomAccessState::Revoked => access.last_confirmed_global_sequence,
+            };
+            let read_seq = match access.state {
+                RoomAccessState::Local => cursor.read_seq,
+                RoomAccessState::Live
+                | RoomAccessState::Connecting
+                | RoomAccessState::Recovering
+                | RoomAccessState::Revoked => cursor.mirrored_upstream_read_seq,
+            };
+            let counts = match access.state {
+                RoomAccessState::Local => reg.local_room_attention(&key, read_seq)?,
+                RoomAccessState::Live
+                | RoomAccessState::Connecting
+                | RoomAccessState::Recovering
+                | RoomAccessState::Revoked => match principal.as_deref() {
+                    Some(principal) => reg.federated_room_attention(&key, principal, read_seq)?,
+                    None => ocean_store::RoomAttentionCounts::default(),
+                },
+            };
+            let latest_seq = latest_seq.map(|seq| seq.to_string());
+            let read_seq = read_seq.map(|seq| seq.to_string());
+            if counts.unread_count > 0 || counts.mention_count > 0 {
+                attention.push(PersistentRoomAttention {
                     room_id: room.id.to_string(),
-                    latest_seq: latest_seq.map(|seq| seq.to_string()),
-                    read_seq: read_seq.map(|seq| seq.to_string()),
-                })
-            })
-            .collect::<Result<Vec<_>, ocean_store::RoomStoreError>>()?;
+                    latest_seq: latest_seq.clone(),
+                    read_seq: read_seq.clone(),
+                    unread_count: counts.unread_count,
+                    mention_count: counts.mention_count,
+                });
+            }
+            read_states.push(PersistentRoomReadState {
+                room_id: room.id.to_string(),
+                latest_seq,
+                read_seq,
+            });
+        }
         Ok::<_, ocean_store::RoomStoreError>(PersistentRoomsListResponse {
             ok: true,
             rooms: page.rooms,
             read_states,
+            attention,
             next_cursor: page.next_cursor,
             has_more: page.has_more,
         })
@@ -5727,6 +5759,31 @@ mod tests {
         }
     }
 
+    fn attention_event(
+        ledger_event_id: &str,
+        global_sequence: u64,
+        mention_member_ids: &[&str],
+    ) -> ocean_store::ConfirmedEvent {
+        ocean_store::ConfirmedEvent {
+            ledger_event_id: ledger_event_id.into(),
+            global_sequence,
+            source_id: "attention-source".into(),
+            source_sequence: global_sequence,
+            client_event_id: format!("attention-client-{ledger_event_id}"),
+            origin_principal_id: "attention-origin".into(),
+            origin_member_id: "attention-author".into(),
+            author_id: "attention-author".into(),
+            author_kind: RoomParticipantKind::Human,
+            kind: RoomMessageKind::Message,
+            body: format!("attention message {ledger_event_id}"),
+            mention_member_ids: mention_member_ids
+                .iter()
+                .map(|member| (*member).to_string())
+                .collect(),
+            trigger_targets: Vec::new(),
+        }
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn rooms_list_persistent_includes_ordered_read_states_for_local_and_live() {
         let tmp = tempfile::tempdir().unwrap();
@@ -5846,6 +5903,156 @@ mod tests {
         let encoded = serde_json::to_string(&body.0).unwrap();
         assert!(!encoded.contains("bearer-secret"));
         assert!(!encoded.contains("connecting-principal"));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn rooms_list_attention_is_identity_scoped_and_mirror_clear_restores_signal() {
+        let tmp = tempfile::tempdir().unwrap();
+        let state = fake_convene_state(&tmp);
+        let key = RoomKey::new("list-attention-live");
+        with_rooms(&state, |store| {
+            store.create(key.clone(), "Live attention", None, Utc::now())?;
+            store.update_room_access_safe(&key, Some(RoomAccessState::Live), None, None)?;
+            store.install_room_credential(&key, "bearer-secret", "local-human")?;
+            store.ingest_confirmed_event(
+                &key,
+                &attention_event("one", 1, &["local-human", "someone-else"]),
+                Utc::now(),
+            )?;
+            store.ingest_confirmed_event(
+                &key,
+                &attention_event("two", 2, &["someone-else"]),
+                Utc::now(),
+            )?;
+            Ok::<_, ocean_store::RoomStoreError>(())
+        })
+        .unwrap();
+
+        let list = |state: AppState| async move {
+            rooms_list_persistent(
+                State(state),
+                Query(RoomsListQuery {
+                    limit: Some(10),
+                    cursor: None,
+                }),
+            )
+            .await
+        };
+        let (status, body) = list(state.clone()).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            body.0["attention"],
+            json!([{
+                "room_id": key.as_str(),
+                "latest_seq": "2",
+                "unread_count": 2,
+                "mention_count": 1
+            }])
+        );
+        let encoded = serde_json::to_string(&body.0).unwrap();
+        assert!(!encoded.contains("local-human"));
+        assert!(!encoded.contains("someone-else"));
+        assert!(!encoded.contains("bearer-secret"));
+
+        with_rooms(&state, |store| {
+            store.set_room_read_cursor_mirror(&key, "local-human", None, Some(2))?;
+            Ok::<_, ocean_store::RoomStoreError>(())
+        })
+        .unwrap();
+        let (_, after_read) = list(state.clone()).await;
+        assert_eq!(after_read.0["attention"], json!([]));
+
+        with_rooms(&state, |store| {
+            store.set_room_read_cursor_mirror(&key, "local-human", Some(2), None)?;
+            Ok::<_, ocean_store::RoomStoreError>(())
+        })
+        .unwrap();
+        let (_, after_clear) = list(state).await;
+        assert_eq!(
+            after_clear.0["attention"],
+            json!([{
+                "room_id": key.as_str(),
+                "latest_seq": "2",
+                "unread_count": 2,
+                "mention_count": 1
+            }])
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn rooms_list_attention_is_page_bounded_and_keeps_nonselected_room_signal() {
+        let tmp = tempfile::tempdir().unwrap();
+        let state = fake_convene_state(&tmp);
+        let selected = RoomKey::new("list-attention-selected");
+        let unopened = RoomKey::new("list-attention-unopened");
+        let next_page = RoomKey::new("list-attention-next-page");
+        let base = Utc::now();
+        with_rooms(&state, |store| {
+            for (offset, key) in [(0, &next_page), (1, &unopened), (2, &selected)] {
+                let at = base + chrono::Duration::seconds(offset);
+                store.create(key.clone(), key.as_str(), None, at)?;
+                store.append_message(
+                    key,
+                    "human",
+                    RoomParticipantKind::Human,
+                    RoomMessageKind::Message,
+                    "durable unread",
+                    at,
+                )?;
+            }
+            store.update_room_read_cursor(
+                &selected,
+                local_room_read_cursor_principal(),
+                RoomReadCursorUpdateRequest { read_seq: 0 },
+            )?;
+            Ok::<_, ocean_store::RoomStoreError>(())
+        })
+        .unwrap();
+
+        let (status, first) = rooms_list_persistent(
+            State(state.clone()),
+            Query(RoomsListQuery {
+                limit: Some(2),
+                cursor: None,
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(first.0["rooms"].as_array().unwrap().len(), 2);
+        assert_eq!(
+            first.0["attention"],
+            json!([{
+                "room_id": unopened.as_str(),
+                "latest_seq": "0",
+                "unread_count": 1,
+                "mention_count": 0
+            }])
+        );
+        assert!(
+            !serde_json::to_string(&first.0["attention"])
+                .unwrap()
+                .contains(next_page.as_str()),
+            "a room outside the selected page must not leak into attention"
+        );
+
+        let cursor = first.0["next_cursor"].as_str().unwrap().to_string();
+        let (_, second) = rooms_list_persistent(
+            State(state),
+            Query(RoomsListQuery {
+                limit: Some(2),
+                cursor: Some(cursor),
+            }),
+        )
+        .await;
+        assert_eq!(
+            second.0["attention"],
+            json!([{
+                "room_id": next_page.as_str(),
+                "latest_seq": "0",
+                "unread_count": 1,
+                "mention_count": 0
+            }])
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

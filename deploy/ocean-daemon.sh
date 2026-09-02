@@ -68,32 +68,28 @@ if [[ ! -d "$NEUTRAL_CWD" ]]; then
   exit 78 # EX_CONFIG
 fi
 # ── Federation credentials: the daemon-specific secret loader (spec line 0.6) ──
-# OCEAN_FEDERATION_URL and OCEAN_FEDERATION_OWNER_TOKEN reach the daemon ONLY
-# here: an untracked, owner-only file that this launcher reads right before it
-# execs the daemon, so the two values live in the daemon's process environment
-# and nowhere else — not in the tracked template, not in the rendered plist,
-# not in the launchd domain (no `launchctl setenv`), and never in this log.
+# OCEAN_FEDERATION_URL and OCEAN_FEDERATION_OWNER_TOKEN reach the supervised
+# daemon through an untracked, owner-only file that this launcher reads right
+# before exec. An explicit process environment wins wholesale; the file is a
+# fallback only when both variables are absent. Neither source enters the
+# tracked template, rendered plist, launchd domain (`launchctl setenv` is never
+# used), or this log.
 # launchd runs this launcher on every start, so a fresh login or reboot goes
 # through the same path as an installer run. A file that fails any custody
 # check is refused WHOLE and the daemon starts with federation OFF, the state
 # it had before the file existed; every refusal names the reason and never the
-# contents. Inherited values are dropped for the same reason: the file is the
-# one supported channel, and a value that arrived any other way is exactly the
-# leak the ruling closes.
+# contents. The daemon independently enforces the same file custody when it is
+# run without this launcher.
 OCEAN_FEDERATION_ENV_FILE="${OCEAN_FEDERATION_ENV_FILE:-${OCEAN_CONFIG_DIR:-${XDG_CONFIG_HOME:-${HOME:-}/.config}/ocean-rs}/federation.env}"
 federation="off"
-if [[ -n "${OCEAN_FEDERATION_URL:-}${OCEAN_FEDERATION_OWNER_TOKEN:-}" ]]; then
-  echo "==> ocean-daemon: ignored inherited OCEAN_FEDERATION_* from the environment; only $OCEAN_FEDERATION_ENV_FILE is honoured" >&2
-fi
-unset OCEAN_FEDERATION_URL OCEAN_FEDERATION_OWNER_TOKEN
 federation_refuse() {
-  echo "==> ocean-daemon: federation OFF — $OCEAN_FEDERATION_ENV_FILE refused: $1" >&2
+  echo "==> ocean-daemon: federation OFF — private configuration refused: $1" >&2
   unset OCEAN_FEDERATION_URL OCEAN_FEDERATION_OWNER_TOKEN
   federation="off"
 }
 federation_load() {
   local f="$1" mode owner line n=0 key value url="" token="" keychain=""
-  if [[ -L "$f" || ! -f "$f" ]]; then federation_refuse "not a regular file"; return; fi
+  if [[ -L "$f" || ! -f "$f" ]]; then federation_refuse "not_regular"; return; fi
   # GNU stat and BSD stat spell this differently, and GNU's `-f` is a
   # filesystem query that would print a block of text into the capture, so
   # pick the flavour first instead of falling through one to the other.
@@ -102,34 +98,38 @@ federation_load() {
   else
     mode="$(stat -f '%Lp' "$f" 2>/dev/null || echo '?')"; owner="$(stat -f '%u' "$f" 2>/dev/null || echo '?')"
   fi
-  if [[ "$mode" != "600" ]]; then federation_refuse "mode is $mode, must be 0600"; return; fi
-  if [[ "$owner" != "$(id -u)" ]]; then federation_refuse "owned by uid $owner, not $(id -u)"; return; fi
+  if [[ "$mode" != "600" ]]; then federation_refuse "unsafe_mode"; return; fi
+  if [[ "$owner" != "$(id -u)" ]]; then federation_refuse "foreign_owner"; return; fi
   while IFS= read -r line || [[ -n "$line" ]]; do
     n=$((n + 1)); line="${line%$'\r'}"
     [[ -z "${line// /}" || "$line" == \#* ]] && continue
     key="${line%%=*}"; value="${line#*=}"
     case "$key" in
-      OCEAN_FEDERATION_URL) [[ -z "$url" ]] || { federation_refuse "line $n repeats OCEAN_FEDERATION_URL"; return; }; url="$value" ;;
-      OCEAN_FEDERATION_OWNER_TOKEN) [[ -z "$token" ]] || { federation_refuse "line $n repeats OCEAN_FEDERATION_OWNER_TOKEN"; return; }; token="$value" ;;
-      OCEAN_FEDERATION_OWNER_TOKEN_KEYCHAIN) [[ -z "$keychain" ]] || { federation_refuse "line $n repeats OCEAN_FEDERATION_OWNER_TOKEN_KEYCHAIN"; return; }; keychain="$value" ;;
-      *) federation_refuse "unexpected line $n (only the two federation keys and a keychain reference may appear)"; return ;;
+      OCEAN_FEDERATION_URL) [[ -z "$url" ]] || { federation_refuse "duplicate_entry"; return; }; url="$value" ;;
+      OCEAN_FEDERATION_OWNER_TOKEN) [[ -z "$token" ]] || { federation_refuse "duplicate_entry"; return; }; token="$value" ;;
+      OCEAN_FEDERATION_OWNER_TOKEN_KEYCHAIN) [[ -z "$keychain" ]] || { federation_refuse "duplicate_entry"; return; }; keychain="$value" ;;
+      *) federation_refuse "unsupported_entry"; return ;;
     esac
   done < "$f"
   if [[ ! "$url" =~ ^https://[A-Za-z0-9.-]+(:[0-9]{1,5})?$ && ! "$url" =~ ^http://(127\.0\.0\.1|localhost)(:[0-9]{1,5})?$ ]]; then
-    federation_refuse "OCEAN_FEDERATION_URL must be an https origin with nothing after the host (http is allowed for 127.0.0.1 and localhost only)"; return
+    federation_refuse "origin is invalid"; return
   fi
-  if [[ -n "$token" && -n "$keychain" ]]; then federation_refuse "both a token and a keychain reference are set; keep one"; return; fi
+  if [[ -n "$token" && -n "$keychain" ]]; then federation_refuse "ambiguous_credential"; return; fi
   if [[ -n "$keychain" ]]; then
     token="$(security find-generic-password -a "${USER:-$(id -un)}" -s "$keychain" -w 2>/dev/null || true)"
-    [[ -n "$token" ]] || { federation_refuse "keychain item '$keychain' is unavailable for this user"; return; }
+    [[ -n "$token" ]] || { federation_refuse "credential_unavailable"; return; }
     federation="on (keychain)"
   else
     federation="on (file)"
   fi
-  if [[ -z "$token" || "$token" =~ [[:space:]] ]]; then federation_refuse "OCEAN_FEDERATION_OWNER_TOKEN is empty or holds whitespace"; return; fi
+  if [[ -z "$token" || "$token" =~ [[:space:]] ]]; then federation_refuse "credential is invalid"; return; fi
   export OCEAN_FEDERATION_URL="$url" OCEAN_FEDERATION_OWNER_TOKEN="$token"
 }
-if [[ -e "$OCEAN_FEDERATION_ENV_FILE" ]]; then federation_load "$OCEAN_FEDERATION_ENV_FILE"; fi
+if [[ -n "${OCEAN_FEDERATION_URL:-}" || -n "${OCEAN_FEDERATION_OWNER_TOKEN:-}" ]]; then
+  federation="on (process)"
+elif [[ -e "$OCEAN_FEDERATION_ENV_FILE" ]]; then
+  federation_load "$OCEAN_FEDERATION_ENV_FILE"
+fi
 echo "==> ocean-daemon: cwd=$NEUTRAL_CWD (neutral) bin=$BIN yolo=$OCEAN_YOLO bind=${OCEAN_BIND:-127.0.0.1:4780} federation=$federation"
 cd "$NEUTRAL_CWD"
 exec "$BIN"

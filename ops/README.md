@@ -106,7 +106,7 @@ tail -f /private/tmp/ocean-daemon.log
 ### Federation credentials (the daemon's secret loader)
 
 The two federation values, `OCEAN_FEDERATION_URL` and
-`OCEAN_FEDERATION_OWNER_TOKEN`, reach the daemon through exactly one channel:
+`OCEAN_FEDERATION_OWNER_TOKEN`, normally reach the supervised daemon through
 an untracked, owner-only (`0600`) file that the launcher
 (`deploy/ocean-daemon.sh`, installed as `~/.local/libexec/ocean-daemon/launch.sh`)
 reads right before it execs the daemon. They live in the daemon's process
@@ -116,7 +116,11 @@ rendered plist, not in the launchd domain (the launcher never calls
 so a fresh login or reboot takes the same path as an installer run. A file that
 fails any custody check (mode, owner, an unexpected line, a URL with anything
 after the host) is refused whole and the daemon starts with federation off; the
-refusal in `/private/tmp/ocean-daemon.log` names the reason, never the contents.
+refusal in `/private/tmp/ocean-daemon.log` is a fixed reason code and never a
+key name or value. For a direct invocation, an explicit process pair wins
+wholesale. When both process variables are absent, the daemon itself enforces
+the same owner, regular-file, `0600`, and 16 KiB file boundary; the native
+fallback accepts only the URL and literal owner-token lines.
 
 Set it with the reviewed procedure, after turns drain (the restart drops any turn
 in flight). The bearer is never accepted on the command line:

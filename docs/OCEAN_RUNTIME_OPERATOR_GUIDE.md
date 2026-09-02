@@ -241,6 +241,19 @@ disagree with what you set.
 
 ### Federated-room Bedrock bridge
 
+Federation configuration is resolved once at daemon startup. An explicit
+process environment wins as a pair: if either federation variable is present,
+the daemon never falls back to disk and an incomplete pair is invalid. When
+both are absent, the daemon reads
+`${OCEAN_CONFIG_DIR:-~/.config/ocean-rs}/federation.env`. That file must be a
+same-owner, non-symlink regular file at exactly `0600`, no larger than 16 KiB,
+and contain exactly one `OCEAN_FEDERATION_URL=...` line plus one
+`OCEAN_FEDERATION_OWNER_TOKEN=...` line. Any other entry, duplicate, custody
+failure, invalid origin, or invalid token refuses the whole file. Runtime
+diagnostics report only that private configuration was invalid; key names and
+values never enter logs. The supervised launcher uses the same file as its
+fallback immediately before exec and never calls `launchctl setenv`.
+
 Set `OCEAN_FEDERATION_URL` to the Bedrock **origin only** (for example
 `https://bedrock.example.com` or trusted-loopback diagnostics such as
 `http://127.0.0.1:8787`). The daemon rejects userinfo, paths, query strings,

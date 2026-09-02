@@ -64,21 +64,23 @@ test('a 0600 file with the two keys reaches the daemon process, and the bearer n
   assert.ok(!log.includes(TOKEN), 'the bearer must not appear in the launcher log');
 });
 
-test('a file that is not 0600 is refused whole, by mode, without printing its contents', async () => {
+test('a file that is not 0600 is refused whole, without printing key names or contents', async () => {
   const h = await harness();
   await writeFile(h.envFile, `OCEAN_FEDERATION_URL=https://bedrock.example\nOCEAN_FEDERATION_OWNER_TOKEN=${TOKEN}\n`, { mode: 0o644 });
   const { seen, log } = await launch(h);
   assert.equal(seen.URL_SET, ''); assert.equal(seen.TOKEN_SET, '');
-  assert.match(log, /refused: mode is 644, must be 0600/);
+  assert.match(log, /private configuration refused: unsafe_mode/);
   assert.ok(!log.includes(TOKEN));
+  assert.ok(!log.includes('OCEAN_FEDERATION_'));
 });
 
-test('a line that is not one of the federation keys refuses the file, naming the line', async () => {
+test('a line that is not one of the federation keys refuses the file without naming it', async () => {
   const h = await harness();
   await writeFile(h.envFile, `OCEAN_FEDERATION_URL=https://bedrock.example\nOCEAN_FEDERATION_OWNER_TOKEN=${TOKEN}\nOCEAN_YOLO=0\n`, { mode: 0o600 });
   const { seen, log } = await launch(h);
   assert.equal(seen.TOKEN_SET, '');
-  assert.match(log, /refused: unexpected line 3/);
+  assert.match(log, /private configuration refused: unsupported_entry/);
+  assert.ok(!log.includes('OCEAN_YOLO'));
 });
 
 test('a URL with anything after the host, or a plain-http remote, is refused', async () => {
@@ -87,29 +89,33 @@ test('a URL with anything after the host, or a plain-http remote, is refused', a
     await writeFile(h.envFile, `OCEAN_FEDERATION_URL=${url}\nOCEAN_FEDERATION_OWNER_TOKEN=${TOKEN}\n`, { mode: 0o600 });
     const { seen, log } = await launch(h);
     assert.equal(seen.TOKEN_SET, '', url);
-    assert.match(log, /OCEAN_FEDERATION_URL must be an https origin/);
+    assert.match(log, /private configuration refused: origin is invalid/);
   }
   const h = await harness();
   await writeFile(h.envFile, `OCEAN_FEDERATION_URL=http://127.0.0.1:4790\nOCEAN_FEDERATION_OWNER_TOKEN=${TOKEN}\n`, { mode: 0o600 });
   assert.equal((await launch(h)).seen.URL, 'http://127.0.0.1:4790', 'loopback http is allowed for local Bedrock');
 });
 
-test('inherited federation variables are dropped: the file is the only channel', async () => {
+test('an explicit process pair wins wholesale over the file fallback', async () => {
   const h = await harness();
-  const { seen, log } = await launch(h, { OCEAN_FEDERATION_URL: 'https://leak.example', OCEAN_FEDERATION_OWNER_TOKEN: 'leaked' });
-  assert.equal(seen.URL_SET, ''); assert.equal(seen.TOKEN_SET, '');
-  assert.match(log, /ignored inherited OCEAN_FEDERATION_\*/);
+  await writeFile(h.envFile, `OCEAN_FEDERATION_URL=https://disk.example\nOCEAN_FEDERATION_OWNER_TOKEN=${TOKEN}\n`, { mode: 0o600 });
+  const { seen, log } = await launch(h, { OCEAN_FEDERATION_URL: 'https://process.example', OCEAN_FEDERATION_OWNER_TOKEN: 'process-secret' });
+  assert.equal(seen.URL, 'https://process.example');
+  assert.equal(seen.TOKEN_SHA, sha16('process-secret'));
+  assert.match(log, /federation=on \(process\)/);
+  assert.ok(!log.includes('process-secret'));
 });
 
 test('a token and a keychain reference together are refused; a keychain reference alone defers to the Keychain', async () => {
   const h = await harness();
   await writeFile(h.envFile, `OCEAN_FEDERATION_URL=https://bedrock.example\nOCEAN_FEDERATION_OWNER_TOKEN=${TOKEN}\nOCEAN_FEDERATION_OWNER_TOKEN_KEYCHAIN=ocean-federation\n`, { mode: 0o600 });
-  assert.match((await launch(h)).log, /both a token and a keychain reference are set/);
+  assert.match((await launch(h)).log, /private configuration refused: ambiguous_credential/);
   const h2 = await harness();
   await writeFile(h2.envFile, `OCEAN_FEDERATION_URL=https://bedrock.example\nOCEAN_FEDERATION_OWNER_TOKEN_KEYCHAIN=ocean-federation-test-missing\n`, { mode: 0o600 });
   const { seen, log } = await launch(h2);
   assert.equal(seen.TOKEN_SET, '');
-  assert.match(log, /keychain item 'ocean-federation-test-missing' is unavailable|federation OFF/);
+  assert.match(log, /private configuration refused: credential_unavailable/);
+  assert.ok(!log.includes('ocean-federation-test-missing'));
 });
 
 test('neither the tracked plist nor a rendered copy carries a federation key', async () => {
