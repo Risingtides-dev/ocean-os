@@ -9605,3 +9605,47 @@ red before this branch and still red on RUSTSEC-2026-0274 (`rtrb`) and yanked
 `cloud/rooms-workspace-root-surface`, which sends the field at create time and
 adds the bind/unbind control this route makes possible.
 _________________________________________________________________________________ 21:04 cloud/rooms-workspace-root-daemon
+
+time:      [23:51] [01-09-26]
+agent:     [claude-code], [claude-opus-5], [cloud run]
+worktree:  cloud/rooms-workspace-root-daemon
+type:      [review]: Codex P1 on #443 — the owning crate contract was not updated
+area:      [docs]: crates/ocean-daemon/AGENTS.md, rooms workspace binding
+
+Codex reviewed #443 and raised one P1, correctly. The slice updated
+`docs/OCEAN_RUNTIME_OPERATOR_GUIDE.md` and appended a root ledger entry, but
+left the NEAREST OWNING contract alone: `crates/ocean-daemon/AGENTS.md`'s
+`persistent_rooms.rs` paragraph still said "Room creation accepts a nonblank
+`workspace_root` ... blank remains unbound" and nothing else — a create-only
+statement in front of a change that makes the binding mutable. Root AGENTS.md
+line 21 requires the devlog pass to update the nearest owning `AGENTS.md`, and
+this one was missed. Verified against the file before acting rather than taken
+on the bot's word: the sentence is exactly as quoted, and it is the only place
+in that contract that describes when a room's workspace can be set.
+
+That paragraph now carries the post-create half: `room_update` is the only
+writer, `RoomUpdateRequest::workspace_root` is a double `Option` behind
+`double_option_workspace_root` exactly as `trigger_policy` is, absent leaves the
+binding untouched, explicit `null` and a blank string unbind, and a nonblank
+value binds through the same `canonical_submitted_workspace_root` create calls
+under the same frozen `invalid_workspace_root` 400. It records WHY absent
+cannot collapse to a clear — PATCH is also the rename route, and an unbound room
+refuses every agent turn, so a rename that cleared the field would switch a
+working room's agents off silently — and why the value reaching
+`RoomStore::update` is already canonical. It also states the defect the slice
+fixed, since a contract that never says a room could not be bound after creation
+cannot explain why the route grew a field.
+
+`crates/ocean-store/AGENTS.md` was checked and deliberately left alone: it
+carries no `workspace_root` or `RoomStore::update` text at all, so there is
+nothing stale there to correct and adding a first mention is not this repair.
+The existing ledger entry for this slice was NOT edited — the ledger is
+append-only, so the review pass gets its own entry.
+
+Gates on the repaired tree: `cargo xtask docs-check` PASS (30 packages, 157
+files, 179 links); the rest of `cargo xtask ci` re-run below. Docs-only change,
+no code touched, so no behavior moves. `cargo deny` remains red before and after
+on the pre-existing yanked `spin` advisory — red on `main` at 616293e too, which
+is this branch's base — reported and not fixed, and this branch still touches no
+`Cargo.toml`, `Cargo.lock` or `deny.toml`.
+_________________________________________________________________________________ 23:51 cloud/rooms-workspace-root-daemon
