@@ -154,14 +154,14 @@ The **Auth** column names what a caller must present BEYOND reaching the daemon.
 
 | Method | Path | Purpose | Auth |
 | --- | --- | --- | --- |
-| `GET` | `/v1/rooms/persistent` | List every persistent room this daemon owns. | Loopback trust only |
+| `GET` | `/v1/rooms/persistent` | List this daemon's persistent rooms as ONE BOUNDED PAGE (`?limit=&cursor=`, default 100, capped at 1000), with `next_cursor` and `has_more` beside it — a client past the cap must page rather than read the array as the whole set. | Loopback trust only |
 | `POST` | `/v1/rooms/persistent` | Create a room from `{ key, name, trigger_policy?, workspace_root? }`. | Loopback trust only |
 | `GET` | `/v1/rooms/persistent/{key}` | Fetch one OPEN room with its bounded first transcript page, access projection, and `agent_owners`. | Loopback trust only |
 | `PATCH` | `/v1/rooms/persistent/{key}` | Update the mutable `name` / `trigger_policy` metadata of an open room. | Loopback trust only |
 | `POST` | `/v1/rooms/persistent/{key}/participants` | Join: add one participant to the roster. | Loopback trust only; a claimed `Agent` kind is refused (`forged_participant_kind`) |
 | `DELETE` | `/v1/rooms/persistent/{key}/participants/{participant_id}` | Leave: remove one participant from the roster. | Loopback trust only |
 | `POST` | `/v1/rooms/persistent/{key}/messages` | Append one entry to the transcript. | Roster-asserted `author_id` + `author_kind` (403 `author_not_in_roster` / `forged_author_kind`) |
-| `POST` | `/v1/rooms/persistent/{key}/invites` | Bootstrap the owner if the room is Local, then mint a federated invite carrying the code and its `onboard_url`. | Daemon-held `OCEAN_FEDERATION_OWNER_TOKEN`; never surface-submitted |
+| `POST` | `/v1/rooms/persistent/{key}/invites` | Bootstrap the owner if the room is Local, then mint a federated invite carrying the code and its `onboard_url`. | Daemon-held room bearer. `OCEAN_FEDERATION_OWNER_TOKEN` is the LOCAL-BOOTSTRAP EXCEPTION, not the general case: it registers a Local room that has no credential yet and becomes that room's stored bearer, while an already-federated room mints under the credential it already has. Neither is ever surface-submitted |
 | `POST` | `/v1/rooms/persistent/invites/redeem` | Redeem `{ code }` restart-safely and self-join the room the invite's scope resolves to. | The invite `code` IS the bearer grant; the minted room bearer stays in the daemon |
 | `POST` | `/v1/rooms/persistent/{key}/members/agents` | Register this daemon's safe local agent descriptors with the room's federation peer. | Daemon-held room bearer |
 | `DELETE` | `/v1/rooms/persistent/{key}/members/{member_id}` | Remove one federated member through Bedrock. | Daemon-held room bearer; Bedrock's owner-or-self refusal surfaces as 403 `federation_forbidden` |
@@ -193,7 +193,7 @@ The **Auth** column names what a caller must present BEYOND reaching the daemon.
 | `GET` | `/v1/rooms/persistent/{key}/workspace` | Report the status of the room's Bedrock workspace. | Membership-gated `?actor_id=`; the daemon supplies the bearer and the upstream actor id |
 | `GET` | `/v1/rooms/persistent/{key}/workspace/{*leaf}` | Read one allowlisted workspace leaf. | Membership-gated `?actor_id=`; `WORKSPACE_ALLOWLIST` decides whether the leaf is a call at all |
 | `POST` | `/v1/rooms/persistent/{key}/workspace/{*leaf}` | Run one allowlisted workspace command leaf. | Membership-gated `?actor_id=`; owner verbs additionally require an actor resolving to the credential's principal (403 `workspace_not_owner_principal`) |
-| `POST` | `/v1/rooms/{room_id}/livekit-token` | Mint a LiveKit join token for a server-authored, still-open `call:` room. | Subscribe by default; PUBLISH needs a matching `X-Ocean-Publish-Token` and fails closed when no operator secret is set |
+| `POST` | `/v1/rooms/{room_id}/livekit-token` | Mint a LiveKit join token. A `call:` id must name a server-authored room that still EXISTS and is open (404 otherwise); any other id is admitted with NO store check, which is what lets a fresh project or surface room get a token before it is durable. | Subscribe by default; PUBLISH needs a matching `X-Ocean-Publish-Token` and fails closed when no operator secret is set |
 
 **Transcript** is a flat, append-only event log of `RoomMessage` entries, each
 carrying author attribution (`author_id`, `author_kind`), a `kind`
