@@ -1519,6 +1519,17 @@ pub(super) async fn admit_room_agent(
             cancel_superseded_locked(&mut requests, room, agent_member_id, stale.generation);
         drop(requests);
         cleanup_cancelled(state, cancelled).await;
+        // §4.1 admission refusals. This arm is the ONE refusal that does not go
+        // through `append_admission_audit`: `mark_room_agent_stale` writes its
+        // own `outcome: "refused"` / `reason_code: "binding_stale"` row inside
+        // the authority transaction. Without this bump the refusal that first
+        // DISCOVERS digest drift — the interesting one, the moment a package
+        // changed under an approved binding — would be the only one missing from
+        // the counter, while every later attempt against the now-stale binding
+        // got counted by the status arm above.
+        state
+            .room_metrics
+            .record_admission_refusal(crate::metrics::AdmissionRefusal::BindingStale);
         return Err(ApiError::conflict("binding_stale"));
     }
     if !trigger.permits(binding.activation_policy) {

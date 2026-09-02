@@ -9747,3 +9747,62 @@ deploy and no migration: every new column is absent because there are none, and
 a daemon that upgrades into this code sweeps nothing until an operator sets a
 window.
 _________________________________________________________________________________ 05:08 cloud/os-room-lifecycle
+
+time:      [06:13] [02-09-26]
+agent:     [claude-code], [claude-opus-5], [cloud loop]
+worktree:  [cloud/os-room-metrics]
+type:      [bug report]
+area:      [backend]
+
+Codex review round on PR #447. Three P2 findings, all about whether the §4.1
+counters say true things. I verified each against the tree before touching
+anything; all three were real, and all three are fixed.
+
+Reconnects were counted beside the backoff at the bottom of run_room's loop.
+Every path between there and the next dial is a return that never redials —
+cancellation or shutdown winning the backoff select!, a missing client, a
+credential that vanished, a room gone Revoked — so stopping a room or shutting
+the daemon down reported a reconnect that never happened. Codex proposed moving
+the bump into the sleep-wins arm; that still over-counts, because the credential
+and Revoked checks sit after it. The bump now sits immediately before the
+run_epoch call it counts, guarded on attempt > 0 so the task's first dial stays
+out of a counter about REconnects.
+
+A room's lag entry was never removed, and the gauge is the maximum across
+entries, so a room revoked while behind held that backlog forever, outliving the
+room. Rather than clear at each of run_room's seven returns — a metric cleaned
+up by hand at six of them leaks at the seventh — the entry is owned by a
+FederationLagScope held for the task's life, the same RAII shape InFlightGuard
+already uses for the turn gauge. That also closes the closed-room case Codex
+named: closing a room stops its task, so the guard drops the entry. One thing
+the finding did not mention would have bitten: a room can restart, and the old
+task's cleanup can land after the new task reported, blanking a live
+measurement. Entries carry the reporting generation and a clear removes only its
+own; two tests pin the fall-back and the late-clear.
+
+The digest-drift arm of admit_room_agent was the one refusal that never reaches
+append_admission_audit, where I hung the counter: mark_room_agent_stale writes
+its own outcome refused / reason_code binding_stale row inside the authority
+transaction. So the counter and the ledger disagreed on exactly one row — the
+refusal that DISCOVERS drift, the moment a package changed under an approved
+binding, which is the one worth paging on. Every later attempt was already
+counted by the status arm, so the metric would have shown drift refusals
+starting from the second. It bumps itself now, and the asymmetry is recorded in
+the daemon AGENTS.md so the next reader does not assume one site still covers
+every arm.
+
+Also merged the owner's 75a41b7, which relocated the metrics.rs ownership bullet
+past room_agent_authority.rs to clear PR #442's AGENTS.md hunk. My fix commit had
+extended that bullet at its old position, so the two collided; resolved by taking
+both intents — the relocated position (now line 136, clear of #442's 109-125) with
+the updated text. One copy of the bullet remains. Merged rather than rebased, so
+nobody's checkout is invalidated.
+
+Gates on the merged tree: docs-check PASS (30 packages, 157 files, 179 links),
+build PASS, workspace tests PASS (3249 passed, 0 failed; ocean-daemon 883/883),
+Clippy clean, format clean, ledger PASS. Dependency policy DID NOT RUN — cargo
+deny is not installed here. cargo-deny is red in CI for RUSTSEC on rtrb 0.3.4 via
+livekit, identical on main at 616293e and established as the base branch's, not
+this PR's; commented once, not widened into a lockfile bump, and the fix is the
+user's call as its own PR.
+_________________________________________________________________________________ 06:13 cloud/os-room-metrics
