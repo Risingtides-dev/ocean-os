@@ -9549,3 +9549,20 @@ RUSTSEC-2026-0274 (`rtrb` double-free) and yanked `spin`, unchanged and
 pre-existing: the branch touches no `Cargo.toml`, `Cargo.lock` or `deny.toml` at
 all, and every line this pass changed is a comment. No deploy, no migration.
 _________________________________________________________________________________ 12:16 loop/os-transcript-page-including-closed
+
+time:      [20:01] [01-09-26]
+agent:     [claude-code], [claude-fable-5-1], [ocean operator]
+worktree:  docs/rooms-definition-of-done
+type:      [plan]
+area:      [docs]
+
+Added the production-grade definition of done for Ocean Rooms as
+`docs/specs/2026-09-01-ocean-rooms-definition-of-done.md`, indexed it in
+`docs/README.md`, and opened a ROADMAP checkbox under the rooms program that
+names what is open on this repo's side. Nothing in the loop's contract or in
+any repo defined "done" for rooms before this; the backlog was replenishing
+polish faster than it drained. Written from three read-only assessments at
+ocean-bedrock 8753038, ocean-os 616293e, ocean-surface d58a145. Docs only:
+no code, no deploy, no migration; `cargo deny` red on rtrb is unchanged and
+named in the checklist as a user ruling.
+_________________________________________________________________________________ 20:01 docs/rooms-definition-of-done
