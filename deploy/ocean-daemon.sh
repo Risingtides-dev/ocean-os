@@ -94,8 +94,14 @@ federation_refuse() {
 federation_load() {
   local f="$1" mode owner line n=0 key value url="" token="" keychain=""
   if [[ -L "$f" || ! -f "$f" ]]; then federation_refuse "not a regular file"; return; fi
-  mode="$(stat -f '%Lp' "$f" 2>/dev/null || stat -c '%a' "$f" 2>/dev/null || echo '?')"
-  owner="$(stat -f '%u' "$f" 2>/dev/null || stat -c '%u' "$f" 2>/dev/null || echo '?')"
+  # GNU stat and BSD stat spell this differently, and GNU's `-f` is a
+  # filesystem query that would print a block of text into the capture, so
+  # pick the flavour first instead of falling through one to the other.
+  if stat -c '%a' / >/dev/null 2>&1; then
+    mode="$(stat -c '%a' "$f" 2>/dev/null || echo '?')"; owner="$(stat -c '%u' "$f" 2>/dev/null || echo '?')"
+  else
+    mode="$(stat -f '%Lp' "$f" 2>/dev/null || echo '?')"; owner="$(stat -f '%u' "$f" 2>/dev/null || echo '?')"
+  fi
   if [[ "$mode" != "600" ]]; then federation_refuse "mode is $mode, must be 0600"; return; fi
   if [[ "$owner" != "$(id -u)" ]]; then federation_refuse "owned by uid $owner, not $(id -u)"; return; fi
   while IFS= read -r line || [[ -n "$line" ]]; do
