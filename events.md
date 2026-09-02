@@ -9567,10 +9567,10 @@ no code, no deploy, no migration; `cargo deny` red on rtrb is unchanged and
 named in the checklist as a user ruling.
 _________________________________________________________________________________ 20:01 docs/rooms-definition-of-done
 
-time:      [20:16] [01-09-26]
+time:      [20:16] [09-01-26]
 agent:     [codex] [gpt-5]
 worktree:  docs/rooms-definition-of-done
-type:      [review]
+type:      [bug report]
 area:      [docs]
 
 Addressed Codex review on the Rooms finish-line contract. The documentation
@@ -9580,3 +9580,16 @@ claim and attaches concrete commands, test owners, and remaining matrix
 requirements to criteria 2.1 and 2.3 through 2.5. Docs only; no runtime,
 deployment, migration, or production state changed.
 _________________________________________________________________________________ 20:16 docs/rooms-definition-of-done
+
+time:      [21:13] [09-01-26]
+agent:     [codex] [gpt-5]
+worktree:  docs/rooms-definition-of-done
+type:      [bug report]
+area:      [review]
+
+Closed the second Codex review pass on criterion 2.4. Its exit check now runs
+the daemon route-level refusal and stored-value transition tests plus Surface
+coverage for the offered trigger rows and access-state holds. The earlier
+review entry's date and type were corrected to this ledger's declared schema.
+Docs only; no daemon, deployment, migration, or production state changed.
+_________________________________________________________________________________ 21:13 docs/rooms-definition-of-done

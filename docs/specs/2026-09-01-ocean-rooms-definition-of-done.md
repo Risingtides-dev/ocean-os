@@ -99,9 +99,13 @@ ocean-os 616293e, ocean-surface d58a145.
 - 2.4 Triggers that are offered fire: on_thread_reply works in federated rooms
   or is not offered there and a stored dead value can be cleared;
   on_component_event and on_schedule are hidden until wired. Check:
-  `cargo test -p ocean-daemon dead_thread_reply_transition_refuses_only_the_flip_out_of_a_local_room`
-  and, in ocean-surface,
-  `cargo test -p ocean-surface-ui --test ci_failure_trigger_control`.
+  `cargo test -p ocean-daemon room_update_refuses_enabling_thread_reply_once_the_room_federates`,
+  `cargo test -p ocean-daemon room_update_accepts_a_federated_room_resending_a_thread_reply_it_already_stores`,
+  and, in ocean-surface, `cargo test -p ocean-surface-ui --test
+  ci_failure_trigger_control` plus `cargo test -p ocean-surface-ui
+  thread_reply_is_dead_in_a_federated_room`. The route tests must prove both
+  refusal of a new dead value and clearing/re-sending the stored value; the
+  Surface checks must prove the offered rows and their access-state holds.
   [os, surface, S]
 - 2.5 Agents drive rooms through MCP and the CLI for every route a human has:
   build, CI, secrets, purge, port close. Today MCP stops at expose_port. Check:
