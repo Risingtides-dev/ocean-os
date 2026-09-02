@@ -56,6 +56,42 @@ outbox, and the restart-safe federation core (S2 P2-A). One database file
 
 ### Load-bearing invariants
 
+- **Durability settings live in ONE named place and are read back, never
+  assumed.** `apply_durability_pragmas` is the only place production PRAGMAs are
+  set, and `open()` — the single file-backed open path — applies it BEFORE
+  `migrate`, so the migration itself runs under them and WAL's `-wal`/`-shm`
+  sidecars exist by the time the post-migration owner-only enforcement locks
+  them down. `journal_mode = WAL` (readers do not block the writer, and the
+  setting persists in the DB header), `synchronous = NORMAL` (WAL's
+  durable-enough level: nothing committed is lost to a process or daemon crash,
+  and what NORMAL trades away versus FULL is an OS-crash/power-loss window over
+  the most recent commits — the invariants below are ATOMICITY invariants, which
+  NORMAL keeps whole, so a lost transaction is lost whole and never torn), a
+  5-second `busy_timeout`, and `foreign_keys`. The residual risk is stated
+  exactly in that function and must not be softened here: an `append_message`
+  the store ACKNOWLEDGED can be lost to a power cut with nothing to replay it.
+  The outbox does not cover this and is not a redo log — `append_message` writes
+  no outbox row (only `allocate_outbox_pending` and the federated agent-reply
+  path do), and a federated event's outbox row commits in the SAME transaction
+  as the work it covers, so a lost transaction takes the row with it. The outbox
+  retries the unconfirmed federated events that SURVIVED, which is a narrower
+  claim than "the outbox replays what was lost" and is the only one true. `open_in_memory` deliberately does
+  NOT take them: `:memory:` has no journal to hold in WAL and no second
+  connection to contend with, and `migrate` supplies the one setting that still
+  means something there. `durability()` re-queries all four off the live
+  connection — never echoing what was requested — and the daemon logs it on the
+  `persistent rooms store ready` startup line, which is how an operator tells
+  without opening the DB by hand (`docs/OCEAN_RUNTIME_OPERATOR_GUIDE.md`).
+  Two things about `busy_timeout` that a reader will otherwise re-derive wrong:
+  it was ALREADY five seconds before this function existed, because
+  `rusqlite::Connection::open` sets `sqlite3_busy_timeout(db, 5000)` itself, so
+  deleting our call is green — the explicit call takes ownership of a value that
+  was a borrowed driver default, and the pinning assertion is what would catch a
+  `rusqlite` bump dropping it. Zeroing it is the mutation that reds, on both
+  `a_production_store_opens_in_wal_with_the_chosen_durability_settings` and
+  `a_second_writer_waits_for_the_lock_instead_of_failing_busy`. Store writes are
+  serialized in-process by the daemon's `Mutex` around the store; the timeout is
+  what BOUNDS a writer arriving on a second connection.
 - **u64 as canonical decimal TEXT.** Counters, cursors, and sequences are
   stored via `write_u64_text` and re-read only through
   `parse_canonical_u64_text`; noncanonical text fails closed. Never compare
