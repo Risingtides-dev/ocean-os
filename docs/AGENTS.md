@@ -38,6 +38,10 @@ This child contract governs current architecture, operations, cross-repository r
 - A document under `specs/` or `superpowers/` is not current architecture merely because it exists. Preserve its status and verify implementation before using it as a work order.
 - Rooms means durable `/v1/rooms/persistent/*` collaboration plus the independent LiveKit token route; Track-0 projection-room material is historical.
 - `specs/2026-08-16-ocean-rooms-distributed-workspace-architecture.md` is the operator-approved (2026-08-17) multi-computer Rooms direction: room-scoped agent authorization, member-contributed resource grants, a logical cross-node namespace, Tailscale-backed direct operations with local enforcement, and extension-owned workflow policy. `specs/2026-08-17-ocean-rooms-gate0-decisions-and-threat-model.md` is the operator-accepted security and scope ruling. Gate 0 authorized preparation and review of the local-only Phase 1 manifest; later phases still require separate manifests. `specs/2026-08-25-ocean-rooms-phase1-room-agent-authorization-manifest.md` is that accepted contract — read it before touching room-agent routes, schemas, or the Surface authorization flow. Exact backend and Surface candidates passed independent review and local/GitHub gates, then landed through Ocean OS PR #425 and Ocean Surface PR #177 on 2026-08-31. Every §15 closure remains binding. Stage 2 contributed folders remains closed until its own implementation manifest is accepted.
+- `specs/2026-09-01-ocean-rooms-definition-of-done.md` is the active
+  cross-repository Rooms finish-line contract. It records member-visible,
+  executable acceptance criteria and remaining ownership across Ocean OS,
+  Surface, and Bedrock; it authorizes no implementation by itself.
 
 ## Work Guidance
 

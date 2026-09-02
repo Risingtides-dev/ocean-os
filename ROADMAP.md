@@ -41,6 +41,16 @@ across those computers. The architecture does not itself authorize code changes.
       Stage 2 (contributed folders) remains closed and requires its own accepted
       implementation manifest.
 
+- [ ] Reach the production-grade finish line in
+      [`docs/specs/2026-09-01-ocean-rooms-definition-of-done.md`](docs/specs/2026-09-01-ocean-rooms-definition-of-done.md):
+      every line checked with its named executable check across ocean-os,
+      ocean-surface and ocean-bedrock. Open on this repo's side as of
+      2026-09-01: the operated daemon is behind `main` with federation off
+      (0.5, 0.6); `PHASE1_SAFE_CAPABILITIES` is deliberately empty pending a
+      Stage 2 manifest (2.3); room routes are unauthenticated (3.1); there are
+      no room or federation metrics (4.1); `OCEAN_ECOSYSTEM_CONTRACT.md` lists
+      11 of the 40 room routes (5.2); `cargo deny` is red (3.5).
+
 ## Ocean Observatory
 
 - [x] Gate 0 decisions accepted — see [`docs/specs/2026-07-17-observatory-gate0-decisions.md`](docs/specs/2026-07-17-observatory-gate0-decisions.md), including the operator's 90s-game visual-parity ruling on truthful events with a durable event store.
