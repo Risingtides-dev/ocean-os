@@ -26444,6 +26444,114 @@ mod tests {
         );
     }
 
+    /// The `/v1/rooms` half of `source_registered_routes()`. The contract's
+    /// room-route table claims to be the WHOLE room surface, so the comparison
+    /// has to be against every registered room route rather than a hand-listed
+    /// subset — otherwise a new route could be added to neither side and the
+    /// table would still pass while lying.
+    fn registered_room_routes() -> std::collections::BTreeSet<String> {
+        source_registered_routes()
+            .into_iter()
+            .filter(|route| {
+                route
+                    .split_once(' ')
+                    .is_some_and(|(_, path)| path == "/v1/rooms" || path.starts_with("/v1/rooms/"))
+            })
+            .collect()
+    }
+
+    /// Parse the room-route table out of `OCEAN_ECOSYSTEM_CONTRACT.md`: any
+    /// Markdown table row whose first cell is a wire method and whose second is
+    /// a `/v1/rooms` path. Prose mentioning a path is ignored because it is not
+    /// a table row, and the header/separator rows are ignored because `Method`
+    /// and `---` are not wire methods.
+    fn contract_room_route_table() -> std::collections::BTreeSet<String> {
+        let contract = include_str!("../../../docs/OCEAN_ECOSYSTEM_CONTRACT.md");
+        contract
+            .lines()
+            .filter_map(|line| {
+                let mut cells = line.trim().strip_prefix('|')?.split('|').map(str::trim);
+                let method = cells.next()?.trim_matches('`');
+                let path = cells.next()?.trim_matches('`');
+                (matches!(method, "GET" | "POST" | "PUT" | "PATCH" | "DELETE")
+                    && path.starts_with("/v1/rooms"))
+                .then(|| format!("{method} {path}"))
+            })
+            .collect()
+    }
+
+    /// The decimal number immediately following `marker` in `sentence`. Anchored
+    /// on the surrounding words rather than "the first number in the line" so
+    /// that ordinary prose gaining a digit cannot silently repoint the check at
+    /// the wrong number.
+    fn number_after(sentence: &str, marker: &str) -> usize {
+        let start = sentence.find(marker).unwrap_or_else(|| {
+            panic!("ARCHITECTURE.md's route-count sentence must contain {marker:?}")
+        }) + marker.len();
+        sentence[start..]
+            .chars()
+            .take_while(char::is_ascii_digit)
+            .collect::<String>()
+            .parse()
+            .unwrap_or_else(|_| panic!("ARCHITECTURE.md must state a number after {marker:?}"))
+    }
+
+    /// Spec line 5.2: the ecosystem contract lists ALL daemon room routes and
+    /// `ARCHITECTURE.md`'s route count is true, both pinned executably.
+    ///
+    /// The sibling above pins the router against `GET /` discovery and the
+    /// operator guide. This one pins the two remaining prose claims: the
+    /// contract's room-route table is exactly the router's `/v1/rooms`
+    /// registrations, and `ARCHITECTURE.md`'s stated totals are the router's own
+    /// counts rather than a number that was true once.
+    ///
+    /// Mutation-proved on 2026-09-02, one mutation per assertion, each applied
+    /// alone to the tree this test landed in and then reverted. Both went red,
+    /// so neither assertion is decorative:
+    ///
+    /// 1. Deleting the PATCH /v1/rooms/persistent/{key}/read-cursor row from the
+    ///    contract table:
+    ///
+    ///        assertion `left == right` failed: every registered /v1/rooms route
+    ///        must appear in the ecosystem contract's room-route table, and
+    ///        every row of that table must be a registered route
+    ///
+    ///    The two printed sets differed in exactly that one entry — 40 routes on
+    ///    the router side, 39 in the table.
+    ///
+    /// 2. Changing ARCHITECTURE.md's room-route count from 40 to 39:
+    ///
+    ///        assertion `left == right` failed: ARCHITECTURE.md's room-route
+    ///        count must equal the router's own /v1/rooms registrations
+    ///          left: 39
+    ///         right: 40
+    #[test]
+    fn room_route_table_and_architecture_route_counts_are_in_parity() {
+        let registered = registered_room_routes();
+        let documented = contract_room_route_table();
+        assert_eq!(
+            registered, documented,
+            "every registered /v1/rooms route must appear in the ecosystem contract's \
+             room-route table, and every row of that table must be a registered route"
+        );
+
+        let architecture = include_str!("../../../docs/ARCHITECTURE.md");
+        let sentence = architecture
+            .lines()
+            .find(|line| line.contains("explicit method/path pairs"))
+            .expect("ARCHITECTURE.md states the router's registered route count");
+        assert_eq!(
+            number_after(sentence, "registers "),
+            source_registered_routes().len(),
+            "ARCHITECTURE.md's total route count must equal the router's own registrations"
+        );
+        assert_eq!(
+            number_after(sentence, "pairs, "),
+            registered.len(),
+            "ARCHITECTURE.md's room-route count must equal the router's own /v1/rooms registrations"
+        );
+    }
+
     #[test]
     fn router_contract_middleware_and_default_fallback_snapshot_is_explicit() {
         let source = include_str!("main.rs");

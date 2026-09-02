@@ -148,21 +148,52 @@ lifecycle is namespaced under `/v1/rooms/persistent`. Source of truth:
 `RoomMessage`, `RoomTriggerPolicy`, `RoomTriggerEvent`, `evaluate_trigger_policy`)
 and `crates/ocean-store` (`RoomStore` trait for lifecycle, inherent access-projection and outbox APIs, `RoomStoreError`).
 
-Routes (all in `crates/ocean-daemon/src/main.rs`; JSON routes use typed `{ ok, error }` bodies with 400 on a bad key and 404 on an unknown room; SSE is streaming; retry returns strict status codes):
+Routes (all in `crates/ocean-daemon/src/main.rs`; JSON routes use typed `{ ok, error }` bodies with 400 on a bad key and 404 on an unknown room; SSE is streaming; retry returns strict status codes). The table below is the COMPLETE room surface — one row per registered method and path, forty of them, in the order `room_routes()` registers them — and it is executable, not descriptive: `room_route_table_and_architecture_route_counts_are_in_parity` in `crates/ocean-daemon/src/main.rs` fails if the router grows a `/v1/rooms` route this table does not carry, or if this table carries one the router does not register.
 
-```text
-POST /v1/rooms/persistent                                  # create a room
-GET  /v1/rooms/persistent                                  # list rooms
-GET  /v1/rooms/persistent/{key}                            # fetch one room (includes access projection)
-POST /v1/rooms/persistent/{key}/participants               # join (add participant)
-DEL  /v1/rooms/persistent/{key}/participants/{participant_id}  # leave
-POST /v1/rooms/persistent/{key}/messages                   # append a transcript entry
-GET  /v1/rooms/persistent/{key}/transcript                 # read transcript (after_seq tail)
-GET  /v1/rooms/persistent/{key}/snapshot                   # hydrate durable room state (includes access + closed + agent_owners; before_seq for the tail)
-GET  /v1/rooms/persistent/{key}/events                     # merged SSE tail (access + messages)
-POST /v1/rooms/persistent/{key}/outbox/retry               # retry a failed outbox item
-POST /v1/rooms/{room_id}/livekit-token                     # mint voice/video join token
-```
+The **Auth** column names what a caller must present BEYOND reaching the daemon. `Loopback trust only` is the honest reading of most of them: the daemon is a local trust boundary with no HTTP authentication of its own (see `OCEAN_BIND` and the CORS whitelist in `OCEAN_RUNTIME_OPERATOR_GUIDE.md`), so on those routes reaching the socket IS the grant. `Roster-asserted` means the caller NAMES an identity and the daemon checks that name against the live roster inside the same guard as the write — an assertion the room can refuse, not a credential the client holds. The federated and workspace lanes never take a client-supplied bearer at all: the room's Bedrock credential stays in this process.
+
+| Method | Path | Purpose | Auth |
+| --- | --- | --- | --- |
+| `GET` | `/v1/rooms/persistent` | List this daemon's persistent rooms as ONE BOUNDED PAGE (`?limit=&cursor=`, default 100, capped at 1000), with `next_cursor` and `has_more` beside it — a client past the cap must page rather than read the array as the whole set. | Loopback trust only |
+| `POST` | `/v1/rooms/persistent` | Create a room from `{ key, name, trigger_policy?, workspace_root? }`. | Loopback trust only |
+| `GET` | `/v1/rooms/persistent/{key}` | Fetch one OPEN room with its bounded first transcript page, access projection, and `agent_owners`. | Loopback trust only |
+| `PATCH` | `/v1/rooms/persistent/{key}` | Update the mutable `name` / `trigger_policy` metadata of an open room. | Loopback trust only |
+| `POST` | `/v1/rooms/persistent/{key}/participants` | Join: add one participant to the roster. | Loopback trust only; a claimed `Agent` kind is refused (`forged_participant_kind`) |
+| `DELETE` | `/v1/rooms/persistent/{key}/participants/{participant_id}` | Leave: remove one participant from the roster. | Loopback trust only |
+| `POST` | `/v1/rooms/persistent/{key}/messages` | Append one entry to the transcript. | Roster-asserted `author_id` + `author_kind` (403 `author_not_in_roster` / `forged_author_kind`) |
+| `POST` | `/v1/rooms/persistent/{key}/invites` | Bootstrap the owner if the room is Local, then mint a federated invite carrying the code and its `onboard_url`. | Daemon-held room bearer. `OCEAN_FEDERATION_OWNER_TOKEN` is the LOCAL-BOOTSTRAP EXCEPTION, not the general case: it registers a Local room that has no credential yet and becomes that room's stored bearer, while an already-federated room mints under the credential it already has. Neither is ever surface-submitted |
+| `POST` | `/v1/rooms/persistent/invites/redeem` | Redeem `{ code }` restart-safely and self-join the room the invite's scope resolves to. | The invite `code` IS the bearer grant; the minted room bearer stays in the daemon |
+| `POST` | `/v1/rooms/persistent/{key}/members/agents` | Register this daemon's safe local agent descriptors with the room's federation peer. | Daemon-held room bearer |
+| `DELETE` | `/v1/rooms/persistent/{key}/members/{member_id}` | Remove one federated member through Bedrock. | Daemon-held room bearer; Bedrock's owner-or-self refusal surfaces as 403 `federation_forbidden` |
+| `GET` | `/v1/rooms/persistent/{key}/agents` | List the room's durable agent bindings. | Loopback trust only; the projection returns no operator or replay secret |
+| `POST` | `/v1/rooms/persistent/{key}/agents` | Authorize one exact room member / package / digest binding. | `X-Ocean-Operator`; a missing header or unavailable operator key is 503 |
+| `POST` | `/v1/rooms/persistent/{key}/agents/bootstrap` | Atomically establish or verify the Local room owner plus the package-derived Agent roster tuple, authorizing no execution. | `X-Ocean-Operator` |
+| `GET` | `/v1/rooms/persistent/{key}/agents/preview/{agent_package_id}` | Non-authorizing preview of a package's digest, grantable and unavailable capabilities, and any existing member or binding. | Loopback trust only |
+| `GET` | `/v1/rooms/persistent/{key}/agents/{agent_member_id}` | Inspect one binding. | Loopback trust only |
+| `DELETE` | `/v1/rooms/persistent/{key}/agents/{agent_member_id}` | Terminally revoke one binding. | `X-Ocean-Operator` + a replay-checked `decision_id` |
+| `POST` | `/v1/rooms/persistent/{key}/agents/{agent_member_id}/reauthorize` | Approve the current full package digest and bump the authority generation. | `X-Ocean-Operator` + a replay-checked `decision_id` |
+| `POST` | `/v1/rooms/persistent/{key}/agents/{agent_member_id}/suspend` | Suspend a binding and cancel older-generation in-flight turns. | `X-Ocean-Operator` + a replay-checked `decision_id` |
+| `POST` | `/v1/rooms/persistent/{key}/agents/{agent_member_id}/resume` | Resume a binding under a new authority generation. | `X-Ocean-Operator` + a replay-checked `decision_id` |
+| `POST` | `/v1/rooms/persistent/{key}/agents/{agent_member_id}/invoke` | Run one explicit turn for a bound agent from an authoritative same-room message. | Roster-asserted `invoked_by` — a local non-Agent participant, or a federated `User` member — plus the optional turn `decision_token` |
+| `GET` | `/v1/rooms/persistent/{key}/transcript` | Read the transcript forward (`?after_seq=N&limit=M`). | Loopback trust only |
+| `POST` | `/v1/rooms/persistent/{key}/artifacts` | Record what the room produced as a task, decision, or note, with a System transcript line in the same transaction. | Roster-asserted human `author_id` (403 `forged_artifact_author`) |
+| `GET` | `/v1/rooms/persistent/{key}/artifacts` | List this room's artifacts, most recently changed first. | Loopback trust only |
+| `GET` | `/v1/rooms/persistent/{key}/artifacts/{artifact_id}` | Read one artifact — the cheap half of the compare-and-swap loop. | Loopback trust only |
+| `POST` | `/v1/rooms/persistent/{key}/artifacts/{artifact_id}/amend` | Rewrite one artifact in place under `expected_version` compare-and-swap. | Roster-asserted human `author_id` (403 `forged_artifact_author`) |
+| `POST` | `/v1/rooms/persistent/{key}/attachments` | Upload one context file as raw bytes, its metadata in the query. | Roster-asserted `?uploader_id=` (403 `forged_attachment_author`) |
+| `GET` | `/v1/rooms/persistent/{key}/attachments` | List this room's attachments, newest first; metadata only, no bytes. | Loopback trust only |
+| `GET` | `/v1/rooms/persistent/{key}/attachments/{attachment_id}` | Download the stored bytes under a DERIVED content type, never the declared one. | Loopback trust only |
+| `DELETE` | `/v1/rooms/persistent/{key}/attachments/{attachment_id}` | Remove the row and its bytes, recording in the transcript who removed it. | Roster-asserted `?actor_id=` |
+| `POST` | `/v1/rooms/persistent/{key}/summarize` | Fold the newest transcript rows into the room's single well-known `room-summary` note in one model turn. | Roster-asserted `requested_by` (403 `forged_artifact_author` / non-roster) |
+| `GET` | `/v1/rooms/persistent/{key}/snapshot` | Hydrate the room: roster, one bounded transcript page from EITHER end, cursors, `closed`, `agent_owners`. | Loopback trust only |
+| `GET` | `/v1/rooms/persistent/{key}/events` | Merged SSE tail: the initial full access projection, then id-bearing message frames and access updates. | Loopback trust only |
+| `GET` | `/v1/rooms/persistent/{key}/read-cursor` | Fetch the daemon-owned read-cursor projection; Local and Live rooms only. | Loopback trust only |
+| `PATCH` | `/v1/rooms/persistent/{key}/read-cursor` | Advance the daemon-owned read cursor monotonically and publish the wake. | Loopback trust only |
+| `POST` | `/v1/rooms/persistent/{key}/outbox/retry` | Durably requeue one locally-authored federated event still awaiting Bedrock confirmation. | Loopback trust only; the route performs no network call itself |
+| `GET` | `/v1/rooms/persistent/{key}/workspace` | Report the status of the room's Bedrock workspace. | Membership-gated `?actor_id=`; the daemon supplies the bearer and the upstream actor id |
+| `GET` | `/v1/rooms/persistent/{key}/workspace/{*leaf}` | Read one allowlisted workspace leaf. | Membership-gated `?actor_id=`; `WORKSPACE_ALLOWLIST` decides whether the leaf is a call at all |
+| `POST` | `/v1/rooms/persistent/{key}/workspace/{*leaf}` | Run one allowlisted workspace command leaf. | Membership-gated `?actor_id=`; owner verbs additionally require an actor resolving to the credential's principal (403 `workspace_not_owner_principal`) |
+| `POST` | `/v1/rooms/{room_id}/livekit-token` | Mint a LiveKit join token. A `call:` id must name a server-authored room that still EXISTS and is open (404 otherwise); any other id is admitted with NO store check, which is what lets a fresh project or surface room get a token before it is durable. | Subscribe by default; PUBLISH needs a matching `X-Ocean-Publish-Token` and fails closed when no operator secret is set |
 
 **Transcript** is a flat, append-only event log of `RoomMessage` entries, each
 carrying author attribution (`author_id`, `author_kind`), a `kind`
