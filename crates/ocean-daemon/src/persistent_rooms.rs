@@ -4426,7 +4426,6 @@ mod tests {
         assert_eq!(body.0["room"]["workspace_root"], serde_json::Value::Null);
     }
 
-
     #[test]
     fn a_short_body_is_borrowed_untouched() {
         let body = "a normal reply";
