@@ -32,17 +32,20 @@ ocean-os 616293e, ocean-surface d58a145.
   command, with the revision on /health recorded in events.md. Today: 7bf80cdc
   from 08-31. [os]
 - 0.6 Federation is ON in the operated daemon: a supported, untracked,
-  owner-only login loader restores `OCEAN_FEDERATION_URL` and
-  `OCEAN_FEDERATION_OWNER_TOKEN` into every fresh per-user launchd GUI domain
-  before the daemon is bootstrapped. The loader reads the bearer from an
-  owner-only (`0600`) file or Keychain item and calls `launchctl setenv`; it
-  never places either value—and especially never the owner bearer—in the
-  tracked or rendered `deploy/dev.risingtides.ocean-daemon.plist`. Its service
-  ordering must make the variables available before the daemon's `RunAtLoad`
-  start, not only before one installer run. Do not print or record the launchd
-  environment while verifying this criterion. After a fresh login or reboot,
-  a real credentialed room must still reach `live` against production Bedrock.
-  Today: off, with no supported login loader shipped. [os, user]
+  owner-only, daemon-specific launcher (or an equivalent per-job secret
+  channel) restores `OCEAN_FEDERATION_URL` and
+  `OCEAN_FEDERATION_OWNER_TOKEN` only in the daemon process environment before
+  it execs the daemon. The launcher reads the bearer from an owner-only
+  (`0600`) file or Keychain item. It must not call domain-wide `launchctl
+  setenv`, and it never places either value—and especially never the owner
+  bearer—in the tracked or rendered
+  `deploy/dev.risingtides.ocean-daemon.plist`. The LaunchAgent's service
+  ordering must invoke that launcher before the daemon's `RunAtLoad` start,
+  not only during one installer run. Verification must inspect only the target
+  daemon process and must not print or record its environment or the wider
+  launchd environment. After a fresh login or reboot, a real credentialed room
+  must still reach `live` against production Bedrock. Today: off, with no
+  supported daemon-specific secret loader shipped. [os, user]
 - 0.7 The surface web bundle, Tauri build and extension are published from
   origin/main through the promotion guard with the build identity visible in
   the surface. [surface]

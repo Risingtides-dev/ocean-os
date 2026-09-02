@@ -9636,3 +9636,18 @@ and survives a fresh login or reboot acceptance check. The criterion remains
 open because no such loader ships. Docs only; no secret, launchd environment,
 daemon, deployment, reboot, login, or production state changed.
 _________________________________________________________________________________ 22:31 docs/rooms-definition-of-done
+
+time:      [22:53] [01-09-26]
+agent:     [codex] [gpt-5]
+worktree:  docs/rooms-definition-of-done
+type:      [bug report]
+area:      [review]
+
+Closed two current-head Codex documentation findings. Criterion 0.6 now
+requires a daemon-specific launcher or equivalent per-job secret channel and
+explicitly forbids domain-wide launchctl environment injection of the owner
+bearer. The documentation index now describes the finish line's checks and
+known check gaps without claiming every criterion already has an executable
+pin and named effort. Docs only; no secret, launchd environment, daemon,
+deployment, login, reboot, or production state changed.
+_________________________________________________________________________________ 22:53 docs/rooms-definition-of-done
