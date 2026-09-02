@@ -113,6 +113,16 @@ test('a repaired one-digit-hour entry is recognized as closed on the rerun', () 
   assert.equal(openEntries(repaired).length, 0);
 });
 
+test('an invalid header clock never becomes an invalid identity separator', () => {
+  for (const invalid of ['24:00', '99:99', '09:60']) {
+    const open = entry(invalid, 'This malformed entry lost its separator.', 'loop/slice-a').join('\n');
+    assert.equal(entryIdentity(open.split('\n')), '', `${invalid} is not a 24-hour clock`);
+    const repaired = closeEntries(open).text;
+    assert.match(repaired, /^_{5,}$/m, 'the repair falls back to the valid bare form');
+    assert.equal(openEntries(repaired).length, 0, 'the repaired entry is closed on the next run');
+  }
+});
+
 test('closeEntries repairs the fold without deleting a line, and the rerun is clean', () => {
   const { text, closed } = closeEntries(FOLDED);
   assert.equal(closed.length, 1);

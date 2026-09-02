@@ -4639,7 +4639,7 @@ ________________________________________________________________________________
 time:      [15:23] [19-07-26]
 agent:     [pi] [gpt-5.6]
 worktree:  [feat/compact-session-sync]
-type:      [issues]
+type:      [review]
 area:      [review]
 
 Closed every blocker from three adversarial review rounds. Session sync now projects directly from persisted messages with no SessionDetail/raw/tool/image copy, filters projectable rows before the 512-row cap, enforces the 1 MiB visible-text budget, and signals truncation. Every later session mutation publishes a scoped lifecycle/invalidation under the shared lease; legacy no-session requests pin ids before admission, and durable room triggers wait rather than drop. Replay gaps retain first-party event:error compatibility, reject empty/non-UTF8/foreign/unknown/evicted anchors, and expose only session-filtered diagnostic bounds. Compact acquires the busy lease before any existence read. Final independent release review approved with no blocker/high findings.
@@ -9572,14 +9572,17 @@ formatting passed. No deployment, migration, daemon restart, or live room action
 occurred.
 _________________________________________________________________________________ 20:54 codex/review-sweep-20260901
 
-time:      [21:13] [09-01-26]
+time:      [21:13] [01-09-26]
 agent:     [codex] [gpt-5]
 worktree:  codex/review-sweep-20260901
 type:      [bug report]
 area:      [review]
 
-Addressed the fresh Codex finding on PR #442. The separator grammar now accepts
-the same one-digit hour that entryIdentity can extract, and the regression test
-proves a --fix repair is recognized as closed on its next run. No deployment,
-daemon restart, migration, or production state changed.
+Addressed the final Codex findings on PR #442. The separator grammar now accepts
+the same valid one-digit hour that entryIdentity can extract while rejecting
+invalid 24-hour clocks before they can become invalid repair suffixes. Regression
+tests prove both valid and malformed repairs are recognized as closed on rerun.
+Restored the historical Stage A1 event type instead of rewriting append-only
+history, and corrected this branch's event date to the ledger's DD-MM-YY schema.
+No deployment, daemon restart, migration, or production state changed.
 _________________________________________________________________________________ 21:13 codex/review-sweep-20260901

@@ -100,7 +100,7 @@ const RULE_BAR = /^_+/;
 // appends are by definition on two different branches. An entry with no
 // worktree was written on the main checkout, where there is one writer and
 // nothing to race, so its time alone is enough.
-const HEADER_TIME = /\[(\d{1,2}:\d{2})\]/;
+const HEADER_TIME = /\[((?:[01]?\d|2[0-3]):[0-5]\d)\]/;
 const WORKTREE_FIELD = /^worktree:[ \t]*(\S+)/;
 
 // Only the fallback for a ledger with no rule left to copy: the width a repair
