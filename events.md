@@ -9612,3 +9612,16 @@ CI contract; the shared red-conclusion predicate remains the marker label and
 chase-link authority. No deployment, daemon restart, migration, room, or
 production state changed.
 _________________________________________________________________________________ 22:23 codex/review-sweep-20260901
+
+time:      [22:31] [01-09-26]
+agent:     [codex] [gpt-5]
+worktree:  codex/review-sweep-20260901
+type:      [bug report]
+area:      [review]
+
+Closed the current-head unwired-CI-policy finding. Room create and update now
+return the typed trigger_unwired refusal when on_ci_failure is enabled; legacy
+stored values remain readable, but ci_checked stays a marker and cannot dispatch
+from core. Added route regressions and aligned the daemon contracts. No daemon,
+room, migration, deployment, or production state changed.
+_________________________________________________________________________________ 22:31 codex/review-sweep-20260901

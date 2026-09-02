@@ -175,10 +175,11 @@ optional `RoomTriggerPolicy` gates each `RoomTriggerEvent` variant one-for-one:
 `on_mention` ↔ `Mention`, `on_thread_reply` ↔ `ThreadReply`,
 `on_component_event` ↔ `ComponentEvent`, `on_schedule` (cron) ↔ `Schedule`,
 `on_build_failure` ↔ `BuildFailed`, and `on_ci_failure` ↔ `CiFailure`. The two
-workspace flags are independent rather than one widened flag, so a room that
-opted in to build failures before CI triggers existed convenes on exactly what
-it opted in to. `ComponentEvent` and `Schedule` have no daemon source, so the
-room write routes refuse values that would turn those two on rather than store
+workspace flags are independent rather than one widened flag. Only build
+failure has an accepted core dispatch path: `ci_checked` is a transcript marker
+and CI dispatch remains extension-owned. `ComponentEvent`, `Schedule`, and
+`CiFailure` therefore have no core source that can convene an agent, so room
+write routes refuse values that would turn those three on rather than store
 configuration that silently never acts. An absent policy (`None`) never
 convenes. A positive `TriggerDecision`
 (`should_convene: true`, optional `target_participant`, human-readable `reason`)

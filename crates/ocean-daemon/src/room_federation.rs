@@ -3996,9 +3996,10 @@ fn conclusion_is_red(conclusion: Option<&str>) -> bool {
 ///
 /// `trigger_targets` is filled only for `build_failed` under the accepted
 /// `on_build_failure` contract. `ci_checked` always remains a marker, even when
-/// its payload is red and the stored policy carries the forward-compatible
-/// `on_ci_failure` field: named-agent CI orchestration is extension-owned and
-/// core has no accepted implementation manifest for dispatching it. Targets are
+/// its payload is red or a legacy store row carries `on_ci_failure`: room write
+/// routes now refuse enabling that unwired field. Named-agent CI orchestration
+/// is extension-owned and core has no accepted implementation manifest for
+/// dispatching it. Targets are
 /// the roster's Agent members; the store's claim site keeps only the
 /// locally-bound ones and consumes each (row, target) pair once, and the
 /// dispatcher re-validates ownership and binding before queuing a turn — so a
@@ -9011,11 +9012,10 @@ mod tests {
         }
     }
 
-    /// #413 wakes an agent on a red `ci_checked`, and the agent's whole input
-    /// is this one line — so the line ends with a route to the failing run.
-    /// The URL is `gh` stdout read inside the room's container, which is why
-    /// it is gated the way ocean-surface gates the same field before it
-    /// becomes an anchor.
+    /// A red `ci_checked` remains a transcript marker, and a human reading it
+    /// needs a route to the failing run. The URL is `gh` stdout read inside the
+    /// room's container, which is why it is gated the way ocean-surface gates
+    /// the same field before it becomes an anchor.
     #[test]
     fn a_ci_marker_carries_one_route_to_the_first_red_run() {
         let sha = |c: char| c.to_string().repeat(40);
@@ -9027,8 +9027,8 @@ mod tests {
             compose_workspace_marker("room.workspace.ci_checked", &payload)
         };
 
-        // The route is the FIRST RED check's, not the first check's: nobody was
-        // woken for the green one, and its run is not the one to open.
+        // The route is the FIRST RED check's, not the first check's: the green
+        // run is not the failure a transcript reader needs to open.
         let line = marker(json!([
             {"name": "lint", "conclusion": "success", "head_sha": sha('a'),
              "url": "https://example.test/runs/1"},
@@ -9457,8 +9457,9 @@ mod tests {
         );
     }
 
-    /// CI rows are durable markers only in core. The stored opt-in remains
-    /// forward-compatible, but dispatch requires an accepted extension seam.
+    /// CI rows are durable markers only in core. A legacy stored opt-in still
+    /// cannot dispatch; room write routes refuse creating a new one until an
+    /// accepted extension seam exists.
     #[tokio::test]
     async fn ci_checked_is_always_a_marker_in_core() {
         let key = RoomKey::new("workspace-ci-trigger");
