@@ -536,7 +536,7 @@ ________________________________________________________________________________
 time:      [06:08am] [06-24-26]
 agent:     [claude] [opus 4.8]
 worktree:  main
-type:      [bug report]
+type:      [review]
 area:      [testing]
 
 Post-session verification capstone: ran full test suites across all 4 repos
@@ -9567,7 +9567,7 @@ no code, no deploy, no migration; `cargo deny` red on rtrb is unchanged and
 named in the checklist as a user ruling.
 _________________________________________________________________________________ 20:01 docs/rooms-definition-of-done
 
-time:      [20:16] [09-01-26]
+time:      [20:16] [01-09-26]
 agent:     [codex] [gpt-5]
 worktree:  docs/rooms-definition-of-done
 type:      [bug report]
@@ -9581,15 +9581,17 @@ requirements to criteria 2.1 and 2.3 through 2.5. Docs only; no runtime,
 deployment, migration, or production state changed.
 _________________________________________________________________________________ 20:16 docs/rooms-definition-of-done
 
-time:      [21:13] [09-01-26]
+time:      [21:13] [01-09-26]
 agent:     [codex] [gpt-5]
 worktree:  docs/rooms-definition-of-done
 type:      [bug report]
 area:      [review]
 
-Closed the second Codex review pass on criterion 2.4. Its exit check now runs
-the daemon route-level refusal and stored-value transition tests plus Surface
-coverage for the offered trigger rows and access-state holds. The earlier
-review entry's date and type were corrected to this ledger's declared schema.
-Docs only; no daemon, deployment, migration, or production state changed.
+Closed the final Codex review pass on criteria 2.1 and 2.4. The authorization
+exit check now names both the authority unit suite and the existing route-level
+authenticated bootstrap ceremony test. Criterion 2.4 runs the daemon refusal
+and stored-value transition tests plus Surface coverage for offered trigger rows
+and access-state holds. Both branch dates use the ledger's DD-MM-YY schema, and
+the historical June entry remains untouched. Docs only; no daemon, deployment,
+migration, or production state changed.
 _________________________________________________________________________________ 21:13 docs/rooms-definition-of-done

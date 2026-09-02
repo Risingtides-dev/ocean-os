@@ -83,6 +83,9 @@ ocean-os 616293e, ocean-surface d58a145.
 ## 2. What an agent can do
 - 2.1 Bound to a room through the authorization ceremony from any host. Check:
   `cargo test -p ocean-daemon room_agent_authority::tests` in ocean-os and
+  `cargo test -p ocean-daemon
+  local_room_agent_bootstrap_is_authenticated_previewable_and_non_authorizing`
+  for route-level authentication/bootstrap wiring, plus
   `cargo test -p ocean-surface-ui --test room_agent_authorization_regressions`
   in ocean-surface; the Surface test must carry an explicit web, Tauri and
   extension host matrix before this line can close. [os, surface, M]
