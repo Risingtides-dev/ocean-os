@@ -31,9 +31,16 @@ ocean-os 616293e, ocean-surface d58a145.
   2026-09-01 paging fixes (#436 to #439), installed by the documented single
   command, with the revision on /health recorded in events.md. Today: 7bf80cdc
   from 08-31. [os]
-- 0.6 Federation is ON in the operated daemon: OCEAN_FEDERATION_URL and the
-  owner token are set in deploy/dev.risingtides.ocean-daemon.plist and a real
-  credentialed room reaches `live` against production Bedrock. Today: off. [os, user]
+- 0.6 Federation is ON in the operated daemon: `OCEAN_FEDERATION_URL` is set for
+  the per-user launchd domain and `OCEAN_FEDERATION_OWNER_TOKEN` is injected
+  locally from an owner-only (`0600`) file or Keychain item with `launchctl
+  setenv` before the guarded installer bootstraps the job. Neither value—and
+  especially never the owner bearer—may be added to the tracked
+  `deploy/dev.risingtides.ocean-daemon.plist`; the installer requires a clean
+  public-repository checkout and renders that template verbatim. Do not print
+  or record the launchd environment while verifying this criterion. A real
+  credentialed room must reach `live` against production Bedrock after the
+  supervised restart. Today: off. [os, user]
 - 0.7 The surface web bundle, Tauri build and extension are published from
   origin/main through the promotion guard with the build identity visible in
   the surface. [surface]

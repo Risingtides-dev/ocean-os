@@ -9595,3 +9595,17 @@ and access-state holds. Both branch dates use the ledger's DD-MM-YY schema, and
 the historical June entry remains untouched. Docs only; no daemon, deployment,
 migration, or production state changed.
 _________________________________________________________________________________ 21:13 docs/rooms-definition-of-done
+
+time:      [21:59] [01-09-26]
+agent:     [codex] [gpt-5]
+worktree:  docs/rooms-definition-of-done
+type:      [bug report]
+area:      [review]
+
+Closed the fresh Codex security finding in criterion 0.6. The owner bearer is
+now explicitly forbidden from the tracked public plist and must be injected
+into the per-user launchd domain from owner-only local custody before the
+guarded installer bootstraps the daemon. Verification must not print or retain
+the launchd environment. Docs only; no secret, launchd environment, daemon,
+deployment, or production state changed.
+_________________________________________________________________________________ 21:59 docs/rooms-definition-of-done
