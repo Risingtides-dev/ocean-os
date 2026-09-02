@@ -1079,13 +1079,23 @@ pub trait RoomStore {
     /// yields rows that sort after it — paging is resilient to a stale cursor.
     fn list_page(&self, after: Option<&str>, limit: Option<usize>) -> Result<RoomPage>;
 
-    /// Update a room's mutable metadata (name and/or trigger policy). `None`
-    /// leaves a field unchanged; `Some(None)` clears the trigger policy.
+    /// Update a room's mutable metadata (name, trigger policy, and/or workspace
+    /// binding). `None` leaves a field unchanged; `Some(None)` clears the
+    /// trigger policy or unbinds the workspace.
+    ///
+    /// `workspace_root` is the same binding [`create_in_workspace`](Self::create_in_workspace)
+    /// persists at create time, so a room created unbound can be bound later
+    /// instead of being recreated with a lost transcript. The caller is
+    /// responsible for canonicalizing the path before it reaches the store —
+    /// the daemon route does that through `canonical_submitted_workspace_root`,
+    /// and agent execution revalidates the stored value on every turn, so a
+    /// value that was never canonical here just fails closed later.
     fn update(
         &mut self,
         key: &RoomKey,
         name: Option<String>,
         trigger_policy: Option<Option<RoomTriggerPolicy>>,
+        workspace_root: Option<Option<String>>,
         now: DateTime<Utc>,
     ) -> Result<RoomRecord>;
 
@@ -3733,14 +3743,15 @@ impl RoomStore for SqliteRoomStore {
         key: &RoomKey,
         name: Option<String>,
         trigger_policy: Option<Option<RoomTriggerPolicy>>,
+        workspace_root: Option<Option<String>>,
         now: DateTime<Utc>,
     ) -> Result<RoomRecord> {
         if !self.room_is_open(key)? {
             return Err(RoomStoreError::UnknownRoom(key.clone()));
         }
-        // name/policy/touch are separate UPDATEs to the same room row; wrap them so
-        // a partial failure can't leave the row half-updated (e.g. new name but
-        // stale policy) (OCEAN-201).
+        // name/policy/workspace/touch are separate UPDATEs to the same room row;
+        // wrap them so a partial failure can't leave the row half-updated (e.g. new
+        // name but stale policy) (OCEAN-201).
         let tx = self
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -3754,6 +3765,14 @@ impl RoomStore for SqliteRoomStore {
             tx.execute(
                 "UPDATE rooms SET trigger_policy = ?2 WHERE id = ?1",
                 params![key.as_str(), encode_policy(policy.as_ref())?],
+            )?;
+        }
+        if let Some(workspace_root) = workspace_root {
+            // `None` binds NULL, which is exactly the unbound state
+            // `create_in_workspace` writes for a room created without one.
+            tx.execute(
+                "UPDATE rooms SET workspace_root = ?2 WHERE id = ?1",
+                params![key.as_str(), workspace_root],
             )?;
         }
         Self::touch_on(&tx, key, now)?;
@@ -10967,6 +10986,7 @@ mod tests {
                     on_thread_reply: true,
                     ..Default::default()
                 })),
+                None,
                 now(),
             )
             .unwrap();
@@ -10975,15 +10995,70 @@ mod tests {
         assert!(updated.room.updated_at >= created.room.updated_at);
 
         // Clearing the policy with Some(None).
-        let cleared = s.update(&key, None, Some(None), now()).unwrap();
+        let cleared = s.update(&key, None, Some(None), None, now()).unwrap();
         assert!(cleared.room.trigger_policy.is_none());
         assert_eq!(cleared.room.name, "New"); // name untouched
 
         // Update of unknown room errors.
         assert!(matches!(
-            s.update(&RoomKey::new("nope"), Some("x".into()), None, now()),
+            s.update(&RoomKey::new("nope"), Some("x".into()), None, None, now()),
             Err(RoomStoreError::UnknownRoom(_))
         ));
+    }
+
+    /// OCEAN-260: the workspace binding is writable AFTER creation, on the same
+    /// absent/`Some(None)`/`Some(Some(_))` contract the trigger policy uses.
+    /// Before this, a room created unbound stayed unbound forever and every
+    /// room-bound agent turn in it failed closed with `workspace_unavailable`.
+    #[test]
+    fn update_binds_unbinds_and_leaves_workspace_root_alone() {
+        let mut s = store();
+        let key = RoomKey::new("ws-room");
+        let created = s.create(key.clone(), "Unbound", None, now()).unwrap();
+        assert_eq!(created.room.workspace_root, None);
+
+        // Bind.
+        let bound = s
+            .update(&key, None, None, Some(Some("/dev/ocean-os".into())), now())
+            .unwrap();
+        assert_eq!(bound.room.workspace_root.as_deref(), Some("/dev/ocean-os"));
+        assert_eq!(
+            s.get(&key).unwrap().unwrap().room.workspace_root.as_deref(),
+            Some("/dev/ocean-os"),
+            "the binding must survive a read back through the row reader"
+        );
+
+        // Absent leaves it alone — a rename must not silently unbind the room.
+        let renamed = s
+            .update(&key, Some("Renamed".into()), None, None, now())
+            .unwrap();
+        assert_eq!(renamed.room.name, "Renamed");
+        assert_eq!(
+            renamed.room.workspace_root.as_deref(),
+            Some("/dev/ocean-os")
+        );
+
+        // Rebind to a different directory.
+        let rebound = s
+            .update(
+                &key,
+                None,
+                None,
+                Some(Some("/dev/ocean-surface".into())),
+                now(),
+            )
+            .unwrap();
+        assert_eq!(
+            rebound.room.workspace_root.as_deref(),
+            Some("/dev/ocean-surface")
+        );
+
+        // Unbind with Some(None) — back to the NULL a room created without a
+        // binding carries, not an empty string.
+        let unbound = s.update(&key, None, None, Some(None), now()).unwrap();
+        assert_eq!(unbound.room.workspace_root, None);
+        assert_eq!(s.get(&key).unwrap().unwrap().room.workspace_root, None);
+        assert_eq!(unbound.room.name, "Renamed", "name untouched");
     }
 
     #[test]
