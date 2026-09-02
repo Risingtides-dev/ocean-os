@@ -4303,6 +4303,130 @@ mod tests {
     use super::*;
     use ocean_store::ActivationPolicy;
 
+    /// OCEAN-260: PATCH can bind a room's workspace after creation, unbind it,
+    /// and leave it alone — the same absent/`null`/present contract
+    /// `trigger_policy` draws, because collapsing absent into `null` here would
+    /// turn every unrelated rename into a silent unbind, and an unbound room's
+    /// agent turns all fail closed.
+    ///
+    /// Before this field a room created unbound could never be bound: the only
+    /// repair was a new room and a lost transcript.
+    #[tokio::test]
+    async fn room_update_binds_unbinds_and_preserves_the_workspace_root() {
+        let _env = AUTO_CONVENE_ENV_LOCK.lock().await;
+        let tmp = tempfile::tempdir().unwrap();
+        let state = fake_convene_state(&tmp);
+        let key = RoomKey::new("workspace-update-room");
+        with_rooms(&state, |store| {
+            store.create(key.clone(), "Workspace Update", None, Utc::now())
+        })
+        .unwrap();
+
+        let workspace = tmp.path().join("bind-target");
+        std::fs::create_dir(&workspace).unwrap();
+        let canonical = std::fs::canonicalize(&workspace)
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
+
+        // A room created without a binding starts unbound.
+        let stored = with_rooms(&state, |store| store.get(&key))
+            .unwrap()
+            .expect("room exists");
+        assert_eq!(stored.room.workspace_root, None);
+
+        // Bind. The stored value is the CANONICAL path, not what was submitted:
+        // a noncanonical spelling that resolves to the right directory must not
+        // land verbatim, because agent execution revalidates canonicality and
+        // would then refuse the room it just bound.
+        let noncanonical = workspace.join("..").join("bind-target");
+        let (status, body) = room_update(
+            State(state.clone()),
+            Path(key.as_str().to_string()),
+            Bytes::from(
+                serde_json::to_vec(&json!({"workspace_root": noncanonical.to_string_lossy()}))
+                    .unwrap(),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body.0["ok"], json!(true));
+        assert_eq!(body.0["room"]["workspace_root"], json!(canonical));
+        // The binding must be the one agent execution will actually accept.
+        assert_eq!(
+            persisted_room_workspace(&canonical).as_deref(),
+            Some(canonical.as_str())
+        );
+
+        // Absent leaves the binding alone.
+        let (status, body) = room_update(
+            State(state.clone()),
+            Path(key.as_str().to_string()),
+            Bytes::from_static(br#"{"name":"Renamed"}"#),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body.0["room"]["name"], json!("Renamed"));
+        assert_eq!(body.0["room"]["workspace_root"], json!(canonical));
+
+        // A relative path and a nonexistent absolute one both earn the frozen
+        // create-time refusal body, and neither disturbs the stored binding.
+        for rejected in [
+            json!({"workspace_root": "."}),
+            json!({"workspace_root": tmp.path().join("not-here").to_string_lossy()}),
+        ] {
+            let (status, body) = room_update(
+                State(state.clone()),
+                Path(key.as_str().to_string()),
+                Bytes::from(serde_json::to_vec(&rejected).unwrap()),
+            )
+            .await;
+            assert_eq!(status, StatusCode::BAD_REQUEST);
+            assert_eq!(
+                body.0,
+                json!({"ok": false, "error": "invalid_workspace_root"})
+            );
+            let stored = with_rooms(&state, |store| store.get(&key))
+                .unwrap()
+                .expect("room exists");
+            assert_eq!(
+                stored.room.workspace_root.as_deref(),
+                Some(canonical.as_str())
+            );
+        }
+
+        // Explicit null unbinds.
+        let (status, body) = room_update(
+            State(state.clone()),
+            Path(key.as_str().to_string()),
+            Bytes::from_static(br#"{"workspace_root":null}"#),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body.0["room"]["workspace_root"], serde_json::Value::Null);
+        let stored = with_rooms(&state, |store| store.get(&key))
+            .unwrap()
+            .expect("room exists");
+        assert_eq!(stored.room.workspace_root, None);
+        assert_eq!(stored.room.name, "Renamed", "the rename survived");
+
+        // A blank string unbinds too, matching create's treatment of a blank
+        // value rather than storing whitespace as a binding.
+        with_rooms(&state, |store| {
+            store.update(&key, None, None, Some(Some(canonical.clone())), Utc::now())
+        })
+        .unwrap();
+        let (status, body) = room_update(
+            State(state.clone()),
+            Path(key.as_str().to_string()),
+            Bytes::from_static(br#"{"workspace_root":"   "}"#),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body.0["room"]["workspace_root"], serde_json::Value::Null);
+    }
+
+
     #[test]
     fn a_short_body_is_borrowed_untouched() {
         let body = "a normal reply";
@@ -5482,129 +5606,6 @@ mod tests {
         .await;
         assert_eq!(status, StatusCode::BAD_REQUEST);
         assert_eq!(body.0, json!({"ok": false, "error": "invalid_request"}));
-    }
-
-    /// OCEAN-260: PATCH can bind a room's workspace after creation, unbind it,
-    /// and leave it alone — the same absent/`null`/present contract
-    /// `trigger_policy` draws, because collapsing absent into `null` here would
-    /// turn every unrelated rename into a silent unbind, and an unbound room's
-    /// agent turns all fail closed.
-    ///
-    /// Before this field a room created unbound could never be bound: the only
-    /// repair was a new room and a lost transcript.
-    #[tokio::test]
-    async fn room_update_binds_unbinds_and_preserves_the_workspace_root() {
-        let _env = AUTO_CONVENE_ENV_LOCK.lock().await;
-        let tmp = tempfile::tempdir().unwrap();
-        let state = fake_convene_state(&tmp);
-        let key = RoomKey::new("workspace-update-room");
-        with_rooms(&state, |store| {
-            store.create(key.clone(), "Workspace Update", None, Utc::now())
-        })
-        .unwrap();
-
-        let workspace = tmp.path().join("bind-target");
-        std::fs::create_dir(&workspace).unwrap();
-        let canonical = std::fs::canonicalize(&workspace)
-            .unwrap()
-            .to_string_lossy()
-            .into_owned();
-
-        // A room created without a binding starts unbound.
-        let stored = with_rooms(&state, |store| store.get(&key))
-            .unwrap()
-            .expect("room exists");
-        assert_eq!(stored.room.workspace_root, None);
-
-        // Bind. The stored value is the CANONICAL path, not what was submitted:
-        // a noncanonical spelling that resolves to the right directory must not
-        // land verbatim, because agent execution revalidates canonicality and
-        // would then refuse the room it just bound.
-        let noncanonical = workspace.join("..").join("bind-target");
-        let (status, body) = room_update(
-            State(state.clone()),
-            Path(key.as_str().to_string()),
-            Bytes::from(
-                serde_json::to_vec(&json!({"workspace_root": noncanonical.to_string_lossy()}))
-                    .unwrap(),
-            ),
-        )
-        .await;
-        assert_eq!(status, StatusCode::OK);
-        assert_eq!(body.0["ok"], json!(true));
-        assert_eq!(body.0["room"]["workspace_root"], json!(canonical));
-        // The binding must be the one agent execution will actually accept.
-        assert_eq!(
-            persisted_room_workspace(&canonical).as_deref(),
-            Some(canonical.as_str())
-        );
-
-        // Absent leaves the binding alone.
-        let (status, body) = room_update(
-            State(state.clone()),
-            Path(key.as_str().to_string()),
-            Bytes::from_static(br#"{"name":"Renamed"}"#),
-        )
-        .await;
-        assert_eq!(status, StatusCode::OK);
-        assert_eq!(body.0["room"]["name"], json!("Renamed"));
-        assert_eq!(body.0["room"]["workspace_root"], json!(canonical));
-
-        // A relative path and a nonexistent absolute one both earn the frozen
-        // create-time refusal body, and neither disturbs the stored binding.
-        for rejected in [
-            json!({"workspace_root": "."}),
-            json!({"workspace_root": tmp.path().join("not-here").to_string_lossy()}),
-        ] {
-            let (status, body) = room_update(
-                State(state.clone()),
-                Path(key.as_str().to_string()),
-                Bytes::from(serde_json::to_vec(&rejected).unwrap()),
-            )
-            .await;
-            assert_eq!(status, StatusCode::BAD_REQUEST);
-            assert_eq!(
-                body.0,
-                json!({"ok": false, "error": "invalid_workspace_root"})
-            );
-            let stored = with_rooms(&state, |store| store.get(&key))
-                .unwrap()
-                .expect("room exists");
-            assert_eq!(
-                stored.room.workspace_root.as_deref(),
-                Some(canonical.as_str())
-            );
-        }
-
-        // Explicit null unbinds.
-        let (status, body) = room_update(
-            State(state.clone()),
-            Path(key.as_str().to_string()),
-            Bytes::from_static(br#"{"workspace_root":null}"#),
-        )
-        .await;
-        assert_eq!(status, StatusCode::OK);
-        assert_eq!(body.0["room"]["workspace_root"], serde_json::Value::Null);
-        let stored = with_rooms(&state, |store| store.get(&key))
-            .unwrap()
-            .expect("room exists");
-        assert_eq!(stored.room.workspace_root, None);
-        assert_eq!(stored.room.name, "Renamed", "the rename survived");
-
-        // A blank string unbinds too, matching create's treatment of a blank
-        // value rather than storing whitespace as a binding.
-        with_rooms(&state, |store| {
-            store.update(&key, None, None, Some(Some(canonical.clone())), Utc::now())
-        })
-        .unwrap();
-        let (status, body) = room_update(
-            State(state.clone()),
-            Path(key.as_str().to_string()),
-            Bytes::from_static(br#"{"workspace_root":"   "}"#),
-        )
-        .await;
-        assert_eq!(status, StatusCode::OK);
-        assert_eq!(body.0["room"]["workspace_root"], serde_json::Value::Null);
     }
 
     /// The two triggers nothing fires — a cron in `on_schedule`, a `true`
