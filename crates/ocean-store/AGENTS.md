@@ -49,6 +49,8 @@ outbox, and the restart-safe federation core (S2 P2-A). One database file
   (member→agent binding, `registration_key` PRIVATE, agent name unique per
   room), `producer_counters` (next source_sequence per room+member),
   `federated_events` (dedup + monotonic order index),
+  `federated_event_mentions` (normalized exact Bedrock addressees for bounded
+  local attention counts; child rows cascade with their event),
   `processed_room_triggers` (at-most-once trigger-claim journal), and
   `pending_redemptions` (v1.2 amendment table 7: pre-room `{redemption_id,
   bearer, invite_code}` custody, `invite_code` UNIQUE — bearer AND invite
@@ -56,6 +58,44 @@ outbox, and the restart-safe federation core (S2 P2-A). One database file
 
 ### Load-bearing invariants
 
+- **Durability settings live in ONE named place and are read back, never
+  assumed.** `apply_durability_pragmas` is the only place production PRAGMAs are
+  set, and `open()` — the single file-backed open path — applies it BEFORE
+  `migrate`, so the migration itself runs under them and WAL's `-wal`/`-shm`
+  sidecars exist by the time the post-migration owner-only enforcement locks
+  them down. `journal_mode = WAL` (readers do not block the writer, its setting
+  persists in the DB header, and the pragma's returned mode must decode to
+  `wal` or `open()` fails because SQLite may retain another mode without making
+  the pragma itself an error), `synchronous = NORMAL` (WAL's
+  durable-enough level: nothing committed is lost to a process or daemon crash,
+  and what NORMAL trades away versus FULL is an OS-crash/power-loss window over
+  the most recent commits — the invariants below are ATOMICITY invariants, which
+  NORMAL keeps whole, so a lost transaction is lost whole and never torn), a
+  5-second `busy_timeout`, and `foreign_keys`. The residual risk is stated
+  exactly in that function and must not be softened here: an `append_message`
+  the store ACKNOWLEDGED can be lost to a power cut with nothing to replay it.
+  The outbox does not cover this and is not a redo log — `append_message` writes
+  no outbox row (only `allocate_outbox_pending` and the federated agent-reply
+  path do), and a federated event's outbox row commits in the SAME transaction
+  as the work it covers, so a lost transaction takes the row with it. The outbox
+  retries the unconfirmed federated events that SURVIVED, which is a narrower
+  claim than "the outbox replays what was lost" and is the only one true. `open_in_memory` deliberately does
+  NOT take them: `:memory:` has no journal to hold in WAL and no second
+  connection to contend with, and `migrate` supplies the one setting that still
+  means something there. `durability()` re-queries all four off the live
+  connection — never echoing what was requested — and the daemon logs it on the
+  `persistent rooms store ready` startup line, which is how an operator tells
+  without opening the DB by hand (`docs/OCEAN_RUNTIME_OPERATOR_GUIDE.md`).
+  Two things about `busy_timeout` that a reader will otherwise re-derive wrong:
+  it was ALREADY five seconds before this function existed, because
+  `rusqlite::Connection::open` sets `sqlite3_busy_timeout(db, 5000)` itself, so
+  deleting our call is green — the explicit call takes ownership of a value that
+  was a borrowed driver default, and the pinning assertion is what would catch a
+  `rusqlite` bump dropping it. Zeroing it is the mutation that reds, on both
+  `a_production_store_opens_in_wal_with_the_chosen_durability_settings` and
+  `a_second_writer_waits_for_the_lock_instead_of_failing_busy`. Store writes are
+  serialized in-process by the daemon's `Mutex` around the store; the timeout is
+  what BOUNDS a writer arriving on a second connection.
 - **u64 as canonical decimal TEXT.** Counters, cursors, and sequences are
   stored via `write_u64_text` and re-read only through
   `parse_canonical_u64_text`; noncanonical text fails closed. Never compare
@@ -68,6 +108,28 @@ outbox, and the restart-safe federation core (S2 P2-A). One database file
 - **Outbox removal requires the full producer tuple.** A confirmed event
   deletes an outbox row only when `client_event_id`, `source_id`, and
   `source_sequence` all match — never `client_event_id` alone.
+- **Confirmed ingest requires an OPEN room.** `ingest_confirmed_event` guards
+  on `room_is_open_on`, not on the room merely existing. It guarded on existence
+  until the close route landed, and the gap was unreachable only because the one
+  close production could reach was a call room's autoclose and `call:` rooms
+  never federate. A route that closes any room makes it reachable, and the
+  result is the worst transcript corruption available here: rows appended AFTER
+  the close marker, into a room whose daemon SSE tails have ended and whose
+  `/snapshot` says `closed: true`, so nothing watching can see them arrive —
+  and, after a retention cut, the same path refilling from sequence 0 a
+  transcript the operator was told was emptied. The daemon also stops the room's
+  federation task on close so the refusal is not a reconnect loop, but the guard
+  lives HERE too and not only there: a supervisor that is slow, restarted, or
+  racing the close is exactly the case the invariant must survive, and only the
+  store can decide it atomically with the write.
+- **Retention eligibility is "a cut would remove something", never "closed long
+  enough".** `rooms_closed_before` requires an EXISTS over the same four tables
+  `cut_closed_room` empties. Without that clause a cut's own deliberate
+  preservation of the `rooms` row and its `closed_at` makes every historical
+  room eligible again on every sweep: an IMMEDIATE write transaction per room
+  every interval forever, deleting nothing, with each empty no-op counted to the
+  operator as another `rooms_cut`. The condition is derived from what the cut
+  does rather than from a marker column, so the two cannot drift apart.
 - **Confirmed ingest is fail-closed.** Dedup cross-checks BOTH persisted
   copies: the `federated_events` index tuple must equal the parsed transcript
   `FederatedMessageMeta`, and that meta must equal the incoming event — every
@@ -82,6 +144,13 @@ outbox, and the restart-safe federation core (S2 P2-A). One database file
 - **Trigger claims are at-most-once per (room, ledger event, target).**
   Claims commit inside the ingest transaction, only for locally-bound
   targets, and never for agent-authored rows.
+- **Attention counts never infer identity from prose.** Local unread counts are
+  aggregate message-row counts after the daemon cursor and Local mention counts
+  stay zero because no structured addressee is stored. Federated unread counts
+  aggregate confirmed rows after the mirrored global cursor using canonical
+  decimal numeric ordering (not subtraction: gaps are legal); mention counts
+  join only the exact `federated_event_mentions` rows committed with ingest.
+  These queries load no message body and keep memory constant.
 - **Producer counters never reuse a sequence.** Allocation is transactional
   across connections; exhaustion at `u64::MAX` fails closed.
 - **Credential custody.** `bearer_token`, `registration_key`, and pending
@@ -154,9 +223,10 @@ outbox, and the restart-safe federation core (S2 P2-A). One database file
   sentinel; the cursors are named `next_seq` and `prev_seq` respectively so a
   backward cursor cannot be replayed as an `after_seq`. The `u64 -> i64` cursor
   guard is checked in both and lands opposite ways: forward, a cursor above
-  `i64::MAX` is a terminal empty page, and backward it saturates to `i64::MAX`
-  and is the newest page, because "before a number past the end" includes every
-  row. `before_seq = 0` is empty — the first message's seq is 0. BOTH directions'
+  `i64::MAX` is a terminal empty page, and backward it selects the unbounded SQL
+  arm with no strict upper predicate, because "before a number past the end"
+  includes every row, including a valid row at SQLite's `i64::MAX`.
+  `before_seq = 0` is empty — the first message's seq is 0. BOTH directions'
   soft-closed answers are the STORE's, through `transcript_page_including_closed`
   and `transcript_tail_page_including_closed` — each a `room_exists()` guard plus
   the private loader, gated on existence rather than openness, so an absent room
@@ -207,9 +277,11 @@ outbox, and the restart-safe federation core (S2 P2-A). One database file
   `ocean-core` because the dependency runs daemon -> store and neither crate
   can call the other; the bound is this crate's policy. Read the derivation
   there before widening what these lines drop, and do not re-inline a filter
-  here — a second copy is exactly the drift the hoist removed. The same rule,
-  same bound, now also guards `ocean_agent::rooms::RoomRegistry`, the dormant
-  in-memory twin of this store.
+  here — a second copy is exactly the drift the hoist removed. A nonblank input
+  filtered entirely away is emitted as the fixed `[filtered]` placeholder, so
+  a durable marker never claims the blank title/name state the record rejects.
+  The same shared rule and bound also guard `ocean_agent::rooms::RoomRegistry`,
+  the dormant in-memory twin of this store.
 - **The `room.agent.*` audit rows are records, not prose, and are NOT
   filtered.** They are `RoomMessageKind::System` bodies like the markers
   above, so the rule preceding this one would read as covering them; it
@@ -278,6 +350,54 @@ outbox, and the restart-safe federation core (S2 P2-A). One database file
   `upsert_summary_artifact` reaches the store without passing one. A blank
   `artifact_id` is NOT checked here — that refusal is route-only in
   `persistent_rooms.rs`.
+- **Closing a room is an act somebody did, and the transcript says so.**
+  `close_with_marker` is the ROUTE's close and `RoomStore::close` is the CALL
+  path's; they are deliberately separate rather than one with a flag. `CallEnded`
+  fires with no actor to name, so its close soft-sets `closed_at`, returns the
+  pre-close record, and mints nothing. A member or operator closing a room is an
+  act, and a room that simply stops answering with nothing in its log saying why
+  or at whose hand is the same evidence gap the join, artifact and attachment
+  markers exist to close. `close_with_marker` therefore takes one IMMEDIATE
+  transaction over the openness check, the marker insert (which reads
+  `MAX(seq)+1`) and the `closed_at` write: those three are dependent, and a
+  concurrent writer between the marker and the update leaves a room whose
+  transcript announces a close that did not happen — a state no caller can
+  detect from the return value, which is why the guards are
+  `room_is_open_on`/`room_exists_on` against the TRANSACTION and not the
+  `&self` reads beside them. A room that is not open is `UnknownRoom`, the
+  answer every other mutation here already gives, so a second close is a 404
+  and never a silent success. `RoomCloser` is an enum and not an id plus a
+  boolean: a `Member` is roster-checked inside that transaction
+  (`RoomCloserNotInRoster`) because the marker names them, and an `Operator` is
+  deliberately NOT — operator authority is over the daemon rather than
+  membership in one room — and a flag deciding which check runs is the shape
+  that lets an unchecked member id through when a call site passes the wrong
+  argument. Both ids go through `marker_prose` like every other caller-supplied
+  string a marker's prose quotes; the store still accepts whatever an in-process
+  caller hands it, so no read may assume the daemon's `validate_member_id` ran.
+- **Retention cuts a CLOSED room's content and keeps its row.** `cut_closed_room`
+  removes `messages`, `room_attachments`, both read-cursor tables and
+  `federated_events` for one room in one IMMEDIATE transaction, refusing an OPEN
+  room with `RoomNotClosed` having written nothing — eligibility is measured
+  from the close, so a live room is never cuttable however old it is, and that
+  guard is inside the transaction so a racing reopen cannot pass it. What stays
+  is as load-bearing as what goes. The `rooms` row stays because deleting it
+  would `ON DELETE CASCADE` the whole room away in one statement: the row is the
+  only durable record that the room existed and when it closed, `/snapshot`
+  answers `closed: true` off it, and a client holding a link to a cut room must
+  learn it is frozen rather than that it never was. `federated_events` goes
+  because a surviving index row is worse than none — `ingest_confirmed_event`
+  cross-checks the index tuple against the TRANSCRIPT row it names, and an entry
+  pointing at a removed `local_seq` makes that read fail closed and the room
+  stops ingesting. Dropping the index does not reopen the dedup window: the
+  ordering baseline is `max(last indexed sequence, persisted room_access
+  cursor)` and the access cursor is deliberately retained. Blob bytes are NOT
+  this crate's to delete: `cut_closed_room` returns the attachment ids and the
+  caller unlinks them AFTER the commit, the same order `remove_attachment` uses.
+  `rooms_closed_before` parses each `closed_at` in Rust rather than comparing
+  RFC3339 TEXT in SQL — UTC RFC3339 happens to sort lexicographically, and
+  "happens to" is the wrong footing for a query whose false positives delete
+  transcripts — and a value it cannot parse is SKIPPED, never cut.
 - **A declared content type is recorded and never trusted.**
   `room_attachments.content_type` is whatever the uploader claimed. It is stored
   verbatim and deliberately kept OUT of the transcript marker, whose body
@@ -292,6 +412,31 @@ outbox, and the restart-safe federation core (S2 P2-A). One database file
   a local link and reds on it, backticks included. `byte_len` and `sha256`
   are what the server measured; a negative stored `byte_len` fails closed on
   read.
+
+- **Open-room list cursors carry the observed ordering boundary.** `list_page`
+  orders by mutable `updated_at DESC, id ASC`, so every newly minted opaque
+  cursor carries both values from the last returned row. It never re-resolves
+  that row's later `updated_at` on the next request: doing so moves the keyset
+  boundary and can return an earlier page row twice. Legacy room-id cursors stay
+  readable through an indexed compatibility lookup; absent/closed legacy ids
+  retain the old first-page fallback.
+- **The room-metrics projection is read-only, transcript-free, and open-room
+  only.** `room_metrics_projection` answers the daemon's §4.1 metrics sample in
+  two aggregate queries: per-room access state (LEFT JOIN `room_access`, so an
+  absent row projects `Local` — the same answer `room_access` gives for that
+  absence, which is what stops the projection and the per-room read disagreeing
+  about what "no row" means), and per-room outbox depth by state plus the
+  `client_event_id` of the lowest-`position` row. It exists because the obvious
+  enumeration cannot serve a scrape: `list`/`list_page` call `load_record` per
+  room, and that loads the roster plus the oldest `MAX_TRANSCRIPT_LIMIT`
+  transcript rows, so counting five access states over a hundred rooms would
+  decode up to a hundred thousand messages. Both halves filter
+  `closed_at IS NULL`: a closed room is not a live access state and its outbox
+  is not a backlog anyone is draining. `MIN(position)`/`ORDER BY position` is
+  legal numeric ordering here because `position` is a real INTEGER column — this
+  is NOT an exception to the canonical-decimal u64 TEXT rule above, which still
+  bans ordering and `MAX()` on those TEXT columns. Only the row's id travels,
+  never its payload; an outbox payload is a room message.
 
 ## Work Guidance
 

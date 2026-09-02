@@ -7,7 +7,9 @@
 use std::{
     collections::{HashMap, HashSet},
     future::{poll_fn, Future},
+    io::Read,
     net::IpAddr,
+    path::Path,
     sync::{
         atomic::{AtomicBool, AtomicU64, Ordering},
         Arc,
@@ -43,6 +45,8 @@ use crate::persistent_rooms::{
 
 const FEDERATION_URL_ENV: &str = "OCEAN_FEDERATION_URL";
 const FEDERATION_OWNER_TOKEN_ENV: &str = "OCEAN_FEDERATION_OWNER_TOKEN";
+const FEDERATION_CONFIG_FILE: &str = "federation.env";
+const FEDERATION_CONFIG_MAX_BYTES: u64 = 16 * 1024;
 const RECOVERY_CONCURRENCY: usize = 4;
 const REVOKED_STORE_SENTINEL: &str = "room access revoked";
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
@@ -404,14 +408,6 @@ struct FederationClient {
 }
 
 impl FederationClient {
-    fn from_env() -> Result<Option<Self>, BridgeError> {
-        let raw = match std::env::var(FEDERATION_URL_ENV) {
-            Ok(raw) if !raw.trim().is_empty() => raw,
-            _ => return Ok(None),
-        };
-        Self::new(&raw).map(Some)
-    }
-
     fn new(raw: &str) -> Result<Self, BridgeError> {
         let mut base = Url::parse(raw).map_err(|_| BridgeError::InvalidConfig)?;
         let authority_has_userinfo = raw
@@ -492,6 +488,117 @@ impl FederationClient {
         self.endpoint(&["api", "v1", "invites", code, "onboard"])
             .ok()
             .map(String::from)
+    }
+}
+
+struct FederationConfig {
+    client: Option<FederationClient>,
+    owner_token: Option<String>,
+}
+
+impl FederationConfig {
+    /// Resolve one source pair. Presence of either process variable selects the
+    /// process source wholesale; the private file is only a fallback when both
+    /// are absent, so stale disk state can never replace an explicit launch.
+    fn resolve(config_dir: &Path) -> Result<Self, BridgeError> {
+        let env_url = std::env::var_os(FEDERATION_URL_ENV);
+        let env_token = std::env::var_os(FEDERATION_OWNER_TOKEN_ENV);
+        let pair = if env_url.is_some() || env_token.is_some() {
+            Some((
+                env_url
+                    .and_then(|value| value.into_string().ok())
+                    .ok_or(BridgeError::InvalidConfig)?,
+                env_token
+                    .and_then(|value| value.into_string().ok())
+                    .ok_or(BridgeError::InvalidConfig)?,
+            ))
+        } else {
+            read_federation_config_file(&config_dir.join(FEDERATION_CONFIG_FILE))?
+        };
+        let Some((url, owner_token)) = pair else {
+            return Ok(Self {
+                client: None,
+                owner_token: None,
+            });
+        };
+        if owner_token.is_empty()
+            || owner_token != owner_token.trim()
+            || owner_token.chars().any(char::is_control)
+        {
+            return Err(BridgeError::InvalidConfig);
+        }
+        Ok(Self {
+            client: Some(FederationClient::new(&url)?),
+            owner_token: Some(owner_token),
+        })
+    }
+}
+
+fn parse_federation_config(raw: &str) -> Result<(String, String), BridgeError> {
+    let mut url = None;
+    let mut owner_token = None;
+    for line in raw.lines() {
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let (key, value) = line.split_once('=').ok_or(BridgeError::InvalidConfig)?;
+        let slot = match key {
+            FEDERATION_URL_ENV => &mut url,
+            FEDERATION_OWNER_TOKEN_ENV => &mut owner_token,
+            _ => return Err(BridgeError::InvalidConfig),
+        };
+        if slot.replace(value.to_string()).is_some() {
+            return Err(BridgeError::InvalidConfig);
+        }
+    }
+    Ok((
+        url.ok_or(BridgeError::InvalidConfig)?,
+        owner_token.ok_or(BridgeError::InvalidConfig)?,
+    ))
+}
+
+#[cfg(unix)]
+fn read_federation_config_file(path: &Path) -> Result<Option<(String, String)>, BridgeError> {
+    use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
+
+    let file = match std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(path)
+    {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(_) => return Err(BridgeError::InvalidConfig),
+    };
+    let metadata = file.metadata().map_err(|_| BridgeError::InvalidConfig)?;
+    // SAFETY: geteuid has no preconditions and reads the effective uid of this
+    // process; it is used only to compare file ownership.
+    let effective_uid = unsafe { libc::geteuid() };
+    if !metadata.is_file()
+        || metadata.uid() != effective_uid
+        || metadata.permissions().mode() & 0o777 != 0o600
+        || metadata.len() > FEDERATION_CONFIG_MAX_BYTES
+    {
+        return Err(BridgeError::InvalidConfig);
+    }
+    let mut raw = String::new();
+    file.take(FEDERATION_CONFIG_MAX_BYTES + 1)
+        .read_to_string(&mut raw)
+        .map_err(|_| BridgeError::InvalidConfig)?;
+    if raw.len() as u64 > FEDERATION_CONFIG_MAX_BYTES {
+        return Err(BridgeError::InvalidConfig);
+    }
+    parse_federation_config(&raw).map(Some)
+}
+
+#[cfg(not(unix))]
+fn read_federation_config_file(path: &Path) -> Result<Option<(String, String)>, BridgeError> {
+    match std::fs::symlink_metadata(path) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        // This format is owner-mode-gated. Platforms without Unix ownership
+        // bits must use the explicit process environment until an equivalent
+        // custody proof is implemented.
+        _ => Err(BridgeError::InvalidConfig),
     }
 }
 
@@ -630,7 +737,8 @@ struct RunningRoom {
 }
 
 impl FederationSupervisor {
-    pub(super) fn from_env(
+    pub(super) fn from_config_dir(
+        config_dir: &Path,
         rooms: RoomStoreHandle,
         room_wakes: RoomWakeBus,
         access_wakes: RoomAccessWakeBus,
@@ -638,15 +746,10 @@ impl FederationSupervisor {
         trigger_tx: mpsc::UnboundedSender<FederatedTriggerDispatch>,
         shutdown: CancellationToken,
     ) -> Self {
-        let (client, invalid_config) = match FederationClient::from_env() {
-            Ok(client) => (client, false),
-            Err(_) => (None, true),
+        let (client, owner_token, invalid_config) = match FederationConfig::resolve(config_dir) {
+            Ok(config) => (config.client, config.owner_token, false),
+            Err(_) => (None, None, true),
         };
-        let owner_token = std::env::var(FEDERATION_OWNER_TOKEN_ENV)
-            .ok()
-            .filter(|token| {
-                !token.is_empty() && token == token.trim() && !token.chars().any(char::is_control)
-            });
         Self::new_inner(SupervisorInit {
             client,
             owner_token,
@@ -754,9 +857,10 @@ impl FederationSupervisor {
         }
     }
 
-    /// Enumerate durable credentials and start one task tree per non-Revoked
-    /// room. Missing/invalid config downgrades those rooms to Recovering so a
-    /// previous process can never leave stale Live chrome behind.
+    /// Enumerate durable credentials and start one task tree per open,
+    /// non-Revoked room. Missing/invalid config downgrades those rooms to
+    /// Recovering so a previous process can never leave stale Live chrome
+    /// behind. Closed rooms retain credentials for audit but stay frozen.
     pub(super) async fn startup(&self) {
         let credentials =
             with_rooms_handle(&self.inner.rooms, |store| store.list_credentialed_rooms());
@@ -766,7 +870,9 @@ impl FederationSupervisor {
         };
         for credential in credentials {
             let state = with_rooms_handle(&self.inner.rooms, |store| {
-                store.room_access(&credential.room_id).map(|p| p.state)
+                let open = store.is_open(&credential.room_id)?;
+                let state = store.room_access(&credential.room_id)?.state;
+                Ok::<_, ocean_store::RoomStoreError>((state, open))
             })
             .map_err(|_| BridgeError::Store);
             match startup_should_start(state) {
@@ -2389,6 +2495,11 @@ async fn run_room(
     cancel: CancellationToken,
 ) {
     let mut attempt = 0u32;
+    // §4.1: this room's lag entry lives exactly as long as the task tracking it.
+    // Every `return` below drops it, so a room that was behind when it stopped
+    // cannot leave an obsolete backlog dominating the gauge forever.
+    let _lag_scope =
+        crate::metrics::FederationLagScope::enter(key.as_str().to_string(), generation);
     loop {
         if cancel.is_cancelled() || inner.shutdown.is_cancelled() {
             return;
@@ -2407,6 +2518,19 @@ async fn run_room(
         };
         if state == RoomAccessState::Revoked {
             return;
+        }
+        // §4.1 federation SSE reconnects. Counted HERE — immediately before the
+        // dial that is actually about to happen — rather than beside the backoff
+        // at the bottom of the loop. Every path between the two is a `return`
+        // that never redials: cancellation or shutdown winning the backoff
+        // `select!`, a missing client, a credential that disappeared, or a room
+        // gone Revoked. Counting at the backoff therefore reported a reconnect
+        // for every task that was stopped while sleeping. `attempt > 0` is what
+        // keeps the first dial of the task out of a counter about REconnects.
+        if attempt > 0 {
+            crate::metrics::with_process_room_metrics(|metrics| {
+                metrics.record_federation_reconnect()
+            });
         }
         let outcome = run_epoch(
             inner.clone(),
@@ -2519,6 +2643,14 @@ async fn run_epoch(
         Err(EpochOutcome::Revoked) => return EpochOutcome::Revoked,
         Err(outcome) => return outcome,
     };
+    // §4.1 federation SSE lag: the epoch's announced snapshot high-water minus
+    // what this daemon has accepted. Reported once at hello (the backlog this
+    // epoch opens with) and again on every accepted row below, so the gauge
+    // falls to zero as the room catches up instead of only being sampled.
+    crate::metrics::with_process_room_metrics(|metrics| {
+        metrics.set_federation_lag(key.as_str(), generation, high_water.saturating_sub(cursor))
+    });
+
     let state = access_state_for_hello(cursor, high_water);
     if !commit_access(&inner, &key, state, Some(&members), None) {
         return EpochOutcome::Recover;
@@ -2649,6 +2781,13 @@ async fn run_epoch(
                         match result {
                             Ok(IngestDisposition::Committed) => {
                                 last_accepted = sequence;
+                                crate::metrics::with_process_room_metrics(|metrics| {
+                                    metrics.set_federation_lag(
+                                        key.as_str(),
+                                        generation,
+                                        high_water.saturating_sub(last_accepted),
+                                    )
+                                });
                                 if last_accepted >= high_water
                                     && ensure_live_with(
                                         durable_state(&inner.rooms, &key),
@@ -3248,6 +3387,7 @@ async fn ingest_message_row(
         || origin_principal_id.is_empty()
         || payload.client_event_id.is_empty()
         || payload.author_member_id != actor_member_id
+        || payload.mention_member_ids.iter().any(String::is_empty)
         || unique_mentions.len() != payload.mention_member_ids.len()
     {
         return Err(BridgeError::Protocol);
@@ -3317,6 +3457,7 @@ async fn ingest_message_row(
         author_kind,
         kind: RoomMessageKind::Message,
         body: payload.body,
+        mention_member_ids: payload.mention_member_ids,
         trigger_targets,
     };
     let outcome = with_rooms_handle(&inner.rooms, |store| {
@@ -3536,10 +3677,9 @@ struct WorkspaceEventPayload {
 /// are a ruling rather than an oversight: `check_run_id`, `title`, `status`,
 /// `event`, `created_at` and `updated_at` say nothing a ONE-LINE marker can
 /// afford room for, and the whole record is already on the ledger and in
-/// ocean-surface's repo panel. `head_sha` and `url` are decoded because a red
-/// `ci_checked` now CONVENES the room's agents, and a convened agent has no
-/// panel to click — the marker is its entire input, so the marker has to
-/// carry which commit went red and where the run is.
+/// ocean-surface's repo panel. `head_sha` and `url` are decoded so the
+/// durable marker identifies which commit went red and where the run is; core
+/// does not convene agents from CI markers.
 #[derive(Debug, Default, Deserialize)]
 struct WorkspaceCiCheck {
     #[serde(default)]
@@ -3898,18 +4038,15 @@ fn compose_workspace_marker(event_type: &str, p: &WorkspaceEventPayload) -> Stri
             if !named.is_empty() {
                 line.push_str(&format!(" — {}", named.join(", ")));
             }
-            // A red result now convenes the room's agents, and a convened
-            // agent's whole input is this line — so it ends with a route to
-            // the run. ONE route: the FIRST RED check's, not the first
-            // check's, because nobody was woken for a green one, and three
-            // URLs would wreck the line the three-check cap exists to protect.
+            // A red result ends with a route to the run. ONE route: the FIRST
+            // RED check's, not the first check's, because a green one needs no
+            // chase link and three URLs would wreck the line the three-check
+            // cap exists to protect.
             // The repo panel links every check (ocean-surface
             // `room_repo::check_row`); the marker links the one that matters.
             //
-            // The predicate is [`conclusion_is_red`], shared with
-            // [`ci_checks_are_red`] so the line and the trigger cannot drift:
-            // the tail is present exactly when the room had grounds to convene
-            // and Bedrock gave something to chase.
+            // The predicate is [`conclusion_is_red`]: the tail is present
+            // exactly when Bedrock gave a failed run to chase.
             if let Some(red) = p
                 .checks
                 .iter()
@@ -3966,36 +4103,12 @@ fn compose_workspace_marker(event_type: &str, p: &WorkspaceEventPayload) -> Stri
     }
 }
 
-/// Whether a `ci_checked` payload carries a result a room should be woken for.
-///
-/// `build_failed` IS the failure; `ci_checked` is one event type carrying both
-/// colors, so this half of the decision has to read the payload. Bedrock lists
-/// only completed runs (`gh run list --status completed`), which makes a null
-/// conclusion a defensive case rather than the normal one — and an unreadable
-/// conclusion is never grounds to convene. Absent or empty `checks` means there
-/// is nothing to judge.
-///
-/// Deduplication is upstream and deliberately NOT repeated here: Bedrock sends
-/// only checks the room has not seen plus re-runs whose conclusion actually
-/// changed, and emits no event at all when there is no news. So a member
-/// polling on a timer does not re-convene on the same red check, and a
-/// green-to-red re-run still arrives as news.
-fn ci_checks_are_red(checks: Option<&[WorkspaceCiCheck]>) -> bool {
-    checks.is_some_and(|checks| {
-        checks
-            .iter()
-            .any(|check| conclusion_is_red(check.conclusion.as_deref()))
-    })
-}
-
 /// The conclusions that mean a human has to look. `cancelled` and `stale` are
 /// superseded runs, `skipped` and `neutral` are not failures, and `success` is
 /// the point.
 ///
-/// One predicate rather than two because both the convening decision and the
-/// marker's run link read it: an agent woken by a red check must find that
-/// check's run named on the line that woke it, which only holds while the two
-/// agree on what red means.
+/// The marker uses this one predicate for both the first-failure label and its
+/// chase link.
 fn conclusion_is_red(conclusion: Option<&str>) -> bool {
     matches!(
         conclusion,
@@ -4022,20 +4135,19 @@ fn conclusion_is_red(conclusion: Option<&str>) -> bool {
 ///   row, so a replayed row rebuilds byte-identical meta and lands in the
 ///   store's Duplicate arm instead of its corruption arm.
 ///
-/// `trigger_targets` is filled for exactly two row kinds, each behind its own
-/// opt-in: `build_failed` under `on_build_failure`, and a `ci_checked` row
-/// whose payload [`ci_checks_are_red`] judges red under `on_ci_failure` (ruled
-/// 2026-08-29: a build failure is a trigger event on the existing convene
-/// path, not a new mechanism; a red check joined it on the same terms). The
-/// two flags are independent, so a room that opted in to build failures before
-/// CI triggers existed convenes on exactly what it opted in to. Targets are
+/// `trigger_targets` is filled only for `build_failed` under the accepted
+/// `on_build_failure` contract. `ci_checked` always remains a marker, even when
+/// its payload is red or a legacy store row carries `on_ci_failure`: room write
+/// routes now refuse enabling that unwired field. Named-agent CI orchestration
+/// is extension-owned and core has no accepted implementation manifest for
+/// dispatching it. Targets are
 /// the roster's Agent members; the store's claim site keeps only the
 /// locally-bound ones and consumes each (row, target) pair once, and the
 /// dispatcher re-validates ownership and binding before queuing a turn — so a
 /// replayed row or a foreign agent can never be convened from here. Every
-/// other workspace row — a green build, a green or in-progress CI run — keeps
-/// empty targets: the marker reaching agents through the transcript on their
-/// NEXT convened turn is the point of this lane.
+/// other workspace row keeps empty targets: the marker reaching agents through
+/// the transcript on their NEXT separately-authorized turn is the point of this
+/// lane.
 fn ingest_workspace_row(
     inner: &Arc<SupervisorInner>,
     key: &RoomKey,
@@ -4048,16 +4160,11 @@ fn ingest_workspace_row(
     let payload: WorkspaceEventPayload =
         serde_json::from_value(row.payload).map_err(|_| BridgeError::Protocol)?;
     let body = compose_workspace_marker(&row.event_type, &payload);
-    // Only a failure consults the policy, and each kind answers to its own
-    // flag. A build row IS the failure; a CI row has to be read, because the
-    // one `ci_checked` event type carries green and red alike. Everything else
-    // stays a pure marker. The over-broad roster read is deliberate — the store
-    // and the dispatcher both re-filter (see the doc above).
+    // Only the accepted build-failure trigger consults core policy. CI rows are
+    // pure markers regardless of color; dispatch belongs behind an extension
+    // seam and has no accepted core implementation manifest.
     let trigger_event = match row.event_type.as_str() {
         "room.workspace.build_failed" => Some(RoomTriggerEvent::BuildFailed),
-        "room.workspace.ci_checked" if ci_checks_are_red(payload.checks.as_deref()) => {
-            Some(RoomTriggerEvent::CiFailure)
-        }
         _ => None,
     };
     let (trigger_targets, trigger_reason) = if let Some(trigger_event) = trigger_event {
@@ -4098,6 +4205,7 @@ fn ingest_workspace_row(
         author_kind: RoomParticipantKind::System,
         kind: RoomMessageKind::System,
         body,
+        mention_member_ids: Vec::new(),
         trigger_targets,
     };
     let outcome = with_rooms_handle(&inner.rooms, |store| {
@@ -4384,8 +4492,10 @@ fn fail_row_and_wake(inner: &Arc<SupervisorInner>, key: &RoomKey, client_event_i
     }
 }
 
-fn startup_should_start(state: Result<RoomAccessState, BridgeError>) -> Result<bool, BridgeError> {
-    state.map(|state| state != RoomAccessState::Revoked)
+fn startup_should_start(
+    state: Result<(RoomAccessState, bool), BridgeError>,
+) -> Result<bool, BridgeError> {
+    state.map(|(state, open)| open && state != RoomAccessState::Revoked)
 }
 
 fn cursor_or_zero(cursor: Result<Option<u64>, BridgeError>) -> Result<u64, BridgeError> {
@@ -4692,13 +4802,114 @@ mod tests {
     }
 
     #[test]
-    fn env_missing_is_not_invalid_config() {
+    fn config_missing_is_not_invalid() {
         let _guard = ENV_LOCK.lock().unwrap();
-        let old = std::env::var_os(FEDERATION_URL_ENV);
+        let old_url = std::env::var_os(FEDERATION_URL_ENV);
+        let old_token = std::env::var_os(FEDERATION_OWNER_TOKEN_ENV);
         std::env::remove_var(FEDERATION_URL_ENV);
-        assert!(FederationClient::from_env().unwrap().is_none());
-        if let Some(old) = old {
-            std::env::set_var(FEDERATION_URL_ENV, old);
+        std::env::remove_var(FEDERATION_OWNER_TOKEN_ENV);
+        let tmp = tempfile::tempdir().unwrap();
+        let config = FederationConfig::resolve(tmp.path()).unwrap();
+        assert!(config.client.is_none());
+        assert!(config.owner_token.is_none());
+        restore_federation_env(old_url, old_token);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn private_config_file_loads_and_process_pair_wins() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let _guard = ENV_LOCK.lock().unwrap();
+        let old_url = std::env::var_os(FEDERATION_URL_ENV);
+        let old_token = std::env::var_os(FEDERATION_OWNER_TOKEN_ENV);
+        std::env::remove_var(FEDERATION_URL_ENV);
+        std::env::remove_var(FEDERATION_OWNER_TOKEN_ENV);
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join(FEDERATION_CONFIG_FILE);
+        std::fs::write(
+            &path,
+            "# owner-only daemon federation configuration\nOCEAN_FEDERATION_URL=https://disk.example\nOCEAN_FEDERATION_OWNER_TOKEN=disk-secret\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+
+        let disk = FederationConfig::resolve(tmp.path()).unwrap();
+        assert_eq!(disk.client.unwrap().base.as_str(), "https://disk.example/");
+        assert_eq!(disk.owner_token.as_deref(), Some("disk-secret"));
+
+        std::env::set_var(FEDERATION_URL_ENV, "https://process.example");
+        std::env::set_var(FEDERATION_OWNER_TOKEN_ENV, "process-secret");
+        let process = FederationConfig::resolve(tmp.path()).unwrap();
+        assert_eq!(
+            process.client.unwrap().base.as_str(),
+            "https://process.example/"
+        );
+        assert_eq!(process.owner_token.as_deref(), Some("process-secret"));
+
+        std::env::remove_var(FEDERATION_OWNER_TOKEN_ENV);
+        assert!(
+            matches!(
+                FederationConfig::resolve(tmp.path()),
+                Err(BridgeError::InvalidConfig)
+            ),
+            "a partial process pair must fail closed instead of falling back to disk"
+        );
+        restore_federation_env(old_url, old_token);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn private_config_file_refuses_unsafe_mode_symlink_and_unknown_entry() {
+        use std::os::unix::fs::{symlink, PermissionsExt};
+
+        let _guard = ENV_LOCK.lock().unwrap();
+        let old_url = std::env::var_os(FEDERATION_URL_ENV);
+        let old_token = std::env::var_os(FEDERATION_OWNER_TOKEN_ENV);
+        std::env::remove_var(FEDERATION_URL_ENV);
+        std::env::remove_var(FEDERATION_OWNER_TOKEN_ENV);
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join(FEDERATION_CONFIG_FILE);
+        let valid =
+            "OCEAN_FEDERATION_URL=https://disk.example\nOCEAN_FEDERATION_OWNER_TOKEN=disk-secret\n";
+        std::fs::write(&path, valid).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        assert!(matches!(
+            FederationConfig::resolve(tmp.path()),
+            Err(BridgeError::InvalidConfig)
+        ));
+
+        std::fs::remove_file(&path).unwrap();
+        let target = tmp.path().join("target");
+        std::fs::write(&target, valid).unwrap();
+        std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o600)).unwrap();
+        symlink(&target, &path).unwrap();
+        assert!(matches!(
+            FederationConfig::resolve(tmp.path()),
+            Err(BridgeError::InvalidConfig)
+        ));
+
+        std::fs::remove_file(&path).unwrap();
+        std::fs::write(&path, format!("{valid}UNSUPPORTED=value\n")).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        assert!(matches!(
+            FederationConfig::resolve(tmp.path()),
+            Err(BridgeError::InvalidConfig)
+        ));
+        restore_federation_env(old_url, old_token);
+    }
+
+    fn restore_federation_env(
+        old_url: Option<std::ffi::OsString>,
+        old_token: Option<std::ffi::OsString>,
+    ) {
+        match old_url {
+            Some(value) => std::env::set_var(FEDERATION_URL_ENV, value),
+            None => std::env::remove_var(FEDERATION_URL_ENV),
+        }
+        match old_token {
+            Some(value) => std::env::set_var(FEDERATION_OWNER_TOKEN_ENV, value),
+            None => std::env::remove_var(FEDERATION_OWNER_TOKEN_ENV),
         }
     }
 
@@ -4749,8 +4960,9 @@ mod tests {
             startup_should_start(Err(BridgeError::Store)),
             Err(BridgeError::Store)
         );
-        assert!(!startup_should_start(Ok(RoomAccessState::Revoked)).unwrap());
-        assert!(startup_should_start(Ok(RoomAccessState::Live)).unwrap());
+        assert!(!startup_should_start(Ok((RoomAccessState::Revoked, true))).unwrap());
+        assert!(!startup_should_start(Ok((RoomAccessState::Live, false))).unwrap());
+        assert!(startup_should_start(Ok((RoomAccessState::Live, true))).unwrap());
 
         let commits = std::cell::Cell::new(0);
         assert_eq!(
@@ -6351,6 +6563,7 @@ mod tests {
                     on_mention: true,
                     ..Default::default()
                 })),
+                None,
                 chrono::Utc::now(),
             )
         })
@@ -8072,6 +8285,55 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn startup_does_not_restart_a_closed_credentialed_room() {
+        let key = RoomKey::new("fed-closed-restart");
+        let human = "11111111-1111-4111-8111-111111111111";
+        let mut store = ocean_store::SqliteRoomStore::open_in_memory().unwrap();
+        store
+            .create(key.clone(), "Closed", None, chrono::Utc::now())
+            .unwrap();
+        store
+            .install_room_credential(&key, "closed-bearer", human)
+            .unwrap();
+        store
+            .update_room_access_safe(&key, Some(RoomAccessState::Live), None, None)
+            .unwrap();
+        store
+            .close_with_marker(
+                &key,
+                ocean_store::RoomCloser::Operator("test"),
+                chrono::Utc::now(),
+            )
+            .unwrap();
+        let rooms = Arc::new(std::sync::Mutex::new(store));
+        let fake = FakeBedrock::new(key.as_str(), "closed-bearer");
+        let (base, server) = start_fake_bedrock(fake.clone()).await;
+        let supervisor = FederationSupervisor::for_test(
+            &base,
+            rooms,
+            RoomWakeBus::default(),
+            RoomAccessWakeBus::default(),
+            RoomReadCursorWakeBus::default(),
+            CancellationToken::new(),
+            Duration::from_millis(20),
+        );
+
+        supervisor.startup().await;
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        assert!(
+            supervisor.inner.slots.lock().await.is_empty(),
+            "a closed room must not regain a task slot after restart"
+        );
+        assert!(
+            fake.request_meta.lock().await.is_empty(),
+            "a closed room must not reconnect its Bedrock SSE stream"
+        );
+        supervisor.shutdown().await;
+        server.abort();
+    }
+
+    #[tokio::test]
     async fn valid_but_unreachable_startup_clears_stale_live_presence() {
         let key = RoomKey::new("fed-hanging-connect");
         let human = "11111111-1111-4111-8111-111111111111";
@@ -9046,11 +9308,10 @@ mod tests {
         }
     }
 
-    /// #413 wakes an agent on a red `ci_checked`, and the agent's whole input
-    /// is this one line — so the line ends with a route to the failing run.
-    /// The URL is `gh` stdout read inside the room's container, which is why
-    /// it is gated the way ocean-surface gates the same field before it
-    /// becomes an anchor.
+    /// A red `ci_checked` remains a transcript marker, and a human reading it
+    /// needs a route to the failing run. The URL is `gh` stdout read inside the
+    /// room's container, which is why it is gated the way ocean-surface gates
+    /// the same field before it becomes an anchor.
     #[test]
     fn a_ci_marker_carries_one_route_to_the_first_red_run() {
         let sha = |c: char| c.to_string().repeat(40);
@@ -9062,8 +9323,8 @@ mod tests {
             compose_workspace_marker("room.workspace.ci_checked", &payload)
         };
 
-        // The route is the FIRST RED check's, not the first check's: nobody was
-        // woken for the green one, and its run is not the one to open.
+        // The route is the FIRST RED check's, not the first check's: the green
+        // run is not the failure a transcript reader needs to open.
         let line = marker(json!([
             {"name": "lint", "conclusion": "success", "head_sha": sha('a'),
              "url": "https://example.test/runs/1"},
@@ -9173,9 +9434,7 @@ mod tests {
         let line = marker(json!([{"name": "test", "conclusion": "failure", "url": ok}]));
         assert!(line.ends_with(&format!(": {ok}")), "got: {line}");
 
-        // The tail and the trigger read ONE predicate, so an agent woken by a
-        // conclusion always finds that conclusion's run on the line that woke
-        // it, and a conclusion that wakes nobody never grows a tail.
+        // The first-failure label and chase link read ONE predicate.
         for conclusion in [
             "failure",
             "timed_out",
@@ -9190,12 +9449,10 @@ mod tests {
             let checks = json!([
                 {"name": "ci", "conclusion": conclusion, "url": "https://example.test/runs/7"}
             ]);
-            let parsed: Vec<WorkspaceCiCheck> =
-                serde_json::from_value(checks.clone()).expect("checks deserialize");
             assert_eq!(
                 marker(checks).contains("first failure"),
-                ci_checks_are_red(Some(&parsed)),
-                "{conclusion}: the marker's route and the convening trigger disagree"
+                conclusion_is_red(Some(conclusion)),
+                "{conclusion}: the marker's label and chase-link predicate disagree"
             );
         }
     }
@@ -9292,50 +9549,6 @@ mod tests {
             "got: {line}"
         );
         assert!(!line.contains('[') && !line.contains(']'), "got: {line}");
-    }
-
-    #[test]
-    fn ci_conclusions_convene_only_on_a_red_result() {
-        let checks = |value: serde_json::Value| -> Vec<WorkspaceCiCheck> {
-            serde_json::from_value(value).expect("checks deserialize")
-        };
-
-        // The four conclusions that mean a human has to look.
-        for red in ["failure", "timed_out", "action_required", "startup_failure"] {
-            assert!(
-                ci_checks_are_red(Some(&checks(json!([{"name": "ci", "conclusion": red}])))),
-                "{red} must convene"
-            );
-        }
-
-        // Everything else is either green, superseded by a later run, or not a
-        // result at all. `null` is defensive — Bedrock lists only completed
-        // runs — and an unreadable conclusion is never grounds to wake a room.
-        for quiet in [
-            json!([{"name": "ci", "conclusion": "success"}]),
-            json!([{"name": "ci", "conclusion": "skipped"}]),
-            json!([{"name": "ci", "conclusion": "neutral"}]),
-            json!([{"name": "ci", "conclusion": "cancelled"}]),
-            json!([{"name": "ci", "conclusion": "stale"}]),
-            json!([{"name": "ci", "conclusion": null}]),
-            json!([{"name": "ci"}]),
-            json!([{"conclusion": "FAILURE"}]),
-            json!([]),
-        ] {
-            assert!(
-                !ci_checks_are_red(Some(&checks(quiet.clone()))),
-                "{quiet} must convene nobody"
-            );
-        }
-
-        // A row with no checks at all has nothing to judge.
-        assert!(!ci_checks_are_red(None));
-
-        // One red among greens is still news: the whole batch is what arrived.
-        assert!(ci_checks_are_red(Some(&checks(json!([
-            {"name": "lint", "conclusion": "success"},
-            {"name": "test", "conclusion": "failure"}
-        ])))));
     }
 
     #[tokio::test]
@@ -9489,7 +9702,7 @@ mod tests {
         // The opt-in gates the ROW KIND, not the lane: a green build and a CI
         // row with nothing red in it stay pure markers even with
         // on_build_failure enabled. (A RED CI row under this same flag is
-        // pinned in ci_failure_marker_convenes_only_on_a_red_check_and_opt_in.)
+        // pinned in ci_checked_is_always_a_marker_in_core.)
         for (id, sequence, event_type) in [
             ("ledger-ok", "1", "room.workspace.build_finished"),
             ("ledger-ci", "2", "room.workspace.ci_checked"),
@@ -9540,12 +9753,11 @@ mod tests {
         );
     }
 
-    /// A red CI row is a trigger event on the same convene path as a build
-    /// failure, gated by its own flag. This walks the whole matrix in one
-    /// room: the colors that must stay silent, the cross-flag case that proves
-    /// `on_build_failure` was not quietly widened, and the red row that fires.
+    /// CI rows are durable markers only in core. A legacy stored opt-in still
+    /// cannot dispatch; room write routes refuse creating a new one until an
+    /// accepted extension seam exists.
     #[tokio::test]
-    async fn ci_failure_marker_convenes_only_on_a_red_check_and_opt_in() {
+    async fn ci_checked_is_always_a_marker_in_core() {
         let key = RoomKey::new("workspace-ci-trigger");
         let human = "11111111-1111-4111-8111-111111111111";
         let agent = "33333333-3333-4333-8333-333333333333";
@@ -9674,7 +9886,8 @@ mod tests {
             "opting in to CI must not opt the room in to build failures"
         );
 
-        // The red row, with one green alongside it: the batch is the news.
+        // A red row remains a marker too. Core must not turn the policy field
+        // into named-agent dispatch without an accepted implementation scope.
         let red = || {
             ci_row(
                 &key,
@@ -9688,15 +9901,9 @@ mod tests {
         };
         let outcome = ingest_workspace_row(&inner, &key, red()).unwrap();
         assert_eq!(outcome, IngestDisposition::Committed);
-        let dispatch = trigger_rx
-            .try_recv()
-            .expect("a red check convenes the bound agent");
-        assert_eq!(dispatch.target_member_id, agent);
-        assert_eq!(dispatch.ledger_event_id, "ledger-ci-red");
-        assert_eq!(dispatch.reason, "on_ci_failure: workspace CI failed");
         assert!(
             trigger_rx.try_recv().is_err(),
-            "only the bound Agent member is dispatched — never the human"
+            "a red CI marker must not dispatch a core named-agent turn"
         );
 
         // SSE replay: the store's consume-once claim leaves nothing to
@@ -9708,7 +9915,7 @@ mod tests {
             "a replayed row must not double-convene"
         );
 
-        // Every row above still landed as a marker; the trigger is additive.
+        // Every row above landed as a marker and no core dispatch was added.
         let transcript = with_rooms_handle(&rooms, |s| s.get(&key))
             .unwrap()
             .unwrap()

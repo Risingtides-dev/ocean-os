@@ -158,6 +158,10 @@ mod room_attachments;
 mod room_context;
 /// Restart-safe outbound Bedrock room client and per-room supervisor (S2 P2-B).
 mod room_federation;
+/// Transcript retention and attachment orphan GC: the two sweeps that keep
+/// `rooms.db` and the blob tree from growing without bound, the loop that runs
+/// them, and the report an operator reads on `GET /health`.
+mod room_maintenance;
 /// Fail-closed local operator principal for room-agent authorization mutations.
 /// Phase 1 lands and validates this authority before a later accepted slice
 /// wires mutation routes, so the production module is deliberately inert here.
@@ -205,7 +209,7 @@ use longhouse_governance_control::{
 use longhouse_preparation::{longhouse_inspect, longhouse_prepare, workflows_prepare};
 use longhouse_topics::{longhouse_demo, longhouse_topic, longhouse_topics};
 use longhouse_turn_preparation::{apply_longhouse_prep, longhouse_prep_for_turn};
-use metrics::{InFlightGuard, TurnMetrics};
+use metrics::{InFlightGuard, RoomMetrics, TurnMetrics};
 use ocean_buddy::ocean_buddy_event;
 
 use model_catalog::{model_get, model_set, models_list};
@@ -322,6 +326,14 @@ struct AppState {
     /// helper hands in its own tempdir, so parallel tests never build a daemon
     /// pointing at another test's directory.
     room_attachments_root: Arc<std::path::PathBuf>,
+    /// Retention window, orphan grace, and sweep interval for the room
+    /// maintenance loop. Resolved ONCE at startup — `OCEAN_ROOM_RETENTION_DAYS`
+    /// is read there and never again, so the window a sweep applies is always
+    /// the one `/health` reports.
+    room_maintenance_config: room_maintenance::MaintenanceConfig,
+    /// The `room_maintenance` card `GET /health` serves: what the last sweep
+    /// cut, reclaimed, and failed at, plus the configuration it ran under.
+    room_maintenance: room_maintenance::MaintenanceHandle,
     /// Bounded room-scoped wake hints for persistent transcript SSE tails. The
     /// payload is only `(room, seq)`; SQLite remains authoritative for replay,
     /// live delivery, lag recovery, ordering, and deduplication.
@@ -426,6 +438,16 @@ struct AppState {
     /// `/metrics` handler reads it straight off [`AppState::persist_failures`] so
     /// there is a single source of truth for that count. See [`TurnMetrics`].
     metrics: Arc<TurnMetrics>,
+    /// Room and federation observability counters (Ocean Rooms definition-of-done
+    /// §4.1): the six families an operator needs to tell a healthy Rooms daemon
+    /// from a stuck one — rooms by access state, outbox depth and oldest-item
+    /// age, federation SSE reconnects and lag, redemption failures, admission
+    /// refusals, and store lock wait. Held here beside [`AppState::metrics`] for
+    /// the same reason and with the same relaxed-atomic discipline. Rendered onto
+    /// BOTH shipped surfaces: Prometheus lines appended to `GET /metrics`, and
+    /// the JSON `rooms` card on `GET /health` which additionally carries the
+    /// per-room detail that may never become a fixed-cardinality label.
+    room_metrics: Arc<RoomMetrics>,
     /// Bounded permit pool capping concurrently-running turns (OCEAN-304). Both
     /// turn-intake handlers (`agent_turn`, `create_request`) take a permit before
     /// running a turn and reject with 429 / `ok:false` when the pool is exhausted,
@@ -975,7 +997,29 @@ async fn main() -> anyhow::Result<()> {
     }
     let room_store = ocean_store::SqliteRoomStore::open(&rooms_db_path)
         .with_context(|| format!("opening rooms DB at {}", rooms_db_path.display()))?;
-    tracing::info!(path = %rooms_db_path.display(), "persistent rooms store ready");
+    // Durability posture on the wire an operator actually reads. `open` applies
+    // WAL, synchronous=NORMAL, a busy timeout and foreign keys; this reads them
+    // back OFF the live connection, so the startup line reports what SQLite is
+    // actually doing rather than what the code asked for. Answering "is this
+    // daemon running WAL?" should not require a `sqlite3` session against a
+    // live rooms.db. Read-back failure is not fatal — the store opened fine and
+    // refusing to boot over an unreadable diagnostic would be the tail wagging
+    // the dog — but it is logged at warn so a silent unknown is still visible.
+    match room_store.durability() {
+        Ok(d) => tracing::info!(
+            path = %rooms_db_path.display(),
+            journal_mode = %d.journal_mode,
+            synchronous = %d.synchronous,
+            busy_timeout_ms = d.busy_timeout_ms,
+            foreign_keys = d.foreign_keys,
+            "persistent rooms store ready"
+        ),
+        Err(err) => tracing::warn!(
+            path = %rooms_db_path.display(),
+            %err,
+            "persistent rooms store ready; durability settings unreadable"
+        ),
+    }
 
     // Room attachment BYTES live beside the DB that indexes them, so a moved
     // `OCEAN_DB_PATH` carries a room's files with its metadata instead of
@@ -992,6 +1036,21 @@ async fn main() -> anyhow::Result<()> {
     // existing DB. The daemon also mints its single Revoker here. Its capability
     // key never enters the wire and authenticates daemon execution to the title
     // engine; caller admission to control routes is a separate trust boundary.
+    // Room maintenance policy, resolved ONCE here: `OCEAN_ROOM_RETENTION_DAYS`
+    // is read at this line and never again, so the window a sweep applies is
+    // always the one `/health` reports and a running loop cannot have its
+    // retention changed out from under it. Unset or `0` keeps every closed room
+    // forever — retention is opt-in because a transcript cut is unrecoverable
+    // and an upgrade must not start deleting history nobody asked it to.
+    let room_maintenance_config = room_maintenance::MaintenanceConfig::from_env();
+    let room_maintenance = room_maintenance::new_handle(&room_maintenance_config);
+    tracing::info!(
+        retention_days = room_maintenance_config.retention_days,
+        interval_secs = room_maintenance_config.interval.as_secs(),
+        orphan_grace_secs = room_maintenance_config.orphan_grace.as_secs(),
+        "room maintenance policy resolved"
+    );
+
     let titles_db_path = titles_db_path();
     if let Some(parent) = titles_db_path.parent() {
         std::fs::create_dir_all(parent)
@@ -1117,7 +1176,8 @@ async fn main() -> anyhow::Result<()> {
 
     let (federated_trigger_tx, federated_trigger_rx) = tokio::sync::mpsc::unbounded_channel();
     let federated_dispatch_cancel = CancellationToken::new();
-    let room_federation = FederationSupervisor::from_env(
+    let room_federation = FederationSupervisor::from_config_dir(
+        &config_dir,
         rooms.clone(),
         room_wakes.clone(),
         room_access_wakes.clone(),
@@ -1139,6 +1199,8 @@ async fn main() -> anyhow::Result<()> {
         rooms,
         room_operator,
         room_attachments_root: Arc::new(room_attachments_root),
+        room_maintenance_config,
+        room_maintenance,
         room_wakes,
         room_access_wakes,
         room_read_cursor_wakes,
@@ -1160,11 +1222,22 @@ async fn main() -> anyhow::Result<()> {
         shutdown,
         // OCEAN-303: daemon-wide turn metrics behind `GET /metrics`.
         metrics: Arc::new(TurnMetrics::default()),
+        // Ocean Rooms DoD 4.1: room + federation metrics, rendered onto
+        // `GET /metrics` (Prometheus) and `GET /health` (the JSON rooms card).
+        room_metrics: Arc::new(RoomMetrics::default()),
         // OCEAN-304: concurrent-turn ceiling. One permit per running turn;
         // exhaustion → 429/busy at intake instead of unbounded provider fan-out.
         turn_limiter: Arc::new(tokio::sync::Semaphore::new(max_concurrent_turns())),
         advisor_limiter: Arc::new(tokio::sync::Semaphore::new(ADVISOR_CONCURRENCY_LIMIT)),
     };
+
+    // §4.1: publish this state's room registry as the process-global one, so the
+    // two push sites that hold no `AppState` — the handle-only store-lock adapter
+    // and the federation supervisor's room loop — record into the same registry
+    // the surfaces read. Installed only here, on the real startup path: a test
+    // process leaves it unset so one test's `AppState` can never collect
+    // another's counts.
+    metrics::install_process_room_metrics(state.room_metrics.clone());
 
     // The sovereign trigger receiver must exist before federation startup can
     // ingest and claim a confirmed mention. It only validates and spawns; agent
@@ -1218,6 +1291,14 @@ async fn main() -> anyhow::Result<()> {
             }
         });
     }
+
+    // Durable room maintenance: transcript retention plus attachment orphan GC.
+    // A separate loop from the registry GC above and not a second job inside it,
+    // because the two share nothing — that one reaps in-memory registries every
+    // few minutes, this one takes the room-store write lock and walks a blob
+    // tree on a multi-hour interval — and folding them together would put a
+    // filesystem walk on the cadence of a memory sweep.
+    room_maintenance::spawn_maintenance_loop(&state);
 
     // OCEAN-53: the daemon is a local trust boundary; reflecting any origin
     // (`allow_origin(Any)`) let any web page in the operator's browser drive it
@@ -1569,10 +1650,12 @@ fn banner_routes() -> &'static [&'static str] {
         "GET /v1/permissions",
         "POST /v1/permissions/{id}/decision",
         "POST /v1/rooms/{room_id}/livekit-token",
+        "POST /v1/rooms/maintenance/run",
         "GET /v1/rooms/persistent",
         "POST /v1/rooms/persistent",
         "GET /v1/rooms/persistent/{key}",
         "PATCH /v1/rooms/persistent/{key}",
+        "POST /v1/rooms/persistent/{key}/close",
         "POST /v1/rooms/persistent/{key}/participants",
         "DELETE /v1/rooms/persistent/{key}/participants/{participant_id}",
         "POST /v1/rooms/persistent/{key}/messages",
@@ -1684,12 +1767,43 @@ async fn root() -> Json<serde_json::Value> {
 /// provenance are observable without inspecting the process or build dir.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 struct HealthEnvelope {
+    /// What the room maintenance loop last did, and the configuration it did it
+    /// under: sweep interval, retention window in days (`0` = off), orphan
+    /// grace, when the last sweep finished and how long it took, and its counts
+    /// — rooms cut, transcript rows, attachment rows, cursors, federation index
+    /// rows, orphan files and directories, bytes reclaimed — plus its
+    /// `last_error` (`null` when clean).
+    ///
+    /// It carries the CONFIGURATION and not only the counts because the failure
+    /// this card exists to catch is silent by construction: a retention window
+    /// that never got set, or a blob root that moved, both look exactly like a
+    /// healthy daemon with nothing to collect. `rooms_cut: 0` is ambiguous;
+    /// `rooms_cut: 0, retention_days: 0` is an answer.
+    ///
+    /// Additive and beside `rev` rather than inside [`HealthResponse`]: that
+    /// struct is the shared protocol shape, and the maintenance loop is this
+    /// binary's. Pre-field daemons omit the key, and `HealthResponse` carries no
+    /// `deny_unknown_fields`, so existing clients keep parsing.
+    room_maintenance: room_maintenance::RoomMaintenanceReport,
     #[serde(flatten)]
     health: HealthResponse,
     rev: String,
+    /// Ocean Rooms §4.1: the room + federation metrics card. Added here on the
+    /// envelope rather than on `ocean_core::HealthResponse` for the same reason
+    /// `rev` is — the wire shape stays additive and existing clients that
+    /// deserialize into `HealthResponse` still parse — and as a section of this
+    /// existing card rather than as a new route, because the router's method/path
+    /// set is pinned in three places at once (`app_router`, `banner_routes()`,
+    /// and the operator guide's HTTP quick reference).
+    rooms: metrics::RoomMetricsCard,
 }
 
 async fn health(State(state): State<AppState>) -> Json<HealthEnvelope> {
+    // Refresh the room-derived families before projecting the card. This is a
+    // `try_lock` sampler: it never blocks the liveness probe on the daemon-wide
+    // room-store mutex, and reports `rooms.sampled: false` with the previous
+    // numbers when it loses the race. See `persistent_rooms::sample_room_metrics`.
+    persistent_rooms::sample_room_metrics(&state);
     Json(HealthEnvelope {
         health: HealthResponse {
             ok: true,
@@ -1708,11 +1822,16 @@ async fn health(State(state): State<AppState>) -> Json<HealthEnvelope> {
             // `0` healthy; a climbing value means GC is failing and memory is leaking.
             gc_failures_total: state.gc_failures.load(std::sync::atomic::Ordering::Relaxed),
         },
+        // Read through the poison-recovering snapshot: a maintenance mutex
+        // poisoned by a panicked sweep must never be what takes `/health` down,
+        // since this card is how that panic becomes visible in the first place.
+        room_maintenance: room_maintenance::report_snapshot(&state.room_maintenance),
         // Build provenance: the commit the running binary was compiled from, set by
         // build.rs (`-dirty` suffix on uncommitted worktrees; `unknown` when git
         // could not be run). Lets an operator confirm the supervised daemon is
         // actually running the main commit they expect.
         rev: env!("OCEAN_BUILD_REV").into(),
+        rooms: state.room_metrics.card(),
     })
 }
 
@@ -1734,6 +1853,9 @@ async fn health(State(state): State<AppState>) -> Json<HealthEnvelope> {
 ///   * `ocean_sse_events_dropped_total` — events dropped by lagging SSE
 ///     subscribers (OCEAN-372).
 async fn metrics(State(state): State<AppState>) -> impl axum::response::IntoResponse {
+    // §4.1: refresh the sampled room families (access state, outbox) before
+    // rendering. Same non-blocking sampler `GET /health` uses.
+    persistent_rooms::sample_room_metrics(&state);
     let persist_failures = state
         .persist_failures
         .load(std::sync::atomic::Ordering::Relaxed);
@@ -1744,12 +1866,16 @@ async fn metrics(State(state): State<AppState>) -> impl axum::response::IntoResp
     let sse_events_dropped = state
         .sse_events_dropped
         .load(std::sync::atomic::Ordering::Relaxed);
-    let body = state.metrics.render_prometheus(
+    let mut body = state.metrics.render_prometheus(
         persist_failures,
         gc_failures,
         sse_lag_events,
         sse_events_dropped,
     );
+    // §4.1 room + federation families, appended as their own registry's render.
+    // Kept a separate `render_prometheus` rather than folded into `TurnMetrics`
+    // so the two registries stay independently ownable and testable.
+    body.push_str(&state.room_metrics.render_prometheus());
     (
         StatusCode::OK,
         // The Prometheus text exposition content type. `text/plain; version=0.0.4`
@@ -2967,6 +3093,20 @@ fn room_routes() -> Router<AppState> {
         .route(
             "/v1/rooms/persistent/{key}",
             get(room_get).patch(room_update),
+        )
+        // Freeze a room. A static leaf under `{key}` rather than a `DELETE` on
+        // the room itself, because closing is not deleting: every row is
+        // retained and `/snapshot` keeps serving them.
+        .route(
+            "/v1/rooms/persistent/{key}/close",
+            post(persistent_rooms::room_close),
+        )
+        // Store-wide, so it hangs off `/v1/rooms/` rather than under a `{key}`
+        // that would have to be invented for it. Static second segment, so it
+        // cannot be shadowed by `/v1/rooms/{room_id}/livekit-token`.
+        .route(
+            "/v1/rooms/maintenance/run",
+            post(room_maintenance::room_maintenance_run),
         )
         .route("/v1/rooms/persistent/{key}/participants", post(room_join))
         .route(
@@ -13183,10 +13323,18 @@ mod tests {
         let list = persistent_room_http_json(&raw);
         assert_json_object_keys(
             &list,
-            &["ok", "rooms", "read_states", "next_cursor", "has_more"],
+            &[
+                "ok",
+                "rooms",
+                "read_states",
+                "attention",
+                "next_cursor",
+                "has_more",
+            ],
         );
         assert_eq!(list["ok"], true);
         assert_eq!(list["rooms"].as_array().unwrap().len(), 1);
+        assert_eq!(list["attention"], json!([]));
         assert_eq!(list["next_cursor"], serde_json::Value::Null);
         assert_eq!(
             list["read_states"],
@@ -14345,6 +14493,12 @@ mod tests {
                 vec!["http://127.0.0.1:8790".into()],
             )),
             room_attachments_root: Arc::new(tmp.path().join("room-attachments")),
+            // Retention OFF, like every test daemon: a fixture that inherited a
+            // live window would cut its own closed rooms mid-assertion.
+            room_maintenance_config: room_maintenance::MaintenanceConfig::default(),
+            room_maintenance: room_maintenance::new_handle(
+                &room_maintenance::MaintenanceConfig::default(),
+            ),
             room_wakes,
             room_access_wakes,
             room_read_cursor_wakes: RoomReadCursorWakeBus::default(),
@@ -14361,6 +14515,7 @@ mod tests {
             canvas_fulfillments: Arc::new(Mutex::new(HashMap::new())),
             shutdown,
             metrics: Arc::new(TurnMetrics::default()),
+            room_metrics: Arc::new(RoomMetrics::default()),
             // OCEAN-304: generous cap in test helpers so existing concurrency
             // behavior is unchanged; the backpressure tests build their own state
             // with a deliberately small cap to exercise rejection/release.
@@ -16213,6 +16368,12 @@ mod tests {
             // Injected, not read from the environment — same TASK-58 rule as the
             // runtime config dir above, so parallel tests never share a root.
             room_attachments_root: Arc::new(tmp.path().join("room-attachments")),
+            // Retention OFF, like every test daemon: a fixture that inherited a
+            // live window would cut its own closed rooms mid-assertion.
+            room_maintenance_config: room_maintenance::MaintenanceConfig::default(),
+            room_maintenance: room_maintenance::new_handle(
+                &room_maintenance::MaintenanceConfig::default(),
+            ),
             room_wakes,
             room_access_wakes,
             room_read_cursor_wakes: RoomReadCursorWakeBus::default(),
@@ -16229,6 +16390,7 @@ mod tests {
             canvas_fulfillments: Arc::new(Mutex::new(HashMap::new())),
             shutdown,
             metrics: Arc::new(TurnMetrics::default()),
+            room_metrics: Arc::new(RoomMetrics::default()),
             // OCEAN-304: generous cap in test helpers so existing concurrency
             // behavior is unchanged; the backpressure tests build their own state
             // with a deliberately small cap to exercise rejection/release.
@@ -16667,6 +16829,12 @@ mod tests {
                 vec!["http://127.0.0.1:8790".into()],
             )),
             room_attachments_root: Arc::new(tmp.path().join("room-attachments")),
+            // Retention OFF, like every test daemon: a fixture that inherited a
+            // live window would cut its own closed rooms mid-assertion.
+            room_maintenance_config: room_maintenance::MaintenanceConfig::default(),
+            room_maintenance: room_maintenance::new_handle(
+                &room_maintenance::MaintenanceConfig::default(),
+            ),
             room_wakes,
             room_access_wakes,
             room_read_cursor_wakes: RoomReadCursorWakeBus::default(),
@@ -16683,6 +16851,7 @@ mod tests {
             canvas_fulfillments: Arc::new(Mutex::new(HashMap::new())),
             shutdown,
             metrics: Arc::new(TurnMetrics::default()),
+            room_metrics: Arc::new(RoomMetrics::default()),
             turn_limiter: Arc::new(tokio::sync::Semaphore::new(256)),
             advisor_limiter: Arc::new(tokio::sync::Semaphore::new(ADVISOR_CONCURRENCY_LIMIT)),
         };
@@ -18773,6 +18942,12 @@ mod tests {
                 vec!["http://127.0.0.1:8790".into()],
             )),
             room_attachments_root: Arc::new(dir.join("room-attachments")),
+            // Retention OFF, like every test daemon: a fixture that inherited a
+            // live window would cut its own closed rooms mid-assertion.
+            room_maintenance_config: room_maintenance::MaintenanceConfig::default(),
+            room_maintenance: room_maintenance::new_handle(
+                &room_maintenance::MaintenanceConfig::default(),
+            ),
             room_wakes,
             room_access_wakes,
             room_read_cursor_wakes: RoomReadCursorWakeBus::default(),
@@ -18787,6 +18962,7 @@ mod tests {
             canvas_fulfillments: Arc::new(Mutex::new(HashMap::new())),
             shutdown,
             metrics: Arc::new(TurnMetrics::default()),
+            room_metrics: Arc::new(RoomMetrics::default()),
             // OCEAN-304: generous cap in test helpers so existing concurrency
             // behavior is unchanged; the backpressure tests build their own state
             // with a deliberately small cap to exercise rejection/release.
@@ -25134,6 +25310,309 @@ mod tests {
         assert_eq!(body["ok"], json!(false));
     }
 
+    // ── Ocean Rooms DoD §4.1: room + federation metrics ─────────────────────
+
+    /// Both shipped surfaces carry all six §4.1 families, by name.
+    ///
+    /// Driven through the REAL `/health` and `/metrics` handlers via `oneshot`
+    /// on a real `AppState`, in the pattern of
+    /// [`metrics_endpoint_serves_prometheus_with_live_counters`]. The point is
+    /// the spec's own completion rule: a family is not delivered until an
+    /// operator can read it off something the daemon ships, so this asserts the
+    /// Prometheus metric names AND the JSON card's keys rather than poking the
+    /// registry. It also pins the two rules the families must not break — every
+    /// Prometheus line carries `# HELP`/`# TYPE`, and no room id reaches a label
+    /// (per-room detail is on the JSON card, where `rooms` is an array).
+    #[tokio::test]
+    async fn room_metrics_families_are_readable_on_health_and_metrics() {
+        use http_body_util::BodyExt;
+        use tower::ServiceExt;
+
+        let state = {
+            let _g = yolo_env_guard_async().await;
+            permission_test_state()
+        };
+
+        // A room the sampler will actually find, so the access-state family is
+        // exercised against a real store read rather than an empty projection.
+        let key = RoomKey::new("metrics-surface-room");
+        with_rooms(&state, |reg| {
+            reg.create(key.clone(), "Metrics Surface Room", None, Utc::now())
+                .unwrap();
+        });
+
+        // ── Prometheus surface ──
+        let app = Router::new()
+            .route("/metrics", get(metrics))
+            .with_state(state.clone());
+        let resp = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .method(axum::http::Method::GET)
+                    .uri("/metrics")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+        let body = String::from_utf8(bytes.to_vec()).unwrap();
+
+        // One stem per family; the six families, named.
+        for stem in [
+            // 1. rooms by access state
+            "ocean_room_access_state",
+            // 2. outbox depth by state, and oldest-item age
+            "ocean_room_outbox_depth",
+            "ocean_room_outbox_oldest_age_seconds",
+            // 3. federation SSE reconnects and lag
+            "ocean_room_federation_sse_reconnects_total",
+            "ocean_room_federation_lag_events",
+            // 4. redemption failures
+            "ocean_room_redemption_failures_total",
+            // 5. admission refusals
+            "ocean_room_admission_refusals_total",
+            // 6. store lock wait
+            "ocean_room_store_lock_waits_total",
+            "ocean_room_store_lock_wait_seconds_total",
+        ] {
+            assert!(
+                body.contains(&format!("# HELP {stem} ")),
+                "missing # HELP for {stem}\n{body}"
+            );
+            assert!(
+                body.contains(&format!("# TYPE {stem} ")),
+                "missing # TYPE for {stem}\n{body}"
+            );
+        }
+
+        // Every access-state variant is emitted, so a state with no rooms reads
+        // an explicit 0 rather than vanishing from the scrape.
+        for label in ["local", "connecting", "live", "recovering", "revoked"] {
+            assert!(
+                body.contains(&format!("ocean_room_access_state{{state=\"{label}\"}} ")),
+                "missing access-state gauge for {label}\n{body}"
+            );
+        }
+        assert!(
+            body.contains("ocean_room_outbox_depth{state=\"pending\"}")
+                && body.contains("ocean_room_outbox_depth{state=\"failed\"}"),
+            "outbox depth must be emitted for both states\n{body}"
+        );
+        // The room we created is unfederated, so it projects `Local` — the same
+        // answer `room_access` gives for an absent access row.
+        assert_eq!(
+            labelled_value(&body, "ocean_room_access_state{state=\"local\"}"),
+            Some(1),
+            "the sampled room must land in the local gauge\n{body}"
+        );
+        // Fixed cardinality: the room id may never become a label.
+        assert!(
+            !body.contains("metrics-surface-room"),
+            "a room id must never reach a Prometheus label\n{body}"
+        );
+
+        // ── JSON surface ──
+        let app = Router::new()
+            .route("/health", get(health))
+            .with_state(state.clone());
+        let resp = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .method(axum::http::Method::GET)
+                    .uri("/health")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+        let card: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+
+        // The pre-existing envelope is untouched: this section is additive.
+        assert_eq!(card["ok"], json!(true));
+        assert_eq!(card["service"], json!("ocean-daemon"));
+
+        let rooms = &card["rooms"];
+        for family_key in [
+            "rooms_by_access_state",
+            "outbox_pending",
+            "outbox_failed",
+            "federation_sse_reconnects_total",
+            "federation_lag_events_max",
+            "redemption_failures",
+            "admission_refusals",
+            "store_lock_waits_total",
+            "store_lock_wait_seconds_total",
+        ] {
+            assert!(
+                rooms.get(family_key).is_some(),
+                "the /health rooms card is missing {family_key}: {rooms}"
+            );
+        }
+        assert_eq!(rooms["sampled"], json!(true), "card: {rooms}");
+        assert_eq!(rooms["rooms_by_access_state"]["local"], json!(1));
+
+        // The per-room list is the whole reason this surface exists beside the
+        // Prometheus one: it is where room identity is allowed to appear.
+        let per_room = rooms["rooms"].as_array().expect("rooms array");
+        assert_eq!(per_room.len(), 1, "card: {rooms}");
+        assert_eq!(per_room[0]["room_id"], json!("metrics-surface-room"));
+        assert_eq!(per_room[0]["access_state"], json!("local"));
+
+        // The store-lock family counted the real acquisitions this test made
+        // through `with_rooms`, which takes the state's own registry.
+        assert!(
+            rooms["store_lock_waits_total"].as_u64().unwrap_or(0) > 0,
+            "with_rooms acquisitions must be counted: {rooms}"
+        );
+    }
+
+    /// A post from an author the room's roster does not carry is refused
+    /// `403 author_not_in_roster`, and that refusal moves the §4.1 admission
+    /// refusal family from 0 to 1 under its own label.
+    ///
+    /// This is the member-level half of the admission family; the room-agent
+    /// half funnels through `append_admission_audit`'s `outcome == "refused"`.
+    /// Both are counted because both answer the same operator question — who is
+    /// being turned away from this room, and why.
+    #[tokio::test]
+    async fn a_non_roster_author_is_refused_and_counted_as_an_admission_refusal() {
+        let state = {
+            let _g = yolo_env_guard_async().await;
+            permission_test_state()
+        };
+
+        let key = RoomKey::new("refusal-metrics-room");
+        with_rooms(&state, |reg| {
+            reg.create(key.clone(), "Refusal Metrics Room", None, Utc::now())
+                .unwrap();
+            reg.add_participant(
+                &key,
+                RoomParticipant {
+                    id: "john".into(),
+                    kind: RoomParticipantKind::Human,
+                    display_name: "John".into(),
+                },
+                Utc::now(),
+            )
+            .unwrap();
+        });
+
+        let before = state.room_metrics.card();
+        assert_eq!(before.admission_refusals["author_not_in_roster"], 0);
+        assert_eq!(before.admission_refusals_total, 0);
+
+        let (status, body) = room_post_message(
+            State(state.clone()),
+            Path("refusal-metrics-room".to_string()),
+            Json(RoomMessageRequest {
+                // Never joined this room.
+                author_id: "stranger".into(),
+                author_kind: RoomParticipantKind::Human,
+                body: "let me in".into(),
+                thread_parent_seq: None,
+            }),
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        assert_eq!(body.0["error"], json!("author_not_in_roster"));
+
+        let after = state.room_metrics.card();
+        assert_eq!(
+            after.admission_refusals["author_not_in_roster"], 1,
+            "the refusal must be counted under its own code: {after:?}"
+        );
+        assert_eq!(
+            after.admission_refusals_total, 1,
+            "and must not also land in another bucket: {after:?}"
+        );
+
+        // A refusal writes nothing, so the counter is the only evidence there is.
+        let transcript = with_rooms(&state, |reg| reg.transcript(&key, None)).unwrap();
+        assert!(
+            transcript.iter().all(|m| m.author_id != "stranger"),
+            "a refused post must not reach the transcript"
+        );
+    }
+
+    /// A blank invite code is refused `400 invalid_request`, and that refusal
+    /// moves the §4.1 redemption-failure family from 0 to 1 under `invalid`.
+    ///
+    /// MUTATION PROVED (2026-09-02). Deleting the `record_redemption_failure`
+    /// call from the blank-code arm of `persistent_rooms::room_redeem_invite`
+    /// and re-running turns this test red at the
+    /// `after.redemption_failures["invalid"]` assertion:
+    ///
+    /// ```text
+    /// assertion `left == right` failed: the blank code must be counted as a
+    /// redemption failure
+    ///   left: 0
+    ///  right: 1
+    /// ```
+    ///
+    /// The status and body assertions above it still pass under that mutation,
+    /// so this test is pinned to the increment and not merely to the route's
+    /// pre-existing 400. Restoring the call returns it to green.
+    ///
+    /// The counter lives on the ROUTE and not on
+    /// `FederationSupervisor::redeem_invite` for a reason this test is the proof
+    /// of: the route refuses a blank code itself, before that call is made, so a
+    /// counter on the supervisor's `IntentError::Invalid` return would still
+    /// read 0 here.
+    #[tokio::test]
+    async fn a_blank_redeem_code_is_refused_and_counted_as_a_redemption_failure() {
+        use http_body_util::BodyExt;
+        use tower::ServiceExt;
+
+        let state = {
+            let _g = yolo_env_guard_async().await;
+            permission_test_state()
+        };
+
+        let before = state.room_metrics.card();
+        assert_eq!(before.redemption_failures["invalid"], 0);
+        assert_eq!(before.redemption_failures_total, 0);
+
+        // Through the real route with a real body: `RedeemInviteBody::code` is
+        // module-private, and a genuine POST is what the spec line asks for.
+        let app = Router::new()
+            .route(
+                "/v1/rooms/persistent/invites/redeem",
+                post(persistent_rooms::room_redeem_invite),
+            )
+            .with_state(state.clone());
+        let resp = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .method(axum::http::Method::POST)
+                    .uri("/v1/rooms/persistent/invites/redeem")
+                    .header(axum::http::header::CONTENT_TYPE, "application/json")
+                    .body(axum::body::Body::from(r#"{"code":"   "}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+        let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(body["error"], json!("invalid_request"));
+
+        let after = state.room_metrics.card();
+        assert_eq!(
+            after.redemption_failures["invalid"], 1,
+            "the blank code must be counted as a redemption failure"
+        );
+        assert_eq!(
+            after.redemption_failures_total, 1,
+            "and must not also land in another bucket: {after:?}"
+        );
+    }
+
     // ── OCEAN-303: /metrics endpoint ────────────────────────────────────────
 
     /// `GET /metrics` through the REAL handler + a real `AppState`, driven via
@@ -25322,6 +25801,82 @@ mod tests {
             !rev.is_empty(),
             "/health must surface a non-empty build `rev` (got: {health_json})"
         );
+    }
+
+    /// `/health` carries the `room_maintenance` card, and the card carries the
+    /// CONFIGURATION as well as the counts.
+    ///
+    /// The configuration half is what this asserts by name, because it is the
+    /// half that is easy to drop as redundant and is the reason the card is
+    /// readable at all: `rooms_cut: 0` on its own cannot tell an operator
+    /// whether retention swept and found nothing or was never turned on, and
+    /// those two have opposite remedies. `retention_days` beside it makes the
+    /// zero an answer.
+    ///
+    /// It also pins that the field rides BESIDE the flattened `HealthResponse`
+    /// rather than inside it: a client parsing the shared protocol struct must
+    /// still parse this body, which is what makes the field additive.
+    #[tokio::test]
+    async fn health_carries_the_room_maintenance_card() {
+        use http_body_util::BodyExt;
+        use tower::ServiceExt;
+
+        let state = {
+            let _g = yolo_env_guard_async().await;
+            permission_test_state()
+        };
+        // Record a sweep the way the loop's own bookkeeping does, so this test
+        // reads the same path production writes rather than a hand-built struct.
+        room_maintenance::record_sweep_for_test(
+            &state.room_maintenance,
+            room_maintenance::SweepOutcome {
+                rooms_cut: 1,
+                messages_removed: 9,
+                orphan_files_removed: 2,
+                bytes_reclaimed: 2048,
+                ..Default::default()
+            },
+        );
+
+        let app = Router::new()
+            .route("/health", get(health))
+            .with_state(state);
+        let resp = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .method(axum::http::Method::GET)
+                    .uri("/health")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+
+        // The shared protocol struct still parses: the card is additive.
+        let _: ocean_core::HealthResponse =
+            serde_json::from_slice(&bytes).expect("HealthResponse still parses this body");
+
+        let body: Value = serde_json::from_slice(&bytes).expect("health body is JSON");
+        let card = body
+            .get("room_maintenance")
+            .expect("/health must carry a room_maintenance card");
+        assert_eq!(card["rooms_cut"], json!(1));
+        assert_eq!(card["messages_removed"], json!(9));
+        assert_eq!(card["orphan_files_removed"], json!(2));
+        assert_eq!(card["bytes_reclaimed"], json!(2048));
+        assert_eq!(card["runs_total"], json!(1));
+        assert_eq!(card["last_error"], Value::Null);
+        assert!(card["last_run_at"].is_string());
+        // Configuration, without which the counts cannot be read.
+        assert_eq!(
+            card["retention_days"],
+            json!(0),
+            "a test daemon runs with retention off, and the card must say so"
+        );
+        assert!(card["interval_secs"].as_u64().unwrap_or(0) > 0);
+        assert!(card["orphan_grace_secs"].as_u64().unwrap_or(0) > 0);
     }
 
     // OCEAN-372 — sse_lag_events_total + sse_events_dropped_total (/metrics)
@@ -25962,6 +26517,73 @@ mod tests {
         assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
         assert_eq!(unavailable["error"], "workspace_unavailable");
 
+        // OCEAN-260: that refusal is the whole reason PATCH grew
+        // `workspace_root`. The room above was created unbound, so every agent
+        // turn in it fails closed forever; before the field existed the only
+        // repair was a new room and a lost transcript. Bind it in place and the
+        // SAME invocation is admitted — this is the pair that proves the field
+        // is load-bearing rather than merely stored.
+        let bound_workspace = tmp.path().join("room-workspace");
+        std::fs::create_dir(&bound_workspace).unwrap();
+        let canonical_workspace = std::fs::canonicalize(&bound_workspace)
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
+        let (status, bound) = operator_room_http_request(
+            app.clone(),
+            axum::http::Method::PATCH,
+            "/v1/rooms/persistent/bootstrap-route",
+            Some(json!({ "workspace_root": canonical_workspace })),
+            &[],
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(bound["room"]["workspace_root"], canonical_workspace);
+
+        let (status, admitted) = operator_room_http_request(
+            app.clone(),
+            axum::http::Method::POST,
+            "/v1/rooms/persistent/bootstrap-route/agents/builder/invoke",
+            Some(json!({
+                "invoked_by": "human-1",
+                "message_seq": invocation.seq,
+            })),
+            &[],
+        )
+        .await;
+        assert_ne!(
+            admitted.get("error").and_then(|e| e.as_str()),
+            Some("workspace_unavailable"),
+            "a bound room must not still refuse its own agents: {admitted}"
+        );
+        assert_eq!(status, StatusCode::ACCEPTED, "{admitted}");
+
+        // And unbinding puts the room back where it was, so the binding really
+        // is what gates execution rather than some one-way latch the first
+        // successful turn flipped.
+        let (status, _) = operator_room_http_request(
+            app.clone(),
+            axum::http::Method::PATCH,
+            "/v1/rooms/persistent/bootstrap-route",
+            Some(json!({ "workspace_root": serde_json::Value::Null })),
+            &[],
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let (status, unavailable_again) = operator_room_http_request(
+            app.clone(),
+            axum::http::Method::POST,
+            "/v1/rooms/persistent/bootstrap-route/agents/builder/invoke",
+            Some(json!({
+                "invoked_by": "human-1",
+                "message_seq": invocation.seq,
+            })),
+            &[],
+        )
+        .await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(unavailable_again["error"], "workspace_unavailable");
+
         let federated = RoomKey::new("bootstrap-federated");
         with_rooms(&state, |store| {
             store.create(federated.clone(), "Federated", None, Utc::now())?;
@@ -26349,9 +26971,16 @@ mod tests {
         // 123 -> 124: Local-room agent bootstrap establishes the durable Room
         // owner role and package-derived Agent roster tuple without authorizing
         // execution or consuming a decision.
+        // 124 -> 126: room lifecycle. POST /v1/rooms/persistent/{key}/close is
+        // the first way to end a persistent room from a shipped surface —
+        // `closed_at` and every soft-closed read path already existed, but
+        // production reached them only from `CallEnded`. POST
+        // /v1/rooms/maintenance/run is its operated other half: the on-demand
+        // trigger for the transcript-retention and attachment-orphan sweeps
+        // that keep rooms.db and the blob tree from growing without bound.
         assert_eq!(
             banner.len(),
-            124,
+            126,
             "route baseline changed; review the manifest"
         );
 
@@ -26374,6 +27003,114 @@ mod tests {
         assert_eq!(
             banner, documented,
             "operator HTTP quick reference and GET / discovery must match"
+        );
+    }
+
+    /// The `/v1/rooms` half of `source_registered_routes()`. The contract's
+    /// room-route table claims to be the WHOLE room surface, so the comparison
+    /// has to be against every registered room route rather than a hand-listed
+    /// subset — otherwise a new route could be added to neither side and the
+    /// table would still pass while lying.
+    fn registered_room_routes() -> std::collections::BTreeSet<String> {
+        source_registered_routes()
+            .into_iter()
+            .filter(|route| {
+                route
+                    .split_once(' ')
+                    .is_some_and(|(_, path)| path == "/v1/rooms" || path.starts_with("/v1/rooms/"))
+            })
+            .collect()
+    }
+
+    /// Parse the room-route table out of `OCEAN_ECOSYSTEM_CONTRACT.md`: any
+    /// Markdown table row whose first cell is a wire method and whose second is
+    /// a `/v1/rooms` path. Prose mentioning a path is ignored because it is not
+    /// a table row, and the header/separator rows are ignored because `Method`
+    /// and `---` are not wire methods.
+    fn contract_room_route_table() -> std::collections::BTreeSet<String> {
+        let contract = include_str!("../../../docs/OCEAN_ECOSYSTEM_CONTRACT.md");
+        contract
+            .lines()
+            .filter_map(|line| {
+                let mut cells = line.trim().strip_prefix('|')?.split('|').map(str::trim);
+                let method = cells.next()?.trim_matches('`');
+                let path = cells.next()?.trim_matches('`');
+                (matches!(method, "GET" | "POST" | "PUT" | "PATCH" | "DELETE")
+                    && path.starts_with("/v1/rooms"))
+                .then(|| format!("{method} {path}"))
+            })
+            .collect()
+    }
+
+    /// The decimal number immediately following `marker` in `sentence`. Anchored
+    /// on the surrounding words rather than "the first number in the line" so
+    /// that ordinary prose gaining a digit cannot silently repoint the check at
+    /// the wrong number.
+    fn number_after(sentence: &str, marker: &str) -> usize {
+        let start = sentence.find(marker).unwrap_or_else(|| {
+            panic!("ARCHITECTURE.md's route-count sentence must contain {marker:?}")
+        }) + marker.len();
+        sentence[start..]
+            .chars()
+            .take_while(char::is_ascii_digit)
+            .collect::<String>()
+            .parse()
+            .unwrap_or_else(|_| panic!("ARCHITECTURE.md must state a number after {marker:?}"))
+    }
+
+    /// Spec line 5.2: the ecosystem contract lists ALL daemon room routes and
+    /// `ARCHITECTURE.md`'s route count is true, both pinned executably.
+    ///
+    /// The sibling above pins the router against `GET /` discovery and the
+    /// operator guide. This one pins the two remaining prose claims: the
+    /// contract's room-route table is exactly the router's `/v1/rooms`
+    /// registrations, and `ARCHITECTURE.md`'s stated totals are the router's own
+    /// counts rather than a number that was true once.
+    ///
+    /// Mutation-proved on 2026-09-02, one mutation per assertion, each applied
+    /// alone to the tree this test landed in and then reverted. Both went red,
+    /// so neither assertion is decorative:
+    ///
+    /// 1. Deleting the PATCH /v1/rooms/persistent/{key}/read-cursor row from the
+    ///    contract table:
+    ///
+    ///        assertion `left == right` failed: every registered /v1/rooms route
+    ///        must appear in the ecosystem contract's room-route table, and
+    ///        every row of that table must be a registered route
+    ///
+    ///    The two printed sets differed in exactly that one entry — 40 routes on
+    ///    the router side, 39 in the table.
+    ///
+    /// 2. Changing ARCHITECTURE.md's room-route count from 40 to 39:
+    ///
+    ///        assertion `left == right` failed: ARCHITECTURE.md's room-route
+    ///        count must equal the router's own /v1/rooms registrations
+    ///          left: 41
+    ///         right: 42
+    #[test]
+    fn room_route_table_and_architecture_route_counts_are_in_parity() {
+        let registered = registered_room_routes();
+        let documented = contract_room_route_table();
+        assert_eq!(
+            registered, documented,
+            "every registered /v1/rooms route must appear in the ecosystem contract's \
+             room-route table, and every row of that table must be a registered route"
+        );
+
+        let architecture = include_str!("../../../docs/ARCHITECTURE.md");
+        let sentence = architecture
+            .lines()
+            .find(|line| line.contains("explicit method/path pairs"))
+            .expect("ARCHITECTURE.md states the router's registered route count");
+        assert_eq!(
+            number_after(sentence, "registers "),
+            source_registered_routes().len(),
+            "ARCHITECTURE.md's total route count must equal the router's own registrations"
+        );
+        assert_eq!(
+            number_after(sentence, "pairs, "),
+            registered.len(),
+            "ARCHITECTURE.md's room-route count must equal the router's own /v1/rooms registrations"
         );
     }
 

@@ -4607,6 +4607,7 @@ ________________________________________________________________________________
 ## 2026-07-19 — knowledge-separation extraction (wave 1)
 
 Double landing. TASK-56 48bd92f9 (daemon-core raw #1): TurnTerminalGuard RAII mirrors InFlightGuard — a panic in the prompt await now drives the SAME update_request_finished terminal transition (no second state machine) and emits TurnFinished{Failed}; its return value gates emission so cancels keep their frame and normal turns emit exactly once; Drop hands async work to Handle::try_current detached spawn. 3 new tests through real registry+bus; 522 daemon tests green. TASK-54 9498905f: every injected prompt layer now anchored at generation — folder-agent gets [folder-agent instructions]…[end folder-agent instructions] sentinels via one shared compose helper (both daemon sites + rooms), browser context loses its internal blank line and strips on an exact two-line prefix; strip_injected_turn_prep peels all 5 layers order-tolerantly; 6 strip tests + 2 cross-crate anchor guards; agent 199 / daemon 524 green. Completes TASK-50's display-strip. KNOWN FLAKE (ticket-worthy): github::tests intermittently red under full-parallel cargo test (subprocess/tempdir races, different test each run, 19/19 in isolation on clean main) — bit one TASK-54 gate run, clean on rerun. Daemon rebuild + announced bounce for 54/56/57 follows.
+_________________________________________________________________________________ 22:05 [detached
 time:      [18:17] [19-07-26]
 agent:     [pi] [gpt-5.6] [thoth]
 worktree:  [feat/tui-compact-activation]
@@ -4638,7 +4639,7 @@ ________________________________________________________________________________
 time:      [15:23] [19-07-26]
 agent:     [pi] [gpt-5.6]
 worktree:  [feat/compact-session-sync]
-type:      [issues]
+type:      [review]
 area:      [review]
 
 Closed every blocker from three adversarial review rounds. Session sync now projects directly from persisted messages with no SessionDetail/raw/tool/image copy, filters projectable rows before the 512-row cap, enforces the 1 MiB visible-text budget, and signals truncation. Every later session mutation publishes a scoped lifecycle/invalidation under the shared lease; legacy no-session requests pin ids before admission, and durable room triggers wait rather than drop. Replay gaps retain first-party event:error compatibility, reject empty/non-UTF8/foreign/unknown/evicted anchors, and expose only session-filtered diagnostic bounds. Compact acquires the busy lease before any existence read. Final independent release review approved with no blocker/high findings.
@@ -4799,6 +4800,7 @@ area:      [writing]
 Corrected the Observatory authentication contract after closing stale pad TASK-9: the read-only routes already consumed ObservatoryAuth in baf26468, so no route implementation was repeated. Gate 1 now states the implemented stateless-bearer truth — nonces make issuances unique but do not prevent replay within scope/lifetime — and assigns optional Authorization-Observer cookie issuance plus Secure/HttpOnly/SameSite/Path attributes to the authenticated Ocean Surface proxy. The daemon remains header/cookie input only, emits no Set-Cookie, exposes no issuance route, and never distributes its signing secret.
 _________________________________________________________________________________
 Moved internal operating material out of this public repo into the now-private `ocean-agents` repository: `docs/orchestrator/` (factory goal/loop/migration, team_takeover notes, workflows/) → `ocean-agents/docs/orchestrator/`; `skills/` (ocean-os-software-factory, ocean-coworker-onboarding) → `ocean-agents/internal/ocean-os/skills/` with live copies installed at `~/.config/ocean-rs/skills/` so Longhouse advisory discovery keeps working. Updated `docs/README.md` index and the two path references plus the Stage E prose in `docs/specs/2026-07-18-ocean-crew-orchestration-and-durable-workflow-manifest.md`. Workflow discovery (`{cwd}/docs/orchestrator/workflows/`) is fail-open, so ocean-os-cwd turns simply see no factory workflows now. `cargo xtask docs-check` PASS (155 active files, 141 links). Also generated `docs/phase0-inventory.json` (1,296-file classification manifest across the four repos). worktree: main
+_________________________________________________________________________________ 22:53 [pi/observatory-auth-docs-20260719]
 time:      [00:15] [20-07-26]
 agent:     [claude] [fable 5]
 worktree:  fix/task17-18-k3-bound-visibility
@@ -5457,6 +5459,7 @@ this ratification.
 _________________________________________________________________________________
 
 ---
+_________________________________________________________________________________ 21:48 [docs/extensions-stage-a-implementation-manifest]
 
 time:      [22:11] [27-07-26]
 agent:     [api], [gpt-5.4], [worker]
@@ -5509,7 +5512,7 @@ ________________________________________________________________________________
 time:      [23:05] [27-07-26]
 agent:     [pi] [gpt-5.4] [thoth]
 worktree:  [feat/extensions-stage-a1]
-type:      [review]
+type:      [issues]
 area:      [testing]
 
 Accepted Stage A1 after three independent review rounds and corrective deltas.
@@ -9576,3 +9579,967 @@ still the warning it was under `yanked = "warn"`, so once main carries this
 lockfile the cargo-deny lane is green for every open PR; CI's own run of that
 lane on this branch is the proof. No build, no deploy, no code change.
 _________________________________________________________________________________ 05:55 deps/rtrb-0.3.5-rustsec-2026-0274
+time:      [20:01] [01-09-26]
+agent:     [claude-code], [claude-fable-5-1], [ocean operator]
+worktree:  docs/rooms-definition-of-done
+type:      [plan]
+area:      [docs]
+
+Added the production-grade definition of done for Ocean Rooms as
+`docs/specs/2026-09-01-ocean-rooms-definition-of-done.md`, indexed it in
+`docs/README.md`, and opened a ROADMAP checkbox under the rooms program that
+names what is open on this repo's side. Nothing in the loop's contract or in
+any repo defined "done" for rooms before this; the backlog was replenishing
+polish faster than it drained. Written from three read-only assessments at
+ocean-bedrock 8753038, ocean-os 616293e, ocean-surface d58a145. Docs only:
+no code, no deploy, no migration; `cargo deny` red on rtrb is unchanged and
+named in the checklist as a user ruling.
+_________________________________________________________________________________ 20:01 docs/rooms-definition-of-done
+
+time:      [20:16] [01-09-26]
+agent:     [codex] [gpt-5]
+worktree:  docs/rooms-definition-of-done
+type:      [bug report]
+area:      [docs]
+
+Addressed Codex review on the Rooms finish-line contract. The documentation
+index now records the reviewed and merged Phase 1 candidates instead of the
+obsolete pre-review status. The definition of done narrows its universal check
+claim and attaches concrete commands, test owners, and remaining matrix
+requirements to criteria 2.1 and 2.3 through 2.5. Docs only; no runtime,
+deployment, migration, or production state changed.
+_________________________________________________________________________________ 20:16 docs/rooms-definition-of-done
+
+time:      [21:13] [01-09-26]
+agent:     [codex] [gpt-5]
+worktree:  docs/rooms-definition-of-done
+type:      [bug report]
+area:      [review]
+
+Closed the final Codex review pass on criteria 2.1 and 2.4. The authorization
+exit check now names both the authority unit suite and the existing route-level
+authenticated bootstrap ceremony test. Criterion 2.4 runs the daemon refusal
+and stored-value transition tests plus Surface coverage for offered trigger rows
+and access-state holds. Both branch dates use the ledger's DD-MM-YY schema, and
+the historical June entry remains untouched. Docs only; no daemon, deployment,
+migration, or production state changed.
+_________________________________________________________________________________ 21:13 docs/rooms-definition-of-done
+
+time:      [21:59] [01-09-26]
+agent:     [codex] [gpt-5]
+worktree:  docs/rooms-definition-of-done
+type:      [bug report]
+area:      [review]
+
+Closed the fresh Codex security finding in criterion 0.6. The owner bearer is
+now explicitly forbidden from the tracked public plist and must be injected
+into the per-user launchd domain from owner-only local custody before the
+guarded installer bootstraps the daemon. Verification must not print or retain
+the launchd environment. Docs only; no secret, launchd environment, daemon,
+deployment, or production state changed.
+_________________________________________________________________________________ 21:59 docs/rooms-definition-of-done
+
+time:      [22:16] [01-09-26]
+agent:     [codex] [gpt-5]
+worktree:  docs/rooms-definition-of-done
+type:      [bug report]
+area:      [review]
+
+Closed the latest Codex documentation-index finding. The docs-local owning
+contract now indexes the active cross-repository Rooms definition of done,
+names its acceptance and ownership role, and preserves that it authorizes no
+implementation by itself. Docs only; no daemon, launchd, deployment, migration,
+or production state changed.
+_________________________________________________________________________________ 22:16 docs/rooms-definition-of-done
+
+time:      [22:31] [01-09-26]
+agent:     [codex] [gpt-5]
+worktree:  docs/rooms-definition-of-done
+type:      [bug report]
+area:      [review]
+
+Closed the reboot-persistence finding in criterion 0.6. Federation now requires
+a supported untracked owner-only login loader that restores both variables
+before every fresh GUI-domain daemon start, keeps the bearer out of both plists,
+and survives a fresh login or reboot acceptance check. The criterion remains
+open because no such loader ships. Docs only; no secret, launchd environment,
+daemon, deployment, reboot, login, or production state changed.
+_________________________________________________________________________________ 22:31 docs/rooms-definition-of-done
+
+time:      [22:53] [01-09-26]
+agent:     [codex] [gpt-5]
+worktree:  docs/rooms-definition-of-done
+type:      [bug report]
+area:      [review]
+
+Closed two current-head Codex documentation findings. Criterion 0.6 now
+requires a daemon-specific launcher or equivalent per-job secret channel and
+explicitly forbids domain-wide launchctl environment injection of the owner
+bearer. The documentation index now describes the finish line's checks and
+known check gaps without claiming every criterion already has an executable
+pin and named effort. Docs only; no secret, launchd environment, daemon,
+deployment, login, reboot, or production state changed.
+_________________________________________________________________________________ 22:53 docs/rooms-definition-of-done
+time:      [20:15] [01-09-26]
+agent:     [claude-code], [claude-fable-5-1], [ocean operator]
+worktree:  docs/rooms-federation-runbook
+type:      [handoff]
+area:      [docs]
+
+Added a rooms and federation runbook to `docs/OPERATIONS.md`: the order of
+operations to enable federation on the supervised daemon (two environment
+variables the tracked plist does not carry, so the operated daemon runs rooms
+local-only today), how to verify a credentialed room reaches `live` and its
+outbox drains, the workspace lane's Bedrock requirements, how to read the
+bridge while `/metrics` has no room counters, rollback, and the `rooms.db`
+migration rehearsal the Phase 1 manifest's gate 4 asks for — stated plainly
+as NOT yet performed, so the definition-of-done line stays open on an
+executable record rather than on prose. Also records the Bedrock ordering
+this daemon depends on: `db/013` before any deploy carrying ocean-bedrock
+#117. `docs/README.md` no longer says the Phase 1 independent review has not
+run; ROADMAP.md has said since 2026-08-31 that it did, and ROADMAP.md's own
+"not implied" list no longer names room federation as unapproved, since it
+shipped in room_federation.rs and is operated per the new section. Docs
+only; no code, no deploy, no migration, no rehearsal performed.
+_________________________________________________________________________________ 20:15 docs/rooms-federation-runbook
+time:      [20:27] [01-09-26]
+agent:     [codex] [gpt-5]
+worktree:  docs/rooms-federation-runbook
+type:      [bug report]
+area:      [docs]
+
+Addressed the three Codex review findings on PR #441. Plist changes now require
+the installer's guarded bootout, teardown wait, bootstrap, enable, and kickstart
+sequence on both enable and rollback. The migration rehearsal uses SQLite's
+online backup API plus quick_check instead of copying a live main file without
+its WAL. References now resolve to the tracked ROADMAP and accepted Phase 1
+manifest rather than an unmerged definition-of-done branch. Docs only; no
+launchd job, database, daemon, deployment, or production state changed.
+_________________________________________________________________________________ 20:27 docs/rooms-federation-runbook
+
+time:      [21:13] [01-09-26]
+agent:     [codex] [gpt-5]
+worktree:  docs/rooms-federation-runbook
+type:      [bug report]
+area:      [review]
+
+Closed the second Codex review pass on the migration rehearsal. Candidate and
+rollback runs now use isolated config roots, set the explicit unsupervised
+override while launchd remains loaded, and prove rollback by restoring the
+online backup and reading it through the previous immutable binary. Docs only;
+no rehearsal, database mutation, daemon restart, launchd action, deployment,
+or production state change occurred.
+_________________________________________________________________________________ 21:13 docs/rooms-federation-runbook
+
+time:      [21:20] [01-09-26]
+agent:     [codex] [gpt-5]
+worktree:  docs/rooms-federation-runbook
+type:      [bug report]
+area:      [review]
+
+Closed the final Codex review pass on federation authority and the rehearsal
+source. The runbook now distinguishes the Bedrock transport URL from the owner
+token used only for Local-room bootstrap, preserves revoked state explicitly,
+and resolves `OCEAN_DB_PATH` before falling back to the effective config-dir
+database. It accurately scopes the 2026-08-31 rehearsal, reconstructs and
+verifies a pre-Phase-1 schema before taking the rollback backup, requires a
+truly pre-Phase-1 rollback artifact, and runs both binaries from a neutral cwd.
+The two branch event dates also follow the ledger's DD-MM-YY schema. Docs only;
+no rehearsal, database mutation, daemon restart, launchd action, deployment, or
+production state change occurred.
+_________________________________________________________________________________ 21:20 docs/rooms-federation-runbook
+
+time:      [21:58] [01-09-26]
+agent:     [codex] [gpt-5]
+worktree:  docs/rooms-federation-runbook
+type:      [bug report]
+area:      [review]
+
+Closed the fresh Codex review findings on the offline migration rehearsal. A
+genuine retained pre-Phase-1 backup is now checked through sqlite_master rather
+than querying tables that do not exist, while the row-count guard remains only
+for reconstruction from a current database. Both candidate and rollback daemon
+commands explicitly remove federation URL and owner-token variables before
+launch. Docs only; no rehearsal, database mutation, daemon restart, launchd
+action, deployment, or production state change occurred.
+_________________________________________________________________________________ 21:58 docs/rooms-federation-runbook
+
+time:      [22:16] [01-09-26]
+agent:     [codex] [gpt-5]
+worktree:  docs/rooms-federation-runbook
+type:      [bug report]
+area:      [review]
+
+Closed the latest Codex runbook findings without overwriting the concurrent
+branch cleanup at 95581a13. The rendered launchd plist is linted before the
+healthy daemon is stopped, and both candidate and rollback rehearsals remove
+title-database and plugin-directory overrides as well as federation authority.
+Docs only; no rehearsal, database mutation, daemon restart, launchd action,
+deployment, or production state changed.
+_________________________________________________________________________________ 22:16 docs/rooms-federation-runbook
+
+time:      [22:31] [01-09-26]
+agent:     [codex] [gpt-5]
+worktree:  docs/rooms-federation-runbook
+type:      [bug report]
+area:      [review]
+
+Closed the current-head credential-custody findings. The runbook no longer
+places the owner bearer in a rendered plist or dumps the launchd environment to
+discover database paths. Production enablement is explicitly blocked until a
+supported untracked owner-only login loader can restore the variables before
+every daemon start. Docs only; no secret, launchd environment, daemon restart,
+rehearsal, deployment, login, reboot, or production state changed.
+_________________________________________________________________________________ 22:31 docs/rooms-federation-runbook
+time:  [20:54] [01-09-26]
+agent: [codex] [gpt-5]
+worktree: [codex/review-sweep-20260901]
+type:  [issues]: Codex review follow-up sweep
+area:  [backend]: Room store and daemon contract corrections
+
+Addressed the recent Codex review findings still present on current main:
+strict ledger separator parsing and repaired fused historical seams, nonblank
+marker fallbacks, inclusive maximum transcript cursors, raw control-character
+identity rejection, human JSON transcript preservation, marker-only ci_checked
+handling, and removal of unreachable workspace-port proxy routes and their stale
+tests. Updated the owning daemon/store devlogs and operator guide.
+
+Ocean Store passed 215 tests, Ocean Daemon passed 874 tests with none ignored,
+the ledger guard passed 15 tests and confirmed all 555 entries closed, and
+formatting passed. No deployment, migration, daemon restart, or live room action
+occurred.
+_________________________________________________________________________________ 20:54 codex/review-sweep-20260901
+
+time:      [21:13] [01-09-26]
+agent:     [codex] [gpt-5]
+worktree:  codex/review-sweep-20260901
+type:      [bug report]
+area:      [review]
+
+Addressed the final Codex findings on PR #442. The separator grammar now accepts
+the same valid one-digit hour that entryIdentity can extract while rejecting
+invalid 24-hour clocks before they can become invalid repair suffixes. Regression
+tests prove both valid and malformed repairs are recognized as closed on rerun.
+Restored the historical Stage A1 event type instead of rewriting append-only
+history, and corrected this branch's event date to the ledger's DD-MM-YY schema.
+No deployment, daemon restart, migration, or production state changed.
+_________________________________________________________________________________ 21:13 codex/review-sweep-20260901
+
+time:      [22:20] [01-09-26]
+agent:     [codex] [gpt-5]
+worktree:  codex/review-sweep-20260901
+type:      [bug report]
+area:      [review]
+
+Closed the current-head Codex finding on the workspace proxy. The module now
+states that port publication is absent pending an accepted manifest, and the
+unused caller-body path-segment field, port validator, fake routes, and stale
+test prose are removed. The no-port allowlist tripwire remains authoritative.
+No deployment, daemon restart, migration, room, or production state changed.
+_________________________________________________________________________________ 22:20 codex/review-sweep-20260901
+
+time:      [22:23] [01-09-26]
+agent:     [codex] [gpt-5]
+worktree:  codex/review-sweep-20260901
+type:      [bug report]
+area:      [testing]
+
+Closed the GitHub repository-gate failure on both platforms. Removed the dead
+CI-convening helper and stale comments/tests left after the accepted marker-only
+CI contract; the shared red-conclusion predicate remains the marker label and
+chase-link authority. No deployment, daemon restart, migration, room, or
+production state changed.
+_________________________________________________________________________________ 22:23 codex/review-sweep-20260901
+
+time:      [22:31] [01-09-26]
+agent:     [codex] [gpt-5]
+worktree:  codex/review-sweep-20260901
+type:      [bug report]
+area:      [review]
+
+Closed the current-head unwired-CI-policy finding. Room create and update now
+return the typed trigger_unwired refusal when on_ci_failure is enabled; legacy
+stored values remain readable, but ci_checked stays a marker and cannot dispatch
+from core. Added route regressions and aligned the daemon contracts. No daemon,
+room, migration, deployment, or production state changed.
+_________________________________________________________________________________ 22:31 codex/review-sweep-20260901
+time:      [21:04] [01-09-26]
+agent:     [claude-code], [claude-opus-5], [cloud run]
+worktree:  cloud/rooms-workspace-root-daemon
+type:      [bug report]: a room created unbound could never be bound
+area:      [backend]: rooms, persistent room metadata, room store
+
+`POST /v1/rooms/persistent` has taken an optional `workspace_root` since
+OCEAN-260, but `PATCH /v1/rooms/persistent/{key}` took only `name` and
+`trigger_policy`. So a room created without a binding was unbound for the life
+of the room, and `spawn_room_agent_turn` fails closed on exactly that: no
+stored `workspace_root` means 503 `workspace_unavailable` on every room-bound
+agent turn, forever. The only repair was a new room and a lost transcript. The
+`rooms.workspace_root` column and the row reader were already there — nothing
+could write to them after the INSERT.
+
+`RoomUpdateRequest` gains `workspace_root: Option<Option<String>>` behind
+`double_option_workspace_root`, the same shape `trigger_policy` uses: absent is
+unchanged, explicit `null` unbinds, a string binds through the SAME
+`canonical_submitted_workspace_root` create runs and earns the same frozen
+`{"ok": false, "error": "invalid_workspace_root"}` 400. Absent had to stay
+"unchanged" rather than collapse to a clear, or an unrelated rename would
+silently switch a working room's agents off. A blank string unbinds, matching
+create's treatment of a blank value. `RoomStore::update` gains the parameter
+between `trigger_policy` and `now` and persists it inside the existing
+IMMEDIATE transaction, so name/policy/workspace/touch stay atomic; the stored
+value is the canonical path, because agent execution revalidates canonicality
+through `persisted_room_workspace` and would otherwise refuse a room it had
+just bound. `SqliteRoomStore` is the only implementor of the trait —
+`ocean-agent`'s in-memory `RoomRegistry` is a separate inherent type, not a
+`RoomStore` impl, and is not on the PATCH path, so it was left alone.
+
+Tests: `update_binds_unbinds_and_leaves_workspace_root_alone` in `ocean-store`
+(bind, read back through the row reader, absent-leaves-alone, rebind, unbind to
+NULL), `room_update_binds_unbinds_and_preserves_the_workspace_root` in
+`persistent_rooms.rs` (noncanonical input lands canonical, absent preserved,
+relative and nonexistent both answer the frozen body without disturbing the
+stored binding, null and blank both unbind). The end-to-end harness
+`local_room_agent_bootstrap_is_authenticated_previewable_and_non_authorizing`
+already asserted the `workspace_unavailable` refusal; it now PATCHes a binding
+in and shows the SAME invocation admitted 202, then unbinds and shows it refused
+again — the pair is what proves the field is load-bearing and not merely stored.
+
+Docs: the operator guide's rooms quick reference PATCH row, which
+`router_contract_source_banner_and_operator_guide_are_in_parity` pins.
+`OCEAN_ECOSYSTEM_CONTRACT.md` was left alone deliberately: it never lists the
+PATCH body's fields — its one `PATCH` mention is prose about which routes
+serialize `Room`.
+
+Gates: `cargo xtask ci` — see the PR for the per-lane verdict. `cargo deny` is
+red before this branch and still red on RUSTSEC-2026-0274 (`rtrb`) and yanked
+`spin`, reported and not fixed; this branch touches no `Cargo.toml`,
+`Cargo.lock` or `deny.toml`. Paired with ocean-surface
+`cloud/rooms-workspace-root-surface`, which sends the field at create time and
+adds the bind/unbind control this route makes possible.
+_________________________________________________________________________________ 21:04 cloud/rooms-workspace-root-daemon
+
+time:      [23:51] [01-09-26]
+agent:     [claude-code], [claude-opus-5], [cloud run]
+worktree:  cloud/rooms-workspace-root-daemon
+type:      [review]: Codex P1 on #443 — the owning crate contract was not updated
+area:      [docs]: crates/ocean-daemon/AGENTS.md, rooms workspace binding
+
+Codex reviewed #443 and raised one P1, correctly. The slice updated
+`docs/OCEAN_RUNTIME_OPERATOR_GUIDE.md` and appended a root ledger entry, but
+left the NEAREST OWNING contract alone: `crates/ocean-daemon/AGENTS.md`'s
+`persistent_rooms.rs` paragraph still said "Room creation accepts a nonblank
+`workspace_root` ... blank remains unbound" and nothing else — a create-only
+statement in front of a change that makes the binding mutable. Root AGENTS.md
+line 21 requires the devlog pass to update the nearest owning `AGENTS.md`, and
+this one was missed. Verified against the file before acting rather than taken
+on the bot's word: the sentence is exactly as quoted, and it is the only place
+in that contract that describes when a room's workspace can be set.
+
+That paragraph now carries the post-create half: `room_update` is the only
+writer, `RoomUpdateRequest::workspace_root` is a double `Option` behind
+`double_option_workspace_root` exactly as `trigger_policy` is, absent leaves the
+binding untouched, explicit `null` and a blank string unbind, and a nonblank
+value binds through the same `canonical_submitted_workspace_root` create calls
+under the same frozen `invalid_workspace_root` 400. It records WHY absent
+cannot collapse to a clear — PATCH is also the rename route, and an unbound room
+refuses every agent turn, so a rename that cleared the field would switch a
+working room's agents off silently — and why the value reaching
+`RoomStore::update` is already canonical. It also states the defect the slice
+fixed, since a contract that never says a room could not be bound after creation
+cannot explain why the route grew a field.
+
+`crates/ocean-store/AGENTS.md` was checked and deliberately left alone: it
+carries no `workspace_root` or `RoomStore::update` text at all, so there is
+nothing stale there to correct and adding a first mention is not this repair.
+The existing ledger entry for this slice was NOT edited — the ledger is
+append-only, so the review pass gets its own entry.
+
+Gates on the repaired tree: `cargo xtask docs-check` PASS (30 packages, 157
+files, 179 links); the rest of `cargo xtask ci` re-run below. Docs-only change,
+no code touched, so no behavior moves. `cargo deny` remains red before and after
+on the pre-existing yanked `spin` advisory — red on `main` at 616293e too, which
+is this branch's base — reported and not fixed, and this branch still touches no
+`Cargo.toml`, `Cargo.lock` or `deny.toml`.
+_________________________________________________________________________________ 23:51 cloud/rooms-workspace-root-daemon
+time:      [23:06] [01-09-26]
+agent:     [claude-code], [claude-fable-5-1]
+worktree:  cloud/os-federation-login-loader
+type:      [feature-request]
+area:      [infra]
+
+Spec line 0.6 (#440) asks for a supported, untracked, owner-only, daemon-specific
+launcher that restores OCEAN_FEDERATION_URL and OCEAN_FEDERATION_OWNER_TOKEN only
+in the daemon's process environment before it execs the daemon, never calls
+domain-wide `launchctl setenv`, and never places either value in the tracked or
+rendered plist; until now nothing shipped that, so enablement stopped at the
+runbook's step 3. The launcher that launchd already runs on every start,
+deploy/ocean-daemon.sh installed as launch.sh, now reads
+${OCEAN_CONFIG_DIR:-~/.config/ocean-rs}/federation.env right before exec: the
+file must be a regular 0600 file owned by the daemon's user, may hold only the
+two keys or a Keychain reference, and its URL must be an https origin with
+nothing after the host (loopback http allowed for a local Bedrock). Any custody
+failure refuses the file whole, starts the daemon with federation off, and logs
+the reason and never the contents; inherited OCEAN_FEDERATION_* values are
+dropped so the file is the one channel. ops/set-ocean-federation.sh is the
+reviewed activation: it writes the file atomically under umask 077 from
+--token-file, --token-stdin or a --keychain reference (the bearer is never an
+argument), lints both plists and proves neither carries a federation key, then
+restarts the job through the installer's guarded bootout, wait, bootstrap,
+enable, kickstart sequence, waits for /health, and with --verify-room polls one
+room's snapshot until access.state is live, reading nothing else. --off removes
+the file. scripts/federation-loader.test.mjs (ten tests, wired into the ledger
+job) runs the launcher against a fake daemon that records which variables
+reached its process and a digest of the bearer, and covers the mode, owner,
+unexpected-line, URL, inherited-value, keychain and plist guards plus the
+setter's file half; the launchd half is verified on the operated machine by a
+room reaching live. Not touched: docs/OPERATIONS.md, whose Enable federation
+step 3 lives on #441 and still says `launchctl setenv`, which 0.6 forbids; the
+replacement text is in this PR's body for that branch. Nothing here was run
+against production or the operated daemon.
+_________________________________________________________________________________ 23:06 cloud/os-federation-login-loader
+time:      [01:05] [02-09-26]
+agent:     [claude code], [opus 5], [ocean-cloud routine]
+worktree:  cloud/os-contract-room-routes
+type:      [refactor]: The room-route surface stops being a claim and becomes a checked table
+area:      [docs]: Ecosystem contract, architecture route counts, daemon router parity
+
+`OCEAN_ECOSYSTEM_CONTRACT.md` said it listed the daemon's room routes and then listed ten paths in a fenced comment block, while the router registers forty method/path pairs under `/v1/rooms`; `ARCHITECTURE.md` said the router registers eighty explicit pairs, which was true before ninety-five, and gave no room-route count at all. Both numbers were prose, so nothing could tell either of them it had gone stale. The forty was re-derived from the tree the way `source_registered_routes` does — parsing `.route(...)` calls out of `app_router`, `room_routes` and `longhouse_routes` and filtering to paths under `/v1/rooms` — not read off the spec, and it agrees with the `GET /` discovery banner the existing parity test already pins. The contract now carries a complete table, one row per registered method and path in router-registration order, each with a one-line purpose and its auth expectation, under a paragraph that says what "auth" means here: the daemon is a local trust boundary with no HTTP authentication of its own, so `Loopback trust only` is the honest label for most rows, `Roster-asserted` means the caller names an identity the daemon checks against the live roster rather than holding a credential, and the operator-header, federated-bearer and membership-gated lanes are named where they actually apply. `ARCHITECTURE.md`'s sentence now reads one hundred twenty-four explicit pairs with forty of them room routes, and points at the table. `room_route_table_and_architecture_route_counts_are_in_parity` sits beside the existing banner/guide test and pins all three claims: the contract's table equals the router's `/v1/rooms` registrations set-for-set, and both stated counts equal the router's own. It parses the counts by anchoring on the surrounding words rather than taking the first number in the line, so prose gaining a digit cannot silently repoint the check. Mutation-proved and recorded in the test's doc comment: deleting the `PATCH .../read-cursor` row reds the set assertion with that entry the only difference, and changing the room count from forty to thirty-nine reds the count assertion `left: 39, right: 40`. No route was added, removed or changed. PR #442 was read first — it edits `persistent_rooms.rs`, `room_federation.rs` and `room_workspace_proxy.rs` but not `main.rs`, so it adds and removes no routes and the count stands against main. Gates on this tree: docs-check PASS, workspace build PASS, workspace tests 3240 passed 0 failed, Clippy clean, format clean. `cargo deny` DID NOT RUN — cargo-deny is not installed in this environment — and must run in its own Ubuntu CI job.
+_________________________________________________________________________________ 01:05 cloud/os-contract-room-routes
+
+time:      [01:11] [02-09-26]
+agent:     [claude code], [opus 5], [ocean-cloud routine]
+worktree:  cloud/os-contract-room-routes
+type:      [bug report]: Three rows of the new room-route table said less than the router does
+area:      [docs]: Ecosystem contract room-route table
+
+Codex reviewed the table at `86be530` and found three purposes and auth expectations that a client could act on and be wrong, all three confirmed against the source rather than taken on the reviewer's word. `GET /v1/rooms/persistent` said it listed every room this daemon owns; `rooms_list_persistent` calls `list_page`, whose omitted limit is `DEFAULT_LIST_LIMIT` = 100 (clamped to `MAX_LIST_LIMIT` = 1000), and the response carries `next_cursor` and `has_more` — so a daemon past a hundred open rooms answers a page and the old row invited a client to read it as the whole set. `POST .../invites` named `OCEAN_FEDERATION_OWNER_TOKEN` as its credential universally; `FederationSupervisor::create_invite` mints under the stored `RoomCredential`'s bearer whenever one exists, and reaches for the owner token only to REGISTER a Local room that has none yet — the token then becomes that room's stored bearer. The row also contradicted this document's own federation paragraph, which already said the owner token is used only to register a Local room. `POST /v1/rooms/{room_id}/livekit-token` said it minted for a server-authored open `call:` room; `call_room_token_allowed` returns true immediately for any id WITHOUT the `call:` prefix and only existence-gates `call:` ids, deliberately, so a fresh project or surface room can get a token before it is durable — a consumer reading the old row would have suppressed a legitimate flow. All three rows now say what the code does. No method or path changed, so the parity test's set assertion and both route counts are untouched; it stays green. Gates on the corrected tree: docs-check PASS, the room-route parity test and its sibling green, format clean.
+_________________________________________________________________________________ 01:11 cloud/os-contract-room-routes
+time:      [01:08] [02-09-26]
+agent:     [claude-code], [claude-opus-5], [cloud routine]
+worktree:  cloud/os-store-durability-pragmas
+type:      [feature-request]: Ocean Rooms DoD 4.4 — the store is durable under load
+area:      [backend]: SQLite durability PRAGMAs, an operator-readable read-back, and the checks that pin them
+
+Re-derived the premise on main 616293e before touching anything, and it was right in two places out of three. `crates/ocean-store/src/lib.rs` issued no `journal_mode` and no `synchronous` PRAGMA on any path: a raw `Connection::open` here reports `journal_mode=delete` and `synchronous=2`, so the production `rooms.db` really was running a rollback journal under `FULL`. The busy-timeout half does not hold. `rusqlite::Connection::open` calls `sqlite3_busy_timeout(db, 5000)` itself in `inner_connection.rs`, so every connection this store has ever opened already waited five seconds, and a concurrent writer was NOT failing `SQLITE_BUSY` immediately. That is not a reason to leave it alone — it is a five-second policy this crate neither names nor pins, which a `rusqlite` bump could drop silently — but the honest record is that the explicit call takes ownership of a borrowed default rather than changing behavior, and the mutation record on the concurrency test says so rather than claiming a red it does not produce. `foreign_keys` was already on twice over, from `migrate()` and from the bundled SQLite's `SQLITE_DEFAULT_FOREIGN_KEYS=1`.
+
+`apply_durability_pragmas` is now the one named place: WAL, `synchronous = NORMAL`, the five-second `BUSY_TIMEOUT`, and foreign keys, applied by the single production open path before `migrate` so the migration runs under them and WAL's sidecars exist by the time the post-migration owner-only enforcement locks them down. NORMAL over FULL because nothing in this crate's commit semantics ratchets on an OS-crash-durable commit: the invariants here are atomicity ones, which NORMAL keeps whole, so a transaction lost to a power cut is lost whole and never torn. The residual risk is stated exactly rather than softened, because the first draft of this slice softened it and a review caught it: an `append_message` the store ACKNOWLEDGED can be lost to a power cut with nothing to replay it. The outbox is not a redo log and does not cover that — `append_message` writes no outbox row, and a federated event's outbox row commits in the same transaction as the work it covers, so a lost transaction takes the row with it; what the outbox retries is the unconfirmed federated events that survived. Accepted anyway, and the operator guide now says so in the operator's own terms including when FULL would be the right ask, because the daemon already treats transcript persistence as best-effort on the call rail (`persist_failures_total` counts dropped transcript writes rather than stalling the turn), so a fsync per commit would narrow a power-loss window against a rail that is already lossy under pressure. `open_in_memory` deliberately keeps its own settings: `:memory:` has no journal to hold in WAL and no second connection to contend with.
+
+An operator can now tell without opening the database. `SqliteRoomStore::durability()` re-queries all four settings off the live connection — never echoing what was requested, so a pragma that failed to take shows up as what is actually in force — and the daemon logs it on the `persistent rooms store ready` startup line as `journal_mode=wal synchronous=normal busy_timeout_ms=5000 foreign_keys=true`. A read-back failure warns instead of refusing to boot, because a store that opened fine should not be held hostage by an unreadable diagnostic. `docs/OCEAN_RUNTIME_OPERATOR_GUIDE.md` documents the line, what each field should read, and how to tell "unknown" from "wrong".
+
+Three checks pin it. `a_production_store_opens_in_wal_with_the_chosen_durability_settings` asserts through both the raw pragmas and `durability()`, so the reporter cannot drift from the thing it reports, and reopens the file to prove WAL persists in the header. `an_in_memory_store_keeps_foreign_keys_without_the_file_durability_posture` pins the deliberate split. `a_second_writer_waits_for_the_lock_instead_of_failing_busy` runs two connections against one file — a held IMMEDIATE transaction and a real `append_message` through the public API — and asserts the second waits and succeeds, with a lower bound on elapsed time so a pass that never contended cannot masquerade as a pass. Mutations run and recorded in its doc comment: zeroing the timeout reds both tests with `DatabaseBusy`; deleting the `busy_timeout` call is GREEN and is written down as green with the reason; dropping the `journal_mode`/`synchronous` lines reds the pragma test at `left: "delete", right: "wal"`. One test-ordering trap is documented in place: the racer must be opened before the lock is taken, because `open` runs `migrate`, which writes, and an open under the held lock absorbs the wait itself and leaves the measured write proving nothing.
+
+Gates: `cargo xtask ci` — docs/index integrity PASS, workspace build PASS, workspace tests PASS (ocean-store 217/217, ocean-daemon 874/874), Clippy clean, format clean. The dependency-policy lane DID NOT RUN — `cargo-deny` is not installed in this environment (`error: no such command: deny`) — and never passed; it is unclaimed, not green. The branch touches no `Cargo.toml`, `Cargo.lock` or `deny.toml`. Expected rebase against the user's open PR #442 (`codex/review-sweep-20260901`), which also edits `crates/ocean-store/src/lib.rs` and this crate's `AGENTS.md`: its hunks are `marker_prose` and `transcript_tail_page` and its doc edits sit at the tail of the invariant list, while these hunks are the open path, a new appended invariant at the head of that list, and tests past its test regions. No overlap expected, and no deploy or migration.
+_________________________________________________________________________________ 01:08 cloud/os-store-durability-pragmas
+time:      [05:04] [02-09-26]
+agent:     [claude-code], [claude-opus-5], [cloud loop]
+worktree:  [cloud/os-room-metrics]
+type:      [feature-request]
+area:      [backend]
+
+Ocean Rooms definition-of-done line 4.1 asked for room and federation metrics —
+access state by room, outbox depth and age, SSE reconnects and lag, redemption
+failures, admission refusals, store lock wait — and said there are none today.
+Re-derived on main 616293e: true of those six families, not of the surface.
+`GET /metrics` already renders `TurnMetrics` plus four daemon-wide atomics, and
+`GET /health` returns the `HealthEnvelope`; none of it is room- or
+federation-scoped, and `sse_lag_events` counts the daemon's own SSE rails rather
+than the federation receiver.
+
+Added one `RoomMetrics` registry beside `TurnMetrics` in `metrics.rs`, held on
+`AppState` like it, carrying exactly those six families and nothing else. Rooms
+by access state is one gauge per `RoomAccessState` variant; outbox depth is
+pending and failed; the rest are reconnect count, lag, redemption failures by
+`IntentError` variant, admission refusals by refusal code, and lock-wait count
+plus summed wait. Every label comes from a closed enum declared in that file, so
+a room id, member id or invite code can never become one — per-room detail rides
+the JSON card instead.
+
+The surface is a `rooms` section on the `/health` card, additive on the daemon's
+own envelope the way `rev` is, plus the same registry rendered as Prometheus
+lines appended to `/metrics`. A section rather than a route on purpose: PR #445
+pins the room-route table against the router at 40 routes with a parity test,
+and a new route would owe that table an entry.
+
+Two things the re-derivation changed. The blank redeem code the spec names as
+`IntentError::Invalid` never reaches that return — `room_redeem_invite` refuses
+it at the route, before the supervisor call — so a counter on the supervisor
+alone would have read zero for exactly the refusal the test asserts; it is
+counted at the route, covering the malformed body too, since the wire cannot
+tell those apart either. And the outbox has no timestamp column, so age is an
+in-process first-sighting clock keyed on the head row's `(room, client_event_id)`
+rather than a nullable `enqueued_at` migration: it under-reports across a restart
+and never over-reports, and it keeps this slice out of `ocean-store`'s open path
+and migration block, which PRs #442 and #446 are both editing.
+
+Sampling the two store-derived families needed a read `list`/`list_page` cannot
+give: those call `load_record` per room, which loads the roster and the oldest
+thousand transcript rows, so counting five access states over a hundred rooms
+would decode a hundred thousand messages. Added one read-only
+`room_metrics_projection` to `ocean-store` — two aggregate queries, open rooms
+only, no transcript, only the head row's id. `/health` samples it through
+`try_lock` and reports `sampled: false` with the previous numbers rather than
+blocking the one probe whose contract is that it answers whenever the process
+serves HTTP.
+
+Named gaps, all deliberate: the lock-wait family times `with_rooms` and
+`with_rooms_handle` only, and the direct `.lock()` sites in `main.rs`,
+`persistent_rooms.rs` and `room_federation.rs` stay uncounted; the two push sites
+holding no `AppState` record through a process-global install point that the real
+startup path alone installs, so a test process leaves it unset and one test's
+state cannot collect another's counts.
+
+Tests: one reads both surfaces and asserts all six families by name plus that no
+room id reached a label; one posts from a non-roster author (403
+`author_not_in_roster`) and asserts admission refusals 0 to 1; one POSTs a blank
+redeem code (400 `invalid_request`) and asserts redemption failures 0 to 1.
+Mutation proved on the third — deleting the increment reds it at `left: 0, right:
+1` while the status and body assertions still pass — and recorded in its doc
+comment. Four registry unit tests cover the sample, the per-row age reset, the
+closed-label fallback and the stale-sample card; one store test pins the
+projection.
+
+Gates: docs-check PASS, workspace build PASS, workspace tests PASS (3247 passed,
+0 failed, across 93 suites; ocean-daemon 881/881, ocean-store 215/215), Clippy
+clean, format clean. Dependency policy DID NOT RUN — `cargo deny` is not
+installed in this environment, so that lane could not execute and is not
+reported as passing. Expected rebase against #442 on `events.md`. No deploy, no
+migration.
+_________________________________________________________________________________ 05:04 cloud/os-room-metrics
+
+time:      [05:08] [02-09-26]
+agent:     [claude-code], [claude-opus-5], [cloud]
+worktree:  [cloud/os-room-lifecycle]
+type:      [feature-request]
+area:      [backend]
+
+Ocean Rooms Definition of Done line 4.3, the ocean-os half: a route closes a
+room, transcript retention and attachment orphan GC exist, and rooms.db plus the
+blob tree stop growing without bound. Idle-workspace reaping is Bedrock's and is
+not here. The premise was re-derived against main at 616293e before anything was
+written and it held: none of the room routes in the main.rs banner closed a
+room, PATCH moved only name and trigger_policy, and closing was a store
+primitive reached in production from exactly one place, the CallEnded persist
+job. Every soft-closed read path had therefore existed for as long as durable
+rooms had — get_including_closed, both including_closed pagers, the snapshot's
+closed boolean — and only a finished call could ever produce a room for them to
+serve. There was no retention, no GC and no maintenance code of any kind; the
+only sweeper in the daemon was the in-memory registry loop. Attachment bytes sat
+under a one-way sha256 of the room key that is never stored, fsynced before
+their row commits, with a comment already promising a future GC sweep, and the
+room_attachments row rather than the transcript marker is what keeps a blob
+alive, since a removal marker keeps its attachment_id.
+
+POST /v1/rooms/persistent/{key}/close is the route. Two authorities and the
+header picks which rather than the outcome of authorizing it: an X-Ocean-Operator
+credential that was presented and failed is refused outright instead of being
+downgraded to whatever actor_id came with it, and absent that header the route
+wants ?actor_id= naming a roster member, spelled like the attachment delete's
+and refused with 403 forged_closer if it claims an Agent's or System's identity.
+One IMMEDIATE store transaction refuses a room that is not open with the
+existing UnknownRoom 404, appends a System marker naming the closer, and sets
+closed_at; the operator lane is deliberately not roster-checked because operator
+authority is over the daemon and not membership in one room, and RoomCloser is
+an enum rather than an id plus a flag so a call site cannot apply the wrong
+check. Afterwards detail 404s, sends refuse, the snapshot answers closed true
+with the transcript pageable and the roster and agent_owners intact, and
+Bedrock is untouched.
+
+The one SSE contract change is that live tails now END on a close instead of
+idling on a room that can never produce another row, which the route's existing
+404 on a closed room already implied since the client could not have
+re-established that connection. Writing the test for it surfaced a defect older
+than this branch: send_room_catch_up read through the open-only transcript_page,
+and because the close marker is appended in the same transaction that sets
+closed_at, that read answered UnknownRoom for it — so a live tail died on a
+store error one row short of the row explaining why, silently, for every close
+including CallEnded's. It reads through transcript_page_including_closed now. A
+second hole followed: the message tail's already-sent-seq dedupe arm continued
+without checking openness, and the close marker's hint carries that marker's own
+seq, so a tail that had replayed it from the durable log parked forever. Both
+are pinned by a test that asserts the marker arrives and then the stream ends.
+
+Retention is opt-in and the default is never. OCEAN_ROOM_RETENTION_DAYS is read
+once at startup; unset, zero, and anything that does not parse as a non-negative
+integer all mean keep everything, because a transcript cut is unrecoverable and
+a mis-parse must never become a shorter window than the operator wrote. A cut
+removes the transcript, the attachment rows and their blobs, both read-cursor
+tables and the room's federated_events index in one transaction per room, and
+never an open room at any age since the window is measured from the close. The
+rooms row stays, because deleting it would cascade the whole room away and a cut
+room must still be able to say it is frozen rather than 404 as one that never
+existed. The dedup index does not stay, because ingest_confirmed_event
+cross-checks an index tuple against the transcript row it names and a dangling
+one would stop the room ingesting forever; the ordering baseline survives
+through the retained room_access cursor. Blobs are unlinked after the commit,
+the same order the attachment delete route uses.
+
+The orphan GC derives the expected directory of every room the store knows,
+closed rooms included, because the path is a one-way hash and that derivation is
+the only way to ask whose a directory is — through room_attachments::room_dir
+rather than a second hashing here, since two derivations disagreeing would not
+mean a missed orphan but the sweep deleting every live room's files as
+unrecognised. A one-hour grace is a correctness bound and not caution: the
+upload path fsyncs bytes before the row commits, so every successful upload
+spends a moment unreferenced, and a graceless sweep would race it into exactly
+the orphan row that write order exists to prevent. Every uncertainty fails
+closed to do not delete. Both jobs share one six-hour loop, one task per sweep
+so a panic is a JoinError the loop records rather than dies on, and
+POST /v1/rooms/maintenance/run runs them now under operator authentication with
+no member lane, since the sweep is store-wide and belongs to no room.
+
+The report is the operated half. One tracing info line per run carries every
+count, and the room_maintenance card on GET /health carries the configuration —
+interval, retention window, orphan grace — beside them, because rooms_cut zero
+on its own cannot separate a clean sweep from retention that was never turned
+on, and those two have opposite remedies. The card is read through a
+poison-recovering snapshot so a mutex poisoned by a panicked sweep cannot take
+/health down with it.
+
+Checks: a route test closing an open room that asserts detail 404, snapshot
+closed true, a refused send and a readable transcript ending in the marker; a
+refusal test proving three refused closes leave the room open with not one extra
+row; the tail test above; a fixed-clock retention test where a room closed forty
+days back is cut while one closed two days back and an open room seeded at the
+same instant survive with their bytes intact; a GC test proving by MUTATION that
+only the orphan goes — is_referenced is a named function precisely so the test
+can drive sweep_room_dir with a doctored set both ways, and both mutants are
+exercised for real: saying everything is referenced leaves the orphan and fails
+the first assertion, saying nothing is referenced deletes the live blob and
+fails the last, and only the true set removes exactly one file with the other's
+bytes reading back byte for byte; a grace test, a closed-room-directory test, a
+parse test over every unusable value, and a health test asserting both the
+counts and the configuration on the card while proving HealthResponse still
+parses the body.
+
+Gates: cargo xtask ci. cargo-deny is not installed in this environment, so the
+dependency-policy lane DID NOT RUN — not passed, did not run; it fails with "no
+such command: deny" before it evaluates anything, so nothing is known about the
+dependency graph from this run either way. Every other lane ran and is green:
+docs-check PASS at 30 packages, 157 active Markdown files and 179 local links;
+workspace tests with zero FAILED results anywhere, ocean-daemon 885 passed,
+ocean-store 219 passed, ocean-tui 496 passed and 4 ignored; all-target Clippy
+clean under -D warnings after one needless-borrow fix in the new module's test
+fixture; format clean after cargo fmt. Banner count moved 124 to 126
+with both new routes added to the banner, the operator-guide quick reference and
+the ecosystem contract; PR #445 rewrites that route table and raises the same
+counts, so a rebase onto it will need both numbers and both rows reconciled. No
+deploy and no migration: every new column is absent because there are none, and
+a daemon that upgrades into this code sweeps nothing until an operator sets a
+window.
+_________________________________________________________________________________ 05:08 cloud/os-room-lifecycle
+
+time:      [06:13] [02-09-26]
+agent:     [claude-code], [claude-opus-5], [cloud loop]
+worktree:  [cloud/os-room-metrics]
+type:      [bug report]
+area:      [backend]
+
+Codex review round on PR #447. Three P2 findings, all about whether the §4.1
+counters say true things. I verified each against the tree before touching
+anything; all three were real, and all three are fixed.
+
+Reconnects were counted beside the backoff at the bottom of run_room's loop.
+Every path between there and the next dial is a return that never redials —
+cancellation or shutdown winning the backoff select!, a missing client, a
+credential that vanished, a room gone Revoked — so stopping a room or shutting
+the daemon down reported a reconnect that never happened. Codex proposed moving
+the bump into the sleep-wins arm; that still over-counts, because the credential
+and Revoked checks sit after it. The bump now sits immediately before the
+run_epoch call it counts, guarded on attempt > 0 so the task's first dial stays
+out of a counter about REconnects.
+
+A room's lag entry was never removed, and the gauge is the maximum across
+entries, so a room revoked while behind held that backlog forever, outliving the
+room. Rather than clear at each of run_room's seven returns — a metric cleaned
+up by hand at six of them leaks at the seventh — the entry is owned by a
+FederationLagScope held for the task's life, the same RAII shape InFlightGuard
+already uses for the turn gauge. That also closes the closed-room case Codex
+named: closing a room stops its task, so the guard drops the entry. One thing
+the finding did not mention would have bitten: a room can restart, and the old
+task's cleanup can land after the new task reported, blanking a live
+measurement. Entries carry the reporting generation and a clear removes only its
+own; two tests pin the fall-back and the late-clear.
+
+The digest-drift arm of admit_room_agent was the one refusal that never reaches
+append_admission_audit, where I hung the counter: mark_room_agent_stale writes
+its own outcome refused / reason_code binding_stale row inside the authority
+transaction. So the counter and the ledger disagreed on exactly one row — the
+refusal that DISCOVERS drift, the moment a package changed under an approved
+binding, which is the one worth paging on. Every later attempt was already
+counted by the status arm, so the metric would have shown drift refusals
+starting from the second. It bumps itself now, and the asymmetry is recorded in
+the daemon AGENTS.md so the next reader does not assume one site still covers
+every arm.
+
+Also merged the owner's 75a41b7, which relocated the metrics.rs ownership bullet
+past room_agent_authority.rs to clear PR #442's AGENTS.md hunk. My fix commit had
+extended that bullet at its old position, so the two collided; resolved by taking
+both intents — the relocated position (now line 136, clear of #442's 109-125) with
+the updated text. One copy of the bullet remains. Merged rather than rebased, so
+nobody's checkout is invalidated.
+
+Gates on the merged tree: docs-check PASS (30 packages, 157 files, 179 links),
+build PASS, workspace tests PASS (3249 passed, 0 failed; ocean-daemon 883/883),
+Clippy clean, format clean, ledger PASS. Dependency policy DID NOT RUN — cargo
+deny is not installed here. cargo-deny is red in CI for RUSTSEC on rtrb 0.3.4 via
+livekit, identical on main at 616293e and established as the base branch's, not
+this PR's; commented once, not widened into a lockfile bump, and the fix is the
+user's call as its own PR.
+_________________________________________________________________________________ 06:13 cloud/os-room-metrics
+
+time:      [06:42] [02-09-26]
+agent:     [claude-code], [claude-opus-5], [cloud]
+worktree:  [cloud/os-room-lifecycle]
+type:      [bug report]
+area:      [backend]
+
+Three Codex review findings on the room lifecycle PR, all verified against the
+code and all real, all fixed on the branch.
+
+P1, and the one that mattered. ingest_confirmed_event guarded on the room merely
+EXISTING while every other writer in ocean-store guards on it being open —
+add_participant, add_attachment, append_message, the authority mutations. That
+gap was unreachable for as long as the only close production could reach was a
+call room's autoclose, because call: rooms never federate; the close route this
+branch adds makes any room closable and therefore makes the combination
+reachable. Left alone it is the worst transcript corruption available here: a
+confirmed Bedrock event appends AFTER the close marker, into a room whose SSE
+tails have ended and whose snapshot reports closed true, so nothing watching can
+see the row arrive, and after a retention cut the same path refills from
+sequence 0 a transcript the operator was told was emptied. Fixed in two places
+on purpose. The store now refuses ingest for a closed room, which is what makes
+the invariant true atomically with the write and under a supervisor that is
+slow, restarted, or racing the close. The route now also calls
+FederationSupervisor::stop_room after the commit and both wakes, because the
+store refusal alone would have been a reconnect loop: a store error breaks the
+SSE epoch into Recover, so the room would reconnect forever collecting the same
+refusal. Nothing is sent to Bedrock; the credential, outbox and access
+projection are untouched and closing stays a local statement.
+
+P2. Retention rediscovered its own work forever. A cut deliberately keeps the
+rooms row and its closed_at — that row is how a cut room still answers closed
+true instead of 404ing as one that never existed — so an eligibility query
+asking only closed-before-the-cutoff returned every historical room on every
+sweep. That is an IMMEDIATE write transaction per archived room every six hours
+forever, deleting nothing, with each empty no-op counted to the operator as
+another rooms_cut. Eligibility is now an EXISTS over the same four tables the
+cut empties, so it means a cut would remove at least one row, derived from what
+the cut does rather than from a marker column that could drift out of step with
+it.
+
+P3. Blob unlink failures were discarded. The rows commit either way, so a
+swallowed remove_file error is a sweep that reports a clean run and a
+bytes_reclaimed figure taken from the INDEX while the bytes are still on disk —
+a report that actively says the opposite of what happened, which is worse than
+no report at all, in a feature whose whole point is operator visibility. Both
+jobs now count blobs_unlink_failed and set the sweep error, the health card
+carries the counter, and bytes_reclaimed counts a blob only once its file is
+actually gone. An ErrorKind::NotFound stays silent, because a file already gone
+is the outcome that was wanted. The store's cut now returns each blob's recorded
+byte_len alongside its id so the caller can attribute reclaimed bytes to the
+unlinks that succeeded rather than to the rows it deleted.
+
+Five checks added. Store: a closed room refuses federated ingest and a cut one
+is not repopulated from sequence 0, asserting no row is appended by the refusal;
+and an already-cut room drops out of retention eligibility while its rooms row
+survives. Daemon: a blob that cannot be unlinked is reported and not swallowed,
+inducing the failure with a DIRECTORY where the blob file should be so
+remove_file fails EISDIR — a read-only parent would not do, since these tests
+can run as root where mode bits are advisory and the unlink would succeed
+anyway; a clean sweep reports zero failures so the counter means something when
+it is nonzero; and a second sweep over a cut archive is a genuine no-op.
+
+Gates on the fixed tree: docs-check PASS, ocean-store 222 passed, ocean-daemon
+room_maintenance 11 passed, and the full run below. cargo-deny still cannot run
+in this environment and is red on main independently of this branch.
+_________________________________________________________________________________ 06:42 cloud/os-room-lifecycle
+
+time:      [15:23] [09-02-26]
+agent:     [codex] [gpt-5]
+worktree:  codex/ocean-rooms-integration-20260902
+type:      [feature-request]
+area:      [backend]
+
+Integrated the frozen Ocean Rooms PR stack over the post-#449 base in an
+independent clone, then added the daemon-owned unopened-room attention
+projection required by Surface. `GET /v1/rooms/persistent` now returns a sparse
+`attention` array bounded and ordered by the same existing room page. Each row
+contains the room id, optional decimal-string latest/read sequences, and numeric
+unread/mention counts. Identity comes only from the daemon's local-room
+principal or the room credential's authenticated local Human member id; counts
+come only from the local durable transcript, confirmed-event mention rows, and
+the durable read cursor. No client identity is accepted and no list request
+tails Bedrock or scans rooms outside its page. Local message prose is never
+guessed into mentions.
+
+Added a native federation configuration fallback at
+`<config-dir>/federation.env`. Presence of either process variable selects the
+process source wholesale; otherwise the daemon opens the file without following
+symlinks and requires a regular current-owner 0600 file within 16 KiB containing
+only the URL and literal owner token. Invalid partial pairs, origins, tokens,
+ownership, mode, links, duplicates, and unknown entries fail closed without
+logging key names or values. The supervised launcher keeps its Keychain-capable
+loader, uses the same process-first precedence, never publishes the bearer into
+the launchd domain, and the operator docs now describe that single custody
+model instead of the stale `launchctl setenv` instruction.
+
+Ported the shared ledger checker forward to r4. Historical one-digit header
+hours remain readable but repaired rule identities normalize to required
+`HH:MM`; the OS copy's revision/digest witness is now explicit as r4 /
+4762696f29d4 and pinned by the OS regression table.
+
+Verification on the exact change used an isolated offline compile probe because
+the real lock pins rtrb 0.3.5 while this host cache has only 0.3.4 and crates.io
+DNS is unavailable. With only that scratch dependency substitution, ocean-store
+passed all 230 tests; focused daemon attention passed 2/2, federation config
+9/9, and both corrected integration parity regressions passed. The full daemon
+run compiled and passed 805/902; 95 failures require sandbox-denied socket,
+process, or HOME writes and were unrelated, while the two real expectation
+failures exposed by the run were fixed and rerun green. Both Node suites passed
+28/28, docs-check passed (30 packages, 158 active Markdown files, 182 links),
+format and diff checks passed, and the ledger was clean before this append.
+_________________________________________________________________________________ 15:23 codex/ocean-rooms-integration-20260902
+
+time:      [15:46] [09-02-26]
+agent:     [codex] [gpt-5]
+worktree:  codex/ocean-rooms-integration-20260902
+type:      [bug report]
+area:      [backend]
+
+Closed a federation-source precedence edge found in the exact-head security
+audit for PR #450. The Rust daemon already treated an empty-but-present process
+variable as an explicit process source, but the supervised launcher tested only
+for a nonempty value and could load ambient disk credentials when both process
+variables were explicitly empty. The launcher now uses presence semantics too,
+so the native validator sees and rejects that explicit empty pair instead of
+silently replacing it. The focused launcher suite passed 11/11, including the
+new empty-pair regression; shell syntax and diff checks also passed. No daemon
+was restarted and production was not changed.
+_________________________________________________________________________________ 15:46 codex/ocean-rooms-integration-20260902
+
+time:      [15:58] [09-02-26]
+agent:     [codex] [gpt-5]
+worktree:  codex/ocean-rooms-integration-20260902
+type:      [bug report]
+area:      [backend]
+
+Closed both P2 findings from the fresh exact-head review of Ocean OS PR #450.
+Review comment 3918056880 found that orphan-directory bytes were credited before
+`remove_dir_all` succeeded. Whole-directory removal now attributes both the byte
+total and removal count only after success; NotFound stays an already-achieved
+no-op, and every other refusal sets the bounded sweep error without claiming
+bytes. A deterministic injected-failure regression proves a directory left on
+disk contributes zero reclaimed bytes, without relying on mode bits that root
+can bypass. Review comment 3918056889 found that the launcher's duplicate-key
+test inferred presence from a nonempty value. The parser now records explicit
+seen state for URL, literal token, and Keychain reference, so an empty first
+assignment cannot conceal a duplicate second assignment and the file is refused
+whole without logging its keys or values.
+
+Focused verification passed: daemon `room_maintenance::tests::` 11/11 and
+ocean-daemon test-target Clippy with denied warnings in the isolated offline
+compile probe (scratch-only rtrb 0.3.4 substitution; tracked Cargo.lock remains
+unchanged), federation launcher 12/12, cargo fmt check, shell syntax, and git
+diff check. No daemon was restarted and production was not changed.
+_________________________________________________________________________________ 15:58 codex/ocean-rooms-integration-20260902
+
+time:      [16:14] [09-02-26]
+agent:     [codex] [gpt-5]
+worktree:  codex/ocean-rooms-integration-20260902
+type:      [bug report]
+area:      [backend]
+
+Closed the new exact-head P1 from Ocean OS PR #450 review comment 3918092869
+and the earlier current-head pagination P2. The message tail formerly read its
+final transcript page, released the store, then asked whether the room was
+open. A close could commit in that gap, making the tail return before reading
+the close marker already durable behind its cursor. Catch-up now reads the page
+and openness under one store guard and returns that captured state with the
+page. If close preceded the read, the same page carries its marker and the tail
+ends after sending it; if close followed the read, the already-subscribed wake
+bus drives one more catch-up. The direct duplicate-hint openness check was
+removed because it recreated the same split-read race. A held replay/live seam
+now deterministically closes in that exact gap and proves the marker arrives
+before stream end.
+
+The room-list cursor formerly returned only the last room id and re-resolved
+that row's mutable `updated_at` on the next request. Updating the boundary room
+could move the anchor forward and return a room from the first page again. New
+cursors are versioned opaque values carrying the exact `(updated_at, id)`
+boundary observed on the prior page; legacy id cursors retain their indexed
+compatibility lookup and stale fallback. The regression moves the boundary
+room after page one and proves page two neither duplicates nor loops.
+
+Focused verification passed with the tracked Cargo.lock unchanged: ocean-store
+231/231, all room-list cases 7/7, all daemon message-tail cases 8/8 plus the
+existing close-marker test, and ocean-store/ocean-daemon test-target Clippy
+with denied warnings. The initial worker verification used an isolated cached
+rtrb 0.3.4 substitution when crates.io was unavailable; root then replayed the
+room-list and message-tail suites plus both denied-warning Clippy runs directly
+against the tracked lock and its pinned rtrb 0.3.5. Workspace test-target check
+and the ocean-daemon release-profile legacy-chromium check passed in the
+isolated probe; docs-check, 30 Node ledger/federation tests, format, shell
+syntax, and diff checks passed with 588 ledger entries closed. No daemon was
+restarted and production was not changed.
+_________________________________________________________________________________ 16:14 codex/ocean-rooms-integration-20260902
+
+time:      [16:55] [09-02-26]
+agent:     [codex] [gpt-5]
+worktree:  codex/ocean-rooms-integration-20260902
+type:      [bug report]
+area:      [backend]
+
+Closed the two remaining exact-head security findings on Ocean OS PR #450.
+Review comment 3918172761 found that retention joined a stored attachment id
+directly after cutting its row, allowing a malformed imported or corrupt id to
+name a path outside the blob root. Retention now reuses the attachment module's
+single validated `blob_path`; an invalid stored id becomes a bounded sweep
+failure and never reaches `remove_file`. A regression stores an absolute path
+and proves the outside file survives, reclaimed bytes stay zero, and the
+failure is reported.
+
+Review comment 3918172768 found that the supervised federation loader validated
+the credential pathname and reopened it for parsing. The loader now refuses a
+foreign or group/world-writable parent, opens the validated path once, compares
+that descriptor's inode and owner with the checked file, and parses only the
+descriptor. A writable-parent regression proves the source is refused whole.
+
+Focused verification passed: room-maintenance 13/13, federation loader 13/13,
+ocean-daemon all-target Clippy with denied warnings, shell syntax, cargo fmt,
+and git diff checks. The nearest daemon devlog records both hardened contracts;
+the root and crate-parent devlogs remain unchanged because ownership and the
+top-level structure did not move. No daemon was restarted and production was
+not changed.
+_________________________________________________________________________________ 16:55 codex/ocean-rooms-integration-20260902
+
+time:      [18:15] [09-02-26]
+agent:     [codex] [gpt-5]
+worktree:  codex/ocean-rooms-integration-20260902
+type:      [bug report]
+area:      [backend]
+
+Closed all three findings from the fresh exact-head review of Ocean OS PR #450
+at 755db7cf7ef573e49a1181786be7610e9c80e1b7. Review comment 3918637761
+found that a locally closed federated room retained its credential and Live
+projection, so startup could recreate its sender/SSE tasks. Startup now reads
+openness and access state together and starts only an open, non-Revoked room;
+the integration regression proves a closed credentialed room creates no task
+slot and makes no Bedrock subscription after restart.
+
+Review comment 3918637774 found that SQLite may answer a requested
+`journal_mode=WAL` transition with the mode it actually retained rather than
+an error. The file durability helper now decodes that returned value and fails
+to open unless it is exactly WAL; an in-memory connection deterministically
+returns `memory` and proves the rejection branch. Review comment 3918637781
+found that both federation shell validators accepted a syntactically
+five-digit port above 65535. The setup command and supervised launcher now
+share the same explicit numeric range check, with 99999 covered on both paths.
+
+Verification passed: ocean-store 232/232; the closed-room restart and startup
+projection cases; federation loader 13/13; ocean-store and ocean-daemon
+all-target Clippy with denied warnings; shell syntax, cargo fmt, and git diff.
+The daemon and store devlogs record the durable contracts; the root and
+crate-parent docs remain unchanged because no ownership or structure moved.
+No daemon was restarted and production was not changed.
+_________________________________________________________________________________ 18:15 codex/ocean-rooms-integration-20260902

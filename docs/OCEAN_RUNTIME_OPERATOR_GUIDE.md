@@ -195,7 +195,64 @@ Two additional SQLite databases live alongside sessions and the config dir:
 - `rooms.db` — persistent room store (`SqliteRoomStore`). Survives daemon restarts; override the full path with `OCEAN_DB_PATH`.
 - `titles.db` — Longhouse title/escrow registry (firekeeper titles, recall tallies). Survives daemon restarts; override the full path with `OCEAN_TITLES_DB_PATH`.
 
+#### Reading `rooms.db`'s durability settings
+
+Every production open of `rooms.db` applies one named set of PRAGMAs
+(`apply_durability_pragmas` in `crates/ocean-store/src/lib.rs`): WAL journaling,
+`synchronous = NORMAL` (see the durability trade below), a 5-second busy timeout
+so a second writer waits for the lock instead of failing `SQLITE_BUSY`, and
+foreign keys.
+Writes are serialized in-process by the `Mutex` the daemon holds the store
+behind; the busy timeout is what bounds a writer on a SECOND connection.
+
+You do not need `sqlite3` to check any of this. The daemon reads the settings
+back off the live connection at startup and logs them on the
+`persistent rooms store ready` line:
+
+```
+INFO persistent rooms store ready path=/Users/you/.config/ocean-rs/rooms.db
+     journal_mode=wal synchronous=normal busy_timeout_ms=5000 foreign_keys=true
+```
+
+`journal_mode=delete` or `busy_timeout_ms=0` on that line means the store is
+running without the durability posture above. A
+`persistent rooms store ready; durability settings unreadable` warn line means
+the store opened but the read-back query failed — the daemon does not refuse to
+boot over an unreadable diagnostic, so treat that line as the settings being
+unknown, not as them being wrong.
+
+**What `synchronous = NORMAL` costs, stated plainly.** A crash of the daemon
+process loses nothing that was committed. An **OS crash or power cut** can lose
+the most recently committed transactions — including a room message the daemon
+already acknowledged to a client. Nothing replays those. The room outbox is not
+a redo log for this: it holds locally-authored *federated* events that are still
+unconfirmed, it retries the ones that survived the crash, and an ordinary local
+room message never gets an outbox row at all. What NORMAL still guarantees is
+that a lost transaction is lost **whole** — the database is never left torn or
+corrupt, and a partially applied write is not an outcome.
+
+If you are running Ocean on hardware where an unclean power loss is a realistic
+operational event and losing the last few seconds of room history is not
+acceptable, that is the case for `synchronous = FULL`, which fsyncs on every
+commit at a per-write cost. Raise it as a change to
+`apply_durability_pragmas`; do not set it by hand on a live database, since the
+next `open()` reapplies the crate's value and the startup log would then
+disagree with what you set.
+
 ### Federated-room Bedrock bridge
+
+Federation configuration is resolved once at daemon startup. An explicit
+process environment wins as a pair: if either federation variable is present,
+the daemon never falls back to disk and an incomplete pair is invalid. When
+both are absent, the daemon reads
+`${OCEAN_CONFIG_DIR:-~/.config/ocean-rs}/federation.env`. That file must be a
+same-owner, non-symlink regular file at exactly `0600`, no larger than 16 KiB,
+and contain exactly one `OCEAN_FEDERATION_URL=...` line plus one
+`OCEAN_FEDERATION_OWNER_TOKEN=...` line. Any other entry, duplicate, custody
+failure, invalid origin, or invalid token refuses the whole file. Runtime
+diagnostics report only that private configuration was invalid; key names and
+values never enter logs. The supervised launcher uses the same file as its
+fallback immediately before exec and never calls `launchctl setenv`.
 
 Set `OCEAN_FEDERATION_URL` to the Bedrock **origin only** (for example
 `https://bedrock.example.com` or trusted-loopback diagnostics such as
@@ -252,6 +309,82 @@ Bedrock-bound daemon requests (Authorization or the durable redeem exchange),
 and deterministic registration keys cross only in the Bedrock agent batch.
 Neither enters a surface request, projection, transcript, log, or error; local
 paths, tools, provider credentials, and permission posture never cross Bedrock.
+
+Room attachment BYTES live in `room-attachments/` beside `rooms.db` — one
+subdirectory per room, named by a one-way hash of the room key — so
+`OCEAN_DB_PATH` moves a room's metadata and its files together.
+
+#### Room retention and maintenance
+
+Neither `rooms.db` nor the blob tree shrinks on its own. A transcript row is
+written and never removed, and a blob is removed only when somebody deletes the
+row naming it, so a long-lived daemon grows monotonically. Two sweeps run on one
+loop every **6 hours** to bound that, and both report to the `room_maintenance`
+card on `GET /health`:
+
+- **Transcript retention** cuts rooms that have been CLOSED longer than
+  `OCEAN_ROOM_RETENTION_DAYS`. It removes the transcript, the attachment rows
+  and their bytes, the read cursors, and the room's federation dedup index, in
+  one transaction per room. The `rooms` row itself STAYS, so a cut room still
+  answers `closed: true` on `/snapshot` — frozen and empty — rather than 404ing
+  as one that never existed.
+- **Attachment orphan GC** unlinks blob bytes no `room_attachments` row claims:
+  the residue of an upload that fsynced its bytes and then failed to commit its
+  row, `.tmp` files from a crash mid-upload, and whole directories belonging to
+  no room the store knows. Anything modified within the last **hour** is left
+  alone — that grace is what stops the sweep racing an upload in progress.
+
+`OCEAN_ROOM_RETENTION_DAYS` is read ONCE at startup, so the window a sweep
+applies is always the one `/health` reports; changing it needs a restart.
+
+- **Unset or `0` means NEVER, and that is the default.** A transcript cut is
+  unrecoverable, so retention is opt-in: upgrading the daemon must not start
+  deleting history nobody asked it to delete.
+- Anything that is not a non-negative integer — a typo, a `30d`, a negative —
+  also means never, with a warning at startup. The one safe direction to fail
+  on a knob that deletes transcripts is "keep everything"; a mis-parse must
+  never become a SHORTER window than the operator wrote.
+- If you want a window, **90 days** is the number to reach for unless you have
+  a reason for another: it outlasts any review or incident cycle that would
+  send somebody back to a finished room's history, and it still puts a closed
+  room's rows out of the store inside the same quarter it was closed. Set it
+  in the daemon's own environment (`OCEAN_ROOM_RETENTION_DAYS=90`) and confirm
+  it on `/health` — `retention_days` on the card is the daemon's own word for
+  what it will act on.
+
+Retention never touches an OPEN room, at any age: the window is measured from
+the close, so a room that has been running for years is not eligible until
+somebody closes it with `POST /v1/rooms/persistent/{key}/close`. A room that
+has already been cut stops being eligible too: eligibility asks whether a cut
+would still remove something, so an archive of emptied rooms is not re-swept
+forever and `rooms_cut` never counts an empty no-op.
+
+Closing a federated room also stops its federation task, and the store refuses
+confirmed Bedrock events for a closed room outright. Both halves are deliberate:
+the store's refusal is what makes the invariant true under a slow or restarted
+supervisor, and stopping the task is what keeps that refusal from becoming a
+reconnect loop. Nothing is sent to Bedrock — the room's credential and outbox
+are untouched — so a closed room can still be inspected upstream; it simply
+stops accepting new transcript rows locally.
+
+`POST /v1/rooms/maintenance/run` runs both sweeps immediately under operator
+authentication and answers with the same card, which is the fast way to confirm
+a newly set window does what you expect without waiting out the interval.
+
+The `room_maintenance` card on `GET /health` carries the configuration
+(`interval_secs`, `retention_days`, `orphan_grace_secs`) as well as the last
+run's `last_run_at`, `last_run_ms`, `runs_total`, counts (`rooms_cut`,
+`messages_removed`, `attachment_rows_removed`, `cursors_removed`,
+`federated_index_rows_removed`, `orphan_files_removed`, `orphan_dirs_removed`),
+`bytes_reclaimed`, `blobs_unlink_failed`, and `last_error` (`null` when the last
+sweep was clean). `bytes_reclaimed` counts a blob only once its file is actually
+gone, so a nonzero `blobs_unlink_failed` beside a reclaim figure short of what
+was cut is the signature of a blob tree the daemon can read but not write — the
+one failure here that is otherwise invisible, since the rows commit and every
+other count looks healthy while disk never comes back. The
+configuration is on the card deliberately: `rooms_cut: 0` on its own cannot tell
+you whether retention swept and found nothing or was never turned on, and those
+two have opposite remedies.
 
 ## Common commands
 
@@ -322,6 +455,7 @@ the `health` and `ready` route handlers in `crates/ocean-daemon/src/main.rs`.
   state.
 - Body: `{"ok":true,"service":"ocean-daemon","version":"<v>","backend":"<name>","persist_failures_total":<n>}`.
   `persist_failures_total` mirrors `ocean_persist_failures_total` in `GET /metrics` — it is the count of dropped call-transcript writes since daemon start. `0` is healthy; a non-zero value means the SQLite room store is silently losing writes.
+- The body also carries a `rooms` object: the room and federation metrics (rooms by access state, outbox depth and oldest-item age, federation SSE reconnects and lag, redemption failures, admission refusals, store lock wait), including the per-room `rooms[]` list that the `ocean_room_*` Prometheus families in `GET /metrics` cannot carry because a room id may not be a fixed-cardinality label. Room-derived numbers are sampled without blocking the probe: `rooms.sampled: false` means the store lock was busy and the numbers beside it are the previous sample, aged by `rooms.sample_age_ms`. `rooms[].outbox_oldest_age_seconds` is measured from this daemon process's first sighting of the row (the `outbox` table stores no timestamp), so it restarts at zero when the daemon does.
 - Says nothing about whether a provider/credential is configured. A daemon with
   no API key still answers `/health` with 200.
 
@@ -556,7 +690,7 @@ POST   /v1/permissions/{id}/decision      allow/deny a mutating-tool request
 GET    /v1/rooms/persistent               list persistent rooms
 POST   /v1/rooms/persistent               create a room { key, name, trigger_policy?, workspace_root? }; blank workspace_root is unbound, while a nonblank value must resolve to an existing absolute directory and is persisted canonically (400 invalid_workspace_root otherwise). Agent execution revalidates the stored canonical directory and returns 503 workspace_unavailable instead of inheriting daemon cwd when it is missing, symlink-replaced, relative, or noncanonical.
 GET    /v1/rooms/persistent/{key}         room + transcript + access + agent_owners; the transcript is a BOUNDED first page like `/transcript` and `/snapshot` — at most 1000 rows from the START of the log, with next_seq/has_more beside it, so replay the rest as `/transcript?after_seq=next_seq` rather than reading the array as the whole history. Open rooms only; unknown/closed room 404
-PATCH  /v1/rooms/persistent/{key}         update mutable metadata { name?, trigger_policy? }; an absent field is unchanged, trigger_policy: null clears the policy, an unknown field is a 400; 200 { room }, 404 unknown/closed room
+PATCH  /v1/rooms/persistent/{key}         update mutable metadata { name?, trigger_policy?, workspace_root? }; an absent field is unchanged, trigger_policy: null clears the policy, an unknown field is a 400; 200 { room }, 404 unknown/closed room. workspace_root binds or REBINDS the room's workspace after creation, on the same canonicalization and the same 400 invalid_workspace_root create answers — workspace_root: null (or a blank string, matching create) unbinds. Absent is unchanged rather than a clear precisely because an unbound room's agent turns all fail closed with 503 workspace_unavailable, so a plain rename must never silently switch a room's agents off; until this field existed a room created unbound could not be bound at all, and the only repair was a new room and a lost transcript.
 POST   /v1/rooms/persistent/{key}/participants            join { id, display_name, kind? }
 DELETE /v1/rooms/persistent/{key}/participants/{participant_id}  leave
 POST   /v1/rooms/persistent/{key}/messages                post message { author_id, author_kind?, body }
@@ -572,6 +706,7 @@ DELETE /v1/rooms/persistent/{key}/attachments/{attachment_id}  remove the row an
 POST   /v1/rooms/persistent/{key}/summarize               summarize the newest `limit` transcript rows into the room's single well-known `room-summary` note { requested_by, limit?, after_seq? }; ONE model turn on roles.summarize -> roles.fast -> the bound model, created at v1 then amended in place. 200 { summarized: true, artifact, created, model, messages_summarized, from_seq, to_seq, has_more }; 200 { summarized: false, code: no_messages | empty_summary | unchanged } are clean answers, not errors; 403 forged_artifact_author / non-roster requested_by; 404 unknown OR soft-closed room (a frozen room must not gain artifacts); 429 at_capacity; 502 summary_provider_error; 504 summary_timeout. Local-only: a Live room's summary does not propagate to peers.
 GET    /v1/rooms/persistent/{key}/snapshot                hydrate: room+participants+transcript+last_seq+next_seq+prev_seq+has_more+closed+agent_owners (?after_seq=N&limit=M forward, or ?before_seq=N&limit=M backward). `before_seq` picks which END of the log the page comes from: without it the page runs forward from the start with next_seq as the cursor — which for a 12,000-message room opens hydration at message #1 — and with it the page is the newest `limit` rows whose seq is strictly less than the cursor, still ascending, with prev_seq (the oldest row returned) to page further back. A before_seq above every stored seq is how a client opens at the tail before it knows the last seq; before_seq=0 is a terminal empty page; both cursors at once is a 400 conflicting_transcript_cursors rather than a precedence rule. has_more always means more rows exist in the direction that page was paging. Backward paging is THIS route only — `/transcript` and room detail stay forward-only. Unlike room detail and the SSE tail, this route SERVES a soft-closed room (OCEAN-170 audit replay), in both directions and at any length — `closed` is true exactly when it did, and a hydrating client must read it and present an audit view instead of opening a tail nothing will feed and a composer whose every send 404s. `agent_owners` is the same [{agent_id, owner_id, owner_present}] projection room detail serves — which WORKER owns which agent participant, and whether that worker is still on the roster — carried here because hydration goes through this route, so a field only room detail sent could not reach a client at all; empty for a room with no owned agents
 GET    /v1/rooms/persistent/{key}/events                  SSE: initial full room_access projection (no id) + id-bearing room_message frames via ?after_seq=N / Last-Event-ID replay, then post-commit access-update + message tail; open non-call rooms only
+POST   /v1/rooms/persistent/{key}/close                   freeze the room. Two authorities: ?actor_id= naming a roster member (roster-checked in the closing transaction; an Agent's or System's identity claimed off the wire is 403 forged_closer), or an X-Ocean-Operator credential, which is NOT roster-checked and whose presence selects that lane outright — a presented-and-invalid credential is refused, never downgraded to the member lane. One IMMEDIATE transaction appends a System marker naming the closer and sets closed_at, so a frozen room always explains itself. 200 { room, closed: true, marker_seq }, 404 unknown or already-closed room, 400 with neither authority. Afterwards: detail 404s, writes refuse, live /events tails flush the marker and END, and /snapshot answers closed: true with the transcript pageable both ways and the roster and agent_owners intact. Bedrock is untouched.
 GET    /v1/rooms/persistent/{key}/read-cursor             fetch the daemon-owned read cursor projection for Local/Live rooms; closed/pending/revoked return typed unsupported
 PATCH  /v1/rooms/persistent/{key}/read-cursor             advance the daemon-owned read cursor { read_seq }; Local/Live only, monotonic, publishes room_read_cursor wake on success
 POST   /v1/rooms/persistent/{key}/outbox/retry            retry a locally-authored federated event awaiting Bedrock confirmation { client_event_id }; 202 on success, 403 revoked, 404 unknown room/item, 409 pending/local, 400 malformed body, 500 sanitized store error
@@ -593,12 +728,13 @@ POST   /v1/rooms/persistent/{key}/agents/{agent_member_id}/invoke  explicit-only
 # Room workspace — the membership-gated lane to the room's Bedrock container.
 # The room's Bedrock bearer NEVER leaves the daemon: a client asserts a roster participant in
 # ?actor_id= and the daemon supplies the credential and the upstream actor_member_id itself.
-# Three registrations carry eighteen upstream calls; WORKSPACE_ALLOWLIST in
+# Three registrations carry sixteen upstream calls; WORKSPACE_ALLOWLIST in
 # crates/ocean-daemon/src/room_workspace_proxy.rs is the exposed surface, and Bedrock's own
 # gateWorkspaceAccess still runs on every forwarded call. Deliberately NOT exposed:
 # workspace secret READ-BACK (the member-gated name list, and any value return — no route
 # anywhere returns a stored value, upstream included), workspace file WRITE and DELETE,
-# mkdir, flush, and hydrate.
+# mkdir, flush, hydrate, and port expose/close. Port publication stays
+# unreachable until its own accepted implementation manifest authorizes it.
 #
 # Workspace identity model (2026-08-29 operator ruling). ?actor_id= is a LOCAL roster id;
 # Bedrock speaks opaque member ids. On any route that needs one, the daemon DERIVES it and
@@ -614,19 +750,11 @@ POST   /v1/rooms/persistent/{key}/agents/{agent_member_id}/invoke  explicit-only
 # human actually owns the room stays Bedrock's call, and its 403 relays verbatim. Every member
 # may still read, clone, and build the binding an owner made.
 #
-# Port exposure is the ONE pair this lane gates more tightly than Bedrock does. Upstream both
-# expose and close sit behind ordinary member write; here both are owner verbs. The preview
-# token Bedrock mints is derived from the room and the port and is a routing LABEL, not a
-# credential — whatever the room serves on that port is served to anyone holding the URL — so
-# publishing a room's compute to the open internet is treated as the owner's call. This is a
-# deliberate narrowing, not upstream parity; the daemon's manifest test pins it, so an operator
-# reading a 403 workspace_not_owner_principal on a port call is seeing policy and not a bug.
 GET    /v1/rooms/persistent/{key}/workspace               room container status (?actor_id=); Bedrock's status body and code relayed verbatim
 GET    /v1/rooms/persistent/{key}/workspace/{*leaf}       reads (?actor_id=): leaf `list` (?path=), `execs` (?limit=), `repo`, `repo/ci` (?limit=), `file` (?path=) — the one leaf whose upstream 2xx is raw bytes; the daemon answers a bounded JSON PROJECTION { ok, path, size, encoding: "utf8"|"base64", content } with text-vs-binary derived from the bytes, never from Bedrock's extension-derived content-type, so the browser never receives the bytes as a document. 413 workspace_file_too_large past 1 MiB — the daemon's cap is the only bound in the chain and nothing is ever truncated; Bedrock's own refusals on the leaf (workspace_absent, its path 400s) relay verbatim like every other row's
-POST   /v1/rooms/persistent/{key}/workspace/{*leaf}       commands (?actor_id=, JSON object body): leaf `exec`, `repo/clone`, `repo/build`, `repo/ci`. Any client-supplied actor_member_id is stripped and the daemon inserts the actor's RESOLVED member id. 403 forged_workspace_actor for a claimed Agent/System identity, 403 workspace_actor_unmapped for an actor with no derivable member id, 413 workspace_request_too_large over 32 KiB. The daemon waits 960s on these — above Bedrock's own 900s EXEC_TIMEOUT_MAX — so a long `npm test` or build is relayed rather than refused; reads wait 15s. Owner verbs ride two more POST leaves — `repo/bind` ({ remote, branch?, dir? }, forwarded as Bedrock's PUT workspace/repo; validation is upstream and strict deny-extra) and `repo/unbind` ({} — the upstream DELETE reads no body) — because cors.rs does not advertise PUT; the workspace lifecycle rides two more — `provision` ({ spec? }, forwarded as Bedrock's POST workspace; idempotent upstream, 409 workspace_provisioning while another claim is live) and `destroy` ({} — forwarded as the DELETE, which reads no body; ?flush=0 skips the flush-to-Bedrock save, 409 workspace_absent when there is nothing to destroy); and port exposure rides two more — `ports` ({ port }, forwarded as Bedrock's POST workspace/ports; 201 { port, preview_url } relayed verbatim) and `ports/close` ({ port } — the daemon RE-PROVES the value as an integer in 1-65535 and moves it into the upstream path, DELETE workspace/ports/{port}, which reads no body; 400 invalid_request locally for anything that is not a port number, with nothing forwarded, and 404 relayed when the port is not currently exposed). Which ports are legal stays Bedrock's policy and relays verbatim — an integer under 1024, or the reserved 3000, earns its 400 upstream. The room's secrets ride one more — `secrets/set` ({ secrets: { NAME: value-or-null } }, forwarded as Bedrock's PUT workspace/secrets; null removes a name, validation is upstream and strict deny-extra, e.g. GH_TOKEN so `gh` authenticates CI pulls on a private repo). The set is the ONLY secrets call on the lane and values are never echoed by design — the reply { set, removed, total } is names only, and no route anywhere returns a stored value. 409 workspace_absent until the room is provisioned; a Bedrock host without OCEAN_ROOM_SECRET_KEY answers 501 secrets_unconfigured, relayed verbatim. The exec ledger's take-back rides one more — `execs/purge` ({ exec_id? }, forwarded as Bedrock's POST workspace/execs/purge; owner-gated with no admin bypass, because the tails are the room's output and only the room's owner decides they cannot be un-published — the recovery for a token that leaked before the write-time scrub could know it was a secret, or was rotated after a leak, and so sits in stored exec tails forever; omit exec_id to blank every stored tail, reply { purged, exec_id } with exec_id null for a purge-all; 400 malformed exec_id, 404 well-formed but absent, 409 exec_running while the command still runs — a running row has no stored output yet; the audit event room.workspace.execs_purged carries counts and ids, never content). All eight forward only for the actor that resolves to the credential's principal (403 workspace_actor_unmapped / 403 workspace_not_owner_principal otherwise); bind/unbind/secrets-set/execs-purge answer promptly out of Bedrock's own tables and carry the 15s read budget, while provision/destroy (hydrate and checkout restore, flush) and both ports verbs run container work and carry the 960s command budget. Ports needs it because Bedrock drives its compute driver on a 60s budget of its own and only checks that the workspace ROW says ready, so a first expose after an idle container stop pays for a cold start; at 15s the daemon would time out while the expose completed upstream, and the caller would read a failure for a port that IS published and never be handed its preview_url
+POST   /v1/rooms/persistent/{key}/workspace/{*leaf}       commands (?actor_id=, JSON object body): leaf `exec`, `repo/clone`, `repo/build`, `repo/ci`. Any client-supplied actor_member_id is stripped and the daemon inserts the actor's RESOLVED member id. 403 forged_workspace_actor for a claimed Agent/System identity, 403 workspace_actor_unmapped for an actor with no derivable member id, 413 workspace_request_too_large over 32 KiB. The daemon waits 960s on these — above Bedrock's own 900s EXEC_TIMEOUT_MAX — so a long `npm test` or build is relayed rather than refused; reads wait 15s. Owner verbs ride two more POST leaves — `repo/bind` ({ remote, branch?, dir? }, forwarded as Bedrock's PUT workspace/repo; validation is upstream and strict deny-extra) and `repo/unbind` ({} — the upstream DELETE reads no body) — because cors.rs does not advertise PUT; the workspace lifecycle rides two more — `provision` ({ spec? }, forwarded as Bedrock's POST workspace; idempotent upstream, 409 workspace_provisioning while another claim is live) and `destroy` ({} — forwarded as the DELETE, which reads no body; ?flush=0 skips the flush-to-Bedrock save, 409 workspace_absent when there is nothing to destroy). The room's secrets ride one more — `secrets/set` ({ secrets: { NAME: value-or-null } }, forwarded as Bedrock's PUT workspace/secrets; null removes a name, validation is upstream and strict deny-extra, e.g. GH_TOKEN so `gh` authenticates CI pulls on a private repo). The set is the ONLY secrets call on the lane and values are never echoed by design — the reply { set, removed, total } is names only, and no route anywhere returns a stored value. 409 workspace_absent until the room is provisioned; a Bedrock host without OCEAN_ROOM_SECRET_KEY answers 501 secrets_unconfigured, relayed verbatim. The exec ledger's take-back rides one more — `execs/purge` ({ exec_id? }, forwarded as Bedrock's POST workspace/execs/purge; owner-gated with no admin bypass, because the tails are the room's output and only the room's owner decides they cannot be un-published — the recovery for a token that leaked before the write-time scrub could know it was a secret, or was rotated after a leak, and so sits in stored exec tails forever; omit exec_id to blank every stored tail, reply { purged, exec_id } with exec_id null for a purge-all; 400 malformed exec_id, 404 well-formed but absent, 409 exec_running while the command still runs — a running row has no stored output yet; the audit event room.workspace.execs_purged carries counts and ids, never content). All six owner leaves forward only for the actor that resolves to the credential's principal (403 workspace_actor_unmapped / 403 workspace_not_owner_principal otherwise); bind/unbind/secrets-set/execs-purge answer promptly out of Bedrock's own tables and carry the 15s read budget, while provision/destroy (hydrate and checkout restore, flush) run container work and carry the 960s command budget.
 # Shared refusals on every workspace call, all fail-closed with nothing forwarded: 400
-# invalid_request (no ?actor_id=, a non-object body, or a `ports/close` body naming no port
-# number), 403 not_a_room_member, 403
+# invalid_request (no ?actor_id= or a non-object body), 403 not_a_room_member, 403
 # room_access_revoked, 403 workspace_actor_unmapped (a route needing a member id, asserted by
 # an actor the identity model resolves to nothing), 403 workspace_not_owner_principal (an owner
 # verb asserted by an actor that resolves to a member id other than the credential's
@@ -640,6 +768,9 @@ POST   /v1/rooms/persistent/{key}/workspace/{*leaf}       commands (?actor_id=, 
 
 # Room media — retained independently from the retired projection API
 POST   /v1/rooms/{room_id}/livekit-token                  mint a LiveKit join token for web in-room voice/video
+
+# Room maintenance — store-wide, operator only
+POST   /v1/rooms/maintenance/run                          run the transcript-retention and attachment-orphan sweeps NOW instead of waiting for the 6-hour loop. Operator-authenticated (X-Ocean-Operator; no member lane — the sweep is store-wide and belongs to no room), 503 when no operator key is configured or the header is absent, 403 on an invalid, cookie-bearing, or foreign-origin credential. 200 { room_maintenance } — the same card GET /health carries, so a hand-run sweep reports its own result.
 
 # Sessions (legacy view)
 GET    /v1/sessions                       list sessions
