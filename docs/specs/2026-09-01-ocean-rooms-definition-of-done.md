@@ -7,11 +7,13 @@ silently reconciled.
 Scope: Ocean Rooms across ocean-os (daemon), ocean-surface (web, Tauri desktop,
 Chrome extension) and ocean-bedrock (data plane, compute, identity).
 
-One rule for every line: it is done when a member can DO the thing from a
-shipped surface, can TELL that it is there, and an executable check pins it.
+The exit rule is: a line is done when a member can DO the thing from a shipped
+surface, can TELL that it is there, and an executable check pins it. This is an
+inventory of unfinished work, so a line that does not yet name an executable
+check is not eligible to close; its owning repo must add that check first.
 A field with a reader is not done (before_seq had a consumer and no member
 could ask for older history). A route with a curl example is not done. A merge
-production never received is not done. Each line names its check and repo.
+production never received is not done. Each line names its owning repo.
 Written 2026-09-01 from three read-only assessments at ocean-bedrock 8753038,
 ocean-os 616293e, ocean-surface d58a145.
 
@@ -79,19 +81,33 @@ ocean-os 616293e, ocean-surface d58a145.
   desktop is read-only for the ceremony and has no room deep link. [surface, L]
 
 ## 2. What an agent can do
-- 2.1 Bound to a room through the authorization ceremony from any host.
+- 2.1 Bound to a room through the authorization ceremony from any host. Check:
+  `cargo test -p ocean-daemon room_agent_authority::tests` in ocean-os and
+  `cargo test -p ocean-surface-ui --test room_agent_authorization_regressions`
+  in ocean-surface; the Surface test must carry an explicit web, Tauri and
+  extension host matrix before this line can close. [os, surface, M]
 - 2.2 Woken by @mention; the reply lands attributed in the transcript; a
   refusal (workspace_unavailable, room_history_unavailable) is rendered in the
   transcript, not lost in an audit row. Check: end-to-end wake against a real
   agent, recorded. [os, surface co_dispatch, M]
 - 2.3 Able to act: PHASE1_SAFE_CAPABILITIES is non-empty under an accepted
   Stage 2 manifest, so a room agent can at least read the bound repo and run
-  the room's build. Today the set is empty. [os, L, architecture decision]
+  the room's build. Today the set is empty. Check:
+  `cargo test -p ocean-daemon room_agent_authority::tests` must pin the exact
+  accepted Stage 2 capability set and an end-to-end read/build admission before
+  this line can close. [os, L, architecture decision]
 - 2.4 Triggers that are offered fire: on_thread_reply works in federated rooms
   or is not offered there and a stored dead value can be cleared;
-  on_component_event and on_schedule are hidden until wired. [os, surface, S]
+  on_component_event and on_schedule are hidden until wired. Check:
+  `cargo test -p ocean-daemon dead_thread_reply_transition_refuses_only_the_flip_out_of_a_local_room`
+  and, in ocean-surface,
+  `cargo test -p ocean-surface-ui --test ci_failure_trigger_control`.
+  [os, surface, S]
 - 2.5 Agents drive rooms through MCP and the CLI for every route a human has:
-  build, CI, secrets, purge, port close. Today MCP stops at expose_port. [bedrock, M]
+  build, CI, secrets, purge, port close. Today MCP stops at expose_port. Check:
+  `node --test test/toolbox-manifest.test.mjs` in ocean-bedrock must pin the
+  complete tool inventory, and `npm run rooms:compute-smoke` must execute each
+  MCP/CLI verb against its disposable room workspace. [bedrock, M]
 
 ## 3. Safe
 - 3.1 The daemon's room routes authenticate the caller; identity is not a

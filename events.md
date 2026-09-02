@@ -536,7 +536,7 @@ ________________________________________________________________________________
 time:      [06:08am] [06-24-26]
 agent:     [claude] [opus 4.8]
 worktree:  main
-type:      [review]
+type:      [bug report]
 area:      [testing]
 
 Post-session verification capstone: ran full test suites across all 4 repos
@@ -9566,3 +9566,17 @@ ocean-bedrock 8753038, ocean-os 616293e, ocean-surface d58a145. Docs only:
 no code, no deploy, no migration; `cargo deny` red on rtrb is unchanged and
 named in the checklist as a user ruling.
 _________________________________________________________________________________ 20:01 docs/rooms-definition-of-done
+
+time:      [20:16] [01-09-26]
+agent:     [codex] [gpt-5]
+worktree:  docs/rooms-definition-of-done
+type:      [review]
+area:      [docs]
+
+Addressed Codex review on the Rooms finish-line contract. The documentation
+index now records the reviewed and merged Phase 1 candidates instead of the
+obsolete pre-review status. The definition of done narrows its universal check
+claim and attaches concrete commands, test owners, and remaining matrix
+requirements to criteria 2.1 and 2.3 through 2.5. Docs only; no runtime,
+deployment, migration, or production state changed.
+_________________________________________________________________________________ 20:16 docs/rooms-definition-of-done
