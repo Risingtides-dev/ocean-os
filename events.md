@@ -9549,3 +9549,105 @@ RUSTSEC-2026-0274 (`rtrb` double-free) and yanked `spin`, unchanged and
 pre-existing: the branch touches no `Cargo.toml`, `Cargo.lock` or `deny.toml` at
 all, and every line this pass changed is a comment. No deploy, no migration.
 _________________________________________________________________________________ 12:16 loop/os-transcript-page-including-closed
+
+time:      [20:01] [01-09-26]
+agent:     [claude-code], [claude-fable-5-1], [ocean operator]
+worktree:  docs/rooms-definition-of-done
+type:      [plan]
+area:      [docs]
+
+Added the production-grade definition of done for Ocean Rooms as
+`docs/specs/2026-09-01-ocean-rooms-definition-of-done.md`, indexed it in
+`docs/README.md`, and opened a ROADMAP checkbox under the rooms program that
+names what is open on this repo's side. Nothing in the loop's contract or in
+any repo defined "done" for rooms before this; the backlog was replenishing
+polish faster than it drained. Written from three read-only assessments at
+ocean-bedrock 8753038, ocean-os 616293e, ocean-surface d58a145. Docs only:
+no code, no deploy, no migration; `cargo deny` red on rtrb is unchanged and
+named in the checklist as a user ruling.
+_________________________________________________________________________________ 20:01 docs/rooms-definition-of-done
+
+time:      [20:16] [01-09-26]
+agent:     [codex] [gpt-5]
+worktree:  docs/rooms-definition-of-done
+type:      [bug report]
+area:      [docs]
+
+Addressed Codex review on the Rooms finish-line contract. The documentation
+index now records the reviewed and merged Phase 1 candidates instead of the
+obsolete pre-review status. The definition of done narrows its universal check
+claim and attaches concrete commands, test owners, and remaining matrix
+requirements to criteria 2.1 and 2.3 through 2.5. Docs only; no runtime,
+deployment, migration, or production state changed.
+_________________________________________________________________________________ 20:16 docs/rooms-definition-of-done
+
+time:      [21:13] [01-09-26]
+agent:     [codex] [gpt-5]
+worktree:  docs/rooms-definition-of-done
+type:      [bug report]
+area:      [review]
+
+Closed the final Codex review pass on criteria 2.1 and 2.4. The authorization
+exit check now names both the authority unit suite and the existing route-level
+authenticated bootstrap ceremony test. Criterion 2.4 runs the daemon refusal
+and stored-value transition tests plus Surface coverage for offered trigger rows
+and access-state holds. Both branch dates use the ledger's DD-MM-YY schema, and
+the historical June entry remains untouched. Docs only; no daemon, deployment,
+migration, or production state changed.
+_________________________________________________________________________________ 21:13 docs/rooms-definition-of-done
+
+time:      [21:59] [01-09-26]
+agent:     [codex] [gpt-5]
+worktree:  docs/rooms-definition-of-done
+type:      [bug report]
+area:      [review]
+
+Closed the fresh Codex security finding in criterion 0.6. The owner bearer is
+now explicitly forbidden from the tracked public plist and must be injected
+into the per-user launchd domain from owner-only local custody before the
+guarded installer bootstraps the daemon. Verification must not print or retain
+the launchd environment. Docs only; no secret, launchd environment, daemon,
+deployment, or production state changed.
+_________________________________________________________________________________ 21:59 docs/rooms-definition-of-done
+
+time:      [22:16] [01-09-26]
+agent:     [codex] [gpt-5]
+worktree:  docs/rooms-definition-of-done
+type:      [bug report]
+area:      [review]
+
+Closed the latest Codex documentation-index finding. The docs-local owning
+contract now indexes the active cross-repository Rooms definition of done,
+names its acceptance and ownership role, and preserves that it authorizes no
+implementation by itself. Docs only; no daemon, launchd, deployment, migration,
+or production state changed.
+_________________________________________________________________________________ 22:16 docs/rooms-definition-of-done
+
+time:      [22:31] [01-09-26]
+agent:     [codex] [gpt-5]
+worktree:  docs/rooms-definition-of-done
+type:      [bug report]
+area:      [review]
+
+Closed the reboot-persistence finding in criterion 0.6. Federation now requires
+a supported untracked owner-only login loader that restores both variables
+before every fresh GUI-domain daemon start, keeps the bearer out of both plists,
+and survives a fresh login or reboot acceptance check. The criterion remains
+open because no such loader ships. Docs only; no secret, launchd environment,
+daemon, deployment, reboot, login, or production state changed.
+_________________________________________________________________________________ 22:31 docs/rooms-definition-of-done
+
+time:      [22:53] [01-09-26]
+agent:     [codex] [gpt-5]
+worktree:  docs/rooms-definition-of-done
+type:      [bug report]
+area:      [review]
+
+Closed two current-head Codex documentation findings. Criterion 0.6 now
+requires a daemon-specific launcher or equivalent per-job secret channel and
+explicitly forbids domain-wide launchctl environment injection of the owner
+bearer. The documentation index now describes the finish line's checks and
+known check gaps without claiming every criterion already has an executable
+pin and named effort. Docs only; no secret, launchd environment, daemon,
+deployment, login, reboot, or production state changed.
+_________________________________________________________________________________ 22:53 docs/rooms-definition-of-done
