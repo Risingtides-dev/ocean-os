@@ -10443,3 +10443,43 @@ compile probe (scratch-only rtrb 0.3.4 substitution; tracked Cargo.lock remains
 unchanged), federation launcher 12/12, cargo fmt check, shell syntax, and git
 diff check. No daemon was restarted and production was not changed.
 _________________________________________________________________________________ 15:58 codex/ocean-rooms-integration-20260902
+
+time:      [16:14] [09-02-26]
+agent:     [codex] [gpt-5]
+worktree:  codex/ocean-rooms-integration-20260902
+type:      [bug report]
+area:      [backend]
+
+Closed the new exact-head P1 from Ocean OS PR #450 review comment 3918092869
+and the earlier current-head pagination P2. The message tail formerly read its
+final transcript page, released the store, then asked whether the room was
+open. A close could commit in that gap, making the tail return before reading
+the close marker already durable behind its cursor. Catch-up now reads the page
+and openness under one store guard and returns that captured state with the
+page. If close preceded the read, the same page carries its marker and the tail
+ends after sending it; if close followed the read, the already-subscribed wake
+bus drives one more catch-up. The direct duplicate-hint openness check was
+removed because it recreated the same split-read race. A held replay/live seam
+now deterministically closes in that exact gap and proves the marker arrives
+before stream end.
+
+The room-list cursor formerly returned only the last room id and re-resolved
+that row's mutable `updated_at` on the next request. Updating the boundary room
+could move the anchor forward and return a room from the first page again. New
+cursors are versioned opaque values carrying the exact `(updated_at, id)`
+boundary observed on the prior page; legacy id cursors retain their indexed
+compatibility lookup and stale fallback. The regression moves the boundary
+room after page one and proves page two neither duplicates nor loops.
+
+Focused verification passed with the tracked Cargo.lock unchanged: ocean-store
+231/231, all room-list cases 7/7, all daemon message-tail cases 8/8 plus the
+existing close-marker test, and ocean-store/ocean-daemon test-target Clippy
+with denied warnings. The initial worker verification used an isolated cached
+rtrb 0.3.4 substitution when crates.io was unavailable; root then replayed the
+room-list and message-tail suites plus both denied-warning Clippy runs directly
+against the tracked lock and its pinned rtrb 0.3.5. Workspace test-target check
+and the ocean-daemon release-profile legacy-chromium check passed in the
+isolated probe; docs-check, 30 Node ledger/federation tests, format, shell
+syntax, and diff checks passed with 588 ledger entries closed. No daemon was
+restarted and production was not changed.
+_________________________________________________________________________________ 16:14 codex/ocean-rooms-integration-20260902

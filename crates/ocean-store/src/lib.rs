@@ -265,18 +265,41 @@ pub const MAX_LIST_LIMIT: usize = 1000;
 /// One bounded page of a room list (OCEAN-250).
 ///
 /// `rooms` holds at most the effective limit of rooms in the store's stable list
-/// order (`updated_at DESC, id ASC`). `next_cursor` is the room key a client
-/// replays as the next `after` to fetch the following page; it is
-/// `Some(last_returned_key)` when more rows exist and `None` at the end.
+/// order (`updated_at DESC, id ASC`). `next_cursor` is an opaque encoding of
+/// the last returned row's exact ordering boundary, replayed as the next
+/// `after`; it is `Some(_)` when more rows exist and `None` at the end.
 /// `has_more` is the same signal as a bool.
 #[derive(Debug, Clone, PartialEq)]
 pub struct RoomPage {
     /// This page's rooms, in list order, at most the effective limit.
     pub rooms: Vec<Room>,
-    /// Cursor for the next page (the `after` room key), or `None` at the end.
+    /// Opaque cursor for the next page, or `None` at the end.
     pub next_cursor: Option<String>,
     /// Whether at least one more room exists beyond this page.
     pub has_more: bool,
+}
+
+const ROOM_LIST_CURSOR_PREFIX: &str = "ocean-room-list:v1:";
+
+/// Encode the exact keyset boundary a page was read under. `updated_at` is
+/// mutable, so returning only the room id would let the same id resolve to a
+/// different boundary on the next request.
+fn encode_room_list_cursor(updated_at: &str, id: &str) -> String {
+    format!(
+        "{ROOM_LIST_CURSOR_PREFIX}{}",
+        serde_json::json!([updated_at, id])
+    )
+}
+
+/// Read a cursor minted by [`encode_room_list_cursor`]. Non-prefixed cursors
+/// remain legacy room ids and are resolved by the compatibility path below.
+fn decode_room_list_cursor(cursor: &str) -> Option<(String, String)> {
+    let encoded = cursor.strip_prefix(ROOM_LIST_CURSOR_PREFIX)?;
+    let [updated_at, id]: [String; 2] = serde_json::from_str(encoded).ok()?;
+    if updated_at.is_empty() || id.is_empty() {
+        return None;
+    }
+    Some((updated_at, id))
 }
 
 /// Clamp a caller-supplied collection-list limit into the allowed range. `None`
@@ -1137,10 +1160,10 @@ pub trait RoomStore {
     /// One bounded page of the open-room list (OCEAN-250).
     ///
     /// Returns open rooms in `updated_at DESC, id ASC` order starting *after* the
-    /// `after` room key (or from the top when `None`), at most `limit` rooms.
+    /// opaque `after` boundary (or from the top when `None`), at most `limit` rooms.
     /// `limit` is clamped by [`clamp_list_limit`]: `None` ⇒ [`DEFAULT_LIST_LIMIT`],
     /// any value capped at [`MAX_LIST_LIMIT`]. The returned [`RoomPage`] carries
-    /// `next_cursor` (the room key to replay as the next `after`) and `has_more`.
+    /// `next_cursor` (the opaque value to replay as the next `after`) and `has_more`.
     /// Page to the end by repeating with `after = next_cursor` until `has_more` is
     /// false. An `after` key that is not in the list (closed/never-existed) simply
     /// yields rows that sort after it — paging is resilient to a stale cursor.
@@ -4240,49 +4263,55 @@ impl RoomStore for SqliteRoomStore {
     fn list_page(&self, after: Option<&str>, limit: Option<usize>) -> Result<RoomPage> {
         let effective_limit = clamp_list_limit(limit);
         // Keyset pagination over the stable `updated_at DESC, id ASC` order. The
-        // cursor is just the last returned room key; we resolve its `updated_at`
-        // (an indexed point lookup) so the WHERE clause can express "comes strictly
-        // after the cursor in this ordering" without an OFFSET (which would still
-        // scan all skipped rows). A cursor key that no longer exists (room closed
-        // since) yields no anchor row, so we fall back to the unanchored first page
-        // rather than 404 — paging stays resilient to a stale cursor.
+        // current cursor carries the exact `(updated_at, id)` boundary observed on
+        // the previous page. Re-resolving `updated_at` by id would move the boundary
+        // when that room changed between requests, duplicating rows already seen.
+        // A legacy room-id cursor is still accepted via one indexed point lookup;
+        // an absent/closed legacy id falls back to the first page as before.
         let anchor: Option<(String, String)> = match after {
-            Some(k) => self
-                .conn
-                .query_row(
-                    "SELECT updated_at, id FROM rooms WHERE id = ?1 AND closed_at IS NULL",
-                    params![k],
-                    |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)),
-                )
-                .optional()?,
+            Some(cursor) => match decode_room_list_cursor(cursor) {
+                Some(anchor) => Some(anchor),
+                None => self
+                    .conn
+                    .query_row(
+                        "SELECT updated_at, id FROM rooms WHERE id = ?1 AND closed_at IS NULL",
+                        params![cursor],
+                        |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)),
+                    )
+                    .optional()?,
+            },
             None => None,
         };
 
         // Fetch one extra row as the "is there a next page?" sentinel, then drop it.
         let fetch = effective_limit.saturating_add(1) as i64;
-        let keys: Vec<String> = match &anchor {
+        let keys: Vec<(String, String)> = match &anchor {
             // Strictly-after predicate for `updated_at DESC, id ASC`:
             //   updated_at < u_c  OR  (updated_at = u_c AND id > id_c)
             Some((u_c, id_c)) => {
                 let mut stmt = self.conn.prepare(
-                    "SELECT id FROM rooms
+                    "SELECT id, updated_at FROM rooms
                      WHERE closed_at IS NULL
                        AND (updated_at < ?1 OR (updated_at = ?1 AND id > ?2))
                      ORDER BY updated_at DESC, id ASC
                      LIMIT ?3",
                 )?;
                 let keys = stmt
-                    .query_map(params![u_c, id_c, fetch], |r| r.get::<_, String>(0))?
+                    .query_map(params![u_c, id_c, fetch], |r| {
+                        Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
+                    })?
                     .collect::<std::result::Result<_, _>>()?;
                 keys
             }
             None => {
                 let mut stmt = self.conn.prepare(
-                    "SELECT id FROM rooms WHERE closed_at IS NULL
+                    "SELECT id, updated_at FROM rooms WHERE closed_at IS NULL
                      ORDER BY updated_at DESC, id ASC LIMIT ?1",
                 )?;
                 let keys = stmt
-                    .query_map(params![fetch], |r| r.get::<_, String>(0))?
+                    .query_map(params![fetch], |r| {
+                        Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
+                    })?
                     .collect::<std::result::Result<_, _>>()?;
                 keys
             }
@@ -4296,10 +4325,15 @@ impl RoomStore for SqliteRoomStore {
         } else {
             &keys[..]
         };
-        let next_cursor = if has_more { kept.last().cloned() } else { None };
+        let next_cursor = if has_more {
+            kept.last()
+                .map(|(id, updated_at)| encode_room_list_cursor(updated_at, id))
+        } else {
+            None
+        };
 
         let mut rooms = Vec::with_capacity(kept.len());
-        for k in kept {
+        for (k, _) in kept {
             let key = RoomKey::new(k.clone());
             if let Some(rec) = self.load_record(&key, false)? {
                 rooms.push(rec.room);
@@ -9521,8 +9555,13 @@ mod tests {
         assert_eq!(page.rooms[0].id, RoomKey::new("room-009"));
         assert_eq!(page.rooms[3].id, RoomKey::new("room-006"));
         assert!(page.has_more, "6 rooms remain, so has_more is true");
-        // Cursor is the last returned key, to be replayed as the next `after`.
-        assert_eq!(page.next_cursor.as_deref(), Some("room-006"));
+        // Cursor preserves the last row's exact ordering boundary rather than
+        // asking the mutable row for a possibly newer value on the next page.
+        let cursor = page.next_cursor.as_deref().expect("has_more cursor");
+        assert_eq!(
+            decode_room_list_cursor(cursor).map(|(_, id)| id),
+            Some("room-006".to_string())
+        );
     }
 
     #[test]
@@ -9554,6 +9593,46 @@ mod tests {
             expected_room_order(total),
             "every room retrieved once, in list order"
         );
+    }
+
+    #[test]
+    fn list_page_cursor_keeps_its_boundary_when_the_anchor_room_moves() {
+        let mut s = store_with_rooms(4);
+        let first = s.list_page(None, Some(2)).unwrap();
+        assert_eq!(
+            first
+                .rooms
+                .iter()
+                .map(|room| room.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["room-003", "room-002"]
+        );
+        let cursor = first.next_cursor.expect("first page has more");
+
+        // Move the boundary room ahead of the first page after the caller has
+        // received its cursor. A cursor that re-resolves this mutable value
+        // anchors at the new timestamp and returns room-003 a second time.
+        let moved_at = "2026-01-02T00:00:00Z".parse::<DateTime<Utc>>().unwrap();
+        s.update(
+            &RoomKey::new("room-002"),
+            Some("moved".into()),
+            None,
+            None,
+            moved_at,
+        )
+        .unwrap();
+
+        let second = s.list_page(Some(&cursor), Some(2)).unwrap();
+        assert_eq!(
+            second
+                .rooms
+                .iter()
+                .map(|room| room.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["room-001", "room-000"],
+            "the immutable cursor boundary prevents a duplicate from page one"
+        );
+        assert!(!second.has_more);
     }
 
     #[test]

@@ -1418,8 +1418,8 @@ pub(super) struct RoomsListQuery {
     /// (`DEFAULT_LIST_LIMIT`); any value is clamped to `MAX_LIST_LIMIT`.
     #[serde(default)]
     pub(super) limit: Option<usize>,
-    /// Cursor: the room key of the last room from the previous page. Omitted ⇒
-    /// the first page. Replay `next_cursor` here for the following page.
+    /// Opaque cursor from the previous page. Omitted ⇒ the first page. Replay
+    /// `next_cursor` here unchanged for the following page.
     #[serde(default)]
     pub(super) cursor: Option<String>,
 }
@@ -4143,6 +4143,15 @@ pub(super) struct RoomEventsQuery {
 type RoomEventsError = (StatusCode, Json<serde_json::Value>);
 type RoomTailSeam = (oneshot::Sender<()>, oneshot::Receiver<()>);
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RoomCatchUp {
+    /// The durable log is current through `last_sent_seq`; `room_open` was read
+    /// under the same store guard as the final page.
+    Current { room_open: bool },
+    /// The downstream client disappeared while rows were being replayed.
+    DownstreamClosed,
+}
+
 fn room_events_error(status: StatusCode, code: &str, error: impl Into<String>) -> RoomEventsError {
     (
         status,
@@ -4181,7 +4190,7 @@ async fn send_room_catch_up(
     room: &RoomKey,
     last_sent_seq: &mut Option<u64>,
     tx: &mpsc::Sender<RoomMessage>,
-) -> Result<bool, ocean_store::RoomStoreError> {
+) -> Result<RoomCatchUp, ocean_store::RoomStoreError> {
     loop {
         // Gated on EXISTENCE, not openness. The close marker is appended in the
         // same transaction that sets `closed_at`, so by the time the wake
@@ -4191,11 +4200,13 @@ async fn send_room_catch_up(
         // explained why, silently, for every close including `CallEnded`'s. An
         // absent room is still `UnknownRoom` here, so a tail on a room that
         // really is gone still ends through the error path it always did.
-        let page = with_rooms(state, |store| {
-            store.transcript_page_including_closed(room, *last_sent_seq, Some(128))
+        let (page, room_open) = with_rooms(state, |store| {
+            let page = store.transcript_page_including_closed(room, *last_sent_seq, Some(128))?;
+            let room_open = store.is_open(room)?;
+            Ok::<_, ocean_store::RoomStoreError>((page, room_open))
         })?;
         if page.messages.is_empty() {
-            return Ok(true);
+            return Ok(RoomCatchUp::Current { room_open });
         }
         for message in page.messages {
             if last_sent_seq.is_some_and(|last| message.seq <= last) {
@@ -4203,12 +4214,12 @@ async fn send_room_catch_up(
             }
             let seq = message.seq;
             if tx.send(message).await.is_err() {
-                return Ok(false);
+                return Ok(RoomCatchUp::DownstreamClosed);
             }
             *last_sent_seq = Some(seq);
         }
         if !page.has_more {
-            return Ok(true);
+            return Ok(RoomCatchUp::Current { room_open });
         }
     }
 }
@@ -4222,31 +4233,27 @@ async fn run_room_tail(
     seam: Option<RoomTailSeam>,
 ) {
     let mut last_sent_seq = resume;
-    match send_room_catch_up(&state, &room, &mut last_sent_seq, &tx).await {
-        Ok(true) => {}
-        Ok(false) => return,
-        Err(error) => {
-            tracing::warn!(room = %room, %error, "room SSE replay failed");
-            return;
-        }
-    }
+    let initial_catch_up = send_room_catch_up(&state, &room, &mut last_sent_seq, &tx).await;
 
-    // Tests can hold this exact replay/live seam open. The broadcast receiver was
-    // A room can close between the `/events` handler's 404 check and this
-    // task's first read, so the opening replay is checked like every later one:
-    // the rows are flushed, then the tail ends rather than waiting on a wake
-    // that is never coming.
-    if room_tail_should_end(&state, &room) {
-        return;
-    }
-
-    // already subscribed, so hints accumulate while replay is paused; production
-    // passes `None` and continues immediately.
+    // Tests can hold the exact replay/live seam open. The wake receiver was
+    // already subscribed, so hints accumulate while replay is paused;
+    // production passes `None` and continues immediately. This seam sits
+    // BEFORE the captured openness result is interpreted so a regression can
+    // deterministically close the room after the final page read.
     if let Some((ready, release)) = seam {
         let _ = ready.send(());
         tokio::select! {
             _ = tx.closed() => return,
             _ = release => {}
+        }
+    }
+
+    match initial_catch_up {
+        Ok(RoomCatchUp::Current { room_open: true }) => {}
+        Ok(RoomCatchUp::Current { room_open: false } | RoomCatchUp::DownstreamClosed) => return,
+        Err(error) => {
+            tracing::warn!(room = %room, %error, "room SSE replay failed");
+            return;
         }
     }
 
@@ -4257,20 +4264,13 @@ async fn run_room_tail(
         };
         match hint {
             Ok(hint) if hint.room != room => continue,
-            // A hint naming a row this tail has already sent. It still has to
-            // ask whether the room is now closed before going back to sleep:
-            // the close marker's hint carries that marker's own seq, and the
-            // catch-up above may already have delivered it (a tail that started
-            // between the commit and the publish replays it out of the durable
-            // log, not off this bus). A bare `continue` here therefore parked
-            // the tail forever on a room that can never produce another row —
-            // the one path where the openness check below is unreachable.
-            Ok(hint) if Some(hint.seq) <= last_sent_seq => {
-                if room_tail_should_end(&state, &room) {
-                    return;
-                }
-                continue;
-            }
+            // A close-marker hint cannot first appear as already-sent while
+            // this task still believes the room is open: whichever catch-up
+            // sent that marker also captured `room_open = false` under the same
+            // store guard and ended the task. Re-checking openness here would
+            // recreate a gap in which close commits after the last page and the
+            // tail exits before reading the marker.
+            Ok(hint) if Some(hint.seq) <= last_sent_seq => continue,
             Ok(hint) => {
                 let expected = last_sent_seq.map_or(0, |last| last.saturating_add(1));
                 if hint.seq > expected {
@@ -4289,20 +4289,14 @@ async fn run_room_tail(
         }
 
         match send_room_catch_up(&state, &room, &mut last_sent_seq, &tx).await {
-            Ok(true) => {}
-            Ok(false) => return,
+            Ok(RoomCatchUp::Current { room_open: true }) => {}
+            Ok(RoomCatchUp::Current { room_open: false } | RoomCatchUp::DownstreamClosed) => {
+                return;
+            }
             Err(error) => {
                 tracing::warn!(room = %room, %error, "room SSE durable catch-up failed");
                 return;
             }
-        }
-
-        // AFTER the catch-up, never before it: the close marker is appended in
-        // the same transaction that sets `closed_at`, so the wake that told us
-        // about the close is also the wake carrying the last row the room will
-        // ever have. Ending first would freeze the room and never say so.
-        if room_tail_should_end(&state, &room) {
-            return;
         }
     }
 }
@@ -4310,12 +4304,14 @@ async fn run_room_tail(
 /// Has this room been closed out from under a live SSE tail?
 ///
 /// `POST .../close` publishes on the transcript and access wake buses precisely
-/// so the three tails can ask this and stop. Every one of them returning is what
-/// ends the merged stream and completes the HTTP response, which is the
-/// behaviour the rest of the contract already assumed: `/events` refuses a NEW
-/// connection to a closed room with a 404, so a tail that stayed open on one
-/// was a connection the client could never re-establish and the daemon would
-/// never feed again — a stream that is neither alive nor finished.
+/// so the access and cursor tails can ask this and stop. The message tail must
+/// instead capture openness with its final durable page so it cannot end before
+/// sending the close marker. Every tail returning is what ends the merged stream
+/// and completes the HTTP response, which is the behaviour the rest of the
+/// contract already assumed: `/events` refuses a NEW connection to a closed room
+/// with a 404, so a tail that stayed open on one was a connection the client
+/// could never re-establish and the daemon would never feed again — a stream
+/// that is neither alive nor finished.
 ///
 /// Only a store that positively answers "not open" ends a tail. A read error is
 /// left to whatever the calling tail already does about read errors; inventing a
@@ -8665,6 +8661,42 @@ mod tests {
         let message = next_message(&mut tail).await;
         assert_eq!(message.seq, 0);
         assert_eq!(message.body, "during seam");
+    }
+
+    /// A close committed after the final replay page must be consumed from the
+    /// queued wake, never inferred from a later openness read that skips the
+    /// durable close marker.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn room_tail_close_after_final_catch_up_still_sends_the_marker() {
+        let _guard = AUTO_CONVENE_ENV_LOCK.lock().await;
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = fake_convene_state(&tmp);
+        let key = RoomKey::new("close-after-catch-up");
+        create_plain_room(&state, &key);
+        join_human(&state, &key);
+
+        // `paused_tail` releases only after the initial catch-up has captured
+        // the room as open. Close in that exact gap before the task interprets
+        // the captured state and enters its live wait.
+        let (mut tail, release) = paused_tail(&state, &key, None).await;
+        let (status, _) = room_close(
+            State(state),
+            Path(key.as_str().to_string()),
+            HeaderMap::new(),
+            Query(CloseRoomQuery {
+                actor_id: Some("human".into()),
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        release.send(()).expect("release tail after close");
+
+        assert_eq!(next_message(&mut tail).await.body, "Human joined");
+        assert_eq!(next_message(&mut tail).await.body, "human closed the room");
+        let ended = tokio::time::timeout(std::time::Duration::from_secs(1), tail.next())
+            .await
+            .expect("closed tail must end after its marker");
+        assert!(ended.is_none());
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

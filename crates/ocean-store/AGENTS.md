@@ -411,6 +411,13 @@ outbox, and the restart-safe federation core (S2 P2-A). One database file
   are what the server measured; a negative stored `byte_len` fails closed on
   read.
 
+- **Open-room list cursors carry the observed ordering boundary.** `list_page`
+  orders by mutable `updated_at DESC, id ASC`, so every newly minted opaque
+  cursor carries both values from the last returned row. It never re-resolves
+  that row's later `updated_at` on the next request: doing so moves the keyset
+  boundary and can return an earlier page row twice. Legacy room-id cursors stay
+  readable through an indexed compatibility lookup; absent/closed legacy ids
+  retain the old first-page fallback.
 - **The room-metrics projection is read-only, transcript-free, and open-room
   only.** `room_metrics_projection` answers the daemon's §4.1 metrics sample in
   two aggregate queries: per-room access state (LEFT JOIN `room_access`, so an
