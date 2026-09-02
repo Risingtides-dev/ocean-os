@@ -257,17 +257,25 @@ and reloading the plist resumes from the persisted cursor.
 
 ### rooms.db migration rehearsal
 
-The Phase 1 manifest's rollout gate 4 asks for a migration rehearsal on a copy
-of a real `rooms.db`, including rollback. **As of 2026-09-01 this has not been
-performed**: the only rehearsal entries in `events.md` concern `ocean-memory`.
-Phase 1 rollout gate 4 remains open until an `events.md` entry records one;
-writing this procedure down is not performing it. Procedure:
+The Phase 1 manifest's rollout gate 4 asks for a migration rehearsal on a real
+**pre-Phase-1 schema**, including rollback. The 2026-08-31 rehearsal in
+`events.md` was useful but does not close this gate: its `rooms.db` source had
+already been opened by Phase 1 and already carried the additive
+`room_agent_bindings` and `room_agent_decisions` tables (both empty). The
+downgrade portion exercised the memory migration and proved that an older
+daemon ignored those empty additive tables; it did not prove that the candidate
+creates the room-agent tables from the pre-Phase-1 schema or that rollback
+restores a database without them. The gate remains open until a new
+`events.md` entry records the proof below. Procedure:
 
-1. Take a transactionally consistent online backup while the daemon is live,
-   using SQLite's backup API rather than copying the main file without its WAL.
-   Create isolated config roots for both halves of the rehearsal; the candidate
-   must not inherit the live `titles.db`, extension projects, observatory, or
-   any other daemon state:
+1. Prefer a retained transactionally consistent backup taken before the Phase 1
+   cutover. If none exists, reconstruct the old schema only in an isolated
+   online backup of the live database: first require both Phase 1 tables to be
+   empty, then drop `room_agent_decisions` before `room_agent_bindings`. Stop if
+   either table contains data; that copy cannot honestly stand in for a
+   pre-Phase-1 source. Create isolated config roots for both halves of the
+   rehearsal; the candidate must not inherit live `titles.db`, extension
+   projects, observatory, or any other daemon state:
 
    ```bash
    rooms_rehearsal_dir="$(mktemp -d /tmp/ocean-rooms-rehearsal.XXXXXX)"
@@ -282,9 +290,15 @@ writing this procedure down is not performing it. Procedure:
    test -f "$live_rooms_db"
    sqlite3 "$live_rooms_db" ".timeout 10000" \
      ".backup '$rooms_rehearsal_dir/candidate-config/rooms.db'"
+   test "$(sqlite3 "$rooms_rehearsal_dir/candidate-config/rooms.db" \
+     "SELECT coalesce(sum(rows),0) FROM (SELECT count(*) AS rows FROM room_agent_bindings UNION ALL SELECT count(*) FROM room_agent_decisions);")" = 0
+   sqlite3 "$rooms_rehearsal_dir/candidate-config/rooms.db" \
+     "DROP TABLE room_agent_decisions; DROP TABLE room_agent_bindings;"
+   test "$(sqlite3 "$rooms_rehearsal_dir/candidate-config/rooms.db" \
+     "SELECT count(*) FROM sqlite_master WHERE type='table' AND name IN ('room_agent_bindings','room_agent_decisions');")" = 0
+   sqlite3 "$rooms_rehearsal_dir/candidate-config/rooms.db" "PRAGMA quick_check;"
    sqlite3 "$rooms_rehearsal_dir/candidate-config/rooms.db" \
      ".backup '$rooms_rehearsal_dir/pre-upgrade-rollback.db'"
-   sqlite3 "$rooms_rehearsal_dir/candidate-config/rooms.db" "PRAGMA quick_check;"
    sqlite3 "$rooms_rehearsal_dir/pre-upgrade-rollback.db" "PRAGMA quick_check;"
    ```
 
@@ -292,28 +306,36 @@ writing this procedure down is not performing it. Procedure:
    `launchctl print` shows its environment. Use its `OCEAN_DB_PATH` first; only
    when that variable is absent may the source fall back to `rooms.db` under the
    daemon's effective config dir. Replace the angle-bracket placeholders before
-   running the command, and require both `quick_check` calls to print `ok`.
+   running the command, and require both `quick_check` calls to print `ok`. When
+   a retained pre-cutover backup exists, use SQLite's backup API to seed
+   `candidate-config/rooms.db` from it and still require the table-count query
+   above to return zero; do not run the two `DROP TABLE` statements.
 2. Resolve the exact candidate and previous immutable artifacts under
-   `~/.local/libexec/ocean-daemon/`, verify both are executable, and run the
-   candidate on a spare loopback port. `OCEAN_UNSUPERVISED=1` is deliberate:
-   the production launchd job remains loaded, and without this override the
-   candidate exits through the foreign-supervisor guard instead of binding.
+   `~/.local/libexec/ocean-daemon/`. The rollback artifact must be a revision
+   from **before Phase 1**, not merely the artifact preceding the current
+   release. Verify both are executable and run the candidate on a spare
+   loopback port from the neutral rehearsal directory. Both the candidate and
+   rollback binaries refuse to run from any Ocean repository worktree;
+   `OCEAN_UNSUPERVISED=1` bypasses the loaded-supervisor guard, not the cwd
+   guard.
 
    ```bash
    candidate_bin="$HOME/.local/libexec/ocean-daemon/ocean-daemon-<candidate-rev>"
-   previous_bin="$HOME/.local/libexec/ocean-daemon/ocean-daemon-<previous-rev>"
+   previous_bin="$HOME/.local/libexec/ocean-daemon/ocean-daemon-<pre-phase1-rev>"
    test -x "$candidate_bin" && test -x "$previous_bin"
-   OCEAN_CONFIG_DIR="$rooms_rehearsal_dir/candidate-config" \
-   OCEAN_DB_PATH="$rooms_rehearsal_dir/candidate-config/rooms.db" \
-   OCEAN_BIND=127.0.0.1:18791 OCEAN_UNSUPERVISED=1 \
-     "$candidate_bin"
+   (cd "$rooms_rehearsal_dir" && \
+     env OCEAN_CONFIG_DIR="$rooms_rehearsal_dir/candidate-config" \
+       OCEAN_DB_PATH="$rooms_rehearsal_dir/candidate-config/rooms.db" \
+       OCEAN_BIND=127.0.0.1:18791 OCEAN_UNSUPERVISED=1 \
+       "$candidate_bin")
    ```
 
    Keep this process in its own terminal. Only the copied `rooms.db` enters the
    isolated config root; no production config file is imported.
-3. Through the candidate, list rooms and read one snapshot; the store applies
-   its migrations on open, so a clean open plus readable rooms is the candidate
-   pass. Record room and message counts before stopping it.
+3. Through the candidate, list rooms and read one snapshot. Before stopping it,
+   require SQLite to report both `room_agent_bindings` and
+   `room_agent_decisions`; a clean open alone is not migration proof. Record the
+   source room/message counts and the post-open table count.
 4. Actually exercise rollback. Stop the candidate, restore the untouched
    pre-upgrade backup into the separate rollback config with SQLite's backup
    API, run `quick_check`, then start the **previous** immutable artifact on a
@@ -323,20 +345,24 @@ writing this procedure down is not performing it. Procedure:
    sqlite3 "$rooms_rehearsal_dir/pre-upgrade-rollback.db" \
      ".backup '$rooms_rehearsal_dir/rollback-config/rooms.db'"
    sqlite3 "$rooms_rehearsal_dir/rollback-config/rooms.db" "PRAGMA quick_check;"
-   OCEAN_CONFIG_DIR="$rooms_rehearsal_dir/rollback-config" \
-   OCEAN_DB_PATH="$rooms_rehearsal_dir/rollback-config/rooms.db" \
-   OCEAN_BIND=127.0.0.1:18792 OCEAN_UNSUPERVISED=1 \
-     "$previous_bin"
+   test "$(sqlite3 "$rooms_rehearsal_dir/rollback-config/rooms.db" \
+     "SELECT count(*) FROM sqlite_master WHERE type='table' AND name IN ('room_agent_bindings','room_agent_decisions');")" = 0
+   (cd "$rooms_rehearsal_dir" && \
+     env OCEAN_CONFIG_DIR="$rooms_rehearsal_dir/rollback-config" \
+       OCEAN_DB_PATH="$rooms_rehearsal_dir/rollback-config/rooms.db" \
+       OCEAN_BIND=127.0.0.1:18792 OCEAN_UNSUPERVISED=1 \
+       "$previous_bin")
    ```
 
    List the same rooms and read the same snapshot through the previous binary;
    room and message counts must match the pre-upgrade backup. Stop it only after
    that read succeeds. This previous-binary read is the rollback proof; merely
    retaining or deleting a backup is not.
-5. Record both exact revisions, both `quick_check` results, the room/message
-   counts before candidate migration and after rollback, and the two isolated
-   config paths in `events.md`. Remove the temporary rehearsal directory only
-   after the evidence is captured.
+5. Record both exact revisions, the pre-open zero and post-open two-table
+   results, both `quick_check` results, the room/message counts before candidate
+   migration and after rollback, and the two isolated config paths in
+   `events.md`. Remove the temporary rehearsal directory only after the evidence
+   is captured.
 
 ### Bedrock ordering this daemon depends on
 

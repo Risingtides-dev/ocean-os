@@ -9688,7 +9688,7 @@ manifest rather than an unmerged definition-of-done branch. Docs only; no
 launchd job, database, daemon, deployment, or production state changed.
 _________________________________________________________________________________ 20:27 docs/rooms-federation-runbook
 
-time:      [21:13] [09-01-26]
+time:      [21:13] [01-09-26]
 agent:     [codex] [gpt-5]
 worktree:  docs/rooms-federation-runbook
 type:      [bug report]
@@ -9702,16 +9702,20 @@ no rehearsal, database mutation, daemon restart, launchd action, deployment,
 or production state change occurred.
 _________________________________________________________________________________ 21:13 docs/rooms-federation-runbook
 
-time:      [21:20] [09-01-26]
+time:      [21:20] [01-09-26]
 agent:     [codex] [gpt-5]
 worktree:  docs/rooms-federation-runbook
 type:      [bug report]
 area:      [review]
 
-Closed the third Codex review pass on federation authority and the rehearsal
+Closed the final Codex review pass on federation authority and the rehearsal
 source. The runbook now distinguishes the Bedrock transport URL from the owner
 token used only for Local-room bootstrap, preserves revoked state explicitly,
 and resolves `OCEAN_DB_PATH` before falling back to the effective config-dir
-database. Docs only; no rehearsal, database mutation, daemon restart, launchd
-action, deployment, or production state change occurred.
+database. It accurately scopes the 2026-08-31 rehearsal, reconstructs and
+verifies a pre-Phase-1 schema before taking the rollback backup, requires a
+truly pre-Phase-1 rollback artifact, and runs both binaries from a neutral cwd.
+The two branch event dates also follow the ledger's DD-MM-YY schema. Docs only;
+no rehearsal, database mutation, daemon restart, launchd action, deployment, or
+production state change occurred.
 _________________________________________________________________________________ 21:20 docs/rooms-federation-runbook
