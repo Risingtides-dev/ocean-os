@@ -66,8 +66,16 @@ outbox, and the restart-safe federation core (S2 P2-A). One database file
   durable-enough level: nothing committed is lost to a process or daemon crash,
   and what NORMAL trades away versus FULL is an OS-crash/power-loss window over
   the most recent commits — the invariants below are ATOMICITY invariants, which
-  NORMAL keeps whole, and an unconfirmed event replays from the outbox), a
-  5-second `busy_timeout`, and `foreign_keys`. `open_in_memory` deliberately does
+  NORMAL keeps whole, so a lost transaction is lost whole and never torn), a
+  5-second `busy_timeout`, and `foreign_keys`. The residual risk is stated
+  exactly in that function and must not be softened here: an `append_message`
+  the store ACKNOWLEDGED can be lost to a power cut with nothing to replay it.
+  The outbox does not cover this and is not a redo log — `append_message` writes
+  no outbox row (only `allocate_outbox_pending` and the federated agent-reply
+  path do), and a federated event's outbox row commits in the SAME transaction
+  as the work it covers, so a lost transaction takes the row with it. The outbox
+  retries the unconfirmed federated events that SURVIVED, which is a narrower
+  claim than "the outbox replays what was lost" and is the only one true. `open_in_memory` deliberately does
   NOT take them: `:memory:` has no journal to hold in WAL and no second
   connection to contend with, and `migrate` supplies the one setting that still
   means something there. `durability()` re-queries all four off the live

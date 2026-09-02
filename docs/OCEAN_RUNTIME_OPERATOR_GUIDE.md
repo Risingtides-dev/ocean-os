@@ -199,10 +199,9 @@ Two additional SQLite databases live alongside sessions and the config dir:
 
 Every production open of `rooms.db` applies one named set of PRAGMAs
 (`apply_durability_pragmas` in `crates/ocean-store/src/lib.rs`): WAL journaling,
-`synchronous = NORMAL` (WAL's durable-enough level — a process or daemon crash
-loses nothing committed; an OS crash or power cut can lose the most recent
-transactions, which the outbox replays), a 5-second busy timeout so a second
-writer waits for the lock instead of failing `SQLITE_BUSY`, and foreign keys.
+`synchronous = NORMAL` (see the durability trade below), a 5-second busy timeout
+so a second writer waits for the lock instead of failing `SQLITE_BUSY`, and
+foreign keys.
 Writes are serialized in-process by the `Mutex` the daemon holds the store
 behind; the busy timeout is what bounds a writer on a SECOND connection.
 
@@ -221,6 +220,24 @@ running without the durability posture above. A
 the store opened but the read-back query failed — the daemon does not refuse to
 boot over an unreadable diagnostic, so treat that line as the settings being
 unknown, not as them being wrong.
+
+**What `synchronous = NORMAL` costs, stated plainly.** A crash of the daemon
+process loses nothing that was committed. An **OS crash or power cut** can lose
+the most recently committed transactions — including a room message the daemon
+already acknowledged to a client. Nothing replays those. The room outbox is not
+a redo log for this: it holds locally-authored *federated* events that are still
+unconfirmed, it retries the ones that survived the crash, and an ordinary local
+room message never gets an outbox row at all. What NORMAL still guarantees is
+that a lost transaction is lost **whole** — the database is never left torn or
+corrupt, and a partially applied write is not an outcome.
+
+If you are running Ocean on hardware where an unclean power loss is a realistic
+operational event and losing the last few seconds of room history is not
+acceptable, that is the case for `synchronous = FULL`, which fsyncs on every
+commit at a per-write cost. Raise it as a change to
+`apply_durability_pragmas`; do not set it by hand on a live database, since the
+next `open()` reapplies the crate's value and the startup log would then
+disagree with what you set.
 
 ### Federated-room Bedrock bridge
 

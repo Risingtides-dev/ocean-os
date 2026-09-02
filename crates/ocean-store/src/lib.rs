@@ -1468,10 +1468,21 @@ const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 ///   on an OS-crash-durable commit: the durability invariants here are
 ///   atomicity ones (all-or-nothing IMMEDIATE transactions, fail-closed dedup,
 ///   never-reused producer sequences), all of which NORMAL preserves — a
-///   transaction that is lost to power failure is lost whole, never torn, and
-///   the outbox/cursor design already replays an unconfirmed event. Paying a
-///   fsync per commit to narrow a power-loss window on a local-first developer
-///   machine is not the trade this store wants.
+///   transaction that is lost to power failure is lost whole, never torn.
+///   State the residual risk exactly, because a comforting version of it is
+///   how the next reader gets it wrong: a room message that `append_message`
+///   acknowledged CAN be lost to a power cut, and nothing replays it. The
+///   outbox is not a redo log and does not cover this — `append_message`
+///   writes no outbox row at all (only `allocate_outbox_pending` and the
+///   federated agent-reply path do), and a locally-authored federated event's
+///   outbox row is written in the SAME transaction as the work it covers, so
+///   a lost transaction takes its outbox row with it. What the outbox does is
+///   retry the unconfirmed federated events that SURVIVED. Accepted anyway:
+///   the daemon already treats transcript persistence as best-effort on the
+///   call rail (`persist_failures_total` on `GET /health` counts dropped
+///   transcript writes rather than stalling the turn), so a fsync on every
+///   commit would buy a narrower power-loss window against a rail that is
+///   already lossy under pressure, on a local-first developer machine.
 /// * `busy_timeout` — see [`BUSY_TIMEOUT`].
 /// * `foreign_keys = ON` — the schema leans on `ON DELETE CASCADE` for
 ///   participant/transcript rows, and stock SQLite defaults this OFF, which
