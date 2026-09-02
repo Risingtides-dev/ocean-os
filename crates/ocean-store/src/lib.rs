@@ -85,7 +85,7 @@
 //! never serialized into projections, transcripts, logs, or error messages.
 //! See `crates/ocean-store/AGENTS.md` for the binding invariants.
 
-use std::path::Path;
+use std::{path::Path, time::Duration};
 
 use chrono::{DateTime, Utc};
 use ocean_core::{
@@ -1441,6 +1441,123 @@ fn decode_thread_parent_seq(stored: Option<i64>) -> Result<Option<u64>> {
     }
 }
 
+/// How long a writer waits for another writer's lock before giving up.
+///
+/// SQLite's own default is zero: a second writer that finds the write lock held
+/// fails with `SQLITE_BUSY` on the spot rather than waiting for a transaction
+/// that is typically microseconds from committing. Every write in this crate is
+/// a short IMMEDIATE transaction, so a few seconds is far more headroom than any
+/// of them needs and still bounds a caller rather than blocking it forever — a
+/// genuinely stuck writer surfaces as `SQLITE_BUSY` after the timeout instead of
+/// hanging the daemon thread that holds the store mutex.
+///
+/// **This value is not new behavior, and that is exactly why it is stated
+/// here.** `rusqlite::Connection::open` already calls `sqlite3_busy_timeout(db,
+/// 5000)` for every connection it hands back (`inner_connection.rs`), so this
+/// store has been getting a five-second wait all along — from the driver, by
+/// coincidence of version, named nowhere in this crate and pinned by no test. A
+/// `rusqlite` bump that drops that line would silently return the store to
+/// SQLite's zero and turn every concurrent write into an immediate
+/// `SQLITE_BUSY`, with nothing going red. Setting it explicitly makes the value
+/// this crate's policy rather than a borrowed default; see the mutation record
+/// on `a_second_writer_waits_for_the_lock_instead_of_failing_busy` for what
+/// each half of that actually proves.
+const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// The durability settings a production connection carries, applied in one
+/// place so a second `Connection::open` cannot quietly get different ones.
+///
+/// * `journal_mode = WAL` — the default rollback journal takes an exclusive
+///   lock across every write, so a reader and a writer cannot overlap at all.
+///   WAL lets readers run against the last committed state while a writer
+///   appends, which is the shape this store actually has: the daemon reads
+///   transcripts on request paths while federation ingest writes. WAL is
+///   persistent — it is recorded in the database header, so it survives reopen
+///   and this call is a no-op on an already-WAL file.
+/// * `synchronous = NORMAL` — WAL's durable-enough setting, and the one the
+///   SQLite documentation names for WAL mode. Under WAL, NORMAL still fsyncs
+///   the WAL on checkpoint and a crash of the *process* or the daemon loses
+///   nothing committed; what it gives up versus FULL is a fsync per commit,
+///   so an OS crash or power loss can lose the most recent transactions. FULL
+///   is not chosen because nothing in this crate's commit semantics ratchets
+///   on an OS-crash-durable commit: the durability invariants here are
+///   atomicity ones (all-or-nothing IMMEDIATE transactions, fail-closed dedup,
+///   never-reused producer sequences), all of which NORMAL preserves — a
+///   transaction that is lost to power failure is lost whole, never torn.
+///   State the residual risk exactly, because a comforting version of it is
+///   how the next reader gets it wrong: a room message that `append_message`
+///   acknowledged CAN be lost to a power cut, and nothing replays it. The
+///   outbox is not a redo log and does not cover this — `append_message`
+///   writes no outbox row at all (only `allocate_outbox_pending` and the
+///   federated agent-reply path do), and a locally-authored federated event's
+///   outbox row is written in the SAME transaction as the work it covers, so
+///   a lost transaction takes its outbox row with it. What the outbox does is
+///   retry the unconfirmed federated events that SURVIVED. Accepted anyway:
+///   the daemon already treats transcript persistence as best-effort on the
+///   call rail (`persist_failures_total` on `GET /health` counts dropped
+///   transcript writes rather than stalling the turn), so a fsync on every
+///   commit would buy a narrower power-loss window against a rail that is
+///   already lossy under pressure, on a local-first developer machine.
+/// * `busy_timeout` — see [`BUSY_TIMEOUT`].
+/// * `foreign_keys = ON` — the schema leans on `ON DELETE CASCADE` for
+///   participant/transcript rows, and stock SQLite defaults this OFF, which
+///   makes every `REFERENCES` clause inert. It was already on before this
+///   function existed, twice over: [`SqliteRoomStore::migrate`] sets it (that
+///   is the in-memory path's only route to it), and the bundled SQLite this
+///   crate compiles in is built with `SQLITE_DEFAULT_FOREIGN_KEYS=1`, so a raw
+///   `Connection::open` here reports `1`. Restated on this connection anyway,
+///   so the production durability posture is readable in one place and does
+///   not depend on a build flag of a vendored C library.
+///
+/// Applied to file-backed [`SqliteRoomStore::open`] only.
+/// [`SqliteRoomStore::open_in_memory`] deliberately keeps its own settings: a
+/// `:memory:` database has no journal file to put in WAL and no second
+/// connection to contend with, so the only one of these that means anything
+/// there is `foreign_keys`, which `migrate` supplies.
+fn apply_durability_pragmas(conn: &Connection) -> Result<()> {
+    conn.busy_timeout(BUSY_TIMEOUT)?;
+    // `PRAGMA journal_mode` RETURNS the resulting mode, so it cannot go through
+    // `pragma_update` (which rejects a statement that yields rows).
+    conn.pragma_update_and_check(None, "journal_mode", "WAL", |_row| Ok(()))?;
+    conn.pragma_update(None, "synchronous", "NORMAL")?;
+    conn.pragma_update(None, "foreign_keys", true)?;
+    Ok(())
+}
+
+/// What the live connection actually reports for its durability settings —
+/// read back from the connection, never echoed from what was requested.
+///
+/// This exists so an operator can tell. The daemon logs it right after opening
+/// `rooms.db` (`persistent rooms store ready`), which means the answer to "is
+/// this daemon running WAL?" is in the startup log rather than behind a
+/// `sqlite3` session against a live database file.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StoreDurability {
+    /// `PRAGMA journal_mode`, as SQLite reports it (lowercase, e.g. `wal`).
+    pub journal_mode: String,
+    /// `PRAGMA synchronous` as its SQLite name (`off`/`normal`/`full`/`extra`),
+    /// or the raw integer for a level SQLite grows later.
+    pub synchronous: String,
+    /// `PRAGMA busy_timeout`, in milliseconds. `0` means a second writer fails
+    /// immediately instead of waiting.
+    pub busy_timeout_ms: i64,
+    /// `PRAGMA foreign_keys`. `false` makes every `REFERENCES` clause inert.
+    pub foreign_keys: bool,
+}
+
+/// Render `PRAGMA synchronous`'s integer as the name operators read in docs.
+/// An unknown level renders as its number rather than being forced into a
+/// neighbouring name.
+fn synchronous_label(level: i64) -> String {
+    match level {
+        0 => "off".to_string(),
+        1 => "normal".to_string(),
+        2 => "full".to_string(),
+        3 => "extra".to_string(),
+        other => other.to_string(),
+    }
+}
+
 /// SQLite-backed durable room store.
 pub struct SqliteRoomStore {
     conn: Connection,
@@ -1453,11 +1570,19 @@ impl SqliteRoomStore {
     /// create/reopen also enforces owner-only `0600` on the database file and
     /// its SQLite sidecars — a previously loosened mode is repaired, not just
     /// asserted.
+    ///
+    /// This is the ONE production open path, and every connection it hands back
+    /// carries [`apply_durability_pragmas`]: WAL, `synchronous = NORMAL`, a
+    /// [`BUSY_TIMEOUT`], and foreign keys. They are applied BEFORE `migrate`, so
+    /// the migration itself runs under them and the `-wal`/`-shm` sidecars WAL
+    /// creates exist by the time the post-migration owner-only enforcement runs
+    /// and are locked down with the DB.
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
         // Enforce BEFORE any DB work: a pre-existing loosened DB (and any
         // sidecars) is repaired before a single byte is read through it.
         enforce_owner_only_db_mode(path.as_ref())?;
         let conn = Connection::open(path.as_ref())?;
+        apply_durability_pragmas(&conn)?;
         let mut store = Self { conn };
         store.migrate()?;
         // Re-enforce after create: a freshly created DB file (and sidecars
@@ -1467,11 +1592,44 @@ impl SqliteRoomStore {
     }
 
     /// Open an in-memory store (for tests). Migrations run on open.
+    ///
+    /// Deliberately does NOT take [`apply_durability_pragmas`]: a `:memory:`
+    /// database has no journal file to hold in WAL and no second connection to
+    /// contend with. `migrate` supplies the one setting that still means
+    /// something here, `foreign_keys`.
     pub fn open_in_memory() -> Result<Self> {
         let conn = Connection::open_in_memory()?;
         let mut store = Self { conn };
         store.migrate()?;
         Ok(store)
+    }
+
+    /// Read the durability settings back off the live connection.
+    ///
+    /// Every field is queried from SQLite, not remembered from what
+    /// [`apply_durability_pragmas`] asked for, so a setting that failed to take
+    /// — an older DB whose `journal_mode` could not be converted, a pragma a
+    /// future edit drops — shows up here as what is actually in force. The
+    /// daemon logs this at startup; see `StoreDurability`.
+    pub fn durability(&self) -> Result<StoreDurability> {
+        let journal_mode: String = self
+            .conn
+            .query_row("PRAGMA journal_mode", [], |row| row.get(0))?;
+        let synchronous: i64 = self
+            .conn
+            .query_row("PRAGMA synchronous", [], |row| row.get(0))?;
+        let busy_timeout_ms: i64 = self
+            .conn
+            .query_row("PRAGMA busy_timeout", [], |row| row.get(0))?;
+        let foreign_keys: i64 = self
+            .conn
+            .query_row("PRAGMA foreign_keys", [], |row| row.get(0))?;
+        Ok(StoreDurability {
+            journal_mode,
+            synchronous: synchronous_label(synchronous),
+            busy_timeout_ms,
+            foreign_keys: foreign_keys != 0,
+        })
     }
 
     /// Create the schema if it does not already exist. Safe to call repeatedly —
@@ -11299,6 +11457,192 @@ mod tests {
             fk_on, 1,
             "foreign_keys pragma must be ON or FK clauses are inert"
         );
+    }
+
+    /// The production open path carries its durability settings, read back off
+    /// the connection SQLite is actually using.
+    ///
+    /// Asserted through BOTH the raw pragmas and [`SqliteRoomStore::durability`]
+    /// so the operator-facing reporter cannot drift from the thing it reports:
+    /// a `durability()` that returned a remembered constant would pass its own
+    /// half and fail the raw half.
+    #[test]
+    fn a_production_store_opens_in_wal_with_the_chosen_durability_settings() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("rooms.db");
+        let s = SqliteRoomStore::open(&path).unwrap();
+
+        let journal_mode: String = s
+            .conn
+            .query_row("PRAGMA journal_mode", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(journal_mode, "wal", "production store must run in WAL");
+        let synchronous: i64 = s
+            .conn
+            .query_row("PRAGMA synchronous", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(synchronous, 1, "synchronous must be NORMAL (1) under WAL");
+        let busy_timeout_ms: i64 = s
+            .conn
+            .query_row("PRAGMA busy_timeout", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(busy_timeout_ms, BUSY_TIMEOUT.as_millis() as i64);
+
+        assert_eq!(
+            s.durability().unwrap(),
+            StoreDurability {
+                journal_mode: "wal".to_string(),
+                synchronous: "normal".to_string(),
+                busy_timeout_ms: BUSY_TIMEOUT.as_millis() as i64,
+                foreign_keys: true,
+            }
+        );
+
+        // WAL is recorded in the DB header, so a REOPEN of the same file must
+        // still report it — the setting is a property of the database, and the
+        // per-connection ones must be re-applied by every open.
+        drop(s);
+        let reopened = SqliteRoomStore::open(&path).unwrap();
+        assert_eq!(
+            reopened.durability().unwrap(),
+            StoreDurability {
+                journal_mode: "wal".to_string(),
+                synchronous: "normal".to_string(),
+                busy_timeout_ms: BUSY_TIMEOUT.as_millis() as i64,
+                foreign_keys: true,
+            }
+        );
+    }
+
+    /// The in-memory test path keeps its OWN settings and is not dragged into
+    /// the production posture: `:memory:` has no journal to hold in WAL, and
+    /// the one setting that still matters there — `foreign_keys` — comes from
+    /// `migrate`. Pinned so a future edit that "unifies" the two open paths has
+    /// to do it deliberately rather than by accident.
+    #[test]
+    fn an_in_memory_store_keeps_foreign_keys_without_the_file_durability_posture() {
+        let d = store().durability().unwrap();
+        assert!(d.foreign_keys, "FK clauses would be inert without this");
+        assert_ne!(d.journal_mode, "wal", "a :memory: DB cannot be in WAL");
+    }
+
+    /// Two writers on ONE store file: the second WAITS for the first's write
+    /// lock and then succeeds, instead of failing immediately with
+    /// `SQLITE_BUSY`. This is the half of "durable under load" that the pragma
+    /// assertions above cannot show — that the timeout is doing work on a real
+    /// contended write and not just sitting in a pragma readout.
+    ///
+    /// The holder takes an IMMEDIATE transaction (the write lock at `BEGIN`,
+    /// which is what every write path in this crate does) and keeps it for
+    /// `HOLD`, well past the instant a second writer would otherwise give up.
+    /// The racer then performs an ordinary store write through the public API.
+    /// It must return `Ok`, and it must have taken at least most of the hold to
+    /// do it — a pass with no elapsed time would mean the two never actually
+    /// contended and the test proved nothing.
+    ///
+    /// Mutations, all run 2026-09-02 on this tree, recorded with the result
+    /// each one ACTUALLY produced rather than the one the shape suggests:
+    ///
+    /// * `conn.busy_timeout(Duration::ZERO)` — RED, here and on
+    ///   `a_production_store_opens_in_wal_with_the_chosen_durability_settings`
+    ///   (0 vs 5000). This test's failure is
+    ///   `the second writer must WAIT for the lock, not fail:
+    ///   Db(SqliteFailure(Error { code: DatabaseBusy, extended_code: 5 },
+    ///   Some("database is locked")))`. This is the mutation that matters: it
+    ///   is what a store with no effective busy timeout does under two writers,
+    ///   and this test is what catches it.
+    /// * DELETING the `conn.busy_timeout(BUSY_TIMEOUT)?` line entirely —
+    ///   **GREEN**, and honestly so. `rusqlite::Connection::open` sets its own
+    ///   `sqlite3_busy_timeout(db, 5000)`, so removing our call leaves the same
+    ///   five seconds in force and there is no behavior for a test to catch.
+    ///   Recorded rather than quietly omitted, because a doc comment claiming
+    ///   this mutation reds would be false and the next reader would trust it:
+    ///   the explicit call buys ownership of the value, not a behavior change,
+    ///   and the assertion in the sibling test is what would catch a `rusqlite`
+    ///   upgrade dropping that default. See [`BUSY_TIMEOUT`].
+    /// * Dropping the `journal_mode`/`synchronous` lines — RED on the sibling
+    ///   test (`production store must run in WAL: left: "delete", right:
+    ///   "wal"`), green here, which is right: a busy timeout bounds a second
+    ///   writer under a rollback journal too.
+    #[test]
+    fn a_second_writer_waits_for_the_lock_instead_of_failing_busy() {
+        use std::{
+            sync::mpsc,
+            thread,
+            time::{Duration, Instant},
+        };
+
+        const HOLD: Duration = Duration::from_millis(750);
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("rooms.db");
+        let key = RoomKey::new("hq");
+        let mut racer = SqliteRoomStore::open(&path).unwrap();
+        racer.create(key.clone(), "HQ", None, now()).unwrap();
+
+        // The racer is opened BEFORE the lock is taken, deliberately: `open`
+        // runs `migrate`, which writes, so an open under the held lock absorbs
+        // the wait itself and the measured write below would find the lock
+        // already released and prove nothing.
+
+        // Writer one: a real second connection to the same file, holding the
+        // write lock for HOLD.
+        let holder_path = path.clone();
+        let holder_key = key.clone();
+        let (locked_tx, locked_rx) = mpsc::channel();
+        let holder = thread::spawn(move || {
+            let mut holder = SqliteRoomStore::open(&holder_path).unwrap();
+            let tx = holder
+                .conn
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .unwrap();
+            tx.execute(
+                "UPDATE rooms SET name = 'held' WHERE id = ?1",
+                params![holder_key.as_str()],
+            )
+            .unwrap();
+            locked_tx.send(()).unwrap();
+            thread::sleep(HOLD);
+            tx.commit().unwrap();
+        });
+
+        locked_rx.recv().unwrap();
+        // The lock is held. Give the holder a beat past `BEGIN IMMEDIATE` so the
+        // racer is unambiguously contending rather than winning a start race.
+        thread::sleep(Duration::from_millis(50));
+
+        let started = Instant::now();
+        let wrote = racer.append_message(
+            &key,
+            "ann",
+            RoomParticipantKind::Human,
+            RoomMessageKind::Message,
+            "second writer",
+            now(),
+        );
+        let waited = started.elapsed();
+        holder.join().unwrap();
+
+        wrote.unwrap_or_else(|err| {
+            panic!("the second writer must WAIT for the lock, not fail: {err:?}")
+        });
+        assert!(
+            waited >= HOLD / 2,
+            "the second writer returned in {waited:?}, so it never contended \
+             for the lock and this test proved nothing"
+        );
+        assert!(
+            waited < BUSY_TIMEOUT,
+            "the second writer waited {waited:?}, past the timeout it should \
+             have acquired the lock well inside"
+        );
+
+        // And the write is really there, not swallowed.
+        let page = racer.transcript_page(&key, None, Some(10)).unwrap();
+        assert!(page
+            .messages
+            .iter()
+            .any(|m| m.body == "second writer" && m.author_id == "ann"));
     }
 
     #[test]

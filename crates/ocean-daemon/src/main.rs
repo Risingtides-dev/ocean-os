@@ -975,7 +975,29 @@ async fn main() -> anyhow::Result<()> {
     }
     let room_store = ocean_store::SqliteRoomStore::open(&rooms_db_path)
         .with_context(|| format!("opening rooms DB at {}", rooms_db_path.display()))?;
-    tracing::info!(path = %rooms_db_path.display(), "persistent rooms store ready");
+    // Durability posture on the wire an operator actually reads. `open` applies
+    // WAL, synchronous=NORMAL, a busy timeout and foreign keys; this reads them
+    // back OFF the live connection, so the startup line reports what SQLite is
+    // actually doing rather than what the code asked for. Answering "is this
+    // daemon running WAL?" should not require a `sqlite3` session against a
+    // live rooms.db. Read-back failure is not fatal — the store opened fine and
+    // refusing to boot over an unreadable diagnostic would be the tail wagging
+    // the dog — but it is logged at warn so a silent unknown is still visible.
+    match room_store.durability() {
+        Ok(d) => tracing::info!(
+            path = %rooms_db_path.display(),
+            journal_mode = %d.journal_mode,
+            synchronous = %d.synchronous,
+            busy_timeout_ms = d.busy_timeout_ms,
+            foreign_keys = d.foreign_keys,
+            "persistent rooms store ready"
+        ),
+        Err(err) => tracing::warn!(
+            path = %rooms_db_path.display(),
+            %err,
+            "persistent rooms store ready; durability settings unreadable"
+        ),
+    }
 
     // Room attachment BYTES live beside the DB that indexes them, so a moved
     // `OCEAN_DB_PATH` carries a room's files with its metadata instead of
