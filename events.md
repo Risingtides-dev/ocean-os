@@ -9677,3 +9677,114 @@ known check gaps without claiming every criterion already has an executable
 pin and named effort. Docs only; no secret, launchd environment, daemon,
 deployment, login, reboot, or production state changed.
 _________________________________________________________________________________ 22:53 docs/rooms-definition-of-done
+time:      [20:15] [01-09-26]
+agent:     [claude-code], [claude-fable-5-1], [ocean operator]
+worktree:  docs/rooms-federation-runbook
+type:      [handoff]
+area:      [docs]
+
+Added a rooms and federation runbook to `docs/OPERATIONS.md`: the order of
+operations to enable federation on the supervised daemon (two environment
+variables the tracked plist does not carry, so the operated daemon runs rooms
+local-only today), how to verify a credentialed room reaches `live` and its
+outbox drains, the workspace lane's Bedrock requirements, how to read the
+bridge while `/metrics` has no room counters, rollback, and the `rooms.db`
+migration rehearsal the Phase 1 manifest's gate 4 asks for — stated plainly
+as NOT yet performed, so the definition-of-done line stays open on an
+executable record rather than on prose. Also records the Bedrock ordering
+this daemon depends on: `db/013` before any deploy carrying ocean-bedrock
+#117. `docs/README.md` no longer says the Phase 1 independent review has not
+run; ROADMAP.md has said since 2026-08-31 that it did, and ROADMAP.md's own
+"not implied" list no longer names room federation as unapproved, since it
+shipped in room_federation.rs and is operated per the new section. Docs
+only; no code, no deploy, no migration, no rehearsal performed.
+_________________________________________________________________________________ 20:15 docs/rooms-federation-runbook
+time:      [20:27] [01-09-26]
+agent:     [codex] [gpt-5]
+worktree:  docs/rooms-federation-runbook
+type:      [bug report]
+area:      [docs]
+
+Addressed the three Codex review findings on PR #441. Plist changes now require
+the installer's guarded bootout, teardown wait, bootstrap, enable, and kickstart
+sequence on both enable and rollback. The migration rehearsal uses SQLite's
+online backup API plus quick_check instead of copying a live main file without
+its WAL. References now resolve to the tracked ROADMAP and accepted Phase 1
+manifest rather than an unmerged definition-of-done branch. Docs only; no
+launchd job, database, daemon, deployment, or production state changed.
+_________________________________________________________________________________ 20:27 docs/rooms-federation-runbook
+
+time:      [21:13] [01-09-26]
+agent:     [codex] [gpt-5]
+worktree:  docs/rooms-federation-runbook
+type:      [bug report]
+area:      [review]
+
+Closed the second Codex review pass on the migration rehearsal. Candidate and
+rollback runs now use isolated config roots, set the explicit unsupervised
+override while launchd remains loaded, and prove rollback by restoring the
+online backup and reading it through the previous immutable binary. Docs only;
+no rehearsal, database mutation, daemon restart, launchd action, deployment,
+or production state change occurred.
+_________________________________________________________________________________ 21:13 docs/rooms-federation-runbook
+
+time:      [21:20] [01-09-26]
+agent:     [codex] [gpt-5]
+worktree:  docs/rooms-federation-runbook
+type:      [bug report]
+area:      [review]
+
+Closed the final Codex review pass on federation authority and the rehearsal
+source. The runbook now distinguishes the Bedrock transport URL from the owner
+token used only for Local-room bootstrap, preserves revoked state explicitly,
+and resolves `OCEAN_DB_PATH` before falling back to the effective config-dir
+database. It accurately scopes the 2026-08-31 rehearsal, reconstructs and
+verifies a pre-Phase-1 schema before taking the rollback backup, requires a
+truly pre-Phase-1 rollback artifact, and runs both binaries from a neutral cwd.
+The two branch event dates also follow the ledger's DD-MM-YY schema. Docs only;
+no rehearsal, database mutation, daemon restart, launchd action, deployment, or
+production state change occurred.
+_________________________________________________________________________________ 21:20 docs/rooms-federation-runbook
+
+time:      [21:58] [01-09-26]
+agent:     [codex] [gpt-5]
+worktree:  docs/rooms-federation-runbook
+type:      [bug report]
+area:      [review]
+
+Closed the fresh Codex review findings on the offline migration rehearsal. A
+genuine retained pre-Phase-1 backup is now checked through sqlite_master rather
+than querying tables that do not exist, while the row-count guard remains only
+for reconstruction from a current database. Both candidate and rollback daemon
+commands explicitly remove federation URL and owner-token variables before
+launch. Docs only; no rehearsal, database mutation, daemon restart, launchd
+action, deployment, or production state change occurred.
+_________________________________________________________________________________ 21:58 docs/rooms-federation-runbook
+
+time:      [22:16] [01-09-26]
+agent:     [codex] [gpt-5]
+worktree:  docs/rooms-federation-runbook
+type:      [bug report]
+area:      [review]
+
+Closed the latest Codex runbook findings without overwriting the concurrent
+branch cleanup at 95581a13. The rendered launchd plist is linted before the
+healthy daemon is stopped, and both candidate and rollback rehearsals remove
+title-database and plugin-directory overrides as well as federation authority.
+Docs only; no rehearsal, database mutation, daemon restart, launchd action,
+deployment, or production state changed.
+_________________________________________________________________________________ 22:16 docs/rooms-federation-runbook
+
+time:      [22:31] [01-09-26]
+agent:     [codex] [gpt-5]
+worktree:  docs/rooms-federation-runbook
+type:      [bug report]
+area:      [review]
+
+Closed the current-head credential-custody findings. The runbook no longer
+places the owner bearer in a rendered plist or dumps the launchd environment to
+discover database paths. Production enablement is explicitly blocked until a
+supported untracked owner-only login loader can restore the variables before
+every daemon start. Docs only; no secret, launchd environment, daemon restart,
+rehearsal, deployment, login, reboot, or production state changed.
+_________________________________________________________________________________ 22:31 docs/rooms-federation-runbook
