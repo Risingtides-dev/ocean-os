@@ -14796,6 +14796,143 @@ mod tests {
         );
     }
 
+    /// A CLOSED room takes no more federated rows, and a CUT one is not
+    /// repopulated from sequence 0.
+    ///
+    /// `ingest_confirmed_event` guarded on the room merely EXISTING while every
+    /// other writer in this crate guards on it being open. That gap was
+    /// unreachable while the only close in production was a call room's
+    /// autoclose — `call:` rooms never federate — and a route that closes any
+    /// room makes it reachable. Left alone it is the worst transcript
+    /// corruption available here: rows land after the close marker, in a room
+    /// whose SSE tails have ended and whose snapshot says `closed: true`, so
+    /// nobody watching sees them arrive; and after retention the same path
+    /// refills a transcript the operator was told was emptied.
+    #[test]
+    fn a_closed_room_refuses_federated_ingest_and_a_cut_one_stays_cut() {
+        let mut s = store();
+        let key = RoomKey::new("federated-close");
+        s.create(key.clone(), "Federated", None, now()).unwrap();
+        s.add_participant(
+            &key,
+            RoomParticipant {
+                id: "alice".into(),
+                kind: RoomParticipantKind::Human,
+                display_name: "Alice".into(),
+            },
+            now(),
+        )
+        .unwrap();
+        s.update_room_access_safe(&key, Some(RoomAccessState::Live), None, None)
+            .unwrap();
+
+        let event = |ledger: &str, seq: u64| ConfirmedEvent {
+            ledger_event_id: ledger.to_string(),
+            global_sequence: seq,
+            client_event_id: format!("client-{ledger}"),
+            source_id: "src".into(),
+            source_sequence: seq,
+            origin_principal_id: "principal".into(),
+            origin_member_id: "member".into(),
+            trigger_targets: Vec::new(),
+            author_id: "alice".into(),
+            author_kind: RoomParticipantKind::Human,
+            kind: RoomMessageKind::Message,
+            body: format!("federated {ledger}"),
+        };
+
+        // Open: ingest lands.
+        assert!(matches!(
+            s.ingest_confirmed_event(&key, &event("one", 1), now()),
+            Ok(IngestOutcome::Ingested(_))
+        ));
+
+        s.close_with_marker(&key, RoomCloser::Member("alice"), now())
+            .unwrap();
+        let after_close = s
+            .transcript_page_including_closed(&key, None, None)
+            .unwrap()
+            .messages
+            .len();
+
+        // Closed: refused, with the same answer every other write to a closed
+        // room gives, and NOTHING appended.
+        assert!(matches!(
+            s.ingest_confirmed_event(&key, &event("two", 2), now()),
+            Err(RoomStoreError::UnknownRoom(_))
+        ));
+        assert_eq!(
+            s.transcript_page_including_closed(&key, None, None)
+                .unwrap()
+                .messages
+                .len(),
+            after_close,
+            "a refused ingest must append no row"
+        );
+
+        // Cut, then refused again: the cut room stays empty rather than being
+        // refilled from sequence 0 by a late confirmation.
+        s.cut_closed_room(&key).unwrap();
+        assert!(matches!(
+            s.ingest_confirmed_event(&key, &event("three", 3), now()),
+            Err(RoomStoreError::UnknownRoom(_))
+        ));
+        assert!(
+            s.transcript_page_including_closed(&key, None, None)
+                .unwrap()
+                .messages
+                .is_empty(),
+            "a cut room must not be repopulated by federation"
+        );
+    }
+
+    /// Retention does not rediscover its own work forever.
+    ///
+    /// A cut deliberately keeps the `rooms` row and its `closed_at`, so an
+    /// eligibility query that asked only "closed before the cutoff" returned
+    /// every historical room on every sweep — an IMMEDIATE write transaction
+    /// each, every six hours, deleting nothing, and each counted as another
+    /// `rooms_cut` on the operator's card. Eligibility is therefore "a cut would
+    /// remove at least one row", asked against the same four tables the cut
+    /// empties.
+    #[test]
+    fn an_already_cut_room_is_no_longer_eligible_for_retention() {
+        let mut s = store();
+        let base = DateTime::parse_from_rfc3339("2026-09-02T12:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let long_ago = base - chrono::Duration::days(40);
+        let key = RoomKey::new("cut-once");
+        s.create(key.clone(), "Cut Once", None, long_ago).unwrap();
+        s.add_participant(
+            &key,
+            RoomParticipant {
+                id: "alice".into(),
+                kind: RoomParticipantKind::Human,
+                display_name: "Alice".into(),
+            },
+            long_ago,
+        )
+        .unwrap();
+        s.close_with_marker(&key, RoomCloser::Member("alice"), long_ago)
+            .unwrap();
+
+        let cutoff = base - chrono::Duration::days(30);
+        assert_eq!(
+            s.rooms_closed_before(cutoff).unwrap(),
+            vec![key.clone()],
+            "a closed room holding rows is eligible"
+        );
+        s.cut_closed_room(&key).unwrap();
+        assert!(
+            s.rooms_closed_before(cutoff).unwrap().is_empty(),
+            "once emptied, the same room must not come back on every future sweep"
+        );
+        // And it is still THERE — the row survives so the room can still say it
+        // is closed rather than 404 as one that never existed.
+        assert!(s.get_including_closed(&key).unwrap().is_some());
+    }
+
     // ── G1 thread integrity ────────────────────────────────────────────────
 
     /// A store with one open room, ready for thread appends.
@@ -15612,142 +15749,5 @@ mod tests {
             Some("ev-1"),
             "the head is the lowest `position`, which is allocation order"
         );
-    }
-
-    /// A CLOSED room takes no more federated rows, and a CUT one is not
-    /// repopulated from sequence 0.
-    ///
-    /// `ingest_confirmed_event` guarded on the room merely EXISTING while every
-    /// other writer in this crate guards on it being open. That gap was
-    /// unreachable while the only close in production was a call room's
-    /// autoclose — `call:` rooms never federate — and a route that closes any
-    /// room makes it reachable. Left alone it is the worst transcript
-    /// corruption available here: rows land after the close marker, in a room
-    /// whose SSE tails have ended and whose snapshot says `closed: true`, so
-    /// nobody watching sees them arrive; and after retention the same path
-    /// refills a transcript the operator was told was emptied.
-    #[test]
-    fn a_closed_room_refuses_federated_ingest_and_a_cut_one_stays_cut() {
-        let mut s = store();
-        let key = RoomKey::new("federated-close");
-        s.create(key.clone(), "Federated", None, now()).unwrap();
-        s.add_participant(
-            &key,
-            RoomParticipant {
-                id: "alice".into(),
-                kind: RoomParticipantKind::Human,
-                display_name: "Alice".into(),
-            },
-            now(),
-        )
-        .unwrap();
-        s.update_room_access_safe(&key, Some(RoomAccessState::Live), None, None)
-            .unwrap();
-
-        let event = |ledger: &str, seq: u64| ConfirmedEvent {
-            ledger_event_id: ledger.to_string(),
-            global_sequence: seq,
-            client_event_id: format!("client-{ledger}"),
-            source_id: "src".into(),
-            source_sequence: seq,
-            origin_principal_id: "principal".into(),
-            origin_member_id: "member".into(),
-            trigger_targets: Vec::new(),
-            author_id: "alice".into(),
-            author_kind: RoomParticipantKind::Human,
-            kind: RoomMessageKind::Message,
-            body: format!("federated {ledger}"),
-        };
-
-        // Open: ingest lands.
-        assert!(matches!(
-            s.ingest_confirmed_event(&key, &event("one", 1), now()),
-            Ok(IngestOutcome::Ingested(_))
-        ));
-
-        s.close_with_marker(&key, RoomCloser::Member("alice"), now())
-            .unwrap();
-        let after_close = s
-            .transcript_page_including_closed(&key, None, None)
-            .unwrap()
-            .messages
-            .len();
-
-        // Closed: refused, with the same answer every other write to a closed
-        // room gives, and NOTHING appended.
-        assert!(matches!(
-            s.ingest_confirmed_event(&key, &event("two", 2), now()),
-            Err(RoomStoreError::UnknownRoom(_))
-        ));
-        assert_eq!(
-            s.transcript_page_including_closed(&key, None, None)
-                .unwrap()
-                .messages
-                .len(),
-            after_close,
-            "a refused ingest must append no row"
-        );
-
-        // Cut, then refused again: the cut room stays empty rather than being
-        // refilled from sequence 0 by a late confirmation.
-        s.cut_closed_room(&key).unwrap();
-        assert!(matches!(
-            s.ingest_confirmed_event(&key, &event("three", 3), now()),
-            Err(RoomStoreError::UnknownRoom(_))
-        ));
-        assert!(
-            s.transcript_page_including_closed(&key, None, None)
-                .unwrap()
-                .messages
-                .is_empty(),
-            "a cut room must not be repopulated by federation"
-        );
-    }
-
-    /// Retention does not rediscover its own work forever.
-    ///
-    /// A cut deliberately keeps the `rooms` row and its `closed_at`, so an
-    /// eligibility query that asked only "closed before the cutoff" returned
-    /// every historical room on every sweep — an IMMEDIATE write transaction
-    /// each, every six hours, deleting nothing, and each counted as another
-    /// `rooms_cut` on the operator's card. Eligibility is therefore "a cut would
-    /// remove at least one row", asked against the same four tables the cut
-    /// empties.
-    #[test]
-    fn an_already_cut_room_is_no_longer_eligible_for_retention() {
-        let mut s = store();
-        let base = DateTime::parse_from_rfc3339("2026-09-02T12:00:00Z")
-            .unwrap()
-            .with_timezone(&Utc);
-        let long_ago = base - chrono::Duration::days(40);
-        let key = RoomKey::new("cut-once");
-        s.create(key.clone(), "Cut Once", None, long_ago).unwrap();
-        s.add_participant(
-            &key,
-            RoomParticipant {
-                id: "alice".into(),
-                kind: RoomParticipantKind::Human,
-                display_name: "Alice".into(),
-            },
-            long_ago,
-        )
-        .unwrap();
-        s.close_with_marker(&key, RoomCloser::Member("alice"), long_ago)
-            .unwrap();
-
-        let cutoff = base - chrono::Duration::days(30);
-        assert_eq!(
-            s.rooms_closed_before(cutoff).unwrap(),
-            vec![key.clone()],
-            "a closed room holding rows is eligible"
-        );
-        s.cut_closed_room(&key).unwrap();
-        assert!(
-            s.rooms_closed_before(cutoff).unwrap().is_empty(),
-            "once emptied, the same room must not come back on every future sweep"
-        );
-        // And it is still THERE — the row survives so the room can still say it
-        // is closed rather than 404 as one that never existed.
-        assert!(s.get_including_closed(&key).unwrap().is_some());
     }
 }
