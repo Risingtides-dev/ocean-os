@@ -68,6 +68,28 @@ outbox, and the restart-safe federation core (S2 P2-A). One database file
 - **Outbox removal requires the full producer tuple.** A confirmed event
   deletes an outbox row only when `client_event_id`, `source_id`, and
   `source_sequence` all match — never `client_event_id` alone.
+- **Confirmed ingest requires an OPEN room.** `ingest_confirmed_event` guards
+  on `room_is_open_on`, not on the room merely existing. It guarded on existence
+  until the close route landed, and the gap was unreachable only because the one
+  close production could reach was a call room's autoclose and `call:` rooms
+  never federate. A route that closes any room makes it reachable, and the
+  result is the worst transcript corruption available here: rows appended AFTER
+  the close marker, into a room whose daemon SSE tails have ended and whose
+  `/snapshot` says `closed: true`, so nothing watching can see them arrive —
+  and, after a retention cut, the same path refilling from sequence 0 a
+  transcript the operator was told was emptied. The daemon also stops the room's
+  federation task on close so the refusal is not a reconnect loop, but the guard
+  lives HERE too and not only there: a supervisor that is slow, restarted, or
+  racing the close is exactly the case the invariant must survive, and only the
+  store can decide it atomically with the write.
+- **Retention eligibility is "a cut would remove something", never "closed long
+  enough".** `rooms_closed_before` requires an EXISTS over the same four tables
+  `cut_closed_room` empties. Without that clause a cut's own deliberate
+  preservation of the `rooms` row and its `closed_at` makes every historical
+  room eligible again on every sweep: an IMMEDIATE write transaction per room
+  every interval forever, deleting nothing, with each empty no-op counted to the
+  operator as another `rooms_cut`. The condition is derived from what the cut
+  does rather than from a marker column, so the two cannot drift apart.
 - **Confirmed ingest is fail-closed.** Dedup cross-checks BOTH persisted
   copies: the `federated_events` index tuple must equal the parsed transcript
   `FederatedMessageMeta`, and that meta must equal the incoming event — every

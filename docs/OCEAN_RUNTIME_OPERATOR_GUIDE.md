@@ -239,7 +239,18 @@ applies is always the one `/health` reports; changing it needs a restart.
 
 Retention never touches an OPEN room, at any age: the window is measured from
 the close, so a room that has been running for years is not eligible until
-somebody closes it with `POST /v1/rooms/persistent/{key}/close`.
+somebody closes it with `POST /v1/rooms/persistent/{key}/close`. A room that
+has already been cut stops being eligible too: eligibility asks whether a cut
+would still remove something, so an archive of emptied rooms is not re-swept
+forever and `rooms_cut` never counts an empty no-op.
+
+Closing a federated room also stops its federation task, and the store refuses
+confirmed Bedrock events for a closed room outright. Both halves are deliberate:
+the store's refusal is what makes the invariant true under a slow or restarted
+supervisor, and stopping the task is what keeps that refusal from becoming a
+reconnect loop. Nothing is sent to Bedrock — the room's credential and outbox
+are untouched — so a closed room can still be inspected upstream; it simply
+stops accepting new transcript rows locally.
 
 `POST /v1/rooms/maintenance/run` runs both sweeps immediately under operator
 authentication and answers with the same card, which is the fast way to confirm
@@ -250,7 +261,12 @@ The `room_maintenance` card on `GET /health` carries the configuration
 run's `last_run_at`, `last_run_ms`, `runs_total`, counts (`rooms_cut`,
 `messages_removed`, `attachment_rows_removed`, `cursors_removed`,
 `federated_index_rows_removed`, `orphan_files_removed`, `orphan_dirs_removed`),
-`bytes_reclaimed`, and `last_error` (`null` when the last sweep was clean). The
+`bytes_reclaimed`, `blobs_unlink_failed`, and `last_error` (`null` when the last
+sweep was clean). `bytes_reclaimed` counts a blob only once its file is actually
+gone, so a nonzero `blobs_unlink_failed` beside a reclaim figure short of what
+was cut is the signature of a blob tree the daemon can read but not write — the
+one failure here that is otherwise invisible, since the rows commit and every
+other count looks healthy while disk never comes back. The
 configuration is on the card deliberately: `rooms_cut: 0` on its own cannot tell
 you whether retention swept and found nothing or was never turned on, and those
 two have opposite remedies.

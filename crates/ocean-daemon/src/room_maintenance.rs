@@ -210,8 +210,16 @@ pub(super) struct RoomMaintenanceReport {
     /// Whole room DIRECTORIES matching no room the store knows, removed by the
     /// last sweep.
     pub(super) orphan_dirs_removed: u64,
-    /// Bytes the last sweep reclaimed: retention's recorded `byte_len` totals
-    /// plus the measured size of every orphan it unlinked.
+    /// Blob unlinks that FAILED in the last sweep, across both jobs.
+    ///
+    /// Its own counter rather than only an `last_error` string, because this is
+    /// the one failure here that is invisible by construction: the rows commit,
+    /// every count looks healthy, and disk simply never comes back. A nonzero
+    /// value with `bytes_reclaimed` short of what was cut is the signature of a
+    /// blob tree the daemon can read but not write.
+    pub(super) blobs_unlink_failed: u64,
+    /// Bytes the last sweep ACTUALLY reclaimed — a blob counts only once its
+    /// file is gone, never merely because its row was deleted.
     pub(super) bytes_reclaimed: u64,
     /// The last sweep's error, or `None` if it was clean. A fixed, bounded
     /// string — never a path, a room key, or a store message that could carry
@@ -237,6 +245,7 @@ impl RoomMaintenanceReport {
             federated_index_rows_removed: 0,
             orphan_files_removed: 0,
             orphan_dirs_removed: 0,
+            blobs_unlink_failed: 0,
             bytes_reclaimed: 0,
             last_error: None,
         }
@@ -272,6 +281,7 @@ pub(super) struct SweepOutcome {
     pub(super) federated_index_rows_removed: u64,
     pub(super) orphan_files_removed: u64,
     pub(super) orphan_dirs_removed: u64,
+    pub(super) blobs_unlink_failed: u64,
     pub(super) bytes_reclaimed: u64,
     pub(super) error: Option<String>,
 }
@@ -347,15 +357,32 @@ fn run_retention(
         outcome.attachment_rows_removed += cut.attachment_rows_removed;
         outcome.cursors_removed += cut.cursors_removed;
         outcome.federated_index_rows_removed += cut.federated_index_rows_removed;
-        outcome.bytes_reclaimed += cut.attachment_bytes_removed;
 
         // Bytes AFTER the commit, exactly as `DELETE .../attachments/{id}` does
-        // it. A failed unlink here is not an error worth reporting: the row is
-        // gone, so the file is now an orphan, and the very next pass of the
-        // sweep below is what collects it.
+        // it. A blob whose unlink fails is still collectable — the row is gone,
+        // so the orphan pass below sees an unreferenced file in a directory the
+        // store still expects — but "a later sweep gets it" is not a reason to
+        // discard the error, and the byte total is not allowed to claim it.
+        //
+        // `bytes_reclaimed` counts a blob only when the file is actually gone
+        // (unlinked here, or already absent). Adding the row's recorded
+        // `byte_len` unconditionally would let the report announce reclaimed
+        // disk on a tree that never gave any back, which is the exact failure
+        // this card exists to make visible rather than to paper over.
         let dir = crate::room_attachments::room_dir(blob_root, &key);
-        for id in cut.attachment_ids {
-            let _ = std::fs::remove_file(dir.join(&id));
+        for (id, byte_len) in cut.attachment_blobs {
+            let path = dir.join(&id);
+            match std::fs::remove_file(&path) {
+                Ok(()) => outcome.bytes_reclaimed += byte_len,
+                // Already gone: nothing to reclaim, and nothing wrong.
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(_) => {
+                    outcome.blobs_unlink_failed += 1;
+                    outcome.error.get_or_insert_with(|| {
+                        "retention could not unlink a cut room's attachment bytes".to_string()
+                    });
+                }
+            }
         }
         // The room's directory is empty now and no room will ever file anything
         // under it again. `remove_dir` (not `remove_dir_all`) so a file the
@@ -473,9 +500,24 @@ fn sweep_room_dir(
             continue;
         }
         let size = entry.metadata().map(|m| m.len()).unwrap_or(0);
-        if std::fs::remove_file(&path).is_ok() {
-            outcome.orphan_files_removed += 1;
-            outcome.bytes_reclaimed += size;
+        match std::fs::remove_file(&path) {
+            Ok(()) => {
+                outcome.orphan_files_removed += 1;
+                outcome.bytes_reclaimed += size;
+            }
+            // Somebody else removed it between the listing and here. Not a
+            // failure: the file is gone, which is what was wanted.
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            // A directory that refuses deletion — wrong permissions, a
+            // read-only mount — is the failure mode this whole module exists to
+            // make visible: disk keeps growing while every sweep reports a
+            // clean run. Counted and surfaced, never swallowed.
+            Err(_) => {
+                outcome.blobs_unlink_failed += 1;
+                outcome
+                    .error
+                    .get_or_insert_with(|| "orphan GC could not unlink a blob".to_string());
+            }
         }
     }
 }
@@ -548,6 +590,7 @@ fn record_sweep(
     guard.federated_index_rows_removed = outcome.federated_index_rows_removed;
     guard.orphan_files_removed = outcome.orphan_files_removed;
     guard.orphan_dirs_removed = outcome.orphan_dirs_removed;
+    guard.blobs_unlink_failed = outcome.blobs_unlink_failed;
     guard.bytes_reclaimed = outcome.bytes_reclaimed;
     guard.last_error = outcome.error.clone();
 
@@ -562,6 +605,7 @@ fn record_sweep(
         federated_index_rows_removed = outcome.federated_index_rows_removed,
         orphan_files_removed = outcome.orphan_files_removed,
         orphan_dirs_removed = outcome.orphan_dirs_removed,
+        blobs_unlink_failed = outcome.blobs_unlink_failed,
         bytes_reclaimed = outcome.bytes_reclaimed,
         retention_days = guard.retention_days,
         elapsed_ms = guard.last_run_ms,
@@ -1127,5 +1171,163 @@ mod tests {
         let clean = report_snapshot(&handle);
         assert_eq!(clean.last_error, None);
         assert_eq!(clean.runs_total, 2);
+    }
+
+    /// A blob that cannot be unlinked is COUNTED and SURFACED, and its bytes
+    /// are not claimed as reclaimed.
+    ///
+    /// This is the failure the whole operated half exists to catch, and it is
+    /// invisible by construction: the rows commit, every count looks healthy,
+    /// and disk simply never comes back. Discarding the `remove_file` error let
+    /// a sweep report `last_error: null` and a `bytes_reclaimed` figure taken
+    /// from the INDEX while the bytes were still on the filesystem — a report
+    /// that is worse than none, because it actively says the opposite of what
+    /// happened.
+    ///
+    /// The failure is induced by putting a DIRECTORY where the blob file should
+    /// be, so `remove_file` fails with `EISDIR`. A read-only parent would not
+    /// do: these tests can run as root, where mode bits are advisory and the
+    /// unlink would succeed anyway.
+    #[test]
+    fn a_blob_that_cannot_be_unlinked_is_reported_not_swallowed() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (rooms, blob_root) = fixture(tmp.path());
+        let now = DateTime::parse_from_rfc3339("2026-09-02T12:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let long_ago = now - chrono::Duration::days(40);
+        let key = RoomKey::new("unlinkable");
+        seed_room(&rooms, &key, long_ago);
+
+        // The row says there are 9 bytes; the path is a directory, so the
+        // unlink cannot succeed.
+        let id = "a".repeat(32);
+        let stuck = crate::room_attachments::room_dir(&blob_root, &key).join(&id);
+        std::fs::create_dir_all(&stuck).unwrap();
+        with_rooms_handle(&rooms, |store| {
+            store.add_attachment(
+                &key,
+                &id,
+                "notes.txt",
+                "text/plain",
+                9,
+                "0".repeat(64).as_str(),
+                "alice",
+                long_ago,
+            )
+        })
+        .unwrap();
+        with_rooms_handle(&rooms, |store| {
+            store.close_with_marker(&key, RoomCloser::Member("alice"), long_ago)
+        })
+        .unwrap();
+
+        let config = MaintenanceConfig {
+            retention_days: 30,
+            orphan_grace: Duration::ZERO,
+            ..MaintenanceConfig::default()
+        };
+        let outcome = run_sweep(&rooms, &blob_root, &config, now);
+
+        assert_eq!(outcome.rooms_cut, 1, "the row-level cut still happened");
+        assert_eq!(
+            outcome.blobs_unlink_failed, 1,
+            "the failed unlink is counted, not discarded"
+        );
+        assert_eq!(
+            outcome.bytes_reclaimed, 0,
+            "bytes still on disk are never reported as reclaimed"
+        );
+        assert!(
+            outcome.error.is_some(),
+            "a sweep that could not free what it deleted is not a clean sweep"
+        );
+        assert!(stuck.exists(), "the fixture really did block the unlink");
+
+        // The report an operator reads carries both.
+        let handle = new_handle(&config);
+        record_sweep(&handle, &outcome, now, Duration::from_millis(1));
+        let card = report_snapshot(&handle);
+        assert_eq!(card.blobs_unlink_failed, 1);
+        assert_eq!(card.bytes_reclaimed, 0);
+        assert!(card.last_error.is_some());
+    }
+
+    /// A clean sweep still reports zero failures, so the counter above means
+    /// something when it is nonzero.
+    #[test]
+    fn a_clean_sweep_reports_no_unlink_failures() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (rooms, blob_root) = fixture(tmp.path());
+        let now = DateTime::parse_from_rfc3339("2026-09-02T12:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let long_ago = now - chrono::Duration::days(40);
+        let key = RoomKey::new("clean-cut");
+        seed_room(&rooms, &key, long_ago);
+        seed_attachment(
+            &rooms,
+            &blob_root,
+            &key,
+            &"b".repeat(32),
+            b"12345678",
+            long_ago,
+        );
+        with_rooms_handle(&rooms, |store| {
+            store.close_with_marker(&key, RoomCloser::Member("alice"), long_ago)
+        })
+        .unwrap();
+
+        let config = MaintenanceConfig {
+            retention_days: 30,
+            orphan_grace: Duration::ZERO,
+            ..MaintenanceConfig::default()
+        };
+        let outcome = run_sweep(&rooms, &blob_root, &config, now);
+        assert_eq!(outcome.blobs_unlink_failed, 0);
+        assert_eq!(outcome.error, None);
+        assert_eq!(
+            outcome.bytes_reclaimed, 8,
+            "bytes are claimed exactly when the file is actually gone"
+        );
+    }
+
+    /// A second sweep over an already-cut archive does nothing and says so.
+    ///
+    /// The store's eligibility query is what makes this true; asserted from the
+    /// sweep because that is where the misleading number would have shown up —
+    /// every historical room recounted as another `rooms_cut`, on every run,
+    /// forever.
+    #[test]
+    fn a_second_sweep_over_a_cut_archive_is_a_genuine_no_op() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (rooms, blob_root) = fixture(tmp.path());
+        let now = DateTime::parse_from_rfc3339("2026-09-02T12:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let long_ago = now - chrono::Duration::days(40);
+        let key = RoomKey::new("archive");
+        seed_room(&rooms, &key, long_ago);
+        with_rooms_handle(&rooms, |store| {
+            store.close_with_marker(&key, RoomCloser::Member("alice"), long_ago)
+        })
+        .unwrap();
+
+        let config = MaintenanceConfig {
+            retention_days: 30,
+            orphan_grace: Duration::ZERO,
+            ..MaintenanceConfig::default()
+        };
+        let first = run_sweep(&rooms, &blob_root, &config, now);
+        assert_eq!(first.rooms_cut, 1);
+        assert!(first.messages_removed > 0);
+
+        let second = run_sweep(&rooms, &blob_root, &config, now);
+        assert_eq!(
+            second.rooms_cut, 0,
+            "an emptied room must not be recounted on every future sweep"
+        );
+        assert_eq!(second.messages_removed, 0);
+        assert_eq!(second.error, None);
     }
 }

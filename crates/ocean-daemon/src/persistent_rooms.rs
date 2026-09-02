@@ -1261,6 +1261,24 @@ pub(super) async fn room_close(
             // subscribers re-read SQLite, which is now the closed truth.
             publish_room_wake(&state, &key, &message);
             publish_room_access_wake(&state, &key);
+            // Stop the room's federation task, if it has one.
+            //
+            // The STORE is what guarantees a closed room takes no more rows —
+            // `ingest_confirmed_event` refuses one, atomically, however this
+            // task is scheduled. This call is the operational half of that
+            // refusal rather than a second copy of it: without it the
+            // supervisor would keep an SSE epoch open against a room whose
+            // every ingest now fails, and a store error there breaks the epoch
+            // into `Recover`, so the room would reconnect-loop forever getting
+            // the same refusal. Stopping it is also just true — a frozen room
+            // has nothing left to receive.
+            //
+            // After the commit and after both wakes, so a tail flushes the
+            // close marker first; and this handler holds no store guard here,
+            // so awaiting is safe. Bedrock is not told anything: the room's
+            // credential, outbox and access projection are untouched, and
+            // closing stays a LOCAL statement about a local lifecycle.
+            state.room_federation.stop_room(&key).await;
             tracing::info!(
                 room = %key,
                 closer_kind = closer_id.kind_label(),

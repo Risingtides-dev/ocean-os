@@ -335,11 +335,14 @@ pub struct RoomRetentionCut {
     /// said those blobs weighed, which is also what the server measured when it
     /// wrote them; a blob already missing from disk still counts here, so the
     /// figure is "bytes this cut stopped being responsible for" rather than a
-    /// re-measurement of the filesystem.
+    /// re-measurement of the filesystem — and deliberately NOT the same number
+    /// as bytes the caller went on to reclaim, since an unlink can fail.
     pub attachment_bytes_removed: u64,
-    /// Ids whose bytes the CALLER must now unlink. The store does not own the
-    /// blob tree and must not reach into it.
-    pub attachment_ids: Vec<String>,
+    /// Blobs the CALLER must now unlink, each with the `byte_len` its row
+    /// recorded. The store does not own the blob tree and must not reach into
+    /// it; the sizes ride along so the caller can attribute reclaimed bytes to
+    /// the unlinks that actually succeeded rather than to the rows it deleted.
+    pub attachment_blobs: Vec<(String, u64)>,
     /// Rows deleted across `room_read_cursors` and `room_read_cursor_mirrors`.
     pub cursors_removed: u64,
     /// `federated_events` dedup-index rows deleted.
@@ -3020,9 +3023,35 @@ impl SqliteRoomStore {
     /// the whole retention safety property: the window is measured from the
     /// close, so a room nobody closed is never eligible however old it is.
     pub fn rooms_closed_before(&self, cutoff: DateTime<Utc>) -> Result<Vec<RoomKey>> {
-        let mut stmt = self
-            .conn
-            .prepare("SELECT id, closed_at FROM rooms WHERE closed_at IS NOT NULL ORDER BY id")?;
+        // Only rooms that still HOLD something a cut would remove.
+        //
+        // This clause is what stops retention rediscovering its own work
+        // forever. A cut deliberately keeps the `rooms` row and its
+        // `closed_at` — that row is how a cut room still answers
+        // `closed: true` instead of 404ing as one that never existed — so
+        // without this the same historical rooms come back on every sweep, and
+        // a daemon with a large archive opens an IMMEDIATE write transaction
+        // per room every six hours forever to delete nothing. It also keeps the
+        // operator's report honest: `rooms_cut` would otherwise count those
+        // empty no-ops and report steady activity on a store where nothing has
+        // changed in months.
+        //
+        // The four EXISTS arms are exactly the four tables `cut_closed_room`
+        // empties, so "eligible" means "a cut would remove at least one row"
+        // by construction rather than by a marker column that could drift out
+        // of step with what the cut actually does.
+        let mut stmt = self.conn.prepare(
+            "SELECT id, closed_at FROM rooms
+              WHERE closed_at IS NOT NULL
+                AND (
+                     EXISTS (SELECT 1 FROM messages          WHERE room_id = rooms.id)
+                  OR EXISTS (SELECT 1 FROM room_attachments  WHERE room_id = rooms.id)
+                  OR EXISTS (SELECT 1 FROM room_read_cursors WHERE room_id = rooms.id)
+                  OR EXISTS (SELECT 1 FROM room_read_cursor_mirrors WHERE room_id = rooms.id)
+                  OR EXISTS (SELECT 1 FROM federated_events  WHERE room_id = rooms.id)
+                )
+              ORDER BY id",
+        )?;
         let rows = stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?;
         let mut out = Vec::new();
         for row in rows {
@@ -3135,7 +3164,10 @@ impl SqliteRoomStore {
                 .iter()
                 .filter_map(|(_, len)| u64::try_from(*len).ok())
                 .sum(),
-            attachment_ids: attachments.into_iter().map(|(id, _)| id).collect(),
+            attachment_blobs: attachments
+                .into_iter()
+                .map(|(id, len)| (id, u64::try_from(len).unwrap_or(0)))
+                .collect(),
             cursors_removed: cursors_removed as u64,
             federated_index_rows_removed: federated_index_rows_removed as u64,
         })
@@ -7171,14 +7203,25 @@ impl SqliteRoomStore {
         let tx = self
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let room_exists: Option<i64> = tx
-            .query_row(
-                "SELECT 1 FROM rooms WHERE id = ?1",
-                params![key.as_str()],
-                |r| r.get(0),
-            )
-            .optional()?;
-        if room_exists.is_none() {
+        // OPEN, not merely present. Every other writer in this crate opens with
+        // `room_is_open` — `add_participant`, `add_attachment`, `append_message`,
+        // the authority mutations — and this one guarded on mere existence.
+        // That was invisible for as long as the only close reachable in
+        // production was a call room's autoclose, because `call:` rooms never
+        // federate. A route that closes ANY room makes the combination
+        // reachable, and an ingest into a closed room is transcript corruption
+        // of the worst shape available here: rows appended after the close
+        // marker, in a room whose `/events` tails have ended and whose
+        // `/snapshot` says `closed: true`, so no reader watching can see them
+        // arrive. Worse after a retention cut, where this same path repopulates
+        // from sequence 0 a transcript the operator was told was emptied.
+        //
+        // The daemon stops the room's federation task on close, so this refusal
+        // is not a reconnect loop in practice. The guard still belongs HERE and
+        // not only there: a supervisor that is slow, restarted, or racing the
+        // close is precisely the case the invariant must survive, and the store
+        // is the only place that can decide it atomically with the write.
+        if !Self::room_is_open_on(&tx, key)? {
             return Err(RoomStoreError::UnknownRoom(key.clone()));
         }
 
@@ -14675,9 +14718,9 @@ mod tests {
         assert_eq!(cut.attachment_rows_removed, 1);
         assert_eq!(cut.attachment_bytes_removed, 11);
         assert_eq!(
-            cut.attachment_ids,
-            vec!["0123456789abcdef0123456789abcdef".to_string()],
-            "the caller is told exactly which blobs to unlink"
+            cut.attachment_blobs,
+            vec![("0123456789abcdef0123456789abcdef".to_string(), 11)],
+            "the caller is told exactly which blobs to unlink, and how big each was"
         );
         assert_eq!(cut.cursors_removed, 1);
         assert_eq!(cut.federated_index_rows_removed, 1);
@@ -15569,5 +15612,142 @@ mod tests {
             Some("ev-1"),
             "the head is the lowest `position`, which is allocation order"
         );
+    }
+
+    /// A CLOSED room takes no more federated rows, and a CUT one is not
+    /// repopulated from sequence 0.
+    ///
+    /// `ingest_confirmed_event` guarded on the room merely EXISTING while every
+    /// other writer in this crate guards on it being open. That gap was
+    /// unreachable while the only close in production was a call room's
+    /// autoclose — `call:` rooms never federate — and a route that closes any
+    /// room makes it reachable. Left alone it is the worst transcript
+    /// corruption available here: rows land after the close marker, in a room
+    /// whose SSE tails have ended and whose snapshot says `closed: true`, so
+    /// nobody watching sees them arrive; and after retention the same path
+    /// refills a transcript the operator was told was emptied.
+    #[test]
+    fn a_closed_room_refuses_federated_ingest_and_a_cut_one_stays_cut() {
+        let mut s = store();
+        let key = RoomKey::new("federated-close");
+        s.create(key.clone(), "Federated", None, now()).unwrap();
+        s.add_participant(
+            &key,
+            RoomParticipant {
+                id: "alice".into(),
+                kind: RoomParticipantKind::Human,
+                display_name: "Alice".into(),
+            },
+            now(),
+        )
+        .unwrap();
+        s.update_room_access_safe(&key, Some(RoomAccessState::Live), None, None)
+            .unwrap();
+
+        let event = |ledger: &str, seq: u64| ConfirmedEvent {
+            ledger_event_id: ledger.to_string(),
+            global_sequence: seq,
+            client_event_id: format!("client-{ledger}"),
+            source_id: "src".into(),
+            source_sequence: seq,
+            origin_principal_id: "principal".into(),
+            origin_member_id: "member".into(),
+            trigger_targets: Vec::new(),
+            author_id: "alice".into(),
+            author_kind: RoomParticipantKind::Human,
+            kind: RoomMessageKind::Message,
+            body: format!("federated {ledger}"),
+        };
+
+        // Open: ingest lands.
+        assert!(matches!(
+            s.ingest_confirmed_event(&key, &event("one", 1), now()),
+            Ok(IngestOutcome::Ingested(_))
+        ));
+
+        s.close_with_marker(&key, RoomCloser::Member("alice"), now())
+            .unwrap();
+        let after_close = s
+            .transcript_page_including_closed(&key, None, None)
+            .unwrap()
+            .messages
+            .len();
+
+        // Closed: refused, with the same answer every other write to a closed
+        // room gives, and NOTHING appended.
+        assert!(matches!(
+            s.ingest_confirmed_event(&key, &event("two", 2), now()),
+            Err(RoomStoreError::UnknownRoom(_))
+        ));
+        assert_eq!(
+            s.transcript_page_including_closed(&key, None, None)
+                .unwrap()
+                .messages
+                .len(),
+            after_close,
+            "a refused ingest must append no row"
+        );
+
+        // Cut, then refused again: the cut room stays empty rather than being
+        // refilled from sequence 0 by a late confirmation.
+        s.cut_closed_room(&key).unwrap();
+        assert!(matches!(
+            s.ingest_confirmed_event(&key, &event("three", 3), now()),
+            Err(RoomStoreError::UnknownRoom(_))
+        ));
+        assert!(
+            s.transcript_page_including_closed(&key, None, None)
+                .unwrap()
+                .messages
+                .is_empty(),
+            "a cut room must not be repopulated by federation"
+        );
+    }
+
+    /// Retention does not rediscover its own work forever.
+    ///
+    /// A cut deliberately keeps the `rooms` row and its `closed_at`, so an
+    /// eligibility query that asked only "closed before the cutoff" returned
+    /// every historical room on every sweep — an IMMEDIATE write transaction
+    /// each, every six hours, deleting nothing, and each counted as another
+    /// `rooms_cut` on the operator's card. Eligibility is therefore "a cut would
+    /// remove at least one row", asked against the same four tables the cut
+    /// empties.
+    #[test]
+    fn an_already_cut_room_is_no_longer_eligible_for_retention() {
+        let mut s = store();
+        let base = DateTime::parse_from_rfc3339("2026-09-02T12:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let long_ago = base - chrono::Duration::days(40);
+        let key = RoomKey::new("cut-once");
+        s.create(key.clone(), "Cut Once", None, long_ago).unwrap();
+        s.add_participant(
+            &key,
+            RoomParticipant {
+                id: "alice".into(),
+                kind: RoomParticipantKind::Human,
+                display_name: "Alice".into(),
+            },
+            long_ago,
+        )
+        .unwrap();
+        s.close_with_marker(&key, RoomCloser::Member("alice"), long_ago)
+            .unwrap();
+
+        let cutoff = base - chrono::Duration::days(30);
+        assert_eq!(
+            s.rooms_closed_before(cutoff).unwrap(),
+            vec![key.clone()],
+            "a closed room holding rows is eligible"
+        );
+        s.cut_closed_room(&key).unwrap();
+        assert!(
+            s.rooms_closed_before(cutoff).unwrap().is_empty(),
+            "once emptied, the same room must not come back on every future sweep"
+        );
+        // And it is still THERE — the row survives so the room can still say it
+        // is closed rather than 404 as one that never existed.
+        assert!(s.get_including_closed(&key).unwrap().is_some());
     }
 }

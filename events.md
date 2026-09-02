@@ -9806,3 +9806,70 @@ livekit, identical on main at 616293e and established as the base branch's, not
 this PR's; commented once, not widened into a lockfile bump, and the fix is the
 user's call as its own PR.
 _________________________________________________________________________________ 06:13 cloud/os-room-metrics
+
+time:      [06:42] [02-09-26]
+agent:     [claude-code], [claude-opus-5], [cloud]
+worktree:  [cloud/os-room-lifecycle]
+type:      [bug report]
+area:      [backend]
+
+Three Codex review findings on the room lifecycle PR, all verified against the
+code and all real, all fixed on the branch.
+
+P1, and the one that mattered. ingest_confirmed_event guarded on the room merely
+EXISTING while every other writer in ocean-store guards on it being open —
+add_participant, add_attachment, append_message, the authority mutations. That
+gap was unreachable for as long as the only close production could reach was a
+call room's autoclose, because call: rooms never federate; the close route this
+branch adds makes any room closable and therefore makes the combination
+reachable. Left alone it is the worst transcript corruption available here: a
+confirmed Bedrock event appends AFTER the close marker, into a room whose SSE
+tails have ended and whose snapshot reports closed true, so nothing watching can
+see the row arrive, and after a retention cut the same path refills from
+sequence 0 a transcript the operator was told was emptied. Fixed in two places
+on purpose. The store now refuses ingest for a closed room, which is what makes
+the invariant true atomically with the write and under a supervisor that is
+slow, restarted, or racing the close. The route now also calls
+FederationSupervisor::stop_room after the commit and both wakes, because the
+store refusal alone would have been a reconnect loop: a store error breaks the
+SSE epoch into Recover, so the room would reconnect forever collecting the same
+refusal. Nothing is sent to Bedrock; the credential, outbox and access
+projection are untouched and closing stays a local statement.
+
+P2. Retention rediscovered its own work forever. A cut deliberately keeps the
+rooms row and its closed_at — that row is how a cut room still answers closed
+true instead of 404ing as one that never existed — so an eligibility query
+asking only closed-before-the-cutoff returned every historical room on every
+sweep. That is an IMMEDIATE write transaction per archived room every six hours
+forever, deleting nothing, with each empty no-op counted to the operator as
+another rooms_cut. Eligibility is now an EXISTS over the same four tables the
+cut empties, so it means a cut would remove at least one row, derived from what
+the cut does rather than from a marker column that could drift out of step with
+it.
+
+P3. Blob unlink failures were discarded. The rows commit either way, so a
+swallowed remove_file error is a sweep that reports a clean run and a
+bytes_reclaimed figure taken from the INDEX while the bytes are still on disk —
+a report that actively says the opposite of what happened, which is worse than
+no report at all, in a feature whose whole point is operator visibility. Both
+jobs now count blobs_unlink_failed and set the sweep error, the health card
+carries the counter, and bytes_reclaimed counts a blob only once its file is
+actually gone. An ErrorKind::NotFound stays silent, because a file already gone
+is the outcome that was wanted. The store's cut now returns each blob's recorded
+byte_len alongside its id so the caller can attribute reclaimed bytes to the
+unlinks that succeeded rather than to the rows it deleted.
+
+Five checks added. Store: a closed room refuses federated ingest and a cut one
+is not repopulated from sequence 0, asserting no row is appended by the refusal;
+and an already-cut room drops out of retention eligibility while its rooms row
+survives. Daemon: a blob that cannot be unlinked is reported and not swallowed,
+inducing the failure with a DIRECTORY where the blob file should be so
+remove_file fails EISDIR — a read-only parent would not do, since these tests
+can run as root where mode bits are advisory and the unlink would succeed
+anyway; a clean sweep reports zero failures so the counter means something when
+it is nonzero; and a second sweep over a cut archive is a genuine no-op.
+
+Gates on the fixed tree: docs-check PASS, ocean-store 222 passed, ocean-daemon
+room_maintenance 11 passed, and the full run below. cargo-deny still cannot run
+in this environment and is red on main independently of this branch.
+_________________________________________________________________________________ 06:42 cloud/os-room-lifecycle
