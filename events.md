@@ -10483,3 +10483,32 @@ isolated probe; docs-check, 30 Node ledger/federation tests, format, shell
 syntax, and diff checks passed with 588 ledger entries closed. No daemon was
 restarted and production was not changed.
 _________________________________________________________________________________ 16:14 codex/ocean-rooms-integration-20260902
+
+time:      [16:55] [02-09-26]
+agent:     [codex] [gpt-5]
+worktree:  codex/ocean-rooms-integration-20260902
+type:      [bug report]
+area:      [backend]
+
+Closed the two remaining exact-head security findings on Ocean OS PR #450.
+Review comment 3918172761 found that retention joined a stored attachment id
+directly after cutting its row, allowing a malformed imported or corrupt id to
+name a path outside the blob root. Retention now reuses the attachment module's
+single validated `blob_path`; an invalid stored id becomes a bounded sweep
+failure and never reaches `remove_file`. A regression stores an absolute path
+and proves the outside file survives, reclaimed bytes stay zero, and the
+failure is reported.
+
+Review comment 3918172768 found that the supervised federation loader validated
+the credential pathname and reopened it for parsing. The loader now refuses a
+foreign or group/world-writable parent, opens the validated path once, compares
+that descriptor's inode and owner with the checked file, and parses only the
+descriptor. A writable-parent regression proves the source is refused whole.
+
+Focused verification passed: room-maintenance 13/13, federation loader 13/13,
+ocean-daemon all-target Clippy with denied warnings, shell syntax, cargo fmt,
+and git diff checks. The nearest daemon devlog records both hardened contracts;
+the root and crate-parent devlogs remain unchanged because ownership and the
+top-level structure did not move. No daemon was restarted and production was
+not changed.
+_________________________________________________________________________________ 16:55 codex/ocean-rooms-integration-20260902

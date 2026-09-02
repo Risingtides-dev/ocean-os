@@ -88,30 +88,58 @@ federation_refuse() {
   federation="off"
 }
 federation_load() {
-  local f="$1" mode owner line n=0 key value url="" token="" keychain=""
+  local f="$1" parent parent_mode parent_owner mode owner inode opened_owner opened_inode line n=0 key value url="" token="" keychain=""
+  local federation_fd parse_error=""
   local url_seen=0 token_seen=0 keychain_seen=0
+  parent="$(dirname "$f")"
+  if [[ -L "$parent" || ! -d "$parent" ]]; then federation_refuse "unsafe_parent"; return; fi
   if [[ -L "$f" || ! -f "$f" ]]; then federation_refuse "not_regular"; return; fi
   # GNU stat and BSD stat spell this differently, and GNU's `-f` is a
   # filesystem query that would print a block of text into the capture, so
   # pick the flavour first instead of falling through one to the other.
   if stat -c '%a' / >/dev/null 2>&1; then
-    mode="$(stat -c '%a' "$f" 2>/dev/null || echo '?')"; owner="$(stat -c '%u' "$f" 2>/dev/null || echo '?')"
+    read -r parent_mode parent_owner < <(stat -c '%a %u' "$parent" 2>/dev/null || echo '? ?')
+    read -r mode owner inode < <(stat -c '%a %u %i' "$f" 2>/dev/null || echo '? ? ?')
   else
-    mode="$(stat -f '%Lp' "$f" 2>/dev/null || echo '?')"; owner="$(stat -f '%u' "$f" 2>/dev/null || echo '?')"
+    read -r parent_mode parent_owner < <(stat -f '%Lp %u' "$parent" 2>/dev/null || echo '? ?')
+    read -r mode owner inode < <(stat -f '%Lp %u %i' "$f" 2>/dev/null || echo '? ? ?')
+  fi
+  if [[ ! "$parent_mode" =~ ^[0-7]+$ ]]; then
+    federation_refuse "unsafe_parent"; return
+  fi
+  if [[ "$parent_owner" != "$(id -u)" ]] || (( (8#$parent_mode & 8#022) != 0 )); then
+    federation_refuse "unsafe_parent"; return
   fi
   if [[ "$mode" != "600" ]]; then federation_refuse "unsafe_mode"; return; fi
   if [[ "$owner" != "$(id -u)" ]]; then federation_refuse "foreign_owner"; return; fi
+  # Open exactly once, then prove that descriptor is the inode just validated.
+  # The owner-only, non-group/world-writable parent prevents another account
+  # from renaming an entry between the pathname checks and this open; the inode
+  # comparison also refuses a same-user replacement in that interval. Parsing
+  # below reads this descriptor, never the pathname again.
+  if ! exec {federation_fd}<"$f"; then federation_refuse "open_failed"; return; fi
+  if stat -c '%a' / >/dev/null 2>&1; then
+    read -r opened_owner opened_inode < <(stat -Lc '%u %i' "/dev/fd/$federation_fd" 2>/dev/null || echo '? ?')
+  else
+    read -r opened_owner opened_inode < <(stat -f '%u %i' "/dev/fd/$federation_fd" 2>/dev/null || echo '? ?')
+  fi
+  if [[ "$opened_owner" != "$owner" || "$opened_inode" != "$inode" ]]; then
+    exec {federation_fd}<&-
+    federation_refuse "changed_during_open"; return
+  fi
   while IFS= read -r line || [[ -n "$line" ]]; do
     n=$((n + 1)); line="${line%$'\r'}"
     [[ -z "${line// /}" || "$line" == \#* ]] && continue
     key="${line%%=*}"; value="${line#*=}"
     case "$key" in
-      OCEAN_FEDERATION_URL) [[ "$url_seen" -eq 0 ]] || { federation_refuse "duplicate_entry"; return; }; url_seen=1; url="$value" ;;
-      OCEAN_FEDERATION_OWNER_TOKEN) [[ "$token_seen" -eq 0 ]] || { federation_refuse "duplicate_entry"; return; }; token_seen=1; token="$value" ;;
-      OCEAN_FEDERATION_OWNER_TOKEN_KEYCHAIN) [[ "$keychain_seen" -eq 0 ]] || { federation_refuse "duplicate_entry"; return; }; keychain_seen=1; keychain="$value" ;;
-      *) federation_refuse "unsupported_entry"; return ;;
+      OCEAN_FEDERATION_URL) [[ "$url_seen" -eq 0 ]] || { parse_error="duplicate_entry"; break; }; url_seen=1; url="$value" ;;
+      OCEAN_FEDERATION_OWNER_TOKEN) [[ "$token_seen" -eq 0 ]] || { parse_error="duplicate_entry"; break; }; token_seen=1; token="$value" ;;
+      OCEAN_FEDERATION_OWNER_TOKEN_KEYCHAIN) [[ "$keychain_seen" -eq 0 ]] || { parse_error="duplicate_entry"; break; }; keychain_seen=1; keychain="$value" ;;
+      *) parse_error="unsupported_entry"; break ;;
     esac
-  done < "$f"
+  done <&"$federation_fd"
+  exec {federation_fd}<&-
+  if [[ -n "$parse_error" ]]; then federation_refuse "$parse_error"; return; fi
   if [[ ! "$url" =~ ^https://[A-Za-z0-9.-]+(:[0-9]{1,5})?$ && ! "$url" =~ ^http://(127\.0\.0\.1|localhost)(:[0-9]{1,5})?$ ]]; then
     federation_refuse "origin is invalid"; return
   fi

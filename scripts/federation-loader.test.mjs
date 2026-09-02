@@ -74,6 +74,16 @@ test('a file that is not 0600 is refused whole, without printing key names or co
   assert.ok(!log.includes('OCEAN_FEDERATION_'));
 });
 
+test('a file in a group/world-writable parent is refused before its pathname can be reopened', async () => {
+  const h = await harness();
+  await writeFile(h.envFile, `OCEAN_FEDERATION_URL=https://bedrock.example\nOCEAN_FEDERATION_OWNER_TOKEN=${TOKEN}\n`, { mode: 0o600 });
+  await chmod(h.home, 0o777);
+  const { seen, log } = await launch(h);
+  assert.equal(seen.URL_SET, ''); assert.equal(seen.TOKEN_SET, '');
+  assert.match(log, /private configuration refused: unsafe_parent/);
+  assert.ok(!log.includes(TOKEN));
+});
+
 test('a line that is not one of the federation keys refuses the file without naming it', async () => {
   const h = await harness();
   await writeFile(h.envFile, `OCEAN_FEDERATION_URL=https://bedrock.example\nOCEAN_FEDERATION_OWNER_TOKEN=${TOKEN}\nOCEAN_YOLO=0\n`, { mode: 0o600 });

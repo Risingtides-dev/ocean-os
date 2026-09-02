@@ -175,7 +175,11 @@ fn is_attachment_id(id: &str) -> bool {
 /// Returning `Option` rather than building a path and hoping keeps the check on
 /// the only route to the filesystem: there is no way to obtain a path for a
 /// malformed id.
-fn blob_path(root: &std::path::Path, key: &RoomKey, id: &str) -> Option<std::path::PathBuf> {
+pub(super) fn blob_path(
+    root: &std::path::Path,
+    key: &RoomKey,
+    id: &str,
+) -> Option<std::path::PathBuf> {
     is_attachment_id(id).then(|| room_dir(root, key).join(id))
 }
 

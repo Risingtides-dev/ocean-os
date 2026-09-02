@@ -371,7 +371,13 @@ fn run_retention(
         // this card exists to make visible rather than to paper over.
         let dir = crate::room_attachments::room_dir(blob_root, &key);
         for (id, byte_len) in cut.attachment_blobs {
-            let path = dir.join(&id);
+            let Some(path) = crate::room_attachments::blob_path(blob_root, &key, &id) else {
+                outcome.blobs_unlink_failed += 1;
+                outcome.error.get_or_insert_with(|| {
+                    "retention refused a malformed stored attachment id".to_string()
+                });
+                continue;
+            };
             match std::fs::remove_file(&path) {
                 Ok(()) => outcome.bytes_reclaimed += byte_len,
                 // Already gone: nothing to reclaim, and nothing wrong.
@@ -1302,6 +1308,58 @@ mod tests {
         assert_eq!(card.blobs_unlink_failed, 1);
         assert_eq!(card.bytes_reclaimed, 0);
         assert!(card.last_error.is_some());
+    }
+
+    /// A corrupt/imported row is untrusted even though the HTTP upload path
+    /// mints safe ids. Retention must never turn its stored id into an arbitrary
+    /// filesystem path after the row-level cut has committed.
+    #[test]
+    fn a_malformed_stored_attachment_id_cannot_escape_the_blob_root() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (rooms, blob_root) = fixture(tmp.path());
+        let now = DateTime::parse_from_rfc3339("2026-09-02T12:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let long_ago = now - chrono::Duration::days(40);
+        let key = RoomKey::new("malformed-retained-id");
+        seed_room(&rooms, &key, long_ago);
+
+        let outside = tmp.path().join("must-survive.txt");
+        std::fs::write(&outside, b"outside").unwrap();
+        let malformed = outside.to_string_lossy().into_owned();
+        with_rooms_handle(&rooms, |store| {
+            store.add_attachment(
+                &key,
+                &malformed,
+                "notes.txt",
+                "text/plain",
+                7,
+                "0".repeat(64).as_str(),
+                "alice",
+                long_ago,
+            )
+        })
+        .unwrap();
+        with_rooms_handle(&rooms, |store| {
+            store.close_with_marker(&key, RoomCloser::Member("alice"), long_ago)
+        })
+        .unwrap();
+
+        let config = MaintenanceConfig {
+            retention_days: 30,
+            orphan_grace: Duration::ZERO,
+            ..MaintenanceConfig::default()
+        };
+        let outcome = run_sweep(&rooms, &blob_root, &config, now);
+
+        assert_eq!(outcome.rooms_cut, 1);
+        assert_eq!(outcome.blobs_unlink_failed, 1);
+        assert_eq!(outcome.bytes_reclaimed, 0);
+        assert_eq!(
+            outcome.error.as_deref(),
+            Some("retention refused a malformed stored attachment id")
+        );
+        assert_eq!(std::fs::read(&outside).unwrap(), b"outside");
     }
 
     /// A clean sweep still reports zero failures, so the counter above means

@@ -157,6 +157,11 @@ This crate owns the long-running Ocean HTTP service on `:4780`, including API ro
 - Prefer narrow route tests for API behavior and workspace checks before merge.
 - A test that writes the process-global env this bin reads at request time (`OCEAN_CONFIG_DIR`, `OCEAN_MODEL`, `OCEAN_YOLO`) must hold `AUTO_CONVENE_ENV_LOCK` while it writes AND for as long as the state it built is in use, paired with `TestEnvRestore::capture` so a panic cannot leak a value into the next test. `fake_convene_state`/`fake_convene_file_state` write all three, so every caller inherits that obligation; their doc comments say so but nothing enforces it, and a single unlocked call site reddened `check (ubuntu-latest)` on a PR containing no Rust at all — the victim was a distant yolo-resolution assertion reading the clobbered `OCEAN_CONFIG_DIR`, not the unlocked test. Bind the guard in the test body, not in a helper that returns the state: a guard dropped at the end of a builder function is not held for the state's lifetime. When a test also needs `YOLO_ENV_LOCK`, acquire it FIRST — `YOLO_ENV_LOCK` → `AUTO_CONVENE_ENV_LOCK` is the repo-wide order, no path may invert it, and the two must never be aliased or merged because tokio's mutex is not reentrant and the tests that hold both would self-deadlock. Neither lock alone is sufficient for an `OCEAN_YOLO` writer: the two domains are disjoint, so a writer holding only one still races a writer holding only the other.
 
+### Review hardening
+
+- Retention obtains every stored attachment path through `room_attachments::blob_path`, including rows returned by a cut. Imported or corrupt stored ids do not inherit trust from the HTTP path's server-minted ids; malformed ids fail closed, count as unlink failures, and never become filesystem paths. `blob_path` is `pub(super)` only for this reuse.
+- The supervised federation loader requires the credential file's parent directory to be same-owner and not group/world writable. After pathname validation it compares the inode against one open descriptor and parses only that descriptor, so a rename cannot swap credentials between validation and read.
+
 ## Verification
 
 - `cargo test -p ocean-daemon bus::tests::`
