@@ -9748,3 +9748,17 @@ title-database and plugin-directory overrides as well as federation authority.
 Docs only; no rehearsal, database mutation, daemon restart, launchd action,
 deployment, or production state changed.
 _________________________________________________________________________________ 22:16 docs/rooms-federation-runbook
+
+time:      [22:31] [01-09-26]
+agent:     [codex] [gpt-5]
+worktree:  docs/rooms-federation-runbook
+type:      [bug report]
+area:      [review]
+
+Closed the current-head credential-custody findings. The runbook no longer
+places the owner bearer in a rendered plist or dumps the launchd environment to
+discover database paths. Production enablement is explicitly blocked until a
+supported untracked owner-only login loader can restore the variables before
+every daemon start. Docs only; no secret, launchd environment, daemon restart,
+rehearsal, deployment, login, reboot, or production state changed.
+_________________________________________________________________________________ 22:31 docs/rooms-federation-runbook

@@ -159,38 +159,23 @@ Phase 1 rollout gates remain authoritative in
    do not constrain an admin token, so it is full-instance authority, and
    ocean-bedrock #117 adds the operator path that will replace it. Treat the
    value as a production secret.
-3. Set, on the supervised daemon only:
+3. Install a supported untracked owner-only login loader for the supervised
+   daemon. It must set:
    - `OCEAN_FEDERATION_URL` — the Bedrock origin, nothing after the host.
    - `OCEAN_FEDERATION_OWNER_TOKEN` — the bearer from step 2.
 
-   The installer renders `deploy/dev.risingtides.ocean-daemon.plist` and
-   substitutes only `__OCEAN_HOME__`; there is no untracked env file yet. Add
-   the two keys to the RENDERED plist at
-   `~/Library/LaunchAgents/dev.risingtides.ocean-daemon.plist` after
-   `./ops/install-ocean-daemon.sh`, never to the tracked template, and repeat
-   after every reinstall because the installer overwrites it. Teaching the
-   installer to merge a local, untracked env file is the follow-up that
-   removes this step.
-4. Reload the edited plist after turns drain. `kickstart` alone restarts the
-   already-loaded definition and will not load the new environment. Follow the
-   same teardown guard as `ops/install-ocean-daemon.sh`, then bootstrap and
-   kickstart the named job:
-
-   ```bash
-   plutil -lint "$HOME/Library/LaunchAgents/dev.risingtides.ocean-daemon.plist"
-   launchctl bootout "gui/$(id -u)/dev.risingtides.ocean-daemon" 2>/dev/null || true
-   for _ in $(seq 1 50); do
-     launchctl print "gui/$(id -u)/dev.risingtides.ocean-daemon" >/dev/null 2>&1 || break
-     sleep 0.2
-   done
-   ! launchctl print "gui/$(id -u)/dev.risingtides.ocean-daemon" >/dev/null 2>&1
-   launchctl bootstrap "gui/$(id -u)" "$HOME/Library/LaunchAgents/dev.risingtides.ocean-daemon.plist"
-   launchctl enable "gui/$(id -u)/dev.risingtides.ocean-daemon"
-   launchctl kickstart -k "gui/$(id -u)/dev.risingtides.ocean-daemon"
-   ```
-
-   Stop if the teardown assertion or bootstrap fails; the installer documents
-   the recovery command and health check for that state.
+   The loader must read the bearer from an owner-only (`0600`) file or Keychain
+   item, call `launchctl setenv` for both values on every fresh GUI login, and
+   complete before the daemon's `RunAtLoad` start. Neither the tracked template
+   nor the rendered plist may contain either federation value. The repository
+   does not ship that loader yet, so production enablement stops here: do not
+   substitute a manual edit of either plist.
+4. Once that loader exists, use its reviewed install/activation procedure after
+   turns drain. It must lint every plist before stopping the healthy daemon,
+   inject the variables without printing or recording the bearer in shell
+   history or logs, and use the guarded `bootout` → wait → `bootstrap` → `enable` →
+   `kickstart` sequence from `ops/install-ocean-daemon.sh`. Stop if any custody,
+   ordering, teardown, bootstrap, or health assertion fails.
 5. Verify, in this order. First the revision:
 
    ```bash
@@ -250,11 +235,12 @@ There are no room or federation counters on `/metrics` yet. Until there are:
 
 ### Rollback
 
-Remove the two variables from the rendered plist, then repeat the guarded
-`bootout` → wait → `bootstrap` → `enable` → `kickstart` sequence above so
-launchd loads their removal. Local rooms are untouched; credentialed rooms sit
-in `recovering` with honest chrome; nothing is deleted. Re-adding the variables
-and reloading the plist resumes from the persisted cursor.
+Remove the two variables from the protected loader source, have that loader
+clear only those named variables from the per-user launchd domain, then repeat
+its guarded restart procedure. Never edit either daemon plist. Local rooms are
+untouched; credentialed rooms sit in `recovering` with honest chrome; nothing
+is deleted. Restoring the protected values through the loader resumes from the
+persisted cursor.
 
 ### rooms.db migration rehearsal
 
@@ -303,11 +289,15 @@ restores a database without them. The gate remains open until a new
    sqlite3 "$rooms_rehearsal_dir/pre-upgrade-rollback.db" "PRAGMA quick_check;"
    ```
 
-   Resolve both placeholders from the running job, not from the operator shell:
-   `launchctl print` shows its environment. Use its `OCEAN_DB_PATH` first; only
-   when that variable is absent may the source fall back to `rooms.db` under the
-   daemon's effective config dir. Replace the angle-bracket placeholders before
-   running the command, and require both `quick_check` calls to print `ok`. When
+   Resolve both placeholders by reading only the named non-secret path values
+   from their protected source or, when they live in the rendered daemon plist,
+   with targeted `plutil -extract EnvironmentVariables.OCEAN_DB_PATH raw` and
+   `plutil -extract EnvironmentVariables.OCEAN_CONFIG_DIR raw` reads. Never run
+   `launchctl print` to discover them: that dumps the whole environment and can
+   expose the owner bearer. Use `OCEAN_DB_PATH` first; only when it is absent may
+   the source fall back to `rooms.db` under the daemon's effective config dir.
+   Replace the angle-bracket placeholders before running the command, and
+   require both `quick_check` calls to print `ok`. When
    a retained pre-cutover backup exists, use SQLite's backup API to seed
    `candidate-config/rooms.db` from it, require the `sqlite_master` absence
    query above to return zero, and do not run either the row-count query or the
