@@ -9719,3 +9719,18 @@ The two branch event dates also follow the ledger's DD-MM-YY schema. Docs only;
 no rehearsal, database mutation, daemon restart, launchd action, deployment, or
 production state change occurred.
 _________________________________________________________________________________ 21:20 docs/rooms-federation-runbook
+
+time:      [21:58] [01-09-26]
+agent:     [codex] [gpt-5]
+worktree:  docs/rooms-federation-runbook
+type:      [bug report]
+area:      [review]
+
+Closed the fresh Codex review findings on the offline migration rehearsal. A
+genuine retained pre-Phase-1 backup is now checked through sqlite_master rather
+than querying tables that do not exist, while the row-count guard remains only
+for reconstruction from a current database. Both candidate and rollback daemon
+commands explicitly remove federation URL and owner-token variables before
+launch. Docs only; no rehearsal, database mutation, daemon restart, launchd
+action, deployment, or production state change occurred.
+_________________________________________________________________________________ 21:58 docs/rooms-federation-runbook

@@ -308,8 +308,12 @@ restores a database without them. The gate remains open until a new
    daemon's effective config dir. Replace the angle-bracket placeholders before
    running the command, and require both `quick_check` calls to print `ok`. When
    a retained pre-cutover backup exists, use SQLite's backup API to seed
-   `candidate-config/rooms.db` from it and still require the table-count query
-   above to return zero; do not run the two `DROP TABLE` statements.
+   `candidate-config/rooms.db` from it, require the `sqlite_master` absence
+   query above to return zero, and do not run either the row-count query or the
+   two `DROP TABLE` statements: a genuine pre-Phase-1 database has no such
+   tables to count. The row-count query belongs only to reconstruction from a
+   current database, while its tables still exist and must be proven empty
+   before they are dropped.
 2. Resolve the exact candidate and previous immutable artifacts under
    `~/.local/libexec/ocean-daemon/`. The rollback artifact must be a revision
    from **before Phase 1**, not merely the artifact preceding the current
@@ -324,14 +328,18 @@ restores a database without them. The gate remains open until a new
    previous_bin="$HOME/.local/libexec/ocean-daemon/ocean-daemon-<pre-phase1-rev>"
    test -x "$candidate_bin" && test -x "$previous_bin"
    (cd "$rooms_rehearsal_dir" && \
-     env OCEAN_CONFIG_DIR="$rooms_rehearsal_dir/candidate-config" \
+     env -u OCEAN_FEDERATION_URL -u OCEAN_FEDERATION_OWNER_TOKEN \
+       OCEAN_CONFIG_DIR="$rooms_rehearsal_dir/candidate-config" \
        OCEAN_DB_PATH="$rooms_rehearsal_dir/candidate-config/rooms.db" \
        OCEAN_BIND=127.0.0.1:18791 OCEAN_UNSUPERVISED=1 \
        "$candidate_bin")
    ```
 
    Keep this process in its own terminal. Only the copied `rooms.db` enters the
-   isolated config root; no production config file is imported.
+   isolated config root; no production config file is imported. Both federation
+   variables are explicitly removed from the rehearsal process even if the
+   operator shell exported them, so copied credentials, pending outbox rows, or
+   pending redemptions cannot contact Bedrock.
 3. Through the candidate, list rooms and read one snapshot. Before stopping it,
    require SQLite to report both `room_agent_bindings` and
    `room_agent_decisions`; a clean open alone is not migration proof. Record the
@@ -348,7 +356,8 @@ restores a database without them. The gate remains open until a new
    test "$(sqlite3 "$rooms_rehearsal_dir/rollback-config/rooms.db" \
      "SELECT count(*) FROM sqlite_master WHERE type='table' AND name IN ('room_agent_bindings','room_agent_decisions');")" = 0
    (cd "$rooms_rehearsal_dir" && \
-     env OCEAN_CONFIG_DIR="$rooms_rehearsal_dir/rollback-config" \
+     env -u OCEAN_FEDERATION_URL -u OCEAN_FEDERATION_OWNER_TOKEN \
+       OCEAN_CONFIG_DIR="$rooms_rehearsal_dir/rollback-config" \
        OCEAN_DB_PATH="$rooms_rehearsal_dir/rollback-config/rooms.db" \
        OCEAN_BIND=127.0.0.1:18792 OCEAN_UNSUPERVISED=1 \
        "$previous_bin")
