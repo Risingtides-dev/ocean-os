@@ -133,11 +133,16 @@ Rooms are daemon-local by default: a room, its transcript, roster, artifacts
 and attachments live in `rooms.db` beside the config dir (`OCEAN_CONFIG_DIR`,
 else `$XDG_CONFIG_HOME/ocean-rs`, else `~/.config/ocean-rs`; `OCEAN_DB_PATH`
 overrides the full path). Federation is what lets a room span daemons: invites,
-the Bedrock room stream, and the container workspace lane. It is off unless the
-supervised daemon carries two environment variables, and as of 2026-09-01 the
-tracked plist carries neither, so the operated daemon runs rooms local-only and
-any room that ever held a Bedrock credential sits in `recovering`. The
-mechanics are in `OCEAN_RUNTIME_OPERATOR_GUIDE.md` under "Federated-room
+the Bedrock room stream, and the container workspace lane.
+`OCEAN_FEDERATION_URL` enables transport for rooms that already hold a Bedrock
+credential; `OCEAN_FEDERATION_OWNER_TOKEN` separately lets this daemon bootstrap
+an existing Local room as its Bedrock owner. Missing the owner token does not
+disable existing credentialed rooms or invite redemption. Missing or invalid
+transport configuration moves credentialed non-revoked rooms to `recovering`;
+revoked rooms remain revoked. As of 2026-09-01 the tracked plist carries neither
+variable, so the operated daemon cannot bootstrap Local rooms and cannot run
+transport for any credentials already in `rooms.db`. The mechanics are in
+`OCEAN_RUNTIME_OPERATOR_GUIDE.md` under "Federated-room
 Bedrock bridge"; this section is the operator's order of operations. The
 tracked completion state is the Ocean Rooms section of `../ROADMAP.md`; the
 Phase 1 rollout gates remain authoritative in
@@ -259,27 +264,79 @@ Phase 1 rollout gate 4 remains open until an `events.md` entry records one;
 writing this procedure down is not performing it. Procedure:
 
 1. Take a transactionally consistent online backup while the daemon is live,
-   using SQLite's backup API rather than copying the main file without its WAL:
+   using SQLite's backup API rather than copying the main file without its WAL.
+   Create isolated config roots for both halves of the rehearsal; the candidate
+   must not inherit the live `titles.db`, extension projects, observatory, or
+   any other daemon state:
 
    ```bash
-   sqlite3 "<config dir>/rooms.db" ".timeout 10000" ".backup '/tmp/rooms-rehearsal.db'"
-   sqlite3 "/tmp/rooms-rehearsal.db" "PRAGMA quick_check;"
+   rooms_rehearsal_dir="$(mktemp -d /tmp/ocean-rooms-rehearsal.XXXXXX)"
+   mkdir -p "$rooms_rehearsal_dir/candidate-config" "$rooms_rehearsal_dir/rollback-config"
+   running_ocean_db_path="<OCEAN_DB_PATH from the running launchd job, or empty>"
+   running_ocean_config_dir="<effective OCEAN_CONFIG_DIR or resolved default>"
+   if [ -n "$running_ocean_db_path" ]; then
+     live_rooms_db="$running_ocean_db_path"
+   else
+     live_rooms_db="$running_ocean_config_dir/rooms.db"
+   fi
+   test -f "$live_rooms_db"
+   sqlite3 "$live_rooms_db" ".timeout 10000" \
+     ".backup '$rooms_rehearsal_dir/candidate-config/rooms.db'"
+   sqlite3 "$rooms_rehearsal_dir/candidate-config/rooms.db" \
+     ".backup '$rooms_rehearsal_dir/pre-upgrade-rollback.db'"
+   sqlite3 "$rooms_rehearsal_dir/candidate-config/rooms.db" "PRAGMA quick_check;"
+   sqlite3 "$rooms_rehearsal_dir/pre-upgrade-rollback.db" "PRAGMA quick_check;"
    ```
 
-   Use the config dir the running daemon actually uses (`launchctl print` shows
-   its environment), require `quick_check` to print `ok`, and use the same
-   online-backup procedure for the pre-upgrade rollback copy.
-2. Run the candidate binary against the copy on a spare port with
-   `OCEAN_DB_PATH=/tmp/rooms-rehearsal.db` and `OCEAN_BIND`, from the immutable
-   artifact under `~/.local/libexec/ocean-daemon/`.
+   Resolve both placeholders from the running job, not from the operator shell:
+   `launchctl print` shows its environment. Use its `OCEAN_DB_PATH` first; only
+   when that variable is absent may the source fall back to `rooms.db` under the
+   daemon's effective config dir. Replace the angle-bracket placeholders before
+   running the command, and require both `quick_check` calls to print `ok`.
+2. Resolve the exact candidate and previous immutable artifacts under
+   `~/.local/libexec/ocean-daemon/`, verify both are executable, and run the
+   candidate on a spare loopback port. `OCEAN_UNSUPERVISED=1` is deliberate:
+   the production launchd job remains loaded, and without this override the
+   candidate exits through the foreign-supervisor guard instead of binding.
+
+   ```bash
+   candidate_bin="$HOME/.local/libexec/ocean-daemon/ocean-daemon-<candidate-rev>"
+   previous_bin="$HOME/.local/libexec/ocean-daemon/ocean-daemon-<previous-rev>"
+   test -x "$candidate_bin" && test -x "$previous_bin"
+   OCEAN_CONFIG_DIR="$rooms_rehearsal_dir/candidate-config" \
+   OCEAN_DB_PATH="$rooms_rehearsal_dir/candidate-config/rooms.db" \
+   OCEAN_BIND=127.0.0.1:18791 OCEAN_UNSUPERVISED=1 \
+     "$candidate_bin"
+   ```
+
+   Keep this process in its own terminal. Only the copied `rooms.db` enters the
+   isolated config root; no production config file is imported.
 3. Through the candidate, list rooms and read one snapshot; the store applies
-   its migrations on open, so a clean open plus readable rooms is the pass.
-4. Rollback: stop the candidate and delete the copy. For a real upgrade,
-   rollback is the previous immutable artifact plus the transactionally
-   consistent pre-upgrade backup from step 1, because the store's migrations
-   are forward-only; that verified backup is the rollback.
-5. Record both revisions and the room and message counts before and after in
-   `events.md`.
+   its migrations on open, so a clean open plus readable rooms is the candidate
+   pass. Record room and message counts before stopping it.
+4. Actually exercise rollback. Stop the candidate, restore the untouched
+   pre-upgrade backup into the separate rollback config with SQLite's backup
+   API, run `quick_check`, then start the **previous** immutable artifact on a
+   second spare port with the same unsupervised and isolation controls:
+
+   ```bash
+   sqlite3 "$rooms_rehearsal_dir/pre-upgrade-rollback.db" \
+     ".backup '$rooms_rehearsal_dir/rollback-config/rooms.db'"
+   sqlite3 "$rooms_rehearsal_dir/rollback-config/rooms.db" "PRAGMA quick_check;"
+   OCEAN_CONFIG_DIR="$rooms_rehearsal_dir/rollback-config" \
+   OCEAN_DB_PATH="$rooms_rehearsal_dir/rollback-config/rooms.db" \
+   OCEAN_BIND=127.0.0.1:18792 OCEAN_UNSUPERVISED=1 \
+     "$previous_bin"
+   ```
+
+   List the same rooms and read the same snapshot through the previous binary;
+   room and message counts must match the pre-upgrade backup. Stop it only after
+   that read succeeds. This previous-binary read is the rollback proof; merely
+   retaining or deleting a backup is not.
+5. Record both exact revisions, both `quick_check` results, the room/message
+   counts before candidate migration and after rollback, and the two isolated
+   config paths in `events.md`. Remove the temporary rehearsal directory only
+   after the evidence is captured.
 
 ### Bedrock ordering this daemon depends on
 

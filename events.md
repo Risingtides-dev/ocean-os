@@ -9687,3 +9687,31 @@ its WAL. References now resolve to the tracked ROADMAP and accepted Phase 1
 manifest rather than an unmerged definition-of-done branch. Docs only; no
 launchd job, database, daemon, deployment, or production state changed.
 _________________________________________________________________________________ 20:27 docs/rooms-federation-runbook
+
+time:      [21:13] [09-01-26]
+agent:     [codex] [gpt-5]
+worktree:  docs/rooms-federation-runbook
+type:      [bug report]
+area:      [review]
+
+Closed the second Codex review pass on the migration rehearsal. Candidate and
+rollback runs now use isolated config roots, set the explicit unsupervised
+override while launchd remains loaded, and prove rollback by restoring the
+online backup and reading it through the previous immutable binary. Docs only;
+no rehearsal, database mutation, daemon restart, launchd action, deployment,
+or production state change occurred.
+_________________________________________________________________________________ 21:13 docs/rooms-federation-runbook
+
+time:      [21:20] [09-01-26]
+agent:     [codex] [gpt-5]
+worktree:  docs/rooms-federation-runbook
+type:      [bug report]
+area:      [review]
+
+Closed the third Codex review pass on federation authority and the rehearsal
+source. The runbook now distinguishes the Bedrock transport URL from the owner
+token used only for Local-room bootstrap, preserves revoked state explicitly,
+and resolves `OCEAN_DB_PATH` before falling back to the effective config-dir
+database. Docs only; no rehearsal, database mutation, daemon restart, launchd
+action, deployment, or production state change occurred.
+_________________________________________________________________________________ 21:20 docs/rooms-federation-runbook
