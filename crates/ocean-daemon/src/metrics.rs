@@ -550,8 +550,10 @@ struct RoomMetricsDetail {
     /// The first-sighting clock. room id -> (client_event_id of the oldest row,
     /// when this process first saw that exact row at the head of the outbox).
     oldest_seen: HashMap<String, (String, Instant)>,
-    /// Last reported federation SSE lag per room.
-    lag: HashMap<String, u64>,
+    /// Last reported federation SSE lag per room, as `(generation, lag)`. The
+    /// generation is the reporting room task's, so a stopped task's cleanup can
+    /// only remove the entry it wrote itself.
+    lag: HashMap<String, (u64, u64)>,
     /// When the last successful store sample completed.
     sampled_at: Option<Instant>,
     /// Whether the most recent sample ATTEMPT succeeded.
@@ -697,13 +699,49 @@ impl RoomMetrics {
 
     /// Report this room's federation SSE lag — the epoch's announced snapshot
     /// high-water minus the last sequence accepted on it. Zero means caught up.
-    pub(super) fn set_federation_lag(&self, room: &str, lag: u64) {
+    ///
+    /// The `generation` is the room task's own, and it is stored beside the lag
+    /// so [`Self::clear_federation_lag`] can tell one task's entry from its
+    /// successor's; see there for why that matters.
+    pub(super) fn set_federation_lag(&self, room: &str, generation: u64, lag: u64) {
         let mut detail = self.detail();
-        detail.lag.insert(room.to_string(), lag);
-        let max = detail.lag.values().copied().max().unwrap_or(0);
+        detail.lag.insert(room.to_string(), (generation, lag));
+        let max = Self::max_lag(&detail);
         drop(detail);
         self.federation_lag_max
             .store(max, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Drop this room's lag entry when its federation task stops tracking it.
+    ///
+    /// Without this a room that was behind when its epoch was revoked or
+    /// stopped keeps its last nonzero lag in the map forever, and since the
+    /// gauge is the maximum across entries, `/metrics` would report that
+    /// obsolete backlog indefinitely — outliving the room itself. A stopped
+    /// task is not a lagging one, so its entry goes.
+    ///
+    /// Guarded on `generation`: a room can be stopped and restarted, and the
+    /// old task's cleanup can land after the new task has already reported.
+    /// Removing only an entry this exact generation wrote means a late clear
+    /// cannot blank its successor's live measurement.
+    pub(super) fn clear_federation_lag(&self, room: &str, generation: u64) {
+        let mut detail = self.detail();
+        let mine = detail
+            .lag
+            .get(room)
+            .is_some_and(|(stored, _)| *stored == generation);
+        if !mine {
+            return;
+        }
+        detail.lag.remove(room);
+        let max = Self::max_lag(&detail);
+        drop(detail);
+        self.federation_lag_max
+            .store(max, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    fn max_lag(detail: &RoomMetricsDetail) -> u64 {
+        detail.lag.values().map(|(_, lag)| *lag).max().unwrap_or(0)
     }
 
     pub(super) fn record_redemption_failure(&self, reason: RedemptionFailure) {
@@ -744,7 +782,7 @@ impl RoomMetrics {
                     outbox_pending: pending,
                     outbox_failed: failed,
                     outbox_oldest_age_seconds,
-                    federation_lag_events: detail.lag.get(room_id).copied(),
+                    federation_lag_events: detail.lag.get(room_id).map(|(_, lag)| *lag),
                 }
             })
             .collect();
@@ -918,6 +956,35 @@ impl RoomMetrics {
         );
 
         out
+    }
+}
+
+/// RAII scope for one room federation task's lag entry.
+///
+/// Held for the life of `room_federation::run_room`, so the room's lag is
+/// dropped from the registry on EVERY exit path — cancellation, shutdown, a
+/// revoked epoch, a missing client or credential, or a panic unwinding the task
+/// — without each of those `return`s having to remember. That is the same reason
+/// [`InFlightGuard`] exists for the turn gauge: a metric cleaned up by hand at
+/// nine return sites is a metric that leaks at the tenth.
+///
+/// Carries the task's `generation` so a late drop cannot clear the entry a
+/// restarted task has since written.
+pub(super) struct FederationLagScope {
+    room: String,
+    generation: u64,
+}
+
+impl FederationLagScope {
+    pub(super) fn enter(room: String, generation: u64) -> Self {
+        Self { room, generation }
+    }
+}
+
+impl Drop for FederationLagScope {
+    fn drop(&mut self) {
+        let (room, generation) = (self.room.as_str(), self.generation);
+        with_process_room_metrics(|metrics| metrics.clear_federation_lag(room, generation));
     }
 }
 
@@ -1435,8 +1502,8 @@ mod tests {
         let m = RoomMetrics::default();
         m.record_federation_reconnect();
         m.record_federation_reconnect();
-        m.set_federation_lag("room-a", 12);
-        m.set_federation_lag("room-b", 5);
+        m.set_federation_lag("room-a", 1, 12);
+        m.set_federation_lag("room-b", 1, 5);
         m.record_redemption_failure(RedemptionFailure::Invalid);
         m.record_redemption_failure(RedemptionFailure::Unavailable);
         m.record_admission_refusal(AdmissionRefusal::classify("author_not_in_roster"));
@@ -1503,11 +1570,73 @@ mod tests {
         );
 
         // Lag falls back as a room catches up; the gauge is not a high-water mark.
-        m.set_federation_lag("room-a", 0);
+        m.set_federation_lag("room-a", 1, 0);
         let body = m.render_prometheus();
         assert_eq!(
             metric_value(&body, "ocean_room_federation_lag_events"),
             Some(5)
+        );
+    }
+
+    /// A room that stops being tracked while behind must not leave its lag in
+    /// the gauge forever. Codex review finding (P2) on PR #447: the maximum is
+    /// taken across every stored entry, so one obsolete backlog would outlive
+    /// the room itself.
+    #[test]
+    fn room_metrics_lag_is_dropped_when_a_room_stops_being_tracked() {
+        let m = RoomMetrics::default();
+        m.set_federation_lag("busy", 7, 40);
+        m.set_federation_lag("quiet", 7, 3);
+        assert_eq!(
+            metric_value(&m.render_prometheus(), "ocean_room_federation_lag_events"),
+            Some(40)
+        );
+
+        // `busy`'s task stops while still behind: the gauge falls back to the
+        // worst room STILL being tracked, rather than holding 40 forever.
+        m.clear_federation_lag("busy", 7);
+        assert_eq!(
+            metric_value(&m.render_prometheus(), "ocean_room_federation_lag_events"),
+            Some(3)
+        );
+        assert!(
+            m.card()
+                .rooms
+                .iter()
+                .all(|room| room.federation_lag_events.is_none()),
+            "no room was sampled, so none should carry a lag on the card"
+        );
+
+        // Nothing tracked at all reads zero, not the last thing seen.
+        m.clear_federation_lag("quiet", 7);
+        assert_eq!(
+            metric_value(&m.render_prometheus(), "ocean_room_federation_lag_events"),
+            Some(0)
+        );
+    }
+
+    /// The clear is generation-guarded: a stopped task's cleanup landing after
+    /// its replacement has already reported must not blank the live measurement.
+    #[test]
+    fn room_metrics_a_late_lag_clear_cannot_blank_its_successors_measurement() {
+        let m = RoomMetrics::default();
+        // Generation 4's task reports, stops; generation 5 restarts and reports.
+        m.set_federation_lag("room", 4, 11);
+        m.set_federation_lag("room", 5, 22);
+
+        // Generation 4's guard drops LATE, after the restart. It owns nothing now.
+        m.clear_federation_lag("room", 4);
+        assert_eq!(
+            metric_value(&m.render_prometheus(), "ocean_room_federation_lag_events"),
+            Some(22),
+            "a late clear from the old generation must leave the new one alone"
+        );
+
+        // The current generation's own clear does take effect.
+        m.clear_federation_lag("room", 5);
+        assert_eq!(
+            metric_value(&m.render_prometheus(), "ocean_room_federation_lag_events"),
+            Some(0)
         );
     }
 
