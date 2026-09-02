@@ -278,6 +278,54 @@ outbox, and the restart-safe federation core (S2 P2-A). One database file
   `upsert_summary_artifact` reaches the store without passing one. A blank
   `artifact_id` is NOT checked here — that refusal is route-only in
   `persistent_rooms.rs`.
+- **Closing a room is an act somebody did, and the transcript says so.**
+  `close_with_marker` is the ROUTE's close and `RoomStore::close` is the CALL
+  path's; they are deliberately separate rather than one with a flag. `CallEnded`
+  fires with no actor to name, so its close soft-sets `closed_at`, returns the
+  pre-close record, and mints nothing. A member or operator closing a room is an
+  act, and a room that simply stops answering with nothing in its log saying why
+  or at whose hand is the same evidence gap the join, artifact and attachment
+  markers exist to close. `close_with_marker` therefore takes one IMMEDIATE
+  transaction over the openness check, the marker insert (which reads
+  `MAX(seq)+1`) and the `closed_at` write: those three are dependent, and a
+  concurrent writer between the marker and the update leaves a room whose
+  transcript announces a close that did not happen — a state no caller can
+  detect from the return value, which is why the guards are
+  `room_is_open_on`/`room_exists_on` against the TRANSACTION and not the
+  `&self` reads beside them. A room that is not open is `UnknownRoom`, the
+  answer every other mutation here already gives, so a second close is a 404
+  and never a silent success. `RoomCloser` is an enum and not an id plus a
+  boolean: a `Member` is roster-checked inside that transaction
+  (`RoomCloserNotInRoster`) because the marker names them, and an `Operator` is
+  deliberately NOT — operator authority is over the daemon rather than
+  membership in one room — and a flag deciding which check runs is the shape
+  that lets an unchecked member id through when a call site passes the wrong
+  argument. Both ids go through `marker_prose` like every other caller-supplied
+  string a marker's prose quotes; the store still accepts whatever an in-process
+  caller hands it, so no read may assume the daemon's `validate_member_id` ran.
+- **Retention cuts a CLOSED room's content and keeps its row.** `cut_closed_room`
+  removes `messages`, `room_attachments`, both read-cursor tables and
+  `federated_events` for one room in one IMMEDIATE transaction, refusing an OPEN
+  room with `RoomNotClosed` having written nothing — eligibility is measured
+  from the close, so a live room is never cuttable however old it is, and that
+  guard is inside the transaction so a racing reopen cannot pass it. What stays
+  is as load-bearing as what goes. The `rooms` row stays because deleting it
+  would `ON DELETE CASCADE` the whole room away in one statement: the row is the
+  only durable record that the room existed and when it closed, `/snapshot`
+  answers `closed: true` off it, and a client holding a link to a cut room must
+  learn it is frozen rather than that it never was. `federated_events` goes
+  because a surviving index row is worse than none — `ingest_confirmed_event`
+  cross-checks the index tuple against the TRANSCRIPT row it names, and an entry
+  pointing at a removed `local_seq` makes that read fail closed and the room
+  stops ingesting. Dropping the index does not reopen the dedup window: the
+  ordering baseline is `max(last indexed sequence, persisted room_access
+  cursor)` and the access cursor is deliberately retained. Blob bytes are NOT
+  this crate's to delete: `cut_closed_room` returns the attachment ids and the
+  caller unlinks them AFTER the commit, the same order `remove_attachment` uses.
+  `rooms_closed_before` parses each `closed_at` in Rust rather than comparing
+  RFC3339 TEXT in SQL — UTC RFC3339 happens to sort lexicographically, and
+  "happens to" is the wrong footing for a query whose false positives delete
+  transcripts — and a value it cannot parse is SKIPPED, never cut.
 - **A declared content type is recorded and never trusted.**
   `room_attachments.content_type` is whatever the uploader claimed. It is stored
   verbatim and deliberately kept OUT of the transcript marker, whose body

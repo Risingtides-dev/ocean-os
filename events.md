@@ -9549,3 +9549,125 @@ RUSTSEC-2026-0274 (`rtrb` double-free) and yanked `spin`, unchanged and
 pre-existing: the branch touches no `Cargo.toml`, `Cargo.lock` or `deny.toml` at
 all, and every line this pass changed is a comment. No deploy, no migration.
 _________________________________________________________________________________ 12:16 loop/os-transcript-page-including-closed
+
+time:      [05:08] [02-09-26]
+agent:     [claude-code], [claude-opus-5], [cloud]
+worktree:  [cloud/os-room-lifecycle]
+type:      [feature-request]
+area:      [backend]
+
+Ocean Rooms Definition of Done line 4.3, the ocean-os half: a route closes a
+room, transcript retention and attachment orphan GC exist, and rooms.db plus the
+blob tree stop growing without bound. Idle-workspace reaping is Bedrock's and is
+not here. The premise was re-derived against main at 616293e before anything was
+written and it held: none of the room routes in the main.rs banner closed a
+room, PATCH moved only name and trigger_policy, and closing was a store
+primitive reached in production from exactly one place, the CallEnded persist
+job. Every soft-closed read path had therefore existed for as long as durable
+rooms had — get_including_closed, both including_closed pagers, the snapshot's
+closed boolean — and only a finished call could ever produce a room for them to
+serve. There was no retention, no GC and no maintenance code of any kind; the
+only sweeper in the daemon was the in-memory registry loop. Attachment bytes sat
+under a one-way sha256 of the room key that is never stored, fsynced before
+their row commits, with a comment already promising a future GC sweep, and the
+room_attachments row rather than the transcript marker is what keeps a blob
+alive, since a removal marker keeps its attachment_id.
+
+POST /v1/rooms/persistent/{key}/close is the route. Two authorities and the
+header picks which rather than the outcome of authorizing it: an X-Ocean-Operator
+credential that was presented and failed is refused outright instead of being
+downgraded to whatever actor_id came with it, and absent that header the route
+wants ?actor_id= naming a roster member, spelled like the attachment delete's
+and refused with 403 forged_closer if it claims an Agent's or System's identity.
+One IMMEDIATE store transaction refuses a room that is not open with the
+existing UnknownRoom 404, appends a System marker naming the closer, and sets
+closed_at; the operator lane is deliberately not roster-checked because operator
+authority is over the daemon and not membership in one room, and RoomCloser is
+an enum rather than an id plus a flag so a call site cannot apply the wrong
+check. Afterwards detail 404s, sends refuse, the snapshot answers closed true
+with the transcript pageable and the roster and agent_owners intact, and
+Bedrock is untouched.
+
+The one SSE contract change is that live tails now END on a close instead of
+idling on a room that can never produce another row, which the route's existing
+404 on a closed room already implied since the client could not have
+re-established that connection. Writing the test for it surfaced a defect older
+than this branch: send_room_catch_up read through the open-only transcript_page,
+and because the close marker is appended in the same transaction that sets
+closed_at, that read answered UnknownRoom for it — so a live tail died on a
+store error one row short of the row explaining why, silently, for every close
+including CallEnded's. It reads through transcript_page_including_closed now. A
+second hole followed: the message tail's already-sent-seq dedupe arm continued
+without checking openness, and the close marker's hint carries that marker's own
+seq, so a tail that had replayed it from the durable log parked forever. Both
+are pinned by a test that asserts the marker arrives and then the stream ends.
+
+Retention is opt-in and the default is never. OCEAN_ROOM_RETENTION_DAYS is read
+once at startup; unset, zero, and anything that does not parse as a non-negative
+integer all mean keep everything, because a transcript cut is unrecoverable and
+a mis-parse must never become a shorter window than the operator wrote. A cut
+removes the transcript, the attachment rows and their blobs, both read-cursor
+tables and the room's federated_events index in one transaction per room, and
+never an open room at any age since the window is measured from the close. The
+rooms row stays, because deleting it would cascade the whole room away and a cut
+room must still be able to say it is frozen rather than 404 as one that never
+existed. The dedup index does not stay, because ingest_confirmed_event
+cross-checks an index tuple against the transcript row it names and a dangling
+one would stop the room ingesting forever; the ordering baseline survives
+through the retained room_access cursor. Blobs are unlinked after the commit,
+the same order the attachment delete route uses.
+
+The orphan GC derives the expected directory of every room the store knows,
+closed rooms included, because the path is a one-way hash and that derivation is
+the only way to ask whose a directory is — through room_attachments::room_dir
+rather than a second hashing here, since two derivations disagreeing would not
+mean a missed orphan but the sweep deleting every live room's files as
+unrecognised. A one-hour grace is a correctness bound and not caution: the
+upload path fsyncs bytes before the row commits, so every successful upload
+spends a moment unreferenced, and a graceless sweep would race it into exactly
+the orphan row that write order exists to prevent. Every uncertainty fails
+closed to do not delete. Both jobs share one six-hour loop, one task per sweep
+so a panic is a JoinError the loop records rather than dies on, and
+POST /v1/rooms/maintenance/run runs them now under operator authentication with
+no member lane, since the sweep is store-wide and belongs to no room.
+
+The report is the operated half. One tracing info line per run carries every
+count, and the room_maintenance card on GET /health carries the configuration —
+interval, retention window, orphan grace — beside them, because rooms_cut zero
+on its own cannot separate a clean sweep from retention that was never turned
+on, and those two have opposite remedies. The card is read through a
+poison-recovering snapshot so a mutex poisoned by a panicked sweep cannot take
+/health down with it.
+
+Checks: a route test closing an open room that asserts detail 404, snapshot
+closed true, a refused send and a readable transcript ending in the marker; a
+refusal test proving three refused closes leave the room open with not one extra
+row; the tail test above; a fixed-clock retention test where a room closed forty
+days back is cut while one closed two days back and an open room seeded at the
+same instant survive with their bytes intact; a GC test proving by MUTATION that
+only the orphan goes — is_referenced is a named function precisely so the test
+can drive sweep_room_dir with a doctored set both ways, and both mutants are
+exercised for real: saying everything is referenced leaves the orphan and fails
+the first assertion, saying nothing is referenced deletes the live blob and
+fails the last, and only the true set removes exactly one file with the other's
+bytes reading back byte for byte; a grace test, a closed-room-directory test, a
+parse test over every unusable value, and a health test asserting both the
+counts and the configuration on the card while proving HealthResponse still
+parses the body.
+
+Gates: cargo xtask ci. cargo-deny is not installed in this environment, so the
+dependency-policy lane DID NOT RUN — not passed, did not run; it fails with "no
+such command: deny" before it evaluates anything, so nothing is known about the
+dependency graph from this run either way. Every other lane ran and is green:
+docs-check PASS at 30 packages, 157 active Markdown files and 179 local links;
+workspace tests with zero FAILED results anywhere, ocean-daemon 885 passed,
+ocean-store 219 passed, ocean-tui 496 passed and 4 ignored; all-target Clippy
+clean under -D warnings after one needless-borrow fix in the new module's test
+fixture; format clean after cargo fmt. Banner count moved 124 to 126
+with both new routes added to the banner, the operator-guide quick reference and
+the ecosystem contract; PR #445 rewrites that route table and raises the same
+counts, so a rebase onto it will need both numbers and both rows reconciled. No
+deploy and no migration: every new column is absent because there are none, and
+a daemon that upgrades into this code sweeps nothing until an operator sets a
+window.
+_________________________________________________________________________________ 05:08 cloud/os-room-lifecycle

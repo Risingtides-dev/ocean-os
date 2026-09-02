@@ -195,6 +195,66 @@ Two additional SQLite databases live alongside sessions and the config dir:
 - `rooms.db` — persistent room store (`SqliteRoomStore`). Survives daemon restarts; override the full path with `OCEAN_DB_PATH`.
 - `titles.db` — Longhouse title/escrow registry (firekeeper titles, recall tallies). Survives daemon restarts; override the full path with `OCEAN_TITLES_DB_PATH`.
 
+Room attachment BYTES live in `room-attachments/` beside `rooms.db` — one
+subdirectory per room, named by a one-way hash of the room key — so
+`OCEAN_DB_PATH` moves a room's metadata and its files together.
+
+#### Room retention and maintenance
+
+Neither `rooms.db` nor the blob tree shrinks on its own. A transcript row is
+written and never removed, and a blob is removed only when somebody deletes the
+row naming it, so a long-lived daemon grows monotonically. Two sweeps run on one
+loop every **6 hours** to bound that, and both report to the `room_maintenance`
+card on `GET /health`:
+
+- **Transcript retention** cuts rooms that have been CLOSED longer than
+  `OCEAN_ROOM_RETENTION_DAYS`. It removes the transcript, the attachment rows
+  and their bytes, the read cursors, and the room's federation dedup index, in
+  one transaction per room. The `rooms` row itself STAYS, so a cut room still
+  answers `closed: true` on `/snapshot` — frozen and empty — rather than 404ing
+  as one that never existed.
+- **Attachment orphan GC** unlinks blob bytes no `room_attachments` row claims:
+  the residue of an upload that fsynced its bytes and then failed to commit its
+  row, `.tmp` files from a crash mid-upload, and whole directories belonging to
+  no room the store knows. Anything modified within the last **hour** is left
+  alone — that grace is what stops the sweep racing an upload in progress.
+
+`OCEAN_ROOM_RETENTION_DAYS` is read ONCE at startup, so the window a sweep
+applies is always the one `/health` reports; changing it needs a restart.
+
+- **Unset or `0` means NEVER, and that is the default.** A transcript cut is
+  unrecoverable, so retention is opt-in: upgrading the daemon must not start
+  deleting history nobody asked it to delete.
+- Anything that is not a non-negative integer — a typo, a `30d`, a negative —
+  also means never, with a warning at startup. The one safe direction to fail
+  on a knob that deletes transcripts is "keep everything"; a mis-parse must
+  never become a SHORTER window than the operator wrote.
+- If you want a window, **90 days** is the number to reach for unless you have
+  a reason for another: it outlasts any review or incident cycle that would
+  send somebody back to a finished room's history, and it still puts a closed
+  room's rows out of the store inside the same quarter it was closed. Set it
+  in the daemon's own environment (`OCEAN_ROOM_RETENTION_DAYS=90`) and confirm
+  it on `/health` — `retention_days` on the card is the daemon's own word for
+  what it will act on.
+
+Retention never touches an OPEN room, at any age: the window is measured from
+the close, so a room that has been running for years is not eligible until
+somebody closes it with `POST /v1/rooms/persistent/{key}/close`.
+
+`POST /v1/rooms/maintenance/run` runs both sweeps immediately under operator
+authentication and answers with the same card, which is the fast way to confirm
+a newly set window does what you expect without waiting out the interval.
+
+The `room_maintenance` card on `GET /health` carries the configuration
+(`interval_secs`, `retention_days`, `orphan_grace_secs`) as well as the last
+run's `last_run_at`, `last_run_ms`, `runs_total`, counts (`rooms_cut`,
+`messages_removed`, `attachment_rows_removed`, `cursors_removed`,
+`federated_index_rows_removed`, `orphan_files_removed`, `orphan_dirs_removed`),
+`bytes_reclaimed`, and `last_error` (`null` when the last sweep was clean). The
+configuration is on the card deliberately: `rooms_cut: 0` on its own cannot tell
+you whether retention swept and found nothing or was never turned on, and those
+two have opposite remedies.
+
 ### Federated-room Bedrock bridge
 
 Set `OCEAN_FEDERATION_URL` to the Bedrock **origin only** (for example
@@ -557,6 +617,7 @@ GET    /v1/rooms/persistent               list persistent rooms
 POST   /v1/rooms/persistent               create a room { key, name, trigger_policy?, workspace_root? }; blank workspace_root is unbound, while a nonblank value must resolve to an existing absolute directory and is persisted canonically (400 invalid_workspace_root otherwise). Agent execution revalidates the stored canonical directory and returns 503 workspace_unavailable instead of inheriting daemon cwd when it is missing, symlink-replaced, relative, or noncanonical.
 GET    /v1/rooms/persistent/{key}         room + transcript + access + agent_owners; the transcript is a BOUNDED first page like `/transcript` and `/snapshot` — at most 1000 rows from the START of the log, with next_seq/has_more beside it, so replay the rest as `/transcript?after_seq=next_seq` rather than reading the array as the whole history. Open rooms only; unknown/closed room 404
 PATCH  /v1/rooms/persistent/{key}         update mutable metadata { name?, trigger_policy? }; an absent field is unchanged, trigger_policy: null clears the policy, an unknown field is a 400; 200 { room }, 404 unknown/closed room
+POST   /v1/rooms/persistent/{key}/close                   freeze the room. Two authorities: ?actor_id= naming a roster member (roster-checked in the closing transaction; an Agent's or System's identity claimed off the wire is 403 forged_closer), or an X-Ocean-Operator credential, which is NOT roster-checked and whose presence selects that lane outright — a presented-and-invalid credential is refused, never downgraded to the member lane. One IMMEDIATE transaction appends a System marker naming the closer and sets closed_at, so a frozen room always explains itself. 200 { room, closed: true, marker_seq }, 404 unknown or already-closed room, 400 with neither authority. Afterwards: detail 404s, writes refuse, live /events tails flush the marker and END, and /snapshot answers closed: true with the transcript pageable both ways and the roster and agent_owners intact. Bedrock is untouched.
 POST   /v1/rooms/persistent/{key}/participants            join { id, display_name, kind? }
 DELETE /v1/rooms/persistent/{key}/participants/{participant_id}  leave
 POST   /v1/rooms/persistent/{key}/messages                post message { author_id, author_kind?, body }
@@ -640,6 +701,9 @@ POST   /v1/rooms/persistent/{key}/workspace/{*leaf}       commands (?actor_id=, 
 
 # Room media — retained independently from the retired projection API
 POST   /v1/rooms/{room_id}/livekit-token                  mint a LiveKit join token for web in-room voice/video
+
+# Room maintenance — store-wide, operator only
+POST   /v1/rooms/maintenance/run                          run the transcript-retention and attachment-orphan sweeps NOW instead of waiting for the 6-hour loop. Operator-authenticated (X-Ocean-Operator; no member lane — the sweep is store-wide and belongs to no room), 503 when no operator key is configured or the header is absent, 403 on an invalid, cookie-bearing, or foreign-origin credential. 200 { room_maintenance } — the same card GET /health carries, so a hand-run sweep reports its own result.
 
 # Sessions (legacy view)
 GET    /v1/sessions                       list sessions
