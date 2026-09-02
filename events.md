@@ -9651,3 +9651,23 @@ known check gaps without claiming every criterion already has an executable
 pin and named effort. Docs only; no secret, launchd environment, daemon,
 deployment, login, reboot, or production state changed.
 _________________________________________________________________________________ 22:53 docs/rooms-definition-of-done
+time:      [20:15] [01-09-26]
+agent:     [claude-code], [claude-fable-5-1], [ocean operator]
+worktree:  docs/rooms-federation-runbook
+type:      [handoff]
+area:      [docs]
+
+Added a rooms and federation runbook to `docs/OPERATIONS.md`: the order of
+operations to enable federation on the supervised daemon (two environment
+variables the tracked plist does not carry, so the operated daemon runs rooms
+local-only today), how to verify a credentialed room reaches `live` and its
+outbox drains, the workspace lane's Bedrock requirements, how to read the
+bridge while `/metrics` has no room counters, rollback, and the `rooms.db`
+migration rehearsal the Phase 1 manifest's gate 4 asks for — stated plainly
+as NOT yet performed, so the definition-of-done line stays open on an
+executable record rather than on prose. Also records the Bedrock ordering
+this daemon depends on: `db/013` before any deploy carrying ocean-bedrock
+#117. `docs/README.md` no longer says the Phase 1 independent review has not
+run; ROADMAP.md has said since 2026-08-31 that it did. Docs only; no code,
+no deploy, no migration, no rehearsal performed.
+_________________________________________________________________________________ 20:15 docs/rooms-federation-runbook

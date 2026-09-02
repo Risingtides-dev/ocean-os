@@ -127,6 +127,139 @@ tail -n 200 /private/tmp/ocean-daemon.log
 Use the actual plist/script paths if local configuration differs; the tracked
 installer and `ops/README.md` are authoritative.
 
+## Rooms and federation
+
+Rooms are daemon-local by default: a room, its transcript, roster, artifacts
+and attachments live in `rooms.db` beside the config dir (`OCEAN_CONFIG_DIR`,
+else `$XDG_CONFIG_HOME/ocean-rs`, else `~/.config/ocean-rs`; `OCEAN_DB_PATH`
+overrides the full path). Federation is what lets a room span daemons: invites,
+the Bedrock room stream, and the container workspace lane. It is off unless the
+supervised daemon carries two environment variables, and as of 2026-09-01 the
+tracked plist carries neither, so the operated daemon runs rooms local-only and
+any room that ever held a Bedrock credential sits in `recovering`. The
+mechanics are in `OCEAN_RUNTIME_OPERATOR_GUIDE.md` under "Federated-room
+Bedrock bridge"; this section is the operator's order of operations. The
+finish line it serves is `docs/specs/2026-09-01-ocean-rooms-definition-of-done.md`.
+
+### Enable federation
+
+1. Bedrock must be reachable over HTTPS at its origin with its federation
+   schema applied: `npm run db:check` there must report `roomMembersReady`
+   and `roomComputeReady`, and `operatorRoomsReady` once ocean-bedrock #117 is
+   deployed. Production today is `https://ocean-bedrock-production.up.railway.app`.
+2. Mint the daemon's owner bearer on Bedrock. Today that is an admin token
+   (`npm run token:create` there); Bedrock's own handoff warns that path scopes
+   do not constrain an admin token, so it is full-instance authority, and
+   ocean-bedrock #117 adds the operator path that will replace it. Treat the
+   value as a production secret.
+3. Set, on the supervised daemon only:
+   - `OCEAN_FEDERATION_URL` — the Bedrock origin, nothing after the host.
+   - `OCEAN_FEDERATION_OWNER_TOKEN` — the bearer from step 2.
+
+   The installer renders `deploy/dev.risingtides.ocean-daemon.plist` and
+   substitutes only `__OCEAN_HOME__`; there is no untracked env file yet. Add
+   the two keys to the RENDERED plist at
+   `~/Library/LaunchAgents/dev.risingtides.ocean-daemon.plist` after
+   `./ops/install-ocean-daemon.sh`, never to the tracked template, and repeat
+   after every reinstall because the installer overwrites it. Teaching the
+   installer to merge a local, untracked env file is the follow-up that
+   removes this step.
+4. Restart the named LaunchAgent after turns drain, exactly as in the
+   supervised-daemon section above.
+5. Verify, in this order. First the revision:
+
+   ```bash
+   curl -fsS http://127.0.0.1:4780/health
+   ```
+
+   Then bootstrap one existing Local room as its Bedrock owner by minting an
+   invite from the surface's room invite control, or by POSTing
+   `/v1/rooms/persistent/<key>/invites` with the body the operator guide
+   documents; the response is the only place the invite code and `onboard_url`
+   appear. Then read the room's access state:
+
+   ```bash
+   curl -fsS "http://127.0.0.1:4780/v1/rooms/persistent/<key>/snapshot?before_seq=18446744073709551615&limit=1"
+   ```
+
+   `access.state` must move from `connecting` to `live` within one reconnect
+   interval. A `recovering` that never turns `live` means the origin was
+   rejected, the token is invalid, or Bedrock is down; the daemon moves every
+   credentialed room there on bad configuration rather than leaving stale
+   `live` chrome. Then post a message in that room: it answers 202 and reaches
+   the transcript only when Bedrock's ordered stream confirms it, and the
+   snapshot's `outbox` must drain to empty.
+6. Record the verification in `events.md` with the daemon revision and the
+   room key, as the 2026-08-31 install entry did. Until such an entry exists,
+   line 0.6 of the rooms definition of done stays open.
+
+### The workspace lane
+
+The daemon proxies a federated room's Bedrock workspace under
+`GET|POST /v1/rooms/persistent/{key}/workspace/{leaf}` with the room's own
+credential, so no browser ever holds the bearer. It needs the room to be
+federated (a credential in `rooms.db`) and Bedrock to run a compute driver with
+its runtime Worker deployed. Bedrock's typed refusals (`workspace_absent`,
+`repo_unbound`, `federation_unavailable`) are relayed as states, not errors.
+Owner verbs (provision, destroy, repo bind and unbind, secrets set) forward
+only for the actor that resolves to the credential's own principal. CI pulls
+need a `GH_TOKEN` room secret set through `secrets/set`; Bedrock returns no
+secret value on any route.
+
+### Reading the bridge without metrics
+
+There are no room or federation counters on `/metrics` yet (definition of done,
+line 4.1). Until there are:
+
+- `access.state` on the snapshot is the primary signal: `live` is caught up,
+  `recovering` is replaying from the durable cursor or misconfigured, `revoked`
+  means this principal's membership was removed and nothing is writable.
+- `outbox` on the snapshot: pending rows that age while the state is `live`
+  mean the sender is not being confirmed. The ordered SSE stream is the only
+  confirmation rail; a ledger 201 never is.
+- The daemon log (`/private/tmp/ocean-daemon.log`) carries the bridge's
+  reconnects and refusals under the `room_federation` module; jittered
+  reconnects cap at 60 s.
+- Presence follows the SSE lease: a disconnect downgrades every projected
+  member to Unavailable in the same access commit.
+
+### Rollback
+
+Remove the two variables from the rendered plist and kickstart. Local rooms are
+untouched; credentialed rooms sit in `recovering` with honest chrome; nothing
+is deleted. Re-adding the variables resumes from the persisted cursor.
+
+### rooms.db migration rehearsal
+
+The Phase 1 manifest's rollout gate 4 asks for a migration rehearsal on a copy
+of a real `rooms.db`, including rollback. **As of 2026-09-01 this has not been
+performed**: the only rehearsal entries in `events.md` concern `ocean-memory`.
+Line 4.5 of the rooms definition of done stays open until an `events.md` entry
+records one; writing this procedure down is not performing it. Procedure:
+
+1. Copy the live store without stopping the daemon:
+   `cp <config dir>/rooms.db /tmp/rooms-rehearsal.db`, using the config dir
+   the running daemon actually uses (`launchctl print` shows its environment).
+2. Run the candidate binary against the copy on a spare port with
+   `OCEAN_DB_PATH=/tmp/rooms-rehearsal.db` and `OCEAN_BIND`, from the immutable
+   artifact under `~/.local/libexec/ocean-daemon/`.
+3. Through the candidate, list rooms and read one snapshot; the store applies
+   its migrations on open, so a clean open plus readable rooms is the pass.
+4. Rollback: stop the candidate and delete the copy. For a real upgrade,
+   rollback is the previous immutable artifact plus the pre-upgrade copy from
+   step 1, because the store's migrations are forward-only; the copy is the
+   rollback.
+5. Record both revisions and the room and message counts before and after in
+   `events.md`.
+
+### Bedrock ordering this daemon depends on
+
+ocean-bedrock #117 makes Bedrock's `register()` write `room_members.operator_id`,
+so Bedrock migration `db/013` must be applied to its production database before
+any deploy containing #117, or legacy room registration (the path the owner
+bootstrap above uses) answers 500. Bedrock's `npm run deploy:status` and
+`npm run db:check` are the checks; this daemon cannot see either.
+
 ## Install the TUI
 
 Feature branches must build and test the TUI normally. Installation is a
