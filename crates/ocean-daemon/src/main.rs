@@ -1744,17 +1744,6 @@ async fn root() -> Json<serde_json::Value> {
 /// provenance are observable without inspecting the process or build dir.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 struct HealthEnvelope {
-    #[serde(flatten)]
-    health: HealthResponse,
-    rev: String,
-    /// Ocean Rooms §4.1: the room + federation metrics card. Added here on the
-    /// envelope rather than on `ocean_core::HealthResponse` for the same reason
-    /// `rev` is — the wire shape stays additive and existing clients that
-    /// deserialize into `HealthResponse` still parse — and as a section of this
-    /// existing card rather than as a new route, because the router's method/path
-    /// set is pinned in three places at once (`app_router`, `banner_routes()`,
-    /// and the operator guide's HTTP quick reference).
-    rooms: metrics::RoomMetricsCard,
     /// What the room maintenance loop last did, and the configuration it did it
     /// under: sweep interval, retention window in days (`0` = off), orphan
     /// grace, when the last sweep finished and how long it took, and its counts
@@ -1773,6 +1762,17 @@ struct HealthEnvelope {
     /// binary's. Pre-field daemons omit the key, and `HealthResponse` carries no
     /// `deny_unknown_fields`, so existing clients keep parsing.
     room_maintenance: room_maintenance::RoomMaintenanceReport,
+    #[serde(flatten)]
+    health: HealthResponse,
+    rev: String,
+    /// Ocean Rooms §4.1: the room + federation metrics card. Added here on the
+    /// envelope rather than on `ocean_core::HealthResponse` for the same reason
+    /// `rev` is — the wire shape stays additive and existing clients that
+    /// deserialize into `HealthResponse` still parse — and as a section of this
+    /// existing card rather than as a new route, because the router's method/path
+    /// set is pinned in three places at once (`app_router`, `banner_routes()`,
+    /// and the operator guide's HTTP quick reference).
+    rooms: metrics::RoomMetricsCard,
 }
 
 async fn health(State(state): State<AppState>) -> Json<HealthEnvelope> {
@@ -1799,16 +1799,16 @@ async fn health(State(state): State<AppState>) -> Json<HealthEnvelope> {
             // `0` healthy; a climbing value means GC is failing and memory is leaking.
             gc_failures_total: state.gc_failures.load(std::sync::atomic::Ordering::Relaxed),
         },
+        // Read through the poison-recovering snapshot: a maintenance mutex
+        // poisoned by a panicked sweep must never be what takes `/health` down,
+        // since this card is how that panic becomes visible in the first place.
+        room_maintenance: room_maintenance::report_snapshot(&state.room_maintenance),
         // Build provenance: the commit the running binary was compiled from, set by
         // build.rs (`-dirty` suffix on uncommitted worktrees; `unknown` when git
         // could not be run). Lets an operator confirm the supervised daemon is
         // actually running the main commit they expect.
         rev: env!("OCEAN_BUILD_REV").into(),
         rooms: state.room_metrics.card(),
-        // Read through the poison-recovering snapshot: a maintenance mutex
-        // poisoned by a panicked sweep must never be what takes `/health` down,
-        // since this card is how that panic becomes visible in the first place.
-        room_maintenance: room_maintenance::report_snapshot(&state.room_maintenance),
     })
 }
 

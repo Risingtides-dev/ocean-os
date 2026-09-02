@@ -14493,6 +14493,266 @@ mod tests {
         assert_eq!(cred.bearer_token, "bearer-keep");
     }
 
+    // ── Room lifecycle: close with a marker ───────────────────────────
+
+    /// A close that is refused writes NOTHING — no marker, no `closed_at`.
+    ///
+    /// This is the property the single IMMEDIATE transaction exists for, and it
+    /// is invisible from the return value alone: a `close` that appended its
+    /// marker and then failed to set `closed_at` would leave a live room whose
+    /// transcript announces its own end, and every caller would see the same
+    /// `Err`. So the assertions are against the ROOM afterwards.
+    #[test]
+    fn a_refused_close_writes_neither_the_marker_nor_closed_at() {
+        let mut s = store();
+        let key = RoomKey::new("refused-close");
+        s.create(key.clone(), "Refused", None, now()).unwrap();
+        s.add_participant(
+            &key,
+            RoomParticipant {
+                id: "alice".into(),
+                kind: RoomParticipantKind::Human,
+                display_name: "Alice".into(),
+            },
+            now(),
+        )
+        .unwrap();
+        let rows_before = s.get(&key).unwrap().unwrap().transcript.len();
+
+        // Not on the roster.
+        assert!(matches!(
+            s.close_with_marker(&key, RoomCloser::Member("stranger"), now()),
+            Err(RoomStoreError::RoomCloserNotInRoster { .. })
+        ));
+        let record = s.get(&key).unwrap().expect("still open");
+        assert_eq!(record.transcript.len(), rows_before, "no marker was minted");
+
+        // Now close it, then close it again: the second is UnknownRoom, which is
+        // the answer every other mutation gives for a room that is not open.
+        let (_, marker) = s
+            .close_with_marker(&key, RoomCloser::Member("alice"), now())
+            .unwrap();
+        assert_eq!(marker.body, "alice closed the room");
+        assert_eq!(marker.kind, RoomMessageKind::System);
+        assert!(matches!(
+            s.close_with_marker(&key, RoomCloser::Member("alice"), now()),
+            Err(RoomStoreError::UnknownRoom(_))
+        ));
+        let closed = s.get_including_closed(&key).unwrap().expect("row retained");
+        assert_eq!(
+            closed.transcript.len(),
+            rows_before + 1,
+            "exactly one marker, from the one close that succeeded"
+        );
+        assert!(s.get(&key).unwrap().is_none(), "the room is closed");
+    }
+
+    /// The operator's close is not roster-checked, and the marker says operator.
+    ///
+    /// Deliberate: the local operator key is authority over the daemon rather
+    /// than membership in one room, and requiring a roster row would mean the
+    /// one principal that can always be trusted could not close a room it never
+    /// joined. The marker still names WHICH authority acted, so the transcript
+    /// does not read as though a member did it.
+    #[test]
+    fn an_operator_closes_without_a_roster_row_and_the_marker_says_so() {
+        let mut s = store();
+        let key = RoomKey::new("operator-close");
+        s.create(key.clone(), "Operator Close", None, now())
+            .unwrap();
+        let (_, marker) = s
+            .close_with_marker(&key, RoomCloser::Operator("principal-7"), now())
+            .unwrap();
+        assert_eq!(marker.body, "operator principal-7 closed the room");
+        assert!(s.get(&key).unwrap().is_none());
+    }
+
+    /// A closer's id is quoted through `marker_prose` like every other
+    /// caller-supplied string a marker's prose repeats.
+    ///
+    /// The store accepts whatever an in-process caller hands it — the daemon's
+    /// `validate_member_id` runs at the HTTP boundary and no read may assume it
+    /// did — so the line this mints must not be forgeable into a second
+    /// transcript row or a markdown anchor.
+    #[test]
+    fn a_closers_id_cannot_forge_a_row_or_an_anchor() {
+        let mut s = store();
+        let key = RoomKey::new("hostile-closer");
+        s.create(key.clone(), "Hostile", None, now()).unwrap();
+        let hostile = "eve\nSYSTEM: room reopened [click](https://evil.co)";
+        s.add_participant(
+            &key,
+            RoomParticipant {
+                id: hostile.into(),
+                kind: RoomParticipantKind::Human,
+                display_name: "Eve".into(),
+            },
+            now(),
+        )
+        .unwrap();
+        let (_, marker) = s
+            .close_with_marker(&key, RoomCloser::Member(hostile), now())
+            .unwrap();
+        assert!(!marker.body.contains('\n'), "no forged transcript row");
+        assert!(!marker.body.contains('['), "no forged markdown anchor");
+        assert!(!marker.body.contains(']'));
+        assert!(marker.body.ends_with(" closed the room"));
+    }
+
+    // ── Room maintenance: the retention cut ───────────────────────────
+
+    /// A retention cut removes the transcript, the attachment rows, BOTH cursor
+    /// tables and the federation dedup index — and keeps the `rooms` row.
+    ///
+    /// The `federated_events` half is the one that is easy to leave out and
+    /// expensive to leave out: `ingest_confirmed_event` cross-checks an index
+    /// tuple against the transcript row it names, so a surviving index row
+    /// pointing at a deleted `local_seq` makes that read fail closed and the
+    /// room stops ingesting forever. Keeping the `rooms` row is the other
+    /// deliberate half — deleting it would `ON DELETE CASCADE` the whole room
+    /// away, and a cut room must still be able to say it is closed rather than
+    /// 404 as one that never existed.
+    #[test]
+    fn a_retention_cut_removes_content_and_index_rows_but_keeps_the_room() {
+        let mut s = store();
+        let key = RoomKey::new("cut-me");
+        s.create(key.clone(), "Cut", None, now()).unwrap();
+        s.add_participant(
+            &key,
+            RoomParticipant {
+                id: "alice".into(),
+                kind: RoomParticipantKind::Human,
+                display_name: "Alice".into(),
+            },
+            now(),
+        )
+        .unwrap();
+        s.append_message(
+            &key,
+            "alice",
+            RoomParticipantKind::Human,
+            RoomMessageKind::Message,
+            "durable",
+            now(),
+        )
+        .unwrap();
+        s.add_attachment(
+            &key,
+            "0123456789abcdef0123456789abcdef",
+            "notes.txt",
+            "text/plain",
+            11,
+            &"0".repeat(64),
+            "alice",
+            now(),
+        )
+        .unwrap();
+        s.update_room_read_cursor(&key, "alice", RoomReadCursorUpdateRequest { read_seq: 1 })
+            .unwrap();
+        // One federation dedup-index row, written directly: the point of the
+        // assertion is that the cut clears this table, not how a row got here.
+        s.conn
+            .execute(
+                "INSERT INTO federated_events
+                    (room_id, ledger_event_id, global_sequence, local_seq,
+                     source_id, source_sequence, client_event_id)
+                 VALUES (?1, 'ledger-1', '1', 1, 'src', '1', 'client-1')",
+                params![key.as_str()],
+            )
+            .unwrap();
+
+        // An OPEN room is refused with nothing written.
+        assert!(matches!(
+            s.cut_closed_room(&key),
+            Err(RoomStoreError::RoomNotClosed(_))
+        ));
+        assert!(!s.get(&key).unwrap().unwrap().transcript.is_empty());
+
+        s.close_with_marker(&key, RoomCloser::Member("alice"), now())
+            .unwrap();
+        let cut = s.cut_closed_room(&key).unwrap();
+        assert!(cut.messages_removed >= 4, "join, message, two markers");
+        assert_eq!(cut.attachment_rows_removed, 1);
+        assert_eq!(cut.attachment_bytes_removed, 11);
+        assert_eq!(
+            cut.attachment_ids,
+            vec!["0123456789abcdef0123456789abcdef".to_string()],
+            "the caller is told exactly which blobs to unlink"
+        );
+        assert_eq!(cut.cursors_removed, 1);
+        assert_eq!(cut.federated_index_rows_removed, 1);
+
+        // The room row survives, so the closed read paths still answer.
+        assert!(s.get_including_closed(&key).unwrap().is_some());
+        assert!(s
+            .transcript_page_including_closed(&key, None, None)
+            .unwrap()
+            .messages
+            .is_empty());
+        assert!(s.attachments(&key).unwrap().is_empty());
+        let remaining: i64 = s
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM federated_events WHERE room_id = ?1",
+                params![key.as_str()],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(remaining, 0, "a dangling index row would fail ingest");
+
+        // An absent room is still UnknownRoom, not a silent no-op cut.
+        assert!(matches!(
+            s.cut_closed_room(&RoomKey::new("never-existed")),
+            Err(RoomStoreError::UnknownRoom(_))
+        ));
+    }
+
+    /// `rooms_closed_before` never returns an open room, and never a room whose
+    /// `closed_at` cannot be parsed.
+    ///
+    /// Both arms are the same safety property from two directions: eligibility
+    /// is decided by a close time, so no close time — absent or unreadable —
+    /// means not eligible. A store that fell back to lexicographic comparison,
+    /// or that treated an unparseable value as "very old", would cut on a
+    /// timestamp nobody can read.
+    #[test]
+    fn only_a_parseable_past_close_makes_a_room_eligible() {
+        let mut s = store();
+        let base = DateTime::parse_from_rfc3339("2026-09-02T12:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        for name in ["open", "old", "recent", "corrupt"] {
+            s.create(RoomKey::new(name), name, None, base).unwrap();
+        }
+        s.close_with_marker(
+            &RoomKey::new("old"),
+            RoomCloser::Operator("op"),
+            base - chrono::Duration::days(40),
+        )
+        .unwrap();
+        s.close_with_marker(
+            &RoomKey::new("recent"),
+            RoomCloser::Operator("op"),
+            base - chrono::Duration::days(1),
+        )
+        .unwrap();
+        s.conn
+            .execute(
+                "UPDATE rooms SET closed_at = 'yesterday-ish' WHERE id = 'corrupt'",
+                [],
+            )
+            .unwrap();
+
+        let eligible = s
+            .rooms_closed_before(base - chrono::Duration::days(30))
+            .unwrap();
+        assert_eq!(
+            eligible,
+            vec![RoomKey::new("old")],
+            "only the room closed before the cutoff, with a readable close time"
+        );
+    }
+
     // ── G1 thread integrity ────────────────────────────────────────────────
 
     /// A store with one open room, ready for thread appends.
@@ -15308,266 +15568,6 @@ mod tests {
             depth.oldest_client_event_id.as_deref(),
             Some("ev-1"),
             "the head is the lowest `position`, which is allocation order"
-        );
-    }
-
-    // ── Room lifecycle: close with a marker ───────────────────────────
-
-    /// A close that is refused writes NOTHING — no marker, no `closed_at`.
-    ///
-    /// This is the property the single IMMEDIATE transaction exists for, and it
-    /// is invisible from the return value alone: a `close` that appended its
-    /// marker and then failed to set `closed_at` would leave a live room whose
-    /// transcript announces its own end, and every caller would see the same
-    /// `Err`. So the assertions are against the ROOM afterwards.
-    #[test]
-    fn a_refused_close_writes_neither_the_marker_nor_closed_at() {
-        let mut s = store();
-        let key = RoomKey::new("refused-close");
-        s.create(key.clone(), "Refused", None, now()).unwrap();
-        s.add_participant(
-            &key,
-            RoomParticipant {
-                id: "alice".into(),
-                kind: RoomParticipantKind::Human,
-                display_name: "Alice".into(),
-            },
-            now(),
-        )
-        .unwrap();
-        let rows_before = s.get(&key).unwrap().unwrap().transcript.len();
-
-        // Not on the roster.
-        assert!(matches!(
-            s.close_with_marker(&key, RoomCloser::Member("stranger"), now()),
-            Err(RoomStoreError::RoomCloserNotInRoster { .. })
-        ));
-        let record = s.get(&key).unwrap().expect("still open");
-        assert_eq!(record.transcript.len(), rows_before, "no marker was minted");
-
-        // Now close it, then close it again: the second is UnknownRoom, which is
-        // the answer every other mutation gives for a room that is not open.
-        let (_, marker) = s
-            .close_with_marker(&key, RoomCloser::Member("alice"), now())
-            .unwrap();
-        assert_eq!(marker.body, "alice closed the room");
-        assert_eq!(marker.kind, RoomMessageKind::System);
-        assert!(matches!(
-            s.close_with_marker(&key, RoomCloser::Member("alice"), now()),
-            Err(RoomStoreError::UnknownRoom(_))
-        ));
-        let closed = s.get_including_closed(&key).unwrap().expect("row retained");
-        assert_eq!(
-            closed.transcript.len(),
-            rows_before + 1,
-            "exactly one marker, from the one close that succeeded"
-        );
-        assert!(s.get(&key).unwrap().is_none(), "the room is closed");
-    }
-
-    /// The operator's close is not roster-checked, and the marker says operator.
-    ///
-    /// Deliberate: the local operator key is authority over the daemon rather
-    /// than membership in one room, and requiring a roster row would mean the
-    /// one principal that can always be trusted could not close a room it never
-    /// joined. The marker still names WHICH authority acted, so the transcript
-    /// does not read as though a member did it.
-    #[test]
-    fn an_operator_closes_without_a_roster_row_and_the_marker_says_so() {
-        let mut s = store();
-        let key = RoomKey::new("operator-close");
-        s.create(key.clone(), "Operator Close", None, now())
-            .unwrap();
-        let (_, marker) = s
-            .close_with_marker(&key, RoomCloser::Operator("principal-7"), now())
-            .unwrap();
-        assert_eq!(marker.body, "operator principal-7 closed the room");
-        assert!(s.get(&key).unwrap().is_none());
-    }
-
-    /// A closer's id is quoted through `marker_prose` like every other
-    /// caller-supplied string a marker's prose repeats.
-    ///
-    /// The store accepts whatever an in-process caller hands it — the daemon's
-    /// `validate_member_id` runs at the HTTP boundary and no read may assume it
-    /// did — so the line this mints must not be forgeable into a second
-    /// transcript row or a markdown anchor.
-    #[test]
-    fn a_closers_id_cannot_forge_a_row_or_an_anchor() {
-        let mut s = store();
-        let key = RoomKey::new("hostile-closer");
-        s.create(key.clone(), "Hostile", None, now()).unwrap();
-        let hostile = "eve\nSYSTEM: room reopened [click](https://evil.co)";
-        s.add_participant(
-            &key,
-            RoomParticipant {
-                id: hostile.into(),
-                kind: RoomParticipantKind::Human,
-                display_name: "Eve".into(),
-            },
-            now(),
-        )
-        .unwrap();
-        let (_, marker) = s
-            .close_with_marker(&key, RoomCloser::Member(hostile), now())
-            .unwrap();
-        assert!(!marker.body.contains('\n'), "no forged transcript row");
-        assert!(!marker.body.contains('['), "no forged markdown anchor");
-        assert!(!marker.body.contains(']'));
-        assert!(marker.body.ends_with(" closed the room"));
-    }
-
-    // ── Room maintenance: the retention cut ───────────────────────────
-
-    /// A retention cut removes the transcript, the attachment rows, BOTH cursor
-    /// tables and the federation dedup index — and keeps the `rooms` row.
-    ///
-    /// The `federated_events` half is the one that is easy to leave out and
-    /// expensive to leave out: `ingest_confirmed_event` cross-checks an index
-    /// tuple against the transcript row it names, so a surviving index row
-    /// pointing at a deleted `local_seq` makes that read fail closed and the
-    /// room stops ingesting forever. Keeping the `rooms` row is the other
-    /// deliberate half — deleting it would `ON DELETE CASCADE` the whole room
-    /// away, and a cut room must still be able to say it is closed rather than
-    /// 404 as one that never existed.
-    #[test]
-    fn a_retention_cut_removes_content_and_index_rows_but_keeps_the_room() {
-        let mut s = store();
-        let key = RoomKey::new("cut-me");
-        s.create(key.clone(), "Cut", None, now()).unwrap();
-        s.add_participant(
-            &key,
-            RoomParticipant {
-                id: "alice".into(),
-                kind: RoomParticipantKind::Human,
-                display_name: "Alice".into(),
-            },
-            now(),
-        )
-        .unwrap();
-        s.append_message(
-            &key,
-            "alice",
-            RoomParticipantKind::Human,
-            RoomMessageKind::Message,
-            "durable",
-            now(),
-        )
-        .unwrap();
-        s.add_attachment(
-            &key,
-            "0123456789abcdef0123456789abcdef",
-            "notes.txt",
-            "text/plain",
-            11,
-            &"0".repeat(64),
-            "alice",
-            now(),
-        )
-        .unwrap();
-        s.update_room_read_cursor(&key, "alice", RoomReadCursorUpdateRequest { read_seq: 1 })
-            .unwrap();
-        // One federation dedup-index row, written directly: the point of the
-        // assertion is that the cut clears this table, not how a row got here.
-        s.conn
-            .execute(
-                "INSERT INTO federated_events
-                    (room_id, ledger_event_id, global_sequence, local_seq,
-                     source_id, source_sequence, client_event_id)
-                 VALUES (?1, 'ledger-1', '1', 1, 'src', '1', 'client-1')",
-                params![key.as_str()],
-            )
-            .unwrap();
-
-        // An OPEN room is refused with nothing written.
-        assert!(matches!(
-            s.cut_closed_room(&key),
-            Err(RoomStoreError::RoomNotClosed(_))
-        ));
-        assert!(!s.get(&key).unwrap().unwrap().transcript.is_empty());
-
-        s.close_with_marker(&key, RoomCloser::Member("alice"), now())
-            .unwrap();
-        let cut = s.cut_closed_room(&key).unwrap();
-        assert!(cut.messages_removed >= 4, "join, message, two markers");
-        assert_eq!(cut.attachment_rows_removed, 1);
-        assert_eq!(cut.attachment_bytes_removed, 11);
-        assert_eq!(
-            cut.attachment_ids,
-            vec!["0123456789abcdef0123456789abcdef".to_string()],
-            "the caller is told exactly which blobs to unlink"
-        );
-        assert_eq!(cut.cursors_removed, 1);
-        assert_eq!(cut.federated_index_rows_removed, 1);
-
-        // The room row survives, so the closed read paths still answer.
-        assert!(s.get_including_closed(&key).unwrap().is_some());
-        assert!(s
-            .transcript_page_including_closed(&key, None, None)
-            .unwrap()
-            .messages
-            .is_empty());
-        assert!(s.attachments(&key).unwrap().is_empty());
-        let remaining: i64 = s
-            .conn
-            .query_row(
-                "SELECT COUNT(*) FROM federated_events WHERE room_id = ?1",
-                params![key.as_str()],
-                |r| r.get(0),
-            )
-            .unwrap();
-        assert_eq!(remaining, 0, "a dangling index row would fail ingest");
-
-        // An absent room is still UnknownRoom, not a silent no-op cut.
-        assert!(matches!(
-            s.cut_closed_room(&RoomKey::new("never-existed")),
-            Err(RoomStoreError::UnknownRoom(_))
-        ));
-    }
-
-    /// `rooms_closed_before` never returns an open room, and never a room whose
-    /// `closed_at` cannot be parsed.
-    ///
-    /// Both arms are the same safety property from two directions: eligibility
-    /// is decided by a close time, so no close time — absent or unreadable —
-    /// means not eligible. A store that fell back to lexicographic comparison,
-    /// or that treated an unparseable value as "very old", would cut on a
-    /// timestamp nobody can read.
-    #[test]
-    fn only_a_parseable_past_close_makes_a_room_eligible() {
-        let mut s = store();
-        let base = DateTime::parse_from_rfc3339("2026-09-02T12:00:00Z")
-            .unwrap()
-            .with_timezone(&Utc);
-        for name in ["open", "old", "recent", "corrupt"] {
-            s.create(RoomKey::new(name), name, None, base).unwrap();
-        }
-        s.close_with_marker(
-            &RoomKey::new("old"),
-            RoomCloser::Operator("op"),
-            base - chrono::Duration::days(40),
-        )
-        .unwrap();
-        s.close_with_marker(
-            &RoomKey::new("recent"),
-            RoomCloser::Operator("op"),
-            base - chrono::Duration::days(1),
-        )
-        .unwrap();
-        s.conn
-            .execute(
-                "UPDATE rooms SET closed_at = 'yesterday-ish' WHERE id = 'corrupt'",
-                [],
-            )
-            .unwrap();
-
-        let eligible = s
-            .rooms_closed_before(base - chrono::Duration::days(30))
-            .unwrap();
-        assert_eq!(
-            eligible,
-            vec![RoomKey::new("old")],
-            "only the room closed before the cutoff, with a readable close time"
         );
     }
 }
