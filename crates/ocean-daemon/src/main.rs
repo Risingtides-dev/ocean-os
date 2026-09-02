@@ -25962,6 +25962,73 @@ mod tests {
         assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
         assert_eq!(unavailable["error"], "workspace_unavailable");
 
+        // OCEAN-260: that refusal is the whole reason PATCH grew
+        // `workspace_root`. The room above was created unbound, so every agent
+        // turn in it fails closed forever; before the field existed the only
+        // repair was a new room and a lost transcript. Bind it in place and the
+        // SAME invocation is admitted — this is the pair that proves the field
+        // is load-bearing rather than merely stored.
+        let bound_workspace = tmp.path().join("room-workspace");
+        std::fs::create_dir(&bound_workspace).unwrap();
+        let canonical_workspace = std::fs::canonicalize(&bound_workspace)
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
+        let (status, bound) = operator_room_http_request(
+            app.clone(),
+            axum::http::Method::PATCH,
+            "/v1/rooms/persistent/bootstrap-route",
+            Some(json!({ "workspace_root": canonical_workspace })),
+            &[],
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(bound["room"]["workspace_root"], canonical_workspace);
+
+        let (status, admitted) = operator_room_http_request(
+            app.clone(),
+            axum::http::Method::POST,
+            "/v1/rooms/persistent/bootstrap-route/agents/builder/invoke",
+            Some(json!({
+                "invoked_by": "human-1",
+                "message_seq": invocation.seq,
+            })),
+            &[],
+        )
+        .await;
+        assert_ne!(
+            admitted.get("error").and_then(|e| e.as_str()),
+            Some("workspace_unavailable"),
+            "a bound room must not still refuse its own agents: {admitted}"
+        );
+        assert_eq!(status, StatusCode::ACCEPTED, "{admitted}");
+
+        // And unbinding puts the room back where it was, so the binding really
+        // is what gates execution rather than some one-way latch the first
+        // successful turn flipped.
+        let (status, _) = operator_room_http_request(
+            app.clone(),
+            axum::http::Method::PATCH,
+            "/v1/rooms/persistent/bootstrap-route",
+            Some(json!({ "workspace_root": serde_json::Value::Null })),
+            &[],
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let (status, unavailable_again) = operator_room_http_request(
+            app.clone(),
+            axum::http::Method::POST,
+            "/v1/rooms/persistent/bootstrap-route/agents/builder/invoke",
+            Some(json!({
+                "invoked_by": "human-1",
+                "message_seq": invocation.seq,
+            })),
+            &[],
+        )
+        .await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(unavailable_again["error"], "workspace_unavailable");
+
         let federated = RoomKey::new("bootstrap-federated");
         with_rooms(&state, |store| {
             store.create(federated.clone(), "Federated", None, Utc::now())?;
