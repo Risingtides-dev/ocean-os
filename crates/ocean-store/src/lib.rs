@@ -4407,6 +4407,48 @@ impl SqliteRoomStore {
     }
 }
 
+/// One room's outbox depth plus the identity of its oldest still-unconfirmed
+/// row, as read by [`SqliteRoomStore::room_metrics_projection`].
+///
+/// "Oldest" is the lowest `position`, which is allocation order — the outbox's
+/// own stable ordering, and the same order `pending_outbox` hands rows back in.
+/// Only the row's `client_event_id` travels, never its payload: the daemon uses
+/// it purely as an identity to age, and an outbox payload is a room message.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RoomOutboxDepth {
+    pub room: RoomKey,
+    /// Rows in `OutboxItemState::Pending`.
+    pub pending: u64,
+    /// Rows in `OutboxItemState::Failed`.
+    pub failed: u64,
+    /// `client_event_id` of the lowest-`position` row still in this room's
+    /// outbox, in either state. `None` when the room's outbox is empty.
+    pub oldest_client_event_id: Option<String>,
+}
+
+/// The bounded read-only projection behind the daemon's room-metrics sample
+/// (Ocean Rooms definition-of-done §4.1).
+///
+/// This exists because the obvious enumeration is far too expensive to sit
+/// behind a scrape: `RoomStore::list` delegates to `list_page`, which calls
+/// `load_record` per room, and `load_record` loads the roster AND the oldest
+/// `MAX_TRANSCRIPT_LIMIT` transcript rows. Sampling a hundred rooms that way
+/// decodes up to a hundred thousand messages to count five access states. Two
+/// aggregate queries answer the same question without touching a transcript.
+///
+/// Both queries are over OPEN rooms only (`closed_at IS NULL`), matching what
+/// `list_page` considers a room; a closed room is not a live access state and
+/// its outbox is not a backlog anyone is draining.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RoomMetricsProjection {
+    /// One entry per open room. A room with no `room_access` row projects
+    /// `RoomAccessState::Local`, exactly as [`SqliteRoomStore::room_access`]
+    /// does for the same absence.
+    pub access_states: Vec<(RoomKey, RoomAccessState)>,
+    /// One entry per open room that currently has at least one outbox row.
+    pub outbox: Vec<RoomOutboxDepth>,
+}
+
 // ── S2-P1 federation: inherent APIs (not on RoomStore trait) ───────────────
 
 impl SqliteRoomStore {
@@ -5079,6 +5121,78 @@ impl SqliteRoomStore {
                 local_human_member_id,
             })
             .collect())
+    }
+
+    /// Read the bounded room-metrics projection (definition-of-done §4.1) —
+    /// per-room access state plus outbox depth — in two aggregate queries.
+    ///
+    /// Read-only and transcript-free by construction; see
+    /// [`RoomMetricsProjection`] for why the existing `list`/`list_page` path
+    /// cannot serve a scrape. Both halves are keyed on OPEN rooms.
+    ///
+    /// The access half LEFT JOINs `room_access` so a room with no access row
+    /// projects `Local`, the same answer [`Self::room_access`] gives for that
+    /// absence — the projection and the per-room read can never disagree about
+    /// what "no row" means.
+    ///
+    /// The outbox half aggregates `pending`/`failed` counts and, in the same
+    /// pass, picks the lowest-`position` row's `client_event_id` per room via
+    /// `MIN(position)`. `position` is a real INTEGER column, so `MIN()` here is
+    /// numeric order and not the lexicographic hazard this crate bans for its
+    /// canonical-decimal u64 TEXT columns.
+    pub fn room_metrics_projection(&self) -> Result<RoomMetricsProjection> {
+        let mut access_stmt = self.conn.prepare(
+            "SELECT r.id, a.state
+             FROM rooms r
+             LEFT JOIN room_access a ON a.room_id = r.id
+             WHERE r.closed_at IS NULL
+             ORDER BY r.id",
+        )?;
+        let access_rows = access_stmt
+            .query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?))
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        let mut access_states = Vec::with_capacity(access_rows.len());
+        for (id, state_str) in access_rows {
+            // No access row ⇒ exact `Local`, matching `room_access`.
+            let state = match state_str {
+                Some(text) => serde_json::from_value(serde_json::Value::String(text))
+                    .map_err(|e| RoomStoreError::Encode(format!("bad access state: {e}")))?,
+                None => RoomAccessState::Local,
+            };
+            access_states.push((RoomKey::new(id), state));
+        }
+
+        let mut outbox_stmt = self.conn.prepare(
+            "SELECT o.room_id,
+                    SUM(CASE WHEN o.state = 'pending' THEN 1 ELSE 0 END),
+                    SUM(CASE WHEN o.state = 'failed' THEN 1 ELSE 0 END),
+                    (SELECT head.client_event_id
+                       FROM outbox head
+                      WHERE head.room_id = o.room_id
+                      ORDER BY head.position
+                      LIMIT 1)
+             FROM outbox o
+             JOIN rooms r ON r.id = o.room_id AND r.closed_at IS NULL
+             GROUP BY o.room_id
+             ORDER BY o.room_id",
+        )?;
+        let outbox = outbox_stmt
+            .query_map([], |row| {
+                Ok(RoomOutboxDepth {
+                    room: RoomKey::new(row.get::<_, String>(0)?),
+                    pending: row.get::<_, i64>(1)?.max(0) as u64,
+                    failed: row.get::<_, i64>(2)?.max(0) as u64,
+                    oldest_client_event_id: row.get::<_, Option<String>>(3)?,
+                })
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+
+        Ok(RoomMetricsProjection {
+            access_states,
+            outbox,
+        })
     }
 
     /// Atomic get-or-insert of one pre-room redemption triple, keyed by
@@ -14751,5 +14865,90 @@ mod tests {
             None,
         );
         assert_eq!(rejection(err), ThreadParentRejection::NotTopLevel);
+    }
+
+    /// The room-metrics projection (§4.1) reports one access state per OPEN
+    /// room — `Local` for a room with no access row, exactly as `room_access`
+    /// answers that same absence — plus outbox depth by state and the identity
+    /// of the lowest-`position` row, and it excludes closed rooms from both
+    /// halves.
+    #[test]
+    fn room_metrics_projection_reports_access_state_and_outbox_head() {
+        let mut s = SqliteRoomStore::open_in_memory().unwrap();
+        let now = Utc::now();
+        let unfederated = RoomKey::new("plain");
+        let federated = RoomKey::new("federated");
+        let closed = RoomKey::new("gone");
+        for key in [&unfederated, &federated, &closed] {
+            s.create(key.clone(), "Room", None, now).unwrap();
+        }
+
+        s.replace_room_access(
+            &federated,
+            &RoomAccessProjection {
+                state: RoomAccessState::Recovering,
+                last_confirmed_global_sequence: None,
+                members: vec![],
+                self_member_id: None,
+                outbox: vec![],
+            },
+        )
+        .unwrap();
+
+        // Three outbox rows in allocation order; the first is the head.
+        for id in ["ev-1", "ev-2", "ev-3"] {
+            s.allocate_outbox_pending(
+                &federated,
+                "alice",
+                id,
+                "message",
+                serde_json::json!({"body": "hi"}),
+                vec![],
+            )
+            .unwrap();
+        }
+        assert!(s.fail_outbox_pending(&federated, "ev-3").unwrap());
+
+        // A closed room's outbox must not read as a live backlog.
+        s.allocate_outbox_pending(
+            &closed,
+            "alice",
+            "ev-closed",
+            "message",
+            serde_json::json!({"body": "hi"}),
+            vec![],
+        )
+        .unwrap();
+        s.close(&closed).unwrap();
+
+        let projection = s.room_metrics_projection().unwrap();
+        assert_eq!(
+            projection.access_states,
+            vec![
+                (federated.clone(), RoomAccessState::Recovering),
+                // No access row at all ⇒ Local, matching `room_access`.
+                (unfederated.clone(), RoomAccessState::Local),
+            ],
+            "a closed room is not a live access state"
+        );
+        assert_eq!(
+            s.room_access(&unfederated).unwrap().state,
+            RoomAccessState::Local
+        );
+
+        assert_eq!(
+            projection.outbox.len(),
+            1,
+            "only the open room has a backlog"
+        );
+        let depth = &projection.outbox[0];
+        assert_eq!(depth.room, federated);
+        assert_eq!(depth.pending, 2);
+        assert_eq!(depth.failed, 1);
+        assert_eq!(
+            depth.oldest_client_event_id.as_deref(),
+            Some("ev-1"),
+            "the head is the lowest `position`, which is allocation order"
+        );
     }
 }
