@@ -154,9 +154,10 @@ outbox, and the restart-safe federation core (S2 P2-A). One database file
   sentinel; the cursors are named `next_seq` and `prev_seq` respectively so a
   backward cursor cannot be replayed as an `after_seq`. The `u64 -> i64` cursor
   guard is checked in both and lands opposite ways: forward, a cursor above
-  `i64::MAX` is a terminal empty page, and backward it saturates to `i64::MAX`
-  and is the newest page, because "before a number past the end" includes every
-  row. `before_seq = 0` is empty — the first message's seq is 0. BOTH directions'
+  `i64::MAX` is a terminal empty page, and backward it selects the unbounded SQL
+  arm with no strict upper predicate, because "before a number past the end"
+  includes every row, including a valid row at SQLite's `i64::MAX`.
+  `before_seq = 0` is empty — the first message's seq is 0. BOTH directions'
   soft-closed answers are the STORE's, through `transcript_page_including_closed`
   and `transcript_tail_page_including_closed` — each a `room_exists()` guard plus
   the private loader, gated on existence rather than openness, so an absent room
@@ -207,9 +208,11 @@ outbox, and the restart-safe federation core (S2 P2-A). One database file
   `ocean-core` because the dependency runs daemon -> store and neither crate
   can call the other; the bound is this crate's policy. Read the derivation
   there before widening what these lines drop, and do not re-inline a filter
-  here — a second copy is exactly the drift the hoist removed. The same rule,
-  same bound, now also guards `ocean_agent::rooms::RoomRegistry`, the dormant
-  in-memory twin of this store.
+  here — a second copy is exactly the drift the hoist removed. A nonblank input
+  filtered entirely away is emitted as the fixed `[filtered]` placeholder, so
+  a durable marker never claims the blank title/name state the record rejects.
+  The same shared rule and bound also guard `ocean_agent::rooms::RoomRegistry`,
+  the dormant in-memory twin of this store.
 - **The `room.agent.*` audit rows are records, not prose, and are NOT
   filtered.** They are `RoomMessageKind::System` bodies like the markers
   above, so the rule preceding this one would read as covering them; it

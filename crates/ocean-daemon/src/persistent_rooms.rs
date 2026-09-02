@@ -439,7 +439,7 @@ fn room_history_row(message: RoomMessage) -> ocean_agent::RoomHistoryRow {
         seq: message.seq,
         author_id: message.author_id,
         author_kind,
-        text: room_history_text(message.body),
+        text: room_history_text(message.body, message.author_kind, message.kind),
     }
 }
 
@@ -453,7 +453,14 @@ fn room_history_row(message: RoomMessage) -> ocean_agent::RoomHistoryRow {
 /// purpose, and every renderer of a room body in this crate is a caller —
 /// `room_history_row`, `projected_room_message`, `summary_user_prompt`, and
 /// `build_room_prompt`. Four renderers must not become four rules.
-pub(super) fn room_history_text(body: String) -> String {
+pub(super) fn room_history_text(
+    body: String,
+    author_kind: RoomParticipantKind,
+    message_kind: RoomMessageKind,
+) -> String {
+    if author_kind != RoomParticipantKind::System || message_kind != RoomMessageKind::System {
+        return body;
+    }
     let audit_type = serde_json::from_str::<serde_json::Value>(&body)
         .ok()
         .and_then(|value| {
@@ -505,7 +512,7 @@ pub(super) fn room_history_text(body: String) -> String {
 /// of those paths with no test going red. Named in
 /// `crates/ocean-store/AGENTS.md`.
 fn projected_room_message(mut message: RoomMessage) -> RoomMessage {
-    message.body = room_history_text(message.body);
+    message.body = room_history_text(message.body, message.author_kind, message.kind);
     message
 }
 
@@ -843,25 +850,25 @@ fn trigger_unwired_response(
 }
 
 /// Refuse a submitted policy that enables a trigger the daemon never fires.
-/// Mention, build-failure, and CI-failure events come from real code paths —
-/// mention from a local post and a federated inbound alike, the two failure
-/// flags from the federation ingest rail alone; nothing emits a schedule tick
-/// or a component event, so storing those values would accept configuration
-/// that silently never acts. Refuse the VALUE, not the field's presence:
+/// Mention and build-failure come from real code paths — mention from a local
+/// post and a federated inbound alike, build failure from the federation ingest
+/// rail. CI rows are markers only until extension-owned dispatch exists, and
+/// nothing emits a schedule tick or a component event, so storing any of those
+/// three values would accept configuration that silently never acts. Refuse the
+/// VALUE, not the field's presence:
 /// clients serialize `"on_component_event": false` into every policy body
 /// (bools have no skip-if-default on the wire), so presence-refusal would 400
 /// every room write that sets any trigger.
 ///
-/// Neither thread-reply nor the two failure flags is refused here, for
-/// opposite reasons. A room is created `Local` and only ever federates later,
-/// so enabling a failure flag in a Local room is anticipatory, not inert.
-/// Thread-reply runs the asymmetry the other way — live in `Local`, dead the
-/// moment a room leaves it — so it is gated on the room's access state by
+/// Thread-reply is not refused here. It is live in `Local` and dead the moment
+/// a room leaves it, so it is gated on the room's access state by
 /// [`dead_thread_reply_transition`] rather than on its value alone.
 fn unwired_trigger_response(
     policy: &RoomTriggerPolicy,
 ) -> Option<(StatusCode, Json<serde_json::Value>)> {
-    let field = if policy.on_component_event {
+    let field = if policy.on_ci_failure {
+        "on_ci_failure"
+    } else if policy.on_component_event {
         "on_component_event"
     } else if policy.on_schedule.is_some() {
         "on_schedule"
@@ -870,7 +877,7 @@ fn unwired_trigger_response(
     };
     Some(trigger_unwired_response(
         field,
-        format!("{field} has no runtime yet: the daemon never fires this trigger, so the value would be stored and never act"),
+        format!("{field} has no runtime yet: core never dispatches this trigger, so the value would be stored and never act"),
     ))
 }
 
@@ -2922,7 +2929,7 @@ were mentioned.\n\n",
             "[#{seq}] {author}: {body}{marker}\n",
             seq = m.seq,
             author = m.author_id,
-            body = room_history_text(m.body.clone()),
+            body = room_history_text(m.body.clone(), m.author_kind, m.kind),
             marker = marker,
         ));
     }
@@ -4504,6 +4511,27 @@ mod tests {
     }
 
     #[test]
+    fn human_json_that_resembles_an_audit_is_preserved() {
+        let body = r#"{"type":"room.agent.bootstrap","question":"@builder review this"}"#;
+        assert_eq!(
+            room_history_text(
+                body.to_string(),
+                RoomParticipantKind::Human,
+                RoomMessageKind::Message,
+            ),
+            body
+        );
+        assert_eq!(
+            room_history_text(
+                body.to_string(),
+                RoomParticipantKind::System,
+                RoomMessageKind::System,
+            ),
+            "[room agent bootstrap audit]"
+        );
+    }
+
+    #[test]
     fn room_history_redacts_structured_audit_without_breaking_backward_cursor() {
         let mut store = ocean_store::SqliteRoomStore::open_in_memory().unwrap();
         let room = RoomKey::new("history-redaction");
@@ -5354,7 +5382,7 @@ mod tests {
             State(state.clone()),
             Path(key.as_str().to_string()),
             Bytes::from_static(
-                br#"{"trigger_policy":{"on_mention":true,"on_build_failure":true,"on_ci_failure":true}}"#,
+                br#"{"trigger_policy":{"on_mention":true,"on_build_failure":true,"on_ci_failure":false}}"#,
             ),
         )
         .await;
@@ -5367,7 +5395,7 @@ mod tests {
         );
         assert_eq!(
             body.0["room"]["trigger_policy"]["on_ci_failure"],
-            json!(true)
+            json!(false)
         );
 
         let (status, body) = room_update(
@@ -5382,11 +5410,10 @@ mod tests {
             body.0["room"]["trigger_policy"]["on_build_failure"],
             json!(true)
         );
-        // Read back through the store's hand-rolled policy codec: a flag that
-        // codec drops would read false here while the write response lied.
+        // Read back through the store after an unrelated room-name update.
         assert_eq!(
             body.0["room"]["trigger_policy"]["on_ci_failure"],
-            json!(true)
+            json!(false)
         );
 
         let (status, body) = room_update(
@@ -5441,9 +5468,10 @@ mod tests {
         assert_eq!(body.0, json!({"ok": false, "error": "invalid_request"}));
     }
 
-    /// The two triggers nothing fires — a cron in `on_schedule`, a `true`
-    /// `on_component_event` — are refused at create with a typed 400 naming
-    /// the field, instead of stored as configuration that silently never
+    /// The three triggers core does not fire — a cron in `on_schedule`, a
+    /// `true` `on_component_event`, or a `true` `on_ci_failure` — are refused
+    /// at create with a typed 400 naming the field, instead of stored as
+    /// configuration that silently never
     /// acts. Refusal is by VALUE: clients serialize every bool into the
     /// policy body, so explicit-`false` dead fields must keep passing.
     #[tokio::test]
@@ -5482,7 +5510,16 @@ mod tests {
         assert_eq!(body.0["code"], json!("trigger_unwired"));
         assert_eq!(body.0["field"], json!("on_component_event"));
 
-        // Neither refusal wrote anything.
+        let (status, body) = room_create(
+            State(state.clone()),
+            Json(req(json!({"on_ci_failure": true}))),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(body.0["code"], json!("trigger_unwired"));
+        assert_eq!(body.0["field"], json!("on_ci_failure"));
+
+        // No refusal wrote anything.
         let stored =
             with_rooms(&state, |store| store.get(&RoomKey::new("unwired-create"))).unwrap();
         assert!(stored.is_none());
@@ -5496,17 +5533,15 @@ mod tests {
                 "on_thread_reply": true,
                 "on_component_event": false,
                 "on_build_failure": true,
-                "on_ci_failure": true,
+                "on_ci_failure": false,
             }))),
         )
         .await;
         assert_eq!(status, StatusCode::CREATED);
         assert_eq!(body.0["room"]["trigger_policy"]["on_mention"], json!(true));
-        // Wired, so it is stored rather than refused — the create route must
-        // not grow a refusal for a flag the daemon actually fires.
         assert_eq!(
             body.0["room"]["trigger_policy"]["on_ci_failure"],
-            json!(true)
+            json!(false)
         );
     }
 
@@ -5620,7 +5655,16 @@ mod tests {
         assert_eq!(status, StatusCode::BAD_REQUEST);
         assert_eq!(body.0["field"], json!("on_component_event"));
 
-        // Both refusals wrote nothing: the policy is still what create stored.
+        let (status, body) = room_update(
+            State(state.clone()),
+            Path(key.as_str().to_string()),
+            Bytes::from_static(br#"{"trigger_policy":{"on_ci_failure":true}}"#),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(body.0["field"], json!("on_ci_failure"));
+
+        // All refusals wrote nothing: the policy is still what create stored.
         let stored = with_rooms(&state, |store| store.get(&key))
             .unwrap()
             .expect("room exists");

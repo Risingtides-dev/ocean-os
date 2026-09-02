@@ -4607,6 +4607,7 @@ ________________________________________________________________________________
 ## 2026-07-19 — knowledge-separation extraction (wave 1)
 
 Double landing. TASK-56 48bd92f9 (daemon-core raw #1): TurnTerminalGuard RAII mirrors InFlightGuard — a panic in the prompt await now drives the SAME update_request_finished terminal transition (no second state machine) and emits TurnFinished{Failed}; its return value gates emission so cancels keep their frame and normal turns emit exactly once; Drop hands async work to Handle::try_current detached spawn. 3 new tests through real registry+bus; 522 daemon tests green. TASK-54 9498905f: every injected prompt layer now anchored at generation — folder-agent gets [folder-agent instructions]…[end folder-agent instructions] sentinels via one shared compose helper (both daemon sites + rooms), browser context loses its internal blank line and strips on an exact two-line prefix; strip_injected_turn_prep peels all 5 layers order-tolerantly; 6 strip tests + 2 cross-crate anchor guards; agent 199 / daemon 524 green. Completes TASK-50's display-strip. KNOWN FLAKE (ticket-worthy): github::tests intermittently red under full-parallel cargo test (subprocess/tempdir races, different test each run, 19/19 in isolation on clean main) — bit one TASK-54 gate run, clean on rerun. Daemon rebuild + announced bounce for 54/56/57 follows.
+_________________________________________________________________________________ 22:05 [detached
 time:      [18:17] [19-07-26]
 agent:     [pi] [gpt-5.6] [thoth]
 worktree:  [feat/tui-compact-activation]
@@ -4638,7 +4639,7 @@ ________________________________________________________________________________
 time:      [15:23] [19-07-26]
 agent:     [pi] [gpt-5.6]
 worktree:  [feat/compact-session-sync]
-type:      [issues]
+type:      [review]
 area:      [review]
 
 Closed every blocker from three adversarial review rounds. Session sync now projects directly from persisted messages with no SessionDetail/raw/tool/image copy, filters projectable rows before the 512-row cap, enforces the 1 MiB visible-text budget, and signals truncation. Every later session mutation publishes a scoped lifecycle/invalidation under the shared lease; legacy no-session requests pin ids before admission, and durable room triggers wait rather than drop. Replay gaps retain first-party event:error compatibility, reject empty/non-UTF8/foreign/unknown/evicted anchors, and expose only session-filtered diagnostic bounds. Compact acquires the busy lease before any existence read. Final independent release review approved with no blocker/high findings.
@@ -4799,6 +4800,7 @@ area:      [writing]
 Corrected the Observatory authentication contract after closing stale pad TASK-9: the read-only routes already consumed ObservatoryAuth in baf26468, so no route implementation was repeated. Gate 1 now states the implemented stateless-bearer truth — nonces make issuances unique but do not prevent replay within scope/lifetime — and assigns optional Authorization-Observer cookie issuance plus Secure/HttpOnly/SameSite/Path attributes to the authenticated Ocean Surface proxy. The daemon remains header/cookie input only, emits no Set-Cookie, exposes no issuance route, and never distributes its signing secret.
 _________________________________________________________________________________
 Moved internal operating material out of this public repo into the now-private `ocean-agents` repository: `docs/orchestrator/` (factory goal/loop/migration, team_takeover notes, workflows/) → `ocean-agents/docs/orchestrator/`; `skills/` (ocean-os-software-factory, ocean-coworker-onboarding) → `ocean-agents/internal/ocean-os/skills/` with live copies installed at `~/.config/ocean-rs/skills/` so Longhouse advisory discovery keeps working. Updated `docs/README.md` index and the two path references plus the Stage E prose in `docs/specs/2026-07-18-ocean-crew-orchestration-and-durable-workflow-manifest.md`. Workflow discovery (`{cwd}/docs/orchestrator/workflows/`) is fail-open, so ocean-os-cwd turns simply see no factory workflows now. `cargo xtask docs-check` PASS (155 active files, 141 links). Also generated `docs/phase0-inventory.json` (1,296-file classification manifest across the four repos). worktree: main
+_________________________________________________________________________________ 22:53 [pi/observatory-auth-docs-20260719]
 time:      [00:15] [20-07-26]
 agent:     [claude] [fable 5]
 worktree:  fix/task17-18-k3-bound-visibility
@@ -5457,6 +5459,7 @@ this ratification.
 _________________________________________________________________________________
 
 ---
+_________________________________________________________________________________ 21:48 [docs/extensions-stage-a-implementation-manifest]
 
 time:      [22:11] [27-07-26]
 agent:     [api], [gpt-5.4], [worker]
@@ -5509,7 +5512,7 @@ ________________________________________________________________________________
 time:      [23:05] [27-07-26]
 agent:     [pi] [gpt-5.4] [thoth]
 worktree:  [feat/extensions-stage-a1]
-type:      [review]
+type:      [issues]
 area:      [testing]
 
 Accepted Stage A1 after three independent review rounds and corrective deltas.
@@ -9549,3 +9552,76 @@ RUSTSEC-2026-0274 (`rtrb` double-free) and yanked `spin`, unchanged and
 pre-existing: the branch touches no `Cargo.toml`, `Cargo.lock` or `deny.toml` at
 all, and every line this pass changed is a comment. No deploy, no migration.
 _________________________________________________________________________________ 12:16 loop/os-transcript-page-including-closed
+
+time:  [20:54] [01-09-26]
+agent: [codex] [gpt-5]
+worktree: [codex/review-sweep-20260901]
+type:  [issues]: Codex review follow-up sweep
+area:  [backend]: Room store and daemon contract corrections
+
+Addressed the recent Codex review findings still present on current main:
+strict ledger separator parsing and repaired fused historical seams, nonblank
+marker fallbacks, inclusive maximum transcript cursors, raw control-character
+identity rejection, human JSON transcript preservation, marker-only ci_checked
+handling, and removal of unreachable workspace-port proxy routes and their stale
+tests. Updated the owning daemon/store devlogs and operator guide.
+
+Ocean Store passed 215 tests, Ocean Daemon passed 874 tests with none ignored,
+the ledger guard passed 15 tests and confirmed all 555 entries closed, and
+formatting passed. No deployment, migration, daemon restart, or live room action
+occurred.
+_________________________________________________________________________________ 20:54 codex/review-sweep-20260901
+
+time:      [21:13] [01-09-26]
+agent:     [codex] [gpt-5]
+worktree:  codex/review-sweep-20260901
+type:      [bug report]
+area:      [review]
+
+Addressed the final Codex findings on PR #442. The separator grammar now accepts
+the same valid one-digit hour that entryIdentity can extract while rejecting
+invalid 24-hour clocks before they can become invalid repair suffixes. Regression
+tests prove both valid and malformed repairs are recognized as closed on rerun.
+Restored the historical Stage A1 event type instead of rewriting append-only
+history, and corrected this branch's event date to the ledger's DD-MM-YY schema.
+No deployment, daemon restart, migration, or production state changed.
+_________________________________________________________________________________ 21:13 codex/review-sweep-20260901
+
+time:      [22:20] [01-09-26]
+agent:     [codex] [gpt-5]
+worktree:  codex/review-sweep-20260901
+type:      [bug report]
+area:      [review]
+
+Closed the current-head Codex finding on the workspace proxy. The module now
+states that port publication is absent pending an accepted manifest, and the
+unused caller-body path-segment field, port validator, fake routes, and stale
+test prose are removed. The no-port allowlist tripwire remains authoritative.
+No deployment, daemon restart, migration, room, or production state changed.
+_________________________________________________________________________________ 22:20 codex/review-sweep-20260901
+
+time:      [22:23] [01-09-26]
+agent:     [codex] [gpt-5]
+worktree:  codex/review-sweep-20260901
+type:      [bug report]
+area:      [testing]
+
+Closed the GitHub repository-gate failure on both platforms. Removed the dead
+CI-convening helper and stale comments/tests left after the accepted marker-only
+CI contract; the shared red-conclusion predicate remains the marker label and
+chase-link authority. No deployment, daemon restart, migration, room, or
+production state changed.
+_________________________________________________________________________________ 22:23 codex/review-sweep-20260901
+
+time:      [22:31] [01-09-26]
+agent:     [codex] [gpt-5]
+worktree:  codex/review-sweep-20260901
+type:      [bug report]
+area:      [review]
+
+Closed the current-head unwired-CI-policy finding. Room create and update now
+return the typed trigger_unwired refusal when on_ci_failure is enabled; legacy
+stored values remain readable, but ci_checked stays a marker and cannot dispatch
+from core. Added route regressions and aligned the daemon contracts. No daemon,
+room, migration, deployment, or production state changed.
+_________________________________________________________________________________ 22:31 codex/review-sweep-20260901

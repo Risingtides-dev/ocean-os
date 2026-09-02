@@ -73,31 +73,54 @@ test('a fold leaves the first entry open and names where the next one starts', (
 // All 697 rules this ledger carried before the convention are bare, and it is
 // append-only, so the bare form has to keep closing an entry for as long as the
 // file exists.
-test('both rule forms close an entry, and a rule may carry anything after the bar', () => {
+test('both exact rule forms close an entry', () => {
   const bare = [...entry('10:00', 'First.'), RULE, ''];
   const identity = [...entry('11:00', 'Second.'), `${RULE} 11:00 loop/slice-b`, ''];
   assert.equal(openEntries([...bare, ...identity].join('\n')).length, 0);
 });
 
-test('an entry closed anywhere in its body counts as closed', () => {
-  // 145 entries in this ledger quote a second rule inside their prose, so the
-  // check is "a rule before the next header", never "a rule on the last line".
-  // The first entry's rule is followed by more prose, so a last-line reading
-  // would call it open — which is what makes this fixture discriminate.
+test('an embedded separator does not close an entry', () => {
+  // A separator-shaped quotation in the prose must not conceal a later fold.
+  // Only the final nonblank line before the next entry closes the entry.
   const quoted = [...entry('10:00', 'First.'), RULE, 'Quoting the rule above, not closing on it.', ''];
   const ledger = [...quoted, ...entry('11:00', 'Second.'), RULE].join('\n');
-  assert.equal(openEntries(ledger).length, 0);
+  const open = openEntries(ledger);
+  assert.equal(open.length, 1);
+  assert.equal(open[0].line, 1);
   assert.notEqual(quoted.filter((line) => line.trim()).pop(), RULE, 'the fixture must not end on a rule');
+});
+
+test('prose after the bar is not an identity separator', () => {
+  const ledger = [...entry('10:00', 'First.'), `${RULE} arbitrary prose`, ''].join('\n');
+  assert.equal(openEntries(ledger).length, 1);
 });
 
 test('entryIdentity reads the minute and the worktree off the entry itself', () => {
   assert.equal(entryIdentity(entry('09:04', 'On a branch.', 'loop/slice-a')), '09:04 loop/slice-a');
+  assert.equal(entryIdentity(entry('9:04', 'A historical one-digit hour.', 'loop/slice-a')), '9:04 loop/slice-a');
   assert.equal(entryIdentity(entry('09:04', 'On the main checkout.', null)), '09:04', 'no branch to name');
   assert.equal(
     entryIdentity(['time:      no clock here', 'worktree:', '', 'Neither field carries a value.']),
     '',
     'an entry naming neither a time nor a branch has no identity to write',
   );
+});
+
+test('a repaired one-digit-hour entry is recognized as closed on the rerun', () => {
+  const open = entry('9:04', 'This entry lost its separator.', 'loop/slice-a').join('\n');
+  const repaired = closeEntries(open).text;
+  assert.match(repaired, /^_{5,} 9:04 loop\/slice-a$/m);
+  assert.equal(openEntries(repaired).length, 0);
+});
+
+test('an invalid header clock never becomes an invalid identity separator', () => {
+  for (const invalid of ['24:00', '99:99', '09:60']) {
+    const open = entry(invalid, 'This malformed entry lost its separator.', 'loop/slice-a').join('\n');
+    assert.equal(entryIdentity(open.split('\n')), '', `${invalid} is not a 24-hour clock`);
+    const repaired = closeEntries(open).text;
+    assert.match(repaired, /^_{5,}$/m, 'the repair falls back to the valid bare form');
+    assert.equal(openEntries(repaired).length, 0, 'the repaired entry is closed on the next run');
+  }
 });
 
 test('closeEntries repairs the fold without deleting a line, and the rerun is clean', () => {
@@ -190,8 +213,8 @@ test('the fenced schema template parses as an entry, and a rule closes it', () =
   const repaired = closeEntries(withHeader).text.split('\n');
   assert.equal(
     repaired[11],
-    `${RULE} [branch/ref]`,
-    'the rule lands after the --- that already divides header from log, and carries no minute because `[HH:MM]` is not a clock',
+    RULE,
+    'the rule lands after the --- that already divides header from log, and stays bare because `[HH:MM]` is not a clock',
   );
   assert.equal(openEntries(repaired.join('\n')).length, 0);
 });
