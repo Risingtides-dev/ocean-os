@@ -158,6 +158,10 @@ mod room_attachments;
 mod room_context;
 /// Restart-safe outbound Bedrock room client and per-room supervisor (S2 P2-B).
 mod room_federation;
+/// Transcript retention and attachment orphan GC: the two sweeps that keep
+/// `rooms.db` and the blob tree from growing without bound, the loop that runs
+/// them, and the report an operator reads on `GET /health`.
+mod room_maintenance;
 /// Fail-closed local operator principal for room-agent authorization mutations.
 /// Phase 1 lands and validates this authority before a later accepted slice
 /// wires mutation routes, so the production module is deliberately inert here.
@@ -322,6 +326,14 @@ struct AppState {
     /// helper hands in its own tempdir, so parallel tests never build a daemon
     /// pointing at another test's directory.
     room_attachments_root: Arc<std::path::PathBuf>,
+    /// Retention window, orphan grace, and sweep interval for the room
+    /// maintenance loop. Resolved ONCE at startup — `OCEAN_ROOM_RETENTION_DAYS`
+    /// is read there and never again, so the window a sweep applies is always
+    /// the one `/health` reports.
+    room_maintenance_config: room_maintenance::MaintenanceConfig,
+    /// The `room_maintenance` card `GET /health` serves: what the last sweep
+    /// cut, reclaimed, and failed at, plus the configuration it ran under.
+    room_maintenance: room_maintenance::MaintenanceHandle,
     /// Bounded room-scoped wake hints for persistent transcript SSE tails. The
     /// payload is only `(room, seq)`; SQLite remains authoritative for replay,
     /// live delivery, lag recovery, ordering, and deduplication.
@@ -1024,6 +1036,21 @@ async fn main() -> anyhow::Result<()> {
     // existing DB. The daemon also mints its single Revoker here. Its capability
     // key never enters the wire and authenticates daemon execution to the title
     // engine; caller admission to control routes is a separate trust boundary.
+    // Room maintenance policy, resolved ONCE here: `OCEAN_ROOM_RETENTION_DAYS`
+    // is read at this line and never again, so the window a sweep applies is
+    // always the one `/health` reports and a running loop cannot have its
+    // retention changed out from under it. Unset or `0` keeps every closed room
+    // forever — retention is opt-in because a transcript cut is unrecoverable
+    // and an upgrade must not start deleting history nobody asked it to.
+    let room_maintenance_config = room_maintenance::MaintenanceConfig::from_env();
+    let room_maintenance = room_maintenance::new_handle(&room_maintenance_config);
+    tracing::info!(
+        retention_days = room_maintenance_config.retention_days,
+        interval_secs = room_maintenance_config.interval.as_secs(),
+        orphan_grace_secs = room_maintenance_config.orphan_grace.as_secs(),
+        "room maintenance policy resolved"
+    );
+
     let titles_db_path = titles_db_path();
     if let Some(parent) = titles_db_path.parent() {
         std::fs::create_dir_all(parent)
@@ -1171,6 +1198,8 @@ async fn main() -> anyhow::Result<()> {
         rooms,
         room_operator,
         room_attachments_root: Arc::new(room_attachments_root),
+        room_maintenance_config,
+        room_maintenance,
         room_wakes,
         room_access_wakes,
         room_read_cursor_wakes,
@@ -1261,6 +1290,14 @@ async fn main() -> anyhow::Result<()> {
             }
         });
     }
+
+    // Durable room maintenance: transcript retention plus attachment orphan GC.
+    // A separate loop from the registry GC above and not a second job inside it,
+    // because the two share nothing — that one reaps in-memory registries every
+    // few minutes, this one takes the room-store write lock and walks a blob
+    // tree on a multi-hour interval — and folding them together would put a
+    // filesystem walk on the cadence of a memory sweep.
+    room_maintenance::spawn_maintenance_loop(&state);
 
     // OCEAN-53: the daemon is a local trust boundary; reflecting any origin
     // (`allow_origin(Any)`) let any web page in the operator's browser drive it
@@ -1612,10 +1649,12 @@ fn banner_routes() -> &'static [&'static str] {
         "GET /v1/permissions",
         "POST /v1/permissions/{id}/decision",
         "POST /v1/rooms/{room_id}/livekit-token",
+        "POST /v1/rooms/maintenance/run",
         "GET /v1/rooms/persistent",
         "POST /v1/rooms/persistent",
         "GET /v1/rooms/persistent/{key}",
         "PATCH /v1/rooms/persistent/{key}",
+        "POST /v1/rooms/persistent/{key}/close",
         "POST /v1/rooms/persistent/{key}/participants",
         "DELETE /v1/rooms/persistent/{key}/participants/{participant_id}",
         "POST /v1/rooms/persistent/{key}/messages",
@@ -1727,6 +1766,24 @@ async fn root() -> Json<serde_json::Value> {
 /// provenance are observable without inspecting the process or build dir.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 struct HealthEnvelope {
+    /// What the room maintenance loop last did, and the configuration it did it
+    /// under: sweep interval, retention window in days (`0` = off), orphan
+    /// grace, when the last sweep finished and how long it took, and its counts
+    /// — rooms cut, transcript rows, attachment rows, cursors, federation index
+    /// rows, orphan files and directories, bytes reclaimed — plus its
+    /// `last_error` (`null` when clean).
+    ///
+    /// It carries the CONFIGURATION and not only the counts because the failure
+    /// this card exists to catch is silent by construction: a retention window
+    /// that never got set, or a blob root that moved, both look exactly like a
+    /// healthy daemon with nothing to collect. `rooms_cut: 0` is ambiguous;
+    /// `rooms_cut: 0, retention_days: 0` is an answer.
+    ///
+    /// Additive and beside `rev` rather than inside [`HealthResponse`]: that
+    /// struct is the shared protocol shape, and the maintenance loop is this
+    /// binary's. Pre-field daemons omit the key, and `HealthResponse` carries no
+    /// `deny_unknown_fields`, so existing clients keep parsing.
+    room_maintenance: room_maintenance::RoomMaintenanceReport,
     #[serde(flatten)]
     health: HealthResponse,
     rev: String,
@@ -1764,6 +1821,10 @@ async fn health(State(state): State<AppState>) -> Json<HealthEnvelope> {
             // `0` healthy; a climbing value means GC is failing and memory is leaking.
             gc_failures_total: state.gc_failures.load(std::sync::atomic::Ordering::Relaxed),
         },
+        // Read through the poison-recovering snapshot: a maintenance mutex
+        // poisoned by a panicked sweep must never be what takes `/health` down,
+        // since this card is how that panic becomes visible in the first place.
+        room_maintenance: room_maintenance::report_snapshot(&state.room_maintenance),
         // Build provenance: the commit the running binary was compiled from, set by
         // build.rs (`-dirty` suffix on uncommitted worktrees; `unknown` when git
         // could not be run). Lets an operator confirm the supervised daemon is
@@ -3031,6 +3092,20 @@ fn room_routes() -> Router<AppState> {
         .route(
             "/v1/rooms/persistent/{key}",
             get(room_get).patch(room_update),
+        )
+        // Freeze a room. A static leaf under `{key}` rather than a `DELETE` on
+        // the room itself, because closing is not deleting: every row is
+        // retained and `/snapshot` keeps serving them.
+        .route(
+            "/v1/rooms/persistent/{key}/close",
+            post(persistent_rooms::room_close),
+        )
+        // Store-wide, so it hangs off `/v1/rooms/` rather than under a `{key}`
+        // that would have to be invented for it. Static second segment, so it
+        // cannot be shadowed by `/v1/rooms/{room_id}/livekit-token`.
+        .route(
+            "/v1/rooms/maintenance/run",
+            post(room_maintenance::room_maintenance_run),
         )
         .route("/v1/rooms/persistent/{key}/participants", post(room_join))
         .route(
@@ -14409,6 +14484,12 @@ mod tests {
                 vec!["http://127.0.0.1:8790".into()],
             )),
             room_attachments_root: Arc::new(tmp.path().join("room-attachments")),
+            // Retention OFF, like every test daemon: a fixture that inherited a
+            // live window would cut its own closed rooms mid-assertion.
+            room_maintenance_config: room_maintenance::MaintenanceConfig::default(),
+            room_maintenance: room_maintenance::new_handle(
+                &room_maintenance::MaintenanceConfig::default(),
+            ),
             room_wakes,
             room_access_wakes,
             room_read_cursor_wakes: RoomReadCursorWakeBus::default(),
@@ -16278,6 +16359,12 @@ mod tests {
             // Injected, not read from the environment — same TASK-58 rule as the
             // runtime config dir above, so parallel tests never share a root.
             room_attachments_root: Arc::new(tmp.path().join("room-attachments")),
+            // Retention OFF, like every test daemon: a fixture that inherited a
+            // live window would cut its own closed rooms mid-assertion.
+            room_maintenance_config: room_maintenance::MaintenanceConfig::default(),
+            room_maintenance: room_maintenance::new_handle(
+                &room_maintenance::MaintenanceConfig::default(),
+            ),
             room_wakes,
             room_access_wakes,
             room_read_cursor_wakes: RoomReadCursorWakeBus::default(),
@@ -16733,6 +16820,12 @@ mod tests {
                 vec!["http://127.0.0.1:8790".into()],
             )),
             room_attachments_root: Arc::new(tmp.path().join("room-attachments")),
+            // Retention OFF, like every test daemon: a fixture that inherited a
+            // live window would cut its own closed rooms mid-assertion.
+            room_maintenance_config: room_maintenance::MaintenanceConfig::default(),
+            room_maintenance: room_maintenance::new_handle(
+                &room_maintenance::MaintenanceConfig::default(),
+            ),
             room_wakes,
             room_access_wakes,
             room_read_cursor_wakes: RoomReadCursorWakeBus::default(),
@@ -18840,6 +18933,12 @@ mod tests {
                 vec!["http://127.0.0.1:8790".into()],
             )),
             room_attachments_root: Arc::new(dir.join("room-attachments")),
+            // Retention OFF, like every test daemon: a fixture that inherited a
+            // live window would cut its own closed rooms mid-assertion.
+            room_maintenance_config: room_maintenance::MaintenanceConfig::default(),
+            room_maintenance: room_maintenance::new_handle(
+                &room_maintenance::MaintenanceConfig::default(),
+            ),
             room_wakes,
             room_access_wakes,
             room_read_cursor_wakes: RoomReadCursorWakeBus::default(),
@@ -25695,6 +25794,82 @@ mod tests {
         );
     }
 
+    /// `/health` carries the `room_maintenance` card, and the card carries the
+    /// CONFIGURATION as well as the counts.
+    ///
+    /// The configuration half is what this asserts by name, because it is the
+    /// half that is easy to drop as redundant and is the reason the card is
+    /// readable at all: `rooms_cut: 0` on its own cannot tell an operator
+    /// whether retention swept and found nothing or was never turned on, and
+    /// those two have opposite remedies. `retention_days` beside it makes the
+    /// zero an answer.
+    ///
+    /// It also pins that the field rides BESIDE the flattened `HealthResponse`
+    /// rather than inside it: a client parsing the shared protocol struct must
+    /// still parse this body, which is what makes the field additive.
+    #[tokio::test]
+    async fn health_carries_the_room_maintenance_card() {
+        use http_body_util::BodyExt;
+        use tower::ServiceExt;
+
+        let state = {
+            let _g = yolo_env_guard_async().await;
+            permission_test_state()
+        };
+        // Record a sweep the way the loop's own bookkeeping does, so this test
+        // reads the same path production writes rather than a hand-built struct.
+        room_maintenance::record_sweep_for_test(
+            &state.room_maintenance,
+            room_maintenance::SweepOutcome {
+                rooms_cut: 1,
+                messages_removed: 9,
+                orphan_files_removed: 2,
+                bytes_reclaimed: 2048,
+                ..Default::default()
+            },
+        );
+
+        let app = Router::new()
+            .route("/health", get(health))
+            .with_state(state);
+        let resp = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .method(axum::http::Method::GET)
+                    .uri("/health")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+
+        // The shared protocol struct still parses: the card is additive.
+        let _: ocean_core::HealthResponse =
+            serde_json::from_slice(&bytes).expect("HealthResponse still parses this body");
+
+        let body: Value = serde_json::from_slice(&bytes).expect("health body is JSON");
+        let card = body
+            .get("room_maintenance")
+            .expect("/health must carry a room_maintenance card");
+        assert_eq!(card["rooms_cut"], json!(1));
+        assert_eq!(card["messages_removed"], json!(9));
+        assert_eq!(card["orphan_files_removed"], json!(2));
+        assert_eq!(card["bytes_reclaimed"], json!(2048));
+        assert_eq!(card["runs_total"], json!(1));
+        assert_eq!(card["last_error"], Value::Null);
+        assert!(card["last_run_at"].is_string());
+        // Configuration, without which the counts cannot be read.
+        assert_eq!(
+            card["retention_days"],
+            json!(0),
+            "a test daemon runs with retention off, and the card must say so"
+        );
+        assert!(card["interval_secs"].as_u64().unwrap_or(0) > 0);
+        assert!(card["orphan_grace_secs"].as_u64().unwrap_or(0) > 0);
+    }
+
     // OCEAN-372 — sse_lag_events_total + sse_events_dropped_total (/metrics)
     // ----------------------------------------------------------------------
 
@@ -26787,9 +26962,16 @@ mod tests {
         // 123 -> 124: Local-room agent bootstrap establishes the durable Room
         // owner role and package-derived Agent roster tuple without authorizing
         // execution or consuming a decision.
+        // 124 -> 126: room lifecycle. POST /v1/rooms/persistent/{key}/close is
+        // the first way to end a persistent room from a shipped surface —
+        // `closed_at` and every soft-closed read path already existed, but
+        // production reached them only from `CallEnded`. POST
+        // /v1/rooms/maintenance/run is its operated other half: the on-demand
+        // trigger for the transcript-retention and attachment-orphan sweeps
+        // that keep rooms.db and the blob tree from growing without bound.
         assert_eq!(
             banner.len(),
-            124,
+            126,
             "route baseline changed; review the manifest"
         );
 

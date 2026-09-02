@@ -676,6 +676,14 @@ pub(super) fn room_store_error_response(
         // Same rule as an artifact author: a file attributed to somebody who is
         // not in the room is a lie, not a server fault.
         AttachmentUploaderNotInRoster { .. } => StatusCode::FORBIDDEN,
+        // And the same rule again for the person the close marker names. The
+        // room exists and the act is well formed; the caller is claiming to be
+        // somebody who is not in it.
+        RoomCloserNotInRoster { .. } => StatusCode::FORBIDDEN,
+        // Retention was asked of a live room. Nothing was written, and no
+        // re-read makes it right until somebody closes the room — a conflict
+        // with the room's state, not a malformed request.
+        RoomNotClosed(_) => StatusCode::CONFLICT,
         // Rooms Phase 1. Asking about a binding that was never authorized is a
         // 404, not a 403: the caller is inspecting, and there is nothing there.
         // Admission refusal on an absent binding is a separate path that never
@@ -1180,6 +1188,226 @@ pub(super) async fn room_update(
         ),
         Err(RoomUpdateError::Store(e)) => room_store_error_response(e),
     }
+}
+
+/// Who is closing a room.
+///
+/// A query parameter and not a body, matching `DELETE .../attachments/{id}`'s
+/// `?actor_id=`: both are "one caller-asserted roster identity and nothing
+/// else", and giving the two the same spelling means a client that already
+/// knows how to delete a file knows how to close a room. Optional here because
+/// the OTHER way to authorize this route is the operator header, which names
+/// its principal itself and needs no roster id.
+#[derive(Debug, Default, Deserialize)]
+pub(super) struct CloseRoomQuery {
+    #[serde(default)]
+    actor_id: Option<String>,
+}
+
+/// `POST /v1/rooms/persistent/{key}/close` — freeze the room.
+///
+/// The route the store has been waiting for. `closed_at` and the soft-closed
+/// read paths (`get_including_closed`, both `*_including_closed` pagers,
+/// `/snapshot`'s `closed` boolean) have existed for as long as durable rooms
+/// have, but production reached them from exactly one place: `CallEnded`. A
+/// persistent room a member made could be joined, written, summarized and
+/// federated, and never ended — so rooms.db only ever grew, and the audit view
+/// built to serve a frozen room served only finished calls.
+///
+/// **Two authorities, chosen by the header.** `X-Ocean-Operator` present means
+/// the operator lane and every operator refusal applies (an invalid, cookie-
+/// bearing, or foreign-origin credential is a 403; an unconfigured key is a
+/// 503) — a presented credential is never silently downgraded to the member
+/// lane, because a caller who tried to prove operator authority and failed must
+/// not then be judged as whatever `?actor_id=` they also sent. Absent, the
+/// route wants `?actor_id=` naming a roster member, roster-checked inside the
+/// closing transaction and refused if it claims an Agent's or System's identity
+/// — the same gate the attachment routes carry, ported for the same reason: an
+/// agent does not close a room, and the marker this route writes would say it
+/// did.
+///
+/// **Afterwards** the room is frozen, not gone: `GET /v1/rooms/persistent/{key}`
+/// 404s, every write refuses, `/events` refuses a new connection and the tails
+/// on existing ones end, and `/snapshot` answers `closed: true` with the
+/// transcript still pageable in both directions and the roster and agent
+/// ownership rows intact. Nothing here touches Bedrock — a federated room's
+/// credential, outbox and access projection are untouched, and closing is a
+/// LOCAL statement about a local room's lifecycle.
+pub(super) async fn room_close(
+    State(state): State<AppState>,
+    Path(raw_key): Path<String>,
+    headers: HeaderMap,
+    Query(query): Query<CloseRoomQuery>,
+) -> (StatusCode, Json<serde_json::Value>) {
+    let trimmed = raw_key.trim();
+    if trimmed.is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "ok": false, "error": "invalid room key; must be non-empty" })),
+        );
+    }
+    let key = RoomKey::new(trimmed);
+
+    // Presence of the header, not the outcome of authorizing it, is what picks
+    // the lane. Asking `authorize` first and treating its `Missing` as "try the
+    // member lane" would work today and would silently change meaning the day
+    // that function grows another reason to refuse before it looks for a header.
+    let operator_offered = headers.contains_key(crate::room_operator::OPERATOR_HEADER);
+    let closer_id = if operator_offered {
+        match state.room_operator.authorize(&headers) {
+            Ok(principal) => CloserIdentity::Operator(principal.id().to_string()),
+            Err(error) => return operator_refusal_response(error),
+        }
+    } else {
+        let actor = query.actor_id.unwrap_or_default();
+        let actor = actor.trim();
+        if actor.is_empty() {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({
+                    "ok": false,
+                    "code": "invalid_request",
+                    "error": "closing a room needs ?actor_id= naming a roster member, or an X-Ocean-Operator credential",
+                })),
+            );
+        }
+        CloserIdentity::Member(actor.to_string())
+    };
+
+    // One lock acquisition for the forged-kind gate AND the close. The
+    // attachment routes take two (their `forged_author_response` opens its own
+    // guard), which leaves a window where a roster edit lands between the check
+    // and the write; there is no reason to copy that here when the check has to
+    // read the room the close is about anyway.
+    let result = with_rooms(&state, |store| {
+        if let CloserIdentity::Member(id) = &closer_id {
+            let claimed_kind = store.get(&key)?.and_then(|record| {
+                record
+                    .room
+                    .participants
+                    .iter()
+                    .find(|participant| &participant.id == id)
+                    .map(|participant| participant.kind)
+            });
+            if matches!(
+                claimed_kind,
+                Some(RoomParticipantKind::Agent) | Some(RoomParticipantKind::System)
+            ) {
+                return Ok(Err(forged_closer_response()));
+            }
+        }
+        let closer = match &closer_id {
+            CloserIdentity::Member(id) => ocean_store::RoomCloser::Member(id),
+            CloserIdentity::Operator(id) => ocean_store::RoomCloser::Operator(id),
+        };
+        store.close_with_marker(&key, closer, Utc::now()).map(Ok)
+    });
+
+    match result {
+        Ok(Ok((record, message))) => {
+            // Post-commit, in the order every other room writer uses: the
+            // transcript hint first so a tail flushes the close marker it is
+            // about to stop on, then the access hint. Both are payload-free —
+            // subscribers re-read SQLite, which is now the closed truth.
+            publish_room_wake(&state, &key, &message);
+            publish_room_access_wake(&state, &key);
+            // Stop the room's federation task, if it has one.
+            //
+            // The STORE is what guarantees a closed room takes no more rows —
+            // `ingest_confirmed_event` refuses one, atomically, however this
+            // task is scheduled. This call is the operational half of that
+            // refusal rather than a second copy of it: without it the
+            // supervisor would keep an SSE epoch open against a room whose
+            // every ingest now fails, and a store error there breaks the epoch
+            // into `Recover`, so the room would reconnect-loop forever getting
+            // the same refusal. Stopping it is also just true — a frozen room
+            // has nothing left to receive.
+            //
+            // After the commit and after both wakes, so a tail flushes the
+            // close marker first; and this handler holds no store guard here,
+            // so awaiting is safe. Bedrock is not told anything: the room's
+            // credential, outbox and access projection are untouched, and
+            // closing stays a LOCAL statement about a local lifecycle.
+            state.room_federation.stop_room(&key).await;
+            tracing::info!(
+                room = %key,
+                closer_kind = closer_id.kind_label(),
+                marker_seq = message.seq,
+                "persistent room closed"
+            );
+            (
+                StatusCode::OK,
+                Json(json!({
+                    "ok": true,
+                    "room": record.room,
+                    "closed": true,
+                    "marker_seq": message.seq,
+                })),
+            )
+        }
+        Ok(Err(refusal)) => refusal,
+        Err(e) => room_store_error_response(e),
+    }
+}
+
+/// The verified closer, carried as owned strings because the store call happens
+/// inside a closure that outlives the request's borrows.
+enum CloserIdentity {
+    Member(String),
+    Operator(String),
+}
+
+impl CloserIdentity {
+    /// For the log line only. The operator PRINCIPAL is not a secret and the
+    /// marker quotes it, but the log line does not need to name anybody to say
+    /// which authority was used.
+    fn kind_label(&self) -> &'static str {
+        match self {
+            Self::Member(_) => "member",
+            Self::Operator(_) => "operator",
+        }
+    }
+}
+
+/// The 403 for a client closing a room while claiming an agent's or the
+/// daemon's identity. `enforce_client_artifact_author`'s rule and
+/// `forged_attachment_author`'s shape, under this route's own code.
+fn forged_closer_response() -> (StatusCode, Json<serde_json::Value>) {
+    (
+        StatusCode::FORBIDDEN,
+        Json(json!({
+            "ok": false,
+            "code": "forged_closer",
+            "error": "an agent does not close a room; a client may not close one while claiming its identity",
+        })),
+    )
+}
+
+/// Map an operator-credential refusal onto the wire.
+///
+/// Deliberately its own function rather than `room_agent_authority`'s
+/// `ApiError` conversion: that one maps `Missing` to 503 because on those routes
+/// the operator header is the ONLY authority, and an absent one means the
+/// feature is unavailable. Here an absent header is not an error at all — it
+/// selects the member lane before this function is ever reached — so `Missing`
+/// can only mean a header that was present and then vanished between two reads,
+/// which is a 403 and not a service statement.
+pub(super) fn operator_refusal_response(
+    error: crate::room_operator::OperatorAuthError,
+) -> (StatusCode, Json<serde_json::Value>) {
+    use crate::room_operator::OperatorAuthError::*;
+    let status = match error {
+        Unavailable => StatusCode::SERVICE_UNAVAILABLE,
+        Missing | Invalid | AmbientCredential | ForeignOrigin => StatusCode::FORBIDDEN,
+    };
+    (
+        status,
+        Json(json!({
+            "ok": false,
+            "code": error.code(),
+            "error": error.to_string(),
+        })),
+    )
 }
 
 /// `GET /v1/rooms/persistent` — list all persistent rooms (no transcripts).
@@ -3923,8 +4151,16 @@ async fn send_room_catch_up(
     tx: &mpsc::Sender<RoomMessage>,
 ) -> Result<bool, ocean_store::RoomStoreError> {
     loop {
+        // Gated on EXISTENCE, not openness. The close marker is appended in the
+        // same transaction that sets `closed_at`, so by the time the wake
+        // announcing a close reaches this catch-up the room is already closed —
+        // and the open-only `transcript_page` answers `UnknownRoom` for it. That
+        // made a live tail die on a store error one row short of the row that
+        // explained why, silently, for every close including `CallEnded`'s. An
+        // absent room is still `UnknownRoom` here, so a tail on a room that
+        // really is gone still ends through the error path it always did.
         let page = with_rooms(state, |store| {
-            store.transcript_page(room, *last_sent_seq, Some(128))
+            store.transcript_page_including_closed(room, *last_sent_seq, Some(128))
         })?;
         if page.messages.is_empty() {
             return Ok(true);
@@ -3964,6 +4200,14 @@ async fn run_room_tail(
     }
 
     // Tests can hold this exact replay/live seam open. The broadcast receiver was
+    // A room can close between the `/events` handler's 404 check and this
+    // task's first read, so the opening replay is checked like every later one:
+    // the rows are flushed, then the tail ends rather than waiting on a wake
+    // that is never coming.
+    if room_tail_should_end(&state, &room) {
+        return;
+    }
+
     // already subscribed, so hints accumulate while replay is paused; production
     // passes `None` and continues immediately.
     if let Some((ready, release)) = seam {
@@ -3980,7 +4224,21 @@ async fn run_room_tail(
             hint = hints.recv() => hint,
         };
         match hint {
-            Ok(hint) if hint.room != room || Some(hint.seq) <= last_sent_seq => continue,
+            Ok(hint) if hint.room != room => continue,
+            // A hint naming a row this tail has already sent. It still has to
+            // ask whether the room is now closed before going back to sleep:
+            // the close marker's hint carries that marker's own seq, and the
+            // catch-up above may already have delivered it (a tail that started
+            // between the commit and the publish replays it out of the durable
+            // log, not off this bus). A bare `continue` here therefore parked
+            // the tail forever on a room that can never produce another row —
+            // the one path where the openness check below is unreachable.
+            Ok(hint) if Some(hint.seq) <= last_sent_seq => {
+                if room_tail_should_end(&state, &room) {
+                    return;
+                }
+                continue;
+            }
             Ok(hint) => {
                 let expected = last_sent_seq.map_or(0, |last| last.saturating_add(1));
                 if hint.seq > expected {
@@ -4006,7 +4264,32 @@ async fn run_room_tail(
                 return;
             }
         }
+
+        // AFTER the catch-up, never before it: the close marker is appended in
+        // the same transaction that sets `closed_at`, so the wake that told us
+        // about the close is also the wake carrying the last row the room will
+        // ever have. Ending first would freeze the room and never say so.
+        if room_tail_should_end(&state, &room) {
+            return;
+        }
     }
+}
+
+/// Has this room been closed out from under a live SSE tail?
+///
+/// `POST .../close` publishes on the transcript and access wake buses precisely
+/// so the three tails can ask this and stop. Every one of them returning is what
+/// ends the merged stream and completes the HTTP response, which is the
+/// behaviour the rest of the contract already assumed: `/events` refuses a NEW
+/// connection to a closed room with a 404, so a tail that stayed open on one
+/// was a connection the client could never re-establish and the daemon would
+/// never feed again — a stream that is neither alive nor finished.
+///
+/// Only a store that positively answers "not open" ends a tail. A read error is
+/// left to whatever the calling tail already does about read errors; inventing a
+/// close out of an I/O failure would drop live clients on a blip.
+fn room_tail_should_end(state: &AppState, room: &RoomKey) -> bool {
+    matches!(with_rooms(state, |store| store.is_open(room)), Ok(false))
 }
 
 #[allow(dead_code)]
@@ -4220,6 +4503,12 @@ async fn run_room_access_tail(
                 return;
             }
         }
+        // Send the final projection first, then stop: a closed room's access
+        // state is frozen from here on, and there is nothing further this tail
+        // could ever have to say. See `room_tail_should_end`.
+        if room_tail_should_end(&state, &room) {
+            return;
+        }
     }
 }
 
@@ -4275,6 +4564,13 @@ async fn run_room_read_cursor_tail(
         };
         if !should_read {
             continue;
+        }
+        // Checked BEFORE the read here, unlike the other two tails, because
+        // closing changes no cursor: there is no final value to flush, and the
+        // `continue` arms below (an unsupported access state re-derives nothing)
+        // would otherwise carry a closed room's tail past the check forever.
+        if room_tail_should_end(&state, &room) {
+            return;
         }
         let read_seq = match with_rooms(&state, |store| -> Result<_, ocean_store::RoomStoreError> {
             let access = store.room_access(&room)?;
@@ -11275,5 +11571,298 @@ env = { FIXTURE = "1" }
                 "wake on 500"
             );
         }
+    }
+
+    /// Closing a room from the ROUTE, and the four things a member can then
+    /// tell about it.
+    ///
+    /// Before this route the only close in production was `CallEnded`'s, so
+    /// every soft-closed read path — `get_including_closed`, both
+    /// `*_including_closed` pagers, `/snapshot`'s `closed` boolean — was
+    /// reachable only by a finished call. This asserts the whole after-state a
+    /// member sees, because each half of it is a different route's contract and
+    /// three of them would keep passing if the fourth broke: detail 404s, the
+    /// snapshot answers `closed: true`, a send is refused, and the transcript is
+    /// still readable AND still ends with the marker naming who closed it.
+    #[tokio::test]
+    async fn closing_a_room_freezes_it_and_says_who_did_it() {
+        let _env = AUTO_CONVENE_ENV_LOCK.lock().await;
+        let tmp = tempfile::tempdir().unwrap();
+        let state = fake_convene_state(&tmp);
+        let key = RoomKey::new("close-route-room");
+        with_rooms(&state, |store| {
+            store.create(key.clone(), "Close Route", None, Utc::now())
+        })
+        .unwrap();
+        let (status, _) = room_join(
+            State(state.clone()),
+            Path(key.as_str().to_string()),
+            Json(RoomJoinRequest {
+                id: "alice".into(),
+                display_name: "Alice".into(),
+                kind: RoomParticipantKind::Human,
+                owner_id: None,
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let (status, _) = room_post_message(
+            State(state.clone()),
+            Path(key.as_str().to_string()),
+            Json(RoomMessageRequest {
+                author_id: "alice".into(),
+                author_kind: RoomParticipantKind::Human,
+                body: "before the close".into(),
+                thread_parent_seq: None,
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED);
+
+        let (status, body) = room_close(
+            State(state.clone()),
+            Path(key.as_str().to_string()),
+            HeaderMap::new(),
+            Query(CloseRoomQuery {
+                actor_id: Some("alice".into()),
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "close body: {}", body.0);
+        assert_eq!(body.0["ok"], json!(true));
+        assert_eq!(body.0["closed"], json!(true));
+
+        // 1. Detail 404s. This is the contract `room_get` has always had for a
+        //    closed room; until now nothing but a call could produce one.
+        let (status, _) = room_get(State(state.clone()), Path(key.as_str().to_string())).await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+
+        // 2. The snapshot answers `closed: true` — the signal a hydrating
+        //    surface actually reads, since it no longer hydrates through detail.
+        let (status, snapshot) = room_snapshot(
+            State(state.clone()),
+            Path(key.as_str().to_string()),
+            Query(SnapshotQuery {
+                after_seq: None,
+                before_seq: None,
+                limit: None,
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(snapshot.0["closed"], json!(true));
+        // The roster survives the close: a frozen room still says who was in it.
+        assert_eq!(
+            snapshot.0["room"]["participants"]
+                .as_array()
+                .map(|p| p.len()),
+            Some(1)
+        );
+
+        // 3. A send is refused. The store's `room_is_open` guard is what does
+        //    it, and the answer is the flat 404 every write to a closed room
+        //    gives — not a new code this route would have to teach clients.
+        let (status, _) = room_post_message(
+            State(state.clone()),
+            Path(key.as_str().to_string()),
+            Json(RoomMessageRequest {
+                author_id: "alice".into(),
+                author_kind: RoomParticipantKind::Human,
+                body: "after the close".into(),
+                thread_parent_seq: None,
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+
+        // 4. The transcript is still readable, and its LAST row is the marker
+        //    naming the closer. A close that froze the room without recording
+        //    who did it would pass every assertion above.
+        let (status, transcript) = room_transcript(
+            State(state.clone()),
+            Path(key.as_str().to_string()),
+            Query(TranscriptQuery {
+                after_seq: None,
+                limit: None,
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let rows = transcript.0["transcript"].as_array().unwrap();
+        assert!(
+            rows.iter()
+                .any(|row| row["body"] == json!("before the close")),
+            "the pre-close message must survive: closing is soft ({rows:?})"
+        );
+        let last = rows.last().unwrap();
+        assert_eq!(last["kind"], json!("system"));
+        assert_eq!(last["body"], json!("alice closed the room"));
+    }
+
+    /// A second close is a 404, and an off-roster or forged closer is refused
+    /// with nothing written.
+    ///
+    /// Three refusals in one test because they share the one property that
+    /// matters: each must leave the room exactly as it was. A close that
+    /// half-applied — marker written, `closed_at` not, or the reverse — is the
+    /// failure the single IMMEDIATE transaction exists to prevent, and it is
+    /// invisible unless the refusal path is checked against the room afterwards.
+    #[tokio::test]
+    async fn a_refused_close_leaves_the_room_exactly_as_it_was() {
+        let _env = AUTO_CONVENE_ENV_LOCK.lock().await;
+        let tmp = tempfile::tempdir().unwrap();
+        let state = fake_convene_state(&tmp);
+        let key = RoomKey::new("close-refusal-room");
+        with_rooms(&state, |store| {
+            store.create(key.clone(), "Close Refusals", None, Utc::now())
+        })
+        .unwrap();
+        // The Agent goes on through the store rather than through `room_join`:
+        // that route resolves an Agent name against a real folder-agent
+        // definition and there is none here. The roster row is all this test
+        // needs — the forged-closer gate reads the participant's KIND.
+        with_rooms(&state, |store| {
+            for participant in [
+                RoomParticipant {
+                    id: "alice".into(),
+                    kind: RoomParticipantKind::Human,
+                    display_name: "Alice".into(),
+                },
+                RoomParticipant {
+                    id: "researcher".into(),
+                    kind: RoomParticipantKind::Agent,
+                    display_name: "Researcher".into(),
+                },
+            ] {
+                store.add_participant(&key, participant, Utc::now())?;
+            }
+            Ok::<_, ocean_store::RoomStoreError>(())
+        })
+        .unwrap();
+        let rows_before = with_rooms(&state, |store| store.get(&key))
+            .unwrap()
+            .expect("open room")
+            .transcript
+            .len();
+
+        // Nobody named at all.
+        let (status, body) = room_close(
+            State(state.clone()),
+            Path(key.as_str().to_string()),
+            HeaderMap::new(),
+            Query(CloseRoomQuery { actor_id: None }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(body.0["code"], json!("invalid_request"));
+
+        // An Agent's identity claimed off the wire. An agent does not close a
+        // room, and the marker would have said it did.
+        let (status, body) = room_close(
+            State(state.clone()),
+            Path(key.as_str().to_string()),
+            HeaderMap::new(),
+            Query(CloseRoomQuery {
+                actor_id: Some("researcher".into()),
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        assert_eq!(body.0["code"], json!("forged_closer"));
+
+        // On the roster of no room. Refused inside the store's transaction.
+        let (status, _) = room_close(
+            State(state.clone()),
+            Path(key.as_str().to_string()),
+            HeaderMap::new(),
+            Query(CloseRoomQuery {
+                actor_id: Some("stranger".into()),
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+
+        // Still open, and not one extra transcript row from three refusals.
+        let record = with_rooms(&state, |store| store.get(&key))
+            .unwrap()
+            .expect("room is still open after three refused closes");
+        assert_eq!(record.transcript.len(), rows_before);
+
+        // Now close it for real, then close it again: the second is the same
+        // 404 an absent room gets, never a silent success.
+        let (status, _) = room_close(
+            State(state.clone()),
+            Path(key.as_str().to_string()),
+            HeaderMap::new(),
+            Query(CloseRoomQuery {
+                actor_id: Some("alice".into()),
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let (status, _) = room_close(
+            State(state.clone()),
+            Path(key.as_str().to_string()),
+            HeaderMap::new(),
+            Query(CloseRoomQuery {
+                actor_id: Some("alice".into()),
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+    }
+
+    /// Closing a room ENDS the live message tail — after flushing the marker.
+    ///
+    /// `/events` already refuses a NEW connection to a closed room with a 404,
+    /// so a tail that stayed open on one was a connection the client could never
+    /// re-establish and the daemon would never feed again: a stream neither
+    /// alive nor finished, and indistinguishable from a healthy idle one. The
+    /// close route publishes on both wake buses so the tails can notice.
+    ///
+    /// The ORDER is the load-bearing half and is what this asserts. The close
+    /// marker is appended in the same transaction that sets `closed_at`, so the
+    /// wake that says "closed" is also the wake carrying the room's last row. A
+    /// tail that checked openness before its catch-up would end the stream one
+    /// row short and freeze the room without ever saying why.
+    #[tokio::test]
+    async fn closing_a_room_ends_the_message_tail_after_the_marker() {
+        let _env = AUTO_CONVENE_ENV_LOCK.lock().await;
+        let tmp = tempfile::tempdir().unwrap();
+        let state = fake_convene_state(&tmp);
+        let key = RoomKey::new("tail-close-room");
+        with_rooms(&state, |store| {
+            store.create(key.clone(), "Tail Close", None, Utc::now())
+        })
+        .unwrap();
+        join_participant(&state, &key, "alice", RoomParticipantKind::Human, "Alice");
+
+        let hints = state.room_wakes.subscribe();
+        let mut stream = room_message_tail(state.clone(), key.clone(), None, hints, None);
+        wait_for_wake_receivers(&state, 1).await;
+
+        let (status, _) = room_close(
+            State(state.clone()),
+            Path(key.as_str().to_string()),
+            HeaderMap::new(),
+            Query(CloseRoomQuery {
+                actor_id: Some("alice".into()),
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+
+        // The close marker still arrives — after the join marker the initial
+        // catch-up already replayed.
+        let joined = next_message(&mut stream).await;
+        assert_eq!(joined.body, "Alice joined");
+        let marker = next_message(&mut stream).await;
+        assert_eq!(marker.body, "alice closed the room");
+        // ...and then the stream ENDS, rather than idling on a room that can
+        // never produce another row.
+        let ended = tokio::time::timeout(std::time::Duration::from_secs(2), stream.next())
+            .await
+            .expect("the tail must end, not idle, on a closed room");
+        assert!(ended.is_none(), "no rows follow the close marker");
     }
 }
