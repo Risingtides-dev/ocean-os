@@ -9549,3 +9549,59 @@ RUSTSEC-2026-0274 (`rtrb` double-free) and yanked `spin`, unchanged and
 pre-existing: the branch touches no `Cargo.toml`, `Cargo.lock` or `deny.toml` at
 all, and every line this pass changed is a comment. No deploy, no migration.
 _________________________________________________________________________________ 12:16 loop/os-transcript-page-including-closed
+
+time:      [21:04] [01-09-26]
+agent:     [claude-code], [claude-opus-5], [cloud run]
+worktree:  cloud/rooms-workspace-root-daemon
+type:      [bug report]: a room created unbound could never be bound
+area:      [backend]: rooms, persistent room metadata, room store
+
+`POST /v1/rooms/persistent` has taken an optional `workspace_root` since
+OCEAN-260, but `PATCH /v1/rooms/persistent/{key}` took only `name` and
+`trigger_policy`. So a room created without a binding was unbound for the life
+of the room, and `spawn_room_agent_turn` fails closed on exactly that: no
+stored `workspace_root` means 503 `workspace_unavailable` on every room-bound
+agent turn, forever. The only repair was a new room and a lost transcript. The
+`rooms.workspace_root` column and the row reader were already there — nothing
+could write to them after the INSERT.
+
+`RoomUpdateRequest` gains `workspace_root: Option<Option<String>>` behind
+`double_option_workspace_root`, the same shape `trigger_policy` uses: absent is
+unchanged, explicit `null` unbinds, a string binds through the SAME
+`canonical_submitted_workspace_root` create runs and earns the same frozen
+`{"ok": false, "error": "invalid_workspace_root"}` 400. Absent had to stay
+"unchanged" rather than collapse to a clear, or an unrelated rename would
+silently switch a working room's agents off. A blank string unbinds, matching
+create's treatment of a blank value. `RoomStore::update` gains the parameter
+between `trigger_policy` and `now` and persists it inside the existing
+IMMEDIATE transaction, so name/policy/workspace/touch stay atomic; the stored
+value is the canonical path, because agent execution revalidates canonicality
+through `persisted_room_workspace` and would otherwise refuse a room it had
+just bound. `SqliteRoomStore` is the only implementor of the trait —
+`ocean-agent`'s in-memory `RoomRegistry` is a separate inherent type, not a
+`RoomStore` impl, and is not on the PATCH path, so it was left alone.
+
+Tests: `update_binds_unbinds_and_leaves_workspace_root_alone` in `ocean-store`
+(bind, read back through the row reader, absent-leaves-alone, rebind, unbind to
+NULL), `room_update_binds_unbinds_and_preserves_the_workspace_root` in
+`persistent_rooms.rs` (noncanonical input lands canonical, absent preserved,
+relative and nonexistent both answer the frozen body without disturbing the
+stored binding, null and blank both unbind). The end-to-end harness
+`local_room_agent_bootstrap_is_authenticated_previewable_and_non_authorizing`
+already asserted the `workspace_unavailable` refusal; it now PATCHes a binding
+in and shows the SAME invocation admitted 202, then unbinds and shows it refused
+again — the pair is what proves the field is load-bearing and not merely stored.
+
+Docs: the operator guide's rooms quick reference PATCH row, which
+`router_contract_source_banner_and_operator_guide_are_in_parity` pins.
+`OCEAN_ECOSYSTEM_CONTRACT.md` was left alone deliberately: it never lists the
+PATCH body's fields — its one `PATCH` mention is prose about which routes
+serialize `Room`.
+
+Gates: `cargo xtask ci` — see the PR for the per-lane verdict. `cargo deny` is
+red before this branch and still red on RUSTSEC-2026-0274 (`rtrb`) and yanked
+`spin`, reported and not fixed; this branch touches no `Cargo.toml`,
+`Cargo.lock` or `deny.toml`. Paired with ocean-surface
+`cloud/rooms-workspace-root-surface`, which sends the field at create time and
+adds the bind/unbind control this route makes possible.
+_________________________________________________________________________________ 21:04 cloud/rooms-workspace-root-daemon

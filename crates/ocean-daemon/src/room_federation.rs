@@ -6351,6 +6351,7 @@ mod tests {
                     on_mention: true,
                     ..Default::default()
                 })),
+                None,
                 chrono::Utc::now(),
             )
         })
