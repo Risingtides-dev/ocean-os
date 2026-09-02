@@ -108,7 +108,7 @@ fi
 # ── 2. the plists carry nothing ───────────────────────────────────────────
 for plist in "$PLIST_SRC" "$PLIST_DST"; do
   [[ -f "$plist" ]] || continue
-  if command -v plutil >/dev/null 2>&1; then plutil -lint "$plist" >/dev/null || fail "$plist does not lint"; fi
+  if command -v plutil >/dev/null 2>&1; then plutil -lint -- "$plist" >/dev/null || fail "$plist does not lint"; fi
   if grep -q "OCEAN_FEDERATION" "$plist"; then fail "$plist carries a federation key; remove it, the launcher is the only channel"; fi
 done
 echo "==> [2/3] plists lint and carry no federation value"
@@ -142,7 +142,9 @@ if [[ -n "$verify_room" ]]; then
   base="${HEALTH_URL%/health}"
   state=""
   for _ in $(seq 1 60); do
-    state="$(curl -fsS "$base/v1/rooms/persistent/$verify_room/snapshot?before_seq=18446744073709551615&limit=1" 2>/dev/null | sed -n 's/.*"access":{[^}]*"state":"\([a-z]*\)".*/\1/p' | head -1)"
+    # A transient failure here must reach the sleep and the next attempt, not
+    # end the script under set -e: the curl is guarded so only its output counts.
+    state="$({ curl -fsS "$base/v1/rooms/persistent/$verify_room/snapshot?before_seq=18446744073709551615&limit=1" 2>/dev/null || true; } | sed -n 's/.*"access":{[^}]*"state":"\([a-z]*\)".*/\1/p' | head -1)"
     [[ "$state" == "live" ]] && break
     sleep 1
   done
