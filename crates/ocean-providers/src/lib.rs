@@ -805,6 +805,11 @@ pub fn known_models() -> Vec<KnownModel> {
         m("claude-sonnet-5", "claude-code", "Claude Sonnet 5"),
         m("claude-haiku-4-5", "claude-code", "Claude Haiku 4.5"),
         m("claude-code-fable-5", "claude-code", "Claude Code Fable 5"),
+        m(
+            "claude-code-fable-5-1",
+            "claude-code",
+            "Claude Code Fable 5.1",
+        ),
         // MiniMax ids use the API casing the resolver returns as current.model
         // (`MiniMax-M2`, not the lowercase alias), so `id == current.model`
         // holds for every entry — ACP/Zed match the selected mode id against the
@@ -1059,6 +1064,17 @@ pub fn resolve_model_selection(env: &ProviderEnv) -> Result<ModelSelection, Prov
                 16_384,
             ))
         }
+        // Fable 5.1 — current point release. The plain wire id
+        // `claude-fable-5-1` must resolve (pinned sessions replay it; see the
+        // fable-5 wire-id outage fixed in #362). `fable` stays on 5.0 so a
+        // pinned shorthand does not silently retarget.
+        "claude-code-fable-5-1" | "claude-fable-5-1" => Ok(model_selection(
+            ProviderId::ClaudeCode,
+            "claude-code-fable-5-1",
+            ANTHROPIC_BASE_URL,
+            200_000,
+            16_384,
+        )),
         "claude-code-opus-5" | "claude-code-opus" | "cc-opus" => Ok(model_selection(
             ProviderId::ClaudeCode,
             "claude-code-opus-5",
@@ -1924,6 +1940,15 @@ mod tests {
             assert_eq!(s.provider, ProviderId::ClaudeCode, "{alias}");
             assert_eq!(s.model, "claude-code-fable-5", "{alias}");
         }
+
+        // 5.1 — current point release. Both the menu alias and the wire id
+        // (already pinned by live loops, events.md 02-09-26) resolve to the
+        // 5.1 menu id; `fable` itself stays pinned to 5.0 above.
+        for alias in ["claude-code-fable-5-1", "claude-fable-5-1"] {
+            let s = resolve_model_selection(&env(&[("OCEAN_MODEL", alias)])).unwrap();
+            assert_eq!(s.provider, ProviderId::ClaudeCode, "{alias}");
+            assert_eq!(s.model, "claude-code-fable-5-1", "{alias}");
+        }
     }
 
     #[test]
@@ -2120,6 +2145,7 @@ mod tests {
             "claude-sonnet-5",
             "claude-haiku-4-5",
             "claude-code-fable-5",
+            "claude-code-fable-5-1",
             // API-cased ids: `resolve_model_selection` returns these as
             // current.model, and known_models() advertises the same string.
             "MiniMax-M2",
