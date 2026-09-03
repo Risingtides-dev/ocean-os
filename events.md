@@ -9576,3 +9576,28 @@ still the warning it was under `yanked = "warn"`, so once main carries this
 lockfile the cargo-deny lane is green for every open PR; CI's own run of that
 lane on this branch is the proof. No build, no deploy, no code change.
 _________________________________________________________________________________ 05:55 deps/rtrb-0.3.5-rustsec-2026-0274
+
+time:      [22:29] [02-09-26]
+agent:     [ocean loop], [claude-fable-5-1]
+worktree:  feat/fable-5.1
+type:      [feature-request]
+area:      [backend]
+
+Added `claude-fable-5-1` (Claude Fable 5.1) routing end-to-end, mirroring the
+fable-5 arms and PR #451's shape: `Model::anthropic_claude_fable_5_1()` in
+`ocean-protocol` (wire id `claude-fable-5-1`, anthropic-messages, 200k/16_384);
+a `known_models()` menu entry and resolver arm (`claude-code-fable-5-1` |
+`claude-fable-5-1` -> `ProviderId::ClaudeCode`) plus invariant-list and
+wire-id-round-trip test coverage in `ocean-providers`; and both the `Anthropic`
+and `ClaudeCode` match arms in `ocean-agent`'s `model_from_provider_config`.
+The wire id had to resolve because the events ledger (02-09-26, above) already
+shows loops pinning `claude-fable-5-1`, and a wire id missing from the
+resolver is exactly what bricked every fable-5-pinned session on 2026-07-29
+(#362) — sessions persist `Model.id` and replay it verbatim. The bare `fable`
+shorthand intentionally stays pinned to 5.0. `cargo test -p ocean-protocol`
+(163+5 green), `cargo test -p ocean-agent` (239/239 green), `cargo test -p
+ocean-providers` (51/51 green), `cargo clippy -p ocean-providers -p
+ocean-protocol -p ocean-agent --all-targets -- -D warnings` (clean), and
+`cargo fmt --check` (clean) all pass on top of `origin/main` 9fc88743. Opened
+as PR #452 against main.
+_________________________________________________________________________________ 22:29 feat/fable-5.1
