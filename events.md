@@ -9601,3 +9601,31 @@ ocean-protocol -p ocean-agent --all-targets -- -D warnings` (clean), and
 `cargo fmt --check` (clean) all pass on top of `origin/main` 9fc88743. Opened
 as PR #452 against main.
 _________________________________________________________________________________ 22:29 feat/fable-5.1
+time:      [12:31] [04-09-26]
+agent:     [claude code], [claude-opus-5]
+worktree:  worktree-providers-glm53flash-fable51
+type:      [feature-request]
+area:      [backend]
+
+Added `glm-5.3-flash` (GLM 5.3 Flash) routing. The 5.3 generation's fast tier
+was already live on the Z.AI coding-plan base but had no arm in
+`ocean-providers`, so it was unreachable and absent from the model picker while
+its sibling `glm-5.3` (34cc488) routed fine — the operator reported exactly
+that gap. Verified live 2026-09-04: `POST {GLM_BASE_URL}/chat/completions`
+with model `glm-5.3-flash` returns 200 on the operator's coding-plan key, the
+same base and auth every other GLM id already uses, so it takes the shared
+200k/8_192 limits and the `glm_base_url(env)` override like the rest of the
+family. Match arms compare exact strings, so the existing `glm-5.3` arm never
+shadowed the `-flash` suffix; the id was simply missing. Adds a
+`known_models()` menu entry, the resolver arm (`glm-5.3-flash` |
+`glm-5-3-flash`), the id to the menu-invariant list, and extends
+`current_glm_models_route_and_round_trip_through_known_models` to cover the
+canonical id, its hyphen alias, and picker presence. No `ocean-agent` change
+was needed: GLM resolves through the generic `openai_compat` path in
+`model_from_provider_config`. Found while smoke-testing every menu model at the
+wire level for the operator (16/22 reachable; the six Codex ids return 429
+`usage_limit_reached` until 08-09-26, a plan quota, not a routing fault).
+`cargo test -p ocean-providers` (51/51 green), `cargo clippy -p ocean-providers
+--all-targets` (clean) and `cargo fmt --check` (clean) all pass on top of
+`origin/main` 4b69b66. Opened as PR #453 against main.
+_________________________________________________________________________________ 12:31 worktree-providers-glm53flash-fable51
