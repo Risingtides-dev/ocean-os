@@ -822,6 +822,7 @@ pub fn known_models() -> Vec<KnownModel> {
         m("kimi-k2.6", "kimi", "Kimi K2.6"),
         m("kimi-k2", "kimi", "Kimi K2"),
         m("glm-5.3", "glm", "GLM 5.3"),
+        m("glm-5.3-flash", "glm", "GLM 5.3 Flash"),
         m("glm-5.2", "glm", "GLM 5.2"),
         m("glm-4.7", "glm", "GLM 4.7"),
         m("glm-4.6", "glm", "GLM 4.6"),
@@ -1198,6 +1199,16 @@ pub fn resolve_model_selection(env: &ProviderEnv) -> Result<ModelSelection, Prov
         "glm-5.3" | "glm-5-3" => Ok(model_selection(
             ProviderId::Glm,
             "glm-5.3",
+            glm_base_url(env),
+            200_000,
+            8_192,
+        )),
+        // GLM 5.3 Flash — the fast tier of the 5.3 generation, served by the
+        // same Z.AI coding-plan base (verified live 2026-09-04: 200 on
+        // {base}/chat/completions with model "glm-5.3-flash").
+        "glm-5.3-flash" | "glm-5-3-flash" => Ok(model_selection(
+            ProviderId::Glm,
+            "glm-5.3-flash",
             glm_base_url(env),
             200_000,
             8_192,
@@ -2155,6 +2166,7 @@ mod tests {
             "kimi-k2.6",
             "kimi-k2",
             "glm-5.3",
+            "glm-5.3-flash",
             "glm-5.2",
             "glm-4.7",
             "glm-4.6",
@@ -2574,6 +2586,7 @@ mod tests {
             ("glm-4.7", "glm-4-7"),
             ("glm-5.2", "glm-5-2"),
             ("glm-5.3", "glm-5-3"),
+            ("glm-5.3-flash", "glm-5-3-flash"),
         ] {
             let sel = resolve_model_selection(&env(&[("OCEAN_MODEL", id)])).unwrap();
             assert_eq!(sel.provider, ProviderId::Glm);
@@ -2590,6 +2603,10 @@ mod tests {
         assert!(listed.contains("glm-4.7"), "glm-4.7 must be in the picker");
         assert!(listed.contains("glm-5.2"), "glm-5.2 must be in the picker");
         assert!(listed.contains("glm-5.3"), "glm-5.3 must be in the picker");
+        assert!(
+            listed.contains("glm-5.3-flash"),
+            "glm-5.3-flash must be in the picker"
+        );
     }
 
     #[test]
