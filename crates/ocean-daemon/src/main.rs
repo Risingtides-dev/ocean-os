@@ -158,6 +158,7 @@ mod room_attachments;
 mod room_context;
 /// Restart-safe outbound Bedrock room client and per-room supervisor (S2 P2-B).
 mod room_federation;
+mod room_inspect;
 /// Fail-closed local operator principal for room-agent authorization mutations.
 /// Phase 1 lands and validates this authority before a later accepted slice
 /// wires mutation routes, so the production module is deliberately inert here.
@@ -1601,6 +1602,7 @@ fn banner_routes() -> &'static [&'static str] {
         "DELETE /v1/rooms/persistent/{key}/attachments/{attachment_id}",
         "POST /v1/rooms/persistent/{key}/summarize",
         "GET /v1/rooms/persistent/{key}/snapshot",
+        "GET /v1/rooms/persistent/{key}/inspect",
         "GET /v1/rooms/persistent/{key}/events",
         "GET /v1/rooms/persistent/{key}/read-cursor",
         "PATCH /v1/rooms/persistent/{key}/read-cursor",
@@ -2997,6 +2999,10 @@ fn room_routes() -> Router<AppState> {
             "/v1/rooms/persistent/{key}/agents",
             get(room_agent_authority::room_agent_bindings)
                 .post(room_agent_authority::room_agent_authorize),
+        )
+        .route(
+            "/v1/rooms/persistent/{key}/inspect",
+            get(room_inspect::room_inspect),
         )
         .route(
             "/v1/rooms/persistent/{key}/agents/bootstrap",
