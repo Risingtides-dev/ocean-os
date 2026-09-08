@@ -10623,6 +10623,16 @@ area:      [backend], [review], [testing]
 
 Addressed PR #450 findings 3960575953 and 3960575970. Duplicate and legacy confirmed replays now compare persisted body, author id, author kind and message kind before accepting or repairing mention metadata. Attachment GC preserves bounded directory-entry enumeration and inspection errors while continuing unrelated entries, including byte-accounting scans. Added regressions for each divergent payload field with both known and legacy mention state, and deterministic enumeration failure/continuation/error preservation. The replay regression and all 16 maintenance tests pass. Updated nearest store and daemon contracts; parent ownership and child indexes unchanged. Full workspace and remote gates rerunning; not merged or installed yet.
 _________________________________________________________________________________ 13:40 codex/rooms-release-20260908
+
+
+time:      [13:50] [08-09-26]
+agent:     [codex]
+worktree:  [codex/rooms-release-20260908] /Users/risingtidesdev/dev/ocean-os-worktrees/rooms-release-20260908
+type:      [workflow]
+area:      [backend], [review], [testing]
+
+Reconciled concurrently landed main 3996c68c (PR #455, accepted Room-profile Stage 2b) into the release candidate without dropping its profile or credential-status behavior. Resolved the documentation conflict by retaining accepted Phase 2 authority and the cross-repository definition-of-done link. Updated executable and documented route inventory to 129 total / 45 Room routes, including profile GET and PUT; corrected inspect documentation to include landed profile/status data. All 17 route-filtered tests pass. Before reconciliation, 05bf16c4 passed the full local gate: 3307 tests across 93 suites, Clippy, format, docs and dependency audit. Full integrated gate and fresh review are rerunning. Ownership and child indexes unchanged.
+_________________________________________________________________________________ 13:50 codex/rooms-release-20260908
 time:      [12:05] [08-09-26]
 agent:     [claude] [fable-5.1]
 worktree:  cc/rooms-phase2-2b

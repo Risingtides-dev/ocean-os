@@ -27030,12 +27030,12 @@ mod tests {
         // 126 -> 127: Rooms Phase 2 Stage 2a read-only inspect projection
         // (room, access, federated bool, owner, execution cwd_source, every
         // binding with its deterministic session id, empty Phase 2 slots).
-        // 125 -> 127: Rooms Phase 2 Stage 2b room profile — credential-free
+        // 127 -> 129: Rooms Phase 2 Stage 2b room profile — credential-free
         // GET and operator-gated, replay-safe PUT of the references-only
         // profile (repos, tools, credential slots) with slot STATUS on read.
         assert_eq!(
             banner.len(),
-            127,
+            129,
             "route baseline changed; review the manifest"
         );
 

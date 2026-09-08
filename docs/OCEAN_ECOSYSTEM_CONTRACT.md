@@ -187,7 +187,9 @@ The **Auth** column names what a caller must present BEYOND reaching the daemon.
 | `DELETE` | `/v1/rooms/persistent/{key}/attachments/{attachment_id}` | Remove the row and its bytes, recording in the transcript who removed it. | Roster-asserted `?actor_id=` |
 | `POST` | `/v1/rooms/persistent/{key}/summarize` | Fold the newest transcript rows into the room's single well-known `room-summary` note in one model turn. | Roster-asserted `requested_by` (403 `forged_artifact_author` / non-roster) |
 | `GET` | `/v1/rooms/persistent/{key}/snapshot` | Hydrate the room: roster, one bounded transcript page from EITHER end, cursors, `closed`, `agent_owners`. | Loopback trust only |
-| `GET` | `/v1/rooms/persistent/{key}/inspect` | Read the Room's access, owner, local execution context and agent bindings; Phase 2 resource/profile slots remain empty. | Loopback trust only; credential-free read |
+| `GET` | `/v1/rooms/persistent/{key}/inspect` | Read the Room's access, owner, local execution context, agent bindings, profile references and credential-slot status; resource grants remain unavailable. | Loopback trust only; credential-free read |
+| `GET` | `/v1/rooms/persistent/{key}/profile` | Read references-only Room profile and this node's credential-slot status; never credential values. | Loopback trust only; credential-free read |
+| `PUT` | `/v1/rooms/persistent/{key}/profile` | Update Room profile references with a replay-safe decision and content-minimal audit. | `X-Ocean-Operator`; decision id required |
 | `GET` | `/v1/rooms/persistent/{key}/events` | Merged SSE tail: the initial full access projection, then id-bearing message frames and access updates. | Loopback trust only |
 | `GET` | `/v1/rooms/persistent/{key}/read-cursor` | Fetch the daemon-owned read-cursor projection; Local and Live rooms only. | Loopback trust only |
 | `PATCH` | `/v1/rooms/persistent/{key}/read-cursor` | Advance the daemon-owned read cursor monotonically and publish the wake. | Loopback trust only |
