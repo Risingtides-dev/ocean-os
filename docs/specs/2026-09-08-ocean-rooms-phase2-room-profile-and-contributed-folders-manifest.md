@@ -1,6 +1,6 @@
 # Ocean Rooms — Phase 2 implementation manifest: room profile and local contributed folders
 
-**Status:** proposed 2026-09-08; awaiting operator acceptance. Stage 2a (`inspect` route) is implemented alongside this document as a read-only observation surface and authorizes nothing else.
+**Status:** operator-accepted 2026-09-08 with the four §11 rulings recorded below; concurrent implementation and review per the Phase 1 deviation. Stage 2a (`inspect` route) landed through Ocean OS PR #454. Stage 2b (room profile record, `GET`/`PUT .../profile`, credential-slot status on read and at admission) is implemented; 2c and 2d open in order as §10 gates pass. The operator has authorized this as an ongoing program: work continues through 2b → 2c → 2d without repeated approval prompts, pausing only for a concrete blocker or a design decision this document does not already settle.
 **Date:** 2026-09-08
 **Phase:** 2 of the Decision 6 capability delivery order
 **Authorizing documents:**
@@ -86,7 +86,8 @@ RoomProfile
   repos                   JSON NOT NULL              -- [RepoRef]
   tools                   JSON NOT NULL              -- [ToolRef]
   credential_slots        JSON NOT NULL              -- [CredentialSlot]
-  default_resource_id     TEXT                       -- which folder is the turn cwd (§5)
+  default_resource_id     TEXT                       -- room-wide fallback folder for the turn cwd (§5)
+  agent_defaults          JSON NOT NULL              -- { agent_member_id: resource_id } per-agent folder (§5, §11.4)
   updated_by              TEXT NOT NULL              -- operator principal id
   updated_at              TIMESTAMPTZ NOT NULL
 
@@ -111,6 +112,17 @@ CredentialSlot
 Validation is total: an unknown resolver scheme, a `remote` that parses as a
 filesystem path, a `resource_id` that does not name a live grant on this node,
 or a tool `name` not installed locally is a typed 400 and writes nothing.
+Until Stage 2c lands there are no grants, so in 2b any non-null `resource_id`,
+`default_resource_id`, or `agent_defaults` entry is refused with
+`phase_not_open` rather than silently accepted as a dangling reference.
+
+**Recorded 2b deviation — tool presence is reported, not enforced.** The
+"tool `name` not installed locally is a 400" rule above is deferred to Stage
+2d. In 2b a `ToolRef` is validated for shape (`kind`, identifier `name`,
+canonical `allowed` list) and projected with `installed: "unknown"`; the
+write-time refusal lands with the resource-aware tools, when there is one
+inventory (MCP servers, plugins, builtins) the daemon can check against
+instead of three partial ones.
 
 **Nothing in this record is a secret and nothing in it is federated.** The
 `resolvers` list names *where to look*, never *what was found*.
@@ -194,8 +206,9 @@ fallback to the daemon launch directory for an authorized turn. That single
 optional string is the compatibility surface architecture §18 names. Phase 2
 does not remove it. It layers over it:
 
-1. If the profile names a `default_resource_id` and that grant is `available`
-   and authorizes the admitted agent, the turn's cwd is that grant's
+1. If the profile's `agent_defaults` names a grant for the admitted agent, or
+   failing that its `default_resource_id` names one, and that grant is
+   `available` and authorizes the agent, the turn's cwd is that grant's
    `local_root`.
 2. Otherwise `Room.workspace_root`, exactly as before.
 3. Otherwise the turn is refused, exactly as before.
@@ -242,8 +255,8 @@ All routes live under `/v1/rooms/persistent/{key}`.
 | route | auth | stage |
 | --- | --- | --- |
 | `GET  .../inspect` | none | **2a (landed with this document)** |
-| `GET  .../profile` | none | 2b |
-| `PUT  .../profile` | operator | 2b |
+| `GET  .../profile` | none | **2b (landed)** |
+| `PUT  .../profile` | operator | **2b (landed)** |
 | `GET  .../resources` | none | 2c |
 | `POST .../resources` | operator | 2c |
 | `GET  .../resources/{resource_id}` | none | 2c |
@@ -312,7 +325,28 @@ Stage 2a (with this document):
 - `inspect` never serializes a bearer: a federated fixture's body contains no
   substring of the installed credential.
 
-Stages 2b to 2d each add their own list before opening; the pattern is Phase
+Stage 2b (landed with the profile routes):
+
+- store: first write is revision 1 with one content-minimal audit row (counts
+  and revision, no remote, no slot name); a second decision bumps to 2;
+  identical replay is idempotent with no audit; changed content under a
+  consumed id is refused and writes nothing; an id consumed by the
+  agent-binding ledger cannot write a profile; unknown room is an error.
+- routes: `GET` is 404 on an unknown room and `profile: null` before any
+  write; `PUT` without the operator header is 503 and a typed validation
+  refusal from an authenticated operator leaves no row and no audit line;
+  `PUT` creates (201), replays (200, `changed: false`), refuses changed
+  content (409 `decision_replay_mismatch`), and a fresh decision bumps the
+  revision; `GET`, `PUT`, and `inspect` serve byte-identical `profile` and
+  `credential_slots`.
+- resolution: `env:` reports presence only; `oauth:` reads block presence and
+  `expires` from the daemon's own `auth.json` and never the token; `expired`
+  outranks `resolver_not_open` outranks `missing`; no projection ever
+  contains a value.
+- admission: a `required` slot that does not resolve refuses the room-agent
+  turn with an audit row naming the slot, and the agent never speaks.
+
+Stages 2c and 2d each add their own list before opening; the pattern is Phase
 1 §12.
 
 ## 10. Rollout gates
@@ -326,15 +360,23 @@ Stages 2b to 2d each add their own list before opening; the pattern is Phase
 - Phase 3 does not open until every stage here is landed and the §9 suites are
   green.
 
-## 11. Open questions for review
+## 11. Open questions — ruled 2026-09-08
 
-1. Should `keychain:` resolution ship in 2b behind a platform gate, or wait for
-   the remote-worker isolation ruling since a keychain read is a broader
-   capability than an env read?
-2. Should a profile be allowed to reference a repo with no contributed folder
-   (pure intent, "this room is about repo X") or must every `RepoRef` bind to a
-   `resource_id`?
-3. Does the Surface want `inspect` to also serve the last N admission audit
-   rows, or is the transcript's System line stream sufficient?
-4. Should `default_resource_id` be per-agent rather than per-room, given two
-   agents in one room may reasonably work in different folders?
+Each was answered by the operator on 2026-09-08 and is binding.
+
+1. **`keychain:` resolution waits for the remote-worker isolation ruling.**
+   A keychain read is a broader capability than an env read. In 2b the scheme
+   is accepted by validation and every slot naming it reports
+   `resolver_not_open`; `oauth:` and `env:` are the only live resolvers.
+2. **A `RepoRef` may have no `resource_id`.** A room that is "about" a repo
+   before anyone contributes a checkout is a real state. `resource_id` remains
+   optional, and when present must name a live grant on this node (2c).
+3. **`inspect` does not serve audit rows.** The transcript's System-line stream
+   is the audit view; a dedicated audit projection is Phase 3 work if the
+   Surface asks for it.
+4. **The default folder is per-agent, with a room default as fallback.** Two
+   agents in one room working in different folders is the normal case. §2.1
+   gains `agent_defaults` — a map from `agent_member_id` to `resource_id` — and
+   §5 rule 1 reads the agent's entry first, then `default_resource_id`. Both
+   are validated the same way and both stay `null`/empty until 2c can name a
+   grant.
