@@ -567,7 +567,7 @@ fn parse_memory(raw: &str) -> Result<MemoryScope, ApiError> {
     }
 }
 
-fn validate_decision_id(raw: &str) -> Result<String, ApiError> {
+pub(super) fn validate_decision_id(raw: &str) -> Result<String, ApiError> {
     let parsed =
         Uuid::parse_str(raw.trim()).map_err(|_| ApiError::bad_request("invalid_decision_id"))?;
     if parsed.is_nil() {
@@ -628,7 +628,7 @@ fn validate_member_id(raw: &str, code: &'static str) -> Result<String, ApiError>
     Ok(id.to_string())
 }
 
-fn decision_digest(input: &impl Serialize) -> Result<String, ApiError> {
+pub(super) fn decision_digest(input: &impl Serialize) -> Result<String, ApiError> {
     let bytes =
         serde_json::to_vec(input).map_err(|_| ApiError::internal("decision_digest_failed"))?;
     let mut digest = Sha256::new();
@@ -637,7 +637,10 @@ fn decision_digest(input: &impl Serialize) -> Result<String, ApiError> {
     Ok(format!("sha256:{:x}", digest.finalize()))
 }
 
-fn operator(state: &AppState, headers: &HeaderMap) -> Result<OperatorPrincipal, ApiError> {
+pub(super) fn operator(
+    state: &AppState,
+    headers: &HeaderMap,
+) -> Result<OperatorPrincipal, ApiError> {
     state
         .room_operator
         .authorize(headers)
@@ -1518,6 +1521,26 @@ pub(super) async fn admit_room_agent(
         )?;
         return Err(ApiError::conflict("activation_policy_refused"));
     }
+    // Phase 2b (manifest §6): a required credential slot that does not resolve
+    // on this node refuses the turn. The audit names the slot, never a value.
+    let blocking = with_rooms(state, |store| {
+        crate::room_profile::blocking_slot(store, room, state.runtime.config_dir())
+    })
+    .map_err(ApiError::from)?;
+    if let Some(slot) = blocking {
+        tracing::warn!(room = %room, agent = agent_member_id, slot, "room-agent admission refused: required credential slot unresolved");
+        append_admission_audit(
+            state,
+            room,
+            &admission_id,
+            &package,
+            agent_member_id,
+            Some(&binding),
+            "refused",
+            "credential_slot_missing",
+        )?;
+        return Err(ApiError::conflict("credential_slot_missing"));
+    }
     let wants_room_memory = binding.memory_scope == MemoryScope::Room;
     let effective_capabilities = binding
         .effective_capabilities()
@@ -1688,42 +1711,42 @@ pub(super) struct ApiError {
 }
 
 impl ApiError {
-    fn bad_request(code: &'static str) -> Self {
+    pub(super) fn bad_request(code: &'static str) -> Self {
         Self {
             status: StatusCode::BAD_REQUEST,
             code,
         }
     }
 
-    fn forbidden(code: &'static str) -> Self {
+    pub(super) fn forbidden(code: &'static str) -> Self {
         Self {
             status: StatusCode::FORBIDDEN,
             code,
         }
     }
 
-    fn not_found(code: &'static str) -> Self {
+    pub(super) fn not_found(code: &'static str) -> Self {
         Self {
             status: StatusCode::NOT_FOUND,
             code,
         }
     }
 
-    fn conflict(code: &'static str) -> Self {
+    pub(super) fn conflict(code: &'static str) -> Self {
         Self {
             status: StatusCode::CONFLICT,
             code,
         }
     }
 
-    fn service_unavailable(code: &'static str) -> Self {
+    pub(super) fn service_unavailable(code: &'static str) -> Self {
         Self {
             status: StatusCode::SERVICE_UNAVAILABLE,
             code,
         }
     }
 
-    fn internal(code: &'static str) -> Self {
+    pub(super) fn internal(code: &'static str) -> Self {
         Self {
             status: StatusCode::INTERNAL_SERVER_ERROR,
             code,

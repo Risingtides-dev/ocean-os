@@ -9459,6 +9459,335 @@ env = { FIXTURE = "1" }
         );
     }
 
+    // ── Profile (Phase 2 Stage 2b) ────────────────────────────────────────────
+
+    async fn profile_request(
+        state: &AppState,
+        method: axum::http::Method,
+        key: &str,
+        body: Option<serde_json::Value>,
+        headers: &[(&str, &str)],
+    ) -> (StatusCode, serde_json::Value) {
+        let app = room_routes().with_state(state.clone());
+        let mut builder = axum::http::Request::builder()
+            .method(method)
+            .uri(format!("/v1/rooms/persistent/{key}/profile"))
+            .header(axum::http::header::CONTENT_TYPE, "application/json");
+        for (name, value) in headers {
+            builder = builder.header(*name, *value);
+        }
+        let resp = app
+            .oneshot(
+                builder
+                    .body(Body::from(body.map(|v| v.to_string()).unwrap_or_default()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let status = resp.status();
+        let body: serde_json::Value = serde_json::from_slice(
+            &axum::body::to_bytes(resp.into_body(), 1024 * 1024)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        (status, body)
+    }
+
+    const OPERATOR: &[(&str, &str)] = &[("x-ocean-operator", "test-room-operator")];
+
+    fn profile_body(decision_id: &str, slot_resolver: &str) -> serde_json::Value {
+        json!({
+            "decision_id": decision_id,
+            "repos": [{"alias": "source", "remote": "git@github.com:Risingtides-dev/ocean-os.git", "default_branch": "main"}],
+            "tools": [{"kind": "mcp", "name": "github", "allowed": ["list_prs"]}],
+            "credential_slots": [{"name": "GH_TOKEN", "purpose": "gh CLI", "required": true, "resolvers": [slot_resolver]}]
+        })
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn profile_get_is_404_on_unknown_room_and_null_before_any_write() {
+        let _guard = AUTO_CONVENE_ENV_LOCK.lock().await;
+        let tmp = tempfile::TempDir::new().unwrap();
+        let state = fake_convene_state(&tmp);
+        let (status, body) =
+            profile_request(&state, axum::http::Method::GET, "no-such-room", None, &[]).await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert_eq!(body["error"], json!("room_not_found"));
+
+        let key = RoomKey::new("profile-empty");
+        seed_access(&state, &key, local_access());
+        let (status, body) =
+            profile_request(&state, axum::http::Method::GET, key.as_str(), None, &[]).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["profile"], serde_json::Value::Null);
+        assert_eq!(body["credential_slots"], json!([]));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn profile_put_requires_the_operator_and_writes_nothing_when_refused() {
+        let _guard = AUTO_CONVENE_ENV_LOCK.lock().await;
+        let tmp = tempfile::TempDir::new().unwrap();
+        let state = fake_convene_state(&tmp);
+        let key = RoomKey::new("profile-gate");
+        seed_access(&state, &key, local_access());
+        let decision = uuid::Uuid::new_v4().to_string();
+
+        let (status, body) = profile_request(
+            &state,
+            axum::http::Method::PUT,
+            key.as_str(),
+            Some(profile_body(&decision, "env:GH_TOKEN")),
+            &[],
+        )
+        .await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{body}");
+        assert_eq!(body["error"], json!("operator_credential_missing"));
+
+        // A typed validation refusal from an authenticated operator also
+        // leaves no row and no audit line.
+        let mut bad = profile_body(&decision, "env:GH_TOKEN");
+        bad["repos"][0]["remote"] = json!("/Users/someone/dev/ocean-os");
+        let (status, body) = profile_request(
+            &state,
+            axum::http::Method::PUT,
+            key.as_str(),
+            Some(bad),
+            OPERATOR,
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+        assert_eq!(body["error"], json!("invalid_repo_remote"));
+
+        let mut early = profile_body(&decision, "env:GH_TOKEN");
+        early["default_resource_id"] = json!("res-1");
+        let (status, body) = profile_request(
+            &state,
+            axum::http::Method::PUT,
+            key.as_str(),
+            Some(early),
+            OPERATOR,
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+        assert_eq!(body["error"], json!("phase_not_open"));
+
+        let (_, body) =
+            profile_request(&state, axum::http::Method::GET, key.as_str(), None, &[]).await;
+        assert_eq!(body["profile"], serde_json::Value::Null);
+        let transcript = with_rooms(&state, |store| store.transcript(&key, None)).unwrap();
+        assert!(transcript.is_empty(), "refusals must not mint audit rows");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn profile_put_creates_then_replays_idempotently_and_refuses_changed_content() {
+        let _guard = AUTO_CONVENE_ENV_LOCK.lock().await;
+        let _env = TestEnvRestore::capture(&["OCEAN_TEST_GH_SLOT"]);
+        std::env::set_var("OCEAN_TEST_GH_SLOT", "present-but-never-projected");
+        let tmp = tempfile::TempDir::new().unwrap();
+        let state = fake_convene_state(&tmp);
+        let key = RoomKey::new("profile-write");
+        seed_access(&state, &key, local_access());
+        let decision = uuid::Uuid::new_v4().to_string();
+        let body = profile_body(&decision, "env:OCEAN_TEST_GH_SLOT");
+
+        let (status, first) = profile_request(
+            &state,
+            axum::http::Method::PUT,
+            key.as_str(),
+            Some(body.clone()),
+            OPERATOR,
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED, "{first}");
+        assert_eq!(first["changed"], json!(true));
+        assert_eq!(first["profile"]["revision"], json!("1"));
+        assert_eq!(first["profile"]["repos"][0]["alias"], json!("source"));
+        assert_eq!(first["profile"]["tools"][0]["installed"], json!("unknown"));
+        assert_eq!(first["credential_slots"][0]["name"], json!("GH_TOKEN"));
+        assert_eq!(first["credential_slots"][0]["status"], json!("resolved"));
+        assert_eq!(
+            first["credential_slots"][0]["resolver"],
+            json!("env:OCEAN_TEST_GH_SLOT")
+        );
+        assert!(!first.to_string().contains("present-but-never-projected"));
+
+        // GET and inspect agree with PUT.
+        let (_, got) =
+            profile_request(&state, axum::http::Method::GET, key.as_str(), None, &[]).await;
+        assert_eq!(got["profile"], first["profile"]);
+        assert_eq!(got["credential_slots"], first["credential_slots"]);
+        let (_, inspected) = inspect_response(&state, key.as_str()).await;
+        assert_eq!(inspected["profile"], first["profile"]);
+        assert_eq!(inspected["credential_slots"], first["credential_slots"]);
+
+        // One content-minimal audit row.
+        let transcript = with_rooms(&state, |store| store.transcript(&key, None)).unwrap();
+        assert_eq!(transcript.len(), 1);
+        let audit: serde_json::Value = serde_json::from_str(&transcript[0].body).unwrap();
+        assert_eq!(audit["type"], json!("room.profile.created"));
+        assert!(!transcript[0].body.contains("GH_TOKEN"));
+        assert!(!transcript[0].body.contains("github.com"));
+
+        // Exact replay: 200, unchanged, still revision 1, no second audit row.
+        let (status, replay) = profile_request(
+            &state,
+            axum::http::Method::PUT,
+            key.as_str(),
+            Some(body.clone()),
+            OPERATOR,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{replay}");
+        assert_eq!(replay["changed"], json!(false));
+        assert_eq!(replay["profile"]["revision"], json!("1"));
+        assert_eq!(
+            with_rooms(&state, |store| store.transcript(&key, None))
+                .unwrap()
+                .len(),
+            1
+        );
+
+        // Same decision, different content: refused, nothing moves.
+        let mut changed = body.clone();
+        changed["repos"] = json!([]);
+        let (status, refused) = profile_request(
+            &state,
+            axum::http::Method::PUT,
+            key.as_str(),
+            Some(changed),
+            OPERATOR,
+        )
+        .await;
+        assert_eq!(status, StatusCode::CONFLICT, "{refused}");
+        assert_eq!(refused["error"], json!("decision_replay_mismatch"));
+        let (_, got) =
+            profile_request(&state, axum::http::Method::GET, key.as_str(), None, &[]).await;
+        assert_eq!(got["profile"]["revision"], json!("1"));
+        assert_eq!(got["profile"]["repos"].as_array().unwrap().len(), 1);
+
+        // A fresh decision bumps the revision.
+        let mut next = body.clone();
+        next["decision_id"] = json!(uuid::Uuid::new_v4().to_string());
+        next["repos"] = json!([]);
+        let (status, second) = profile_request(
+            &state,
+            axum::http::Method::PUT,
+            key.as_str(),
+            Some(next),
+            OPERATOR,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{second}");
+        assert_eq!(second["profile"]["revision"], json!("2"));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_required_unresolved_slot_refuses_room_agent_admission_with_a_named_audit() {
+        let _guard = AUTO_CONVENE_ENV_LOCK.lock().await;
+        let _env = TestEnvRestore::capture(&["OCEAN_AGENTS_DIR", "OCEAN_TEST_UNSET_SLOT"]);
+        std::env::remove_var("OCEAN_TEST_UNSET_SLOT");
+        let tmp = tempfile::TempDir::new().unwrap();
+        let state = fake_convene_state(&tmp);
+        let agents_root = tmp.path().join("agents");
+        write_agent_fixture(&agents_root, "helper", r#"model = "fake-ok""#, None);
+        std::env::set_var("OCEAN_AGENTS_DIR", &agents_root);
+
+        let key = RoomKey::new("profile-admission");
+        with_rooms(&state, |store| {
+            store.create_in_workspace(
+                key.clone(),
+                "Profile Admission",
+                Some(canonical_test_workspace(tmp.path())),
+                Some(RoomTriggerPolicy {
+                    on_mention: true,
+                    ..Default::default()
+                }),
+                Utc::now(),
+            )?;
+            store.add_participant(
+                &key,
+                RoomParticipant {
+                    id: "john".into(),
+                    kind: RoomParticipantKind::Human,
+                    display_name: "John".into(),
+                },
+                Utc::now(),
+            )?;
+            store.add_agent_participant_with_owner(
+                &key,
+                RoomParticipant {
+                    id: "helper".into(),
+                    kind: RoomParticipantKind::Agent,
+                    display_name: "Helper".into(),
+                },
+                "john",
+                Utc::now(),
+            )?;
+            Ok::<_, ocean_store::RoomStoreError>(())
+        })
+        .unwrap();
+        let _generation = authorize_room_agent_fixture(
+            &state,
+            &key,
+            "helper",
+            ActivationPolicy::Mention,
+            ContextPolicy::InvocationOnly,
+        );
+        let (status, body) = profile_request(
+            &state,
+            axum::http::Method::PUT,
+            key.as_str(),
+            Some(profile_body(
+                &uuid::Uuid::new_v4().to_string(),
+                "env:OCEAN_TEST_UNSET_SLOT",
+            )),
+            OPERATOR,
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED, "{body}");
+        assert_eq!(body["credential_slots"][0]["status"], json!("missing"));
+
+        let (status, _) = room_post_message(
+            State(state.clone()),
+            Path(key.as_str().to_string()),
+            Json(RoomMessageRequest {
+                author_id: "john".into(),
+                author_kind: RoomParticipantKind::Human,
+                body: "@helper go".into(),
+                thread_parent_seq: None,
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED);
+
+        let mut refusal = None;
+        for _ in 0..100 {
+            refusal = with_rooms(&state, |store| store.transcript(&key, None))
+                .unwrap()
+                .into_iter()
+                .find(|m| {
+                    matches!(m.kind, RoomMessageKind::System)
+                        && m.body
+                            .contains("\"reason_code\":\"credential_slot_missing\"")
+                });
+            if refusal.is_some() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        let refusal = refusal.expect("admission must be refused with a named audit row");
+        let audit: serde_json::Value = serde_json::from_str(&refusal.body).unwrap();
+        assert_eq!(audit["outcome"], json!("refused"));
+        assert_eq!(audit["agent_member_id"], json!("helper"));
+        // The agent never spoke.
+        let spoke = with_rooms(&state, |store| store.transcript(&key, None))
+            .unwrap()
+            .iter()
+            .any(|m| m.author_id == "helper" && matches!(m.kind, RoomMessageKind::Message));
+        assert!(!spoke, "a refused admission must not produce agent output");
+    }
+
     // ── Snapshot tail paging (`before_seq`) ──────────────────────────────────
 
     /// GET a snapshot with a raw query string and return `(status, body)`.

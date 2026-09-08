@@ -9637,3 +9637,19 @@ area:      [backend]
 
 John could not see how Rooms organizes sessions, where agents execute, or how repos/tools/auth would attach per room. Wrote the proposed Phase 2 manifest (docs/specs/2026-09-08-ocean-rooms-phase2-room-profile-and-contributed-folders-manifest.md): a room profile that carries repo, tool, and credential-slot REFERENCES resolved on the executing node (never tokens, per architecture §12.7 and Gate 0 Decision 13), local folder grants with path confinement and generations, slot-status resolution, and a staged 2a→2d rollout. Landed Stage 2a: read-only GET /v1/rooms/persistent/{key}/inspect (new room_inspect.rs) projecting room, access, federated bool, owner, every binding with its deterministic session id and session_exists, truthful execution.cwd_source (room_workspace_root | unbound — found that an authorized turn with no live workspace is refused, not run from daemon cwd, and corrected the manifest to match), and empty profile/credential_slots/resources slots. Five HTTP tests plus three unit tests; clippy, fmt, docs-check green. Stages 2b–2d stay closed pending acceptance.
 _________________________________________________________________________________ 11:20 cc/rooms-architecture-sessions-60d21b
+time:      [12:05] [08-09-26]
+agent:     [claude] [fable-5.1]
+worktree:  cc/rooms-phase2-2b
+type:      [goal]
+area:      [backend]
+
+John ruled yes on all four Phase 2 open questions (keychain resolver deferred; RepoRef may lack a folder; no audit rows in inspect; per-agent default folder with room fallback) and accepted the manifest. Flipped docs/specs/2026-09-08-ocean-rooms-phase2-room-profile-and-contributed-folders-manifest.md to operator-accepted, recorded the rulings in §11 (and the agent_defaults field + phase_not_open 2b restriction they imply), and added an ongoing GOAL to ROADMAP.md under Ocean Rooms: carry 2b → 2c → 2d through on green gates without re-approval, closing with a live inspect that shows a real agent, folder, and resolved slots in the campaigns room. Deployed the Stage 2a inspect route from a clean origin/main worktree (daemon rev f7080b00); live inspect showed zero authorized agents in every room and 3 of 4 rooms unbound. Starting Stage 2b (room profile record, GET/PUT routes, credential-slot status) now.
+_________________________________________________________________________________ 12:05 cc/rooms-phase2-2b
+time:      [13:10] [08-09-26]
+agent:     [claude] [fable-5.1]
+worktree:  cc/rooms-phase2-2b
+type:      [feature-request]
+area:      [backend]
+
+Rooms Phase 2 Stage 2b implemented under the authorized program. ocean-store gains room_profile.rs (room_profiles + room_profile_decisions tables, RoomProfile/RepoRef/ToolRef/CredentialSlot types, put/get with room-wide decision replay across both ledgers, one content-minimal audit row per real write; 8 tests). ocean-daemon gains room_profile.rs: credential-free GET and operator-gated replay-safe PUT /v1/rooms/persistent/{key}/profile with total typed validation (path-shaped remotes refused, three-scheme resolver grammar, phase_not_open for any 2c resource reference), credential-slot STATUS resolution (env presence; oauth block presence + expires from the daemon's own auth.json; keychain reports resolver_not_open; values never projected), inspect now serves profile + slot statuses, and admit_room_agent refuses a turn whose required slot is unresolved with 409 credential_slot_missing and a named audit row. Route baseline 125 -> 127, operator guide entries added. Deviation recorded in the manifest: tool installed-status is reported not enforced until 2d. Gates: ocean-store 222 tests, room daemon modules 145 tests, clippy -D warnings, fmt, docs-check green.
+_________________________________________________________________________________ 13:10 cc/rooms-phase2-2b

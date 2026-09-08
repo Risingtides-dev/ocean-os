@@ -3781,6 +3781,7 @@ dependencies = [
  "chrono",
  "ocean-core",
  "rusqlite",
+ "serde",
  "serde_json",
  "tempfile",
 ]

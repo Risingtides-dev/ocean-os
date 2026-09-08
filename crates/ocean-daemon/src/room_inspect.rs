@@ -108,6 +108,7 @@ pub(super) async fn room_inspect(
         let federated = store.room_credential(&key)?.is_some();
         let owner = store.local_room_owner(&key)?;
         let bindings = store.room_agent_bindings(&key)?;
+        let profile = store.room_profile(&key)?;
         Ok::<_, RoomStoreError>(Some((
             record.room,
             closed,
@@ -115,12 +116,15 @@ pub(super) async fn room_inspect(
             federated,
             owner,
             bindings,
+            profile,
         )))
     });
 
     match result {
-        Ok(Some((room, closed, access, federated, owner, bindings))) => {
+        Ok(Some((room, closed, access, federated, owner, bindings, profile))) => {
             let (cwd, cwd_source) = resolve_execution(room.workspace_root.as_deref());
+            let (profile, credential_slots) =
+                crate::room_profile::profile_with_slots(&state, profile.as_ref());
             // Session existence is a filesystem read outside the store lock; a
             // session file appearing between the two reads only moves this
             // flag from false to true, never the other way, so the projection
@@ -169,12 +173,12 @@ pub(super) async fn room_inspect(
                         "cwd_source": cwd_source.as_str(),
                     },
                     "agents": agents,
-                    // Phase 2 slots. Stage 2b fills `profile` and
-                    // `credential_slots`; Stage 2c fills `resources`. Serving
-                    // them empty now means a client written against the final
-                    // shape needs no change when they arrive.
-                    "profile": Value::Null,
-                    "credential_slots": [],
+                    // Stage 2b: the profile and each slot's STATUS on this
+                    // node (never a value). Stage 2c fills `resources`; served
+                    // empty now so a client written against the final shape
+                    // needs no change when it arrives.
+                    "profile": profile,
+                    "credential_slots": credential_slots,
                     "resources": [],
                 })),
             )
