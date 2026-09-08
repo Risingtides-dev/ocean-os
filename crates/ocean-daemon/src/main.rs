@@ -27069,12 +27069,12 @@ mod tests {
         // 129 -> 135: Rooms Phase 2 Stage 2c local contributed folders —
         // list/grant/get/revoke/suspend/resume of generation-bound grants
         // whose local_root never leaves the daemon.
-        // 133 -> 135: Rooms Phase 2 Stage 2d operator preview of the
+        // 135 -> 137: Rooms Phase 2 Stage 2d operator preview of the
         // admitted room_list / room_read tools under the agent's current
         // binding generation.
         assert_eq!(
             banner.len(),
-            135,
+            137,
             "route baseline changed; review the manifest"
         );
 

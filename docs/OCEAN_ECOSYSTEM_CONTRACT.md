@@ -196,6 +196,8 @@ The **Auth** column names what a caller must present BEYOND reaching the daemon.
 | `DELETE` | `/v1/rooms/persistent/{key}/resources/{resource_id}` | Revoke one grant permanently and advance its generation. | `X-Ocean-Operator`; replay-safe decision id |
 | `POST` | `/v1/rooms/persistent/{key}/resources/{resource_id}/suspend` | Suspend one local resource grant. | `X-Ocean-Operator`; replay-safe decision id |
 | `POST` | `/v1/rooms/persistent/{key}/resources/{resource_id}/resume` | Resume one suspended local resource grant. | `X-Ocean-Operator`; replay-safe decision id |
+| `POST` | `/v1/rooms/persistent/{key}/resources/{resource_id}/list` | Preview bounded folder listing through the named agent's current binding and per-call resource authority. | `X-Ocean-Operator`; active agent binding; audited |
+| `POST` | `/v1/rooms/persistent/{key}/resources/{resource_id}/read` | Preview one bounded UTF-8 chunk through the same admitted read tool and resource authority. | `X-Ocean-Operator`; active agent binding; audited |
 | `GET` | `/v1/rooms/persistent/{key}/events` | Merged SSE tail: the initial full access projection, then id-bearing message frames and access updates. | Loopback trust only |
 | `GET` | `/v1/rooms/persistent/{key}/read-cursor` | Fetch the daemon-owned read-cursor projection; Local and Live rooms only. | Loopback trust only |
 | `PATCH` | `/v1/rooms/persistent/{key}/read-cursor` | Advance the daemon-owned read cursor monotonically and publish the wake. | Loopback trust only |
