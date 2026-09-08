@@ -1,6 +1,6 @@
 # Ocean Rooms — Phase 2 implementation manifest: room profile and local contributed folders
 
-**Status:** operator-accepted 2026-09-08 with the four §11 rulings recorded below; concurrent implementation and review per the Phase 1 deviation. Stage 2a (`inspect` route) landed through Ocean OS PR #454. Stage 2b (room profile record, `GET`/`PUT .../profile`, credential-slot status on read and at admission) is implemented; 2c and 2d open in order as §10 gates pass. The operator has authorized this as an ongoing program: work continues through 2b → 2c → 2d without repeated approval prompts, pausing only for a concrete blocker or a design decision this document does not already settle.
+**Status:** operator-accepted 2026-09-08 with the four §11 rulings recorded below; concurrent implementation and review per the Phase 1 deviation. Stage 2a (`inspect` route) landed through Ocean OS PR #454. Stage 2b (room profile record, `GET`/`PUT .../profile`, credential-slot status on read and at admission) landed through Ocean OS PR #455 and is proven live. Stage 2c (local folder grants, dangerous-root refusal, path confinement, generation-bound status, the §5 cwd rule in the convene path and in `inspect`) is implemented; 2d opens as the §10 gate passes. The operator has authorized this as an ongoing program: work continues through 2b → 2c → 2d without repeated approval prompts, pausing only for a concrete blocker or a design decision this document does not already settle.
 **Date:** 2026-09-08
 **Phase:** 2 of the Decision 6 capability delivery order
 **Authorizing documents:**
@@ -257,12 +257,12 @@ All routes live under `/v1/rooms/persistent/{key}`.
 | `GET  .../inspect` | none | **2a (landed with this document)** |
 | `GET  .../profile` | none | **2b (landed)** |
 | `PUT  .../profile` | operator | **2b (landed)** |
-| `GET  .../resources` | none | 2c |
-| `POST .../resources` | operator | 2c |
-| `GET  .../resources/{resource_id}` | none | 2c |
-| `POST .../resources/{resource_id}/suspend` | operator | 2c |
-| `POST .../resources/{resource_id}/resume` | operator | 2c |
-| `DELETE .../resources/{resource_id}` | operator | 2c |
+| `GET  .../resources` | none | **2c (landed)** |
+| `POST .../resources` | operator | **2c (landed)** |
+| `GET  .../resources/{resource_id}` | none | **2c (landed)** |
+| `POST .../resources/{resource_id}/suspend` | operator | **2c (landed)** |
+| `POST .../resources/{resource_id}/resume` | operator | **2c (landed)** |
+| `DELETE .../resources/{resource_id}` | operator | **2c (landed)** |
 | `POST .../resources/{resource_id}/list` | binding + grant | 2d |
 | `POST .../resources/{resource_id}/read` | binding + grant | 2d |
 
@@ -346,8 +346,39 @@ Stage 2b (landed with the profile routes):
 - admission: a `required` slot that does not resolve refuses the room-agent
   turn with an audit row naming the slot, and the agent never speaks.
 
-Stages 2c and 2d each add their own list before opening; the pattern is Phase
-1 §12.
+Stage 2c (landed with the resource routes):
+
+- store: a grant is generation 1 and `available` with an audit row that names
+  the id and alias but never the root; one live grant per canonical root
+  until revoked, and a revoked root may be granted again as a new id; an
+  expired live grant reads `revoked` at every check and is retired in the
+  same transaction when its root is granted again; suspend/resume/revoke each
+  bump the generation, a no-op transition consumes the decision without
+  bumping, and revoked is terminal; replay is idempotent and a decision
+  consumed by any other ledger is refused; unknown room and unknown grant
+  are errors.
+- daemon: every §4 dangerous root is refused by name (`/`, `$HOME` itself, a
+  symlinked root, a non-directory, plus not-absolute, dot components, and
+  missing); confinement is on the canonical RESULT — an in-folder symlink
+  pointing outside is `path_escapes_root` while one pointing inside resolves;
+  the safe projection never carries `local_root` or the digest, and an
+  expired grant projects as `revoked`; an agent's `execution` projection
+  carries `resource_id` and `grant_generation` but never a grant's path.
+- routes: unauthenticated grant is 503 and writes nothing; dangerous and
+  malformed roots each answer their own code and write nothing; a real grant
+  is 201, exact replay 200 `created:false`, same root under a new decision
+  409 `root_already_granted`; list, get, and `inspect` serve one identical
+  rootless projection; suspend → resume → revoke bump generations 2 → 3 → 4
+  and a transition out of revoked is 409; the audit ledger is exactly
+  `granted, suspended, resumed, revoked, granted` with no root in any row.
+- the cwd rule: a profile referencing a grant that does not exist is 400
+  `resource_not_found` before any digest; with no workspace and no grant the
+  agent is `unbound`; after a grant naming the agent and an `agent_defaults`
+  entry, `inspect` reports `resource_grant` with the id and generation and
+  no `cwd`, and a mention actually convenes the agent and it replies;
+  suspending the grant makes the same agent `unbound` again.
+
+Stage 2d adds its own list before opening; the pattern is Phase 1 §12.
 
 ## 10. Rollout gates
 

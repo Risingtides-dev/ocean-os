@@ -239,7 +239,7 @@ impl SqliteRoomStore {
             .transpose()
     }
 
-    /// Whether `decision_id` has already been consumed in this room by EITHER
+    /// Whether `decision_id` has already been consumed in this room by ANY
     /// authority ledger, and with what digest. The namespace is room-wide so
     /// one approval can never be replayed across authority kinds.
     pub fn room_profile_decision(
@@ -247,27 +247,7 @@ impl SqliteRoomStore {
         key: &RoomKey,
         decision_id: &str,
     ) -> Result<Option<String>> {
-        if let Some(digest) = self
-            .conn
-            .query_row(
-                "SELECT request_digest FROM room_profile_decisions
-                  WHERE room_id = ?1 AND decision_id = ?2",
-                params![key.as_str(), decision_id],
-                |row| row.get::<_, String>(0),
-            )
-            .optional()?
-        {
-            return Ok(Some(digest));
-        }
-        self.conn
-            .query_row(
-                "SELECT request_digest FROM room_agent_decisions
-                  WHERE room_id = ?1 AND decision_id = ?2",
-                params![key.as_str(), decision_id],
-                |row| row.get::<_, String>(0),
-            )
-            .optional()
-            .map_err(RoomStoreError::from)
+        super::room_resources::consumed_decision_on(&self.conn, key, decision_id)
     }
 
     /// Write the room's profile under one operator decision.
@@ -315,15 +295,10 @@ impl SqliteRoomStore {
                 |row| row.get(0),
             )
             .optional()?;
-        let prior_agent: Option<String> = tx
-            .query_row(
-                "SELECT request_digest FROM room_agent_decisions
-                  WHERE room_id = ?1 AND decision_id = ?2",
-                params![key.as_str(), input.decision_id],
-                |row| row.get(0),
-            )
-            .optional()?;
-        if prior_agent.is_some() {
+        let prior_any = super::room_resources::consumed_decision_on(&tx, key, &input.decision_id)?;
+        if prior_any.is_some() && prior_profile.is_none() {
+            // Consumed by another ledger: an approval for one authority kind
+            // never mints another, whatever its digest.
             return Err(RoomStoreError::DecisionReplayMismatch {
                 room: key.clone(),
                 decision_id: input.decision_id,

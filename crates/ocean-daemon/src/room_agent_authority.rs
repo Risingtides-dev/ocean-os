@@ -618,7 +618,7 @@ const MEMBER_ID_MAX_CHARS: usize = 128;
 /// here had to reach the `participants` table first. What this closes is the
 /// step after that — such a row can no longer be spent minting a permanent
 /// audit line that repeats it.
-fn validate_member_id(raw: &str, code: &'static str) -> Result<String, ApiError> {
+pub(super) fn validate_member_id(raw: &str, code: &'static str) -> Result<String, ApiError> {
     if raw.chars().any(|c| c.is_control()) {
         return Err(ApiError::bad_request(code));
     }
@@ -1830,6 +1830,13 @@ impl From<RoomStoreError> for ApiError {
                 Self::conflict("bootstrap_target_conflict")
             }
             RoomStoreError::InvalidAgentOwner { .. } => Self::forbidden("room_owner_required"),
+            RoomStoreError::ResourceRootAlreadyGranted { .. } => {
+                Self::conflict("root_already_granted")
+            }
+            RoomStoreError::UnknownResourceGrant { .. } => Self::not_found("resource_not_found"),
+            RoomStoreError::ResourceStatusConflict { .. } => {
+                Self::conflict("resource_status_conflict")
+            }
             RoomStoreError::Encode(_) => Self::bad_request("invalid_request"),
             _ => Self::internal("room_store_error"),
         }

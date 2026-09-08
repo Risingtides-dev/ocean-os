@@ -169,6 +169,7 @@ mod room_maintenance;
 #[allow(dead_code)]
 mod room_operator;
 mod room_profile;
+mod room_resources;
 /// One-shot room-transcript summary into the room's well-known artifact.
 mod room_summary;
 /// Membership-gated lane from a browser to a room's Bedrock workspace: an
@@ -1690,6 +1691,12 @@ fn banner_routes() -> &'static [&'static str] {
         "GET /v1/rooms/persistent/{key}/inspect",
         "GET /v1/rooms/persistent/{key}/profile",
         "PUT /v1/rooms/persistent/{key}/profile",
+        "GET /v1/rooms/persistent/{key}/resources",
+        "POST /v1/rooms/persistent/{key}/resources",
+        "GET /v1/rooms/persistent/{key}/resources/{resource_id}",
+        "DELETE /v1/rooms/persistent/{key}/resources/{resource_id}",
+        "POST /v1/rooms/persistent/{key}/resources/{resource_id}/suspend",
+        "POST /v1/rooms/persistent/{key}/resources/{resource_id}/resume",
         "GET /v1/rooms/persistent/{key}/events",
         "GET /v1/rooms/persistent/{key}/read-cursor",
         "PATCH /v1/rooms/persistent/{key}/read-cursor",
@@ -3145,6 +3152,22 @@ fn room_routes() -> Router<AppState> {
         .route(
             "/v1/rooms/persistent/{key}/profile",
             get(room_profile::room_profile_get).put(room_profile::room_profile_put),
+        )
+        .route(
+            "/v1/rooms/persistent/{key}/resources",
+            get(room_resources::room_resources_list).post(room_resources::room_resource_grant),
+        )
+        .route(
+            "/v1/rooms/persistent/{key}/resources/{resource_id}",
+            get(room_resources::room_resource_get).delete(room_resources::room_resource_revoke),
+        )
+        .route(
+            "/v1/rooms/persistent/{key}/resources/{resource_id}/suspend",
+            post(room_resources::room_resource_suspend),
+        )
+        .route(
+            "/v1/rooms/persistent/{key}/resources/{resource_id}/resume",
+            post(room_resources::room_resource_resume),
         )
         .route(
             "/v1/rooms/persistent/{key}/agents/bootstrap",
@@ -16869,7 +16892,7 @@ mod tests {
     /// Poll the room transcript until `pred` matches a message or the deadline
     /// passes. The convened turn runs on a spawned task, so the reply lands
     /// asynchronously after `room_post_message` returns.
-    async fn wait_for_message(
+    pub(super) async fn wait_for_message(
         state: &AppState,
         key: &RoomKey,
         pred: impl Fn(&ocean_core::RoomMessage) -> bool,
@@ -27033,9 +27056,12 @@ mod tests {
         // 127 -> 129: Rooms Phase 2 Stage 2b room profile — credential-free
         // GET and operator-gated, replay-safe PUT of the references-only
         // profile (repos, tools, credential slots) with slot STATUS on read.
+        // 129 -> 135: Rooms Phase 2 Stage 2c local contributed folders —
+        // list/grant/get/revoke/suspend/resume of generation-bound grants
+        // whose local_root never leaves the daemon.
         assert_eq!(
             banner.len(),
-            129,
+            135,
             "route baseline changed; review the manifest"
         );
 

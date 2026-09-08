@@ -46,8 +46,9 @@ across those computers. The architecture does not itself authorize code changes.
       read-only `inspect` route) landed through Ocean OS PR #454.
 - [ ] **Goal (authorized 2026-09-08, ongoing):** carry Phase 2 through its
       stages without re-approval — 2b room profile record, routes, and
-      credential-slot status; 2c local folder grants with path confinement and
-      generation-safe revocation; 2d resource-aware `list`/`read` tools — each
+      credential-slot status (landed, PR #455, proven live on `campaigns`);
+      2c local folder grants with path confinement and generation-safe
+      revocation (implemented); 2d resource-aware `list`/`read` tools — each
       landing on green gates with its §9 tests, and closing with a live
       `inspect` that shows a real agent, a real folder, and resolved slots in
       the `campaigns` room. Pause only for a concrete blocker or a design
