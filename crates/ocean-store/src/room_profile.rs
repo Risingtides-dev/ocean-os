@@ -275,7 +275,7 @@ impl SqliteRoomStore {
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
         let exists: Option<i64> = tx
             .query_row(
-                "SELECT 1 FROM rooms WHERE id = ?1",
+                "SELECT 1 FROM rooms WHERE id = ?1 AND closed_at IS NULL",
                 params![key.as_str()],
                 |row| row.get(0),
             )
@@ -465,6 +465,43 @@ mod tests {
             updated_by: "operator-1".into(),
             decision_id: decision.into(),
             request_digest: digest.into(),
+        }
+    }
+
+    #[test]
+    fn closed_profiles_refuse_fresh_and_replayed_writes_even_after_retention() {
+        let (mut s, key) = room();
+        let (before, _, _) = s
+            .put_room_profile(&key, input("dec-1", "digest-1"), Utc::now())
+            .unwrap();
+        s.close_with_marker(&key, crate::RoomCloser::Operator("operator"), Utc::now())
+            .unwrap();
+        for cut in [false, true] {
+            if cut {
+                s.cut_closed_room(&key).unwrap();
+            }
+            let messages = s
+                .get_including_closed(&key)
+                .unwrap()
+                .unwrap()
+                .transcript
+                .len();
+            for request in [input("dec-1", "digest-1"), input("dec-2", "digest-2")] {
+                assert!(matches!(
+                    s.put_room_profile(&key, request, Utc::now()),
+                    Err(RoomStoreError::UnknownRoom(_))
+                ));
+            }
+            assert_eq!(s.room_profile(&key).unwrap(), Some(before.clone()));
+            assert!(s.room_profile_decision(&key, "dec-2").unwrap().is_none());
+            assert_eq!(
+                s.get_including_closed(&key)
+                    .unwrap()
+                    .unwrap()
+                    .transcript
+                    .len(),
+                messages
+            );
         }
     }
 

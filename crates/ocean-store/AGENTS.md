@@ -60,6 +60,17 @@ outbox, and the restart-safe federation core (S2 P2-A). One database file
 
 ### Load-bearing invariants
 
+- **Close freezes content and authority in the writer's transaction.** Profile,
+  resource grant/status, roster/ownership, artifact/attachment, transcript,
+  credential installation, binding, cursor, projection and outbox mutations
+  require `closed_at IS NULL` inside their IMMEDIATE transaction or single SQL
+  statement, including exact retries. A pre-transaction check is not sufficient.
+  Retained binding rows are audit data: closed rooms never pass the active
+  generation predicate or the transactional output/history authority check.
+  Retention cuts remain allowed, as does secret revocation. Separate content-free
+  resource-operation audit rows may record late completions/refusals; they must
+  never repopulate the Room transcript, authority, or read state.
+
 - **Durability settings live in ONE named place and are read back, never
   assumed.** `apply_durability_pragmas` is the only place production PRAGMAs are
   set, and `open()` — the single file-backed open path — applies it BEFORE
@@ -450,6 +461,12 @@ outbox, and the restart-safe federation core (S2 P2-A). One database file
   bans ordering and `MAX()` on those TEXT columns. Only the row's id travels,
   never its payload; an outbox payload is a room message.
 
+### Profile and resource ownership
+
+- `room_profile.rs` (Rooms Phase 2b) owns the `room_profiles` + `room_profile_decisions` tables and the `RoomProfile` / `RepoRef` / `ToolRef` / `CredentialSlot` types (serde-encoded JSON columns, canonical-decimal `revision`). `put_room_profile` is one IMMEDIATE transaction: replay check across BOTH decision ledgers first (an id the agent-binding ledger consumed is a `DecisionReplayMismatch`), identical replay returns `(profile, false, None)` with no audit and no revision bump, a real write upserts, records the decision, appends one content-minimal System audit row (counts + revision only), and touches the room. `room_profile` on an unknown room is `UnknownRoom`, never `None`. Nothing here is a secret: `resolvers` name where to look; the daemon computes status.
+
+- `room_resources.rs` (Rooms Phase 2c) owns `room_resource_grants` (partial UNIQUE index on `(room_id, local_root) WHERE status <> 'revoked'`) and `room_resource_decisions`, the `RoomResourceGrant` / `ResourceAccessMode` (ordered ladder) / `ResourceStatus` types, and `consumed_decision_on` — the ONE room-wide decision check across all three ledgers (agent bindings, profile, resources) that `room_profile.rs` also calls. `grant_room_resource` mints an opaque `res-<32hex>` id via SQLite `randomblob`, is generation 1, retires an EXPIRED live grant on the same root inside the same transaction, and writes an audit row from alias + id, never the root. `set_room_resource_status` bumps the generation on every real transition, consumes a no-op decision without bumping, and keeps `revoked` terminal (`ResourceStatusConflict`). `RoomResourceGrant::effective_status` is what every check must use: expiry reads `revoked`. Phase 2d adds `room_resource_audit` (`append_room_resource_audit` / `room_resource_audit_recent`): one row per admitted `list`/`read`, refused or not, with binding and grant generations, op, a SHA-256 path DIGEST, byte/entry counts, outcome, and actor — no path text, no content, no room message.
+
 ## Work Guidance
 
 - Add new durable state to this crate; do not let the daemon or a network
@@ -470,7 +487,3 @@ outbox, and the restart-safe federation core (S2 P2-A). One database file
 ## Child devlog Index
 
 - (none)
-
-- `room_profile.rs` (Rooms Phase 2b) owns the `room_profiles` + `room_profile_decisions` tables and the `RoomProfile` / `RepoRef` / `ToolRef` / `CredentialSlot` types (serde-encoded JSON columns, canonical-decimal `revision`). `put_room_profile` is one IMMEDIATE transaction: replay check across BOTH decision ledgers first (an id the agent-binding ledger consumed is a `DecisionReplayMismatch`), identical replay returns `(profile, false, None)` with no audit and no revision bump, a real write upserts, records the decision, appends one content-minimal System audit row (counts + revision only), and touches the room. `room_profile` on an unknown room is `UnknownRoom`, never `None`. Nothing here is a secret: `resolvers` name where to look; the daemon computes status.
-
-- `room_resources.rs` (Rooms Phase 2c) owns `room_resource_grants` (partial UNIQUE index on `(room_id, local_root) WHERE status <> 'revoked'`) and `room_resource_decisions`, the `RoomResourceGrant` / `ResourceAccessMode` (ordered ladder) / `ResourceStatus` types, and `consumed_decision_on` — the ONE room-wide decision check across all three ledgers (agent bindings, profile, resources) that `room_profile.rs` also calls. `grant_room_resource` mints an opaque `res-<32hex>` id via SQLite `randomblob`, is generation 1, retires an EXPIRED live grant on the same root inside the same transaction, and writes an audit row from alias + id, never the root. `set_room_resource_status` bumps the generation on every real transition, consumes a no-op decision without bumping, and keeps `revoked` terminal (`ResourceStatusConflict`). `RoomResourceGrant::effective_status` is what every check must use: expiry reads `revoked`. Phase 2d adds `room_resource_audit` (`append_room_resource_audit` / `room_resource_audit_recent`): one row per admitted `list`/`read`, refused or not, with binding and grant generations, op, a SHA-256 path DIGEST, byte/entry counts, outcome, and actor — no path text, no content, no room message.

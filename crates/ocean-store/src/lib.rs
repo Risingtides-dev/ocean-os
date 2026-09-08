@@ -2687,6 +2687,9 @@ impl SqliteRoomStore {
         let tx = self
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        if !Self::room_is_open_on(&tx, key)? {
+            return Err(RoomStoreError::UnknownRoom(key.clone()));
+        }
         Self::require_roster_author_on(&tx, key, author)?;
         // The route guards this too, but a guard that lives only on the route is
         // the shape this refusal exists to remove: the store is the one choke
@@ -2780,6 +2783,9 @@ impl SqliteRoomStore {
         let tx = self
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        if !Self::room_is_open_on(&tx, key)? {
+            return Err(RoomStoreError::UnknownRoom(key.clone()));
+        }
         Self::require_roster_author_on(&tx, key, author)?;
         // An amend that carries a blank title would erase the one thing the room
         // uses to name this artifact, permanently — the old title survives
@@ -2982,6 +2988,9 @@ impl SqliteRoomStore {
         let tx = self
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        if !Self::room_is_open_on(&tx, key)? {
+            return Err(RoomStoreError::UnknownRoom(key.clone()));
+        }
         if !Self::roster_has_on(&tx, key, uploader)? {
             return Err(RoomStoreError::AttachmentUploaderNotInRoster {
                 room: key.clone(),
@@ -3059,6 +3068,9 @@ impl SqliteRoomStore {
         let tx = self
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        if !Self::room_is_open_on(&tx, key)? {
+            return Err(RoomStoreError::UnknownRoom(key.clone()));
+        }
         if !Self::roster_has_on(&tx, key, remover)? {
             return Err(RoomStoreError::AttachmentUploaderNotInRoster {
                 room: key.clone(),
@@ -3468,7 +3480,8 @@ impl SqliteRoomStore {
     /// created keep their snapshotted `on_behalf_of` — history does not rewrite.
     pub fn remove_agent_owner(&mut self, key: &RoomKey, agent_id: &str) -> Result<bool> {
         let n = self.conn.execute(
-            "DELETE FROM room_agent_owners WHERE room_id = ?1 AND agent_id = ?2",
+            "DELETE FROM room_agent_owners WHERE room_id = ?1 AND agent_id = ?2
+             AND EXISTS (SELECT 1 FROM rooms WHERE id = ?1 AND closed_at IS NULL)",
             params![key.as_str(), agent_id],
         )?;
         Ok(n > 0)
@@ -3879,6 +3892,9 @@ impl SqliteRoomStore {
         let tx = self
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        if !Self::room_is_open_on(&tx, key)? {
+            return Err(RoomStoreError::UnknownRoom(key.clone()));
+        }
 
         Self::guard_participant_kind_on(&tx, key, &participant)?;
         // A3: re-adding an existing agent with a DIFFERENT owner is ownership
@@ -4422,6 +4438,9 @@ impl RoomStore for SqliteRoomStore {
         let tx = self
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        if !Self::room_is_open_on(&tx, key)? {
+            return Err(RoomStoreError::UnknownRoom(key.clone()));
+        }
         if let Some(name) = name {
             tx.execute(
                 "UPDATE rooms SET name = ?2 WHERE id = ?1",
@@ -4488,6 +4507,9 @@ impl RoomStore for SqliteRoomStore {
         let tx = self
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        if !Self::room_is_open_on(&tx, key)? {
+            return Err(RoomStoreError::UnknownRoom(key.clone()));
+        }
         Self::guard_participant_kind_on(&tx, key, &participant)?;
         // Idempotent on id: replace any existing entry, appending at the end of
         // the roster ordering (MAX(position)+1) to mirror the Vec push.
@@ -4569,6 +4591,9 @@ impl RoomStore for SqliteRoomStore {
         let tx = self
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        if !Self::room_is_open_on(&tx, key)? {
+            return Err(RoomStoreError::UnknownRoom(key.clone()));
+        }
         tx.execute(
             "DELETE FROM participants WHERE room_id = ?1 AND id = ?2",
             params![key.as_str(), participant_id],
@@ -4717,6 +4742,9 @@ impl SqliteRoomStore {
         let tx = self
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        if !Self::room_is_open_on(&tx, key)? {
+            return Err(RoomStoreError::UnknownRoom(key.clone()).into());
+        }
         if let Some(parent_seq) = thread_parent_seq {
             Self::validate_thread_parent_on(&tx, key, parent_seq)?;
         }
@@ -4740,11 +4768,14 @@ impl SqliteRoomStore {
     }
 
     fn authorized_room_agent_binding_on(
-        conn: &Connection,
+        conn: &rusqlite::Transaction<'_>,
         key: &RoomKey,
         agent_member_id: &str,
         expected_generation: u64,
     ) -> Result<RoomAgentBinding> {
+        if !Self::room_is_open_on(conn, key)? {
+            return Err(RoomStoreError::UnknownRoom(key.clone()));
+        }
         let binding = conn
             .query_row(
                 "SELECT agent_member_id, agent_package_id, agent_definition_digest,
@@ -5241,7 +5272,7 @@ impl SqliteRoomStore {
         // Verify room existence inside the transaction.
         let room_exists: Option<i64> = tx
             .query_row(
-                "SELECT 1 FROM rooms WHERE id = ?1",
+                "SELECT 1 FROM rooms WHERE id = ?1 AND closed_at IS NULL",
                 params![key.as_str()],
                 |r| r.get(0),
             )
@@ -5299,6 +5330,9 @@ impl SqliteRoomStore {
         let tx = self
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        if !Self::room_is_open_on(&tx, key)? {
+            return Err(RoomStoreError::UnknownRoom(key.clone()));
+        }
         let next_seq: i64 = tx.query_row(
             "SELECT COALESCE(MAX(seq) + 1, 0) FROM messages WHERE room_id = ?1",
             params![key.as_str()],
@@ -5365,7 +5399,7 @@ impl SqliteRoomStore {
         // 1. Room must exist.
         let room_exists: Option<i64> = tx
             .query_row(
-                "SELECT 1 FROM rooms WHERE id = ?1",
+                "SELECT 1 FROM rooms WHERE id = ?1 AND closed_at IS NULL",
                 params![key.as_str()],
                 |r| r.get(0),
             )
@@ -5741,7 +5775,7 @@ impl SqliteRoomStore {
     }
 
     /// Install (or replace) the room's one federation credential (P2-A). The
-    /// bearer is stored but never projected; the room must exist.
+    /// bearer is stored but never projected; the room must be open.
     pub fn install_room_credential(
         &mut self,
         key: &RoomKey,
@@ -5754,10 +5788,13 @@ impl SqliteRoomStore {
         if local_human_member_id.is_empty() {
             return Err(RoomStoreError::Encode("empty local human member id".into()));
         }
-        if !self.room_exists(key)? {
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        if !Self::room_is_open_on(&tx, key)? {
             return Err(RoomStoreError::UnknownRoom(key.clone()));
         }
-        self.conn.execute(
+        tx.execute(
             "INSERT INTO room_federation (room_id, bearer_token, local_human_member_id)
              VALUES (?1, ?2, ?3)
              ON CONFLICT(room_id) DO UPDATE SET
@@ -5765,6 +5802,7 @@ impl SqliteRoomStore {
                local_human_member_id = excluded.local_human_member_id",
             params![key.as_str(), bearer_token, local_human_member_id],
         )?;
+        tx.commit()?;
         Ok(())
     }
 
@@ -6285,6 +6323,9 @@ impl SqliteRoomStore {
         let tx = self
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        if !Self::room_is_open_on(&tx, key)? {
+            return Err(RoomStoreError::UnknownRoom(key.clone()));
+        }
         let current = tx
             .query_row(
                 "SELECT agent_member_id, agent_package_id, agent_definition_digest,
@@ -6363,12 +6404,21 @@ impl SqliteRoomStore {
         agent_member_id: &str,
         expected_generation: u64,
     ) -> Result<bool> {
-        Ok(self
-            .room_agent_binding(key, agent_member_id)?
-            .is_some_and(|binding| {
-                binding.status == AgentBindingStatus::Active
-                    && binding.generation == expected_generation
-            }))
+        // One SQLite snapshot: a closed room cannot authorize a cached handle,
+        // even when its binding row is deliberately retained for audit.
+        Ok(self.conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM room_agent_bindings b
+             JOIN rooms r ON r.id = b.room_id
+             WHERE b.room_id = ?1 AND b.agent_member_id = ?2
+               AND b.status = 'active' AND b.generation = ?3
+               AND r.closed_at IS NULL)",
+            params![
+                key.as_str(),
+                agent_member_id,
+                write_u64_text(expected_generation)
+            ],
+            |row| row.get(0),
+        )?)
     }
 
     /// Append one content-minimal admission allow/refusal fact durably.
@@ -6800,7 +6850,7 @@ impl SqliteRoomStore {
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
         let room_exists: Option<i64> = tx
             .query_row(
-                "SELECT 1 FROM rooms WHERE id = ?1",
+                "SELECT 1 FROM rooms WHERE id = ?1 AND closed_at IS NULL",
                 params![key.as_str()],
                 |r| r.get(0),
             )
@@ -7033,7 +7083,7 @@ impl SqliteRoomStore {
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
         let room_exists: Option<i64> = tx
             .query_row(
-                "SELECT 1 FROM rooms WHERE id = ?1",
+                "SELECT 1 FROM rooms WHERE id = ?1 AND closed_at IS NULL",
                 params![key.as_str()],
                 |r| r.get(0),
             )
@@ -7272,7 +7322,7 @@ impl SqliteRoomStore {
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
         let room_exists: Option<i64> = tx
             .query_row(
-                "SELECT 1 FROM rooms WHERE id = ?1",
+                "SELECT 1 FROM rooms WHERE id = ?1 AND closed_at IS NULL",
                 params![key.as_str()],
                 |r| r.get(0),
             )
@@ -7311,7 +7361,8 @@ impl SqliteRoomStore {
     /// existed.
     pub fn unbind_room_agent(&mut self, key: &RoomKey, member_id: &str) -> Result<bool> {
         let n = self.conn.execute(
-            "DELETE FROM room_member_bindings WHERE room_id = ?1 AND member_id = ?2",
+            "DELETE FROM room_member_bindings WHERE room_id = ?1 AND member_id = ?2
+             AND EXISTS(SELECT 1 FROM rooms WHERE id = ?1 AND closed_at IS NULL)",
             params![key.as_str(), member_id],
         )?;
         Ok(n > 0)
@@ -7442,7 +7493,7 @@ impl SqliteRoomStore {
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
         let room_exists: Option<i64> = tx
             .query_row(
-                "SELECT 1 FROM rooms WHERE id = ?1",
+                "SELECT 1 FROM rooms WHERE id = ?1 AND closed_at IS NULL",
                 params![key.as_str()],
                 |r| r.get(0),
             )
@@ -7556,7 +7607,8 @@ impl SqliteRoomStore {
     pub fn fail_outbox_pending(&mut self, key: &RoomKey, client_event_id: &str) -> Result<bool> {
         let n = self.conn.execute(
             "UPDATE outbox SET state = 'failed'
-             WHERE room_id = ?1 AND client_event_id = ?2 AND state = 'pending'",
+             WHERE room_id = ?1 AND client_event_id = ?2 AND state = 'pending'
+             AND EXISTS(SELECT 1 FROM rooms WHERE id = ?1 AND closed_at IS NULL)",
             params![key.as_str(), client_event_id],
         )?;
         Ok(n > 0)
@@ -8654,7 +8706,13 @@ mod tests {
     #[test]
     fn closed_rooms_reject_every_authority_mutation_without_changing_history() {
         let (mut s, key) = room_with_agent("agent-1");
+        assert!(s
+            .room_agent_generation_is_active(&key, "agent-1", 1)
+            .unwrap());
         s.close(&key).unwrap();
+        assert!(!s
+            .room_agent_generation_is_active(&key, "agent-1", 1)
+            .unwrap());
 
         let authorize_error = s
             .authorize_room_agent(&key, auth_input("agent-1", "dec-2", "digest-2"), now())
@@ -8670,6 +8728,29 @@ mod tests {
             )
             .unwrap_err();
         assert!(matches!(status_error, RoomStoreError::UnknownRoom(_)));
+
+        let stale_error = s
+            .mark_room_agent_stale(
+                &key,
+                "agent-1",
+                1,
+                "sha256:def-1",
+                "changed",
+                "admission",
+                now(),
+            )
+            .unwrap_err();
+        assert!(matches!(stale_error, RoomStoreError::UnknownRoom(_)));
+        assert!(!s.remove_agent_owner(&key, "agent-1").unwrap());
+        let tx = s
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .unwrap();
+        assert!(matches!(
+            SqliteRoomStore::authorized_room_agent_binding_on(&tx, &key, "agent-1", 1),
+            Err(RoomStoreError::UnknownRoom(_))
+        ));
+        tx.commit().unwrap();
 
         let retained = s.room_agent_binding(&key, "agent-1").unwrap().unwrap();
         assert_eq!(retained.status, AgentBindingStatus::Active);
@@ -14428,7 +14509,7 @@ mod tests {
         let key = RoomKey::new("closed-projection");
         let mut s = SqliteRoomStore::open(&path).unwrap();
         s.create(key.clone(), "Close", None, now()).unwrap();
-        let before = s
+        let mut before = s
             .update_room_access_safe(
                 &key,
                 Some(RoomAccessState::Live),
@@ -14436,7 +14517,16 @@ mod tests {
                 Some(9),
             )
             .unwrap();
+        before.outbox = vec![
+            outbox_item("failed", OutboxItemState::Failed),
+            outbox_item("pending", OutboxItemState::Pending),
+        ];
+        s.replace_room_access(&key, &before).unwrap();
         s.set_room_read_cursor_mirror(&key, "principal", None, Some(7))
+            .unwrap();
+        s.bind_room_agent(&key, "member", "agent", "registration")
+            .unwrap();
+        s.get_or_insert_pending_redemption("invite", "pending", "bearer", now())
             .unwrap();
         let mut closer = SqliteRoomStore::open(&path).unwrap();
         closer
@@ -14450,12 +14540,63 @@ mod tests {
             s.set_room_read_cursor_mirror(&key, "principal", Some(7), Some(10)),
             Err(RoomStoreError::UnknownRoom(_))
         ));
+        for cut in [false, true] {
+            if cut {
+                s.cut_closed_room(&key).unwrap();
+            }
+            assert!(matches!(
+                s.update_room_read_cursor(
+                    &key,
+                    "principal",
+                    RoomReadCursorUpdateRequest { read_seq: 999 }
+                ),
+                Err(RoomStoreError::UnknownRoom(_))
+            ));
+            assert!(matches!(
+                s.retry_failed_outbox(&key, "failed"),
+                Err(RetryOutboxError::RoomNotFound(_))
+            ));
+            assert!(matches!(
+                s.allocate_outbox_pending(
+                    &key,
+                    "member",
+                    "new",
+                    "message",
+                    serde_json::json!({}),
+                    vec![]
+                ),
+                Err(RoomStoreError::UnknownRoom(_))
+            ));
+            assert!(matches!(
+                s.bind_room_agent(&key, "another", "agent2", "reg2"),
+                Err(RoomStoreError::UnknownRoom(_))
+            ));
+            assert!(matches!(
+                s.install_room_credential(&key, "new-bearer", "member"),
+                Err(RoomStoreError::UnknownRoom(_))
+            ));
+            assert!(matches!(
+                s.promote_pending_redemption("pending", &key, "bearer", "member"),
+                Err(RoomStoreError::UnknownRoom(_))
+            ));
+            assert!(!s.unbind_room_agent(&key, "member").unwrap());
+            assert!(!s.fail_outbox_pending(&key, "pending").unwrap());
+            assert_eq!(
+                s.resolve_room_agent(&key, "member").unwrap().as_deref(),
+                Some("agent")
+            );
+            assert!(matches!(
+                s.replace_room_access(&key, &before),
+                Err(RoomStoreError::UnknownRoom(_))
+            ));
+        }
         assert_eq!(s.room_access(&key).unwrap(), before);
         assert_eq!(
             s.room_read_cursor(&key, "principal")
                 .unwrap()
                 .mirrored_upstream_read_seq,
-            Some(7)
+            None,
+            "retention removed the mirror, and late mutations did not recreate it"
         );
     }
 

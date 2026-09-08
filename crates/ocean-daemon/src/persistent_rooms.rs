@@ -1301,6 +1301,9 @@ pub(super) async fn room_close(
         CloserIdentity::Member(actor.to_string())
     };
 
+    // Match final admission's requests -> store lock order. No request can
+    // register between the durable close and cancellation of existing turns.
+    let mut requests = state.requests.write().await;
     // One lock acquisition for the forged-kind gate AND the close. The
     // attachment routes take two (their `forged_author_response` opens its own
     // guard), which leaves a window where a roster edit lands between the check
@@ -1329,6 +1332,13 @@ pub(super) async fn room_close(
         };
         store.close_with_marker(&key, closer, Utc::now()).map(Ok)
     });
+    let cancelled = if matches!(&result, Ok(Ok(_))) {
+        crate::room_agent_authority::cancel_room_requests_locked(&mut requests, &key)
+    } else {
+        Vec::new()
+    };
+    drop(requests);
+    crate::room_agent_authority::cleanup_cancelled(&state, cancelled).await;
 
     match result {
         Ok(Ok((record, message))) => {
@@ -13038,6 +13048,7 @@ env = { FIXTURE = "1" }
     #[tokio::test]
     async fn closing_a_room_freezes_it_and_says_who_did_it() {
         let _env = AUTO_CONVENE_ENV_LOCK.lock().await;
+        let _restore = TestEnvRestore::capture(&["OCEAN_CONFIG_DIR", "OCEAN_MODEL", "OCEAN_YOLO"]);
         let tmp = tempfile::tempdir().unwrap();
         let state = fake_convene_state(&tmp);
         let key = RoomKey::new("close-route-room");
@@ -13070,6 +13081,54 @@ env = { FIXTURE = "1" }
         .await;
         assert_eq!(status, StatusCode::CREATED);
 
+        let mut running = Vec::new();
+        for scope in [
+            Some(key.clone()),
+            Some(key.clone()),
+            Some(RoomKey::new("other-room")),
+            None,
+        ] {
+            let session_id = ocean_core::SessionId::new_v4();
+            let mut request = PromptRequest {
+                prompt: String::new(),
+                images: None,
+                request_id: None,
+                session_id: Some(session_id),
+                create_if_missing: true,
+                max_turns: None,
+                yolo: false,
+                cwd: tmp.path().to_string_lossy().into_owned(),
+                project_id: None,
+                client_type: Some("room".into()),
+                decision_token: None,
+            };
+            let (id, cancel) = crate::request_control::register_running_request(
+                &state.requests,
+                &mut request,
+                "close regression",
+                ocean_core::RequestState::Running,
+            )
+            .await;
+            if let Some(room) = scope.clone() {
+                state
+                    .requests
+                    .write()
+                    .await
+                    .get_mut(&id)
+                    .unwrap()
+                    .room_agent_authority = Some(RoomAgentRequestAuthority {
+                    room,
+                    agent_member_id: "agent".into(),
+                    generation: 1,
+                    admission_id: "admission".into(),
+                    decision_id: "decision".into(),
+                    approved_definition_digest: "digest".into(),
+                    session_id,
+                });
+            }
+            running.push((id, cancel, scope == Some(key.clone())));
+        }
+
         let (status, body) = room_close(
             State(state.clone()),
             Path(key.as_str().to_string()),
@@ -13082,6 +13141,17 @@ env = { FIXTURE = "1" }
         assert_eq!(status, StatusCode::OK, "close body: {}", body.0);
         assert_eq!(body.0["ok"], json!(true));
         assert_eq!(body.0["closed"], json!(true));
+        for (id, cancel, should_cancel) in running {
+            assert_eq!(cancel.is_cancelled(), should_cancel);
+            assert_eq!(
+                state.requests.read().await[&id].status.state,
+                if should_cancel {
+                    ocean_core::RequestState::Cancelling
+                } else {
+                    ocean_core::RequestState::Running
+                }
+            );
+        }
 
         // 1. Detail 404s. This is the contract `room_get` has always had for a
         //    closed room; until now nothing but a call could produce one.

@@ -1319,7 +1319,31 @@ fn cancel_superseded_locked(
     cancelled
 }
 
-async fn cleanup_cancelled(
+pub(super) fn cancel_room_requests_locked(
+    requests: &mut HashMap<RequestId, RequestControl>,
+    room: &RoomKey,
+) -> Vec<(RequestId, Option<ocean_core::PermissionId>)> {
+    let mut cancelled = Vec::new();
+    let now = Utc::now();
+    for (request_id, control) in requests.iter_mut() {
+        if control
+            .room_agent_authority
+            .as_ref()
+            .is_none_or(|authority| &authority.room != room)
+            || !control.status.state.is_cancellable()
+        {
+            continue;
+        }
+        control.status.state = ocean_core::RequestState::Cancelling;
+        control.status.message = Some("room closed".into());
+        control.status.updated_at = Some(now);
+        control.cancel.cancel();
+        cancelled.push((*request_id, control.status.permission_id));
+    }
+    cancelled
+}
+
+pub(super) async fn cleanup_cancelled(
     state: &AppState,
     cancelled: Vec<(RequestId, Option<ocean_core::PermissionId>)>,
 ) {
