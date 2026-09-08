@@ -172,6 +172,12 @@ This crate owns the long-running Ocean HTTP service on `:4780`, including API ro
 
 ### Review hardening
 
+- Known profile/folder audit messages use fixed readable labels through the
+  shared `room_history_text` projection on HTTP, SSE and model-facing history.
+  Never display raw decision/operator metadata or caller-controlled aliases as
+  trusted Room prose. Human JSON and unknown types retain their original text;
+  new audit types must extend the closed whitelist and regression coverage.
+
 - HTTP Room close acquires the request-registry write lock before the store,
   matching final admission. After the durable close it cancels every cancellable
   request whose immutable authority names that exact Room before dropping the

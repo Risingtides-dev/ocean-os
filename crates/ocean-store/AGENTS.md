@@ -318,9 +318,12 @@ outbox, and the restart-safe federation core (S2 P2-A). One database file
   halves so neither side of the boundary drifts.
   Neutralizing an audit body belongs at the READ boundary, and the four routes
   that hand a transcript straight to a human client now do it. `ocean-daemon`'s
-  `room_history_text` collapses the four audit `type` values that exist today —
+  `room_history_text` collapses the four agent audit `type` values —
   `room.agent.admission`, `.authority`, `.bootstrap`, `.output` — to
-  `[room agent <kind> audit]`, and `projected_room_message` beside it applies
+  `[room agent <kind> audit]`. It also maps profile created/updated and resource
+  granted/resumed/suspended/revoked facts to fixed readable labels with no
+  decision ids, operator ids, aliases, or other audit metadata.
+  `projected_room_message` beside it applies
   that SAME function to `GET /v1/rooms/persistent/{key}`, `/transcript`,
   `/snapshot`, and the `/events` SSE tail. It was never one route: a client
   hydrates through `/snapshot` and then tails `/events`, so a fix covering the
@@ -353,7 +356,7 @@ outbox, and the restart-safe federation core (S2 P2-A). One database file
   convened-agent prompt, off a tail read back through `transcript_page`.
   Two things that boundary still does NOT cover, named because a doc claiming
   otherwise is how the next one gets missed. First, the match is a closed
-  whitelist of four literal strings and not a `room.agent.` prefix; its fallback
+  whitelist of literal strings and not a broad `room.` prefix; its fallback
   arm hands anything else through raw on the human, agent, summarizer AND
   convened-agent paths with no test going red, so a new audit writer lands
   unprojected and silent — add its `type` there in the same commit that adds the

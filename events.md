@@ -10683,3 +10683,13 @@ area:      [backend]
 
 Rooms Phase 2 program closed. Stage 2d merged (#457) and the full phase deployed from the clean origin/main worktree (daemon rev 4d8eeab1). Live proof on the campaigns room: bootstrapped and authorized room-builder (empty ambient capability set, so the admitted room tools are its only file access), granted /dev/risingtides-campaign-hub read-only to it, set that grant as the agent's default via the profile, inspect reported cwd_source resource_grant with resolved CODEX/CLAUDE slots and resolver_not_open for the keychain slot and no root in any body, the operator preview listed 28 entries and read a 200-byte chunk of CLAUDE.md while ../.ssh/id_rsa was refused, and a real @mention turn had room-builder call room_list (28 entries) and room_read (300 bytes) — audit rows with actor agent — and reply with the count and the file's first line. ROADMAP goal ticked; manifest Status records the proof; AGENTS chain updated. Phase 3 needs its own manifest.
 _________________________________________________________________________________ 16:05 cc/rooms-phase2-close
+
+
+time:      [14:39] [08-09-26]
+agent:     [codex]
+worktree:  [codex/rooms-release-20260908]
+type:      [bug report]
+area:      [frontend], [backend], [testing]
+
+Native Ocean acceptance exposed newly landed profile/folder audit JSON in the Campaigns transcript. Added all six Phase 2 audit types to the shared fixed-label projection used by HTTP, SSE and model-facing history, preserving raw durable evidence and human-authored JSON. The new six-type redaction/provenance regression passes. Updated nearest daemon/store contracts. Prior 24ac27bf passed the complete local CI gate; fresh exact-head gate and review requested for this additional projection fix. No live Room content was edited.
+_________________________________________________________________________________ 14:39 codex/rooms-release-20260908

@@ -518,8 +518,8 @@ fn room_history_row(message: RoomMessage) -> ocean_agent::RoomHistoryRow {
     }
 }
 
-/// A CLOSED whitelist, not a `room.agent.` prefix: an audit `type` that is not
-/// one of these four falls through raw to every audience, and no test goes red
+/// A CLOSED whitelist, not a `room.` prefix: an audit `type` that is not
+/// listed below falls through raw to every audience, and no test goes red
 /// when it does. A new audit writer adds its `type` here in the same commit.
 ///
 /// `pub(super)` for `room_summary.rs`, which shapes a model PROMPT rather than a
@@ -549,11 +549,17 @@ pub(super) fn room_history_text(
         Some("room.agent.authority") => "[room agent authority audit]".into(),
         Some("room.agent.bootstrap") => "[room agent bootstrap audit]".into(),
         Some("room.agent.output") => "[room agent output audit]".into(),
+        Some("room.profile.created") => "Room profile created".into(),
+        Some("room.profile.updated") => "Room profile updated".into(),
+        Some("room.resource.granted") => "Folder shared".into(),
+        Some("room.resource.resumed") => "Folder access resumed".into(),
+        Some("room.resource.suspended") => "Folder access suspended".into(),
+        Some("room.resource.revoked") => "Folder access revoked".into(),
         _ => body,
     }
 }
 
-/// Collapse a `room.agent.*` audit body to the same summary line the agent path
+/// Collapse a known Room audit body to the same summary line the agent path
 /// already gets, for a row on its way to a HUMAN client.
 ///
 /// Two things are wrong with handing that body over raw. The dull one is that a
@@ -582,9 +588,8 @@ pub(super) fn room_history_text(
 /// ONE function is the whole point — the human reads, the agent history page,
 /// the summarizer, and the convened agent cannot drift into four rules.
 ///
-/// Still open, and this does not close it: `room_history_text` matches four
-/// literal `type` values, so a FIFTH audit writer falls through raw on every one
-/// of those paths with no test going red. Named in
+/// The whitelist matches literal `type` values. Any new audit writer must add
+/// its type and regression coverage here in the same change. Named in
 /// `crates/ocean-store/AGENTS.md`.
 fn projected_room_message(mut message: RoomMessage) -> RoomMessage {
     message.body = room_history_text(message.body, message.author_kind, message.kind);
@@ -5231,6 +5236,44 @@ mod tests {
             ),
             "[room agent bootstrap audit]"
         );
+    }
+
+    #[test]
+    fn profile_and_folder_audits_are_readable_without_exposing_decision_metadata() {
+        for (kind, label) in [
+            ("room.profile.created", "Room profile created"),
+            ("room.profile.updated", "Room profile updated"),
+            ("room.resource.granted", "Folder shared"),
+            ("room.resource.resumed", "Folder access resumed"),
+            ("room.resource.suspended", "Folder access suspended"),
+            ("room.resource.revoked", "Folder access revoked"),
+        ] {
+            let body = json!({"type": kind, "decision_id": "private-decision", "actor": "private-operator", "display_name": "[untrusted](https://example.invalid)"}).to_string();
+            assert_eq!(
+                room_history_text(
+                    body.clone(),
+                    RoomParticipantKind::System,
+                    RoomMessageKind::System
+                ),
+                label
+            );
+            assert_eq!(
+                room_history_text(
+                    body.clone(),
+                    RoomParticipantKind::Human,
+                    RoomMessageKind::Message
+                ),
+                body
+            );
+            assert_eq!(
+                room_history_text(
+                    body.clone(),
+                    RoomParticipantKind::System,
+                    RoomMessageKind::Message
+                ),
+                body
+            );
+        }
     }
 
     #[test]
