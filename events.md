@@ -10604,3 +10604,12 @@ area:      [backend]
 
 John could not see how Rooms organizes sessions, where agents execute, or how repos/tools/auth would attach per room. Wrote the proposed Phase 2 manifest (docs/specs/2026-09-08-ocean-rooms-phase2-room-profile-and-contributed-folders-manifest.md): a room profile that carries repo, tool, and credential-slot REFERENCES resolved on the executing node (never tokens, per architecture §12.7 and Gate 0 Decision 13), local folder grants with path confinement and generations, slot-status resolution, and a staged 2a→2d rollout. Landed Stage 2a: read-only GET /v1/rooms/persistent/{key}/inspect (new room_inspect.rs) projecting room, access, federated bool, owner, every binding with its deterministic session id and session_exists, truthful execution.cwd_source (room_workspace_root | unbound — found that an authorized turn with no live workspace is refused, not run from daemon cwd, and corrected the manifest to match), and empty profile/credential_slots/resources slots. Five HTTP tests plus three unit tests; clippy, fmt, docs-check green. Stages 2b–2d stay closed pending acceptance.
 _________________________________________________________________________________ 11:20 cc/rooms-architecture-sessions-60d21b
+
+time:      [13:22] [08-09-26]
+agent:     [codex]
+worktree:  [codex/rooms-release-20260908] /Users/risingtidesdev/dev/ocean-os-worktrees/rooms-release-20260908
+type:      [bug report]
+area:      [backend], [review], [testing]
+
+Addressed PR #450 findings 3960426681 and 3960426689. Added durable mention-completeness markers: existing events remain explicitly legacy-unknown, and only an authenticated replay with full persisted metadata equality repairs their exact mention set without replaying transcript/cursor/outbox/trigger effects. Room-list pages omit the additive attention projection while unread mentions are unknown, preserving existing Surface compatibility and read states. Safe access refresh and mirrored-cursor writes now require room openness in their write transaction, preserving frozen projections after close. File-backed migration/reopen and two-connection close regressions pass; store 235/235, daemon 919/919 plus the new serialization regression, docs-check and formatting pass. Full workspace gate rerunning. Updated nearest store/daemon/API contracts; parent ownership and child indexes unchanged. Not merged or installed yet.
+_________________________________________________________________________________ 13:22 codex/rooms-release-20260908

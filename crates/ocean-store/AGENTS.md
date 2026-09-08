@@ -51,6 +51,8 @@ outbox, and the restart-safe federation core (S2 P2-A). One database file
   `federated_events` (dedup + monotonic order index),
   `federated_event_mentions` (normalized exact Bedrock addressees for bounded
   local attention counts; child rows cascade with their event),
+  `federated_event_mentions_known` (one completeness marker per authoritative
+  mention set; absence means legacy unknown, never a known empty set),
   `processed_room_triggers` (at-most-once trigger-claim journal), and
   `pending_redemptions` (v1.2 amendment table 7: pre-room `{redemption_id,
   bearer, invite_code}` custody, `invite_code` UNIQUE — bearer AND invite
@@ -135,6 +137,11 @@ outbox, and the restart-safe federation core (S2 P2-A). One database file
   `FederatedMessageMeta`, and that meta must equal the incoming event — every
   field, never raw JSON bytes or a column subset. The persisted normalized
   mention set must also equal the incoming set (ordering is irrelevant).
+  Legacy rows without a completeness marker may learn their set only from an
+  authenticated confirmed replay after full index/transcript metadata equality;
+  that repair commits only mentions and the marker, without replaying triggers,
+  transcript, cursor or outbox effects. Unknown unread sets are explicitly
+  flagged in attention counts until repaired or passed by the read cursor.
   Full three-way equality plus matching mentions ⇒
   `IngestOutcome::Duplicate` no-op; any divergence (including index vs
   transcript), a missing/unreadable indexed transcript row, a
@@ -177,6 +184,8 @@ outbox, and the restart-safe federation core (S2 P2-A). One database file
 - **`update_room_access_safe` is the runtime refresh path**: it never touches
   the outbox and its cursor only advances. `replace_room_access` is
   destructive test seeding only.
+  Access refresh and mirrored-cursor writes require an open room in their
+  write transaction, so late federation frames cannot alter a frozen room.
 - **Mirrored cursor writes are compare-and-swap.** `set_room_read_cursor_mirror`
   evaluates the expected prior mirror and write under one IMMEDIATE transaction.
   `Applied` returns the durable projection; `Stale` never mutates the row. Callers

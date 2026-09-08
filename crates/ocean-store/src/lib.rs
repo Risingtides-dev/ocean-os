@@ -2066,6 +2066,17 @@ impl SqliteRoomStore {
             CREATE INDEX IF NOT EXISTS idx_federated_event_mentions_member
                 ON federated_event_mentions(room_id, member_id, ledger_event_id);
 
+            -- An absent marker means legacy UNKNOWN, not an empty mention
+            -- list. Old transcripts never retained structured addressees.
+            CREATE TABLE IF NOT EXISTS federated_event_mentions_known (
+                room_id TEXT NOT NULL,
+                ledger_event_id TEXT NOT NULL,
+                PRIMARY KEY (room_id, ledger_event_id),
+                FOREIGN KEY (room_id, ledger_event_id)
+                    REFERENCES federated_events(room_id, ledger_event_id)
+                    ON DELETE CASCADE
+            );
+
             CREATE TABLE IF NOT EXISTS processed_room_triggers (
                 room_id          TEXT NOT NULL REFERENCES rooms(id) ON DELETE CASCADE,
                 ledger_event_id  TEXT NOT NULL,
@@ -5093,6 +5104,8 @@ pub struct RoomMetricsProjection {
 pub struct RoomAttentionCounts {
     pub unread_count: u64,
     pub mention_count: u64,
+    /// At least one unread legacy event has no authoritative mention set.
+    pub mentions_unknown: bool,
 }
 
 // ── S2-P1 federation: inherent APIs (not on RoomStore trait) ───────────────
@@ -6909,6 +6922,7 @@ impl SqliteRoomStore {
             unread_count: u64::try_from(unread)
                 .map_err(|_| RoomStoreError::Encode("negative local unread count".into()))?,
             mention_count: 0,
+            mentions_unknown: false,
         })
     }
 
@@ -6929,8 +6943,11 @@ impl SqliteRoomStore {
             return Err(RoomStoreError::UnknownRoom(key.clone()));
         }
         let read_seq = read_seq.map(write_u64_text);
-        let unread: i64 = self.conn.query_row(
-            "SELECT COUNT(*)
+        let (unread, unknown): (i64, i64) = self.conn.query_row(
+            "SELECT COUNT(*), COALESCE(SUM(NOT EXISTS (
+                 SELECT 1 FROM federated_event_mentions_known k
+                  WHERE k.room_id = e.room_id AND k.ledger_event_id = e.ledger_event_id
+               )), 0)
                FROM federated_events e
               WHERE e.room_id = ?1
                 AND (?2 IS NULL
@@ -6938,7 +6955,7 @@ impl SqliteRoomStore {
                      OR (length(e.global_sequence) = length(?2)
                          AND e.global_sequence > ?2))",
             params![key.as_str(), read_seq.as_deref()],
-            |row| row.get(0),
+            |row| Ok((row.get(0)?, row.get(1)?)),
         )?;
         let mentions: i64 = self.conn.query_row(
             "SELECT COUNT(*)
@@ -6960,6 +6977,7 @@ impl SqliteRoomStore {
                 .map_err(|_| RoomStoreError::Encode("negative federated unread count".into()))?,
             mention_count: u64::try_from(mentions)
                 .map_err(|_| RoomStoreError::Encode("negative federated mention count".into()))?,
+            mentions_unknown: unknown > 0,
         })
     }
 
@@ -7053,14 +7071,7 @@ impl SqliteRoomStore {
         let tx = self
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let room_exists: Option<i64> = tx
-            .query_row(
-                "SELECT 1 FROM rooms WHERE id = ?1",
-                params![key.as_str()],
-                |r| r.get(0),
-            )
-            .optional()?;
-        if room_exists.is_none() {
+        if !Self::room_is_open_on(&tx, key)? {
             return Err(RoomStoreError::UnknownRoom(key.clone()));
         }
         let current_mirror = tx
@@ -7135,14 +7146,7 @@ impl SqliteRoomStore {
         let tx = self
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let room_exists: Option<i64> = tx
-            .query_row(
-                "SELECT 1 FROM rooms WHERE id = ?1",
-                params![key.as_str()],
-                |r| r.get(0),
-            )
-            .optional()?;
-        if room_exists.is_none() {
+        if !Self::room_is_open_on(&tx, key)? {
             return Err(RoomStoreError::UnknownRoom(key.clone()));
         }
         let row = tx
@@ -7663,6 +7667,20 @@ impl SqliteRoomStore {
                 )?
                 .query_map(params![key.as_str(), event.ledger_event_id], |r| r.get(0))?
                 .collect::<std::result::Result<_, _>>()?;
+            let mentions_known: bool = tx.query_row(
+                "SELECT EXISTS(SELECT 1 FROM federated_event_mentions_known
+                 WHERE room_id = ?1 AND ledger_event_id = ?2)",
+                params![key.as_str(), event.ledger_event_id],
+                |r| r.get(0),
+            )?;
+            if stored == meta && !mentions_known {
+                // Upgrade only from this authenticated confirmed replay after
+                // full index/transcript equality. No prose-derived backfill,
+                // cursor movement, transcript append or trigger replay.
+                Self::record_confirmed_mentions(&tx, key, event)?;
+                tx.commit()?;
+                return Ok(IngestOutcome::Duplicate);
+            }
             let mentions_match = stored_mentions.len() == unique_mentions.len()
                 && unique_mentions
                     .iter()
@@ -7750,14 +7768,7 @@ impl SqliteRoomStore {
         // relation is intentionally independent of trigger claims: mentions of
         // the local Human never convene an Agent, but still belong in that
         // principal's unopened-room attention count.
-        for member_id in &event.mention_member_ids {
-            tx.execute(
-                "INSERT INTO federated_event_mentions
-                   (room_id, ledger_event_id, member_id)
-                 VALUES (?1, ?2, ?3)",
-                params![key.as_str(), event.ledger_event_id, member_id],
-            )?;
-        }
+        Self::record_confirmed_mentions(&tx, key, event)?;
 
         // 5. Delete the matching local outbox row — FULL producer tuple only.
         tx.execute(
@@ -7829,6 +7840,30 @@ impl SqliteRoomStore {
             message,
             claimed_trigger_targets: claimed,
         })))
+    }
+
+    fn record_confirmed_mentions(
+        tx: &rusqlite::Transaction<'_>,
+        key: &RoomKey,
+        event: &ConfirmedEvent,
+    ) -> Result<()> {
+        tx.execute(
+            "DELETE FROM federated_event_mentions WHERE room_id = ?1 AND ledger_event_id = ?2",
+            params![key.as_str(), event.ledger_event_id],
+        )?;
+        for member_id in &event.mention_member_ids {
+            tx.execute(
+                "INSERT INTO federated_event_mentions (room_id, ledger_event_id, member_id)
+                 VALUES (?1, ?2, ?3)",
+                params![key.as_str(), event.ledger_event_id, member_id],
+            )?;
+        }
+        tx.execute(
+            "INSERT INTO federated_event_mentions_known (room_id, ledger_event_id)
+             VALUES (?1, ?2)",
+            params![key.as_str(), event.ledger_event_id],
+        )?;
+        Ok(())
     }
 }
 
@@ -13450,6 +13485,7 @@ mod tests {
             RoomAttentionCounts {
                 unread_count: 3,
                 mention_count: 0,
+                mentions_unknown: false,
             }
         );
         assert_eq!(
@@ -13457,6 +13493,7 @@ mod tests {
             RoomAttentionCounts {
                 unread_count: 2,
                 mention_count: 0,
+                mentions_unknown: false,
             }
         );
         assert_eq!(
@@ -14325,6 +14362,44 @@ mod tests {
     }
 
     #[test]
+    fn closed_room_rejects_late_access_and_mirror_updates_from_another_connection() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("closed-projection.db");
+        let key = RoomKey::new("closed-projection");
+        let mut s = SqliteRoomStore::open(&path).unwrap();
+        s.create(key.clone(), "Close", None, now()).unwrap();
+        let before = s
+            .update_room_access_safe(
+                &key,
+                Some(RoomAccessState::Live),
+                Some(&[fed_member("m-a", "Before")]),
+                Some(9),
+            )
+            .unwrap();
+        s.set_room_read_cursor_mirror(&key, "principal", None, Some(7))
+            .unwrap();
+        let mut closer = SqliteRoomStore::open(&path).unwrap();
+        closer
+            .close_with_marker(&key, RoomCloser::Operator("operator"), now())
+            .unwrap();
+        assert!(matches!(
+            s.update_room_access_safe(&key, Some(RoomAccessState::Recovering), Some(&[]), Some(10)),
+            Err(RoomStoreError::UnknownRoom(_))
+        ));
+        assert!(matches!(
+            s.set_room_read_cursor_mirror(&key, "principal", Some(7), Some(10)),
+            Err(RoomStoreError::UnknownRoom(_))
+        ));
+        assert_eq!(s.room_access(&key).unwrap(), before);
+        assert_eq!(
+            s.room_read_cursor(&key, "principal")
+                .unwrap()
+                .mirrored_upstream_read_seq,
+            Some(7)
+        );
+    }
+
+    #[test]
     fn update_room_access_safe_preserves_outbox_and_cursor_monotonic() {
         let (mut s, key) = fed_store_with_room("r-safe");
         // Bootstrap: no access row yet — upsert defaults to Connecting.
@@ -14784,6 +14859,7 @@ mod tests {
             RoomAttentionCounts {
                 unread_count: 3,
                 mention_count: 2,
+                mentions_unknown: false,
             }
         );
         assert_eq!(
@@ -14792,6 +14868,7 @@ mod tests {
             RoomAttentionCounts {
                 unread_count: 2,
                 mention_count: 2,
+                mentions_unknown: false,
             },
             "global-sequence gaps count rows, never the numeric distance",
         );
@@ -14800,6 +14877,74 @@ mod tests {
                 .unwrap(),
             RoomAttentionCounts::default(),
         );
+    }
+
+    #[test]
+    fn legacy_mention_migration_stays_unknown_until_authoritative_replay() {
+        let dir = tempfile::tempdir().unwrap();
+        for mentions in [vec![], vec!["m-self".to_string()]] {
+            let path = dir.path().join(format!("legacy-{}.db", mentions.len()));
+            let key = RoomKey::new("legacy-mentions");
+            let mut event = confirmed_event("legacy-event", 9, "src-a", 1, "evt-a");
+            event.mention_member_ids = mentions.clone();
+            {
+                let mut s = SqliteRoomStore::open(&path).unwrap();
+                s.create(key.clone(), "Legacy", None, now()).unwrap();
+                seed_access_row(&s, &key, "live");
+                s.ingest_confirmed_event(&key, &event, now()).unwrap();
+                // Exact pre-feature schema shape: retained index/transcript,
+                // but no structured mention tables or completeness marker.
+                s.conn
+                    .execute_batch(
+                        "DROP TABLE federated_event_mentions_known;
+                     DROP TABLE federated_event_mentions;",
+                    )
+                    .unwrap();
+            }
+            {
+                let mut s = SqliteRoomStore::open(&path).unwrap();
+                let counts = s.federated_room_attention(&key, "m-self", None).unwrap();
+                assert_eq!(counts.unread_count, 1);
+                assert!(counts.mentions_unknown);
+                assert!(
+                    !s.federated_room_attention(&key, "m-self", Some(9))
+                        .unwrap()
+                        .mentions_unknown
+                );
+                let mut divergent = event.clone();
+                divergent.source_sequence += 1;
+                assert!(matches!(
+                    s.ingest_confirmed_event(&key, &divergent, now()),
+                    Err(RoomStoreError::FederationCorruption(_))
+                ));
+                assert!(
+                    s.federated_room_attention(&key, "m-self", None)
+                        .unwrap()
+                        .mentions_unknown
+                );
+                assert!(matches!(
+                    s.ingest_confirmed_event(&key, &event, now()).unwrap(),
+                    IngestOutcome::Duplicate
+                ));
+                assert_eq!(transcript_count(&s, &key), 1);
+                assert_eq!(federated_events_count(&s, &key), 1);
+                assert_eq!(
+                    s.room_access(&key).unwrap().last_confirmed_global_sequence,
+                    Some(9)
+                );
+            }
+            let mut reopened = SqliteRoomStore::open(&path).unwrap();
+            let counts = reopened
+                .federated_room_attention(&key, "m-self", None)
+                .unwrap();
+            assert!(!counts.mentions_unknown);
+            assert_eq!(counts.mention_count, mentions.len() as u64);
+            event.mention_member_ids = vec!["different-member".into()];
+            assert!(matches!(
+                reopened.ingest_confirmed_event(&key, &event, now()),
+                Err(RoomStoreError::FederationCorruption(_))
+            ));
+        }
     }
 
     #[test]

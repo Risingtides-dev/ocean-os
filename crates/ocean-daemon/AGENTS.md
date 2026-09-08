@@ -152,6 +152,12 @@ This crate owns the long-running Ocean HTTP service on `:4780`, including API ro
 
 ## Work Guidance
 
+- If any unread event on a room-list page has legacy-unknown mention metadata,
+  omit the additive `attention` array for that page while retaining `rooms` and
+  `read_states`. Existing Surface clients interpret absence as unknown; never
+  substitute zero or put null into their numeric mention field. An authenticated
+  confirmed replay can repair the store's legacy set without replaying a turn.
+
 - Every federation start rechecks durable room openness while holding the same
   slot-state lock as stop. A delayed credential promotion must not resurrect a
   room after its local close; store read failure refuses the start.

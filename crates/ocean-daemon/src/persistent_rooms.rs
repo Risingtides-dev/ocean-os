@@ -1474,7 +1474,11 @@ struct PersistentRoomsListResponse {
     ok: bool,
     rooms: Vec<ocean_core::Room>,
     read_states: Vec<PersistentRoomReadState>,
-    attention: Vec<PersistentRoomAttention>,
+    // Omit the additive projection when any unread legacy event on this page
+    // lacks authoritative mentions. Existing clients already treat absence as
+    // unknown; emitting zero or null inside a u64 field would lie or break them.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    attention: Option<Vec<PersistentRoomAttention>>,
     // Deliberately NOT `skip_serializing_if`: pre-existing pollers rely on the
     // key always being present (`"next_cursor": null` on the final page), so
     // omitting the key on a single-page response would be a silent wire
@@ -1495,6 +1499,7 @@ pub(super) async fn rooms_list_persistent(
         let page = reg.list_page(q.cursor.as_deref(), q.limit)?;
         let mut read_states = Vec::with_capacity(page.rooms.len());
         let mut attention = Vec::new();
+        let mut attention_known = true;
         for room in &page.rooms {
             let key = room.id.clone();
             let access = reg.room_access(&key)?;
@@ -1540,6 +1545,7 @@ pub(super) async fn rooms_list_persistent(
             };
             let latest_seq = latest_seq.map(|seq| seq.to_string());
             let read_seq = read_seq.map(|seq| seq.to_string());
+            attention_known &= !counts.mentions_unknown;
             if counts.unread_count > 0 || counts.mention_count > 0 {
                 attention.push(PersistentRoomAttention {
                     room_id: room.id.to_string(),
@@ -1559,7 +1565,7 @@ pub(super) async fn rooms_list_persistent(
             ok: true,
             rooms: page.rooms,
             read_states,
-            attention,
+            attention: attention_known.then_some(attention),
             next_cursor: page.next_cursor,
             has_more: page.has_more,
         })
@@ -4765,6 +4771,26 @@ pub(super) async fn room_retry_outbox(
 mod tests {
     use super::*;
     use ocean_store::ActivationPolicy;
+
+    #[test]
+    fn legacy_unknown_attention_omits_the_additive_array_instead_of_claiming_zero() {
+        let mut response = PersistentRoomsListResponse {
+            ok: true,
+            rooms: vec![],
+            read_states: vec![],
+            attention: None,
+            next_cursor: None,
+            has_more: false,
+        };
+        let unknown = serde_json::to_value(&response).unwrap();
+        assert!(unknown.get("attention").is_none());
+        assert_eq!(unknown["read_states"], json!([]));
+        response.attention = Some(vec![]);
+        assert_eq!(
+            serde_json::to_value(response).unwrap()["attention"],
+            json!([])
+        );
+    }
 
     /// OCEAN-260: PATCH can bind a room's workspace after creation, unbind it,
     /// and leave it alone — the same absent/`null`/present contract

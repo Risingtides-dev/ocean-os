@@ -223,6 +223,12 @@ component-event wiring point.
 **Access projection** is a typed, store-owned `RoomAccessProjection` (a struct, not a tagged variant) returned on room detail (`GET /v1/rooms/persistent/{key}`) and snapshot (`GET /v1/rooms/persistent/{key}/snapshot`). Access states are exact `local`, `connecting`, `live`, `recovering`, and `revoked`. `members` and `outbox` are skip-when-empty struct fields, not variant-confined fields. `self_member_id` is a skip-when-empty room-level field naming the daemon's own authenticated member id, derived at read time from the private credential row; absent on local rooms and pre-field daemons. Outbox stays separate and never enters the confirmed transcript before Bedrock confirmation. Rooms without an access row (including the frozen soft-closed fixture) default exact `local`.
 
 **List attention** is the additive sparse `attention` array on the bounded room
+list response. If any unread legacy event on that page lacks an authoritative
+mention set, the entire additive array is omitted (unknown), while `rooms` and
+`read_states` remain available. Existing clients already support this absence;
+zero counts or null numeric fields must not substitute for unknown data. A
+validated confirmed replay may backfill that event's exact set without replaying
+its transcript or triggers. Otherwise the array has the shape below on the
 list response: `[{ room_id, latest_seq?, read_seq?, unread_count,
 mention_count }]`. It contains only entries with a nonzero count, preserves the
 same deterministic order as that response's `rooms` page, and can never name a
