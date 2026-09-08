@@ -96,6 +96,11 @@ use ocean_core::{
 };
 use rusqlite::{params, Connection, OptionalExtension, TransactionBehavior};
 
+mod room_profile;
+pub use room_profile::{
+    CredentialSlot, PutRoomProfileInput, RepoRef, RoomProfile, ToolRef, ToolRefKind,
+};
+
 /// A persistent room plus the OLDEST bounded page of its transcript.
 ///
 /// Near-mirror of `ocean_agent::rooms::RoomRecord`, deliberately one field wider.
@@ -1892,6 +1897,8 @@ impl SqliteRoomStore {
               FROM room_agent_bindings;
             "#,
         )?;
+        // Rooms Phase 2b tables (idempotent; see `room_profile.rs`).
+        self.conn.execute_batch(room_profile::ROOM_PROFILE_DDL)?;
         self.migrate_room_agent_generation_to_text()?;
         // Backfill columns on DBs created before they existed.
         // position (S2-P1) — on the `outbox` table. The column *and* its

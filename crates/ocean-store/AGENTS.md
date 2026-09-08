@@ -313,3 +313,5 @@ outbox, and the restart-safe federation core (S2 P2-A). One database file
 ## Child devlog Index
 
 - (none)
+
+- `room_profile.rs` (Rooms Phase 2b) owns the `room_profiles` + `room_profile_decisions` tables and the `RoomProfile` / `RepoRef` / `ToolRef` / `CredentialSlot` types (serde-encoded JSON columns, canonical-decimal `revision`). `put_room_profile` is one IMMEDIATE transaction: replay check across BOTH decision ledgers first (an id the agent-binding ledger consumed is a `DecisionReplayMismatch`), identical replay returns `(profile, false, None)` with no audit and no revision bump, a real write upserts, records the decision, appends one content-minimal System audit row (counts + revision only), and touches the room. `room_profile` on an unknown room is `UnknownRoom`, never `None`. Nothing here is a secret: `resolvers` name where to look; the daemon computes status.
