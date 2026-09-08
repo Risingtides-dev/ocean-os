@@ -1238,6 +1238,7 @@ async fn main() -> anyhow::Result<()> {
     // process leaves it unset so one test's `AppState` can never collect
     // another's counts.
     metrics::install_process_room_metrics(state.room_metrics.clone());
+    persistent_rooms::spawn_room_metrics_sampler(&state);
 
     // The sovereign trigger receiver must exist before federation startup can
     // ingest and claim a confirmed mention. It only validates and spawns; agent
@@ -1799,11 +1800,7 @@ struct HealthEnvelope {
 }
 
 async fn health(State(state): State<AppState>) -> Json<HealthEnvelope> {
-    // Refresh the room-derived families before projecting the card. This is a
-    // `try_lock` sampler: it never blocks the liveness probe on the daemon-wide
-    // room-store mutex, and reports `rooms.sampled: false` with the previous
-    // numbers when it loses the race. See `persistent_rooms::sample_room_metrics`.
-    persistent_rooms::sample_room_metrics(&state);
+    // Serve the last background sample; no SQLite scan runs on this request.
     Json(HealthEnvelope {
         health: HealthResponse {
             ok: true,
@@ -1853,9 +1850,7 @@ async fn health(State(state): State<AppState>) -> Json<HealthEnvelope> {
 ///   * `ocean_sse_events_dropped_total` — events dropped by lagging SSE
 ///     subscribers (OCEAN-372).
 async fn metrics(State(state): State<AppState>) -> impl axum::response::IntoResponse {
-    // §4.1: refresh the sampled room families (access state, outbox) before
-    // rendering. Same non-blocking sampler `GET /health` uses.
-    persistent_rooms::sample_room_metrics(&state);
+    // Room-derived families come from the same background cache as /health.
     let persist_failures = state
         .persist_failures
         .load(std::sync::atomic::Ordering::Relaxed);
@@ -25341,6 +25336,9 @@ mod tests {
                 .unwrap();
         });
 
+        persistent_rooms::sample_room_metrics(state.rooms.clone(), state.room_metrics.clone())
+            .await;
+
         // ── Prometheus surface ──
         let app = Router::new()
             .route("/metrics", get(metrics))
@@ -25468,6 +25466,44 @@ mod tests {
             rooms["store_lock_waits_total"].as_u64().unwrap_or(0) > 0,
             "with_rooms acquisitions must be counted: {rooms}"
         );
+    }
+
+    #[tokio::test]
+    async fn room_metrics_health_serves_cached_counts_during_store_contention() {
+        let state = {
+            let _g = yolo_env_guard_async().await;
+            permission_test_state()
+        };
+        with_rooms(&state, |store| {
+            store
+                .create(RoomKey::new("cached-metrics"), "Cached", None, Utc::now())
+                .unwrap();
+        });
+        persistent_rooms::sample_room_metrics(state.rooms.clone(), state.room_metrics.clone())
+            .await;
+        let (locked_tx, locked_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        let rooms = state.rooms.clone();
+        let holder = std::thread::spawn(move || {
+            let _guard = rooms.lock().unwrap();
+            locked_tx.send(()).unwrap();
+            release_rx.blocking_recv().unwrap();
+        });
+        locked_rx.await.unwrap();
+        persistent_rooms::sample_room_metrics(state.rooms.clone(), state.room_metrics.clone())
+            .await;
+        let Json(response) = tokio::time::timeout(
+            std::time::Duration::from_millis(250),
+            health(State(state.clone())),
+        )
+        .await
+        .unwrap();
+        release_tx.send(()).unwrap();
+        holder.join().unwrap();
+        assert!(response.health.ok);
+        assert!(!response.rooms.sampled);
+        assert_eq!(response.rooms.rooms_by_access_state["local"], 1);
+        assert!(response.rooms.sample_age_ms.is_some());
     }
 
     /// A post from an author the room's roster does not carry is refused

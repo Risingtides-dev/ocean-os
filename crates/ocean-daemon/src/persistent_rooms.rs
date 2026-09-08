@@ -441,35 +441,60 @@ pub(super) fn with_rooms<T>(
     f(&mut guard)
 }
 
-/// Sample the room store WITHOUT blocking on its mutex.
-///
-/// The `GET /health` liveness probe reads the room-metrics card, and that card's
-/// room-derived numbers come from the store. Taking the daemon-wide mutex on the
-/// liveness path would make a long store operation able to stall the one probe
-/// whose documented contract is that it answers 200 whenever the process is
-/// serving HTTP. So the sampler tries, and on contention reports the previous
-/// sample as stale rather than waiting. Contributes nothing to the store-lock
-/// wait family by construction: a `try_lock` never waits.
-pub(super) fn sample_room_metrics(state: &AppState) {
-    let guard = match state.rooms.try_lock() {
+/// Refresh cached room metrics off the async workers. Only the startup-owned
+/// loop calls this in production, awaiting each sample before scheduling another.
+pub(super) async fn sample_room_metrics(
+    rooms: RoomStoreHandle,
+    metrics: Arc<crate::metrics::RoomMetrics>,
+) {
+    let sampler_metrics = metrics.clone();
+    if tokio::task::spawn_blocking(move || sample_room_metrics_blocking(&rooms, &sampler_metrics))
+        .await
+        .is_err()
+    {
+        metrics.note_sample_skipped();
+        tracing::warn!("room metrics sampling task failed");
+    }
+}
+
+fn sample_room_metrics_blocking(rooms: &RoomStoreHandle, metrics: &crate::metrics::RoomMetrics) {
+    let guard = match rooms.try_lock() {
         Ok(guard) => guard,
         // Poison recovery matches the blocking adapters above: a panicked
         // writer must not also cost the operator their metrics.
         Err(std::sync::TryLockError::Poisoned(poisoned)) => poisoned.into_inner(),
         Err(std::sync::TryLockError::WouldBlock) => {
-            state.room_metrics.note_sample_skipped();
+            metrics.note_sample_skipped();
             return;
         }
     };
     match guard.room_metrics_projection() {
-        Ok(projection) => state
-            .room_metrics
-            .observe_store_sample(&projection, std::time::Instant::now()),
+        Ok(projection) => metrics.observe_store_sample(&projection, std::time::Instant::now()),
         Err(error) => {
             tracing::warn!(%error, "room metrics sample failed to read the store");
-            state.room_metrics.note_sample_skipped();
+            metrics.note_sample_skipped();
         }
     }
+}
+
+/// One serial sampler per daemon, including an immediate first sample. Slow
+/// reads cannot accumulate tasks or block health/metrics requests; missed ticks
+/// are skipped and the card carries the age of the last successful sample.
+pub(super) fn spawn_room_metrics_sampler(state: &AppState) {
+    let rooms = state.rooms.clone();
+    let metrics = state.room_metrics.clone();
+    let shutdown = state.shutdown.clone();
+    tokio::spawn(async move {
+        let mut ticker = tokio::time::interval(std::time::Duration::from_secs(2));
+        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        loop {
+            tokio::select! {
+                biased;
+                _ = shutdown.cancelled() => break,
+                _ = ticker.tick() => sample_room_metrics(rooms.clone(), metrics.clone()).await,
+            }
+        }
+    });
 }
 
 #[derive(Clone)]

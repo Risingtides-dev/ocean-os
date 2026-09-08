@@ -254,18 +254,26 @@ impl RoomMaintenanceReport {
 
 /// The live report, shared between the sweep loop, the on-demand route, and
 /// `/health`.
-pub(super) type MaintenanceHandle = Arc<Mutex<RoomMaintenanceReport>>;
+pub(super) struct MaintenanceState {
+    report: Mutex<RoomMaintenanceReport>,
+    sweep: Arc<tokio::sync::Mutex<()>>,
+}
+
+pub(super) type MaintenanceHandle = Arc<MaintenanceState>;
 
 /// Build the shared report in its pre-first-sweep state.
 pub(super) fn new_handle(config: &MaintenanceConfig) -> MaintenanceHandle {
-    Arc::new(Mutex::new(RoomMaintenanceReport::new(config)))
+    Arc::new(MaintenanceState {
+        report: Mutex::new(RoomMaintenanceReport::new(config)),
+        sweep: Arc::new(tokio::sync::Mutex::new(())),
+    })
 }
 
 /// Read the current report, recovering a poisoned lock the way every other
 /// registry in this daemon does. A poisoned maintenance mutex must never take
 /// `/health` down with it — the card exists to make failure visible.
 pub(super) fn report_snapshot(handle: &MaintenanceHandle) -> RoomMaintenanceReport {
-    match handle.lock() {
+    match handle.report.lock() {
         Ok(guard) => guard.clone(),
         Err(poisoned) => poisoned.into_inner().clone(),
     }
@@ -605,8 +613,8 @@ fn record_sweep(
     outcome: &SweepOutcome,
     finished_at: DateTime<Utc>,
     elapsed: Duration,
-) {
-    let mut guard = match handle.lock() {
+) -> RoomMaintenanceReport {
+    let mut guard = match handle.report.lock() {
         Ok(guard) => guard,
         Err(poisoned) => poisoned.into_inner(),
     };
@@ -642,6 +650,7 @@ fn record_sweep(
         error = outcome.error.as_deref().unwrap_or("none"),
         "room maintenance sweep finished"
     );
+    guard.clone()
 }
 
 /// [`record_sweep`] for a test that needs a card without running a sweep.
@@ -665,24 +674,36 @@ async fn sweep_once(
     blob_root: Arc<PathBuf>,
     config: MaintenanceConfig,
     handle: MaintenanceHandle,
-) {
+) -> RoomMaintenanceReport {
+    let permit = handle.sweep.clone().lock_owned().await;
     let started = std::time::Instant::now();
-    let outcome = tokio::task::spawn_blocking(move || {
-        run_sweep(&rooms, blob_root.as_path(), &config, Utc::now())
+    let worker_handle = handle.clone();
+    let report = tokio::task::spawn_blocking(move || {
+        // The worker owns serialization and publication even if the HTTP
+        // request goes away while filesystem work is still running.
+        let _permit = permit;
+        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            run_sweep(&rooms, blob_root.as_path(), &config, Utc::now())
+        }))
+        .unwrap_or_else(|_| SweepOutcome {
+            error: Some("room maintenance sweep panicked".to_string()),
+            ..SweepOutcome::default()
+        });
+        record_sweep(&worker_handle, &outcome, Utc::now(), started.elapsed())
     })
     .await;
-    let outcome = match outcome {
-        Ok(outcome) => outcome,
-        Err(join_error) => SweepOutcome {
-            error: Some(if join_error.is_panic() {
-                "room maintenance sweep panicked".to_string()
-            } else {
-                "room maintenance sweep was cancelled".to_string()
-            }),
-            ..SweepOutcome::default()
-        },
-    };
-    record_sweep(&handle, &outcome, Utc::now(), started.elapsed());
+    match report {
+        Ok(report) => report,
+        Err(_) => record_sweep(
+            &handle,
+            &SweepOutcome {
+                error: Some("room maintenance sweep task failed".to_string()),
+                ..SweepOutcome::default()
+            },
+            Utc::now(),
+            started.elapsed(),
+        ),
+    }
 }
 
 /// Start the maintenance loop.
@@ -734,14 +755,13 @@ pub(super) async fn room_maintenance_run(
         operator = principal.id(),
         "room maintenance sweep requested on demand"
     );
-    sweep_once(
+    let report = sweep_once(
         state.rooms.clone(),
         state.room_attachments_root.clone(),
         state.room_maintenance_config,
         state.room_maintenance.clone(),
     )
     .await;
-    let report = report_snapshot(&state.room_maintenance);
     (
         StatusCode::OK,
         Json(json!({ "ok": true, "room_maintenance": report })),
@@ -753,6 +773,69 @@ mod tests {
     use super::*;
     use ocean_core::{RoomMessageKind, RoomParticipant, RoomParticipantKind};
     use ocean_store::{RoomCloser, RoomStore, SqliteRoomStore};
+
+    #[tokio::test]
+    async fn concurrent_sweeps_return_their_own_serial_report() {
+        let dir = tempfile::tempdir().unwrap();
+        let (rooms, root) = fixture(dir.path());
+        let root = Arc::new(root);
+        let config = MaintenanceConfig::default();
+        let handle = new_handle(&config);
+        let (first, second) = tokio::join!(
+            sweep_once(rooms.clone(), root.clone(), config, handle.clone()),
+            sweep_once(rooms, root, config, handle.clone())
+        );
+        let mut runs = [first.runs_total, second.runs_total];
+        runs.sort();
+        assert_eq!(runs, [1, 2]);
+        assert_eq!(report_snapshot(&handle).runs_total, 2);
+    }
+
+    #[tokio::test]
+    async fn cancelled_sweep_request_retains_worker_ownership_and_records_completion() {
+        let dir = tempfile::tempdir().unwrap();
+        let (rooms, root) = fixture(dir.path());
+        let root = Arc::new(root);
+        let config = MaintenanceConfig::default();
+        let handle = new_handle(&config);
+        let (locked_tx, locked_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        let held_rooms = rooms.clone();
+        let holder = std::thread::spawn(move || {
+            let _guard = held_rooms.lock().unwrap();
+            locked_tx.send(()).unwrap();
+            release_rx.blocking_recv().unwrap();
+        });
+        locked_rx.await.unwrap();
+        let request = tokio::spawn(sweep_once(
+            rooms.clone(),
+            root.clone(),
+            config,
+            handle.clone(),
+        ));
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while handle.sweep.try_lock().is_ok() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        request.abort();
+        assert!(request.await.unwrap_err().is_cancelled());
+        assert!(
+            handle.sweep.try_lock().is_err(),
+            "the detached worker still owns the sweep"
+        );
+        assert_eq!(report_snapshot(&handle).runs_total, 0);
+        release_tx.send(()).unwrap();
+        holder.join().unwrap();
+        let next = sweep_once(rooms, root, config, handle.clone()).await;
+        assert_eq!(
+            next.runs_total, 2,
+            "the cancelled request's sweep was recorded before the next run"
+        );
+        assert_eq!(next.last_error, None);
+    }
 
     /// A store handle plus the blob root that indexes into it, laid out the way
     /// the daemon lays them out: `<dir>/rooms.db` beside `<dir>/room-attachments`.

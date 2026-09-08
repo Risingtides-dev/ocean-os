@@ -510,7 +510,7 @@ pub(super) struct RoomCardEntry {
 /// Prometheus label.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub(super) struct RoomMetricsCard {
-    /// Whether the most recent scrape actually got the store lock. `false` means
+    /// Whether the most recent background sample succeeded. `false` means
     /// every room-derived number below is the previous sample — see
     /// [`RoomMetrics::note_sample_skipped`].
     pub(super) sampled: bool,
@@ -574,7 +574,7 @@ struct RoomMetricsDetail {
 /// 5. admission refusals by [`AdmissionRefusal`],
 /// 6. store lock wait (count and summed wait).
 ///
-/// Families 1 and 2 are SAMPLED from the store at scrape time; the rest are
+/// Families 1 and 2 are SAMPLED from the store in the background; the rest are
 /// PUSHED from their sites. The atomics are relaxed for the same reason
 /// [`TurnMetrics`]'s are: independent counters with no cross-counter invariant.
 #[derive(Default)]
@@ -707,9 +707,9 @@ impl RoomMetrics {
         let mut detail = self.detail();
         detail.lag.insert(room.to_string(), (generation, lag));
         let max = Self::max_lag(&detail);
-        drop(detail);
         self.federation_lag_max
             .store(max, std::sync::atomic::Ordering::Relaxed);
+        drop(detail);
     }
 
     /// Drop this room's lag entry when its federation task stops tracking it.
@@ -735,9 +735,9 @@ impl RoomMetrics {
         }
         detail.lag.remove(room);
         let max = Self::max_lag(&detail);
-        drop(detail);
         self.federation_lag_max
             .store(max, std::sync::atomic::Ordering::Relaxed);
+        drop(detail);
     }
 
     fn max_lag(detail: &RoomMetricsDetail) -> u64 {
@@ -1638,6 +1638,35 @@ mod tests {
             metric_value(&m.render_prometheus(), "ocean_room_federation_lag_events"),
             Some(0)
         );
+    }
+
+    #[test]
+    fn room_metrics_concurrent_lag_publication_matches_the_locked_map() {
+        let metrics = RoomMetrics::default();
+        std::thread::scope(|scope| {
+            for worker in 0..8 {
+                let metrics = &metrics;
+                scope.spawn(move || {
+                    let room = format!("room-{worker}");
+                    for generation in 0..1000 {
+                        metrics.set_federation_lag(&room, generation, generation + worker);
+                        if generation % 2 == 0 {
+                            metrics.clear_federation_lag(&room, generation);
+                        }
+                        let detail = metrics.detail();
+                        assert_eq!(
+                            metrics
+                                .federation_lag_max
+                                .load(std::sync::atomic::Ordering::Relaxed),
+                            RoomMetrics::max_lag(&detail),
+                            "a completed map mutation must publish its gauge before unlocking"
+                        );
+                    }
+                    metrics.clear_federation_lag(&room, 999);
+                });
+            }
+        });
+        assert_eq!(metrics.card().federation_lag_events_max, 0);
     }
 
     /// A skipped sample marks the card stale rather than zeroing it: `/health`
