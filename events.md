@@ -9629,3 +9629,11 @@ wire level for the operator (16/22 reachable; the six Codex ids return 429
 --all-targets` (clean) and `cargo fmt --check` (clean) all pass on top of
 `origin/main` 4b69b66. Opened as PR #453 against main.
 _________________________________________________________________________________ 12:31 worktree-providers-glm53flash-fable51
+time:      [11:20] [08-09-26]
+agent:     [claude] [fable-5.1]
+worktree:  cc/rooms-architecture-sessions-60d21b
+type:      [feature-request]
+area:      [backend]
+
+John could not see how Rooms organizes sessions, where agents execute, or how repos/tools/auth would attach per room. Wrote the proposed Phase 2 manifest (docs/specs/2026-09-08-ocean-rooms-phase2-room-profile-and-contributed-folders-manifest.md): a room profile that carries repo, tool, and credential-slot REFERENCES resolved on the executing node (never tokens, per architecture §12.7 and Gate 0 Decision 13), local folder grants with path confinement and generations, slot-status resolution, and a staged 2a→2d rollout. Landed Stage 2a: read-only GET /v1/rooms/persistent/{key}/inspect (new room_inspect.rs) projecting room, access, federated bool, owner, every binding with its deterministic session id and session_exists, truthful execution.cwd_source (room_workspace_root | unbound — found that an authorized turn with no live workspace is refused, not run from daemon cwd, and corrected the manifest to match), and empty profile/credential_slots/resources slots. Five HTTP tests plus three unit tests; clippy, fmt, docs-check green. Stages 2b–2d stay closed pending acceptance.
+_________________________________________________________________________________ 11:20 cc/rooms-architecture-sessions-60d21b

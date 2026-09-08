@@ -805,7 +805,7 @@ fn canonical_submitted_workspace_root(
         .ok_or(())
 }
 
-fn persisted_room_workspace(workspace_root: &str) -> Option<String> {
+pub(super) fn persisted_room_workspace(workspace_root: &str) -> Option<String> {
     let stored = std::path::Path::new(workspace_root);
     if !stored.is_absolute() {
         return None;
@@ -9282,6 +9282,180 @@ env = { FIXTURE = "1" }
             closed_get.status(),
             StatusCode::NOT_FOUND,
             "the other hydration route cannot answer this state at all"
+        );
+    }
+
+    // ── Inspect (Phase 2 Stage 2a) ────────────────────────────────────────────
+
+    async fn inspect_response(state: &AppState, key: &str) -> (StatusCode, serde_json::Value) {
+        let app = room_routes().with_state(state.clone());
+        let resp = app
+            .oneshot(
+                axum::http::Request::get(format!("/v1/rooms/persistent/{key}/inspect"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let status = resp.status();
+        let body: serde_json::Value = serde_json::from_slice(
+            &axum::body::to_bytes(resp.into_body(), 1024 * 1024)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        (status, body)
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn inspect_unknown_room_is_404_with_a_typed_code() {
+        let _guard = AUTO_CONVENE_ENV_LOCK.lock().await;
+        let tmp = tempfile::TempDir::new().unwrap();
+        let state = fake_convene_state(&tmp);
+        let (status, body) = inspect_response(&state, "no-such-room").await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert_eq!(body["ok"], json!(false));
+        assert_eq!(body["code"], json!("room_not_found"));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn inspect_unbound_room_reports_unbound_execution_and_empty_phase2_slots() {
+        let _guard = AUTO_CONVENE_ENV_LOCK.lock().await;
+        let tmp = tempfile::TempDir::new().unwrap();
+        let state = fake_convene_state(&tmp);
+        let key = RoomKey::new("inspect-unbound");
+        seed_access(&state, &key, local_access());
+
+        let (status, body) = inspect_response(&state, key.as_str()).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["ok"], json!(true));
+        assert_eq!(body["room"]["id"], json!(key.as_str()));
+        assert_eq!(body["room"]["closed"], json!(false));
+        assert_eq!(body["room"]["workspace_root"], serde_json::Value::Null);
+        assert_eq!(body["execution"]["node"], json!("local"));
+        assert_eq!(body["execution"]["cwd"], serde_json::Value::Null);
+        // An authorized turn with no workspace is REFUSED, not run from the
+        // daemon cwd; the projection must not imply a fallback that isn't there.
+        assert_eq!(body["execution"]["cwd_source"], json!("unbound"));
+        assert_eq!(body["federated"], json!(false));
+        assert_eq!(body["access"], json!({"state": "local"}));
+        assert_eq!(body["agents"], json!([]));
+        assert_eq!(body["profile"], serde_json::Value::Null);
+        assert_eq!(body["credential_slots"], json!([]));
+        assert_eq!(body["resources"], json!([]));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn inspect_bound_room_reports_the_canonical_workspace_as_cwd() {
+        let _guard = AUTO_CONVENE_ENV_LOCK.lock().await;
+        let tmp = tempfile::TempDir::new().unwrap();
+        let state = fake_convene_state(&tmp);
+        let workspace = tmp.path().join("ws");
+        std::fs::create_dir_all(&workspace).unwrap();
+        let canonical = canonical_test_workspace(&workspace);
+        let key = RoomKey::new("inspect-bound");
+        with_rooms(&state, |store| {
+            store
+                .create_in_workspace(
+                    key.clone(),
+                    "Bound",
+                    Some(canonical.clone()),
+                    None,
+                    Utc::now(),
+                )
+                .expect("create bound room");
+        });
+
+        let (status, body) = inspect_response(&state, key.as_str()).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["room"]["workspace_root"], json!(canonical));
+        assert_eq!(body["execution"]["cwd"], json!(canonical));
+        assert_eq!(
+            body["execution"]["cwd_source"],
+            json!("room_workspace_root")
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn inspect_reports_the_same_session_id_the_convene_path_derives() {
+        let _guard = AUTO_CONVENE_ENV_LOCK.lock().await;
+        let tmp = tempfile::TempDir::new().unwrap();
+        let state = fake_convene_state(&tmp);
+        let _env = TestEnvRestore::capture(&["OCEAN_AGENTS_DIR"]);
+        let agents_root = tmp.path().join("agents");
+        write_agent_fixture(&agents_root, "helper", "", None);
+        std::env::set_var("OCEAN_AGENTS_DIR", &agents_root);
+        let key = RoomKey::new("inspect-binding");
+        seed_access(&state, &key, local_access());
+        with_rooms(&state, |store| {
+            store
+                .add_participant(
+                    &key,
+                    RoomParticipant {
+                        id: "john".into(),
+                        kind: RoomParticipantKind::Human,
+                        display_name: "John".into(),
+                    },
+                    Utc::now(),
+                )
+                .expect("human participant");
+            store
+                .add_agent_participant_with_owner(
+                    &key,
+                    RoomParticipant {
+                        id: "helper".into(),
+                        kind: RoomParticipantKind::Agent,
+                        display_name: "Helper".into(),
+                    },
+                    "john",
+                    Utc::now(),
+                )
+                .expect("owned agent participant");
+        });
+        let generation = authorize_room_agent_fixture(
+            &state,
+            &key,
+            "helper",
+            ActivationPolicy::Mention,
+            ContextPolicy::RoomRecent,
+        );
+
+        let (status, body) = inspect_response(&state, key.as_str()).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let agents = body["agents"].as_array().expect("agents array");
+        assert_eq!(agents.len(), 1);
+        let agent = &agents[0];
+        assert_eq!(agent["agent_member_id"], json!("helper"));
+        assert_eq!(agent["execution_node"], json!("local"));
+        let expected = authorized_room_agent_session_id(&key, "helper", generation).to_string();
+        assert_eq!(agent["session_id"], json!(expected));
+        // No turn has run, so the durable transcript does not exist yet.
+        assert_eq!(agent["session_exists"], json!(false));
+        // The Phase 1 projection rides along unchanged.
+        assert_eq!(agent["status"], json!("active"));
+        assert_eq!(agent["generation"], json!(generation.to_string()));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn inspect_never_serializes_a_room_bearer() {
+        let _guard = AUTO_CONVENE_ENV_LOCK.lock().await;
+        let tmp = tempfile::TempDir::new().unwrap();
+        let state = fake_convene_state(&tmp);
+        let key = RoomKey::new("inspect-federated");
+        seed_access(&state, &key, local_access());
+        const BEARER: &str = "bearer-secret-value-that-must-never-appear";
+        with_rooms(&state, |store| {
+            store
+                .install_room_credential(&key, BEARER, "local-human")
+                .expect("install credential");
+        });
+
+        let (status, body) = inspect_response(&state, key.as_str()).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["federated"], json!(true));
+        assert!(
+            !body.to_string().contains(BEARER),
+            "the bearer must never reach a projection: {body}"
         );
     }
 
