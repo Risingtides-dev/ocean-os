@@ -15,20 +15,26 @@
 //!    [`resource_projection`] is the single projection every route and
 //!    `inspect` share, and it does not carry the root. Tests pin that no
 //!    response body contains it.
-//! 3. **Path confinement** ([`confine`]). Authorization is rooted in the
-//!    canonical root, not a string prefix: the relative path is normalized,
-//!    joined, canonicalized again, and refused unless the RESULT is under the
-//!    root. A symlink inside the folder that points outside is an escape,
-//!    whatever its name says.
+//! 3. **Path confinement** ([`confine`], owned by `ocean-agent` beside the
+//!    tools). Authorization is rooted in the canonical root, not a string
+//!    prefix: the relative path is normalized, joined, canonicalized again, and
+//!    refused unless the RESULT is under the root. A symlink inside the folder
+//!    that points outside is an escape, whatever its name says.
 //! 4. **The cwd rule** ([`resolve_turn_cwd`], manifest §5 as ruled in §11.4):
 //!    the agent's own `agent_defaults` entry, then the profile's
 //!    `default_resource_id`, then `Room.workspace_root`, else refused. The
 //!    convene path and `inspect` call the same function so what the operator
 //!    sees is what the turn gets.
 //!
-//! Phase 2c admits `list` and `read` grants for use by the 2d tools. `write`
-//! and `execute` may be RECORDED so intent is visible, and every operation
-//! needing them is refused with `phase_not_open` until Phases 4 and 5.
+//! 5. **The authority** ([`DurableRoomResourceAuthority`], Stage 2d): what the
+//!    `room_list`/`room_read` tools in `ocean-agent` consult on every call. It
+//!    re-validates the binding generation and the grant on each call and
+//!    records one audit row per operation; the operator preview routes run
+//!    the SAME tools under the agent's current generation so an operator can
+//!    see exactly what the agent would.
+//!
+//! `write` and `execute` may be RECORDED so intent is visible, and every
+//! operation needing them is refused until Phases 4 and 5.
 
 use std::collections::BTreeSet;
 use std::path::{Component, Path as FsPath, PathBuf};
@@ -189,63 +195,11 @@ pub(super) fn canonical_grant_root(submitted: &str) -> Result<PathBuf, RootRefus
     Ok(canonical)
 }
 
-/// Why a relative path was refused under a root.
-///
-/// Constructed only by [`confine`], whose first route callers are the Stage
-/// 2d `list`/`read` tools; both ship in 2c so the escape tests pin the rule
-/// before any route can reach a file.
-#[cfg_attr(not(test), allow(dead_code))]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) enum ConfineRefusal {
-    /// Absolute, or contains `..`/`.`, or a component the OS treats as
-    /// special. Refused lexically before touching the filesystem.
-    NotRelative,
-    NotFound,
-    /// Canonicalized outside the root (a symlink escape).
-    Escapes,
-}
-
-impl ConfineRefusal {
-    #[cfg_attr(not(test), allow(dead_code))]
-    pub(super) fn code(self) -> &'static str {
-        match self {
-            Self::NotRelative => "invalid_relative_path",
-            Self::NotFound => "path_not_found",
-            Self::Escapes => "path_escapes_root",
-        }
-    }
-}
-
-/// Resolve `relative` under `canonical_root` and prove the result stays
-/// inside. `relative` may be empty (the root itself). The check is on the
-/// canonicalized RESULT, after symlink resolution — a prefix check on the
-/// joined string would accept `link-to-home/.ssh` when `link-to-home` points
-/// out of the folder.
-#[cfg_attr(not(test), allow(dead_code))]
-pub(super) fn confine(canonical_root: &FsPath, relative: &str) -> Result<PathBuf, ConfineRefusal> {
-    let rel = FsPath::new(relative);
-    if rel.is_absolute() {
-        return Err(ConfineRefusal::NotRelative);
-    }
-    for component in rel.components() {
-        match component {
-            Component::Normal(_) => {}
-            _ => return Err(ConfineRefusal::NotRelative),
-        }
-    }
-    let joined = canonical_root.join(rel);
-    let resolved = match std::fs::canonicalize(&joined) {
-        Ok(resolved) => resolved,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            return Err(ConfineRefusal::NotFound)
-        }
-        Err(_) => return Err(ConfineRefusal::Escapes),
-    };
-    if resolved != canonical_root && !resolved.starts_with(canonical_root) {
-        return Err(ConfineRefusal::Escapes);
-    }
-    Ok(resolved)
-}
+/// Path confinement lives in `ocean-agent` beside the tools that use it
+/// (Stage 2d); re-exported so the daemon's tests pin the same rule the tools
+/// enforce.
+#[cfg(test)]
+pub(super) use ocean_agent::{confine_room_resource_path as confine, ConfineRefusal};
 
 // ── Projection ────────────────────────────────────────────────────────────────
 
@@ -644,6 +598,275 @@ pub(super) async fn room_resource_revoke(
         headers,
         body,
         ResourceStatus::Revoked,
+    )
+    .await
+}
+
+// ── The daemon-owned authority (Stage 2d) ─────────────────────────────────────
+
+/// What the tools consult on EVERY call. Re-validates the binding generation
+/// the handle was minted under and the grant's effective status, agent list,
+/// access mode, and root liveness, then hands back the root for exactly one
+/// operation. Nothing is cached across calls (Decision 12).
+pub(super) struct DurableRoomResourceAuthority {
+    pub(super) rooms: crate::persistent_rooms::RoomStoreHandle,
+    /// `agent` inside an admitted turn; `operator_preview` from the preview
+    /// routes. Recorded on every audit row.
+    pub(super) actor: &'static str,
+}
+
+fn needed_mode(op: ocean_agent::RoomResourceOp) -> ResourceAccessMode {
+    match op {
+        ocean_agent::RoomResourceOp::List => ResourceAccessMode::List,
+        ocean_agent::RoomResourceOp::Read => ResourceAccessMode::Read,
+    }
+}
+
+#[async_trait::async_trait]
+impl ocean_agent::RoomResourceAuthority for DurableRoomResourceAuthority {
+    async fn resolve(
+        &self,
+        scope: &ocean_agent::RoomResourceScope,
+        resource_id: &str,
+        op: ocean_agent::RoomResourceOp,
+    ) -> Result<ocean_agent::ResolvedResource, ocean_agent::RoomResourceError> {
+        use ocean_agent::RoomResourceError as E;
+        let room = RoomKey::new(scope.room_key());
+        crate::persistent_rooms::with_rooms_handle(&self.rooms, |store| {
+            let live = store
+                .room_agent_generation_is_active(
+                    &room,
+                    scope.agent_member_id(),
+                    scope.binding_generation(),
+                )
+                .map_err(|e| E::Unavailable(e.to_string()))?;
+            if !live {
+                return Err(E::StaleGeneration);
+            }
+            let grant = store
+                .room_resource_grant(&room, resource_id)
+                .map_err(|e| E::Unavailable(e.to_string()))?
+                .ok_or(E::NotFound)?;
+            let now = Utc::now();
+            if grant.effective_status(now) != ResourceStatus::Available {
+                return Err(E::NotAvailable);
+            }
+            if !grant.authorizes_agent(scope.agent_member_id()) {
+                return Err(E::AgentNotAuthorized);
+            }
+            if !grant.access_mode.allows(needed_mode(op)) {
+                return Err(E::ModeNotGranted);
+            }
+            let Some(root) = persisted_room_workspace(&grant.local_root) else {
+                return Err(E::NotAvailable);
+            };
+            Ok(ocean_agent::ResolvedResource {
+                local_root: PathBuf::from(root),
+                grant_generation: grant.generation,
+            })
+        })
+    }
+
+    async fn record(
+        &self,
+        scope: &ocean_agent::RoomResourceScope,
+        fact: ocean_agent::RoomResourceAuditFact,
+    ) {
+        let room = RoomKey::new(scope.room_key());
+        let result = crate::persistent_rooms::with_rooms_handle(&self.rooms, |store| {
+            store.append_room_resource_audit(
+                &room,
+                ocean_store::RoomResourceAuditInput {
+                    resource_id: fact.resource_id,
+                    agent_member_id: scope.agent_member_id().to_string(),
+                    binding_generation: scope.binding_generation(),
+                    grant_generation: fact.grant_generation,
+                    op: fact.op.as_str().to_string(),
+                    relative_path_digest: fact.relative_path_digest,
+                    bytes: fact.bytes,
+                    entries: fact.entries,
+                    outcome: fact.outcome,
+                    actor: self.actor.to_string(),
+                },
+                Utc::now(),
+            )
+        });
+        if let Err(error) = result {
+            tracing::warn!(room = %room, %error, "room resource audit row not recorded");
+        }
+    }
+}
+
+/// Every grant that admits `agent` for at least `list`, as the catalog the
+/// tool description shows. Empty means the turn gets no resource tools.
+pub(super) fn admitted_resource_catalog(
+    store: &mut ocean_store::SqliteRoomStore,
+    room: &RoomKey,
+    agent_member_id: &str,
+) -> Result<Vec<ocean_agent::RoomResourceCatalogEntry>, RoomStoreError> {
+    let now = Utc::now();
+    Ok(store
+        .room_resource_grants(room)?
+        .into_iter()
+        .filter(|grant| grant.admits(agent_member_id, ResourceAccessMode::List, now))
+        .map(|grant| ocean_agent::RoomResourceCatalogEntry {
+            resource_id: grant.resource_id,
+            display_name: grant.display_name,
+            // Phase 2d exposes list/read only; report what the tools can do,
+            // not the recorded intent.
+            access_mode: if grant.access_mode.allows(ResourceAccessMode::Read) {
+                "read".into()
+            } else {
+                "list".into()
+            },
+        })
+        .collect())
+}
+
+// ── Operator preview routes (Stage 2d) ────────────────────────────────────────
+
+/// The admission evidence a preview runs under: the agent's CURRENT active
+/// binding generation, so the preview sees exactly what the agent would.
+struct PreviewAdmission {
+    room: String,
+    agent_member_id: String,
+    generation: u64,
+}
+
+impl ocean_agent::RoomResourceAdmission for PreviewAdmission {
+    fn admitted_room_key(&self) -> &str {
+        &self.room
+    }
+    fn admitted_agent_member_id(&self) -> &str {
+        &self.agent_member_id
+    }
+    fn admitted_generation(&self) -> u64 {
+        self.generation
+    }
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct PreviewBody {
+    agent_member_id: String,
+    #[serde(default)]
+    path: String,
+    #[serde(default)]
+    offset: Option<u64>,
+    #[serde(default)]
+    max_bytes: Option<usize>,
+}
+
+async fn preview(
+    state: AppState,
+    key: String,
+    resource_id: String,
+    headers: HeaderMap,
+    body: Result<Json<PreviewBody>, JsonRejection>,
+    tool_name: &str,
+) -> (StatusCode, Json<Value>) {
+    let prepared = (|| {
+        let _principal = operator(&state, &headers)?;
+        let Json(body) = body.map_err(|_| ApiError::bad_request("invalid_request"))?;
+        let room = room_key(&key)?;
+        let agent = validate_member_id(&body.agent_member_id, "invalid_agent_member_id")?;
+        if agent.is_empty() {
+            return Err(ApiError::bad_request("invalid_request"));
+        }
+        let (generation, catalog) = with_rooms(&state, |store| {
+            let binding = store
+                .room_agent_binding(&room, &agent)?
+                .filter(|b| b.status == ocean_store::AgentBindingStatus::Active)
+                .map(|b| b.generation);
+            let catalog = admitted_resource_catalog(store, &room, &agent)?;
+            Ok::<_, RoomStoreError>((binding, catalog))
+        })
+        .map_err(ApiError::from)?;
+        let generation = generation.ok_or_else(|| ApiError::conflict("agent_binding_required"))?;
+        let admitted = state
+            .runtime
+            .admit_room_resources(
+                &PreviewAdmission {
+                    room: room.as_str().to_string(),
+                    agent_member_id: agent.clone(),
+                    generation,
+                },
+                std::sync::Arc::new(DurableRoomResourceAuthority {
+                    rooms: state.rooms.clone(),
+                    actor: "operator_preview",
+                }),
+                catalog,
+            )
+            .map_err(|_| ApiError::internal("room_resources_unavailable"))?;
+        let mut args = json!({ "resource_id": resource_id.trim(), "path": body.path });
+        if tool_name == ocean_agent::ROOM_READ_TOOL {
+            if let Some(offset) = body.offset {
+                args["offset"] = json!(offset);
+            }
+            if let Some(max_bytes) = body.max_bytes {
+                args["max_bytes"] = json!(max_bytes);
+            }
+        }
+        Ok((admitted, args, agent, generation))
+    })();
+    let (admitted, args, agent, generation) = match prepared {
+        Ok(prepared) => prepared,
+        Err(error) => return error.response(),
+    };
+    let Some(tool) = admitted.tools().into_iter().find(|t| t.name() == tool_name) else {
+        return ApiError::internal("room_resources_unavailable").response();
+    };
+    match tool.execute("operator-preview", args).await {
+        Ok(result) => {
+            let text = result
+                .content
+                .iter()
+                .find_map(|c| match c {
+                    ocean_protocol::Content::Text { text } => Some(text.clone()),
+                    _ => None,
+                })
+                .unwrap_or_default();
+            let mut body: Value = serde_json::from_str(&text)
+                .unwrap_or(json!({ "ok": false, "error": "malformed_tool_result" }));
+            body["via"] = json!("operator_preview");
+            body["agent_member_id"] = json!(agent);
+            body["binding_generation"] = json!(generation.to_string());
+            (StatusCode::OK, Json(body))
+        }
+        Err(_) => ApiError::bad_request("invalid_request").response(),
+    }
+}
+
+pub(super) async fn room_resource_preview_list(
+    State(state): State<AppState>,
+    Path((key, resource_id)): Path<(String, String)>,
+    headers: HeaderMap,
+    body: Result<Json<PreviewBody>, JsonRejection>,
+) -> (StatusCode, Json<Value>) {
+    preview(
+        state,
+        key,
+        resource_id,
+        headers,
+        body,
+        ocean_agent::ROOM_LIST_TOOL,
+    )
+    .await
+}
+
+pub(super) async fn room_resource_preview_read(
+    State(state): State<AppState>,
+    Path((key, resource_id)): Path<(String, String)>,
+    headers: HeaderMap,
+    body: Result<Json<PreviewBody>, JsonRejection>,
+) -> (StatusCode, Json<Value>) {
+    preview(
+        state,
+        key,
+        resource_id,
+        headers,
+        body,
+        ocean_agent::ROOM_READ_TOOL,
     )
     .await
 }

@@ -72,6 +72,13 @@ pub(crate) fn append_room_history_context(prompt: &mut String) {
     );
 }
 
+pub(crate) fn append_room_resources_context(prompt: &mut String) {
+    prompt.push_str(
+        "\n## Contributed folders\n\
+         `room_list {resource_id, path?}` lists one directory and `room_read {resource_id, path, offset?, max_bytes?}` reads a bounded chunk of one UTF-8 file inside a folder a Room member has contributed to this Room. Both take a resource_id from the catalog in the tool description and a path RELATIVE to that folder; they cannot reach outside it, cannot write, and cannot run anything. Read in chunks with next_offset; large or binary files are refused with a typed reason. The Room, agent, and authority generation are fixed by admission.\n",
+    );
+}
+
 /// Inner form of [`build_system_prompt`] that resolves any file-loaded
 /// surface profile against an explicit `assistants_root` instead of the
 /// process-global one. This is the isolation seam (OCEAN-285): tests pass a

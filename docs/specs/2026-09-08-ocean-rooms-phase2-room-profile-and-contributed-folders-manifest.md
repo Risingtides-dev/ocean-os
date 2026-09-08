@@ -1,6 +1,6 @@
 # Ocean Rooms — Phase 2 implementation manifest: room profile and local contributed folders
 
-**Status:** operator-accepted 2026-09-08 with the four §11 rulings recorded below; concurrent implementation and review per the Phase 1 deviation. Stage 2a (`inspect` route) landed through Ocean OS PR #454. Stage 2b (room profile record, `GET`/`PUT .../profile`, credential-slot status on read and at admission) landed through Ocean OS PR #455 and is proven live. Stage 2c (local folder grants, dangerous-root refusal, path confinement, generation-bound status, the §5 cwd rule in the convene path and in `inspect`) is implemented; 2d opens as the §10 gate passes. The operator has authorized this as an ongoing program: work continues through 2b → 2c → 2d without repeated approval prompts, pausing only for a concrete blocker or a design decision this document does not already settle.
+**Status:** operator-accepted 2026-09-08 with the four §11 rulings recorded below; concurrent implementation and review per the Phase 1 deviation. Stage 2a (`inspect` route) landed through Ocean OS PR #454. Stage 2b (room profile record, `GET`/`PUT .../profile`, credential-slot status on read and at admission) landed through Ocean OS PR #455 and is proven live. Stage 2c (local folder grants, dangerous-root refusal, path confinement, generation-bound status, the §5 cwd rule in the convene path and in `inspect`) landed through Ocean OS PR #456. Stage 2d (the admitted `room_list`/`room_read` tools, the daemon authority that re-validates both generations per call, the `room_resource_audit` table, and operator preview routes) is implemented. Phase 2 is complete when 2d lands and is proven live; Phase 3 requires its own manifest. The operator has authorized this as an ongoing program: work continues through 2b → 2c → 2d without repeated approval prompts, pausing only for a concrete blocker or a design decision this document does not already settle.
 **Date:** 2026-09-08
 **Phase:** 2 of the Decision 6 capability delivery order
 **Authorizing documents:**
@@ -116,13 +116,15 @@ Until Stage 2c lands there are no grants, so in 2b any non-null `resource_id`,
 `default_resource_id`, or `agent_defaults` entry is refused with
 `phase_not_open` rather than silently accepted as a dangling reference.
 
-**Recorded 2b deviation — tool presence is reported, not enforced.** The
-"tool `name` not installed locally is a 400" rule above is deferred to Stage
-2d. In 2b a `ToolRef` is validated for shape (`kind`, identifier `name`,
-canonical `allowed` list) and projected with `installed: "unknown"`; the
-write-time refusal lands with the resource-aware tools, when there is one
-inventory (MCP servers, plugins, builtins) the daemon can check against
-instead of three partial ones.
+**Recorded deviation — tool presence is reported, not enforced.** The
+"tool `name` not installed locally is a 400" rule above did not land in Phase
+2. A `ToolRef` is validated for shape (`kind`, identifier `name`, canonical
+`allowed` list) and projected with `installed: "unknown"`. The write-time
+refusal needs one inventory (MCP servers, plugins, builtins) the daemon can
+check against instead of three partial ones; that inventory is Phase 3 work
+and the refusal lands with it. Until then a profile's `tools` are declared
+intent, and the Phase 1 capability intersection remains what actually bounds
+a turn's tools.
 
 **Nothing in this record is a secret and nothing in it is federated.** The
 `resolvers` list names *where to look*, never *what was found*.
@@ -263,8 +265,8 @@ All routes live under `/v1/rooms/persistent/{key}`.
 | `POST .../resources/{resource_id}/suspend` | operator | **2c (landed)** |
 | `POST .../resources/{resource_id}/resume` | operator | **2c (landed)** |
 | `DELETE .../resources/{resource_id}` | operator | **2c (landed)** |
-| `POST .../resources/{resource_id}/list` | binding + grant | 2d |
-| `POST .../resources/{resource_id}/read` | binding + grant | 2d |
+| `POST .../resources/{resource_id}/list` | operator preview (runs the agent's admitted tool) | **2d (landed)** |
+| `POST .../resources/{resource_id}/read` | operator preview (runs the agent's admitted tool) | **2d (landed)** |
 
 ### 7.1 `GET .../inspect` (Stage 2a)
 
@@ -378,7 +380,32 @@ Stage 2c (landed with the resource routes):
   no `cwd`, and a mention actually convenes the agent and it replies;
   suspending the grant makes the same agent `unbound` again.
 
-Stage 2d adds its own list before opening; the pattern is Phase 1 §12.
+Stage 2d (landed with the tools and preview routes):
+
+- agent: `room_list` is scoped to the admitted (room, agent, binding
+  generation) on every call, confined on the canonical result, non-recursive,
+  sorted, symlinks reported as links and never followed, capped at the
+  Decision 8 ceiling with `truncated`, and every call — refused or not —
+  produces one audit fact with a path digest; `room_read` pages in bounded
+  UTF-8-safe chunks with `next_offset`, refuses NUL-bearing files as
+  `binary_not_supported`, directories as `not_a_file`, oversize files as
+  `file_too_large`, and bad offsets; an in-folder symlink pointing outside is
+  `path_escapes_root` for both; an authority refusal is the tool result and is
+  audited before any I/O; the catalog is in the tool description; admission
+  evidence without a generation is refused.
+- store: audit rows round-trip newest first, carry digests and generations,
+  and never path text.
+- daemon: the preview routes are 503 without the operator and 409 without an
+  active binding; list root and subdirectory, refuse escape and miss; read a
+  chunk and page it; an agent the grant does not name is
+  `agent_not_authorized_for_resource`; a suspended grant is
+  `resource_not_available`; every call leaves an audit row with actor
+  `operator_preview`, a 64-hex digest, and no path; no response carries the
+  root.
+
+The reserved names `room_list` and `room_read` are stripped from every
+ambient provider before the admitted tools are appended, exactly as
+`room_history` is.
 
 ## 10. Rollout gates
 
