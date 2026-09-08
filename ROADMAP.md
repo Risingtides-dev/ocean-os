@@ -40,6 +40,18 @@ across those computers. The architecture does not itself authorize code changes.
       in the PRs that depend on them. The §12 local and GitHub gates are green.
       Stage 2 (contributed folders) remains closed and requires its own accepted
       implementation manifest.
+- [x] Write and accept the Phase 2 manifest for the room profile and local
+      contributed folders: [`Phase 2 room profile and contributed folders manifest`](docs/specs/2026-09-08-ocean-rooms-phase2-room-profile-and-contributed-folders-manifest.md),
+      operator-accepted 2026-09-08 with its four §11 rulings. Stage 2a (the
+      read-only `inspect` route) landed through Ocean OS PR #454.
+- [ ] **Goal (authorized 2026-09-08, ongoing):** carry Phase 2 through its
+      stages without re-approval — 2b room profile record, routes, and
+      credential-slot status; 2c local folder grants with path confinement and
+      generation-safe revocation; 2d resource-aware `list`/`read` tools — each
+      landing on green gates with its §9 tests, and closing with a live
+      `inspect` that shows a real agent, a real folder, and resolved slots in
+      the `campaigns` room. Pause only for a concrete blocker or a design
+      decision the manifest does not settle.
 
 - [ ] Reach the production-grade finish line in
       [`docs/specs/2026-09-01-ocean-rooms-definition-of-done.md`](docs/specs/2026-09-01-ocean-rooms-definition-of-done.md):

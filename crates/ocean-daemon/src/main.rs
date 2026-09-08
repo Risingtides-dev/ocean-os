@@ -168,6 +168,7 @@ mod room_maintenance;
 /// wires mutation routes, so the production module is deliberately inert here.
 #[allow(dead_code)]
 mod room_operator;
+mod room_profile;
 /// One-shot room-transcript summary into the room's well-known artifact.
 mod room_summary;
 /// Membership-gated lane from a browser to a room's Bedrock workspace: an
@@ -1687,6 +1688,8 @@ fn banner_routes() -> &'static [&'static str] {
         "POST /v1/rooms/persistent/{key}/summarize",
         "GET /v1/rooms/persistent/{key}/snapshot",
         "GET /v1/rooms/persistent/{key}/inspect",
+        "GET /v1/rooms/persistent/{key}/profile",
+        "PUT /v1/rooms/persistent/{key}/profile",
         "GET /v1/rooms/persistent/{key}/events",
         "GET /v1/rooms/persistent/{key}/read-cursor",
         "PATCH /v1/rooms/persistent/{key}/read-cursor",
@@ -3138,6 +3141,10 @@ fn room_routes() -> Router<AppState> {
         .route(
             "/v1/rooms/persistent/{key}/inspect",
             get(room_inspect::room_inspect),
+        )
+        .route(
+            "/v1/rooms/persistent/{key}/profile",
+            get(room_profile::room_profile_get).put(room_profile::room_profile_put),
         )
         .route(
             "/v1/rooms/persistent/{key}/agents/bootstrap",
@@ -27023,6 +27030,9 @@ mod tests {
         // 126 -> 127: Rooms Phase 2 Stage 2a read-only inspect projection
         // (room, access, federated bool, owner, execution cwd_source, every
         // binding with its deterministic session id, empty Phase 2 slots).
+        // 125 -> 127: Rooms Phase 2 Stage 2b room profile — credential-free
+        // GET and operator-gated, replay-safe PUT of the references-only
+        // profile (repos, tools, credential slots) with slot STATUS on read.
         assert_eq!(
             banner.len(),
             127,
