@@ -44,17 +44,22 @@ across those computers. The architecture does not itself authorize code changes.
       contributed folders: [`Phase 2 room profile and contributed folders manifest`](docs/specs/2026-09-08-ocean-rooms-phase2-room-profile-and-contributed-folders-manifest.md),
       operator-accepted 2026-09-08 with its four §11 rulings. Stage 2a (the
       read-only `inspect` route) landed through Ocean OS PR #454.
-- [ ] **Goal (authorized 2026-09-08, ongoing):** carry Phase 2 through its
-      stages without re-approval — 2b room profile record, routes, and
-      credential-slot status (landed, PR #455, proven live on `campaigns`);
-      2c local folder grants with path confinement and generation-safe
-      revocation (landed, PR #456); 2d resource-aware `room_list`/`room_read`
-      tools with a per-call generation-revalidating authority, audit table,
-      and operator preview routes (implemented) — each
-      landing on green gates with its §9 tests, and closing with a live
-      `inspect` that shows a real agent, a real folder, and resolved slots in
-      the `campaigns` room. Pause only for a concrete blocker or a design
-      decision the manifest does not settle.
+- [x] **Goal (authorized 2026-09-08, closed 2026-09-08):** carry Phase 2
+      through its stages without re-approval — 2b room profile record, routes,
+      and credential-slot status (PR #455); 2c local folder grants with path
+      confinement and generation-safe revocation (PR #456); 2d admitted
+      `room_list`/`room_read` tools with a per-call generation-revalidating
+      authority, audit table, and operator preview routes (PR #457) — each
+      landed on green gates with its §9 tests. Closed by a live `inspect` on
+      the `campaigns` room showing an authorized `room-builder` whose cwd is a
+      contributed folder, three credential slots with typed status, and a real
+      mention turn in which the agent listed the folder and read a file through
+      the admitted tools with audit rows to prove it.
+- [ ] Phase 3 — node identity, Tailscale-bound enrollment, and read-only
+      remote `stat`/`list`/`read` — requires its own accepted manifest
+      (Decision 6 order; Decision 5 blocks remote workers until isolation is
+      proven). Also carried into Phase 3: the single tool inventory that makes
+      a profile's `tools` enforceable at write time.
 
 - [ ] Reach the production-grade finish line in
       [`docs/specs/2026-09-01-ocean-rooms-definition-of-done.md`](docs/specs/2026-09-01-ocean-rooms-definition-of-done.md):
