@@ -17,6 +17,7 @@ legacy-chromium = ["ocean-runtime/legacy-chromium"]
 [dependencies]
 anyhow.workspace = true
 async-trait.workspace = true
+sha2.workspace = true
 chrono.workspace = true
 ocean-core.workspace = true
 ocean-providers.workspace = true

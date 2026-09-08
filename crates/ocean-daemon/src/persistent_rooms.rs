@@ -2958,6 +2958,7 @@ enum RoomTurnStartError {
     Authority(ApiError),
     WorkspaceUnavailable,
     RoomHistoryUnavailable,
+    RoomResourcesUnavailable,
 }
 
 impl RoomTurnStartError {
@@ -2966,6 +2967,7 @@ impl RoomTurnStartError {
             Self::Authority(error) => error.code(),
             Self::WorkspaceUnavailable => "workspace_unavailable",
             Self::RoomHistoryUnavailable => "room_history_unavailable",
+            Self::RoomResourcesUnavailable => "room_resources_unavailable",
         }
     }
 
@@ -2979,6 +2981,10 @@ impl RoomTurnStartError {
             Self::RoomHistoryUnavailable => (
                 StatusCode::SERVICE_UNAVAILABLE,
                 Json(json!({"ok": false, "error": "room_history_unavailable"})),
+            ),
+            Self::RoomResourcesUnavailable => (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(json!({"ok": false, "error": "room_resources_unavailable"})),
             ),
         }
     }
@@ -3043,6 +3049,37 @@ async fn spawn_room_agent_turn(
         }
     } else {
         None
+    };
+    // Phase 2d: every grant that admits this agent becomes a catalog line and
+    // the two reserved tools; no grant, no tools. The authority re-validates
+    // on every call, so the catalog is display only.
+    let catalog = with_rooms(&state, |store| {
+        crate::room_resources::admitted_resource_catalog(store, &room, &admission.agent_member_id)
+    })
+    .map_err(|error| RoomTurnStartError::Authority(ApiError::from(error)))?;
+    let room_resources = if catalog.is_empty() {
+        None
+    } else {
+        match state.runtime.admit_room_resources(
+            &admission,
+            Arc::new(crate::room_resources::DurableRoomResourceAuthority {
+                rooms: state.rooms.clone(),
+                actor: "agent",
+            }),
+            catalog,
+        ) {
+            Ok(resources) => Some(resources),
+            Err(_) => {
+                room_agent_authority::append_remote_output_outcome(
+                    &state,
+                    &admission,
+                    "refused",
+                    "room_resources_unavailable",
+                )
+                .map_err(RoomTurnStartError::Authority)?;
+                return Err(RoomTurnStartError::RoomResourcesUnavailable);
+            }
+        }
     };
     let session_id =
         authorized_room_agent_session_id(&room, &admission.agent_member_id, admission.generation);
@@ -3156,6 +3193,10 @@ async fn spawn_room_agent_turn(
             prompt_req.decision_token.clone(),
         );
         let control = room_agent_authority::apply_admission_to_control(control, &admission);
+        let control = match room_resources {
+            Some(resources) => control.with_room_resources(resources),
+            None => control,
+        };
         let control = match room_history {
             Some(history) => control.with_room_history(history),
             None => control,
@@ -10177,6 +10218,232 @@ env = { FIXTURE = "1" }
             suspended["agents"][0]["execution"]["cwd_source"],
             json!("unbound")
         );
+    }
+
+    // ── Resource tools preview (Phase 2 Stage 2d) ─────────────────────────────
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn operator_preview_runs_the_admitted_tools_under_the_agents_generation() {
+        let _guard = AUTO_CONVENE_ENV_LOCK.lock().await;
+        let _env = TestEnvRestore::capture(&["OCEAN_AGENTS_DIR"]);
+        let tmp = tempfile::TempDir::new().unwrap();
+        let state = fake_convene_state(&tmp);
+        let agents_root = tmp.path().join("agents");
+        write_agent_fixture(&agents_root, "helper", r#"model = "fake-ok""#, None);
+        std::env::set_var("OCEAN_AGENTS_DIR", &agents_root);
+        let key = RoomKey::new("res-preview");
+        seed_access(&state, &key, local_access());
+        with_rooms(&state, |store| {
+            store
+                .add_participant(
+                    &key,
+                    RoomParticipant {
+                        id: "john".into(),
+                        kind: RoomParticipantKind::Human,
+                        display_name: "John".into(),
+                    },
+                    Utc::now(),
+                )
+                .unwrap();
+            store
+                .add_agent_participant_with_owner(
+                    &key,
+                    RoomParticipant {
+                        id: "helper".into(),
+                        kind: RoomParticipantKind::Agent,
+                        display_name: "Helper".into(),
+                    },
+                    "john",
+                    Utc::now(),
+                )
+                .unwrap();
+        });
+
+        let folder = tmp.path().join("granted-private-folder");
+        std::fs::create_dir_all(folder.join("docs")).unwrap();
+        std::fs::write(folder.join("README.md"), "# Campaign Hub\nhello\n").unwrap();
+        std::fs::write(folder.join("docs/plan.txt"), "step one\n").unwrap();
+        let root = canonical_test_workspace(&folder);
+        let (status, created) = grant(&state, &key, grant_body(&root, &["helper"])).await;
+        assert_eq!(status, StatusCode::CREATED, "{created}");
+        let resource_id = created["resource"]["resource_id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let list_uri = format!("/v1/rooms/persistent/{key}/resources/{resource_id}/list");
+        let read_uri = format!("/v1/rooms/persistent/{key}/resources/{resource_id}/read");
+
+        // No operator: 503. No active binding yet: 409.
+        let (status, body) = room_json_request(
+            &state,
+            axum::http::Method::POST,
+            list_uri.clone(),
+            Some(json!({"agent_member_id": "helper"})),
+            &[],
+        )
+        .await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{body}");
+        let (status, body) = room_json_request(
+            &state,
+            axum::http::Method::POST,
+            list_uri.clone(),
+            Some(json!({"agent_member_id": "helper"})),
+            OPERATOR,
+        )
+        .await;
+        assert_eq!(status, StatusCode::CONFLICT, "{body}");
+        assert_eq!(body["error"], json!("agent_binding_required"));
+
+        let generation = authorize_room_agent_fixture(
+            &state,
+            &key,
+            "helper",
+            ActivationPolicy::Mention,
+            ContextPolicy::InvocationOnly,
+        );
+
+        // list root, list a subdirectory, and refuse an escape and a miss.
+        let (status, listed) = room_json_request(
+            &state,
+            axum::http::Method::POST,
+            list_uri.clone(),
+            Some(json!({"agent_member_id": "helper"})),
+            OPERATOR,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{listed}");
+        assert_eq!(listed["ok"], json!(true));
+        assert_eq!(listed["via"], json!("operator_preview"));
+        assert_eq!(listed["binding_generation"], json!(generation.to_string()));
+        assert_eq!(listed["grant_generation"], json!("1"));
+        let names: Vec<&str> = listed["entries"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|e| e["name"].as_str().unwrap())
+            .collect();
+        assert_eq!(names, vec!["README.md", "docs"]);
+        assert!(
+            !listed.to_string().contains("granted-private-folder"),
+            "{listed}"
+        );
+        let (_, sub) = room_json_request(
+            &state,
+            axum::http::Method::POST,
+            list_uri.clone(),
+            Some(json!({"agent_member_id": "helper", "path": "docs"})),
+            OPERATOR,
+        )
+        .await;
+        assert_eq!(sub["entries"][0]["name"], json!("plan.txt"));
+        for (path, code) in [("../", "invalid_relative_path"), ("nope", "path_not_found")] {
+            let (status, refused) = room_json_request(
+                &state,
+                axum::http::Method::POST,
+                list_uri.clone(),
+                Some(json!({"agent_member_id": "helper", "path": path})),
+                OPERATOR,
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK);
+            assert_eq!(refused["ok"], json!(false));
+            assert_eq!(refused["error"], json!(code), "{path}");
+        }
+
+        // read a chunk and page.
+        let (status, chunk) = room_json_request(
+            &state,
+            axum::http::Method::POST,
+            read_uri.clone(),
+            Some(json!({"agent_member_id": "helper", "path": "README.md", "max_bytes": 14})),
+            OPERATOR,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{chunk}");
+        assert_eq!(chunk["content"], json!("# Campaign Hub"));
+        assert_eq!(chunk["next_offset"], json!("14"));
+        let (_, rest) = room_json_request(
+            &state,
+            axum::http::Method::POST,
+            read_uri.clone(),
+            Some(json!({"agent_member_id": "helper", "path": "README.md", "offset": 14})),
+            OPERATOR,
+        )
+        .await;
+        assert_eq!(rest["content"], json!("\nhello\n"));
+        assert_eq!(rest["next_offset"], serde_json::Value::Null);
+
+        // A stranger agent is refused by the grant, not by the route.
+        write_agent_fixture(&agents_root, "stranger", r#"model = "fake-ok""#, None);
+        with_rooms(&state, |store| {
+            store
+                .add_agent_participant_with_owner(
+                    &key,
+                    RoomParticipant {
+                        id: "stranger".into(),
+                        kind: RoomParticipantKind::Agent,
+                        display_name: "Stranger".into(),
+                    },
+                    "john",
+                    Utc::now(),
+                )
+                .unwrap();
+        });
+        authorize_room_agent_fixture(
+            &state,
+            &key,
+            "stranger",
+            ActivationPolicy::Mention,
+            ContextPolicy::InvocationOnly,
+        );
+        let (status, refused) = room_json_request(
+            &state,
+            axum::http::Method::POST,
+            list_uri.clone(),
+            Some(json!({"agent_member_id": "stranger"})),
+            OPERATOR,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(refused["error"], json!("agent_not_authorized_for_resource"));
+
+        // Suspending the grant turns every later call into a typed refusal.
+        let (status, _) = room_json_request(
+            &state,
+            axum::http::Method::POST,
+            format!("/v1/rooms/persistent/{key}/resources/{resource_id}/suspend"),
+            Some(json!({"decision_id": uuid::Uuid::new_v4().to_string()})),
+            OPERATOR,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let (_, refused) = room_json_request(
+            &state,
+            axum::http::Method::POST,
+            read_uri.clone(),
+            Some(json!({"agent_member_id": "helper", "path": "README.md"})),
+            OPERATOR,
+        )
+        .await;
+        assert_eq!(refused["error"], json!("resource_not_available"));
+
+        // Every call left an audit row: digests, no path text, actor preview.
+        let rows = with_rooms(&state, |store| store.room_resource_audit_recent(&key, 50)).unwrap();
+        assert!(rows.len() >= 8, "{}", rows.len());
+        assert!(rows.iter().all(|r| r.actor == "operator_preview"));
+        assert!(rows.iter().all(|r| r.relative_path_digest.len() == 64));
+        assert!(rows
+            .iter()
+            .any(|r| r.outcome == "ok" && r.op == "list" && r.entries == 2));
+        assert!(rows
+            .iter()
+            .any(|r| r.outcome == "ok" && r.op == "read" && r.bytes == 14));
+        assert!(rows
+            .iter()
+            .any(|r| r.outcome == "agent_not_authorized_for_resource"));
+        assert!(rows.iter().any(|r| r.outcome == "resource_not_available"));
+        assert!(rows.iter().any(|r| r.outcome == "invalid_relative_path"));
+        assert!(rows.iter().all(|r| r.binding_generation >= 1));
     }
 
     // ── Snapshot tail paging (`before_seq`) ──────────────────────────────────

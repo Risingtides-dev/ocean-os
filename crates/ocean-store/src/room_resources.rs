@@ -163,6 +163,41 @@ pub struct GrantRoomResourceInput {
     pub request_digest: String,
 }
 
+/// One admitted resource operation fact (Phase 2d). Written by the daemon's
+/// resource authority after every `room_list` / `room_read`, refused or not.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RoomResourceAuditInput {
+    pub resource_id: String,
+    pub agent_member_id: String,
+    pub binding_generation: u64,
+    pub grant_generation: Option<u64>,
+    pub op: String,
+    pub relative_path_digest: String,
+    pub bytes: u64,
+    pub entries: u64,
+    pub outcome: String,
+    /// `agent` for a tool call inside an admitted turn; `operator_preview`
+    /// for the operator-authenticated preview routes.
+    pub actor: String,
+}
+
+/// One stored audit row.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RoomResourceAuditRow {
+    pub seq: u64,
+    pub resource_id: String,
+    pub agent_member_id: String,
+    pub binding_generation: u64,
+    pub grant_generation: Option<u64>,
+    pub op: String,
+    pub relative_path_digest: String,
+    pub bytes: u64,
+    pub entries: u64,
+    pub outcome: String,
+    pub actor: String,
+    pub recorded_at: DateTime<Utc>,
+}
+
 /// One replay-safe status decision (suspend / resume / revoke).
 #[derive(Debug, Clone)]
 pub struct SetResourceStatusInput {
@@ -199,6 +234,26 @@ pub(super) const ROOM_RESOURCE_DDL: &str = r#"
     -- for a fresh grant (a new decision, a new id, generation 1 again).
     CREATE UNIQUE INDEX IF NOT EXISTS idx_room_resource_grants_live_root
         ON room_resource_grants(room_id, local_root) WHERE status <> 'revoked';
+
+    -- Rooms Phase 2d: one row per admitted list/read (manifest §8, Decision
+    -- 13). The relative path is a digest, never text; no content, no root.
+    CREATE TABLE IF NOT EXISTS room_resource_audit (
+        room_id              TEXT NOT NULL REFERENCES rooms(id) ON DELETE CASCADE,
+        seq                  INTEGER PRIMARY KEY AUTOINCREMENT,
+        resource_id          TEXT NOT NULL,
+        agent_member_id      TEXT NOT NULL,
+        binding_generation   TEXT NOT NULL,   -- canonical decimal u64
+        grant_generation     TEXT,            -- canonical decimal u64; NULL when refused before resolution
+        op                   TEXT NOT NULL,   -- list|read
+        relative_path_digest TEXT NOT NULL,   -- sha256 hex of the normalized relative path
+        bytes                TEXT NOT NULL,   -- canonical decimal u64
+        entries              TEXT NOT NULL,   -- canonical decimal u64
+        outcome              TEXT NOT NULL,   -- ok | typed code
+        actor                TEXT NOT NULL,   -- agent | operator_preview
+        recorded_at          TEXT NOT NULL
+    );
+    CREATE INDEX IF NOT EXISTS idx_room_resource_audit_room
+        ON room_resource_audit(room_id, seq);
 
     -- Immutable replay ledger for grant and status decisions.
     CREATE TABLE IF NOT EXISTS room_resource_decisions (
@@ -559,6 +614,103 @@ impl SqliteRoomStore {
         })?;
         tx.commit()?;
         Ok((grant, true, Some(audit)))
+    }
+
+    /// Append one Phase 2d operation fact. No room message is minted: these
+    /// are high-volume facts for the audit table, not transcript lines.
+    pub fn append_room_resource_audit(
+        &mut self,
+        key: &RoomKey,
+        input: RoomResourceAuditInput,
+        now: DateTime<Utc>,
+    ) -> Result<u64> {
+        require_room(&self.conn, key)?;
+        self.conn.execute(
+            "INSERT INTO room_resource_audit (
+                room_id, resource_id, agent_member_id, binding_generation, grant_generation,
+                op, relative_path_digest, bytes, entries, outcome, actor, recorded_at
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+            params![
+                key.as_str(),
+                input.resource_id,
+                input.agent_member_id,
+                input.binding_generation.to_string(),
+                input.grant_generation.map(|g| g.to_string()),
+                input.op,
+                input.relative_path_digest,
+                input.bytes.to_string(),
+                input.entries.to_string(),
+                input.outcome,
+                input.actor,
+                fmt_ts(now),
+            ],
+        )?;
+        Ok(self.conn.last_insert_rowid() as u64)
+    }
+
+    /// The newest `limit` audit rows for a room, newest first.
+    pub fn room_resource_audit_recent(
+        &self,
+        key: &RoomKey,
+        limit: usize,
+    ) -> Result<Vec<RoomResourceAuditRow>> {
+        require_room(&self.conn, key)?;
+        let mut stmt = self.conn.prepare(
+            "SELECT seq, resource_id, agent_member_id, binding_generation, grant_generation,
+                    op, relative_path_digest, bytes, entries, outcome, actor, recorded_at
+               FROM room_resource_audit WHERE room_id = ?1
+              ORDER BY seq DESC LIMIT ?2",
+        )?;
+        let rows = stmt.query_map(params![key.as_str(), limit as i64], |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
+                row.get::<_, Option<String>>(4)?,
+                row.get::<_, String>(5)?,
+                row.get::<_, String>(6)?,
+                row.get::<_, String>(7)?,
+                row.get::<_, String>(8)?,
+                row.get::<_, String>(9)?,
+                row.get::<_, String>(10)?,
+                row.get::<_, String>(11)?,
+            ))
+        })?;
+        rows.map(|row| {
+            let (
+                seq,
+                resource_id,
+                agent_member_id,
+                binding_generation,
+                grant_generation,
+                op,
+                relative_path_digest,
+                bytes,
+                entries,
+                outcome,
+                actor,
+                recorded_at,
+            ) = row?;
+            Ok(RoomResourceAuditRow {
+                seq: seq as u64,
+                resource_id,
+                agent_member_id,
+                binding_generation: parse_canonical_u64_text(&binding_generation)?,
+                grant_generation: grant_generation
+                    .as_deref()
+                    .map(parse_canonical_u64_text)
+                    .transpose()?,
+                op,
+                relative_path_digest,
+                bytes: parse_canonical_u64_text(&bytes)?,
+                entries: parse_canonical_u64_text(&entries)?,
+                outcome,
+                actor,
+                recorded_at: parse_ts(&recorded_at)?,
+            })
+        })
+        .collect()
     }
 
     /// Suspend, resume, or revoke a grant under one decision. Any real change
@@ -946,6 +1098,40 @@ mod tests {
             "{err:?}"
         );
         assert!(s.room_decision_consumed(&key, "dec-p").unwrap().is_some());
+    }
+
+    #[test]
+    fn resource_audit_rows_round_trip_newest_first_and_carry_no_path_text() {
+        let (mut s, key) = room();
+        let fact = |outcome: &str, grant: Option<u64>| RoomResourceAuditInput {
+            resource_id: "res-1".into(),
+            agent_member_id: "builder".into(),
+            binding_generation: 3,
+            grant_generation: grant,
+            op: "read".into(),
+            relative_path_digest: "ab".repeat(32),
+            bytes: 64,
+            entries: 0,
+            outcome: outcome.into(),
+            actor: "agent".into(),
+        };
+        s.append_room_resource_audit(&key, fact("stale_generation", None), Utc::now())
+            .unwrap();
+        s.append_room_resource_audit(&key, fact("ok", Some(7)), Utc::now())
+            .unwrap();
+        let rows = s.room_resource_audit_recent(&key, 10).unwrap();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].outcome, "ok");
+        assert_eq!(rows[0].grant_generation, Some(7));
+        assert_eq!(rows[0].binding_generation, 3);
+        assert_eq!(rows[1].outcome, "stale_generation");
+        assert_eq!(rows[1].grant_generation, None);
+        assert!(rows[0].seq > rows[1].seq);
+        assert!(matches!(
+            s.room_resource_audit_recent(&RoomKey::new("nope"), 1)
+                .unwrap_err(),
+            RoomStoreError::UnknownRoom(_)
+        ));
     }
 
     #[test]
