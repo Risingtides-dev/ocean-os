@@ -102,8 +102,8 @@ pub use room_profile::{
     CredentialSlot, PutRoomProfileInput, RepoRef, RoomProfile, ToolRef, ToolRefKind,
 };
 pub use room_resources::{
-    GrantRoomResourceInput, ResourceAccessMode, ResourceStatus, RoomResourceGrant,
-    SetResourceStatusInput,
+    GrantRoomResourceInput, ResourceAccessMode, ResourceStatus, RoomResourceAuditInput,
+    RoomResourceAuditRow, RoomResourceGrant, SetResourceStatusInput,
 };
 
 /// A persistent room plus the OLDEST bounded page of its transcript.

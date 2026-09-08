@@ -1697,6 +1697,8 @@ fn banner_routes() -> &'static [&'static str] {
         "DELETE /v1/rooms/persistent/{key}/resources/{resource_id}",
         "POST /v1/rooms/persistent/{key}/resources/{resource_id}/suspend",
         "POST /v1/rooms/persistent/{key}/resources/{resource_id}/resume",
+        "POST /v1/rooms/persistent/{key}/resources/{resource_id}/list",
+        "POST /v1/rooms/persistent/{key}/resources/{resource_id}/read",
         "GET /v1/rooms/persistent/{key}/events",
         "GET /v1/rooms/persistent/{key}/read-cursor",
         "PATCH /v1/rooms/persistent/{key}/read-cursor",
@@ -3168,6 +3170,14 @@ fn room_routes() -> Router<AppState> {
         .route(
             "/v1/rooms/persistent/{key}/resources/{resource_id}/resume",
             post(room_resources::room_resource_resume),
+        )
+        .route(
+            "/v1/rooms/persistent/{key}/resources/{resource_id}/list",
+            post(room_resources::room_resource_preview_list),
+        )
+        .route(
+            "/v1/rooms/persistent/{key}/resources/{resource_id}/read",
+            post(room_resources::room_resource_preview_read),
         )
         .route(
             "/v1/rooms/persistent/{key}/agents/bootstrap",
@@ -27059,6 +27069,9 @@ mod tests {
         // 129 -> 135: Rooms Phase 2 Stage 2c local contributed folders —
         // list/grant/get/revoke/suspend/resume of generation-bound grants
         // whose local_root never leaves the daemon.
+        // 133 -> 135: Rooms Phase 2 Stage 2d operator preview of the
+        // admitted room_list / room_read tools under the agent's current
+        // binding generation.
         assert_eq!(
             banner.len(),
             135,

@@ -49,10 +49,16 @@ pub use agentdir::{AgentDef, ResolveError as AgentDirResolveError};
 mod project;
 pub use project::{git_head_info, WorktreeInfo};
 mod room_history;
+mod room_resources;
 pub use room_history::{
     AdmittedRoomHistory, RoomHistoryAdmission, RoomHistoryAuthorKind, RoomHistoryPage,
     RoomHistoryRequest, RoomHistoryRow, RoomHistoryScope, RoomHistorySource,
     RoomHistorySourceError,
+};
+pub use room_resources::{
+    confine as confine_room_resource_path, AdmittedRoomResources, ConfineRefusal, ResolvedResource,
+    RoomResourceAdmission, RoomResourceAuditFact, RoomResourceAuthority, RoomResourceCatalogEntry,
+    RoomResourceError, RoomResourceOp, RoomResourceScope, ROOM_LIST_TOOL, ROOM_READ_TOOL,
 };
 mod rooms;
 pub use rooms::{RoomRecord, RoomRegistry, RoomStoreError};
@@ -504,6 +510,19 @@ impl AgentRuntime {
         source: Arc<dyn RoomHistorySource>,
     ) -> anyhow::Result<AdmittedRoomHistory> {
         AdmittedRoomHistory::from_admission(admission, source)
+    }
+
+    /// Mint one opaque contributed-folder handle (Rooms Phase 2d) from final
+    /// admission evidence, the daemon-owned resource authority, and the
+    /// catalog of grants that admit this agent. The authority re-validates
+    /// both generations on every call; the catalog is display only.
+    pub fn admit_room_resources(
+        &self,
+        admission: &impl RoomResourceAdmission,
+        authority: Arc<dyn RoomResourceAuthority>,
+        catalog: Vec<RoomResourceCatalogEntry>,
+    ) -> anyhow::Result<AdmittedRoomResources> {
+        AdmittedRoomResources::from_admission(admission, authority, catalog)
     }
 
     /// Connect configured MCP servers and fold their tools into the capability
@@ -2267,6 +2286,7 @@ impl AgentRuntime {
             authorized_capabilities,
             memory,
             room_history,
+            room_resources,
             tools_disabled,
             hashline_edits,
             artifact_spill,
@@ -2342,6 +2362,7 @@ impl AgentRuntime {
             authorized_capabilities.as_deref(),
             &memory,
             room_history.as_ref(),
+            room_resources.as_ref(),
             tools_disabled,
         );
 
@@ -2362,6 +2383,9 @@ impl AgentRuntime {
         // selected the stronger fail-closed `without_tools()` boundary.
         if room_history.is_some() && !tools_disabled {
             system_prompt::append_room_history_context(&mut system_prompt);
+        }
+        if room_resources.is_some() && !tools_disabled {
+            system_prompt::append_room_resources_context(&mut system_prompt);
         }
         let mut cfg = AgentConfig::new(snapshot.model.clone(), system_prompt)
             .with_tools(tools)
@@ -2784,6 +2808,10 @@ pub struct PromptControl {
     /// invocation-only, and recent-context turns. Its fixed scoped tool is
     /// appended only after the ambient capability intersection.
     room_history: Option<AdmittedRoomHistory>,
+    /// Opaque contributed-folder authority (Rooms Phase 2d). `None` when the
+    /// room has no grant that admits this agent. Its two reserved tools are
+    /// appended only after the ambient capability intersection.
+    room_resources: Option<AdmittedRoomResources>,
     /// Fail-closed per-turn control that suppresses every tool source, including
     /// dynamically registered and folder-agent subprocess capabilities.
     pub tools_disabled: bool,
@@ -2880,12 +2908,18 @@ fn apply_admitted_room_tools(
     authorized_capabilities: Option<&[String]>,
     memory: &PromptMemory,
     room_history: Option<&AdmittedRoomHistory>,
+    room_resources: Option<&AdmittedRoomResources>,
     tools_disabled: bool,
 ) -> Vec<SharedTool> {
     if tools_disabled {
         return Vec::new();
     }
-    tools.retain(|tool| tool.name() != "room_history");
+    tools.retain(|tool| {
+        !matches!(
+            tool.name(),
+            "room_history" | room_resources::ROOM_LIST_TOOL | room_resources::ROOM_READ_TOOL
+        )
+    });
     if !matches!(memory, PromptMemory::Operator) {
         tools.retain(|tool| !matches!(tool.name(), "retain" | "recall"));
     }
@@ -2897,6 +2931,9 @@ fn apply_admitted_room_tools(
     }
     if let Some(history) = room_history {
         tools.push(history.tool());
+    }
+    if let Some(resources) = room_resources {
+        tools.extend(resources.tools());
     }
     tools
 }
@@ -2915,6 +2952,7 @@ impl PromptControl {
             authorized_capabilities: None,
             memory: PromptMemory::Operator,
             room_history: None,
+            room_resources: None,
             tools_disabled: false,
             hashline_edits: false,
             artifact_spill: false,
@@ -2997,6 +3035,17 @@ impl PromptControl {
             self.memory = PromptMemory::Disabled;
         }
         self.room_history = Some(history);
+        self
+    }
+
+    /// Attach one opaque admitted contributed-folder reader to this turn
+    /// (Rooms Phase 2d). Same memory rule as history: a room turn never
+    /// carries operator memory.
+    pub fn with_room_resources(mut self, resources: AdmittedRoomResources) -> Self {
+        if matches!(self.memory, PromptMemory::Operator) {
+            self.memory = PromptMemory::Disabled;
+        }
+        self.room_resources = Some(resources);
         self
     }
 
@@ -4215,6 +4264,7 @@ mod tests {
             None,
             &PromptMemory::Operator,
             None,
+            None,
             false,
         );
         assert_eq!(names(ordinary), vec!["read"]);
@@ -4223,6 +4273,7 @@ mod tests {
             vec![tool("read")],
             Some(&[]),
             &PromptMemory::Disabled,
+            None,
             None,
             false,
         );
@@ -4233,6 +4284,7 @@ mod tests {
             Some(&[]),
             &PromptMemory::Disabled,
             Some(&history),
+            None,
             false,
         );
         assert_eq!(names(durable_history), vec!["room_history"]);
@@ -4251,6 +4303,7 @@ mod tests {
             control.authorized_capabilities.as_deref(),
             &control.memory,
             control.room_history.as_ref(),
+            control.room_resources.as_ref(),
             control.tools_disabled,
         );
         assert!(disabled.is_empty());
