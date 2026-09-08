@@ -766,7 +766,7 @@ fn binding_owner_eligible(
     )
 }
 
-fn binding_projection(binding: &RoomAgentBinding) -> Value {
+pub(super) fn binding_projection(binding: &RoomAgentBinding) -> Value {
     let operator_intersection = binding.effective_capabilities();
     let effective_capabilities = operator_intersection
         .iter()

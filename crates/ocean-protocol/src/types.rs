@@ -377,6 +377,23 @@ impl Model {
         }
     }
 
+    /// Anthropic Claude Fable 5.1 — current Fable point release. Loops already
+    /// pin the wire id `claude-fable-5-1` (events.md 02-09-26), so it must
+    /// resolve end-to-end: menu alias, wire id, and Model constructor.
+    pub fn anthropic_claude_fable_5_1() -> Self {
+        Self {
+            id: "claude-fable-5-1".into(),
+            name: "Claude Fable 5.1".into(),
+            api: "anthropic-messages".into(),
+            provider: "anthropic".into(),
+            base_url: "https://api.anthropic.com".into(),
+            reasoning: true,
+            supports_images: true,
+            context_window: 200_000,
+            max_tokens: 16_384,
+        }
+    }
+
     /// Anthropic Claude Sonnet 4.6 (LEGACY — kept so sessions pinned to the
     /// old id still resolve; not in the public model menu).
     pub fn anthropic_claude_sonnet_4_6() -> Self {

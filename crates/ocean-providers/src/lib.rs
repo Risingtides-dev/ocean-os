@@ -805,6 +805,11 @@ pub fn known_models() -> Vec<KnownModel> {
         m("claude-sonnet-5", "claude-code", "Claude Sonnet 5"),
         m("claude-haiku-4-5", "claude-code", "Claude Haiku 4.5"),
         m("claude-code-fable-5", "claude-code", "Claude Code Fable 5"),
+        m(
+            "claude-code-fable-5-1",
+            "claude-code",
+            "Claude Code Fable 5.1",
+        ),
         // MiniMax ids use the API casing the resolver returns as current.model
         // (`MiniMax-M2`, not the lowercase alias), so `id == current.model`
         // holds for every entry — ACP/Zed match the selected mode id against the
@@ -817,6 +822,7 @@ pub fn known_models() -> Vec<KnownModel> {
         m("kimi-k2.6", "kimi", "Kimi K2.6"),
         m("kimi-k2", "kimi", "Kimi K2"),
         m("glm-5.3", "glm", "GLM 5.3"),
+        m("glm-5.3-flash", "glm", "GLM 5.3 Flash"),
         m("glm-5.2", "glm", "GLM 5.2"),
         m("glm-4.7", "glm", "GLM 4.7"),
         m("glm-4.6", "glm", "GLM 4.6"),
@@ -1059,6 +1065,17 @@ pub fn resolve_model_selection(env: &ProviderEnv) -> Result<ModelSelection, Prov
                 16_384,
             ))
         }
+        // Fable 5.1 — current point release. The plain wire id
+        // `claude-fable-5-1` must resolve (pinned sessions replay it; see the
+        // fable-5 wire-id outage fixed in #362). `fable` stays on 5.0 so a
+        // pinned shorthand does not silently retarget.
+        "claude-code-fable-5-1" | "claude-fable-5-1" => Ok(model_selection(
+            ProviderId::ClaudeCode,
+            "claude-code-fable-5-1",
+            ANTHROPIC_BASE_URL,
+            200_000,
+            16_384,
+        )),
         "claude-code-opus-5" | "claude-code-opus" | "cc-opus" => Ok(model_selection(
             ProviderId::ClaudeCode,
             "claude-code-opus-5",
@@ -1182,6 +1199,16 @@ pub fn resolve_model_selection(env: &ProviderEnv) -> Result<ModelSelection, Prov
         "glm-5.3" | "glm-5-3" => Ok(model_selection(
             ProviderId::Glm,
             "glm-5.3",
+            glm_base_url(env),
+            200_000,
+            8_192,
+        )),
+        // GLM 5.3 Flash — the fast tier of the 5.3 generation, served by the
+        // same Z.AI coding-plan base (verified live 2026-09-04: 200 on
+        // {base}/chat/completions with model "glm-5.3-flash").
+        "glm-5.3-flash" | "glm-5-3-flash" => Ok(model_selection(
+            ProviderId::Glm,
+            "glm-5.3-flash",
             glm_base_url(env),
             200_000,
             8_192,
@@ -1924,6 +1951,15 @@ mod tests {
             assert_eq!(s.provider, ProviderId::ClaudeCode, "{alias}");
             assert_eq!(s.model, "claude-code-fable-5", "{alias}");
         }
+
+        // 5.1 — current point release. Both the menu alias and the wire id
+        // (already pinned by live loops, events.md 02-09-26) resolve to the
+        // 5.1 menu id; `fable` itself stays pinned to 5.0 above.
+        for alias in ["claude-code-fable-5-1", "claude-fable-5-1"] {
+            let s = resolve_model_selection(&env(&[("OCEAN_MODEL", alias)])).unwrap();
+            assert_eq!(s.provider, ProviderId::ClaudeCode, "{alias}");
+            assert_eq!(s.model, "claude-code-fable-5-1", "{alias}");
+        }
     }
 
     #[test]
@@ -2120,6 +2156,7 @@ mod tests {
             "claude-sonnet-5",
             "claude-haiku-4-5",
             "claude-code-fable-5",
+            "claude-code-fable-5-1",
             // API-cased ids: `resolve_model_selection` returns these as
             // current.model, and known_models() advertises the same string.
             "MiniMax-M2",
@@ -2129,6 +2166,7 @@ mod tests {
             "kimi-k2.6",
             "kimi-k2",
             "glm-5.3",
+            "glm-5.3-flash",
             "glm-5.2",
             "glm-4.7",
             "glm-4.6",
@@ -2548,6 +2586,7 @@ mod tests {
             ("glm-4.7", "glm-4-7"),
             ("glm-5.2", "glm-5-2"),
             ("glm-5.3", "glm-5-3"),
+            ("glm-5.3-flash", "glm-5-3-flash"),
         ] {
             let sel = resolve_model_selection(&env(&[("OCEAN_MODEL", id)])).unwrap();
             assert_eq!(sel.provider, ProviderId::Glm);
@@ -2564,6 +2603,10 @@ mod tests {
         assert!(listed.contains("glm-4.7"), "glm-4.7 must be in the picker");
         assert!(listed.contains("glm-5.2"), "glm-5.2 must be in the picker");
         assert!(listed.contains("glm-5.3"), "glm-5.3 must be in the picker");
+        assert!(
+            listed.contains("glm-5.3-flash"),
+            "glm-5.3-flash must be in the picker"
+        );
     }
 
     #[test]

@@ -158,6 +158,7 @@ mod room_attachments;
 mod room_context;
 /// Restart-safe outbound Bedrock room client and per-room supervisor (S2 P2-B).
 mod room_federation;
+mod room_inspect;
 /// Transcript retention and attachment orphan GC: the two sweeps that keep
 /// `rooms.db` and the blob tree from growing without bound, the loop that runs
 /// them, and the report an operator reads on `GET /health`.
@@ -1685,6 +1686,7 @@ fn banner_routes() -> &'static [&'static str] {
         "DELETE /v1/rooms/persistent/{key}/attachments/{attachment_id}",
         "POST /v1/rooms/persistent/{key}/summarize",
         "GET /v1/rooms/persistent/{key}/snapshot",
+        "GET /v1/rooms/persistent/{key}/inspect",
         "GET /v1/rooms/persistent/{key}/events",
         "GET /v1/rooms/persistent/{key}/read-cursor",
         "PATCH /v1/rooms/persistent/{key}/read-cursor",
@@ -3132,6 +3134,10 @@ fn room_routes() -> Router<AppState> {
             "/v1/rooms/persistent/{key}/agents",
             get(room_agent_authority::room_agent_bindings)
                 .post(room_agent_authority::room_agent_authorize),
+        )
+        .route(
+            "/v1/rooms/persistent/{key}/inspect",
+            get(room_inspect::room_inspect),
         )
         .route(
             "/v1/rooms/persistent/{key}/agents/bootstrap",
@@ -27014,9 +27020,12 @@ mod tests {
         // /v1/rooms/maintenance/run is its operated other half: the on-demand
         // trigger for the transcript-retention and attachment-orphan sweeps
         // that keep rooms.db and the blob tree from growing without bound.
+        // 126 -> 127: Rooms Phase 2 Stage 2a read-only inspect projection
+        // (room, access, federated bool, owner, execution cwd_source, every
+        // binding with its deterministic session id, empty Phase 2 slots).
         assert_eq!(
             banner.len(),
-            126,
+            127,
             "route baseline changed; review the manifest"
         );
 

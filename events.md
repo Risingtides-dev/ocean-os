@@ -10543,3 +10543,64 @@ The daemon and store devlogs record the durable contracts; the root and
 crate-parent docs remain unchanged because no ownership or structure moved.
 No daemon was restarted and production was not changed.
 _________________________________________________________________________________ 18:15 codex/ocean-rooms-integration-20260902
+
+time:      [22:29] [02-09-26]
+agent:     [ocean loop], [claude-fable-5-1]
+worktree:  feat/fable-5.1
+type:      [feature-request]
+area:      [backend]
+
+Added `claude-fable-5-1` (Claude Fable 5.1) routing end-to-end, mirroring the
+fable-5 arms and PR #451's shape: `Model::anthropic_claude_fable_5_1()` in
+`ocean-protocol` (wire id `claude-fable-5-1`, anthropic-messages, 200k/16_384);
+a `known_models()` menu entry and resolver arm (`claude-code-fable-5-1` |
+`claude-fable-5-1` -> `ProviderId::ClaudeCode`) plus invariant-list and
+wire-id-round-trip test coverage in `ocean-providers`; and both the `Anthropic`
+and `ClaudeCode` match arms in `ocean-agent`'s `model_from_provider_config`.
+The wire id had to resolve because the events ledger (02-09-26, above) already
+shows loops pinning `claude-fable-5-1`, and a wire id missing from the
+resolver is exactly what bricked every fable-5-pinned session on 2026-07-29
+(#362) — sessions persist `Model.id` and replay it verbatim. The bare `fable`
+shorthand intentionally stays pinned to 5.0. `cargo test -p ocean-protocol`
+(163+5 green), `cargo test -p ocean-agent` (239/239 green), `cargo test -p
+ocean-providers` (51/51 green), `cargo clippy -p ocean-providers -p
+ocean-protocol -p ocean-agent --all-targets -- -D warnings` (clean), and
+`cargo fmt --check` (clean) all pass on top of `origin/main` 9fc88743. Opened
+as PR #452 against main.
+_________________________________________________________________________________ 22:29 feat/fable-5.1
+time:      [12:31] [04-09-26]
+agent:     [claude code], [claude-opus-5]
+worktree:  worktree-providers-glm53flash-fable51
+type:      [feature-request]
+area:      [backend]
+
+Added `glm-5.3-flash` (GLM 5.3 Flash) routing. The 5.3 generation's fast tier
+was already live on the Z.AI coding-plan base but had no arm in
+`ocean-providers`, so it was unreachable and absent from the model picker while
+its sibling `glm-5.3` (34cc488) routed fine — the operator reported exactly
+that gap. Verified live 2026-09-04: `POST {GLM_BASE_URL}/chat/completions`
+with model `glm-5.3-flash` returns 200 on the operator's coding-plan key, the
+same base and auth every other GLM id already uses, so it takes the shared
+200k/8_192 limits and the `glm_base_url(env)` override like the rest of the
+family. Match arms compare exact strings, so the existing `glm-5.3` arm never
+shadowed the `-flash` suffix; the id was simply missing. Adds a
+`known_models()` menu entry, the resolver arm (`glm-5.3-flash` |
+`glm-5-3-flash`), the id to the menu-invariant list, and extends
+`current_glm_models_route_and_round_trip_through_known_models` to cover the
+canonical id, its hyphen alias, and picker presence. No `ocean-agent` change
+was needed: GLM resolves through the generic `openai_compat` path in
+`model_from_provider_config`. Found while smoke-testing every menu model at the
+wire level for the operator (16/22 reachable; the six Codex ids return 429
+`usage_limit_reached` until 08-09-26, a plan quota, not a routing fault).
+`cargo test -p ocean-providers` (51/51 green), `cargo clippy -p ocean-providers
+--all-targets` (clean) and `cargo fmt --check` (clean) all pass on top of
+`origin/main` 4b69b66. Opened as PR #453 against main.
+_________________________________________________________________________________ 12:31 worktree-providers-glm53flash-fable51
+time:      [11:20] [08-09-26]
+agent:     [claude] [fable-5.1]
+worktree:  cc/rooms-architecture-sessions-60d21b
+type:      [feature-request]
+area:      [backend]
+
+John could not see how Rooms organizes sessions, where agents execute, or how repos/tools/auth would attach per room. Wrote the proposed Phase 2 manifest (docs/specs/2026-09-08-ocean-rooms-phase2-room-profile-and-contributed-folders-manifest.md): a room profile that carries repo, tool, and credential-slot REFERENCES resolved on the executing node (never tokens, per architecture §12.7 and Gate 0 Decision 13), local folder grants with path confinement and generations, slot-status resolution, and a staged 2a→2d rollout. Landed Stage 2a: read-only GET /v1/rooms/persistent/{key}/inspect (new room_inspect.rs) projecting room, access, federated bool, owner, every binding with its deterministic session id and session_exists, truthful execution.cwd_source (room_workspace_root | unbound — found that an authorized turn with no live workspace is refused, not run from daemon cwd, and corrected the manifest to match), and empty profile/credential_slots/resources slots. Five HTTP tests plus three unit tests; clippy, fmt, docs-check green. Stages 2b–2d stay closed pending acceptance.
+_________________________________________________________________________________ 11:20 cc/rooms-architecture-sessions-60d21b
