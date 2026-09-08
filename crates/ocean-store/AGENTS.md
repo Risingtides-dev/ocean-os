@@ -138,11 +138,12 @@ outbox, and the restart-safe federation core (S2 P2-A). One database file
   field, never raw JSON bytes or a column subset. The persisted normalized
   mention set must also equal the incoming set (ordering is irrelevant).
   Legacy rows without a completeness marker may learn their set only from an
-  authenticated confirmed replay after full index/transcript metadata equality;
+  authenticated confirmed replay after full index/transcript metadata equality
+  and exact persisted body, author id, author kind, and message kind equality;
   that repair commits only mentions and the marker, without replaying triggers,
   transcript, cursor or outbox effects. Unknown unread sets are explicitly
   flagged in attention counts until repaired or passed by the read cursor.
-  Full three-way equality plus matching mentions ⇒
+  Full three-way metadata and message-payload equality plus matching mentions ⇒
   `IngestOutcome::Duplicate` no-op; any divergence (including index vs
   transcript), a missing/unreadable indexed transcript row, a
   `global_sequence` at or below the ordering baseline, or a missing access

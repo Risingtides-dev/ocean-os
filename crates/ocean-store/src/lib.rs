@@ -7525,8 +7525,8 @@ impl SqliteRoomStore {
     /// of federated transcript rows. One `IMMEDIATE` transaction performs,
     /// in order:
     ///
-    /// 1. dedup on `ledger_event_id` — identical metadata ⇒ `Duplicate`;
-    ///    same id with different metadata ⇒ corruption;
+    /// 1. dedup on `ledger_event_id` — identical persisted payload and
+    ///    metadata ⇒ `Duplicate`; any divergence ⇒ corruption;
     /// 2. strict monotonic `global_sequence` within the room — a lower or
     ///    equal sequence under a new ledger id ⇒ corruption (gaps allowed);
     /// 3. append exactly one federated transcript row;
@@ -7631,14 +7631,33 @@ impl SqliteRoomStore {
         if let Some((local_seq, idx_gs, idx_sid, idx_sseq, idx_ceid)) = prior {
             let idx_gs = parse_canonical_u64_text(&idx_gs)?;
             let idx_sseq = parse_canonical_u64_text(&idx_sseq)?;
-            let stored_json: Option<Option<String>> = tx
+            type StoredPayload = (Option<String>, String, String, String, String);
+            let stored_payload: Option<StoredPayload> = tx
                 .query_row(
-                    "SELECT federated FROM messages WHERE room_id = ?1 AND seq = ?2",
+                    "SELECT federated, author_id, author_kind, kind, body
+                     FROM messages WHERE room_id = ?1 AND seq = ?2",
                     params![key.as_str(), local_seq],
-                    |r| r.get(0),
+                    |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
                 )
                 .optional()?;
-            let stored_json = stored_json.flatten().ok_or_else(|| {
+            let (stored_json, author_id, author_kind, kind, body) =
+                stored_payload.ok_or_else(|| {
+                    RoomStoreError::FederationCorruption(format!(
+                        "indexed confirmed event {} has no persisted transcript row",
+                        event.ledger_event_id
+                    ))
+                })?;
+            if author_id != event.author_id
+                || author_kind != encode_participant_kind(event.author_kind)
+                || kind != encode_message_kind(event.kind)
+                || body != event.body
+            {
+                return Err(RoomStoreError::FederationCorruption(format!(
+                    "ledger event {} re-ingested with different message payload",
+                    event.ledger_event_id
+                )));
+            }
+            let stored_json = stored_json.ok_or_else(|| {
                 RoomStoreError::FederationCorruption(format!(
                     "indexed confirmed event {} has no persisted federated transcript metadata",
                     event.ledger_event_id
@@ -7675,7 +7694,7 @@ impl SqliteRoomStore {
             )?;
             if stored == meta && !mentions_known {
                 // Upgrade only from this authenticated confirmed replay after
-                // full index/transcript equality. No prose-derived backfill,
+                // full index/transcript metadata and payload equality. No prose-derived backfill,
                 // cursor movement, transcript append or trigger replay.
                 Self::record_confirmed_mentions(&tx, key, event)?;
                 tx.commit()?;
@@ -14944,6 +14963,59 @@ mod tests {
                 reopened.ingest_confirmed_event(&key, &event, now()),
                 Err(RoomStoreError::FederationCorruption(_))
             ));
+        }
+    }
+
+    #[test]
+    fn duplicate_and_legacy_replays_require_the_exact_persisted_payload() {
+        for legacy in [false, true] {
+            let (mut s, key) = fed_store_with_room("r-payload-replay");
+            seed_access_row(&s, &key, "live");
+            let mut event = confirmed_event("payload-replay", 9, "src-a", 1, "evt-a");
+            event.mention_member_ids = vec!["m-self".into()];
+            s.ingest_confirmed_event(&key, &event, now()).unwrap();
+            if legacy {
+                s.conn
+                    .execute_batch(
+                        "DELETE FROM federated_event_mentions;
+                     DELETE FROM federated_event_mentions_known;",
+                    )
+                    .unwrap();
+            }
+            for field in ["body", "author_id", "author_kind", "kind"] {
+                let mut divergent = event.clone();
+                match field {
+                    "body" => divergent.body.push_str(" divergent"),
+                    "author_id" => divergent.author_id.push_str("-different"),
+                    "author_kind" => divergent.author_kind = RoomParticipantKind::Agent,
+                    "kind" => divergent.kind = RoomMessageKind::System,
+                    _ => unreachable!(),
+                }
+                assert!(
+                    matches!(
+                        s.ingest_confirmed_event(&key, &divergent, now()),
+                        Err(RoomStoreError::FederationCorruption(_))
+                    ),
+                    "{field}, legacy={legacy}"
+                );
+                let counts = s.federated_room_attention(&key, "m-self", None).unwrap();
+                assert_eq!(counts.mentions_unknown, legacy);
+                assert_eq!(transcript_count(&s, &key), 1);
+                assert_eq!(federated_events_count(&s, &key), 1);
+                assert_eq!(
+                    s.room_access(&key).unwrap().last_confirmed_global_sequence,
+                    Some(9)
+                );
+            }
+            assert!(matches!(
+                s.ingest_confirmed_event(&key, &event, now()).unwrap(),
+                IngestOutcome::Duplicate
+            ));
+            assert!(
+                !s.federated_room_attention(&key, "m-self", None)
+                    .unwrap()
+                    .mentions_unknown
+            );
         }
     }
 

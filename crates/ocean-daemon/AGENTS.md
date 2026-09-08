@@ -170,6 +170,7 @@ This crate owns the long-running Ocean HTTP service on `:4780`, including API ro
 
 ### Review hardening
 
+- Attachment GC surfaces directory-entry iteration and inspection failures as a bounded sweep error while continuing unrelated entries. Never flatten failed directory entries into a falsely clean report or expose filesystem paths in diagnostics.
 - Scheduled and on-demand maintenance share one sweep permit. The blocking worker owns that permit through report publication, including after HTTP cancellation. Each request returns its own report captured under the report lock; health reads never wait for the sweep permit.
 - Retention obtains every stored attachment path through `room_attachments::blob_path`, including rows returned by a cut. Imported or corrupt stored ids do not inherit trust from the HTTP path's server-minted ids; malformed ids fail closed, count as unlink failures, and never become filesystem paths. `blob_path` is `pub(super)` only for this reuse.
 - The supervised federation loader requires the credential file's parent directory to be same-owner and not group/world writable. After pathname validation it compares the inode against one open descriptor and parses only that descriptor, so a rename cannot swap credentials between validation and read.

@@ -437,9 +437,20 @@ fn run_orphan_gc(
         Err(_) => return Err("orphan GC could not read the attachment root".to_string()),
     };
 
-    for entry in entries.flatten() {
+    for entry in entries {
+        let Some(entry) = gc_inspected(
+            entry,
+            outcome,
+            "orphan GC could not enumerate an attachment root entry",
+        ) else {
+            continue;
+        };
         let path = entry.path();
-        let Ok(file_type) = entry.file_type() else {
+        let Some(file_type) = gc_inspected(
+            entry.file_type(),
+            outcome,
+            "orphan GC could not inspect an attachment root entry",
+        ) else {
             continue;
         };
         // Only directories are ours. A stray file at the root is left alone
@@ -489,7 +500,7 @@ fn remove_orphan_dir_with(
     outcome: &mut SweepOutcome,
     remove_dir_all: impl FnOnce(&Path) -> std::io::Result<()>,
 ) {
-    let bytes = directory_bytes(path);
+    let bytes = directory_bytes(path, outcome);
     match remove_dir_all(path) {
         Ok(()) => {
             outcome.orphan_dirs_removed += 1;
@@ -523,9 +534,23 @@ fn sweep_room_dir(
             .get_or_insert_with(|| "orphan GC could not read a room directory".to_string());
         return;
     };
-    for entry in entries.flatten() {
+    for entry in entries {
+        let Some(entry) = gc_inspected(
+            entry,
+            outcome,
+            "orphan GC could not enumerate a room directory entry",
+        ) else {
+            continue;
+        };
         let path = entry.path();
-        if !entry.file_type().map(|t| t.is_file()).unwrap_or(false) {
+        let Some(file_type) = gc_inspected(
+            entry.file_type(),
+            outcome,
+            "orphan GC could not inspect a room directory entry",
+        ) else {
+            continue;
+        };
+        if !file_type.is_file() {
             continue;
         }
         let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
@@ -537,7 +562,14 @@ fn sweep_room_dir(
         if !older_than_grace(&path, grace) {
             continue;
         }
-        let size = entry.metadata().map(|m| m.len()).unwrap_or(0);
+        let Some(metadata) = gc_inspected(
+            entry.metadata(),
+            outcome,
+            "orphan GC could not measure a blob",
+        ) else {
+            continue;
+        };
+        let size = metadata.len();
         match std::fs::remove_file(&path) {
             Ok(()) => {
                 outcome.orphan_files_removed += 1;
@@ -592,16 +624,51 @@ fn older_than_grace(path: &Path, grace: Duration) -> bool {
 /// Used only to report what removing an orphan directory reclaimed. Non-
 /// recursive because the tree is flat by construction: a room directory holds
 /// blob files and nothing else.
-fn directory_bytes(dir: &Path) -> u64 {
-    let Ok(entries) = std::fs::read_dir(dir) else {
+fn directory_bytes(dir: &Path, outcome: &mut SweepOutcome) -> u64 {
+    let Some(entries) = gc_inspected(
+        std::fs::read_dir(dir),
+        outcome,
+        "orphan GC could not measure an orphan directory",
+    ) else {
         return 0;
     };
-    entries
-        .flatten()
-        .filter_map(|entry| entry.metadata().ok())
-        .filter(|metadata| metadata.is_file())
-        .map(|metadata| metadata.len())
-        .sum()
+    let mut bytes = 0;
+    for entry in entries {
+        let Some(entry) = gc_inspected(
+            entry,
+            outcome,
+            "orphan GC could not enumerate an orphan directory entry",
+        ) else {
+            continue;
+        };
+        let Some(metadata) = gc_inspected(
+            entry.metadata(),
+            outcome,
+            "orphan GC could not measure an orphan directory entry",
+        ) else {
+            continue;
+        };
+        if metadata.is_file() {
+            bytes += metadata.len();
+        }
+    }
+    bytes
+}
+
+/// Preserve the first bounded failure while allowing unrelated entries to be
+/// inspected. Never expose filesystem paths or raw operating-system errors.
+fn gc_inspected<T>(
+    result: std::io::Result<T>,
+    outcome: &mut SweepOutcome,
+    error: &'static str,
+) -> Option<T> {
+    match result {
+        Ok(value) => Some(value),
+        Err(_) => {
+            outcome.error.get_or_insert_with(|| error.to_string());
+            None
+        }
+    }
 }
 
 // ---- Loop + on-demand route -------------------------------------------------
@@ -773,6 +840,33 @@ mod tests {
     use super::*;
     use ocean_core::{RoomMessageKind, RoomParticipant, RoomParticipantKind};
     use ocean_store::{RoomCloser, RoomStore, SqliteRoomStore};
+
+    #[test]
+    fn enumeration_failure_is_bounded_and_does_not_skip_later_entries() {
+        let mut outcome = SweepOutcome::default();
+        let entries = [Ok(1), Err(std::io::Error::other("private/path")), Ok(2)];
+        let mut visited = Vec::new();
+        for entry in entries {
+            if let Some(value) = gc_inspected(entry, &mut outcome, "bounded enumeration failure") {
+                visited.push(value);
+            }
+        }
+        assert_eq!(visited, [1, 2]);
+        assert_eq!(
+            outcome.error.as_deref(),
+            Some("bounded enumeration failure")
+        );
+        assert!(gc_inspected::<()>(
+            Err(std::io::Error::other("secret")),
+            &mut outcome,
+            "second failure"
+        )
+        .is_none());
+        assert_eq!(
+            outcome.error.as_deref(),
+            Some("bounded enumeration failure")
+        );
+    }
 
     #[tokio::test]
     async fn concurrent_sweeps_return_their_own_serial_report() {

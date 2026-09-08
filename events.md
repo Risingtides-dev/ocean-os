@@ -10613,3 +10613,13 @@ area:      [backend], [review], [testing]
 
 Addressed PR #450 findings 3960426681 and 3960426689. Added durable mention-completeness markers: existing events remain explicitly legacy-unknown, and only an authenticated replay with full persisted metadata equality repairs their exact mention set without replaying transcript/cursor/outbox/trigger effects. Room-list pages omit the additive attention projection while unread mentions are unknown, preserving existing Surface compatibility and read states. Safe access refresh and mirrored-cursor writes now require room openness in their write transaction, preserving frozen projections after close. File-backed migration/reopen and two-connection close regressions pass; store 235/235, daemon 919/919 plus the new serialization regression, docs-check and formatting pass. Full workspace gate rerunning. Updated nearest store/daemon/API contracts; parent ownership and child indexes unchanged. Not merged or installed yet.
 _________________________________________________________________________________ 13:22 codex/rooms-release-20260908
+
+
+time:      [13:40] [08-09-26]
+agent:     [codex]
+worktree:  [codex/rooms-release-20260908] /Users/risingtidesdev/dev/ocean-os-worktrees/rooms-release-20260908
+type:      [bug report]
+area:      [backend], [review], [testing]
+
+Addressed PR #450 findings 3960575953 and 3960575970. Duplicate and legacy confirmed replays now compare persisted body, author id, author kind and message kind before accepting or repairing mention metadata. Attachment GC preserves bounded directory-entry enumeration and inspection errors while continuing unrelated entries, including byte-accounting scans. Added regressions for each divergent payload field with both known and legacy mention state, and deterministic enumeration failure/continuation/error preservation. The replay regression and all 16 maintenance tests pass. Updated nearest store and daemon contracts; parent ownership and child indexes unchanged. Full workspace and remote gates rerunning; not merged or installed yet.
+_________________________________________________________________________________ 13:40 codex/rooms-release-20260908
