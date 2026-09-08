@@ -109,6 +109,11 @@ pub(super) async fn room_inspect(
         let owner = store.local_room_owner(&key)?;
         let bindings = store.room_agent_bindings(&key)?;
         let profile = store.room_profile(&key)?;
+        let grants = store.room_resource_grants(&key)?;
+        let agent_cwds = bindings
+            .iter()
+            .map(|b| crate::room_resources::resolve_turn_cwd(store, &key, &b.agent_member_id))
+            .collect::<Result<Vec<_>, _>>()?;
         Ok::<_, RoomStoreError>(Some((
             record.room,
             closed,
@@ -117,11 +122,23 @@ pub(super) async fn room_inspect(
             owner,
             bindings,
             profile,
+            grants,
+            agent_cwds,
         )))
     });
 
     match result {
-        Ok(Some((room, closed, access, federated, owner, bindings, profile))) => {
+        Ok(Some((
+            room,
+            closed,
+            access,
+            federated,
+            owner,
+            bindings,
+            profile,
+            grants,
+            agent_cwds,
+        ))) => {
             let (cwd, cwd_source) = resolve_execution(room.workspace_root.as_deref());
             let (profile, credential_slots) =
                 crate::room_profile::profile_with_slots(&state, profile.as_ref());
@@ -131,7 +148,8 @@ pub(super) async fn room_inspect(
             // cannot claim a transcript that was later deleted.
             let agents = bindings
                 .iter()
-                .map(|binding| {
+                .zip(agent_cwds.iter())
+                .map(|(binding, turn_cwd)| {
                     let sid = authorized_room_agent_session_id(
                         &key,
                         &binding.agent_member_id,
@@ -147,6 +165,7 @@ pub(super) async fn room_inspect(
                     projection["session_id"] = json!(sid.to_string());
                     projection["session_exists"] = json!(session_exists);
                     projection["execution_node"] = json!("local");
+                    projection["execution"] = turn_cwd.projection();
                     projection
                 })
                 .collect::<Vec<_>>();
@@ -174,12 +193,12 @@ pub(super) async fn room_inspect(
                     },
                     "agents": agents,
                     // Stage 2b: the profile and each slot's STATUS on this
-                    // node (never a value). Stage 2c fills `resources`; served
-                    // empty now so a client written against the final shape
-                    // needs no change when it arrives.
+                    // node (never a value). Stage 2c: every grant's safe
+                    // projection (no local_root) and, per agent above, which
+                    // §5 rule chooses its cwd.
                     "profile": profile,
                     "credential_slots": credential_slots,
-                    "resources": [],
+                    "resources": crate::room_resources::resources_projection(&grants),
                 })),
             )
         }

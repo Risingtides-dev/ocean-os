@@ -628,6 +628,8 @@ pub(super) fn room_store_error_response(
         // the terminal revoked state, are both "your view of authority is
         // stale" — re-read and issue a new decision.
         DecisionReplayMismatch { .. } | AgentBindingStatusConflict { .. } => StatusCode::CONFLICT,
+        ResourceRootAlreadyGranted { .. } | ResourceStatusConflict { .. } => StatusCode::CONFLICT,
+        UnknownResourceGrant { .. } => StatusCode::NOT_FOUND,
         // A durable backend can fail on I/O or (de)serialization, which the
         // in-memory registry never could. Surface those as 500s, not as a
         // misleading 4xx. Federation corruption is a fail-closed integrity
@@ -2997,13 +2999,14 @@ async fn spawn_room_agent_turn(
     footprint: Option<RoomTurnFootprint>,
 ) -> Result<QueuedRoomAgentTurn, RoomTurnStartError> {
     let room = admission.room.clone();
-    let room_workspace = with_rooms(&state, |reg| {
-        reg.get(&room)
-            .ok()
-            .flatten()
-            .and_then(|record| record.room.workspace_root)
-    });
-    let Some(cwd) = room_workspace.as_deref().and_then(persisted_room_workspace) else {
+    // Manifest §5: the agent's own default folder, then the room's, then the
+    // legacy workspace_root. One function decides for the turn AND for
+    // `inspect`, so what the operator sees is what runs.
+    let turn_cwd = with_rooms(&state, |reg| {
+        crate::room_resources::resolve_turn_cwd(reg, &room, &admission.agent_member_id)
+    })
+    .map_err(|error| RoomTurnStartError::Authority(ApiError::from(error)))?;
+    let Some(cwd) = turn_cwd.cwd().map(str::to_string) else {
         room_agent_authority::append_remote_output_outcome(
             &state,
             &admission,
@@ -9559,18 +9562,20 @@ env = { FIXTURE = "1" }
         assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
         assert_eq!(body["error"], json!("invalid_repo_remote"));
 
-        let mut early = profile_body(&decision, "env:GH_TOKEN");
-        early["default_resource_id"] = json!("res-1");
+        // A reference to a grant that does not exist in this room is refused
+        // before any digest or write (2c).
+        let mut dangling = profile_body(&decision, "env:GH_TOKEN");
+        dangling["default_resource_id"] = json!("res-1");
         let (status, body) = profile_request(
             &state,
             axum::http::Method::PUT,
             key.as_str(),
-            Some(early),
+            Some(dangling),
             OPERATOR,
         )
         .await;
         assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
-        assert_eq!(body["error"], json!("phase_not_open"));
+        assert_eq!(body["error"], json!("resource_not_found"));
 
         let (_, body) =
             profile_request(&state, axum::http::Method::GET, key.as_str(), None, &[]).await;
@@ -9786,6 +9791,392 @@ env = { FIXTURE = "1" }
             .iter()
             .any(|m| m.author_id == "helper" && matches!(m.kind, RoomMessageKind::Message));
         assert!(!spoke, "a refused admission must not produce agent output");
+    }
+
+    // ── Resources (Phase 2 Stage 2c) ──────────────────────────────────────────
+
+    async fn room_json_request(
+        state: &AppState,
+        method: axum::http::Method,
+        uri: String,
+        body: Option<serde_json::Value>,
+        headers: &[(&str, &str)],
+    ) -> (StatusCode, serde_json::Value) {
+        let app = room_routes().with_state(state.clone());
+        let mut builder = axum::http::Request::builder()
+            .method(method)
+            .uri(uri)
+            .header(axum::http::header::CONTENT_TYPE, "application/json");
+        for (name, value) in headers {
+            builder = builder.header(*name, *value);
+        }
+        let resp = app
+            .oneshot(
+                builder
+                    .body(Body::from(body.map(|v| v.to_string()).unwrap_or_default()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let status = resp.status();
+        let body: serde_json::Value = serde_json::from_slice(
+            &axum::body::to_bytes(resp.into_body(), 1024 * 1024)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        (status, body)
+    }
+
+    fn grant_body(root: &str, agents: &[&str]) -> serde_json::Value {
+        json!({
+            "decision_id": uuid::Uuid::new_v4().to_string(),
+            "display_name": "source",
+            "local_root": root,
+            "access_mode": "read",
+            "authorized_agent_member_ids": agents,
+        })
+    }
+
+    async fn grant(
+        state: &AppState,
+        key: &RoomKey,
+        body: serde_json::Value,
+    ) -> (StatusCode, serde_json::Value) {
+        room_json_request(
+            state,
+            axum::http::Method::POST,
+            format!("/v1/rooms/persistent/{key}/resources"),
+            Some(body),
+            OPERATOR,
+        )
+        .await
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn resource_grant_lifecycle_is_operator_gated_generation_bound_and_rootless() {
+        let _guard = AUTO_CONVENE_ENV_LOCK.lock().await;
+        let tmp = tempfile::TempDir::new().unwrap();
+        let state = fake_convene_state(&tmp);
+        let key = RoomKey::new("res-lifecycle");
+        seed_access(&state, &key, local_access());
+        let folder = tmp.path().join("shared-secret-folder");
+        std::fs::create_dir_all(&folder).unwrap();
+        let root = canonical_test_workspace(&folder);
+
+        // Unauthenticated: 503, nothing written.
+        let (status, body) = room_json_request(
+            &state,
+            axum::http::Method::POST,
+            format!("/v1/rooms/persistent/{key}/resources"),
+            Some(grant_body(&root, &["builder"])),
+            &[],
+        )
+        .await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{body}");
+        let (_, listed) = room_json_request(
+            &state,
+            axum::http::Method::GET,
+            format!("/v1/rooms/persistent/{key}/resources"),
+            None,
+            &[],
+        )
+        .await;
+        assert_eq!(listed["resources"], json!([]));
+
+        // Dangerous and malformed roots, each by name, each writing nothing.
+        for (root, code) in [
+            ("/", "dangerous_root"),
+            (std::env::var("HOME").unwrap().as_str(), "dangerous_root"),
+            ("relative/dir", "invalid_local_root"),
+            ("/definitely/not/here/ocean-2c", "local_root_not_found"),
+        ] {
+            let (status, body) = grant(&state, &key, grant_body(root, &["builder"])).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{root}: {body}");
+            assert_eq!(body["error"], json!(code), "{root}");
+        }
+        let (status, body) = grant(
+            &state,
+            &key,
+            json!({"decision_id": uuid::Uuid::new_v4().to_string(), "display_name": "x", "local_root": root, "access_mode": "shell"}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+        assert_eq!(body["error"], json!("invalid_access_mode"));
+
+        // A real grant.
+        let body = grant_body(&root, &["builder", "builder"]);
+        let (status, created) = grant(&state, &key, body.clone()).await;
+        assert_eq!(status, StatusCode::CREATED, "{created}");
+        let resource = &created["resource"];
+        let resource_id = resource["resource_id"].as_str().unwrap().to_string();
+        assert!(resource_id.starts_with("res-"));
+        assert_eq!(resource["status"], json!("available"));
+        assert_eq!(resource["generation"], json!("1"));
+        assert_eq!(resource["access_mode"], json!("read"));
+        assert_eq!(resource["authorized_agent_member_ids"], json!(["builder"]));
+        assert!(
+            !created.to_string().contains("shared-secret-folder"),
+            "{created}"
+        );
+
+        // Exact replay is 200 / created:false; same root under a new decision is 409.
+        let (status, replay) = grant(&state, &key, body.clone()).await;
+        assert_eq!(status, StatusCode::OK, "{replay}");
+        assert_eq!(replay["created"], json!(false));
+        assert_eq!(replay["resource"]["resource_id"], json!(resource_id));
+        let (status, dup) = grant(&state, &key, grant_body(&root, &["builder"])).await;
+        assert_eq!(status, StatusCode::CONFLICT, "{dup}");
+        assert_eq!(dup["error"], json!("root_already_granted"));
+
+        // List, get, and inspect all serve the rootless projection.
+        let (_, listed) = room_json_request(
+            &state,
+            axum::http::Method::GET,
+            format!("/v1/rooms/persistent/{key}/resources"),
+            None,
+            &[],
+        )
+        .await;
+        assert_eq!(listed["resources"].as_array().unwrap().len(), 1);
+        assert!(!listed.to_string().contains("shared-secret-folder"));
+        let (status, one) = room_json_request(
+            &state,
+            axum::http::Method::GET,
+            format!("/v1/rooms/persistent/{key}/resources/{resource_id}"),
+            None,
+            &[],
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(one["resource"], listed["resources"][0]);
+        let (_, inspected) = inspect_response(&state, key.as_str()).await;
+        assert_eq!(inspected["resources"], listed["resources"]);
+        assert!(!inspected.to_string().contains("shared-secret-folder"));
+        let (status, missing) = room_json_request(
+            &state,
+            axum::http::Method::GET,
+            format!("/v1/rooms/persistent/{key}/resources/res-nope"),
+            None,
+            &[],
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert_eq!(missing["error"], json!("resource_not_found"));
+
+        // suspend -> resume -> revoke, each bumping the generation; revoked is terminal.
+        let status_call = |leaf: &'static str, method: axum::http::Method| {
+            let state = state.clone();
+            let key = key.clone();
+            let resource_id = resource_id.clone();
+            async move {
+                let uri = if leaf.is_empty() {
+                    format!("/v1/rooms/persistent/{key}/resources/{resource_id}")
+                } else {
+                    format!("/v1/rooms/persistent/{key}/resources/{resource_id}/{leaf}")
+                };
+                room_json_request(
+                    &state,
+                    method,
+                    uri,
+                    Some(json!({"decision_id": uuid::Uuid::new_v4().to_string()})),
+                    OPERATOR,
+                )
+                .await
+            }
+        };
+        let (status, s) = status_call("suspend", axum::http::Method::POST).await;
+        assert_eq!(status, StatusCode::OK, "{s}");
+        assert_eq!(s["resource"]["status"], json!("suspended"));
+        assert_eq!(s["resource"]["generation"], json!("2"));
+        let (status, r) = status_call("resume", axum::http::Method::POST).await;
+        assert_eq!(status, StatusCode::OK, "{r}");
+        assert_eq!(r["resource"]["status"], json!("available"));
+        assert_eq!(r["resource"]["generation"], json!("3"));
+        let (status, d) = status_call("", axum::http::Method::DELETE).await;
+        assert_eq!(status, StatusCode::OK, "{d}");
+        assert_eq!(d["resource"]["status"], json!("revoked"));
+        assert_eq!(d["resource"]["generation"], json!("4"));
+        let (status, again) = status_call("resume", axum::http::Method::POST).await;
+        assert_eq!(status, StatusCode::CONFLICT, "{again}");
+        assert_eq!(again["error"], json!("resource_status_conflict"));
+
+        // Revoked frees the root for a fresh grant.
+        let (status, fresh) = grant(&state, &key, grant_body(&root, &["builder"])).await;
+        assert_eq!(status, StatusCode::CREATED, "{fresh}");
+        assert_ne!(fresh["resource"]["resource_id"], json!(resource_id));
+
+        // The audit ledger names ids and aliases, never the root.
+        let transcript = with_rooms(&state, |store| store.transcript(&key, None)).unwrap();
+        let types: Vec<String> = transcript
+            .iter()
+            .filter_map(|m| serde_json::from_str::<serde_json::Value>(&m.body).ok())
+            .filter_map(|v| v["type"].as_str().map(str::to_string))
+            .collect();
+        assert_eq!(
+            types,
+            vec![
+                "room.resource.granted",
+                "room.resource.suspended",
+                "room.resource.resumed",
+                "room.resource.revoked",
+                "room.resource.granted",
+            ]
+        );
+        assert!(transcript
+            .iter()
+            .all(|m| !m.body.contains("shared-secret-folder")));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_profile_may_only_reference_live_grants_and_the_turn_cwd_follows_the_rule() {
+        let _guard = AUTO_CONVENE_ENV_LOCK.lock().await;
+        let _env = TestEnvRestore::capture(&["OCEAN_AGENTS_DIR"]);
+        let tmp = tempfile::TempDir::new().unwrap();
+        let state = fake_convene_state(&tmp);
+        let agents_root = tmp.path().join("agents");
+        write_agent_fixture(&agents_root, "helper", r#"model = "fake-ok""#, None);
+        std::env::set_var("OCEAN_AGENTS_DIR", &agents_root);
+        let key = RoomKey::new("res-cwd-rule");
+        // The room has NO workspace_root: without a grant every turn is refused.
+        with_rooms(&state, |store| {
+            store
+                .create_in_workspace(
+                    key.clone(),
+                    "Cwd Rule",
+                    None,
+                    Some(RoomTriggerPolicy {
+                        on_mention: true,
+                        ..Default::default()
+                    }),
+                    Utc::now(),
+                )
+                .unwrap();
+            store.replace_room_access(&key, &local_access()).unwrap();
+            store
+                .add_participant(
+                    &key,
+                    RoomParticipant {
+                        id: "john".into(),
+                        kind: RoomParticipantKind::Human,
+                        display_name: "John".into(),
+                    },
+                    Utc::now(),
+                )
+                .unwrap();
+            store
+                .add_agent_participant_with_owner(
+                    &key,
+                    RoomParticipant {
+                        id: "helper".into(),
+                        kind: RoomParticipantKind::Agent,
+                        display_name: "Helper".into(),
+                    },
+                    "john",
+                    Utc::now(),
+                )
+                .unwrap();
+        });
+        authorize_room_agent_fixture(
+            &state,
+            &key,
+            "helper",
+            ActivationPolicy::Mention,
+            ContextPolicy::InvocationOnly,
+        );
+
+        // A dangling reference is refused before any digest or write.
+        let (status, body) = profile_request(
+            &state,
+            axum::http::Method::PUT,
+            key.as_str(),
+            Some(json!({"decision_id": uuid::Uuid::new_v4().to_string(), "default_resource_id": "res-nope"})),
+            OPERATOR,
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+        assert_eq!(body["error"], json!("resource_not_found"));
+
+        let (_, before) = inspect_response(&state, key.as_str()).await;
+        assert_eq!(
+            before["agents"][0]["execution"]["cwd_source"],
+            json!("unbound")
+        );
+
+        let folder = tmp.path().join("granted-private-folder");
+        std::fs::create_dir_all(&folder).unwrap();
+        let root = canonical_test_workspace(&folder);
+        let (status, created) = grant(&state, &key, grant_body(&root, &["helper"])).await;
+        assert_eq!(status, StatusCode::CREATED, "{created}");
+        let resource_id = created["resource"]["resource_id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+
+        // The agent's own default wins; the profile round-trips the reference.
+        let (status, body) = profile_request(
+            &state,
+            axum::http::Method::PUT,
+            key.as_str(),
+            Some(json!({
+                "decision_id": uuid::Uuid::new_v4().to_string(),
+                "agent_defaults": { "helper": resource_id },
+            })),
+            OPERATOR,
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED, "{body}");
+        assert_eq!(
+            body["profile"]["agent_defaults"]["helper"],
+            json!(resource_id)
+        );
+
+        let (_, after) = inspect_response(&state, key.as_str()).await;
+        let exec = &after["agents"][0]["execution"];
+        assert_eq!(exec["cwd_source"], json!("resource_grant"));
+        assert_eq!(exec["resource_id"], json!(resource_id));
+        assert_eq!(exec["grant_generation"], json!("1"));
+        assert!(
+            exec.get("cwd").is_none(),
+            "a grant's path is never projected: {exec}"
+        );
+        assert!(!after.to_string().contains("granted-private-folder"));
+
+        // And the convened turn actually runs there: the agent replies.
+        let (status, _) = room_post_message(
+            State(state.clone()),
+            Path(key.as_str().to_string()),
+            Json(RoomMessageRequest {
+                author_id: "john".into(),
+                author_kind: RoomParticipantKind::Human,
+                body: "@helper go".into(),
+                thread_parent_seq: None,
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED);
+        let reply = crate::tests::wait_for_message(&state, &key, |m| {
+            m.author_id == "helper" && matches!(m.kind, RoomMessageKind::Message)
+        })
+        .await
+        .expect("a turn whose cwd is a live grant must be admitted and reply");
+        assert!(reply.body.contains("OCEAN_FAKE_OK"), "{}", reply.body);
+
+        // Suspending the grant makes the SAME agent unbound again.
+        let (status, s) = room_json_request(
+            &state,
+            axum::http::Method::POST,
+            format!("/v1/rooms/persistent/{key}/resources/{resource_id}/suspend"),
+            Some(json!({"decision_id": uuid::Uuid::new_v4().to_string()})),
+            OPERATOR,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{s}");
+        let (_, suspended) = inspect_response(&state, key.as_str()).await;
+        assert_eq!(
+            suspended["agents"][0]["execution"]["cwd_source"],
+            json!("unbound")
+        );
     }
 
     // ── Snapshot tail paging (`before_seq`) ──────────────────────────────────
