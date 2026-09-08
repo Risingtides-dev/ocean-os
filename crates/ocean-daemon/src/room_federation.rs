@@ -945,7 +945,7 @@ impl FederationSupervisor {
     }
 
     /// Idempotently start one room. A start arriving while stop is joining
-    /// waits on the slot lock, then starts the next epoch.
+    /// waits on the slot lock, then starts the next epoch only if still open.
     pub(super) async fn start_room(&self, key: RoomKey) {
         if self.inner.shutting_down.load(Ordering::Acquire)
             || self.inner.shutdown.is_cancelled()
@@ -971,6 +971,16 @@ impl FederationSupervisor {
             let _ = stale.join.await;
         }
         if self.inner.shutting_down.load(Ordering::Acquire) {
+            return;
+        }
+        // Credential promotion can finish before a concurrent close, with its
+        // start delayed until after stop_room found no task. Recheck under the
+        // same slot-state lock as stop, including first-start and restart paths.
+        // A close after this check waits for this start and cancels its task.
+        if !matches!(
+            with_rooms_handle(&self.inner.rooms, |store| store.is_open(&key)),
+            Ok(true)
+        ) {
             return;
         }
         let generation = self.inner.next_generation.fetch_add(1, Ordering::AcqRel);
@@ -11063,6 +11073,82 @@ mod tests {
         assert_eq!(replayed[1], replayed[3]);
         restarted.shutdown().await;
         server.abort();
+    }
+
+    #[tokio::test]
+    async fn delayed_first_start_cannot_restart_a_closed_room() {
+        for waiting_on_slot in [false, true] {
+            let key = RoomKey::new("fed-close-before-start");
+            let mut store = ocean_store::SqliteRoomStore::open_in_memory().unwrap();
+            store
+                .create(key.clone(), "Closed", None, chrono::Utc::now())
+                .unwrap();
+            store
+                .install_room_credential(&key, "closed-bearer", "human")
+                .unwrap();
+            let rooms = Arc::new(std::sync::Mutex::new(store));
+            let fake = FakeBedrock::new(key.as_str(), "closed-bearer");
+            let (base, server) = start_fake_bedrock(fake.clone()).await;
+            let supervisor = FederationSupervisor::for_test(
+                &base,
+                rooms.clone(),
+                RoomWakeBus::default(),
+                RoomAccessWakeBus::default(),
+                RoomReadCursorWakeBus::default(),
+                CancellationToken::new(),
+                Duration::from_millis(20),
+            );
+            let slot = Arc::new(RoomSlot::default());
+            let guard = if waiting_on_slot {
+                supervisor
+                    .inner
+                    .slots
+                    .lock()
+                    .await
+                    .insert(key.clone(), slot.clone());
+                Some(slot.state.lock().await)
+            } else {
+                None
+            };
+            let pending_start = if waiting_on_slot {
+                let supervisor = supervisor.clone();
+                let key = key.clone();
+                Some(tokio::spawn(
+                    async move { supervisor.start_room(key).await },
+                ))
+            } else {
+                None
+            };
+            rooms
+                .lock()
+                .unwrap()
+                .close_with_marker(
+                    &key,
+                    ocean_store::RoomCloser::Operator("operator"),
+                    chrono::Utc::now(),
+                )
+                .unwrap();
+            drop(guard);
+            supervisor.stop_room(&key).await;
+            if let Some(start) = pending_start {
+                start.await.unwrap();
+            } else {
+                supervisor.start_room(key.clone()).await;
+            }
+            let slot = supervisor
+                .inner
+                .slots
+                .lock()
+                .await
+                .get(&key)
+                .cloned()
+                .unwrap();
+            assert!(slot.state.lock().await.is_none());
+            assert_eq!(supervisor.inner.next_generation.load(Ordering::Acquire), 1);
+            assert!(fake.request_meta.lock().await.is_empty());
+            supervisor.shutdown().await;
+            server.abort();
+        }
     }
 
     #[tokio::test]

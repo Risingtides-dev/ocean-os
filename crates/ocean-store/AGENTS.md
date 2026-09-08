@@ -133,7 +133,9 @@ outbox, and the restart-safe federation core (S2 P2-A). One database file
 - **Confirmed ingest is fail-closed.** Dedup cross-checks BOTH persisted
   copies: the `federated_events` index tuple must equal the parsed transcript
   `FederatedMessageMeta`, and that meta must equal the incoming event — every
-  field, never raw JSON bytes or a column subset. Full three-way equality ⇒
+  field, never raw JSON bytes or a column subset. The persisted normalized
+  mention set must also equal the incoming set (ordering is irrelevant).
+  Full three-way equality plus matching mentions ⇒
   `IngestOutcome::Duplicate` no-op; any divergence (including index vs
   transcript), a missing/unreadable indexed transcript row, a
   `global_sequence` at or below the ordering baseline, or a missing access

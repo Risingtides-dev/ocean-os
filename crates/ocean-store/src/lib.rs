@@ -7656,11 +7656,22 @@ impl SqliteRoomStore {
                     event.ledger_event_id
                 )));
             }
-            if stored == meta {
+            let stored_mentions: std::collections::HashSet<String> = tx
+                .prepare(
+                    "SELECT member_id FROM federated_event_mentions
+                     WHERE room_id = ?1 AND ledger_event_id = ?2",
+                )?
+                .query_map(params![key.as_str(), event.ledger_event_id], |r| r.get(0))?
+                .collect::<std::result::Result<_, _>>()?;
+            let mentions_match = stored_mentions.len() == unique_mentions.len()
+                && unique_mentions
+                    .iter()
+                    .all(|id| stored_mentions.contains(*id));
+            if stored == meta && mentions_match {
                 return Ok(IngestOutcome::Duplicate);
             }
             return Err(RoomStoreError::FederationCorruption(format!(
-                "ledger event {} re-ingested with different metadata",
+                "ledger event {} re-ingested with different metadata or mentions",
                 event.ledger_event_id
             )));
         }
@@ -14789,6 +14800,41 @@ mod tests {
                 .unwrap(),
             RoomAttentionCounts::default(),
         );
+    }
+
+    #[test]
+    fn duplicate_confirmed_event_requires_the_exact_normalized_mention_set() {
+        let (mut s, key) = fed_store_with_room("r-mention-replay");
+        seed_access_row(&s, &key, "live");
+        let mut event = confirmed_event("ledger-replay", 9, "src-a", 1, "evt-a");
+        event.mention_member_ids = vec!["m-self".into(), "m-other".into()];
+        s.ingest_confirmed_event(&key, &event, now()).unwrap();
+        event.mention_member_ids.reverse();
+        assert!(matches!(
+            s.ingest_confirmed_event(&key, &event, now()).unwrap(),
+            IngestOutcome::Duplicate
+        ));
+        for mentions in [vec![], vec!["m-self"], vec!["m-self", "m-new"]] {
+            event.mention_member_ids = mentions.into_iter().map(String::from).collect();
+            assert!(matches!(
+                s.ingest_confirmed_event(&key, &event, now()),
+                Err(RoomStoreError::FederationCorruption(_))
+            ));
+            assert_eq!(transcript_count(&s, &key), 1);
+            assert_eq!(federated_events_count(&s, &key), 1);
+            assert_eq!(
+                s.federated_room_attention(&key, "m-self", None)
+                    .unwrap()
+                    .mention_count,
+                1
+            );
+            assert_eq!(
+                s.federated_room_attention(&key, "m-new", None)
+                    .unwrap()
+                    .mention_count,
+                0
+            );
+        }
     }
 
     #[test]

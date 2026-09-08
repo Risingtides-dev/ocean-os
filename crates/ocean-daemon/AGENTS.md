@@ -152,6 +152,10 @@ This crate owns the long-running Ocean HTTP service on `:4780`, including API ro
 
 ## Work Guidance
 
+- Every federation start rechecks durable room openness while holding the same
+  slot-state lock as stop. A delayed credential promotion must not resurrect a
+  room after its local close; store read failure refuses the start.
+
 - Keep HTTP/SSE contracts stable for both `ocean-tui` and `ocean-surface`.
 - Caller-submitted and resumed turns execute in the caller's cwd; never pin them to the daemon launch cwd or the first session cwd. Persistent-room agent turns use only the room's explicit `workspace_root`; an unbound or missing directory fails closed and never inherits the daemon launch cwd.
 - Build from up-to-date `main` before daemon restarts when doing operator work.
