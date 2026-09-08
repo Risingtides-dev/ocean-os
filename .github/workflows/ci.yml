@@ -189,6 +189,14 @@ jobs:
       - name: Test the ledger checker
         run: node --test scripts/check-ledger.test.mjs
 
+      # The daemon's federation secret loader (deploy/ocean-daemon.sh) and the
+      # file-writing half of ops/set-ocean-federation.sh, run against a fake
+      # daemon that records which variables reached its process. Pure bash
+      # and node, so it runs here; the launchd half is verified on the
+      # operated machine by a federated room reaching `live`.
+      - name: Test the federation secret loader
+        run: node --test scripts/federation-loader.test.mjs
+
       # The diff step proves an entry EXISTS; this one proves the ledger it was
       # appended to is still readable. The union merge driver keeps a line both
       # sides added only once, so each extra parallel append eats the `___` rule

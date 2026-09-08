@@ -191,7 +191,7 @@ fn summary_user_prompt(room: &RoomKey, room_name: &str, msgs: &[RoomMessage]) ->
             "[#{seq}] {author}: {body}\n",
             seq = m.seq,
             author = m.author_id,
-            body = room_history_text(m.body.clone()),
+            body = room_history_text(m.body.clone(), m.author_kind, m.kind),
         ));
     }
     out.push_str("--- end transcript ---\n\nYour summary:");

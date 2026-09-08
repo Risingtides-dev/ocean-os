@@ -489,7 +489,9 @@ impl SqliteRoomStore {
         let tx = self
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        require_room(&tx, key)?;
+        if !Self::room_is_open_on(&tx, key)? {
+            return Err(RoomStoreError::UnknownRoom(key.clone()));
+        }
 
         if let Some(prior) = consumed_decision_on(&tx, key, &input.decision_id)? {
             if prior != input.request_digest {
@@ -735,7 +737,9 @@ impl SqliteRoomStore {
         let tx = self
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        require_room(&tx, key)?;
+        if !Self::room_is_open_on(&tx, key)? {
+            return Err(RoomStoreError::UnknownRoom(key.clone()));
+        }
         let current = load_grant_on(&tx, key, resource_id)?.ok_or_else(|| {
             RoomStoreError::UnknownResourceGrant {
                 room: key.clone(),
@@ -875,6 +879,67 @@ mod tests {
             actor: "operator-1".into(),
             decision_id: decision.into(),
             request_digest: format!("digest-{}", to.as_str()),
+        }
+    }
+
+    #[test]
+    fn closed_resources_refuse_grant_and_status_writes_even_after_retention() {
+        let (mut s, key) = room();
+        let (before, _, _) = s
+            .grant_room_resource(&key, input("/tmp/root", "dec-1", "d1"), Utc::now())
+            .unwrap();
+        s.close_with_marker(&key, crate::RoomCloser::Operator("operator"), Utc::now())
+            .unwrap();
+        for cut in [false, true] {
+            if cut {
+                s.cut_closed_room(&key).unwrap();
+            }
+            let messages = s
+                .get_including_closed(&key)
+                .unwrap()
+                .unwrap()
+                .transcript
+                .len();
+            for request in [
+                input("/tmp/root", "dec-1", "d1"),
+                input("/tmp/another-root", "dec-2", "d2"),
+            ] {
+                assert!(matches!(
+                    s.grant_room_resource(&key, request, Utc::now()),
+                    Err(RoomStoreError::UnknownRoom(_))
+                ));
+            }
+            for target in [
+                ResourceStatus::Available,
+                ResourceStatus::Suspended,
+                ResourceStatus::Revoked,
+            ] {
+                assert!(matches!(
+                    s.set_room_resource_status(
+                        &key,
+                        &before.resource_id,
+                        status(target, "dec-status"),
+                        Utc::now()
+                    ),
+                    Err(RoomStoreError::UnknownRoom(_))
+                ));
+            }
+            assert_eq!(
+                s.room_resource_grant(&key, &before.resource_id).unwrap(),
+                Some(before.clone())
+            );
+            assert!(s
+                .room_decision_consumed(&key, "dec-status")
+                .unwrap()
+                .is_none());
+            assert_eq!(
+                s.get_including_closed(&key)
+                    .unwrap()
+                    .unwrap()
+                    .transcript
+                    .len(),
+                messages
+            );
         }
     }
 
