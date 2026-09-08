@@ -20,10 +20,10 @@
 //!
 //! # Phase 2b restrictions (manifest §2.1, ruling §11.1)
 //!
-//! - Any non-null `resource_id`, `default_resource_id`, or `agent_defaults`
-//!   entry is refused with `phase_not_open`: there are no grants to name until
-//!   Stage 2c lands, and a dangling reference accepted now would be authority
-//!   minted by a later stage without a decision.
+//! - Every `resource_id`, `default_resource_id`, or `agent_defaults` value
+//!   must name a grant in this room that is not revoked (`resource_not_found`
+//!   otherwise): a dangling reference would be authority minted by a later
+//!   grant without a decision. Before 2c landed these were `phase_not_open`.
 //! - `keychain:` is a valid scheme that resolves to `resolver_not_open`.
 //! - Tool `installed` status is REPORTED on read, not enforced on write. The
 //!   write-time refusal the manifest names lands with the resource-aware tools
@@ -48,7 +48,9 @@ use serde_json::{json, Value};
 
 use super::AppState;
 use crate::persistent_rooms::{publish_room_wake, with_rooms};
-use crate::room_agent_authority::{decision_digest, operator, validate_decision_id, ApiError};
+use crate::room_agent_authority::{
+    decision_digest, operator, validate_decision_id, validate_member_id, ApiError,
+};
 
 const MAX_REPOS: usize = 32;
 const MAX_TOOLS: usize = 32;
@@ -59,6 +61,7 @@ const MAX_ALIAS_CHARS: usize = 64;
 const MAX_REMOTE_CHARS: usize = 512;
 const MAX_PURPOSE_CHARS: usize = 200;
 const MAX_NAME_CHARS: usize = 128;
+const MAX_AGENT_DEFAULTS: usize = 64;
 
 // ── Request body ──────────────────────────────────────────────────────────────
 
@@ -234,12 +237,24 @@ struct ValidatedProfile {
 fn validate(body: PutProfileBody) -> Result<(String, ValidatedProfile), ApiError> {
     let decision_id = validate_decision_id(&body.decision_id)?;
 
-    // Phase 2b: no grants exist, so no reference to one may be recorded.
-    if body.default_resource_id.is_some()
-        || !body.agent_defaults.is_empty()
-        || body.repos.iter().any(|r| r.resource_id.is_some())
-    {
-        return Err(ApiError::bad_request("phase_not_open"));
+    // Resource references are shape-checked here and existence-checked by the
+    // route against live grants (2c) — validation stays pure.
+    let default_resource_id = body
+        .default_resource_id
+        .as_deref()
+        .map(|id| identifier(id, MAX_NAME_CHARS, "invalid_resource_id"))
+        .transpose()?;
+    let mut agent_defaults = BTreeMap::new();
+    for (agent, resource_id) in &body.agent_defaults {
+        let agent = validate_member_id(agent, "invalid_agent_member_id")?;
+        if agent.is_empty() {
+            return Err(ApiError::bad_request("invalid_agent_member_id"));
+        }
+        let resource_id = identifier(resource_id, MAX_NAME_CHARS, "invalid_resource_id")?;
+        agent_defaults.insert(agent, resource_id);
+    }
+    if agent_defaults.len() > MAX_AGENT_DEFAULTS {
+        return Err(ApiError::bad_request("profile_too_large"));
     }
 
     if body.repos.len() > MAX_REPOS
@@ -262,11 +277,16 @@ fn validate(body: PutProfileBody) -> Result<(String, ValidatedProfile), ApiError
             .as_deref()
             .map(|b| bounded_text(b, MAX_NAME_CHARS, "invalid_default_branch"))
             .transpose()?;
+        let resource_id = repo
+            .resource_id
+            .as_deref()
+            .map(|id| identifier(id, MAX_NAME_CHARS, "invalid_resource_id"))
+            .transpose()?;
         repos.push(RepoRef {
             alias,
             remote,
             default_branch,
-            resource_id: None,
+            resource_id,
         });
     }
 
@@ -342,8 +362,8 @@ fn validate(body: PutProfileBody) -> Result<(String, ValidatedProfile), ApiError
             repos,
             tools,
             credential_slots,
-            default_resource_id: None,
-            agent_defaults: BTreeMap::new(),
+            default_resource_id,
+            agent_defaults,
         },
     ))
 }
@@ -541,6 +561,17 @@ pub(super) async fn room_profile_put(
             return Err(ApiError::bad_request("invalid_room_key"));
         }
         let (decision_id, validated) = validate(body)?;
+        // Every referenced resource must be a live grant in THIS room (2c).
+        let refs = validated
+            .repos
+            .iter()
+            .filter_map(|r| r.resource_id.clone())
+            .chain(validated.default_resource_id.clone())
+            .chain(validated.agent_defaults.values().cloned())
+            .collect::<Vec<_>>();
+        with_rooms(&state, |store| {
+            crate::room_resources::check_profile_resource_refs(store, &room, refs)
+        })?;
         let digest = decision_digest(&ProfileDecisionDigestInput {
             room_id: room.as_str(),
             repos: &validated.repos,
@@ -785,20 +816,22 @@ mod tests {
             serde_json::from_value(v).unwrap()
         };
         let code = |body: PutProfileBody| validate(body).map(|_| ()).unwrap_err().code();
+        // Resource references are shape-checked here; existence is the route's
+        // job against live grants.
+        assert!(validate(base(json!({"default_resource_id": "res-1"}))).is_ok());
+        assert!(validate(base(json!({"agent_defaults": {"builder": "res-1"}}))).is_ok());
         assert_eq!(
-            code(base(json!({"default_resource_id": "r1"}))),
-            "phase_not_open"
+            code(base(json!({"default_resource_id": "[x]"}))),
+            "invalid_resource_id"
         );
         assert_eq!(
-            code(base(json!({"agent_defaults": {"a": "r1"}}))),
-            "phase_not_open"
+            code(base(json!({"agent_defaults": {"[click](x)": "res-1"}}))),
+            "invalid_agent_member_id"
         );
-        assert_eq!(
-            code(base(
-                json!({"repos": [{"alias": "s", "remote": "https://x.y/r", "resource_id": "r1"}]})
-            )),
-            "phase_not_open"
-        );
+        assert!(validate(base(
+            json!({"repos": [{"alias": "s", "remote": "https://x.y/r", "resource_id": "res-1"}]})
+        ))
+        .is_ok());
         assert_eq!(
             code(base(
                 json!({"repos": [{"alias": "s", "remote": "/local/path"}]})
