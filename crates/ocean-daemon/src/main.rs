@@ -26355,9 +26355,12 @@ mod tests {
         // 123 -> 124: Local-room agent bootstrap establishes the durable Room
         // owner role and package-derived Agent roster tuple without authorizing
         // execution or consuming a decision.
+        // 124 -> 125: Rooms Phase 2 Stage 2a read-only inspect projection
+        // (room, access, federated bool, owner, execution cwd_source, every
+        // binding with its deterministic session id, empty Phase 2 slots).
         assert_eq!(
             banner.len(),
-            124,
+            125,
             "route baseline changed; review the manifest"
         );
 
