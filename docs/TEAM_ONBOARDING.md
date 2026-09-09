@@ -192,19 +192,14 @@ Local room as its Bedrock owner and minting invites — and that is the
 operator's job, done with [`../ops/set-ocean-federation.sh`](../ops/set-ocean-federation.sh)
 on the operator's machine. Do not ask for it and do not paste one in.
 
-One wrinkle, honestly: the current daemon
-(`FederationConfig::resolve` in `crates/ocean-daemon/src/room_federation.rs`)
-and the launcher both refuse a `federation.env` that has no owner-token line at
-all — an incomplete pair is treated as invalid configuration, every room goes
-`recovering`, and a redeem answers 503 `federation_unavailable`. So the script
-writes the URL plus a fixed marker line,
-`OCEAN_FEDERATION_OWNER_TOKEN=member-node-without-owner-authority`. The marker
-is not a credential: Bedrock never issued it, it grants nothing, it is only
-sent if your daemon tries to bootstrap a Local room as owner (which answers
-403 `federation_forbidden`), and it is how a re-run tells a file it wrote from
-one that carries a real credential, which it leaves alone unless `--force`.
-When the daemon accepts a URL-only file, the marker line stays harmless and
-the script needs no change.
+Your daemon is a **member node**: `federation.env` holds the origin and
+nothing else, and the launcher logs `federation=on (file, member)`. Only the
+room owner's daemon carries a bearer (written there by
+`ops/set-ocean-federation.sh`); redeeming an invite never uses one, and an
+owner-only route on your node answers `federation_unavailable`, which is
+correct. The script marks the file it wrote with a comment line so a re-run
+recognises it, and it leaves a file that carries a real credential alone
+unless you pass `--force`.
 
 What redemption leaves behind: the room credential the daemon minted lives in
 owner-only `rooms.db` beside the config dir, never in `federation.env`, and it

@@ -40,15 +40,13 @@ CONFIG_DIR="${OCEAN_CONFIG_DIR:-${XDG_CONFIG_HOME:-$HOME/.config}/ocean-rs}"
 ENV_FILE="${OCEAN_FEDERATION_ENV_FILE:-$CONFIG_DIR/federation.env}"
 HEALTH_URL="http://127.0.0.1:4780/health"
 LOG_PATH="/private/tmp/ocean-daemon.log"
-# The daemon (crates/ocean-daemon/src/room_federation.rs, FederationConfig::resolve)
-# and the launcher both refuse a federation.env that has no
-# OCEAN_FEDERATION_OWNER_TOKEN line, although that token is only ever sent when
-# THIS daemon bootstraps a Local room as its Bedrock owner — something a member
-# node never does; invite redemption does not use it. This fixed marker satisfies
-# the file shape, grants nothing (Bedrock never issued it; an owner-bootstrap
-# attempt answers 403 federation_forbidden), and is how a re-run tells a file it
-# wrote from one carrying a real credential.
-MEMBER_TOKEN_MARKER="member-node-without-owner-authority"
+# A coworker's daemon is a MEMBER node: the Bedrock origin only, no owner
+# bearer (crates/ocean-daemon/src/room_federation.rs, FederationConfig::resolve
+# accepts an origin-only file; the launcher logs `federation=on (file, member)`).
+# Invite redemption never uses a bearer; only the room owner's daemon carries
+# one, written by ops/set-ocean-federation.sh. This comment line is how a re-run
+# tells a file it wrote from one carrying a real credential.
+MEMBER_MARKER="# ocean-onboard: member node (origin only, no owner bearer)"
 
 # bun's global bin dir and Homebrew, ahead of whatever the caller's shell had.
 export PATH="$HOME/.bun/bin:/opt/homebrew/bin:/usr/local/bin:$PATH"
@@ -187,9 +185,9 @@ write_federation_env() {
   local has_credential=0 has_marker=0 url_matches=0 tmp
   if [[ -e "$ENV_FILE" ]]; then
     grep -q '^OCEAN_FEDERATION_OWNER_TOKEN\(_KEYCHAIN\)\{0,1\}=' "$ENV_FILE" && has_credential=1
-    grep -qx "OCEAN_FEDERATION_OWNER_TOKEN=$MEMBER_TOKEN_MARKER" "$ENV_FILE" && has_marker=1
+    grep -qxF "$MEMBER_MARKER" "$ENV_FILE" && has_marker=1
     grep -qx "OCEAN_FEDERATION_URL=$BEDROCK_URL" "$ENV_FILE" && url_matches=1
-    if [[ $has_credential -eq 1 && $has_marker -eq 0 && $FORCE -eq 0 ]]; then
+    if [[ $has_credential -eq 1 && $FORCE -eq 0 ]]; then
       note "already carries an owner credential (ops/set-ocean-federation.sh territory); leaving it untouched — --force replaces it"
       return 0
     fi
@@ -201,7 +199,7 @@ write_federation_env() {
     fi
   fi
   if [[ $DRY -eq 1 ]]; then
-    note "[dry-run] would write OCEAN_FEDERATION_URL=$BEDROCK_URL (+ the member marker line) at 0600 in a 0700 $CONFIG_DIR"
+    note "[dry-run] would write OCEAN_FEDERATION_URL=$BEDROCK_URL (origin only, member node) at 0600 in a 0700 $CONFIG_DIR"
     return 0
   fi
   (
@@ -211,11 +209,10 @@ write_federation_env() {
     tmp="$(mktemp "$CONFIG_DIR/.federation.env.XXXXXX")"
     {
       echo "# Written by ops/onboard-teammate.sh (docs/TEAM_ONBOARDING.md). Read by the daemon launcher at start."
-      echo "# Owner-only (0600). Member node: the Bedrock origin only. The token line is a fixed marker,"
-      echo "# not a credential: the daemon refuses this file without one, and only ever sends it to"
-      echo "# bootstrap a Local room as owner, which a member node cannot do. Redeeming invites never uses it."
+      echo "# Owner-only (0600). Member node: the Bedrock origin only, no owner bearer —"
+      echo "# this daemon joins rooms by invite and cannot bootstrap rooms as their owner."
+      echo "$MEMBER_MARKER"
       echo "OCEAN_FEDERATION_URL=$BEDROCK_URL"
-      echo "OCEAN_FEDERATION_OWNER_TOKEN=$MEMBER_TOKEN_MARKER"
     } > "$tmp"
     chmod 600 "$tmp"
     mv -f "$tmp" "$ENV_FILE"

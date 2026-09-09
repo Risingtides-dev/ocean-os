@@ -31,6 +31,7 @@ usage() {
   cat <<USAGE
 Usage:
   ops/set-ocean-federation.sh --url https://bedrock.example (--token-file PATH | --token-stdin | --keychain SERVICE) [--no-restart] [--verify-room KEY]
+  ops/set-ocean-federation.sh --url https://bedrock.example --member [--no-restart]
   ops/set-ocean-federation.sh --off [--no-restart]
 
   --url URL            Bedrock origin: scheme and host only, nothing after the host.
@@ -40,6 +41,8 @@ Usage:
                        start from the login Keychain item with that service name and
                        this account name. Add it with:
                          security add-generic-password -a "\$USER" -s SERVICE -w
+  --member             Origin only, no bearer: this daemon joins rooms by invite and
+                       cannot bootstrap rooms as their Bedrock owner (a coworker node).
   --off                Remove the federation file; the daemon restarts with federation off.
   --no-restart         Write the file and lint the plists, but do not touch launchd.
   --verify-room KEY    After the restart, poll the room's snapshot until access.state is live.
@@ -61,13 +64,14 @@ valid_federation_origin() {
   (( 10#$port <= 65535 ))
 }
 
-url=""; token_file=""; token_stdin=0; keychain=""; off=0; restart=1; verify_room=""
+url=""; token_file=""; token_stdin=0; keychain=""; member=0; off=0; restart=1; verify_room=""
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --url) url="${2:-}"; shift 2 ;;
     --token-file) token_file="${2:-}"; shift 2 ;;
     --token-stdin) token_stdin=1; shift ;;
     --keychain) keychain="${2:-}"; shift 2 ;;
+    --member) member=1; shift ;;
     --off) off=1; shift ;;
     --no-restart) restart=0; shift ;;
     --verify-room) verify_room="${2:-}"; shift 2 ;;
@@ -82,7 +86,11 @@ if [[ $off -eq 0 ]]; then
     fail "--url must be an https origin with nothing after the host (http is allowed for 127.0.0.1 and localhost only)"
   fi
   n=0; [[ -n "$token_file" ]] && n=$((n+1)); [[ $token_stdin -eq 1 ]] && n=$((n+1)); [[ -n "$keychain" ]] && n=$((n+1))
-  [[ $n -eq 1 ]] || { usage >&2; fail "give exactly one of --token-file, --token-stdin, --keychain"; }
+  if [[ $member -eq 1 ]]; then
+    [[ $n -eq 0 ]] || { usage >&2; fail "--member takes no bearer source"; }
+  else
+    [[ $n -eq 1 ]] || { usage >&2; fail "give exactly one of --token-file, --token-stdin, --keychain (or --member for a coworker node)"; }
+  fi
 fi
 
 # ── 1. the owner-only file ────────────────────────────────────────────────
@@ -99,7 +107,7 @@ else
   elif [[ $token_stdin -eq 1 ]]; then
     IFS= read -r token || true
   fi
-  if [[ -z "$keychain" ]]; then
+  if [[ -z "$keychain" && $member -eq 0 ]]; then
     [[ -n "$token" ]] || fail "the bearer is empty"
     [[ "$token" =~ [[:space:]] ]] && fail "the bearer holds whitespace"
   fi
@@ -108,7 +116,9 @@ else
     echo "# Written by ops/set-ocean-federation.sh. Read only by the daemon's launcher."
     echo "# Owner-only (0600). Never copy these values into any plist or shell profile."
     echo "OCEAN_FEDERATION_URL=$url"
-    if [[ -n "$keychain" ]]; then echo "OCEAN_FEDERATION_OWNER_TOKEN_KEYCHAIN=$keychain"; else echo "OCEAN_FEDERATION_OWNER_TOKEN=$token"; fi
+    if [[ $member -eq 1 ]]; then
+      echo "# member node: no owner bearer; this daemon joins rooms by invite only"
+    elif [[ -n "$keychain" ]]; then echo "OCEAN_FEDERATION_OWNER_TOKEN_KEYCHAIN=$keychain"; else echo "OCEAN_FEDERATION_OWNER_TOKEN=$token"; fi
   } > "$tmp"
   unset token
   chmod 600 "$tmp"
