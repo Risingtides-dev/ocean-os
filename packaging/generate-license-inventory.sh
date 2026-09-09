@@ -57,8 +57,9 @@ render_graph() {
 
 render_graph ocean-tui "$tmp_dir/ocean-tui.txt" "$tmp_dir/ocean-tui.json"
 render_graph ocean-daemon "$tmp_dir/ocean-daemon.txt" "$tmp_dir/ocean-daemon.json"
+render_graph ocean-mcp "$tmp_dir/ocean-mcp.txt" "$tmp_dir/ocean-mcp.json"
 
-python3 - "$tmp_dir/ocean-tui.json" "$tmp_dir/ocean-daemon.json" > "$tmp_dir/upstream-notices.txt" <<'PY'
+python3 - "$tmp_dir/ocean-tui.json" "$tmp_dir/ocean-daemon.json" "$tmp_dir/ocean-mcp.json" > "$tmp_dir/upstream-notices.txt" <<'PY'
 import json
 import os
 from pathlib import Path
@@ -128,6 +129,13 @@ BINARY: ocean-daemon (workspace package ocean-daemon)
 ================================================================================
 HEADER
   cat "$tmp_dir/ocean-daemon.txt"
+  cat <<'HEADER'
+
+================================================================================
+BINARY: ocean-mcp (workspace package ocean-mcp)
+================================================================================
+HEADER
+  cat "$tmp_dir/ocean-mcp.txt"
   printf '\n'
   cat "$tmp_dir/upstream-notices.txt"
   printf '\n'

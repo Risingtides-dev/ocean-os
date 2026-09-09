@@ -7,7 +7,8 @@ Distribution artifacts for shipping prebuilt Ocean binaries to teammates.
 ## Ownership
 
 - `npm/` — the `@risingtides-dev/ocean` npm wrapper package: prebuilt
-  `ocean` (TUI) + `ocean-daemon` binaries for macOS arm64, published to
+  `ocean` (TUI) + `ocean-daemon` + `ocean-mcp` (Ocean as an MCP server for
+  Claude Code / Codex / Cursor) binaries for macOS arm64, published to
   GitHub Packages by `.github/workflows/release.yml` on `v*` tag push.
 - `about.toml`, `about.hbs`, and `generate-license-inventory.sh` — pinned,
   fail-closed generation of the full-text dependency-license inventory shipped
@@ -23,7 +24,7 @@ Distribution artifacts for shipping prebuilt Ocean binaries to teammates.
   `origin/main`; prerelease and branch-only tags fail closed.
 - Package scope must remain `@risingtides-dev` (GitHub Packages requires
   the scope to match the repository owner).
-- The `bin` map must keep `ocean` and `ocean-daemon` in the same install
+- The `bin` map must keep `ocean`, `ocean-daemon`, and `ocean-mcp` in the same install
   directory: on machines without launchd supervision, the TUI discovers the
   daemon as a sibling of its own binary
   (`crates/ocean-tui/src/shell/daemon_boot.rs`).

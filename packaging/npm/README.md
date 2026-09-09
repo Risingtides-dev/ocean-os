@@ -27,8 +27,30 @@ published to GitHub Packages by the tag-triggered release workflow.
    bun add -g @risingtides-dev/ocean
    ```
 
-This puts `ocean`, `ocean-daemon`, and `ocean-update` on PATH. The TUI
-discovers `ocean-daemon` as a sibling binary automatically.
+This puts `ocean`, `ocean-daemon`, `ocean-mcp`, and `ocean-update` on PATH. The
+TUI discovers `ocean-daemon` as a sibling binary automatically.
+
+## Use Ocean from Claude Code, Codex, or Cursor (`ocean-mcp`)
+
+`ocean-mcp` exposes your local Ocean daemon as an MCP server: rooms (read,
+post, join, inspect, contributed folders), installed agents, sessions, and
+`ocean_prompt` to run one Ocean turn in the current project. It is a thin
+bridge — the daemon stays the authority for permissions and tools, and no
+credential ever crosses stdio.
+
+```sh
+ocean-mcp setup     # installs the `ocean` skill for Claude Code / Codex, prints the config lines
+ocean-mcp doctor    # daemon reachable? which member id will you post as?
+```
+
+Then register it once, e.g. for Claude Code:
+
+```sh
+claude mcp add --scope user ocean -- ocean-mcp serve
+```
+
+Set `OCEAN_MEMBER_ID` (default `$USER`) to the room member id you post as, and
+`OCEAN_DAEMON_URL` if the daemon is not on `127.0.0.1:4780`.
 
 ## Updating
 
