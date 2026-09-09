@@ -500,18 +500,33 @@ impl FederationConfig {
     /// Resolve one source pair. Presence of either process variable selects the
     /// process source wholesale; the private file is only a fallback when both
     /// are absent, so stale disk state can never replace an explicit launch.
+    ///
+    /// The owner token is OPTIONAL. A daemon configured with only the origin
+    /// is a **member node**: it can redeem invites, sync credentialed rooms,
+    /// and post into them, but cannot bootstrap a Local room as its Bedrock
+    /// owner (that route answers `federation_unavailable`). This is the shape
+    /// every coworker's daemon runs in; only the room owner's daemon carries
+    /// the admin bearer. A token that IS present must be well-formed — an
+    /// explicitly empty process variable reads as "no owner authority", never
+    /// as an error, so `OCEAN_FEDERATION_OWNER_TOKEN=` cannot brick a node.
     fn resolve(config_dir: &Path) -> Result<Self, BridgeError> {
         let env_url = std::env::var_os(FEDERATION_URL_ENV);
         let env_token = std::env::var_os(FEDERATION_OWNER_TOKEN_ENV);
         let pair = if env_url.is_some() || env_token.is_some() {
-            Some((
-                env_url
-                    .and_then(|value| value.into_string().ok())
-                    .ok_or(BridgeError::InvalidConfig)?,
-                env_token
-                    .and_then(|value| value.into_string().ok())
-                    .ok_or(BridgeError::InvalidConfig)?,
-            ))
+            // A token with no origin is not a configuration; the origin is the
+            // one thing a federated node cannot do without.
+            let url = env_url
+                .and_then(|value| value.into_string().ok())
+                .ok_or(BridgeError::InvalidConfig)?;
+            let token = match env_token {
+                None => None,
+                Some(value) => Some(
+                    value
+                        .into_string()
+                        .map_err(|_| BridgeError::InvalidConfig)?,
+                ),
+            };
+            Some((url, token))
         } else {
             read_federation_config_file(&config_dir.join(FEDERATION_CONFIG_FILE))?
         };
@@ -521,20 +536,26 @@ impl FederationConfig {
                 owner_token: None,
             });
         };
-        if owner_token.is_empty()
-            || owner_token != owner_token.trim()
-            || owner_token.chars().any(char::is_control)
-        {
-            return Err(BridgeError::InvalidConfig);
-        }
+        let owner_token = match owner_token {
+            None => None,
+            Some(token) if token.is_empty() => None,
+            Some(token) => {
+                if token != token.trim() || token.chars().any(char::is_control) {
+                    return Err(BridgeError::InvalidConfig);
+                }
+                Some(token)
+            }
+        };
         Ok(Self {
             client: Some(FederationClient::new(&url)?),
-            owner_token: Some(owner_token),
+            owner_token,
         })
     }
 }
 
-fn parse_federation_config(raw: &str) -> Result<(String, String), BridgeError> {
+/// `(origin, owner_token)`. The origin is required; the owner token line may be
+/// absent (a member node — see [`FederationConfig::resolve`]).
+fn parse_federation_config(raw: &str) -> Result<(String, Option<String>), BridgeError> {
     let mut url = None;
     let mut owner_token = None;
     for line in raw.lines() {
@@ -551,14 +572,13 @@ fn parse_federation_config(raw: &str) -> Result<(String, String), BridgeError> {
             return Err(BridgeError::InvalidConfig);
         }
     }
-    Ok((
-        url.ok_or(BridgeError::InvalidConfig)?,
-        owner_token.ok_or(BridgeError::InvalidConfig)?,
-    ))
+    Ok((url.ok_or(BridgeError::InvalidConfig)?, owner_token))
 }
 
 #[cfg(unix)]
-fn read_federation_config_file(path: &Path) -> Result<Option<(String, String)>, BridgeError> {
+fn read_federation_config_file(
+    path: &Path,
+) -> Result<Option<(String, Option<String>)>, BridgeError> {
     use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 
     let file = match std::fs::OpenOptions::new()
@@ -592,7 +612,9 @@ fn read_federation_config_file(path: &Path) -> Result<Option<(String, String)>, 
 }
 
 #[cfg(not(unix))]
-fn read_federation_config_file(path: &Path) -> Result<Option<(String, String)>, BridgeError> {
+fn read_federation_config_file(
+    path: &Path,
+) -> Result<Option<(String, Option<String>)>, BridgeError> {
     match std::fs::symlink_metadata(path) {
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
         // This format is owner-mode-gated. Platforms without Unix ownership
@@ -4857,14 +4879,69 @@ mod tests {
         );
         assert_eq!(process.owner_token.as_deref(), Some("process-secret"));
 
+        // Origin without a token is a MEMBER node: transport on, no owner
+        // authority — and it still never falls back to the disk token.
         std::env::remove_var(FEDERATION_OWNER_TOKEN_ENV);
-        assert!(
-            matches!(
-                FederationConfig::resolve(tmp.path()),
-                Err(BridgeError::InvalidConfig)
-            ),
-            "a partial process pair must fail closed instead of falling back to disk"
+        let member = FederationConfig::resolve(tmp.path()).unwrap();
+        assert_eq!(
+            member.client.unwrap().base.as_str(),
+            "https://process.example/"
         );
+        assert!(
+            member.owner_token.is_none(),
+            "a process origin must not borrow the disk token"
+        );
+        // An explicitly empty token is the same member shape, not an error.
+        std::env::set_var(FEDERATION_OWNER_TOKEN_ENV, "");
+        assert!(FederationConfig::resolve(tmp.path())
+            .unwrap()
+            .owner_token
+            .is_none());
+        // A token with no origin is still not a configuration.
+        std::env::remove_var(FEDERATION_URL_ENV);
+        std::env::set_var(FEDERATION_OWNER_TOKEN_ENV, "orphan-secret");
+        assert!(matches!(
+            FederationConfig::resolve(tmp.path()),
+            Err(BridgeError::InvalidConfig)
+        ));
+        restore_federation_env(old_url, old_token);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn url_only_private_config_file_is_a_member_node() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let _guard = ENV_LOCK.lock().unwrap();
+        let old_url = std::env::var_os(FEDERATION_URL_ENV);
+        let old_token = std::env::var_os(FEDERATION_OWNER_TOKEN_ENV);
+        std::env::remove_var(FEDERATION_URL_ENV);
+        std::env::remove_var(FEDERATION_OWNER_TOKEN_ENV);
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join(FEDERATION_CONFIG_FILE);
+        std::fs::write(
+            &path,
+            "# coworker daemon: origin only, no owner authority\nOCEAN_FEDERATION_URL=https://bedrock.example\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let member = FederationConfig::resolve(tmp.path()).unwrap();
+        assert_eq!(
+            member.client.unwrap().base.as_str(),
+            "https://bedrock.example/"
+        );
+        assert!(member.owner_token.is_none());
+        // Still strict about what IS there: a malformed token line is refused.
+        std::fs::write(
+            &path,
+            "OCEAN_FEDERATION_URL=https://bedrock.example\nOCEAN_FEDERATION_OWNER_TOKEN= padded \n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        assert!(matches!(
+            FederationConfig::resolve(tmp.path()),
+            Err(BridgeError::InvalidConfig)
+        ));
         restore_federation_env(old_url, old_token);
     }
 

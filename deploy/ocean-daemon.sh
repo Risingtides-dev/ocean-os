@@ -158,11 +158,20 @@ federation_load() {
     token="$(security find-generic-password -a "${USER:-$(id -un)}" -s "$keychain" -w 2>/dev/null || true)"
     [[ -n "$token" ]] || { federation_refuse "credential_unavailable"; return; }
     federation="on (keychain)"
-  else
+  elif [[ "$token_seen" -eq 1 ]]; then
     federation="on (file)"
+  else
+    # Origin only: a MEMBER node. It redeems invites and syncs rooms it has
+    # been invited to, and cannot bootstrap a room as its Bedrock owner. This
+    # is every coworker's daemon; only the owner's carries a bearer.
+    federation="on (file, member)"
   fi
-  if [[ -z "$token" || "$token" =~ [[:space:]] ]]; then federation_refuse "credential is invalid"; return; fi
-  export OCEAN_FEDERATION_URL="$url" OCEAN_FEDERATION_OWNER_TOKEN="$token"
+  if [[ "$token_seen" -eq 1 || -n "$keychain" ]]; then
+    if [[ -z "$token" || "$token" =~ [[:space:]] ]]; then federation_refuse "credential is invalid"; return; fi
+    export OCEAN_FEDERATION_URL="$url" OCEAN_FEDERATION_OWNER_TOKEN="$token"
+  else
+    export OCEAN_FEDERATION_URL="$url"
+  fi
 }
 # Presence selects the process source, including an explicitly empty value.
 # The native daemon will reject an empty or partial pair; the launcher must not

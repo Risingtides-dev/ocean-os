@@ -151,6 +151,16 @@ tracked completion state is the Ocean Rooms section of `../ROADMAP.md`; the
 Phase 1 rollout gates remain authoritative in
 `specs/2026-08-25-ocean-rooms-phase1-room-agent-authorization-manifest.md`.
 
+### Join as a member node (a coworker's daemon)
+
+A daemon that only ever joins rooms by invite needs the Bedrock origin and
+nothing else: `ops/set-ocean-federation.sh --url https://bedrock.example --member`
+writes a `federation.env` carrying `OCEAN_FEDERATION_URL` alone. The launcher
+logs `federation=on (file, member)`, invite redemption and room sync work,
+and every owner-only route (`POST .../invites` on a Local room) answers
+`federation_unavailable` on that node. No bearer ever reaches a coworker's
+machine; only the room owner's daemon carries one (next section).
+
 ### Enable federation
 
 1. Bedrock must be reachable over HTTPS at its origin with its federation
