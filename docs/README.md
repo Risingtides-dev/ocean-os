@@ -13,6 +13,7 @@ Documentation policy: [`OCEAN_DOCUMENTATION_CONTRACT.md`](OCEAN_DOCUMENTATION_CO
 | What does Ocean OS own? | [`../README.md`](../README.md) and [`OCEAN_PROJECT_MAP.md`](OCEAN_PROJECT_MAP.md) |
 | How is the runtime assembled? | [`ARCHITECTURE.md`](ARCHITECTURE.md) |
 | How do I build, run, verify, deploy, or recover it? | [`OPERATIONS.md`](OPERATIONS.md) |
+| How does a teammate get into Ocean rooms on their own Mac? | [`TEAM_ONBOARDING.md`](TEAM_ONBOARDING.md) |
 | Which package owns a change and what is its narrow test? | [`../crates/AGENTS.md`](../crates/AGENTS.md) |
 | What is still open? | [`../ROADMAP.md`](../ROADMAP.md) |
 | What changed over time? | [`../events.md`](../events.md) |
@@ -24,6 +25,9 @@ Documentation policy: [`OCEAN_DOCUMENTATION_CONTRACT.md`](OCEAN_DOCUMENTATION_CO
 - [`ARCHITECTURE.md`](ARCHITECTURE.md) — implemented runtime layers, state
   ownership, request flow, and client boundary.
 - [`OPERATIONS.md`](OPERATIONS.md) — concise local and supervised operating path.
+- [`TEAM_ONBOARDING.md`](TEAM_ONBOARDING.md) — teammate runbook: operator
+  prerequisites, `ops/onboard-teammate.sh`, provider login, MCP wiring, invite
+  redemption, federation facts, and the dated team-status table.
 - [`OCEAN_WORKSPACE_BINDING.md`](OCEAN_WORKSPACE_BINDING.md) — cwd/project/session binding invariants; verify source symbols rather than relying on line numbers.
 - [`DAEMON_REFACTOR_MISSION.md`](DAEMON_REFACTOR_MISSION.md) — active behavior-neutral daemon extraction mission, progress, and target.
  - [`ocean-os-site/PUBLIC_EVIDENCE_POLICY.md`](ocean-os-site/PUBLIC_EVIDENCE_POLICY.md) — public-site evidence classes, sensitive-data exclusions, current capture decisions, and safe-recapture checklist.
