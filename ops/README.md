@@ -150,6 +150,30 @@ installer and waits for `/health`. `--no-restart` writes and lints only.
 the file-writing half against a fake daemon; the launchd half is verified on
 the operated machine by the room reaching `live`.
 
+### Teammate machines: `ops/onboard-teammate.sh`
+
+A teammate's Mac has no Rust toolchain and no reason to build. The runbook is
+[`docs/TEAM_ONBOARDING.md`](../docs/TEAM_ONBOARDING.md); the machine side is:
+
+```bash
+ops/onboard-teammate.sh --model <alias> [--bedrock-url URL] [--force] [--dry-run]
+```
+
+It installs `@risingtides-dev/ocean` from GitHub Packages (bun, npm fallback;
+`gh auth refresh -s read:packages` first), writes a member-node
+`federation.env` (Bedrock origin plus a fixed non-credential marker line, since
+the shipped daemon refuses a URL-only file; a file holding a real owner token
+is left alone unless `--force`), then installs the **same** `dev.risingtides.ocean-daemon`
+LaunchAgent shape as above — the package `ocean-daemon` copied to
+`~/.local/libexec/ocean-daemon/current`, the launcher copy at `launch.sh`,
+neutral `$HOME` cwd, `OCEAN_YOLO=1`, `OCEAN_MODEL` pinned, the same guarded
+`bootout` → wait → `bootstrap` → `enable` → `kickstart` sequence, and the same
+`/health` wait — then `ocean-mcp setup` and `claude mcp add`. It refuses to
+replace a `current` that `ops/install-ocean-daemon.sh` published from a repo
+build unless `--force`, so it cannot silently downgrade this box. Idempotent;
+`ocean-update` never hot-swaps the supervised copy, so a teammate updates by
+re-running it.
+
 ### Uninstall / stop supervision
 
 ```bash
