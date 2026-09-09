@@ -21,6 +21,8 @@ serde.workspace = true
 serde_json.workspace = true
 tokio.workspace = true
 tracing.workspace = true
+# `ocean-mcp` binary (Ocean as an MCP server): a thin HTTP bridge to the daemon.
+clap.workspace = true
 
 # Streamable-HTTP MCP transport (OCEAN-166). `reqwest` drives the POST/GET
 # round-trips; `futures-util` + `eventsource-stream` parse the `text/event-stream`
@@ -34,11 +36,17 @@ eventsource-stream = "0.2"
 # discovered). Cargo builds it for tests and sets CARGO_BIN_EXE_fake_server, the
 # path the e2e test spawns as the MCP child. It uses serde_json (a normal dep).
 [[bin]]
+name = "ocean-mcp"
+path = "src/bin/ocean_mcp.rs"
+
+[[bin]]
 name = "fake_server"
 test = false
 doc = false
 
 [dev-dependencies]
+axum.workspace = true
+tempfile = "3"
 # Parses the [[mcp.server]] section in the config test; the daemon's real
 # loader (ocean-agent) carries the non-dev toml dependency.
 toml.workspace = true

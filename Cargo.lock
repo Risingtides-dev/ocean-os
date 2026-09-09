@@ -3622,6 +3622,8 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "async-trait",
+ "axum",
+ "clap",
  "eventsource-stream",
  "futures-util",
  "ocean-protocol",
@@ -3629,6 +3631,7 @@ dependencies = [
  "reqwest 0.12.28",
  "serde",
  "serde_json",
+ "tempfile",
  "tokio",
  "toml 0.8.23",
  "tracing",

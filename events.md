@@ -10693,3 +10693,11 @@ area:      [frontend], [backend], [testing]
 
 Native Ocean acceptance exposed newly landed profile/folder audit JSON in the Campaigns transcript. Added all six Phase 2 audit types to the shared fixed-label projection used by HTTP, SSE and model-facing history, preserving raw durable evidence and human-authored JSON. The new six-type redaction/provenance regression passes. Updated nearest daemon/store contracts. Prior 24ac27bf passed the complete local CI gate; fresh exact-head gate and review requested for this additional projection fix. No live Room content was edited.
 _________________________________________________________________________________ 14:39 codex/rooms-release-20260908
+time:      [17:40] [08-09-26]
+agent:     [claude] [fable-5.1]
+worktree:  cc/ocean-serve-mcp
+type:      [feature-request]
+area:      [agent-building]
+
+John's goal is programmatic adoption: teammates should use Ocean from the tools they already live in. Added the `ocean-mcp` binary to crates/ocean-mcp (src/bin/ocean_mcp.rs): Ocean as an MCP SERVER over newline-delimited JSON-RPC stdio, a thin bridge to the daemon's HTTP API with no agent logic, no sessions, and no credentials crossing the wire. Tools: ocean_health, ocean_rooms, ocean_room_read (newest page, audit rows rendered as labels), ocean_room_post (as OCEAN_MEMBER_ID / $USER; @mention wakes agents), ocean_room_join, ocean_room_inspect, ocean_room_resources, ocean_agents, ocean_sessions, ocean_prompt (one daemon turn in the caller's cwd under the daemon's permission policy; yolo opt-in). `ocean-mcp setup` installs the `ocean` SKILL.md into ~/.claude/skills, ~/.codex/skills, ~/.agents/skills (only where the tool root exists) and prints the Claude Code / Codex / JSON config lines; `ocean-mcp doctor` checks the daemon and identity. Proven live: a real stdio handshake against the running daemon listed rooms, read the campaigns transcript including room-builder's reply, and inspected the room. Packaging: release.yml builds and stages ocean-mcp, npm bin map + README + test-package + license inventory cover it. 5 tests (stub axum daemon), clippy clean, docs-check green.
+_________________________________________________________________________________ 17:40 cc/ocean-serve-mcp

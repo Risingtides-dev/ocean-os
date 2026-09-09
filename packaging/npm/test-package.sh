@@ -16,7 +16,7 @@ command -v npm >/dev/null 2>&1 || {
   exit 1
 }
 
-for binary in ocean ocean-daemon; do
+for binary in ocean ocean-daemon ocean-mcp; do
   path="$PKG_DIR/bin/$binary"
   if [[ ! -x "$path" ]]; then
     echo "error: staged binary is missing or not executable: $path" >&2
@@ -31,6 +31,7 @@ node -e '
   const expectedBins = {
     ocean: "bin/ocean",
     "ocean-daemon": "bin/ocean-daemon",
+    "ocean-mcp": "bin/ocean-mcp",
     "ocean-update": "ocean-update.sh",
   };
   const expectedFiles = [
@@ -72,6 +73,7 @@ test -s "$inventory"
 grep -q "cargo-about 0.9.1" "$inventory"
 grep -q "BINARY: ocean (workspace package ocean-tui)" "$inventory"
 grep -q "BINARY: ocean-daemon (workspace package ocean-daemon)" "$inventory"
+grep -q "BINARY: ocean-mcp (workspace package ocean-mcp)" "$inventory"
 grep -q "UPSTREAM NOTICE FILES" "$inventory"
 grep -q "moka 0.12.15 — NOTICE" "$inventory"
 grep -q "src/common/frequency_sketch.rs" "$inventory"
