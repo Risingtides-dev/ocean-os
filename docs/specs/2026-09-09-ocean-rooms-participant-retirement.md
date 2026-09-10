@@ -80,7 +80,16 @@ display_name = "John"   # optional
 ```
 
 The surface's desktop shell reads the same file (design direction §3.2), so a
-person is one id from a terminal and from the app. Note for S1: the design
+person is one id from a terminal and from the app.
+
+The daemon publishes the same answer on `GET /v1/identity` (credential-free):
+`{ok, member_id: string|null, display_name: string|null, source:
+"member.toml"|"env"|"unset"}`, resolved per request from `member.toml` in
+its config dir then `OCEAN_MEMBER_ID`. Nothing configured answers
+`member_id: null` — never the process user — so a direct host (the desktop
+app, the extension) and the proxy's cross-check see exactly what `ocean-mcp`
+would post as. A malformed `member_id` is absent, not repaired, and does not
+block the env fallback. Note for S1: the design
 direction wrote `~/.config/ocean/member.toml`; the daemon's config dir is
 `~/.config/ocean-rs`, and that is the path this document fixes.
 

@@ -118,6 +118,7 @@ mod filesystem;
 mod github;
 /// Bounded fuzzy search over ocean-agent's persisted display transcripts.
 mod history_search;
+mod identity;
 /// Persisted-title and read-projection mutation HTTP adapters.
 mod longhouse_governance_control;
 /// State-free Longhouse prepare, inspect, and workflow HTTP adapters.
@@ -742,6 +743,9 @@ fn app_router(cors: CorsLayer) -> Router<AppState> {
         .route("/ready", get(ready))
         // OCEAN-303: Prometheus-text turn metrics (latency histogram + counters).
         .route("/metrics", get(metrics))
+        // Rooms S0: who this daemon says its human is (member.toml, then
+        // OCEAN_MEMBER_ID, never the process user). Credential-free.
+        .route("/v1/identity", get(identity::identity))
         .route("/v1/agent/turns", post(agent_turn))
         .route("/v1/agent/voice", post(agent_voice))
         .route("/v1/agent/events", get(agent_events))
@@ -1626,6 +1630,7 @@ fn banner_routes() -> &'static [&'static str] {
         "GET /health",
         "GET /ready",
         "GET /metrics",
+        "GET /v1/identity",
         "POST /v1/agent/turns",
         "POST /v1/agent/voice",
         "GET /v1/agent/events",
@@ -27083,9 +27088,13 @@ mod tests {
         // 137 -> 138: Rooms S0 participant retirement — fold a placeholder
         // human (surface-operator / web-<hex>) into a real member under one
         // operator decision, recording an alias.
+        // 138 -> 139: Rooms S0 identity — GET /v1/identity publishes the
+        // daemon's human from member.toml then OCEAN_MEMBER_ID (null when
+        // neither is set, never the process user) so every client on a
+        // box converges on one member id instead of minting one.
         assert_eq!(
             banner.len(),
-            138,
+            139,
             "route baseline changed; review the manifest"
         );
 
@@ -27235,6 +27244,66 @@ mod tests {
             !builder.contains(".fallback("),
             "the production router must retain Axum's default 404/405 fallback"
         );
+    }
+
+    /// Rooms S0 — `GET /v1/identity` publishes the daemon's human from
+    /// member.toml, then `OCEAN_MEMBER_ID`, and never the process user; it is
+    /// read per request so writing the file needs no restart.
+    #[tokio::test]
+    async fn identity_route_publishes_member_toml_then_env_and_never_the_process_user() {
+        let _lock = AUTO_CONVENE_ENV_LOCK.lock().await;
+        let _restore = TestEnvRestore::capture(&["OCEAN_CONFIG_DIR", "OCEAN_MEMBER_ID"]);
+        let tmp = tempfile::tempdir().unwrap();
+        env::set_var("OCEAN_CONFIG_DIR", tmp.path());
+        env::remove_var("OCEAN_MEMBER_ID");
+        let app = Router::new().route("/v1/identity", get(identity::identity));
+        async fn fetch(app: Router) -> serde_json::Value {
+            use http_body_util::BodyExt as _;
+            use tower::ServiceExt as _;
+            let resp = app
+                .oneshot(
+                    axum::http::Request::builder()
+                        .method(axum::http::Method::GET)
+                        .uri("/v1/identity")
+                        .body(axum::body::Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), StatusCode::OK);
+            let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+            serde_json::from_slice(&bytes).unwrap()
+        }
+
+        // Nothing configured: null, and whatever the OS says the user is
+        // never becomes an answer.
+        let body = fetch(app.clone()).await;
+        assert_eq!(body["ok"], json!(true));
+        assert_eq!(body["member_id"], serde_json::Value::Null);
+        assert_eq!(body["display_name"], serde_json::Value::Null);
+        assert_eq!(body["source"], json!("unset"));
+        if let Ok(user) = env::var("USER") {
+            assert_ne!(body["member_id"], json!(user));
+        }
+
+        // The env fallback.
+        env::set_var("OCEAN_MEMBER_ID", " ecfromthedc ");
+        let body = fetch(app.clone()).await;
+        assert_eq!(body["member_id"], json!("ecfromthedc"));
+        assert_eq!(body["display_name"], serde_json::Value::Null);
+        assert_eq!(body["source"], json!("env"));
+
+        // member.toml wins over the env, carries the display name, and is
+        // picked up without a restart.
+        std::fs::write(
+            tmp.path().join(identity::MEMBER_FILE),
+            "member_id = \"smaths\"\ndisplay_name = \"John\"\n",
+        )
+        .unwrap();
+        let body = fetch(app).await;
+        assert_eq!(body["member_id"], json!("smaths"));
+        assert_eq!(body["display_name"], json!("John"));
+        assert_eq!(body["source"], json!("member.toml"));
     }
 
     fn materialize_route_path(path: &str) -> String {
