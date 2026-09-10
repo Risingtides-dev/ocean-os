@@ -5401,7 +5401,10 @@ mod tests {
         assert!(!projected[1].text.contains("operator-private"));
         assert!(!projected[1].text.contains("decision-private"));
         // S0: the agent's roster id is public and rides after the label.
-        assert_eq!(projected[1].text, "[room agent bootstrap audit] builder-private");
+        assert_eq!(
+            projected[1].text,
+            "[room agent bootstrap audit] builder-private"
+        );
 
         let second = store
             .authorized_room_history_page(&room, "builder", 1, Some(projected[1].seq), 2)

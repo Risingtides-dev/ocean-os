@@ -13425,6 +13425,7 @@ mod tests {
             &[
                 "access",
                 "agent_owners",
+                "aliases",
                 "has_more",
                 "next_seq",
                 "ok",
@@ -21740,6 +21741,7 @@ mod tests {
                 // a field the surface cannot read. Empty for every room with no
                 // owned agents, which is every pre-existing one.
                 "agent_owners",
+                "aliases",
             ],
         );
         assert_eq!(snapshot["ok"], true);
