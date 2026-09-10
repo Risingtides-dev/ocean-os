@@ -1,6 +1,6 @@
 # @risingtides-dev/ocean
 
-Prebuilt Ocean binaries (`ocean` TUI + `ocean-daemon`) for macOS arm64,
+Prebuilt Ocean binaries (`ocean` TUI + `ocean-daemon` + `ocean-mcp`) for macOS arm64,
 published to GitHub Packages by the tag-triggered release workflow.
 
 ## One-time setup (each teammate)

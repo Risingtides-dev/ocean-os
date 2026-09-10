@@ -36,8 +36,8 @@ Distribution artifacts for shipping prebuilt Ocean binaries to teammates.
 - The release workflow must consume the exact `rust-toolchain.toml` pin, build
   with the lockfile, and fail closed unless both the runner and built binaries
   are macOS arm64.
-- The npm package declares `MIT OR Apache-2.0`. Both the 12-file npm payload and
-  nine-file GitHub binary archive carry byte-identical root `LICENSE`,
+- The npm package declares `MIT OR Apache-2.0`. Both the thirteen-file npm
+  payload and ten-file GitHub binary archive carry byte-identical root `LICENSE`,
   `LICENSE-APACHE`, `LICENSE-MIT`, `NOTICE.md`, `CREDITS.md`, and
   `TRADEMARKS.md`, plus generated `THIRD-PARTY-LICENSES.txt` containing full
   license texts and applicable upstream NOTICE files; do not restore the
@@ -85,7 +85,7 @@ Distribution artifacts for shipping prebuilt Ocean binaries to teammates.
   `cmp` the results:
   `packaging/generate-license-inventory.sh /path/to/cargo-about /tmp/licenses.txt`.
 - With executable binaries plus the six project legal files and generated
-  inventory assembled as the workflow's 12-file staging package:
+  inventory assembled as the workflow's thirteen-file staging package:
   `RUN_BUN_SMOKE=1 EXPECTED_VERSION=0.0.0-dev packaging/npm/test-package.sh /path/to/staged/npm`.
 - After a tag push: confirm the Release workflow is green, verify the release
   tarball checksum, and confirm

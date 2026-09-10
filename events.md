@@ -10767,6 +10767,16 @@ area:      [backend]
 
 Rooms S0, the piece the design direction asked for that the retirement spec never carried: GET /v1/identity (crates/ocean-daemon/src/identity.rs). Credential-free; answers {ok, member_id|null, display_name|null, source: member.toml|env|unset} from <config_dir>/member.toml then OCEAN_MEMBER_ID, resolved per request from the daemon's own config dir so writing the file needs no restart; nothing configured answers null and never the process user. The member_id character set is exactly ocean-mcp's, so a terminal and the desktop app on one box read one file the same way. Route banner 138 -> 139, operator guide quick reference, ARCHITECTURE.md count, daemon AGENTS.md, and the retirement spec updated; unit tests for precedence/null/malformed/comments plus an HTTP test through the router. This unblocks surface slice S1 (identity and transport), which reads it on direct hosts and through the proxy's cross-check.
 _________________________________________________________________________________
+
+time:      [20:37] [09-09-26]
+agent:     [claude] [fable 5.1]
+worktree:  cc/release-thirteen-file-contract
+type:      [gh-actions]
+area:      [infra]
+
+The release validation job failed after #465: the npm smoke test's packed-file contract still listed twelve files while the tarball now carries bin/ocean-mcp, and the standalone binary bundle never got ocean-mcp added to its tar at all (it was only copied into staging). Both contracts now name the binary: thirteen files in the npm package, ten in ocean-macos-arm64.tar.gz, with the executable-bit checks and the publish job's chmod covering it; the npm README lists it with the other two.
+_________________________________________________________________________________ 20:37 cc/release-thirteen-file-contract
+
 time:      [14:35] [25-09-26]
 agent:     [claude]
 worktree:  feat/web-identity-spec
@@ -11681,3 +11691,11 @@ area:      [writing]
 
 Observatory docs-truth pass (FQ-013): closed the stale "open" claims left behind after the Gate 1 G1–G5 repair wave landed 2026-09-25 with delta review PASS (PR #486, #487) and the §4.3 WAL checkpoint landed (PR #500). Task 9 review doc: dated Status note on the verdict summary plus §4.3 closure pointers at F10, the hardening-wave open list, and the F10 partial bullet. Observatory architecture doc Status line now records Gate 0 accepted, Gate 1 landed, renderer gate open. Root AGENTS.md, docs/AGENTS.md, and the docs README index now state the repairs landed and passed, keeping renderer work governed by the accepted Gate 0 decisions and Gate 1 manifest. Historical text retained; edits are dated status pointers. cargo xtask docs-check, git diff --check, and node scripts/check-ledger.mjs pass.
 _________________________________________________________________________________ 17:20 factory/fq-013-r1716
+time:      [16:41] [22-10-26]
+agent:     [zcode], [glm-5.3]
+worktree:  cc/release-thirteen-file-contract
+type:      [workflow]: Reconcile PR #470 onto current main
+area:      [infra]
+
+Rebased PR #470 onto main through #533. The npm thirteen-file contract had already landed in test-package.sh via #502 (a superset of this PR's hunk there), so that file collapses to main's version; the PR's remaining payload is the release workflow's standalone binary bundle, which main still shipped without ocean-mcp in its tar, chmod, extracted-executable check, publish-job chmod, and ten-file FILES list. The original [20:37] [09-09-26] ledger entry survived the union merge and now sits at its chronological position closed with an identity rule; packaging/AGENTS.md's payload counts corrected from 12-file/nine-file to thirteen-file/ten-file to match the enforced contracts. Verified: check-ledger clean (710 entries), ledger checker tests 18/18, bash -n / sh -n packaging scripts, release.yml YAML parse plus both FILES lists counted (13 npm, 10 binary), cargo xtask docs-check PASS.
+_________________________________________________________________________________ 16:41 cc/release-thirteen-file-contract
