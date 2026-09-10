@@ -229,15 +229,23 @@ credentialed rooms to `recovering` (not out of the room) until it is fixed.
 
 Facts as of 2026-09-09; `?` means not checked, not a guess.
 
-| Person | Tailscale | GitHub org | Ocean daemon | ocean-mcp | Bedrock room |
-| --- | --- | --- | --- | --- | --- |
-| Eric (`ecfromthedc`) | yes — `erics-machine` 100.119.217.76 | yes | yes (older build) | no | no |
-| Jake (`jakebalik-bit`) | yes — `jakes-macbook-air` | yes | no | ? | no |
-| Jay (`jayvespertine`) | yes — `jays-macbook-air` | yes | no | ? | no |
-| Johnny (`johnnybalikmusic`) | yes — `johnnys-mac-mini` | **no** (not a member yet) | no | ? | no |
+| Person | Tailscale | GitHub org | Surface login | Ocean daemon | ocean-mcp | Bedrock room |
+| --- | --- | --- | --- | --- | --- | --- |
+| Eric (`ecfromthedc`) | yes — `erics-machine` 100.119.217.76 | yes | yes | yes (older build) | no | no |
+| Jake (`jakebalik-bit`) | yes — `jakes-macbook-air` | yes | **no** | no | ? | no |
+| Jay (`jayvespertine`) | yes — `jays-macbook-air` | yes | **no** | no | ? | no |
+| Johnny (`johnnybalikmusic`) | yes — `johnnys-mac-mini` | **no** (not a member yet) | **no** | no | ? | no |
 
 Update the row when a step lands; this table is the only place the team's
 state is written down.
+
+"Surface login" is a roster entry in the operator's
+`~/.config/ocean-surface/users.json` (the ocean-surface repo, `ops/README.md`):
+username, password, and the person's tailnet `daemon_url`. The username IS the
+member id above — it is what `--member` writes and what the surface will post
+as — so pick it once. Only the operator can mint one (the roster holds
+passwords); `ops/add-device.sh` in ocean-surface adds further machines to an
+existing entry.
 
 ## Troubleshooting
 
