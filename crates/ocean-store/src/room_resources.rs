@@ -276,6 +276,7 @@ pub(super) fn consumed_decision_on(
     decision_id: &str,
 ) -> Result<Option<String>> {
     for sql in [
+        "SELECT request_digest FROM room_retirement_decisions WHERE room_id = ?1 AND decision_id = ?2",
         "SELECT request_digest FROM room_resource_decisions WHERE room_id = ?1 AND decision_id = ?2",
         "SELECT request_digest FROM room_profile_decisions WHERE room_id = ?1 AND decision_id = ?2",
         "SELECT request_digest FROM room_agent_decisions WHERE room_id = ?1 AND decision_id = ?2",

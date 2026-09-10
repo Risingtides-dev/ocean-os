@@ -748,6 +748,11 @@ fn prove_owner_and_target(
     agent_member_id: &str,
     package_id: &str,
 ) -> Result<bool, RoomStoreError> {
+    // S0: a binding freezes the owner id it was approved under; if that human
+    // was later retired into a real member, the alias chain says who holds
+    // the authority now. Resolve BEFORE comparing so the frozen ledger row and
+    // the live owner role agree without rewriting either.
+    let owner_member_id = store.resolve_participant_alias(room, owner_member_id)?;
     Ok(target_proof(store, room, package_id)?.is_some_and(|proof| {
         proof.agent_member_id == agent_member_id
             && proof.owner_member_id == owner_member_id

@@ -490,3 +490,5 @@ outbox, and the restart-safe federation core (S2 P2-A). One database file
 ## Child devlog Index
 
 - (none)
+
+- `room_retirement.rs` (Rooms S0) owns `room_participant_aliases` + `room_retirement_decisions` (part of the room-wide `consumed_decision_on` namespace) and `retire_participant`: one IMMEDIATE transaction that moves the Local owner role (partial unique index: delete the placeholder's role row, promote or insert the successor), repoints `room_agent_owners.owner_id`, deletes the placeholder's `participants` row, inserts the alias, records the decision, and appends one content-minimal `room.participant.retired` System row. The store enforces only that both ends are humans (`UnknownParticipant` / `ParticipantKindConflict`); WHICH ids may be retired is the daemon's rule. `resolve_participant_alias` follows chains (8 hops max).

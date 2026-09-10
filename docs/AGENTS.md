@@ -70,3 +70,4 @@ No nested `AGENTS.md` boundaries currently exist below `docs/`.
 ## Historical archive
 
 `docs/.agentarchive/` stores opt-in forensic history: stale handoffs, completed or superseded plans, and context that could redirect a cold agent away from current intent. Do not link active contracts to archive material as required reading.
+- `specs/2026-09-09-ocean-rooms-participant-retirement.md` — Rooms S0 (daemon half of the design direction, ocean-surface PR #220): placeholder-participant retirement with aliases, attributed audit lines, ocean-mcp identity.

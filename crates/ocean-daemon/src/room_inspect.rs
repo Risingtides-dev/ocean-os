@@ -110,6 +110,7 @@ pub(super) async fn room_inspect(
         let bindings = store.room_agent_bindings(&key)?;
         let profile = store.room_profile(&key)?;
         let grants = store.room_resource_grants(&key)?;
+        let aliases = crate::room_retirement::aliases_projection(store, &key)?;
         let agent_cwds = bindings
             .iter()
             .map(|b| crate::room_resources::resolve_turn_cwd(store, &key, &b.agent_member_id))
@@ -124,6 +125,7 @@ pub(super) async fn room_inspect(
             profile,
             grants,
             agent_cwds,
+            aliases,
         )))
     });
 
@@ -138,6 +140,7 @@ pub(super) async fn room_inspect(
             profile,
             grants,
             agent_cwds,
+            aliases,
         ))) => {
             let (cwd, cwd_source) = resolve_execution(room.workspace_root.as_deref());
             let (profile, credential_slots) =
@@ -183,6 +186,10 @@ pub(super) async fn room_inspect(
                         "trigger_policy": room.trigger_policy,
                     },
                     "participants": room.participants,
+                    // S0: `from -> to` merges of retired placeholder humans; a
+                    // client resolves a binding's frozen owner_member_id or an
+                    // old author id through these.
+                    "aliases": aliases,
                     "access": access,
                     "federated": federated,
                     "owner": owner.map(|o| json!({ "member_id": o.member_id, "eligible": o.eligible })),

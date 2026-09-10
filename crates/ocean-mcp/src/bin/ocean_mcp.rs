@@ -49,8 +49,10 @@ struct Cli {
     /// Ocean daemon base URL.
     #[arg(long, env = "OCEAN_DAEMON_URL", default_value = DEFAULT_DAEMON_URL, global = true)]
     daemon: String,
-    /// The room member id this bridge posts as. Defaults to `$USER`.
-    #[arg(long, env = "OCEAN_MEMBER_ID", global = true)]
+    /// The room member id this bridge posts as. Resolution order: this flag,
+    /// then `member.toml` in the Ocean config dir, then `OCEAN_MEMBER_ID`.
+    /// With none of them, reads work and join/post refuse with a hint.
+    #[arg(long, global = true)]
     member: Option<String>,
     #[command(subcommand)]
     command: Option<Command>,
@@ -75,13 +77,8 @@ enum Command {
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
-    let member = cli
-        .member
-        .clone()
-        .or_else(|| std::env::var("USER").ok())
-        .filter(|m| !m.trim().is_empty())
-        .unwrap_or_else(|| "operator".to_string());
-    let daemon = Daemon::new(&cli.daemon, &member);
+    let member = resolve_member(cli.member.clone());
+    let daemon = Daemon::new(&cli.daemon, member.as_deref());
     match cli.command.unwrap_or(Command::Serve) {
         Command::Serve => serve(daemon).await,
         Command::Setup { dry_run } => setup(dry_run),
@@ -91,18 +88,76 @@ async fn main() -> Result<()> {
 
 // ── Daemon client ─────────────────────────────────────────────────────────────
 
+/// Where the member identity lives on disk: the daemon's own config dir
+/// (`OCEAN_CONFIG_DIR`, else `~/.config/ocean-rs`), so a terminal session and
+/// the desktop app on the same box are one person. Format:
+///
+/// ```toml
+/// member_id = "smaths"
+/// display_name = "John"   # optional
+/// ```
+fn member_toml_path() -> Option<PathBuf> {
+    if let Some(dir) = std::env::var_os("OCEAN_CONFIG_DIR") {
+        return Some(PathBuf::from(dir).join("member.toml"));
+    }
+    home()
+        .ok()
+        .map(|h| h.join(".config").join("ocean-rs").join("member.toml"))
+}
+
+/// `member_id` from `member.toml`, parsed without a TOML crate: one
+/// `key = "value"` per line is all the file may hold.
+fn member_from_toml(path: &Path) -> Option<String> {
+    let raw = std::fs::read_to_string(path).ok()?;
+    for line in raw.lines() {
+        let line = line.trim();
+        if let Some(rest) = line.strip_prefix("member_id") {
+            let value = rest.trim_start().strip_prefix('=')?.trim();
+            let value = value.trim_matches('"').trim();
+            if !value.is_empty()
+                && value
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.' | '@'))
+            {
+                return Some(value.to_string());
+            }
+        }
+    }
+    None
+}
+
+/// Flag, then member.toml, then OCEAN_MEMBER_ID. Never a made-up default: a
+/// bridge that does not know who you are must not post as anyone.
+fn resolve_member(flag: Option<String>) -> Option<String> {
+    flag.map(|m| m.trim().to_string())
+        .filter(|m| !m.is_empty())
+        .or_else(|| member_toml_path().and_then(|p| member_from_toml(&p)))
+        .or_else(|| {
+            std::env::var("OCEAN_MEMBER_ID")
+                .ok()
+                .map(|m| m.trim().to_string())
+                .filter(|m| !m.is_empty())
+        })
+}
+
 #[derive(Clone)]
 struct Daemon {
     base: String,
-    member: String,
+    member: Option<String>,
     http: reqwest::Client,
 }
 
+const MEMBER_HINT: &str = "no member identity: write ~/.config/ocean-rs/member.toml with member_id = \"<your users.json username>\" (or pass --member / set OCEAN_MEMBER_ID). Reads still work.";
+
 impl Daemon {
-    fn new(base: &str, member: &str) -> Self {
+    fn member(&self) -> Result<&str> {
+        self.member.as_deref().ok_or_else(|| anyhow!(MEMBER_HINT))
+    }
+
+    fn new(base: &str, member: Option<&str>) -> Self {
         Self {
             base: base.trim_end_matches('/').to_string(),
-            member: member.to_string(),
+            member: member.map(str::to_string),
             http: reqwest::Client::builder()
                 .timeout(Duration::from_secs(600))
                 .build()
@@ -382,8 +437,9 @@ async fn call_tool(daemon: &Daemon, name: &str, args: &Value) -> Result<String> 
         "ocean_room_post" => {
             let room = arg_str(args, "room")?;
             let body = arg_str(args, "body")?;
+            let member = daemon.member()?;
             let mut req = json!({
-                "author_id": daemon.member,
+                "author_id": member,
                 "author_kind": "human",
                 "body": body,
             });
@@ -401,7 +457,7 @@ async fn call_tool(daemon: &Daemon, name: &str, args: &Value) -> Result<String> 
             let fired = v["triggers_fired"].as_array().map(|t| t.len()).unwrap_or(0);
             Ok(format!(
                 "posted #{seq} to {room} as {}{}",
-                daemon.member,
+                member,
                 if fired > 0 {
                     format!("; woke {fired} agent(s) — read the room again shortly for replies")
                 } else {
@@ -411,18 +467,19 @@ async fn call_tool(daemon: &Daemon, name: &str, args: &Value) -> Result<String> 
         }
         "ocean_room_join" => {
             let room = arg_str(args, "room")?;
+            let member = daemon.member()?;
             daemon
                 .post(
                     &format!("/v1/rooms/persistent/{room}/participants"),
                     json!({
-                        "id": daemon.member,
+                        "id": member,
                         "kind": "human",
-                        "display_name": daemon.member,
+                        "display_name": member,
                     }),
                     Duration::from_secs(30),
                 )
                 .await?;
-            Ok(format!("joined {room} as {}", daemon.member))
+            Ok(format!("joined {room} as {member}"))
         }
         "ocean_room_inspect" => {
             let room = arg_str(args, "room")?;
@@ -795,11 +852,13 @@ async fn doctor(daemon: &Daemon) -> Result<()> {
             return Ok(());
         }
     }
-    writeln!(
-        out,
-        "member id: {} (override with --member or OCEAN_MEMBER_ID)",
-        daemon.member
-    )?;
+    match &daemon.member {
+        Some(member) => writeln!(
+            out,
+            "member id: {member} (flag > member.toml > OCEAN_MEMBER_ID)"
+        )?,
+        None => writeln!(out, "member id: NOT SET — {MEMBER_HINT}")?,
+    }
     match daemon.get("/v1/rooms/persistent").await {
         Ok(v) => {
             let n = v["rooms"].as_array().map(|r| r.len()).unwrap_or(0);
@@ -901,7 +960,7 @@ mod tests {
     #[tokio::test]
     async fn handshake_list_and_call_flow_against_a_stub_daemon() {
         let (base, posted) = stub_daemon().await;
-        let daemon = Daemon::new(&base, "smaths");
+        let daemon = Daemon::new(&base, Some("smaths"));
 
         let init: Incoming = serde_json::from_value(
             json!({"id": 1, "method": "initialize", "params": {"protocolVersion": "2025-03-26"}}),
@@ -1003,9 +1062,65 @@ mod tests {
         assert_eq!(reply["error"]["code"], -32601);
     }
 
+    #[test]
+    fn member_toml_is_parsed_strictly_and_never_invented() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let path = tmp.path().join("member.toml");
+        std::fs::write(&path, "display_name = \"John\"\nmember_id = \"smaths\"\n").unwrap();
+        assert_eq!(member_from_toml(&path).as_deref(), Some("smaths"));
+        std::fs::write(&path, "member_id = \"[bad]\"\n").unwrap();
+        assert_eq!(member_from_toml(&path), None);
+        std::fs::write(&path, "member_id = \"\"\n").unwrap();
+        assert_eq!(member_from_toml(&path), None);
+        assert_eq!(member_from_toml(&tmp.path().join("missing.toml")), None);
+        assert_eq!(
+            resolve_member(Some("  flag-wins ".into())).as_deref(),
+            Some("flag-wins")
+        );
+    }
+
+    #[tokio::test]
+    async fn without_an_identity_reads_work_and_writes_refuse_with_a_hint() {
+        let (base, posted) = stub_daemon().await;
+        let daemon = Daemon::new(&base, None);
+        let call = |id: u64, name: &str, args: Value| -> Incoming {
+            serde_json::from_value(json!({"id": id, "method": "tools/call", "params": {"name": name, "arguments": args}})).unwrap()
+        };
+        let reply = handle(&daemon, call(1, "ocean_rooms", json!({})))
+            .await
+            .unwrap();
+        assert_eq!(reply["result"]["isError"], false);
+        let reply = handle(
+            &daemon,
+            call(
+                2,
+                "ocean_room_post",
+                json!({"room": "campaigns", "body": "hi"}),
+            ),
+        )
+        .await
+        .unwrap();
+        assert_eq!(reply["result"]["isError"], true);
+        assert!(reply["result"]["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("member.toml"));
+        let reply = handle(
+            &daemon,
+            call(3, "ocean_room_join", json!({"room": "campaigns"})),
+        )
+        .await
+        .unwrap();
+        assert_eq!(reply["result"]["isError"], true);
+        assert!(
+            posted.lock().unwrap().is_empty(),
+            "nothing was posted as nobody"
+        );
+    }
+
     #[tokio::test]
     async fn an_unreachable_daemon_is_a_tool_error_that_names_the_url() {
-        let daemon = Daemon::new("http://127.0.0.1:9", "smaths");
+        let daemon = Daemon::new("http://127.0.0.1:9", Some("smaths"));
         let call: Incoming = serde_json::from_value(json!({"id": 1, "method": "tools/call", "params": {"name": "ocean_health", "arguments": {}}})).unwrap();
         let reply = handle(&daemon, call).await.unwrap();
         assert_eq!(reply["result"]["isError"], true);
