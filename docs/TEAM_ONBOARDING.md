@@ -43,13 +43,16 @@ Ask John for these before you start; nothing below works without them.
   `https://ocean-bedrock-production.up.railway.app/api/v1/invites/<code>/onboard`.
   The link embeds the code, so it is the credential: single-use, expiring,
   never pasted into a ticket or a screenshot.
-- A published `@risingtides-dev/ocean` release. As of 2026-09-09 there is
-  none: `origin` has no `v*` tag, `gh release list` is empty, and
-  `.github/workflows/release.yml` on `main` does not stage the `ocean-mcp`
-  binary that `packaging/npm/package.json` and `test-package.sh` require.
-  Until the workflow stages `ocean-mcp` and a `v0.1.0` tag is pushed from
-  `main` (`../packaging/AGENTS.md`), step (c) below fails with a 404 from
-  GitHub Packages, and the script stops there.
+- A published `@risingtides-dev/ocean` release. The release workflow
+  (`.github/workflows/release.yml`) builds and stages `ocean`, `ocean-daemon`,
+  and `ocean-mcp` and publishes them to GitHub Packages on a `v*` tag pushed
+  from `main`; `v0.1.0` is the first. If step (c) below answers 404 from
+  GitHub Packages, the tag has not been pushed yet — ask the operator.
+- Your member id: the username the operator put in the surface's
+  `users.json` (`smaths`, `ecfromthedc`). It is who you are in every room
+  from every host — the daemon, `ocean-mcp`, the desktop app, and the browser
+  all converge on it — and there is no default: nothing ever posts as your
+  shell user.
 - The model alias to start with (`--model` below) and which provider to sign
   in to (Claude or Codex). `curl -s 127.0.0.1:4780/v1/models` lists the
   registry once your daemon is up.
@@ -94,13 +97,16 @@ copies out of `deploy/`:
 ```bash
 git clone https://github.com/Risingtides-dev/ocean-os
 cd ocean-os
-ops/onboard-teammate.sh --model <alias-from-the-operator>
+ops/onboard-teammate.sh --model <alias-from-the-operator> --member <your-username>
 ```
 
 Idempotent; re-run it whenever you like. In order it checks macOS arm64,
 bun, gh, and the `read:packages` scope (it never starts a login for you; it
 prints the command and stops); writes the `~/.npmrc` lines; installs the
-package; writes `~/.config/ocean-rs/federation.env` (see "Federation facts");
+package; writes `~/.config/ocean-rs/federation.env` (see "Federation facts")
+and `~/.config/ocean-rs/member.toml` (`member_id = "<--member>"`, plus
+`display_name` when you pass `--display-name`; a file naming someone else is
+left alone unless `--force`);
 copies the package `ocean-daemon` to `~/.local/libexec/ocean-daemon/current`
 and installs the `dev.risingtides.ocean-daemon` LaunchAgent, which runs the
 repo launcher from `$HOME` with `OCEAN_YOLO=1` and your `OCEAN_MODEL`, then
@@ -137,8 +143,18 @@ command = "/Users/<you>/.bun/bin/ocean-mcp"
 args = ["serve"]
 ```
 
-You post as `OCEAN_MEMBER_ID` (default `$USER`); set it in your shell profile
-if your room identity differs. `ocean-mcp doctor` prints which id you are.
+You post as the `member_id` in `~/.config/ocean-rs/member.toml`, the file
+the script wrote from `--member`. `ocean-mcp` resolves `--member`, then that
+file, then `OCEAN_MEMBER_ID`; with none of them reads still work and
+`ocean_room_post` refuses with a hint naming the file — it never guesses.
+The daemon publishes the same answer on `GET /v1/identity`, so the desktop
+app and the browser see exactly what a terminal would post as:
+
+```bash
+curl -s http://127.0.0.1:4780/v1/identity
+# {"ok":true,"member_id":"ecfromthedc","display_name":"Eric","source":"member.toml"}
+ocean-mcp doctor      # its 'member id' line must agree
+```
 
 (g) Join the team room. Redeem the invite exactly once, with your daemon:
 
@@ -162,6 +178,8 @@ for both, in which case ask for two invites.
 (h) Verify.
 
 ```bash
+curl -fsS http://127.0.0.1:4780/v1/identity
+# member_id is you, source is "member.toml"
 ocean-mcp doctor
 # daemon: ok at http://127.0.0.1:4780 (backend …, rev …) / member id: … / rooms: 1
 curl -fsS "http://127.0.0.1:4780/v1/rooms/persistent/<room_key>/snapshot?before_seq=18446744073709551615&limit=1"
