@@ -23,6 +23,7 @@ on:
       - "crates/**/NOTICE*"
       - "crates/ocean-tui/**"
       - "crates/ocean-daemon/**"
+      - "crates/ocean-mcp/**"
   push:
     tags: ["v*"]
 
@@ -94,16 +95,18 @@ jobs:
         run: cargo fetch --locked
 
       - name: Build release binaries
-        run: cargo build --locked --release -p ocean-tui -p ocean-daemon
+        run: cargo build --locked --release -p ocean-tui -p ocean-daemon -p ocean-mcp --bin ocean-tui --bin ocean-daemon --bin ocean-mcp
 
       - name: Stage and verify arm64 binaries
         run: |
           mkdir -p packaging/npm/bin
           cp target/release/ocean-tui packaging/npm/bin/ocean
           cp target/release/ocean-daemon packaging/npm/bin/ocean-daemon
-          chmod +x packaging/generate-license-inventory.sh packaging/npm/bin/ocean packaging/npm/bin/ocean-daemon packaging/npm/ocean-update.sh packaging/npm/test-package.sh
+          cp target/release/ocean-mcp packaging/npm/bin/ocean-mcp
+          chmod +x packaging/generate-license-inventory.sh packaging/npm/bin/ocean packaging/npm/bin/ocean-daemon packaging/npm/bin/ocean-mcp packaging/npm/ocean-update.sh packaging/npm/test-package.sh
           test "$(lipo -archs packaging/npm/bin/ocean)" = "arm64"
           test "$(lipo -archs packaging/npm/bin/ocean-daemon)" = "arm64"
+          test "$(lipo -archs packaging/npm/bin/ocean-mcp)" = "arm64"
 
       - name: Install checksum-pinned cargo-about
         shell: bash
@@ -174,15 +177,15 @@ jobs:
           legal_files=(LICENSE LICENSE-APACHE LICENSE-MIT NOTICE.md CREDITS.md TRADEMARKS.md)
           mkdir -p release-staging/npm/bin release-staging/binary
           cp packaging/npm/package.json packaging/npm/README.md packaging/npm/ocean-update.sh release-staging/npm/
-          cp packaging/npm/bin/ocean packaging/npm/bin/ocean-daemon release-staging/npm/bin/
-          cp packaging/npm/bin/ocean packaging/npm/bin/ocean-daemon release-staging/binary/
+          cp packaging/npm/bin/ocean packaging/npm/bin/ocean-daemon packaging/npm/bin/ocean-mcp release-staging/npm/bin/
+          cp packaging/npm/bin/ocean packaging/npm/bin/ocean-daemon packaging/npm/bin/ocean-mcp release-staging/binary/
           for legal_file in "${legal_files[@]}"; do
             cp "$legal_file" release-staging/npm/
             cp "$legal_file" release-staging/binary/
           done
           cp release-staging/generated/THIRD-PARTY-LICENSES.txt release-staging/npm/
           cp release-staging/generated/THIRD-PARTY-LICENSES.txt release-staging/binary/
-          chmod +x release-staging/npm/ocean-update.sh release-staging/npm/bin/ocean release-staging/npm/bin/ocean-daemon
+          chmod +x release-staging/npm/ocean-update.sh release-staging/npm/bin/ocean release-staging/npm/bin/ocean-daemon release-staging/npm/bin/ocean-mcp
           chmod +x release-staging/binary/ocean release-staging/binary/ocean-daemon
 
           COPYFILE_DISABLE=1 tar -czf release-staging/ocean-macos-arm64.tar.gz \
