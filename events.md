@@ -10759,3 +10759,11 @@ area:      [testing]
 
 Main CI has been red since S0 (#462, f458f2ea) merged next to the codex rooms-release branch (#450): each side was green alone, the union failed three ocean-daemon tests. The retire route was missing from the ecosystem contract's room-route table and ARCHITECTURE.md's pinned counts (137/53 -> 138/54), and the two snapshot envelope characterizations did not list the new aliases key. Fixed the table row, the counts, and the two expected-key arrays; no runtime change.
 _________________________________________________________________________________
+time:      [20:35] [09-09-26]
+agent:     [claude] [fable 5.1]
+worktree:  cc/rooms-s0-identity-route
+type:      [feature-request]
+area:      [backend]
+
+Rooms S0, the piece the design direction asked for that the retirement spec never carried: GET /v1/identity (crates/ocean-daemon/src/identity.rs). Credential-free; answers {ok, member_id|null, display_name|null, source: member.toml|env|unset} from <config_dir>/member.toml then OCEAN_MEMBER_ID, resolved per request from the daemon's own config dir so writing the file needs no restart; nothing configured answers null and never the process user. The member_id character set is exactly ocean-mcp's, so a terminal and the desktop app on one box read one file the same way. Route banner 138 -> 139, operator guide quick reference, ARCHITECTURE.md count, daemon AGENTS.md, and the retirement spec updated; unit tests for precedence/null/malformed/comments plus an HTTP test through the router. This unblocks surface slice S1 (identity and transport), which reads it on direct hosts and through the proxy's cross-check.
+_________________________________________________________________________________
