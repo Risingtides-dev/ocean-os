@@ -186,11 +186,11 @@ jobs:
           cp release-staging/generated/THIRD-PARTY-LICENSES.txt release-staging/npm/
           cp release-staging/generated/THIRD-PARTY-LICENSES.txt release-staging/binary/
           chmod +x release-staging/npm/ocean-update.sh release-staging/npm/bin/ocean release-staging/npm/bin/ocean-daemon release-staging/npm/bin/ocean-mcp
-          chmod +x release-staging/binary/ocean release-staging/binary/ocean-daemon
+          chmod +x release-staging/binary/ocean release-staging/binary/ocean-daemon release-staging/binary/ocean-mcp
 
           COPYFILE_DISABLE=1 tar -czf release-staging/ocean-macos-arm64.tar.gz \
             -C release-staging/binary \
-            ocean ocean-daemon LICENSE LICENSE-APACHE LICENSE-MIT NOTICE.md \
+            ocean ocean-daemon ocean-mcp LICENSE LICENSE-APACHE LICENSE-MIT NOTICE.md \
             CREDITS.md TRADEMARKS.md THIRD-PARTY-LICENSES.txt
           actual_files="$(tar -tzf release-staging/ocean-macos-arm64.tar.gz | sed '/\/$/d' | LC_ALL=C sort)"
           expected_files="$(cat <<'FILES' | LC_ALL=C sort
@@ -203,10 +203,11 @@ jobs:
           TRADEMARKS.md
           ocean
           ocean-daemon
+          ocean-mcp
           FILES
           )"
           if [[ "$actual_files" != "$expected_files" ]]; then
-            echo "error: binary release payload differs from the nine-file contract" >&2
+            echo "error: binary release payload differs from the ten-file contract" >&2
             diff -u <(printf '%s\n' "$expected_files") <(printf '%s\n' "$actual_files") || true
             exit 1
           fi
@@ -220,11 +221,12 @@ jobs:
           cmp release-staging/generated/THIRD-PARTY-LICENSES.txt "$extract_dir/THIRD-PARTY-LICENSES.txt"
           test -x "$extract_dir/ocean"
           test -x "$extract_dir/ocean-daemon"
+          test -x "$extract_dir/ocean-mcp"
           (cd release-staging && shasum -a 256 ocean-macos-arm64.tar.gz > ocean-macos-arm64.tar.gz.sha256)
           (cd release-staging && shasum -a 256 -c ocean-macos-arm64.tar.gz.sha256)
           rm -rf release-staging/binary release-staging/generated
 
-      - name: Smoke-test twelve-file npm and Bun installs
+      - name: Smoke-test thirteen-file npm and Bun installs
         run: |
           SOURCE_ROOT="$GITHUB_WORKSPACE" RUN_BUN_SMOKE=1 \
             EXPECTED_VERSION="$RELEASE_VERSION" \
@@ -270,7 +272,7 @@ jobs:
           unzip -q "$RUNNER_TEMP/ocean-release.zip" -d release-staging
 
       - name: Restore executable modes
-        run: chmod +x release-staging/npm/ocean-update.sh release-staging/npm/bin/ocean release-staging/npm/bin/ocean-daemon
+        run: chmod +x release-staging/npm/ocean-update.sh release-staging/npm/bin/ocean release-staging/npm/bin/ocean-daemon release-staging/npm/bin/ocean-mcp
 
       - name: Setup Node for GitHub Packages
         uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0

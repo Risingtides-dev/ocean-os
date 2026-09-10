@@ -10759,3 +10759,11 @@ area:      [testing]
 
 Main CI has been red since S0 (#462, f458f2ea) merged next to the codex rooms-release branch (#450): each side was green alone, the union failed three ocean-daemon tests. The retire route was missing from the ecosystem contract's room-route table and ARCHITECTURE.md's pinned counts (137/53 -> 138/54), and the two snapshot envelope characterizations did not list the new aliases key. Fixed the table row, the counts, and the two expected-key arrays; no runtime change.
 _________________________________________________________________________________
+time:      [20:37] [09-09-26]
+agent:     [claude] [fable 5.1]
+worktree:  cc/release-thirteen-file-contract
+type:      [gh-actions]
+area:      [infra]
+
+The release validation job failed after #465: the npm smoke test's packed-file contract still listed twelve files while the tarball now carries bin/ocean-mcp, and the standalone binary bundle never got ocean-mcp added to its tar at all (it was only copied into staging). Both contracts now name the binary: thirteen files in the npm package, ten in ocean-macos-arm64.tar.gz, with the executable-bit checks and the publish job's chmod covering it; the npm README lists it with the other two.
+_________________________________________________________________________________
