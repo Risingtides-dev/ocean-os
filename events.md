@@ -10743,3 +10743,19 @@ area:      [agent-building]
 
 First operational Rising Tides ops agent, live on John's daemon (rev f458f2ea). Installed the rt-ops package from risingtides-agents PR #39 into ~/.config/ocean-rs/agents/rt-ops (regular files; preview resolved it with eight read-only requests and an empty grantable set, as designed), joined smaths to rt-hq and set on_mention/on_thread_reply, bootstrapped and authorized rt-ops under smaths (task_and_thread, room_history, memory room, no ambient grants), granted /Users/risingtidesdev/dev/risingtides-agents/docs read-only to rt-ops as alias rt-docs (res-d226a89b…), and wrote the rt-hq profile (agent_defaults rt-ops -> that grant; CLAUDE slot resolved via oauth:claude-code, GH_TOKEN missing). inspect shows rt-ops active with cwd_source resource_grant. A real @rt-ops mention asking for the daily loop with owners and missing data sources produced a correct, sourced answer from OCEAN_ROOMS_OPERATIONS_ONTOLOGY.md; room_resource_audit rows 7 (list, 11 entries) and 8 (read, 41,144 bytes) carry actor agent. Also attempted Johnny's KINGMAKER-SYSTEMS invite: 403, the token lacks admin:org, so that stays with John.
 _________________________________________________________________________________ 20:40 cc/rt-hq-first-ops-agent
+time:      [20:28] [09-09-26]
+agent:     [claude] [fable 5.1]
+worktree:  cc/release-ocean-mcp
+type:      [release]
+area:      [infra]
+
+Landed #465: release.yml now builds ocean-mcp alongside ocean-tui and ocean-daemon, stages it into packaging/npm/bin, checks it is arm64, and ships it in both the npm tarball and the standalone binary bundle; crates/ocean-mcp/** joins the PR path filter. The branch went up over SSH because the gh token lacks the workflow scope. The PR was squash-merged by an unconditional watcher before its checks finished, which is why this ledger entry lands after the merge instead of with it.
+_________________________________________________________________________________
+time:      [20:28] [09-09-26]
+agent:     [claude] [fable 5.1]
+worktree:  cc/fix-main-ci-s0-parity
+type:      [gh-actions]
+area:      [testing]
+
+Main CI has been red since S0 (#462, f458f2ea) merged next to the codex rooms-release branch (#450): each side was green alone, the union failed three ocean-daemon tests. The retire route was missing from the ecosystem contract's room-route table and ARCHITECTURE.md's pinned counts (137/53 -> 138/54), and the two snapshot envelope characterizations did not list the new aliases key. Fixed the table row, the counts, and the two expected-key arrays; no runtime change.
+_________________________________________________________________________________
