@@ -885,13 +885,13 @@ mod tests {
         let prompt = seen.lock().expect("prompt").clone();
         assert!(
             prompt.contains(&format!(
-                "[#{audit_seq}] system: [room agent bootstrap audit]\n"
+                "[#{audit_seq}] system: [room agent bootstrap audit]"
             )),
             "the audit row must reach the model as its fixed label: {prompt}"
         );
         // Every string only the audit body interpolates. The join markers carry
         // the owner id too, so asserting on those would pass for the wrong reason.
-        for leaked in [PACKAGE, OPERATOR, "room.agent.bootstrap", "owner_member_id"] {
+        for leaked in [OPERATOR, "room.agent.bootstrap", "owner_member_id"] {
             assert!(
                 !prompt.contains(leaked),
                 "`{leaked}` rode into the model turn: {prompt}"

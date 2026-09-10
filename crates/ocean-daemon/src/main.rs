@@ -170,6 +170,7 @@ mod room_maintenance;
 mod room_operator;
 mod room_profile;
 mod room_resources;
+mod room_retirement;
 /// One-shot room-transcript summary into the room's well-known artifact.
 mod room_summary;
 /// Membership-gated lane from a browser to a room's Bedrock workspace: an
@@ -1662,6 +1663,7 @@ fn banner_routes() -> &'static [&'static str] {
         "POST /v1/rooms/persistent/{key}/close",
         "POST /v1/rooms/persistent/{key}/participants",
         "DELETE /v1/rooms/persistent/{key}/participants/{participant_id}",
+        "POST /v1/rooms/persistent/{key}/participants/{participant_id}/retire",
         "POST /v1/rooms/persistent/{key}/messages",
         "POST /v1/rooms/persistent/{key}/invites",
         "POST /v1/rooms/persistent/invites/redeem",
@@ -3121,6 +3123,10 @@ fn room_routes() -> Router<AppState> {
         .route(
             "/v1/rooms/persistent/{key}/participants/{participant_id}",
             axum::routing::delete(room_leave),
+        )
+        .route(
+            "/v1/rooms/persistent/{key}/participants/{participant_id}/retire",
+            post(room_retirement::room_participant_retire),
         )
         .route(
             "/v1/rooms/persistent/{key}/messages",
@@ -27072,9 +27078,12 @@ mod tests {
         // 135 -> 137: Rooms Phase 2 Stage 2d operator preview of the
         // admitted room_list / room_read tools under the agent's current
         // binding generation.
+        // 137 -> 138: Rooms S0 participant retirement — fold a placeholder
+        // human (surface-operator / web-<hex>) into a real member under one
+        // operator decision, recording an alias.
         assert_eq!(
             banner.len(),
-            137,
+            138,
             "route baseline changed; review the manifest"
         );
 

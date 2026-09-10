@@ -239,6 +239,22 @@ commit at a per-write cost. Raise it as a change to
 next `open()` reapplies the crate's value and the startup log would then
 disagree with what you set.
 
+### Operator lane (`X-Ocean-Operator`)
+
+Every room mutation that mints authority — authorizing, suspending, or
+revoking an agent; writing a profile; granting, suspending, or revoking a
+folder; retiring a placeholder participant — runs on the operator lane. The
+daemon reads the credential from the `X-Ocean-Operator` header and from
+nowhere else (never a cookie, query string, or body), compares it to the
+owner-only `operator.key` file in the config directory (created on first
+start), and answers 503 `operator_credential_missing` when either the file or
+the header is absent, 403 for an invalid value, a request that also carries a
+cookie (`ambient_credential_rejected`), or a browser origin not listed in
+`OCEAN_OPERATOR_ALLOWED_ORIGINS` (comma-separated origins; the surface proxy
+on `:8790` is the usual entry). Clients never hold the key in a browser: the
+proxy or the desktop shell injects it. Reads (`inspect`, `profile`,
+`resources`, agent listings) are credential-free by design.
+
 ### Federated-room Bedrock bridge
 
 Federation configuration is resolved once at daemon startup. An explicit
@@ -693,6 +709,7 @@ GET    /v1/rooms/persistent/{key}         room + transcript + access + agent_own
 PATCH  /v1/rooms/persistent/{key}         update mutable metadata { name?, trigger_policy?, workspace_root? }; an absent field is unchanged, trigger_policy: null clears the policy, an unknown field is a 400; 200 { room }, 404 unknown/closed room. workspace_root binds or REBINDS the room's workspace after creation, on the same canonicalization and the same 400 invalid_workspace_root create answers — workspace_root: null (or a blank string, matching create) unbinds. Absent is unchanged rather than a clear precisely because an unbound room's agent turns all fail closed with 503 workspace_unavailable, so a plain rename must never silently switch a room's agents off; until this field existed a room created unbound could not be bound at all, and the only repair was a new room and a lost transcript.
 POST   /v1/rooms/persistent/{key}/participants            join { id, display_name, kind? }
 DELETE /v1/rooms/persistent/{key}/participants/{participant_id}  leave
+POST   /v1/rooms/persistent/{key}/participants/{participant_id}/retire  Rooms S0 — fold a PLACEHOLDER human into a real member under one operator decision (X-Ocean-Operator; 503/403 as every mutation; body {decision_id, successor_id}; replay-safe in the room-wide decision namespace). `{participant_id}` must be `surface-operator` or `web-` + 16 lowercase hex — anything else is 400 participant_not_retirable, so the route can never fold a real person or an agent into someone. The successor must be a live human (else 409 successor_not_human; a placeholder or the same id is 400 invalid_successor_id). One transaction moves the Local room owner role and every room_agent_owners row from the placeholder to the successor, removes the placeholder's roster row, records `from -> to` in room_participant_aliases, and appends one System row (`Participant retired: a -> b`). Bindings keep their frozen owner_member_id; owner/target proofs resolve it through the alias chain, so the successor can suspend/reauthorize what the placeholder authorized. `inspect`, room detail, and `snapshot` carry `aliases: [{from, to, retired_at}]`. Response {ok, changed, alias, owner_moved, agents_moved, owner_member_id, aliases}
 POST   /v1/rooms/persistent/{key}/messages                post message { author_id, author_kind?, body }
 GET    /v1/rooms/persistent/{key}/transcript              read transcript (?after_seq=N&limit=M)
 POST   /v1/rooms/persistent/{key}/artifacts               record what the room produced { id, kind: task|decision|note, title, body?, author_id }; 201 { artifact }. Author must be on the roster (403). 400 invalid_request on a blank or untrimmed id (refused at the route only) or a blank (whitespace-only) title — the TITLE is refused in the store, so the daemon's own callers are held to it too, not only clients. Every create writes a System transcript line in the SAME transaction, so an artifact can never exist that the room's history does not explain.

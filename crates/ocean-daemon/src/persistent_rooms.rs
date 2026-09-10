@@ -544,11 +544,47 @@ pub(super) fn room_history_text(
                 .and_then(serde_json::Value::as_str)
                 .map(str::to_owned)
         });
+    // The agent MEMBER id is roster-public (it is what people @mention), so
+    // it may ride after the fixed label; operator principal ids, decision ids,
+    // digests, and capability sets never do. A refused admission names its
+    // reason code so a reader can tell "refused" from "admitted" without the
+    // JSON — the surface's activity strip depends on exactly these shapes.
+    let value = serde_json::from_str::<serde_json::Value>(&body).ok();
+    let agent = value
+        .as_ref()
+        .and_then(|v| v.get("agent_member_id"))
+        .and_then(serde_json::Value::as_str)
+        .filter(|a| !a.is_empty() && !a.chars().any(|c| c.is_control() || c == '[' || c == ']'))
+        .map(|a| format!(" {a}"))
+        .unwrap_or_default();
+    let refused = value
+        .as_ref()
+        .filter(|v| v.get("outcome").and_then(serde_json::Value::as_str) == Some("refused"))
+        .and_then(|v| v.get("reason_code"))
+        .and_then(serde_json::Value::as_str)
+        .filter(|c| !c.is_empty() && c.chars().all(|ch| ch.is_ascii_alphanumeric() || ch == '_'))
+        .map(str::to_owned);
     match audit_type.as_deref() {
-        Some("room.agent.admission") => "[room agent admission audit]".into(),
-        Some("room.agent.authority") => "[room agent authority audit]".into(),
-        Some("room.agent.bootstrap") => "[room agent bootstrap audit]".into(),
-        Some("room.agent.output") => "[room agent output audit]".into(),
+        Some("room.agent.admission") => match refused {
+            Some(code) => format!("[room agent admission refused: {code}]{agent}"),
+            None => format!("[room agent admission audit]{agent}"),
+        },
+        Some("room.agent.authority") => format!("[room agent authority audit]{agent}"),
+        Some("room.agent.bootstrap") => format!("[room agent bootstrap audit]{agent}"),
+        Some("room.agent.output") => format!("[room agent output audit]{agent}"),
+        Some("room.participant.retired") => {
+            let from = value
+                .as_ref()
+                .and_then(|v| v.get("from"))
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("?");
+            let to = value
+                .as_ref()
+                .and_then(|v| v.get("to"))
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("?");
+            format!("Participant retired: {from} -> {to}")
+        }
         Some("room.profile.created") => "Room profile created".into(),
         Some("room.profile.updated") => "Room profile updated".into(),
         Some("room.resource.granted") => "Folder shared".into(),
@@ -1649,6 +1685,7 @@ pub(super) async fn room_get(
         // Absent key == no local ownership recorded, which is what every
         // pre-existing room reports.
         let owners = reg.agent_owners(&key)?;
+        let aliases = crate::room_retirement::aliases_projection(reg, &key)?;
         Ok(Some((
             record.room,
             record.transcript,
@@ -1656,9 +1693,10 @@ pub(super) async fn room_get(
             next_seq,
             access,
             owners,
+            aliases,
         )))
     }) {
-        Ok(Some((room, transcript, has_more, next_seq, access, owners))) => (
+        Ok(Some((room, transcript, has_more, next_seq, access, owners, aliases))) => (
             StatusCode::OK,
             Json(json!({
                 "ok": true,
@@ -1668,6 +1706,7 @@ pub(super) async fn room_get(
                 "has_more": has_more,
                 "access": access,
                 "agent_owners": projected_agent_owners(owners),
+                    "aliases": aliases,
             })),
         ),
         Ok(None) => (
@@ -3989,10 +4028,11 @@ pub(super) async fn room_snapshot(
         // what stops a join landing between them and painting an agent whose
         // owner the roster does not list.
         let owners = reg.agent_owners(&key)?;
-        Ok(Some((record, page, access, closed, owners)))
+        let aliases = crate::room_retirement::aliases_projection(reg, &key)?;
+        Ok(Some((record, page, access, closed, owners, aliases)))
     });
     match result {
-        Ok(Some((rec, page, access, closed, owners))) => {
+        Ok(Some((rec, page, access, closed, owners, aliases))) => {
             let last_seq = page.messages.last().map(|m| m.seq);
             (
                 StatusCode::OK,
@@ -4008,6 +4048,7 @@ pub(super) async fn room_snapshot(
                     "access": access,
                     "closed": closed,
                     "agent_owners": projected_agent_owners(owners),
+                    "aliases": aliases,
                 })),
             )
         }
@@ -5165,7 +5206,10 @@ mod tests {
         );
         // Every string only the audit body interpolates. The join markers carry
         // the owner id too, so asserting on those would pass for the wrong reason.
-        for leaked in [PACKAGE, OPERATOR, "room.agent.bootstrap", "owner_member_id"] {
+        // PACKAGE is the agent's roster id and now rides after the label on
+        // purpose; the private strings are the operator principal, the
+        // decision id, and the raw audit type/field names.
+        for leaked in [OPERATOR, "room.agent.bootstrap", "owner_member_id"] {
             assert!(
                 !prompt.contains(leaked),
                 "`{leaked}` rode into the convened turn: {prompt}"
@@ -5347,10 +5391,17 @@ mod tests {
             .collect::<Vec<_>>();
         assert_eq!(projected[0].seq, newer.seq);
         assert_eq!(projected[1].seq, audit.seq);
-        assert_eq!(projected[1].text, "[room agent bootstrap audit]");
+        assert!(
+            projected[1]
+                .text
+                .starts_with("[room agent bootstrap audit]"),
+            "{}",
+            projected[1].text
+        );
         assert!(!projected[1].text.contains("operator-private"));
         assert!(!projected[1].text.contains("decision-private"));
-        assert!(!projected[1].text.contains("builder-private"));
+        // S0: the agent's roster id is public and rides after the label.
+        assert_eq!(projected[1].text, "[room agent bootstrap audit] builder-private");
 
         let second = store
             .authorized_room_history_page(&room, "builder", 1, Some(projected[1].seq), 2)
@@ -5405,9 +5456,9 @@ mod tests {
             let body = audit["body"]
                 .as_str()
                 .unwrap_or_else(|| panic!("{route} audit body is not a string"));
-            assert_eq!(
-                body, "[room agent bootstrap audit]",
-                "{route} served it raw"
+            assert!(
+                body.starts_with("[room agent bootstrap audit]"),
+                "{route} served it raw: {body}"
             );
             assert!(!body.contains("]("), "{route} kept link syntax: {body}");
             assert!(!body.contains("evil.co"), "{route}: {body}");
@@ -11400,6 +11451,300 @@ env = { FIXTURE = "1" }
         assert!(rows.iter().any(|r| r.outcome == "resource_not_available"));
         assert!(rows.iter().any(|r| r.outcome == "invalid_relative_path"));
         assert!(rows.iter().all(|r| r.binding_generation >= 1));
+    }
+
+    // ── Participant retirement (S0) ───────────────────────────────────────────
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn retiring_the_placeholder_owner_moves_authority_and_keeps_bindings_usable() {
+        let _guard = AUTO_CONVENE_ENV_LOCK.lock().await;
+        let _env = TestEnvRestore::capture(&["OCEAN_AGENTS_DIR"]);
+        let tmp = tempfile::TempDir::new().unwrap();
+        let state = fake_convene_state(&tmp);
+        let agents_root = tmp.path().join("agents");
+        write_agent_fixture(&agents_root, "helper", "", None);
+        std::env::set_var("OCEAN_AGENTS_DIR", &agents_root);
+        // The room the old surface left behind: the placeholder owns the room
+        // and the agent; the real human and a minted web id are just members.
+        let key = RoomKey::new("retire-legacy");
+        seed_access(&state, &key, local_access());
+        with_rooms(&state, |store| {
+            for id in ["surface-operator", "smaths", "web-18c11f5d551e63f8"] {
+                store
+                    .add_participant(
+                        &key,
+                        RoomParticipant {
+                            id: id.into(),
+                            kind: RoomParticipantKind::Human,
+                            display_name: id.into(),
+                        },
+                        Utc::now(),
+                    )
+                    .unwrap();
+            }
+            store
+                .add_agent_participant_with_owner(
+                    &key,
+                    RoomParticipant {
+                        id: "helper".into(),
+                        kind: RoomParticipantKind::Agent,
+                        display_name: "Helper".into(),
+                    },
+                    "surface-operator",
+                    Utc::now(),
+                )
+                .unwrap();
+        });
+        let generation = authorize_room_agent_fixture(
+            &state,
+            &key,
+            "helper",
+            ActivationPolicy::Mention,
+            ContextPolicy::InvocationOnly,
+        );
+        async fn retire(
+            state: &AppState,
+            id: &str,
+            body: serde_json::Value,
+            headers: &[(&str, &str)],
+        ) -> (StatusCode, serde_json::Value) {
+            let uri = format!("/v1/rooms/persistent/retire-legacy/participants/{id}/retire");
+            room_json_request(state, axum::http::Method::POST, uri, Some(body), headers).await
+        }
+        let decision = uuid::Uuid::new_v4().to_string();
+
+        // Operator gate, then the identity-takeover guard.
+        let (status, body) = retire(
+            &state,
+            "surface-operator",
+            json!({"decision_id": decision, "successor_id": "smaths"}),
+            &[],
+        )
+        .await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{body}");
+        for (id, code) in [
+            ("smaths", "participant_not_retirable"),
+            ("helper", "participant_not_retirable"),
+            ("web-18C11F5D551E63F8", "participant_not_retirable"),
+        ] {
+            let (status, body) = retire(
+                &state,
+                id,
+                json!({"decision_id": decision, "successor_id": "smaths"}),
+                OPERATOR,
+            )
+            .await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{id}: {body}");
+            assert_eq!(body["error"], json!(code), "{id}");
+        }
+        let (status, body) = retire(
+            &state,
+            "surface-operator",
+            json!({"decision_id": decision, "successor_id": "web-18c11f5d551e63f8"}),
+            OPERATOR,
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+        assert_eq!(body["error"], json!("invalid_successor_id"));
+        let (status, body) = retire(
+            &state,
+            "surface-operator",
+            json!({"decision_id": decision, "successor_id": "helper"}),
+            OPERATOR,
+        )
+        .await;
+        assert_eq!(status, StatusCode::CONFLICT, "{body}");
+        assert_eq!(body["error"], json!("successor_not_human"));
+        let (status, body) = retire(
+            &state,
+            "surface-operator",
+            json!({"decision_id": decision, "successor_id": "nobody"}),
+            OPERATOR,
+        )
+        .await;
+        assert_eq!(status, StatusCode::CONFLICT, "{body}");
+        assert_eq!(body["error"], json!("successor_not_human"));
+
+        // The real thing.
+        let (status, body) = retire(
+            &state,
+            "surface-operator",
+            json!({"decision_id": decision, "successor_id": "smaths"}),
+            OPERATOR,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["changed"], json!(true));
+        assert_eq!(body["owner_moved"], json!(true));
+        assert_eq!(body["agents_moved"], json!("1"));
+        assert_eq!(body["owner_member_id"], json!("smaths"));
+        assert_eq!(body["aliases"][0]["from"], json!("surface-operator"));
+        assert_eq!(body["aliases"][0]["to"], json!("smaths"));
+
+        // Exact replay: 200, unchanged, no second audit row.
+        let rows_after_first = with_rooms(&state, |store| store.transcript(&key, None))
+            .unwrap()
+            .len();
+        let (status, body) = retire(
+            &state,
+            "surface-operator",
+            json!({"decision_id": decision, "successor_id": "smaths"}),
+            OPERATOR,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["changed"], json!(false));
+        assert_eq!(
+            with_rooms(&state, |store| store.transcript(&key, None))
+                .unwrap()
+                .len(),
+            rows_after_first
+        );
+        // Retiring it again under a NEW decision: it is gone from the roster.
+        let (status, body) = retire(
+            &state,
+            "surface-operator",
+            json!({"decision_id": uuid::Uuid::new_v4().to_string(), "successor_id": "smaths"}),
+            OPERATOR,
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
+        assert_eq!(body["error"], json!("participant_not_found"));
+
+        // inspect / snapshot / room detail agree, and the binding still works
+        // for the successor because owner proofs resolve through the alias.
+        let (_, inspected) = inspect_response(&state, key.as_str()).await;
+        assert_eq!(inspected["owner"]["member_id"], json!("smaths"));
+        assert_eq!(inspected["aliases"][0]["to"], json!("smaths"));
+        assert!(!inspected["participants"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|p| p["id"] == "surface-operator"));
+        let (_, snap) = snapshot_response(&state, &key, "").await;
+        assert_eq!(snap["aliases"][0]["from"], json!("surface-operator"));
+        assert_eq!(snap["agent_owners"][0]["owner_id"], json!("smaths"));
+        let (status, agents) = room_json_request(
+            &state,
+            axum::http::Method::GET,
+            format!("/v1/rooms/persistent/{key}/agents"),
+            None,
+            &[],
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{agents}");
+        assert_eq!(agents["owner_member_id"], json!("smaths"));
+        assert_eq!(
+            agents["bindings"][0]["owner_member_id"],
+            json!("surface-operator"),
+            "the ledger is not rewritten"
+        );
+        assert_eq!(
+            agents["bindings"][0]["owner_eligible"],
+            json!(true),
+            "…but the successor holds the authority"
+        );
+        assert_eq!(
+            agents["bindings"][0]["generation"],
+            json!(generation.to_string())
+        );
+        // The successor can act on the binding: suspend it.
+        let (status, suspended) = room_json_request(
+            &state,
+            axum::http::Method::POST,
+            format!("/v1/rooms/persistent/{key}/agents/helper/suspend"),
+            Some(json!({"decision_id": uuid::Uuid::new_v4().to_string()})),
+            OPERATOR,
+        )
+        .await;
+        assert!(status.is_success(), "{suspended}");
+        assert_eq!(suspended["binding"]["status"], json!("suspended"));
+
+        // The web id retires the same way, without owning anything.
+        let (status, body) = retire(
+            &state,
+            "web-18c11f5d551e63f8",
+            json!({"decision_id": uuid::Uuid::new_v4().to_string(), "successor_id": "smaths"}),
+            OPERATOR,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["owner_moved"], json!(false));
+        assert_eq!(body["aliases"].as_array().unwrap().len(), 2);
+
+        // The transcript reads as activity, not JSON.
+        let rows = with_rooms(&state, |store| store.transcript(&key, None)).unwrap();
+        let texts: Vec<String> = rows
+            .iter()
+            .map(|m| room_history_text(m.body.clone(), m.author_kind, m.kind))
+            .collect();
+        assert!(
+            texts
+                .iter()
+                .any(|t| t == "Participant retired: surface-operator -> smaths"),
+            "{texts:?}"
+        );
+        assert!(
+            texts
+                .iter()
+                .any(|t| t == "Participant retired: web-18c11f5d551e63f8 -> smaths"),
+            "{texts:?}"
+        );
+        assert!(
+            texts
+                .iter()
+                .any(|t| t.starts_with("[room agent authority audit] helper")),
+            "{texts:?}"
+        );
+    }
+
+    #[test]
+    fn audit_lines_name_the_agent_and_refusals_carry_their_code() {
+        let text = |body: &str| {
+            room_history_text(
+                body.to_string(),
+                RoomParticipantKind::System,
+                RoomMessageKind::System,
+            )
+        };
+        assert_eq!(
+            text(
+                r#"{"type":"room.agent.admission","agent_member_id":"helper","outcome":"allowed","operator_principal_id":"op-private"}"#
+            ),
+            "[room agent admission audit] helper"
+        );
+        assert_eq!(
+            text(
+                r#"{"type":"room.agent.admission","agent_member_id":"helper","outcome":"refused","reason_code":"credential_slot_missing"}"#
+            ),
+            "[room agent admission refused: credential_slot_missing] helper"
+        );
+        // A refusal without a code, or with a code that is not an identifier, falls back to the plain label.
+        assert_eq!(
+            text(
+                r#"{"type":"room.agent.admission","agent_member_id":"helper","outcome":"refused"}"#
+            ),
+            "[room agent admission audit] helper"
+        );
+        assert_eq!(
+            text(
+                r#"{"type":"room.agent.admission","agent_member_id":"helper","outcome":"refused","reason_code":"[x](y)"}"#
+            ),
+            "[room agent admission audit] helper"
+        );
+        // An agent id that could forge a row is dropped, never rendered.
+        assert_eq!(
+            text(r#"{"type":"room.agent.output","agent_member_id":"[click](x)"}"#),
+            "[room agent output audit]"
+        );
+        assert_eq!(
+            text(r#"{"type":"room.agent.output"}"#),
+            "[room agent output audit]"
+        );
+        assert_eq!(
+            text(r#"{"type":"room.participant.retired","from":"surface-operator","to":"smaths"}"#),
+            "Participant retired: surface-operator -> smaths"
+        );
     }
 
     // ── Snapshot tail paging (`before_seq`) ──────────────────────────────────

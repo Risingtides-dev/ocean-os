@@ -98,6 +98,7 @@ use rusqlite::{params, Connection, OptionalExtension, TransactionBehavior};
 
 mod room_profile;
 mod room_resources;
+mod room_retirement;
 pub use room_profile::{
     CredentialSlot, PutRoomProfileInput, RepoRef, RoomProfile, ToolRef, ToolRefKind,
 };
@@ -105,6 +106,7 @@ pub use room_resources::{
     GrantRoomResourceInput, ResourceAccessMode, ResourceStatus, RoomResourceAuditInput,
     RoomResourceAuditRow, RoomResourceGrant, SetResourceStatusInput,
 };
+pub use room_retirement::{ParticipantAlias, RetireParticipantInput, RetiredParticipant};
 
 /// A persistent room plus the OLDEST bounded page of its transcript.
 ///
@@ -2230,6 +2232,8 @@ impl SqliteRoomStore {
         // Rooms Phase 2b tables (idempotent; see `room_profile.rs`).
         self.conn.execute_batch(room_profile::ROOM_PROFILE_DDL)?;
         self.conn.execute_batch(room_resources::ROOM_RESOURCE_DDL)?;
+        self.conn
+            .execute_batch(room_retirement::ROOM_RETIREMENT_DDL)?;
         self.migrate_room_agent_generation_to_text()?;
         // Backfill columns on DBs created before they existed.
         // position (S2-P1) — on the `outbox` table. The column *and* its
