@@ -141,12 +141,13 @@ package/THIRD-PARTY-LICENSES.txt
 package/TRADEMARKS.md
 package/bin/ocean
 package/bin/ocean-daemon
+package/bin/ocean-mcp
 package/ocean-update.sh
 package/package.json
 FILES
 )"
 if [[ "$actual_files" != "$expected_files" ]]; then
-  echo "error: packed file set differs from the twelve-file contract" >&2
+  echo "error: packed file set differs from the thirteen-file contract" >&2
   diff -u <(printf '%s\n' "$expected_files") <(printf '%s\n' "$actual_files") || true
   exit 1
 fi
