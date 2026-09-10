@@ -10759,3 +10759,11 @@ area:      [testing]
 
 Main CI has been red since S0 (#462, f458f2ea) merged next to the codex rooms-release branch (#450): each side was green alone, the union failed three ocean-daemon tests. The retire route was missing from the ecosystem contract's room-route table and ARCHITECTURE.md's pinned counts (137/53 -> 138/54), and the two snapshot envelope characterizations did not list the new aliases key. Fixed the table row, the counts, and the two expected-key arrays; no runtime change.
 _________________________________________________________________________________
+time:      [20:49] [09-09-26]
+agent:     [claude] [fable 5.1]
+worktree:  cc/mcp-doctor-identity
+type:      [feature-request]
+area:      [skill/mcp]
+
+ocean-mcp doctor now prints a daemon-identity line: it reads GET /v1/identity (Rooms S0) and shows whether the daemon host's member.toml agrees with the id this bridge would post as, naming the drift when it does not (one person per daemon), saying NOT SET when the daemon host has no member.toml, and saying the daemon predates the route on a 404. Never fatal; reads keep working. Pure identity_line function with a unit test over all six cases.
+_________________________________________________________________________________
