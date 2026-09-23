@@ -127,6 +127,254 @@ tail -n 200 /private/tmp/ocean-daemon.log
 Use the actual plist/script paths if local configuration differs; the tracked
 installer and `ops/README.md` are authoritative.
 
+## Rooms and federation
+
+Rooms are daemon-local by default: a room, its transcript, roster, artifacts
+and attachments live in `rooms.db` beside the config dir (`OCEAN_CONFIG_DIR`,
+else `$XDG_CONFIG_HOME/ocean-rs`, else `~/.config/ocean-rs`; `OCEAN_DB_PATH`
+overrides the full path). Federation is what lets a room span daemons: invites,
+the Bedrock room stream, and the container workspace lane.
+`OCEAN_FEDERATION_URL` enables transport for rooms that already hold a Bedrock
+credential; `OCEAN_FEDERATION_OWNER_TOKEN` separately lets this daemon bootstrap
+an existing Local room as its Bedrock owner. Missing the owner token does not
+disable existing credentialed rooms or invite redemption. Missing or invalid
+transport configuration moves credentialed non-revoked rooms to `recovering`;
+revoked rooms remain revoked. As of 2026-09-01 the tracked plist carries neither
+variable, so the operated daemon cannot bootstrap Local rooms and cannot run
+transport for any credentials already in `rooms.db`. The mechanics are in
+`OCEAN_RUNTIME_OPERATOR_GUIDE.md` under "Federated-room
+Bedrock bridge"; this section is the operator's order of operations. The
+tracked completion state is the Ocean Rooms section of `../ROADMAP.md`; the
+Phase 1 rollout gates remain authoritative in
+`specs/2026-08-25-ocean-rooms-phase1-room-agent-authorization-manifest.md`.
+
+### Enable federation
+
+1. Bedrock must be reachable over HTTPS at its origin with its federation
+   schema applied: `npm run db:check` there must report `roomMembersReady`
+   and `roomComputeReady`, and `operatorRoomsReady` once ocean-bedrock #117 is
+   deployed. Production today is `https://ocean-bedrock-production.up.railway.app`.
+2. Mint the daemon's owner bearer on Bedrock. Today that is an admin token
+   (`npm run token:create` there); Bedrock's own handoff warns that path scopes
+   do not constrain an admin token, so it is full-instance authority, and
+   ocean-bedrock #117 adds the operator path that will replace it. Treat the
+   value as a production secret.
+3. Install a supported untracked owner-only login loader for the supervised
+   daemon. It must set:
+   - `OCEAN_FEDERATION_URL` — the Bedrock origin, nothing after the host.
+   - `OCEAN_FEDERATION_OWNER_TOKEN` — the bearer from step 2.
+
+   The loader must read the bearer from an owner-only (`0600`) file or Keychain
+   item, call `launchctl setenv` for both values on every fresh GUI login, and
+   complete before the daemon's `RunAtLoad` start. Neither the tracked template
+   nor the rendered plist may contain either federation value. The repository
+   does not ship that loader yet, so production enablement stops here: do not
+   substitute a manual edit of either plist.
+4. Once that loader exists, use its reviewed install/activation procedure after
+   turns drain. It must lint every plist before stopping the healthy daemon,
+   inject the variables without printing or recording the bearer in shell
+   history or logs, and use the guarded `bootout` → wait → `bootstrap` → `enable` →
+   `kickstart` sequence from `ops/install-ocean-daemon.sh`. Stop if any custody,
+   ordering, teardown, bootstrap, or health assertion fails.
+5. Verify, in this order. First the revision:
+
+   ```bash
+   curl -fsS http://127.0.0.1:4780/health
+   ```
+
+   Then bootstrap one existing Local room as its Bedrock owner by minting an
+   invite from the surface's room invite control, or by POSTing
+   `/v1/rooms/persistent/<key>/invites` with the body the operator guide
+   documents; the response is the only place the invite code and `onboard_url`
+   appear. Then read the room's access state:
+
+   ```bash
+   curl -fsS "http://127.0.0.1:4780/v1/rooms/persistent/<key>/snapshot?before_seq=18446744073709551615&limit=1"
+   ```
+
+   `access.state` must move from `connecting` to `live` within one reconnect
+   interval. A `recovering` that never turns `live` means the origin was
+   rejected, the token is invalid, or Bedrock is down; the daemon moves every
+   credentialed room there on bad configuration rather than leaving stale
+   `live` chrome. Then post a message in that room: it answers 202 and reaches
+   the transcript only when Bedrock's ordered stream confirms it, and the
+   snapshot's `outbox` must drain to empty.
+6. Record the verification in `events.md` with the daemon revision and the
+   room key, as the 2026-08-31 install entry did. The runbook is not evidence
+   that federation was enabled; keep that operational state explicit in the
+   Ocean Rooms roadmap or its accepted successor contract.
+
+### The workspace lane
+
+The daemon proxies a federated room's Bedrock workspace under
+`GET|POST /v1/rooms/persistent/{key}/workspace/{leaf}` with the room's own
+credential, so no browser ever holds the bearer. It needs the room to be
+federated (a credential in `rooms.db`) and Bedrock to run a compute driver with
+its runtime Worker deployed. Bedrock's typed refusals (`workspace_absent`,
+`repo_unbound`, `federation_unavailable`) are relayed as states, not errors.
+Owner verbs (provision, destroy, repo bind and unbind, secrets set) forward
+only for the actor that resolves to the credential's own principal. CI pulls
+need a `GH_TOKEN` room secret set through `secrets/set`; Bedrock returns no
+secret value on any route.
+
+### Reading the bridge without metrics
+
+There are no room or federation counters on `/metrics` yet. Until there are:
+
+- `access.state` on the snapshot is the primary signal: `live` is caught up,
+  `recovering` is replaying from the durable cursor or misconfigured, `revoked`
+  means this principal's membership was removed and nothing is writable.
+- `outbox` on the snapshot: pending rows that age while the state is `live`
+  mean the sender is not being confirmed. The ordered SSE stream is the only
+  confirmation rail; a ledger 201 never is.
+- The daemon log (`/private/tmp/ocean-daemon.log`) carries the bridge's
+  reconnects and refusals under the `room_federation` module; jittered
+  reconnects cap at 60 s.
+- Presence follows the SSE lease: a disconnect downgrades every projected
+  member to Unavailable in the same access commit.
+
+### Rollback
+
+Remove the two variables from the protected loader source, have that loader
+clear only those named variables from the per-user launchd domain, then repeat
+its guarded restart procedure. Never edit either daemon plist. Local rooms are
+untouched; credentialed rooms sit in `recovering` with honest chrome; nothing
+is deleted. Restoring the protected values through the loader resumes from the
+persisted cursor.
+
+### rooms.db migration rehearsal
+
+The Phase 1 manifest's rollout gate 4 asks for a migration rehearsal on a real
+**pre-Phase-1 schema**, including rollback. The 2026-08-31 rehearsal in
+`events.md` was useful but does not close this gate: its `rooms.db` source had
+already been opened by Phase 1 and already carried the additive
+`room_agent_bindings` and `room_agent_decisions` tables (both empty). The
+downgrade portion exercised the memory migration and proved that an older
+daemon ignored those empty additive tables; it did not prove that the candidate
+creates the room-agent tables from the pre-Phase-1 schema or that rollback
+restores a database without them. The gate remains open until a new
+`events.md` entry records the proof below. Procedure:
+
+1. Prefer a retained transactionally consistent backup taken before the Phase 1
+   cutover. If none exists, reconstruct the old schema only in an isolated
+   online backup of the live database: first require both Phase 1 tables to be
+   empty, then drop `room_agent_decisions` before `room_agent_bindings`. Stop if
+   either table contains data; that copy cannot honestly stand in for a
+   pre-Phase-1 source. Create isolated config roots for both halves of the
+   rehearsal; the candidate must not inherit live `titles.db`, extension
+   projects, observatory, or any other daemon state:
+
+   ```bash
+   rooms_rehearsal_dir="$(mktemp -d /tmp/ocean-rooms-rehearsal.XXXXXX)"
+   mkdir -p "$rooms_rehearsal_dir/candidate-config" "$rooms_rehearsal_dir/rollback-config"
+   running_ocean_db_path="<OCEAN_DB_PATH from the running launchd job, or empty>"
+   running_ocean_config_dir="<effective OCEAN_CONFIG_DIR or resolved default>"
+   if [ -n "$running_ocean_db_path" ]; then
+     live_rooms_db="$running_ocean_db_path"
+   else
+     live_rooms_db="$running_ocean_config_dir/rooms.db"
+   fi
+   test -f "$live_rooms_db"
+   sqlite3 "$live_rooms_db" ".timeout 10000" \
+     ".backup '$rooms_rehearsal_dir/candidate-config/rooms.db'"
+   test "$(sqlite3 "$rooms_rehearsal_dir/candidate-config/rooms.db" \
+     "SELECT coalesce(sum(rows),0) FROM (SELECT count(*) AS rows FROM room_agent_bindings UNION ALL SELECT count(*) FROM room_agent_decisions);")" = 0
+   sqlite3 "$rooms_rehearsal_dir/candidate-config/rooms.db" \
+     "DROP TABLE room_agent_decisions; DROP TABLE room_agent_bindings;"
+   test "$(sqlite3 "$rooms_rehearsal_dir/candidate-config/rooms.db" \
+     "SELECT count(*) FROM sqlite_master WHERE type='table' AND name IN ('room_agent_bindings','room_agent_decisions');")" = 0
+   sqlite3 "$rooms_rehearsal_dir/candidate-config/rooms.db" "PRAGMA quick_check;"
+   sqlite3 "$rooms_rehearsal_dir/candidate-config/rooms.db" \
+     ".backup '$rooms_rehearsal_dir/pre-upgrade-rollback.db'"
+   sqlite3 "$rooms_rehearsal_dir/pre-upgrade-rollback.db" "PRAGMA quick_check;"
+   ```
+
+   Resolve both placeholders by reading only the named non-secret path values
+   from their protected source or, when they live in the rendered daemon plist,
+   with targeted `plutil -extract EnvironmentVariables.OCEAN_DB_PATH raw` and
+   `plutil -extract EnvironmentVariables.OCEAN_CONFIG_DIR raw` reads. Never run
+   `launchctl print` to discover them: that dumps the whole environment and can
+   expose the owner bearer. Use `OCEAN_DB_PATH` first; only when it is absent may
+   the source fall back to `rooms.db` under the daemon's effective config dir.
+   Replace the angle-bracket placeholders before running the command, and
+   require both `quick_check` calls to print `ok`. When
+   a retained pre-cutover backup exists, use SQLite's backup API to seed
+   `candidate-config/rooms.db` from it, require the `sqlite_master` absence
+   query above to return zero, and do not run either the row-count query or the
+   two `DROP TABLE` statements: a genuine pre-Phase-1 database has no such
+   tables to count. The row-count query belongs only to reconstruction from a
+   current database, while its tables still exist and must be proven empty
+   before they are dropped.
+2. Resolve the exact candidate and previous immutable artifacts under
+   `~/.local/libexec/ocean-daemon/`. The rollback artifact must be a revision
+   from **before Phase 1**, not merely the artifact preceding the current
+   release. Verify both are executable and run the candidate on a spare
+   loopback port from the neutral rehearsal directory. Both the candidate and
+   rollback binaries refuse to run from any Ocean repository worktree;
+   `OCEAN_UNSUPERVISED=1` bypasses the loaded-supervisor guard, not the cwd
+   guard.
+
+   ```bash
+   candidate_bin="$HOME/.local/libexec/ocean-daemon/ocean-daemon-<candidate-rev>"
+   previous_bin="$HOME/.local/libexec/ocean-daemon/ocean-daemon-<pre-phase1-rev>"
+   test -x "$candidate_bin" && test -x "$previous_bin"
+   (cd "$rooms_rehearsal_dir" && \
+     env -u OCEAN_FEDERATION_URL -u OCEAN_FEDERATION_OWNER_TOKEN \
+       -u OCEAN_TITLES_DB_PATH -u OCEAN_PLUGINS_DIR \
+       OCEAN_CONFIG_DIR="$rooms_rehearsal_dir/candidate-config" \
+       OCEAN_DB_PATH="$rooms_rehearsal_dir/candidate-config/rooms.db" \
+       OCEAN_BIND=127.0.0.1:18791 OCEAN_UNSUPERVISED=1 \
+       "$candidate_bin")
+   ```
+
+   Keep this process in its own terminal. Only the copied `rooms.db` enters the
+   isolated config root; no production config file is imported. Federation,
+   title-database, and plugin-directory overrides are explicitly removed from
+   the rehearsal process even if the operator shell exported them, so copied
+   credentials, pending outbox rows, or pending redemptions cannot contact
+   Bedrock, open the live title registry, or launch production plugins.
+3. Through the candidate, list rooms and read one snapshot. Before stopping it,
+   require SQLite to report both `room_agent_bindings` and
+   `room_agent_decisions`; a clean open alone is not migration proof. Record the
+   source room/message counts and the post-open table count.
+4. Actually exercise rollback. Stop the candidate, restore the untouched
+   pre-upgrade backup into the separate rollback config with SQLite's backup
+   API, run `quick_check`, then start the **previous** immutable artifact on a
+   second spare port with the same unsupervised and isolation controls:
+
+   ```bash
+   sqlite3 "$rooms_rehearsal_dir/pre-upgrade-rollback.db" \
+     ".backup '$rooms_rehearsal_dir/rollback-config/rooms.db'"
+   sqlite3 "$rooms_rehearsal_dir/rollback-config/rooms.db" "PRAGMA quick_check;"
+   test "$(sqlite3 "$rooms_rehearsal_dir/rollback-config/rooms.db" \
+     "SELECT count(*) FROM sqlite_master WHERE type='table' AND name IN ('room_agent_bindings','room_agent_decisions');")" = 0
+   (cd "$rooms_rehearsal_dir" && \
+     env -u OCEAN_FEDERATION_URL -u OCEAN_FEDERATION_OWNER_TOKEN \
+       -u OCEAN_TITLES_DB_PATH -u OCEAN_PLUGINS_DIR \
+       OCEAN_CONFIG_DIR="$rooms_rehearsal_dir/rollback-config" \
+       OCEAN_DB_PATH="$rooms_rehearsal_dir/rollback-config/rooms.db" \
+       OCEAN_BIND=127.0.0.1:18792 OCEAN_UNSUPERVISED=1 \
+       "$previous_bin")
+   ```
+
+   List the same rooms and read the same snapshot through the previous binary;
+   room and message counts must match the pre-upgrade backup. Stop it only after
+   that read succeeds. This previous-binary read is the rollback proof; merely
+   retaining or deleting a backup is not.
+5. Record both exact revisions, the pre-open zero and post-open two-table
+   results, both `quick_check` results, the room/message counts before candidate
+   migration and after rollback, and the two isolated config paths in
+   `events.md`. Remove the temporary rehearsal directory only after the evidence
+   is captured.
+
+### Bedrock ordering this daemon depends on
+
+ocean-bedrock #117 makes Bedrock's `register()` write `room_members.operator_id`,
+so Bedrock migration `db/013` must be applied to its production database before
+any deploy containing #117, or legacy room registration (the path the owner
+bootstrap above uses) answers 500. Bedrock's `npm run deploy:status` and
+`npm run db:check` are the checks; this daemon cannot see either.
+
 ## Install the TUI
 
 Feature branches must build and test the TUI normally. Installation is a

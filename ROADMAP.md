@@ -146,7 +146,9 @@ The active behavior-neutral daemon extraction is tracked in [`docs/DAEMON_REFACT
 
 ## Explicitly not implied
 
-This file does not approve legacy API removal, session schema changes, room
-federation, Longhouse economic policy, a daemon library, or a performance
-rewrite. Those require current evidence, a bounded design, compatibility gates,
+This file does not approve legacy API removal, session schema changes,
+Longhouse economic policy, a daemon library, or a performance rewrite. (Room
+federation is no longer on this list: it shipped in `room_federation.rs`, is
+operated per `docs/OPERATIONS.md`, and its remaining gaps are tracked by the
+rooms definition of done above.) Those require current evidence, a bounded design, compatibility gates,
 and independent review.
