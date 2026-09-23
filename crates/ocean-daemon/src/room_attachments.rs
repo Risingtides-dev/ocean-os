@@ -141,7 +141,16 @@ pub(super) fn room_attachments_root() -> std::path::PathBuf {
 /// directory is always exactly 64 hex characters and always inside the root.
 /// Never stored: it is recomputed on every use, so there is no persisted path to
 /// go stale or be tampered with.
-fn room_dir(root: &std::path::Path, key: &RoomKey) -> std::path::PathBuf {
+///
+/// `pub(super)` for exactly one caller beyond this module: `room_maintenance`'s
+/// orphan sweep, which has to derive the expected directory of every room the
+/// store knows in order to tell whose the tree's directories are. Because the
+/// hash is one-way and never stored, that derivation is the ONLY way to ask the
+/// question at all — and it must be THIS derivation. A sweep that hashed room
+/// keys itself would be a second implementation of the traversal defence, and
+/// the failure mode of the two disagreeing is not a missed orphan: it is the
+/// sweep deleting every live room's files as unrecognised.
+pub(super) fn room_dir(root: &std::path::Path, key: &RoomKey) -> std::path::PathBuf {
     let mut digest = Sha256::new();
     digest.update(key.as_str().as_bytes());
     root.join(format!("{:x}", digest.finalize()))
