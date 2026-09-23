@@ -859,6 +859,12 @@ async fn doctor(daemon: &Daemon) -> Result<()> {
         )?,
         None => writeln!(out, "member id: NOT SET — {MEMBER_HINT}")?,
     }
+    let identity = daemon.get("/v1/identity").await;
+    writeln!(
+        out,
+        "{}",
+        identity_line(daemon.member.as_deref(), &identity)
+    )?;
     match daemon.get("/v1/rooms/persistent").await {
         Ok(v) => {
             let n = v["rooms"].as_array().map(|r| r.len()).unwrap_or(0);
@@ -882,10 +888,83 @@ async fn doctor(daemon: &Daemon) -> Result<()> {
     Ok(())
 }
 
+/// `doctor`'s identity cross-check: what the daemon says its human is
+/// (`GET /v1/identity`, Rooms S0) beside what this bridge will post as. One
+/// line and never fatal — reads keep working whatever it says; the point is to
+/// make drift visible, because a bridge posting as `smaths` through a daemon
+/// whose host says `ecfromthedc` is exactly the mismatch the surface refuses.
+fn identity_line(member: Option<&str>, daemon_identity: &Result<Value>) -> String {
+    match daemon_identity {
+        Err(err) if err.to_string().contains("(404)") => {
+            "daemon identity: route not available (the daemon predates GET /v1/identity; update it)"
+                .to_string()
+        }
+        Err(err) => format!("daemon identity: could not read — {err:#}"),
+        Ok(value) => {
+            let source = value["source"].as_str().unwrap_or("?");
+            match (value["member_id"].as_str(), member) {
+                (None, _) => format!(
+                    "daemon identity: NOT SET on the daemon host (source {source}) — write member.toml in that daemon's config dir"
+                ),
+                (Some(theirs), Some(mine)) if theirs == mine => {
+                    format!("daemon identity: {theirs} (agrees; source {source})")
+                }
+                (Some(theirs), Some(mine)) => format!(
+                    "daemon identity: {theirs} but you would post as {mine} — one person per daemon; align member.toml on both hosts"
+                ),
+                (Some(theirs), None) => format!(
+                    "daemon identity: {theirs} (source {source}) — this bridge has no member id of its own; write member.toml or pass --member {theirs}"
+                ),
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use axum::{routing::get, routing::post, Json, Router};
+
+    #[test]
+    fn doctor_identity_line_makes_drift_visible_and_never_fails() {
+        let ok = |member_id: Value, source: &str| -> Result<Value> {
+            Ok(json!({"ok": true, "member_id": member_id, "display_name": null, "source": source}))
+        };
+        let line = identity_line(Some("smaths"), &ok(json!("smaths"), "member.toml"));
+        assert_eq!(line, "daemon identity: smaths (agrees; source member.toml)");
+
+        let line = identity_line(Some("smaths"), &ok(json!("ecfromthedc"), "member.toml"));
+        assert!(
+            line.contains("ecfromthedc")
+                && line.contains("post as smaths")
+                && line.contains("align"),
+            "{line}"
+        );
+
+        let line = identity_line(Some("smaths"), &ok(Value::Null, "unset"));
+        assert!(
+            line.contains("NOT SET on the daemon host") && line.contains("member.toml"),
+            "{line}"
+        );
+
+        let line = identity_line(None, &ok(json!("jake"), "env"));
+        assert!(
+            line.contains("jake") && line.contains("--member jake"),
+            "{line}"
+        );
+
+        let line = identity_line(Some("smaths"), &Err(anyhow!("request_failed (404)")));
+        assert!(line.contains("predates GET /v1/identity"), "{line}");
+
+        let line = identity_line(
+            Some("smaths"),
+            &Err(anyhow!("daemon unreachable at http://x")),
+        );
+        assert!(
+            line.starts_with("daemon identity: could not read"),
+            "{line}"
+        );
+    }
     use std::sync::{Arc, Mutex};
 
     #[test]

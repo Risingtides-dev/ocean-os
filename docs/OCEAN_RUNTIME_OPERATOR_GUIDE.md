@@ -636,6 +636,9 @@ GET    /health                            liveness check
 GET    /ready                             readiness (model/credentials wired)
 GET    /metrics                           Prometheus text (v0.0.4); Content-Type: text/plain; version=0.0.4
 
+# Identity (Rooms S0)
+GET    /v1/identity                       who this daemon says its human is — {ok, member_id|null, display_name|null, source: "member.toml"|"env"|"unset"} from <config_dir>/member.toml (member_id = "...", optional display_name = "..."; the dir that holds operator.key and rooms.db) then OCEAN_MEMBER_ID; null when neither is set and NEVER the process user; credential-free; read per request, so writing the file needs no restart. Same file and same rules as ocean-mcp, so a terminal and the desktop app on one box are one person
+
 # Agent product API (session-scoped — first-party surfaces)
 POST   /v1/agent/turns                    submit a turn { prompt, cwd, session_id, ... }
 POST   /v1/agent/voice                    submit a voice turn (transcribed prompt; voice surface)

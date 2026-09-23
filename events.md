@@ -10759,11 +10759,11 @@ area:      [testing]
 
 Main CI has been red since S0 (#462, f458f2ea) merged next to the codex rooms-release branch (#450): each side was green alone, the union failed three ocean-daemon tests. The retire route was missing from the ecosystem contract's room-route table and ARCHITECTURE.md's pinned counts (137/53 -> 138/54), and the two snapshot envelope characterizations did not list the new aliases key. Fixed the table row, the counts, and the two expected-key arrays; no runtime change.
 _________________________________________________________________________________
-time:      [20:47] [09-09-26]
+time:      [20:35] [09-09-26]
 agent:     [claude] [fable 5.1]
-worktree:  cc/onboarding-member-identity
+worktree:  cc/rooms-s0-identity-route
 type:      [feature-request]
-area:      [docs]
+area:      [backend]
 
-The teammate onboarding kit predated Rooms S0: docs/TEAM_ONBOARDING.md still said you post as OCEAN_MEMBER_ID defaulting to $USER, and ops/onboard-teammate.sh never wrote an identity, so a coworker who ran it would install a daemon that does not know who they are. The script now requires --member (the users.json username) and takes an optional --display-name, validates the id against the daemon's and ocean-mcp's character set, and writes ~/.config/ocean-rs/member.toml at 0600 as step 5 of 8 (idempotent; a file naming someone else stops the run unless --force). The checklist prints the GET /v1/identity check. The doc's identity paragraph, the run command, the release bullet (the workflow stages ocean-mcp now; v0.1.0 is the first tag), and the verify step follow. Exercised the new step's scenarios in isolation and confirmed ocean-mcp doctor reads the file it writes.
+Rooms S0, the piece the design direction asked for that the retirement spec never carried: GET /v1/identity (crates/ocean-daemon/src/identity.rs). Credential-free; answers {ok, member_id|null, display_name|null, source: member.toml|env|unset} from <config_dir>/member.toml then OCEAN_MEMBER_ID, resolved per request from the daemon's own config dir so writing the file needs no restart; nothing configured answers null and never the process user. The member_id character set is exactly ocean-mcp's, so a terminal and the desktop app on one box read one file the same way. Route banner 138 -> 139, operator guide quick reference, ARCHITECTURE.md count, daemon AGENTS.md, and the retirement spec updated; unit tests for precedence/null/malformed/comments plus an HTTP test through the router. This unblocks surface slice S1 (identity and transport), which reads it on direct hosts and through the proxy's cross-check.
 _________________________________________________________________________________
