@@ -121,6 +121,7 @@ This crate owns Ocean's agent session/history layer and project prompt loading. 
 
 - `cargo test -p ocean-agent system_prompt`
 - `cargo test -p ocean-agent session`
+- `cargo test -p ocean-agent session_retained_size_measurements -- --nocapture --test-threads=1` — measurement-only persisted-transcript size table (mirrors the runtime's private 32 KiB tool-result cap; see `docs/specs/2026-09-25-retained-size-and-slow-client-measurements.md`).
 - `cargo test -p ocean-agent project_prompt_loads_ocean_agents_md_from_ancestor`
 - `cargo test -p ocean-agent`
 - `cargo check --workspace`

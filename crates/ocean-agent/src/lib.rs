@@ -4043,6 +4043,10 @@ fn last_assistant_text(messages: &[Message]) -> Option<String> {
 }
 
 mod session;
+/// Test-only persisted-transcript retained-size measurements; see
+/// `docs/specs/2026-09-25-retained-size-and-slow-client-measurements.md`.
+#[cfg(test)]
+mod session_retained_size_measurements;
 #[cfg(test)]
 mod tests {
     use super::*;
