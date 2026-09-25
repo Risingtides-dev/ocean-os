@@ -11026,3 +11026,12 @@ area:      [docs]
 
 Recorded three ocean-bedrock landings in the Rooms definition of done. DoD 2.5 is marked done: #161 pins all 39 MCP tools by name, which also showed that "MCP stops at expose_port" was stale because every human route exists. #162 makes rooms:compute-smoke drive all 24 bedrock_workspace tools through the real stdio MCP server and every room CLI verb, asserting outcomes, with a guard test that fails when a pinned tool or verb is not driven. DoD 0.2 gains a note on ocean-bedrock #160: db:check's ok is now true only when every readiness flag holds, it names the gaps and exits 1 otherwise, and the rooms smoke checks that the exit status matches.
 _________________________________________________________________________________ 18:56 docs/dod-2x-bedrock
+
+time:      [18:58] [25-09-26]
+agent:     [claude]
+worktree:  test/observer-token-env-guard
+type:      [feature-request]
+area:      [testing]
+
+Added the guard asked for by the Observatory Task 9 review's rollout recommendation 6: nothing may inject OCEAN_OBSERVER_TOKEN into a child process environment, since every tool subprocess, bash included, would inherit a live Observatory credential. crates/ocean-observatory/tests/observer_token_env_guard.rs scans every crate's production source, skipping test modules and comments. The variable may appear only in ocean-observatory/src/auth.rs, and only as a read. Any .env(, .envs( or set_var( of it fails the test, as does the literal anywhere else. Mutation-checked against a planted Command::env in daemon code. The recommendation's other two parts, parent-directory fsync and the rotation-failure metric, landed with F11.
+_________________________________________________________________________________ 18:58 test/observer-token-env-guard

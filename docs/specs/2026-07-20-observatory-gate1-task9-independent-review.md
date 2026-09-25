@@ -485,3 +485,14 @@ ignore.
   `turn_cancelled`/`turn_abandoned`. Test:
   `restart_sweep_records_interrupted_as_a_phase_change_to_canceled` (also
   fails if an `interrupted` phase is ever added without updating R3).
+
+### Rollout recommendation 6, guard (2026-09-25)
+
+The CI guard the sixth recommendation asks for exists:
+`crates/ocean-observatory/tests/observer_token_env_guard.rs` scans every
+crate's production source and fails if `OCEAN_OBSERVER_TOKEN` is named
+anywhere but `ocean-observatory/src/auth.rs`, or is passed to a child through
+`.env(`, `.envs(`, or `set_var(` there. It was mutation-checked against a
+planted `Command::env` in daemon code. Parent-directory fsync and the
+rotation-failure metric, the other two parts of that recommendation, landed
+with F11.
