@@ -10767,3 +10767,11 @@ area:      [backend]
 
 Rooms S0, the piece the design direction asked for that the retirement spec never carried: GET /v1/identity (crates/ocean-daemon/src/identity.rs). Credential-free; answers {ok, member_id|null, display_name|null, source: member.toml|env|unset} from <config_dir>/member.toml then OCEAN_MEMBER_ID, resolved per request from the daemon's own config dir so writing the file needs no restart; nothing configured answers null and never the process user. The member_id character set is exactly ocean-mcp's, so a terminal and the desktop app on one box read one file the same way. Route banner 138 -> 139, operator guide quick reference, ARCHITECTURE.md count, daemon AGENTS.md, and the retirement spec updated; unit tests for precedence/null/malformed/comments plus an HTTP test through the router. This unblocks surface slice S1 (identity and transport), which reads it on direct hosts and through the proxy's cross-check.
 _________________________________________________________________________________
+time:      [14:35] [25-09-26]
+agent:     [claude]
+worktree:  feat/web-identity-spec
+type:      [plan]
+area:      [docs]
+
+Wrote the operator-approved (2026-09-25) web identity and node-linking program at docs/specs/2026-09-25-ocean-web-identity-and-node-linking-program.md: coworkers sign in at ocean.agentsworld.org with GitHub (active KINGMAKER-SYSTEMS membership, mapped through a new `github` roster field), link their own node with an `ocean link` pairing code (device key per Gate 0 Decision 2, member.toml written to match), see and manage their node's Claude/Codex coding-plan logins through proposed operator-only daemon status/login/logout routes that never return tokens, and use Rooms under that one identity. Invariants: no model credentials in the proxy or coordinator, no identity by address, no daemon URLs in the device picker, tailnet stays the transport. The document authorizes M1 only; M2 and M3 each need an accepted route/contract manifest before daemon or hub routes change, and a relay transport stays deferred. Added a ROADMAP section with M1-M4 and index pointers in docs/README.md and docs/AGENTS.md.
+_________________________________________________________________________________ 14:35 feat/web-identity-spec
