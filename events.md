@@ -10892,3 +10892,12 @@ area:      [infra]
 
 cargo fmt --check was red on main: a hand edit made after formatting in #483 (the widened test deadline) and the scan split in #484 were left unformatted. This is a format-only change to crates/ocean-daemon/src/persistent_rooms.rs and main.rs with no behavior change.
 _________________________________________________________________________________ 16:19 fix/fmt-483
+
+time:      [16:38] [25-09-26]
+agent:     [claude]
+worktree:  fix/observatory-g5-401
+type:      [bug-report]
+area:      [backend]
+
+Repaired the five gating findings from the Observatory Gate 1 Task 9 review as one wave. G1: snapshot_at reads its watermark inside the append lock, and an earlier at is a typed HistoricalSnapshot (409 snapshot_not_historical) instead of current state mislabelled with an old cursor. G2: replay events carry the full §7.3 envelope (recorded_at, truth, producer, topology, correlation, visibility), which the SSE tail already sent, and the manifest's heartbeat text now says 3 seconds. G3: retention finally runs, one minute after boot and hourly on a blocking thread, using the manifest cutoff over a newly persisted per-node first_cursor (additive migration) and real SQLite page usage for the size bound. G4: the cursor seed includes every watermark row, so a full prune plus restart can never reissue a cursor. G5: Observatory 401s carry the §7.4 headers and the §7.1 error body. Each repair has a regression test. The ROADMAP renderer gate stays closed until this wave's delta review passes. ocean-observatory and ocean-daemon suites green, clippy -D warnings.
+_________________________________________________________________________________ 16:38 fix/observatory-g5-401

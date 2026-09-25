@@ -1470,7 +1470,7 @@ id: 1845
 **Event Format:**
 - SSE `data` field: JSON EventEnvelope
 - SSE `id` field: cursor (string), allows browser/client to resume via `Last-Event-ID`
-- Heartbeat (comment lines starting with `:`) every 30 seconds if no events
+- Heartbeat (comment lines starting with `:`) every 3 seconds (the daemon-wide `SSE_KEEPALIVE_INTERVAL`; stricter than the 30 seconds this line first said — text corrected with the Task 9 G2 repair)
 
 **Error Responses:**
 

@@ -1179,6 +1179,13 @@ async fn main() -> anyhow::Result<()> {
     let room_access_wakes = RoomAccessWakeBus::default();
     let room_read_cursor_wakes = RoomReadCursorWakeBus::default();
     let shutdown = CancellationToken::new();
+    // Observatory retention (G3): the Gate 0 7-day / 1-GiB bounds were dead
+    // code with no production caller. Run a pass shortly after boot and then
+    // hourly, off the async workers, until shutdown.
+    if let Some(store) = observatory_store.clone() {
+        let cancel = shutdown.clone();
+        tokio::spawn(observatory::run_retention(store, cancel));
+    }
 
     // Keep the local proxy credential fresh without ever distributing the
     // daemon signing secret. The file is replaced atomically every ten minutes;

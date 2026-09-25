@@ -9,6 +9,11 @@ pub enum StoreError {
     Sql(#[from] rusqlite::Error),
     #[error(transparent)]
     Json(#[from] serde_json::Error),
+    /// G1: the projection is destructive (one current row per execution), so
+    /// Gate 1 cannot answer a snapshot at an earlier cursor. Refused rather
+    /// than answered with current state under an old label.
+    #[error("snapshot at cursor {requested} is historical; the current watermark is {latest}")]
+    HistoricalSnapshot { requested: u64, latest: u64 },
 }
 pub type Result<T> = std::result::Result<T, StoreError>;
 pub struct ObservatoryStore {
@@ -51,8 +56,24 @@ impl ObservatoryStore {
         let db = Connection::open(path)?;
         db.execute_batch("PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON;")?;
         db.execute_batch(SCHEMA)?;
+        // Manifest §4.1/§4.2: the cursor at which each execution first
+        // appeared, so retention can keep every event of a live execution.
+        // Additive: rows written before this column read NULL.
+        let has_first_cursor = db
+            .prepare(
+                "SELECT 1 FROM pragma_table_info('execution_nodes') WHERE name='first_cursor'",
+            )?
+            .exists([])?;
+        if !has_first_cursor {
+            db.execute_batch("ALTER TABLE execution_nodes ADD COLUMN first_cursor INTEGER")?;
+        }
+        // G4: seed from EVERY durable record of how far the log reached, not
+        // only surviving events. A retention pass that prunes every row
+        // followed by a restart would otherwise reissue cursor 1 — a reused
+        // cursor, which the startup rule (§2.3) exists to forbid.
         let max = db.query_row(
-            "SELECT COALESCE(MAX(cursor),0) FROM observatory_events",
+            "SELECT MAX(COALESCE((SELECT MAX(cursor) FROM observatory_events),0),
+                        COALESCE((SELECT MAX(cursor) FROM watermarks),0))",
             [],
             |r| r.get::<_, u64>(0),
         )?;
@@ -77,7 +98,7 @@ impl ObservatoryStore {
             params![cursor.into_inner(), event.event_id, json],
         )?;
         let phase = phase(&event);
-        tx.execute("INSERT INTO execution_nodes(execution_id,root_execution_id,parent_execution_id,phase,created_at) VALUES(?1,?2,?3,?4,?5) ON CONFLICT(execution_id) DO UPDATE SET phase=excluded.phase",params![event.topology.execution_id,event.topology.root_execution_id,event.topology.parent_execution_id,phase,event.recorded_at])?;
+        tx.execute("INSERT INTO execution_nodes(execution_id,root_execution_id,parent_execution_id,phase,created_at,first_cursor) VALUES(?1,?2,?3,?4,?5,?6) ON CONFLICT(execution_id) DO UPDATE SET phase=excluded.phase",params![event.topology.execution_id,event.topology.root_execution_id,event.topology.parent_execution_id,phase,event.recorded_at,cursor.into_inner()])?;
         if let (Some(edge), Some(parent)) = (
             event.topology.edge_id.as_ref(),
             event.topology.parent_execution_id.as_ref(),
@@ -170,35 +191,58 @@ impl ObservatoryStore {
             complete: !more && end == self.latest_cursor(),
         })
     }
-    /// Prune only when all projected executions are terminal; records a retention boundary.
+    /// Apply the retention policy (G3; manifest §4.2) and record the boundary.
+    ///
+    /// Events older than `max_age_days` are pruned, oldest first, and so are
+    /// the oldest events while the database file is over `max_bytes` —
+    /// measured as SQLite's real page usage, not an estimate from envelope
+    /// lengths. Neither rule may cross the first cursor of any non-terminal
+    /// execution: an execution still admitted or running keeps its whole
+    /// history. A non-terminal row written before `first_cursor` existed has
+    /// no recorded start, so it blocks pruning until the restart sweep closes
+    /// it rather than risking its history.
     pub fn apply_retention(&self) -> Result<usize> {
         let mut db = self.db.lock();
-        let active: u64 = db.query_row(
-            "SELECT COUNT(*) FROM execution_nodes WHERE phase IN ('admitted','running')",
+        let (nonterminal, unknown_start, min_first): (u64, u64, Option<u64>) = db.query_row(
+            "SELECT COUNT(*), COALESCE(SUM(first_cursor IS NULL),0), MIN(first_cursor)
+             FROM execution_nodes WHERE phase IN ('admitted','running')",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        )?;
+        if unknown_start > 0 {
+            return Ok(0);
+        }
+        let prunable_through = match (nonterminal, min_first) {
+            // SQLite integers are signed; this is "no ceiling".
+            (0, _) | (_, None) => i64::MAX as u64,
+            (_, Some(first)) => first.saturating_sub(1),
+        };
+        let db_bytes: u64 = db.query_row(
+            "SELECT page_count * page_size FROM pragma_page_count(), pragma_page_size()",
             [],
             |r| r.get(0),
         )?;
-        if active != 0 {
-            return Ok(0);
-        }
-        let mut stmt =
-            db.prepare("SELECT cursor, envelope_json FROM observatory_events ORDER BY cursor")?;
+        let mut over = db_bytes.saturating_sub(self.retention_policy.max_bytes);
+        let mut stmt = db.prepare(
+            "SELECT cursor, envelope_json FROM observatory_events WHERE cursor <= ?1 ORDER BY cursor",
+        )?;
         let rows = stmt
-            .query_map([], |r| Ok((r.get::<_, u64>(0)?, r.get::<_, String>(1)?)))?
+            .query_map([prunable_through], |r| {
+                Ok((r.get::<_, u64>(0)?, r.get::<_, String>(1)?))
+            })?
             .collect::<std::result::Result<Vec<_>, _>>()?;
         drop(stmt);
         let cutoff =
             chrono::Utc::now() - chrono::Duration::days(self.retention_policy.max_age_days as i64);
-        let mut total: u64 = rows.iter().map(|(_, j)| j.len() as u64).sum();
         let mut boundary = 0;
         for (cursor, raw) in &rows {
             let event: EventEnvelope = serde_json::from_str(raw)?;
             let old = chrono::DateTime::parse_from_rfc3339(&event.recorded_at)
                 .map(|t| t.with_timezone(&chrono::Utc).lt(&cutoff))
                 .unwrap_or(false);
-            if old || total > self.retention_policy.max_bytes {
+            if old || over > 0 {
                 boundary = *cursor;
-                total = total.saturating_sub(raw.len() as u64);
+                over = over.saturating_sub(raw.len() as u64);
             } else {
                 break;
             }
@@ -216,9 +260,23 @@ impl ObservatoryStore {
         tx.commit()?;
         Ok(count)
     }
+    /// The current projection, labelled with the watermark it actually
+    /// reflects (G1). The watermark is read INSIDE the database lock that
+    /// `append_event` holds for its whole transaction, so no append can land
+    /// between the label and the rows. `at` is accepted only when it IS that
+    /// watermark: an earlier cursor is `HistoricalSnapshot`, because the
+    /// destructive projection cannot reconstruct past state.
     pub fn snapshot_at(&self, at: Option<Cursor>) -> Result<Snapshot> {
-        let watermark = at.unwrap_or_else(|| self.latest_cursor());
         let db = self.db.lock();
+        let watermark = self.latest_cursor();
+        if let Some(requested) = at {
+            if requested != watermark {
+                return Err(StoreError::HistoricalSnapshot {
+                    requested: requested.into_inner(),
+                    latest: watermark.into_inner(),
+                });
+            }
+        }
         let mut s=db.prepare("SELECT execution_id,root_execution_id,parent_execution_id,phase,created_at FROM execution_nodes")?;
         let nodes = s
             .query_map([], |r| {

@@ -6,6 +6,7 @@
 
 use axum::extract::FromRequestParts;
 use axum::http::{header, request::Parts, StatusCode};
+use axum::response::{IntoResponse, Response};
 use ocean_observatory::{
     verify_token, write_summary_observer_token, ObserverPrincipal, ObserverSecret,
 };
@@ -63,18 +64,65 @@ impl<S> FromRequestParts<S> for ObservatoryAuth
 where
     S: Send + Sync,
 {
-    type Rejection = StatusCode;
+    type Rejection = ObservatoryUnauthorized;
 
     async fn from_request_parts(parts: &mut Parts, _state: &S) -> Result<Self, Self::Rejection> {
+        let rejection = || ObservatoryUnauthorized::for_request(parts);
         let auth_state = parts
             .extensions
             .get::<ObservatoryAuthState>()
-            .ok_or(StatusCode::UNAUTHORIZED)?;
-        let token = request_token(parts).ok_or(StatusCode::UNAUTHORIZED)?;
+            .ok_or_else(rejection)?;
+        let token = request_token(parts).ok_or_else(rejection)?;
 
         verify_token(token, &auth_state.secret, &auth_state.daemon_instance_id)
             .map(Self)
-            .map_err(|_| StatusCode::UNAUTHORIZED)
+            .map_err(|_| rejection())
+    }
+}
+
+/// Every Observatory credential failure (G5): a 401 carrying the §7.4 headers
+/// every Observatory response carries and the §7.1 `{error, message,
+/// http_status}` body — not a bare status. One fixed message whatever failed,
+/// so a caller learns nothing about which check refused it.
+#[derive(Debug)]
+pub(super) struct ObservatoryUnauthorized {
+    cursor: ocean_observatory::Cursor,
+    instance: String,
+}
+
+impl ObservatoryUnauthorized {
+    fn for_request(parts: &Parts) -> Self {
+        let (cursor, instance) = match parts
+            .extensions
+            .get::<crate::observatory::ObservatoryServices>()
+        {
+            Some(services) => services.header_facts(),
+            None => (
+                ocean_observatory::Cursor::new(0),
+                parts
+                    .extensions
+                    .get::<ObservatoryAuthState>()
+                    .map(|state| state.daemon_instance_id.clone())
+                    .unwrap_or_else(|| "unknown".to_owned()),
+            ),
+        };
+        Self { cursor, instance }
+    }
+
+    #[cfg(test)]
+    pub(super) fn status(&self) -> StatusCode {
+        StatusCode::UNAUTHORIZED
+    }
+}
+
+impl IntoResponse for ObservatoryUnauthorized {
+    fn into_response(self) -> Response {
+        crate::observatory::error_response(
+            StatusCode::UNAUTHORIZED,
+            crate::observatory::observatory_headers(self.cursor, &self.instance),
+            "unauthorized",
+            "Missing or invalid observer token",
+        )
     }
 }
 
@@ -121,7 +169,9 @@ mod tests {
     async fn extract(request: Request<axum::body::Body>) -> Result<ObservatoryAuth, StatusCode> {
         let (mut parts, _) = request.into_parts();
         parts.extensions.insert(auth_state());
-        ObservatoryAuth::from_request_parts(&mut parts, &()).await
+        ObservatoryAuth::from_request_parts(&mut parts, &())
+            .await
+            .map_err(|rejection| rejection.status())
     }
 
     #[tokio::test]

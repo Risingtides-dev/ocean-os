@@ -66,6 +66,17 @@ pub(crate) struct ObservatoryServices {
 }
 
 impl ObservatoryServices {
+    /// The watermark and instance the §7.4 headers name, for a response built
+    /// outside a route handler (the auth rejection).
+    pub(super) fn header_facts(&self) -> (Cursor, String) {
+        let cursor = self
+            .store
+            .as_ref()
+            .map(|store| store.latest_cursor())
+            .unwrap_or_else(|| Cursor::new(0));
+        (cursor, self.daemon_instance_id.clone())
+    }
+
     /// Load route services at startup. Never fails: store errors degrade to
     /// `None` and are logged; the stable observatory id falls back to the
     /// boot id when its file is unreadable/unwritable.
@@ -117,7 +128,36 @@ impl ObservatoryServices {
     }
 }
 
-/// Stable observatory identity: persisted across daemon restarts, reset only
+/// How often the retention pass runs. Pruning is cheap when nothing is due,
+/// and the Gate 0 bounds are days and gigabytes, so hourly is ample.
+const RETENTION_INTERVAL: Duration = Duration::from_secs(60 * 60);
+/// First pass shortly after boot, off the startup critical path.
+const RETENTION_FIRST_DELAY: Duration = Duration::from_secs(60);
+
+/// G3: apply the store's retention policy on a schedule until `cancel`.
+/// Each pass runs on a blocking thread (it reads and deletes SQLite rows);
+/// a failed pass is logged and the next one tries again.
+pub(crate) async fn run_retention(
+    store: Arc<ObservatoryStore>,
+    cancel: tokio_util::sync::CancellationToken,
+) {
+    let mut delay = RETENTION_FIRST_DELAY;
+    loop {
+        tokio::select! {
+            () = cancel.cancelled() => return,
+            () = tokio::time::sleep(delay) => {}
+        }
+        delay = RETENTION_INTERVAL;
+        let pass_store = Arc::clone(&store);
+        match tokio::task::spawn_blocking(move || pass_store.apply_retention()).await {
+            Ok(Ok(0)) => {}
+            Ok(Ok(pruned)) => tracing::info!(pruned, "observatory retention pruned events"),
+            Ok(Err(error)) => tracing::warn!(%error, "observatory retention pass failed"),
+            Err(error) => tracing::warn!(%error, "observatory retention pass panicked"),
+        }
+    }
+}
+
 /// when the operator deletes the file. Best-effort; falls back to the boot id.
 fn load_or_create_observatory_id(config_dir: &Path, daemon_instance_id: &str) -> String {
     let path = config_dir.join("observatory-id");
@@ -142,7 +182,7 @@ fn load_or_create_observatory_id(config_dir: &Path, daemon_instance_id: &str) ->
 // ── Shared helpers ──────────────────────────────────────────────────────────
 
 /// §7.4 headers present on every Observatory response.
-fn observatory_headers(watermark: Cursor, instance: &str) -> HeaderMap {
+pub(super) fn observatory_headers(watermark: Cursor, instance: &str) -> HeaderMap {
     let mut headers = HeaderMap::new();
     headers.insert(
         header::CACHE_CONTROL,
@@ -162,7 +202,12 @@ fn observatory_headers(watermark: Cursor, instance: &str) -> HeaderMap {
     headers
 }
 
-fn error_response(status: StatusCode, headers: HeaderMap, error: &str, message: &str) -> Response {
+pub(super) fn error_response(
+    status: StatusCode,
+    headers: HeaderMap,
+    error: &str,
+    message: &str,
+) -> Response {
     let body = json!({
         "error": error,
         "message": message,
@@ -283,6 +328,16 @@ pub(crate) async fn snapshot(
 
     let projection = match store.snapshot_at(at) {
         Ok(projection) => projection,
+        // G1: Gate 1 serves the current projection only; an earlier `at` is
+        // refused instead of answered with current state under its label.
+        Err(ocean_observatory::StoreError::HistoricalSnapshot { .. }) => {
+            return error_response(
+                StatusCode::CONFLICT,
+                headers,
+                "snapshot_not_historical",
+                "Only the current watermark can be snapshotted; omit `at` and tail from the returned watermark",
+            );
+        }
         Err(error) => {
             tracing::error!(%error, "observatory snapshot read failed");
             return store_unavailable(headers);
@@ -645,10 +700,16 @@ pub(crate) async fn replay(
             event_id: envelope.event_id,
             schema_version: envelope.schema_version,
             occurred_at: envelope.occurred_at,
+            recorded_at: envelope.recorded_at,
             kind: serde_json::to_value(envelope.kind)
                 .ok()
                 .and_then(|value| value.as_str().map(str::to_owned))
                 .unwrap_or_else(|| "unknown".to_owned()),
+            truth: envelope.truth,
+            producer: envelope.producer,
+            topology: envelope.topology,
+            correlation: envelope.correlation,
+            visibility: envelope.visibility,
             payload: serde_json::to_value(&envelope.payload)
                 .unwrap_or_else(|_| json!({"redacted": true})),
         })
@@ -758,6 +819,34 @@ mod tests {
         Arc::new(store)
     }
 
+    /// G3: the scheduled loop really runs retention (the policy used to have
+    /// no production caller) and stops when the daemon shuts down.
+    #[tokio::test(start_paused = true)]
+    async fn scheduled_retention_prunes_and_stops_on_shutdown() {
+        let mut old = envelope("done", EventKind::ExecutionFinished);
+        old.recorded_at = (chrono::Utc::now() - chrono::Duration::days(30)).to_rfc3339();
+        let store = store_with(&[old]);
+        assert_eq!(store.events_after(Cursor::new(0), None).unwrap().len(), 1);
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let task = tokio::spawn(run_retention(Arc::clone(&store), cancel.clone()));
+        // Let the loop start its first sleep before the clock moves.
+        tokio::task::yield_now().await;
+        tokio::time::advance(RETENTION_FIRST_DELAY + Duration::from_secs(1)).await;
+        for _ in 0..200 {
+            if store.retention_boundary().unwrap().is_some() {
+                break;
+            }
+            tokio::task::yield_now().await;
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert_eq!(store.retention_boundary().unwrap(), Some(Cursor::new(1)));
+        cancel.cancel();
+        tokio::time::timeout(Duration::from_secs(5), task)
+            .await
+            .expect("retention loop ends on shutdown")
+            .unwrap();
+    }
+
     fn envelope(execution_id: &str, kind: EventKind) -> EventEnvelope {
         let now = chrono::Utc::now().to_rfc3339();
         // Payload drives the store's node-phase projection, so it must agree
@@ -841,7 +930,53 @@ mod tests {
                 .await
                 .expect("response");
             assert_eq!(response.status(), StatusCode::UNAUTHORIZED, "{path}");
+            // G5: §7.4 headers and the §7.1 body on the rejection too.
+            let headers = response.headers();
+            assert_eq!(
+                headers[header::CACHE_CONTROL],
+                "no-store, no-cache, must-revalidate, private",
+                "{path}"
+            );
+            assert_eq!(headers[header::PRAGMA], "no-cache", "{path}");
+            assert_eq!(headers[header::EXPIRES], "0", "{path}");
+            assert!(headers.contains_key("x-observatory-cursor"), "{path}");
+            assert!(headers.contains_key("x-observatory-instance"), "{path}");
+            let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+            assert_eq!(
+                body,
+                json!({
+                    "error": "unauthorized",
+                    "message": "Missing or invalid observer token",
+                    "http_status": 401,
+                }),
+                "{path}"
+            );
         }
+    }
+
+    /// G1 on the wire: an earlier `at` is a 409, never current state under an
+    /// old label; `at` equal to the watermark still answers 200.
+    #[tokio::test]
+    async fn snapshot_refuses_a_historical_cursor() {
+        let store = store_with(&[
+            envelope("a", EventKind::ExecutionAdmitted),
+            envelope("b", EventKind::ExecutionAdmitted),
+        ]);
+        let response = app(Arc::clone(&store))
+            .oneshot(authed("/v1/observatory/snapshot?at=1"))
+            .await
+            .expect("response");
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        let body: Value = serde_json::from_str(&body_string(response).await).expect("json");
+        assert_eq!(body["error"], "snapshot_not_historical");
+        let response = app(store)
+            .oneshot(authed("/v1/observatory/snapshot?at=2"))
+            .await
+            .expect("response");
+        assert_eq!(response.status(), StatusCode::OK);
     }
 
     #[tokio::test]
@@ -922,6 +1057,25 @@ mod tests {
         assert_eq!(first.status(), StatusCode::OK);
         let page: Value = serde_json::from_str(&body_string(first).await).expect("json");
         assert_eq!(page["events"].as_array().expect("events").len(), 2);
+        // G2: the full §7.3 envelope, not the reduced six fields.
+        let event = page["events"][0].as_object().expect("event object");
+        for field in [
+            "cursor",
+            "event_id",
+            "schema_version",
+            "occurred_at",
+            "recorded_at",
+            "kind",
+            "truth",
+            "producer",
+            "topology",
+            "correlation",
+            "visibility",
+            "payload",
+        ] {
+            assert!(event.contains_key(field), "replay event lacks {field}");
+        }
+        assert_eq!(event.len(), 12, "exactly the §7.3 fields: {event:?}");
         assert_eq!(page["has_more"], json!(true));
         assert_eq!(page["complete"], json!(false));
         assert_eq!(page["next_after"], json!("2"));

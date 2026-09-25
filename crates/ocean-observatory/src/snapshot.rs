@@ -263,8 +263,26 @@ pub struct ReplayEvent {
     /// UTC timestamp when the fact occurred (RFC 3339).
     pub occurred_at: String,
 
+    /// UTC timestamp when the daemon recorded the fact (RFC 3339).
+    pub recorded_at: String,
+
     /// Kind of event.
     pub kind: String,
+
+    /// How the fact is known — the attestation seam (manifest §7.3, G2).
+    pub truth: crate::TruthProvenance,
+
+    /// Who produced the fact.
+    pub producer: crate::Producer,
+
+    /// Where the fact sits in the execution tree.
+    pub topology: crate::Topology,
+
+    /// Tool-call / permission correlation ids, when the fact has them.
+    pub correlation: crate::Correlation,
+
+    /// Observer visibility class of the payload.
+    pub visibility: crate::Visibility,
 
     /// JSON payload — varies by kind, never contains forbidden fields.
     pub payload: serde_json::Value,
@@ -393,7 +411,27 @@ mod tests {
                 event_id: "evt-100".to_string(),
                 schema_version: 1,
                 occurred_at: "2026-07-17T18:10:00.000Z".to_string(),
+                recorded_at: "2026-07-17T18:10:00.002Z".to_string(),
                 kind: "execution.admitted".to_string(),
+                truth: crate::TruthProvenance::HostObserved,
+                producer: crate::Producer {
+                    kind: crate::ProducerKind::Daemon,
+                    id: "ocean-daemon".to_string(),
+                },
+                topology: crate::Topology {
+                    execution_id: "e".to_string(),
+                    root_execution_id: "e".to_string(),
+                    parent_execution_id: None,
+                    edge_id: None,
+                    session_id: "s".to_string(),
+                    turn_id: "t".to_string(),
+                    request_id: "r".to_string(),
+                },
+                correlation: crate::Correlation {
+                    tool_call_id: None,
+                    permission_id: None,
+                },
+                visibility: crate::Visibility::Metadata,
                 payload: serde_json::json!({
                     "phase": "running",
                     "labels": ["test"]
