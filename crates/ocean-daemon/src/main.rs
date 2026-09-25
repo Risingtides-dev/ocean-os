@@ -17346,7 +17346,7 @@ mod tests {
 
         // Subscribe before the delete so the sweep's post-commit wake hint —
         // what keeps live roster tails honest — is observable.
-        let mut wake_rx = state.room_wakes.test_subscribe();
+        let mut wake_rx = state.room_wakes.test_subscribe(&swept);
 
         let (status, body) = agent_delete(State(state.clone()), Path("helper".to_string())).await;
         assert_eq!(status, StatusCode::OK);

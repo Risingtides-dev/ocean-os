@@ -57,10 +57,17 @@ pub(super) struct RoomWakeHint {
     seq: u64,
 }
 
-/// Daemon-wide bounded wake channel for durable room transcript tails.
+/// Bounded wake channels for durable room transcript tails, ONE PER ROOM
+/// (DoD 4.4). A single daemon-wide channel woke every open tail on every
+/// room's message and, worse, let one busy room overflow the shared buffer so
+/// quiet rooms' tails lagged and re-paged for traffic that was never theirs.
+/// A room's sender exists while someone subscribes to it and is dropped on the
+/// next subscribe or publish after its last receiver leaves.
 #[derive(Clone)]
 pub(super) struct RoomWakeBus {
-    tx: broadcast::Sender<RoomWakeHint>,
+    capacity: usize,
+    rooms:
+        Arc<std::sync::Mutex<std::collections::HashMap<RoomKey, broadcast::Sender<RoomWakeHint>>>>,
 }
 
 impl Default for RoomWakeBus {
@@ -71,29 +78,66 @@ impl Default for RoomWakeBus {
 
 impl RoomWakeBus {
     pub(super) fn new(capacity: usize) -> Self {
-        let (tx, _) = broadcast::channel(capacity);
-        Self { tx }
+        Self {
+            capacity,
+            rooms: Arc::default(),
+        }
     }
 
-    fn subscribe(&self) -> broadcast::Receiver<RoomWakeHint> {
-        self.tx.subscribe()
+    fn channels(
+        &self,
+    ) -> std::sync::MutexGuard<
+        '_,
+        std::collections::HashMap<RoomKey, broadcast::Sender<RoomWakeHint>>,
+    > {
+        // The map holds only senders; a panic mid-insert leaves it usable.
+        self.rooms
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    fn subscribe(&self, room: &RoomKey) -> broadcast::Receiver<RoomWakeHint> {
+        let mut rooms = self.channels();
+        rooms.retain(|_, tx| tx.receiver_count() > 0);
+        rooms
+            .entry(room.clone())
+            .or_insert_with(|| broadcast::channel(self.capacity).0)
+            .subscribe()
     }
 
     #[cfg(test)]
-    pub(super) fn test_subscribe(&self) -> broadcast::Receiver<RoomWakeHint> {
-        self.subscribe()
+    pub(super) fn test_subscribe(&self, room: &RoomKey) -> broadcast::Receiver<RoomWakeHint> {
+        self.subscribe(room)
     }
 
     fn publish(&self, room: &RoomKey, message: &RoomMessage) {
-        let _ = self.tx.send(RoomWakeHint {
+        let mut rooms = self.channels();
+        let Some(tx) = rooms.get(room) else {
+            return;
+        };
+        if tx.receiver_count() == 0 {
+            rooms.remove(room);
+            return;
+        }
+        let _ = tx.send(RoomWakeHint {
             room: room.clone(),
             seq: message.seq,
         });
     }
 
+    /// Live receivers across every room.
     #[cfg(test)]
     fn receiver_count(&self) -> usize {
-        self.tx.receiver_count()
+        self.channels()
+            .values()
+            .map(broadcast::Sender::receiver_count)
+            .sum()
+    }
+
+    /// How many rooms currently hold a sender.
+    #[cfg(test)]
+    fn room_count(&self) -> usize {
+        self.channels().len()
     }
 }
 
@@ -4589,7 +4633,7 @@ pub(super) async fn room_events(
     // wake alone — e.g. a federated Connecting/Recovering -> Live transition
     // that does not itself carry a fresh upstream cursor frame — is enough to
     // make the cursor tail re-check and emit (see `run_room_read_cursor_tail`).
-    let message_hints = state.room_wakes.subscribe();
+    let message_hints = state.room_wakes.subscribe(&room);
     let access_hints = state.room_access_wakes.subscribe();
     let cursor_access_hints = state.room_access_wakes.subscribe();
     let cursor_hints = state.room_read_cursor_wakes.subscribe();
@@ -5700,6 +5744,56 @@ mod tests {
             on_behalf_of: None,
             version: 4,
         }
+    }
+
+    /// DoD 4.4: a busy room neither wakes nor lags another room's tail.
+    #[test]
+    fn wake_channels_are_per_room_and_a_busy_room_cannot_lag_a_quiet_one() {
+        let bus = RoomWakeBus::new(2);
+        let busy = RoomKey::new("busy");
+        let quiet = RoomKey::new("quiet");
+        let mut quiet_rx = bus.test_subscribe(&quiet);
+        let _busy_rx = bus.test_subscribe(&busy);
+        let mut message = summary_system_line();
+        for seq in 0..10 {
+            message.seq = seq;
+            bus.publish(&busy, &message);
+        }
+        assert!(
+            matches!(
+                quiet_rx.try_recv(),
+                Err(broadcast::error::TryRecvError::Empty)
+            ),
+            "ten messages in another room neither reach nor overflow this tail"
+        );
+        message.seq = 3;
+        bus.publish(&quiet, &message);
+        let hint = quiet_rx.try_recv().expect("its own room's hint arrives");
+        assert_eq!((hint.room, hint.seq), (quiet, 3));
+    }
+
+    #[test]
+    fn a_room_nobody_tails_holds_no_channel() {
+        let bus = RoomWakeBus::new(4);
+        let room = RoomKey::new("r");
+        let message = summary_system_line();
+        bus.publish(&room, &message);
+        assert_eq!(
+            bus.room_count(),
+            0,
+            "publishing to an untailed room allocates nothing"
+        );
+        let rx = bus.test_subscribe(&room);
+        assert_eq!((bus.room_count(), bus.receiver_count()), (1, 1));
+        drop(rx);
+        bus.publish(&room, &message);
+        assert_eq!(
+            bus.room_count(),
+            0,
+            "the last receiver leaving frees the room's sender"
+        );
+        let _rx = bus.test_subscribe(&RoomKey::new("other"));
+        assert_eq!(bus.room_count(), 1);
     }
 
     fn summary_system_line() -> RoomMessage {
@@ -8645,7 +8739,7 @@ mod tests {
         key: &RoomKey,
         resume: Option<u64>,
     ) -> (ReceiverStream<RoomMessage>, oneshot::Sender<()>) {
-        let hints = state.room_wakes.subscribe();
+        let hints = state.room_wakes.subscribe(key);
         let (ready_tx, ready_rx) = oneshot::channel();
         let (release_tx, release_rx) = oneshot::channel();
         let stream = room_message_tail(
@@ -13946,7 +14040,7 @@ env = { FIXTURE = "1" }
         .unwrap();
         join_participant(&state, &key, "alice", RoomParticipantKind::Human, "Alice");
 
-        let hints = state.room_wakes.subscribe();
+        let hints = state.room_wakes.subscribe(&key);
         let mut stream = room_message_tail(state.clone(), key.clone(), None, hints, None);
         wait_for_wake_receivers(&state, 1).await;
 
