@@ -11017,3 +11017,12 @@ area:      [backend]
 
 Fixed the connect-cost hazard the retained-size measurements (#495) found. Every /v1/agent/events connect built merged_ordered(), a deep clone of the whole replay ring (about 31 MiB at the byte cap), while holding the history lock that emit waits on, even for a plain connect with nothing to replay. AgentEventBus now has a by-reference merged_refs(). subscribe_with_replay(None) returns before building any merged view, and anchored resumes (plain and checked) clone only the envelopes after the anchor. Only the ?replay=1 full replay still clones the whole ring, because that is what it returns. Semantics are unchanged: same order, same floor merge, same gap bounds. Measured plain-connect lock hold against a full 31 MiB ring dropped from about 1 ms to 325 ns, next to 229 ns for an empty ring. ocean-daemon 986 tests, clippy -D warnings.
 _________________________________________________________________________________ 18:38 perf/agent-events-connect-copy
+
+time:      [18:56] [25-09-26]
+agent:     [claude]
+worktree:  docs/dod-2x-bedrock
+type:      [review]
+area:      [docs]
+
+Recorded three ocean-bedrock landings in the Rooms definition of done. DoD 2.5 is marked done: #161 pins all 39 MCP tools by name, which also showed that "MCP stops at expose_port" was stale because every human route exists. #162 makes rooms:compute-smoke drive all 24 bedrock_workspace tools through the real stdio MCP server and every room CLI verb, asserting outcomes, with a guard test that fails when a pinned tool or verb is not driven. DoD 0.2 gains a note on ocean-bedrock #160: db:check's ok is now true only when every readiness flag holds, it names the gaps and exits 1 otherwise, and the rooms smoke checks that the exit status matches.
+_________________________________________________________________________________ 18:56 docs/dod-2x-bedrock
