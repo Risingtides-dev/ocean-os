@@ -447,18 +447,39 @@ pub(super) fn room_db_path() -> std::path::PathBuf {
 /// through and records via the process-global install point instead; see
 /// [`crate::metrics::with_process_room_metrics`] for why that indirection
 /// exists and what it costs.
+/// Run blocking room-store work without stalling the async worker it was called
+/// on (DoD 4.4). Every store call is synchronous SQLite behind a std mutex, and
+/// 450-odd call sites reach it from async handlers; on the multi-thread runtime
+/// `block_in_place` hands this worker's other tasks to a fresh worker for the
+/// duration, so one slow write or a contended lock no longer parks every task
+/// queued behind it. Measured cost on a worker: ~6µs per call over the bare
+/// lock (release build, in-memory store), negligible beside the millisecond
+/// HTTP handlers these calls sit in. A current-thread runtime (most unit tests) or a caller
+/// with no runtime at all (a `spawn_blocking` thread, a plain `#[test]`) runs
+/// the closure inline, exactly as before.
+fn off_async_worker<T>(f: impl FnOnce() -> T) -> T {
+    match tokio::runtime::Handle::try_current() {
+        Ok(handle) if handle.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread => {
+            tokio::task::block_in_place(f)
+        }
+        _ => f(),
+    }
+}
+
 pub(super) fn with_rooms_handle<T>(
     rooms: &RoomStoreHandle,
     f: impl FnOnce(&mut ocean_store::SqliteRoomStore) -> T,
 ) -> T {
-    let waiting_since = std::time::Instant::now();
-    let mut guard = match rooms.lock() {
-        Ok(g) => g,
-        Err(poisoned) => poisoned.into_inner(),
-    };
-    let waited = waiting_since.elapsed();
-    crate::metrics::with_process_room_metrics(|metrics| metrics.record_store_lock_wait(waited));
-    f(&mut guard)
+    off_async_worker(|| {
+        let waiting_since = std::time::Instant::now();
+        let mut guard = match rooms.lock() {
+            Ok(g) => g,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        let waited = waiting_since.elapsed();
+        crate::metrics::with_process_room_metrics(|metrics| metrics.record_store_lock_wait(waited));
+        f(&mut guard)
+    })
 }
 
 /// Run a closure with the locked room store, recovering a poisoned lock the same
@@ -474,15 +495,17 @@ pub(super) fn with_rooms<T>(
     state: &AppState,
     f: impl FnOnce(&mut ocean_store::SqliteRoomStore) -> T,
 ) -> T {
-    let waiting_since = std::time::Instant::now();
-    let mut guard = match state.rooms.lock() {
-        Ok(g) => g,
-        Err(poisoned) => poisoned.into_inner(),
-    };
-    state
-        .room_metrics
-        .record_store_lock_wait(waiting_since.elapsed());
-    f(&mut guard)
+    off_async_worker(|| {
+        let waiting_since = std::time::Instant::now();
+        let mut guard = match state.rooms.lock() {
+            Ok(g) => g,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        state
+            .room_metrics
+            .record_store_lock_wait(waiting_since.elapsed());
+        f(&mut guard)
+    })
 }
 
 /// Refresh cached room metrics off the async workers. Only the startup-owned
@@ -5794,6 +5817,55 @@ mod tests {
         );
         let _rx = bus.test_subscribe(&RoomKey::new("other"));
         assert_eq!(bus.room_count(), 1);
+    }
+
+    /// DoD 4.4: a slow store operation on the only worker no longer stalls
+    /// every other task — `block_in_place` moves them to a replacement worker.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    async fn slow_store_work_does_not_park_the_async_worker() {
+        let rooms: RoomStoreHandle = Arc::new(Mutex::new(
+            ocean_store::SqliteRoomStore::open_in_memory().expect("store"),
+        ));
+        let ticked = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        // The store work runs in a SPAWNED task, so it occupies the runtime's
+        // only worker (the test body itself runs on the block_on thread).
+        let store_task = {
+            let ticked = ticked.clone();
+            tokio::spawn(async move {
+                with_rooms_handle(&rooms, |_store| {
+                    let deadline =
+                        std::time::Instant::now() + std::time::Duration::from_secs(5);
+                    while std::time::Instant::now() < deadline {
+                        if ticked.load(std::sync::atomic::Ordering::SeqCst) {
+                            return true;
+                        }
+                        std::thread::sleep(std::time::Duration::from_millis(5));
+                    }
+                    false
+                })
+            })
+        };
+        // Give the store task time to take the worker, then queue work behind it.
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        let ticker = {
+            let ticked = ticked.clone();
+            tokio::spawn(async move {
+                ticked.store(true, std::sync::atomic::Ordering::SeqCst);
+            })
+        };
+        assert!(
+            store_task.await.unwrap(),
+            "a task queued behind blocking store work ran while it held the only worker"
+        );
+        ticker.await.unwrap();
+    }
+
+    #[test]
+    fn store_work_outside_a_runtime_runs_inline() {
+        let rooms: RoomStoreHandle = Arc::new(Mutex::new(
+            ocean_store::SqliteRoomStore::open_in_memory().expect("store"),
+        ));
+        assert_eq!(with_rooms_handle(&rooms, |_store| 7), 7);
     }
 
     fn summary_system_line() -> RoomMessage {
