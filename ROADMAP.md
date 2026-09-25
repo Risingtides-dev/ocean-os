@@ -71,6 +71,23 @@ across those computers. The architecture does not itself authorize code changes.
       no room or federation metrics (4.1); `OCEAN_ECOSYSTEM_CONTRACT.md` lists
       11 of the 40 room routes (5.2); `cargo deny` is red (3.5).
 
+## Ocean web identity and node linking
+
+Program approved 2026-09-25 in
+[`docs/specs/2026-09-25-ocean-web-identity-and-node-linking-program.md`](docs/specs/2026-09-25-ocean-web-identity-and-node-linking-program.md):
+coworkers sign in at `ocean.agentsworld.org`, link their own node, manage its
+coding-plan logins, and use Rooms under one identity. The program authorizes
+M1 only; M2 and M3 each need an accepted route/contract manifest first.
+
+- [ ] M1 — GitHub sign-in on the proxy, gated on active `KINGMAKER-SYSTEMS`
+      membership and mapped through a `github` roster field (ocean-surface).
+- [ ] M2 — Self-serve node linking: `ocean link` pairing code approved on the
+      web, device key per Gate 0 Decision 2, `member.toml` written to match.
+- [ ] M3 — Coding plans over HTTP: operator-authenticated daemon provider
+      status/login/logout routes and a Surface "Coding plans" panel; never tokens.
+- [ ] M4 — Rooms invites and joins in the web UI, member id equal to the web
+      login identity.
+
 ## Ocean Observatory
 
 - [x] Gate 0 decisions accepted — see [`docs/specs/2026-07-17-observatory-gate0-decisions.md`](docs/specs/2026-07-17-observatory-gate0-decisions.md), including the operator's 90s-game visual-parity ruling on truthful events with a durable event store.

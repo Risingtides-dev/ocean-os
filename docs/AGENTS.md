@@ -44,6 +44,13 @@ This child contract governs current architecture, operations, cross-repository r
   cross-repository Rooms finish-line contract. It records member-visible,
   executable acceptance criteria and remaining ownership across Ocean OS,
   Surface, and Bedrock; it authorizes no implementation by itself.
+- `specs/2026-09-25-ocean-web-identity-and-node-linking-program.md` is the
+  operator-approved (2026-09-25) web identity and node-linking program. It
+  authorizes only M1 (GitHub sign-in on the ocean-surface proxy); M2 node
+  linking and M3 daemon provider-login routes each need an accepted
+  route/contract manifest first. Its invariants — no model credentials in the
+  proxy or coordinator, no identity by address, no daemon URLs in the device
+  picker — bind every milestone.
 
 ## Work Guidance
 
