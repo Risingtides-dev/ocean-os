@@ -1,0 +1,55 @@
+{
+  "note": "The room wire facts ocean-surface depends on, published by ocean-daemon and held equal to the router by room_wire_contract_matches_the_daemon (crates/ocean-daemon). ocean-surface vendors this file; see docs/contracts/README.md.",
+  "version": 1,
+  "sse_events": [
+    "room_access",
+    "room_message",
+    "room_read_cursor"
+  ],
+  "access_states": [
+    "local",
+    "connecting",
+    "live",
+    "recovering",
+    "revoked"
+  ],
+  "message_kinds": [
+    "message",
+    "participant_joined",
+    "participant_left",
+    "system"
+  ],
+  "participant_kinds": [
+    "human",
+    "agent",
+    "bot",
+    "tool",
+    "system"
+  ],
+  "snapshot_keys": [
+    "access",
+    "agent_owners",
+    "aliases",
+    "closed",
+    "has_more",
+    "last_seq",
+    "next_seq",
+    "ok",
+    "participants",
+    "prev_seq",
+    "room",
+    "transcript"
+  ],
+  "transcript_keys": [
+    "closed",
+    "has_more",
+    "next_seq",
+    "ok",
+    "transcript"
+  ],
+  "not_open": {
+    "status": 404,
+    "marker": "room_not_open",
+    "code": "room_not_found"
+  }
+}

@@ -10874,3 +10874,12 @@ area:      [backend]
 
 Closed Rooms DoD 4.4: room store work no longer parks the async worker it runs on. All ~450 call sites reach synchronous SQLite behind a std mutex through the two adapters with_rooms and with_rooms_handle, so a slow write or a contended lock stalled every task queued on that worker. Both adapters now run their locked section through off_async_worker, which on the daemon's multi-thread runtime calls tokio::task::block_in_place, handing the worker's queue to a replacement worker, and elsewhere (current-thread test runtimes, spawn_blocking threads, plain tests) runs inline as before. No caller changed and the daemon has no LocalSet. The new multi-thread, single-worker test puts store work in a spawned task that occupies the only worker and proves a task queued behind it still runs; it was mutation-checked to fail with the plain call restored. Workspace 3391 tests, clippy -D warnings.
 _________________________________________________________________________________ 16:04 perf/rooms-store-off-workers
+
+time:      [16:19] [25-09-26]
+agent:     [claude]
+worktree:  feat/room-wire-contract
+type:      [feature-request]
+area:      [backend]
+
+Daemon half of Rooms DoD 5.8, the daemon-to-surface drift check. ocean-os now publishes docs/contracts/room-wire.json, the room wire facts ocean-surface branches on: the /events SSE event names, the access-state, message-kind and participant-kind vocabularies, the top-level keys of /snapshot and /transcript, and the DoD 1.10 not-open answer. room_wire_contract_matches_the_daemon holds it equal to the real daemon. Enum names come through serde from an exhaustive match, so a new variant will not compile until the artifact lists it. The response keys come from live /snapshot and /transcript answers and a never-existed room's 404, and the SSE names are scanned from the handlers' own .event literals. Both repos are public, so the surface can vendor and CI-check the file with no cross-repo credential. That surface half is next, and docs/contracts/README.md indexes the artifact. ocean-daemon 965 tests, clippy -D warnings, docs-check.
+_________________________________________________________________________________ 16:19 feat/room-wire-contract

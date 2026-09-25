@@ -30,6 +30,7 @@ Documentation policy: [`OCEAN_DOCUMENTATION_CONTRACT.md`](OCEAN_DOCUMENTATION_CO
   redemption, federation facts, and the dated team-status table.
 - [`OCEAN_WORKSPACE_BINDING.md`](OCEAN_WORKSPACE_BINDING.md) — cwd/project/session binding invariants; verify source symbols rather than relying on line numbers.
 - [`DAEMON_REFACTOR_MISSION.md`](DAEMON_REFACTOR_MISSION.md) — active behavior-neutral daemon extraction mission, progress, and target.
+- [`contracts/README.md`](contracts/README.md) — cross-repo wire artifacts this repo publishes for siblings to vendor (`room-wire.json` for ocean-surface), each held equal to the daemon by a test.
  - [`ocean-os-site/PUBLIC_EVIDENCE_POLICY.md`](ocean-os-site/PUBLIC_EVIDENCE_POLICY.md) — public-site evidence classes, sensitive-data exclusions, current capture decisions, and safe-recapture checklist.
 
 ## Package and subsystem references
