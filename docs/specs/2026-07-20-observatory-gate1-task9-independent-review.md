@@ -275,7 +275,7 @@ the in-memory watermark ahead of the durable log
 
 The cheap non-gating items landed on branch `fix/observatory-hardening`, each
 with a regression test. F2, F7, F8, F11, F12 and the §4.3 checkpoint task stay
-open.
+open. (F2 later closed; see "F2 migration (2026-09-25)" below.)
 
 - **F1** — every Observatory store call except the in-memory `latest_cursor`
   runs on Tokio's blocking pool through `observatory::off_executor`
@@ -312,3 +312,124 @@ open.
   `retention_archive_records_each_passes_real_from_cursor`. (The burned cursor on
   a failed commit was already closed by the repair wave's cursor-after-commit
   fix.) The §4.3 checkpoint task remains open.
+
+## F2 migration (2026-09-25)
+
+Landed on branch `feat/observatory-f2-schema`. The store schema is now
+versioned by `PRAGMA user_version` and migrated step by step from 0 by
+`ocean_observatory::migrate` (`crates/ocean-observatory/src/migration.rs`),
+which `ObservatoryStore::open` runs before anything else touches the tables.
+
+- **v0 → v1** — the pre-F2 baseline: the Task 3 tables if absent, plus G3's
+  additive `execution_nodes.first_cursor`. Every existing `observatory.db`
+  reads `user_version` 0, whether it is fresh, Task 3 shape, or G3 shape.
+- **v1 → v2** — the §4.1 shape, by SQLite's rebuild procedure for every table
+  (`foreign_keys` off, create `*_new`, copy in rowid order, drop, rename,
+  `pragma_foreign_key_check` must be empty, commit, `foreign_keys` on), all in
+  one `BEGIN IMMEDIATE` transaction that also bumps the version, so a failure
+  leaves the database untouched. Event `kind`, `producer_id`, `visibility`,
+  `schema_version` and `created_at` (= `recorded_at`) are backfilled with
+  `json_extract` from `envelope_json`; an unparseable envelope is kept with
+  sentinel columns rather than dropped. Nodes gain `session_id`, `turn_id`,
+  `request_id`, `producer_id` (from the node's newest surviving event, else
+  empty — the value the snapshot route already showed), `last_cursor` (that
+  event's cursor, else NULL) and `finished_at` (its `recorded_at` when the
+  phase is terminal). Edges gain `root_execution_id` (from the child node).
+  Watermarks gain `created_at` (the migration time), the archive gains
+  `reason` (NULL for old passes; new passes write `age` or `size`). Nodes,
+  edges, watermarks and the archive gain the §4.1 surrogate `id`. All twelve
+  §4.1 indexes are created by their manifest names.
+- **Write path** — `append_event` fills every new column in the same
+  transaction as the event; `last_cursor` moves on every event for the node,
+  `finished_at` is set exactly while the phase is terminal, and identity
+  columns backfilled empty are filled by the next event that carries them.
+- Each step re-reads the version under the write lock, so a second opener or
+  a second run is a no-op; a database newer than the build is refused
+  (`StoreError::UnsupportedSchema`) and left untouched. No route's wire shape
+  changed.
+
+Deviations from §4.1, each forced by a Gate 1 invariant:
+
+- **No FK from `execution_nodes.first_cursor`/`last_cursor` to
+  `observatory_events(cursor)`.** Retention prunes terminal executions'
+  events while their nodes stay in the snapshot. `RESTRICT` would block every
+  prune; `CASCADE` would delete projection rows; `SET NULL` would erase a
+  terminal row's start, and a NULL `first_cursor` is exactly what G3 reads as
+  "unknown start, block retention" if a late event reopens that execution.
+  The cursors are kept as historical pointers that may name pruned events.
+- **`first_cursor` and `last_cursor` are nullable** (§4.1: `NOT NULL`). Rows
+  written before G3 have no recorded start and must keep blocking retention
+  until the restart sweep closes them; a node whose events were all pruned
+  before this migration has no recoverable last cursor. Every row written
+  after the migration has both.
+- **`execution_edges` enforces only `child_execution_id → execution_nodes`.**
+  The child node is upserted in the same transaction as its edge, so that key
+  always holds. The parent and root are usually a session the daemon may
+  never have seen created (a session restored from disk, a lagged durability
+  pump): enforcing them would refuse the whole append — losing every event
+  of such a turn — and existing databases hold such edges, so
+  `foreign_key_check` would fail the migration.
+- **No FK from `watermarks.cursor`.** `retention_boundary` names a pruned
+  cursor by definition, and G4 reseeds the cursor from the watermarks after a
+  full prune.
+- **`observatory_events` keeps `cursor INTEGER PRIMARY KEY` and
+  `envelope_json`** instead of a surrogate `id` plus `UNIQUE(cursor)` and
+  `payload_json`. The cursor is already the unique, monotonic row identity,
+  and replay range scans stay on the table b-tree; replay and the SSE tail
+  return the whole §7.3 envelope (truth, topology, correlation), which no
+  §4.1 column holds. The manifest-named cursor index exists anyway.
+- The `daemon_instance_id` watermark key is still not written (its value is a
+  UUID and §4.1's `cursor` column is an integer); unchanged by F2.
+
+The size-bound test `a_pass_after_the_size_prune_does_not_prune_again` moved
+its bound from 96 KiB to 384 KiB: the never-pruned projection of its 400
+executions grew to about 190 KiB with the §4.1 node columns and indexes, so
+the old bound sat below the projection alone and emptied the log.
+
+A copy of a real operator database (Task 3 shape, 166 MB, 115,697 events,
+7,130 nodes, 6,425 edges) migrated in 2.5 s (release build) with every row
+count preserved and an empty `foreign_key_check`.
+
+Tests (`crates/ocean-observatory/tests/migration.rs`):
+`migrating_a_g3_v0_database_preserves_every_row_and_backfills` and
+`migrating_a_task3_v0_database_without_first_cursor_preserves_every_row`
+(hand-built old-schema databases with a NULL `first_cursor` row, an edge
+whose parent was never observed, a node whose events were already pruned,
+watermarks and an archive row), `running_the_migration_twice_is_a_no_op`
+(full schema-and-row dump unchanged after a second open and a direct
+`migrate`), `a_database_from_a_newer_build_is_refused_untouched`,
+`an_unparseable_envelope_is_kept_with_sentinel_columns`,
+`new_appends_populate_every_column`,
+`retention_still_prunes_a_migrated_database`, and
+`every_manifest_index_and_the_edge_foreign_key_exist` (fresh and migrated;
+the FK is enforced, not inert).
+
+### F2 review follow-ups (2026-09-25)
+
+Independent review requested changes; all four landed before merge:
+
+- **Downgrade safety.** Every NOT NULL column F2 added carries a DEFAULT
+  (`schema_version` 1, `kind` 'unknown', empty strings elsewhere), so an
+  older daemon binary opening a v2 database keeps appending with its pre-F2
+  column lists instead of failing every write
+  (`a_pre_f2_writer_can_still_append_to_a_v2_database`).
+- **No duplicate indexes.** `idx_observatory_events_cursor` (the cursor is the
+  rowid) and `idx_observatory_events_event_id`,
+  `idx_execution_nodes_execution_id`, `idx_execution_edges_edge_id` (UNIQUE
+  columns already carry an autoindex) are not created — a documented
+  deviation from §4.1's list; the remaining eight are
+  (`no_index_duplicates_a_primary_or_unique_key`).
+- **Orphan edges.** An edge whose child node does not exist cannot satisfy
+  the new child FK, so the migration drops it rather than failing
+  `foreign_key_check` on every boot and leaving the store permanently closed.
+- **Projection floor.** Size retention runs only while the event log is what
+  exceeds the bound; when the never-pruned projection alone is over it, the
+  bound is unreachable and the log is left intact rather than emptied every
+  pass (`a_bound_below_the_projection_floor_does_not_wipe_the_log`). The size
+  tests now use single-execution heavy events so their bound sits above that
+  floor.
+
+Operational notes: the first open after upgrade rewrites the database in one
+transaction (~2.5 s for the operator's 166 MB file) on the daemon's startup
+path, and the WAL grows to roughly the database size until checkpoint, so
+the volume needs that much headroom once.

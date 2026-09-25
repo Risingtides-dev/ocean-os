@@ -124,6 +124,19 @@ fn reopen_after_full_prune_continues_the_cursor() {
     );
 }
 
+/// A finished event of ONE shared execution carrying ~4 KiB of payload, so the
+/// event log — not the never-pruned projection — dominates the database and
+/// a realistic size bound sits above the projection floor.
+fn heavy_event(id: &str) -> EventEnvelope {
+    let mut e = event_for(id, "heavy", 0, true);
+    e.payload = EventPayload::ExecutionFinished {
+        phase: ExecutionPhase::Finished,
+        duration_millis: 1,
+        error_classification: Some("x".repeat(4096)),
+    };
+    e
+}
+
 /// G3: the size bound measures the real database, so a tiny ceiling prunes
 /// old-enough-to-keep terminal history too, oldest first.
 #[test]
@@ -133,15 +146,23 @@ fn retention_enforces_the_size_bound_from_real_db_size() {
         &d.path().join("obs.db"),
         RetentionPolicy {
             max_age_days: 365,
-            max_bytes: 1,
+            // ~420 KiB of heavy events: one 64-event batch (~256 KiB) gets
+            // under 320 KiB, so the pass must stop there.
+            max_bytes: 320 * 1024,
         },
     )
     .unwrap();
-    for i in 0..5 {
-        s.append_event(event_for(&format!("e{i}"), &format!("x{i}"), 0, true))
-            .unwrap();
+    for i in 0..100 {
+        s.append_event(heavy_event(&format!("e{i}"))).unwrap();
     }
-    assert!(s.apply_retention().unwrap() > 0, "an over-size db prunes");
+    let pruned = s.apply_retention().unwrap();
+    assert!(pruned > 0, "an over-size db prunes");
+    let kept = s.events_after(Cursor::new(0), None).unwrap().len();
+    assert_eq!(kept, 100 - pruned);
+    assert!(
+        kept > 0,
+        "stops once under the bound instead of emptying the log"
+    );
 }
 
 /// G1: a snapshot is labelled with the watermark its rows reflect, an earlier
@@ -204,12 +225,15 @@ fn a_pass_after_the_size_prune_does_not_prune_again() {
         s.append_event(e).unwrap();
     }
     drop(s);
-    // A bound between "all rows" and "a few rows" of live data.
+    // A bound between "all rows" and "a few rows" of live data. F2's §4.1
+    // node columns and indexes put the never-pruned projection of these 400
+    // executions near 190 KiB (the whole database near 750 KiB), so the
+    // bound sits above the projection alone.
     let s = ObservatoryStore::open(
         &path,
         RetentionPolicy {
             max_age_days: 365,
-            max_bytes: 96 * 1024,
+            max_bytes: 384 * 1024,
         },
     )
     .unwrap();
@@ -291,14 +315,14 @@ fn retention_archive_records_each_passes_real_from_cursor() {
         &path,
         RetentionPolicy {
             max_age_days: 365,
-            max_bytes: 1,
+            max_bytes: 128 * 1024,
         },
     )
     .unwrap();
-    // 100 events: the size loop prunes 1..=64, then 65..=100.
+    // 100 heavy events (~400 KiB): one 64-event batch is not enough to get
+    // under 128 KiB, so the size loop prunes 1..=64 and then 65..=100.
     for i in 0..100 {
-        s.append_event(event_for(&format!("e{i}"), &format!("x{i}"), 0, true))
-            .unwrap();
+        s.append_event(heavy_event(&format!("e{i}"))).unwrap();
     }
     assert_eq!(s.apply_retention().unwrap(), 100);
     let db = rusqlite::Connection::open(&path).unwrap();

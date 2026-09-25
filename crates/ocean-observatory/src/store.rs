@@ -14,6 +14,16 @@ pub enum StoreError {
     /// than answered with current state under an old label.
     #[error("snapshot at cursor {requested} is historical; the current watermark is {latest}")]
     HistoricalSnapshot { requested: u64, latest: u64 },
+    /// F2: the database was written by a newer build (its `user_version` is
+    /// past [`crate::STORE_SCHEMA_VERSION`]); refused rather than guessed at.
+    #[error(
+        "observatory.db schema version {found} is newer than this build supports ({supported})"
+    )]
+    UnsupportedSchema { found: u32, supported: u32 },
+    /// F2: a table rebuild left rows that break a foreign key; the migration
+    /// rolled back and the database is unchanged.
+    #[error("schema migration found {count} foreign-key violations; rolled back")]
+    ForeignKeyViolation { count: i64 },
 }
 pub type Result<T> = std::result::Result<T, StoreError>;
 pub struct ObservatoryStore {
@@ -50,28 +60,17 @@ pub struct EventsPage {
     pub has_more: bool,
     pub complete: bool,
 }
-const SCHEMA:&str="CREATE TABLE IF NOT EXISTS observatory_events (cursor INTEGER PRIMARY KEY,event_id TEXT NOT NULL UNIQUE,envelope_json TEXT NOT NULL); CREATE TABLE IF NOT EXISTS execution_nodes(execution_id TEXT PRIMARY KEY,root_execution_id TEXT NOT NULL,parent_execution_id TEXT,phase TEXT NOT NULL,created_at TEXT NOT NULL); CREATE TABLE IF NOT EXISTS execution_edges(edge_id TEXT PRIMARY KEY,parent_execution_id TEXT NOT NULL,child_execution_id TEXT NOT NULL,created_at TEXT NOT NULL); CREATE TABLE IF NOT EXISTS watermarks(key TEXT PRIMARY KEY,cursor INTEGER NOT NULL); CREATE TABLE IF NOT EXISTS retention_archive(pruned_at TEXT NOT NULL,from_cursor INTEGER NOT NULL,to_cursor INTEGER NOT NULL,count_events INTEGER NOT NULL);";
 impl ObservatoryStore {
     pub fn open(path: &Path, retention_policy: RetentionPolicy) -> Result<Self> {
-        let db = Connection::open(path)?;
+        let mut db = Connection::open(path)?;
         // F10: wait for a competing writer (a checkpoint, an operator's
         // sqlite3 shell) instead of failing the append with SQLITE_BUSY at
         // once. Callers run store methods on blocking threads (F1), so the
         // wait never stalls an async worker.
         db.busy_timeout(BUSY_TIMEOUT)?;
         db.execute_batch("PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON;")?;
-        db.execute_batch(SCHEMA)?;
-        // Manifest §4.1/§4.2: the cursor at which each execution first
-        // appeared, so retention can keep every event of a live execution.
-        // Additive: rows written before this column read NULL.
-        let has_first_cursor = db
-            .prepare(
-                "SELECT 1 FROM pragma_table_info('execution_nodes') WHERE name='first_cursor'",
-            )?
-            .exists([])?;
-        if !has_first_cursor {
-            db.execute_batch("ALTER TABLE execution_nodes ADD COLUMN first_cursor INTEGER")?;
-        }
+        // F2: versioned, idempotent, step-by-step to the §4.1 shape.
+        crate::migration::migrate(&mut db)?;
         // G4: seed from EVERY durable record of how far the log reached, not
         // only surviving events. A retention pass that prunes every row
         // followed by a restart would otherwise reissue cursor 1 — a reused
@@ -100,19 +99,60 @@ impl ObservatoryStore {
         let cursor = self.current_cursor.lock().next();
         event.cursor = cursor;
         let json = serde_json::to_string(&event)?;
+        // F2: every §4.1 column, from the same envelope `envelope_json` holds.
         tx.execute(
-            "INSERT INTO observatory_events(cursor,event_id,envelope_json) VALUES(?1,?2,?3)",
-            params![cursor.into_inner(), event.event_id, json],
+            "INSERT INTO observatory_events(cursor,event_id,schema_version,created_at,kind,producer_id,visibility,envelope_json)
+             VALUES(?1,?2,?3,?4,?5,?6,?7,?8)",
+            params![
+                cursor.into_inner(),
+                event.event_id,
+                event.schema_version,
+                event.recorded_at,
+                wire_str(&event.kind)?,
+                event.producer.id,
+                wire_str(&event.visibility)?,
+                json
+            ],
         )?;
         let phase = phase(&event);
-        tx.execute("INSERT INTO execution_nodes(execution_id,root_execution_id,parent_execution_id,phase,created_at,first_cursor) VALUES(?1,?2,?3,?4,?5,?6) ON CONFLICT(execution_id) DO UPDATE SET phase=excluded.phase",params![event.topology.execution_id,event.topology.root_execution_id,event.topology.parent_execution_id,phase,event.recorded_at,cursor.into_inner()])?;
-        if let (Some(edge), Some(parent)) = (
-            event.topology.edge_id.as_ref(),
-            event.topology.parent_execution_id.as_ref(),
-        ) {
-            tx.execute("INSERT OR IGNORE INTO execution_edges(edge_id,parent_execution_id,child_execution_id,created_at) VALUES(?1,?2,?3,?4)",params![edge,parent,event.topology.execution_id,event.recorded_at])?;
+        // `finished_at` is set exactly while the phase is terminal, so a late
+        // event that reopens an execution clears it.
+        let finished_at = (!matches!(phase.as_str(), "admitted" | "running"))
+            .then_some(event.recorded_at.as_str());
+        let t = &event.topology;
+        tx.execute(
+            "INSERT INTO execution_nodes(execution_id,root_execution_id,parent_execution_id,session_id,turn_id,request_id,producer_id,phase,first_cursor,last_cursor,created_at,finished_at)
+             VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?9,?10,?11)
+             ON CONFLICT(execution_id) DO UPDATE SET
+               phase=excluded.phase,
+               last_cursor=excluded.last_cursor,
+               finished_at=excluded.finished_at,
+               session_id=CASE WHEN session_id='' THEN excluded.session_id ELSE session_id END,
+               turn_id=CASE WHEN turn_id='' THEN excluded.turn_id ELSE turn_id END,
+               request_id=CASE WHEN request_id='' THEN excluded.request_id ELSE request_id END,
+               producer_id=CASE WHEN producer_id='' THEN excluded.producer_id ELSE producer_id END",
+            params![
+                t.execution_id,
+                t.root_execution_id,
+                t.parent_execution_id,
+                t.session_id,
+                t.turn_id,
+                t.request_id,
+                event.producer.id,
+                phase,
+                cursor.into_inner(),
+                event.recorded_at,
+                finished_at
+            ],
+        )?;
+        if let (Some(edge), Some(parent)) = (t.edge_id.as_ref(), t.parent_execution_id.as_ref()) {
+            tx.execute(
+                "INSERT OR IGNORE INTO execution_edges(edge_id,parent_execution_id,child_execution_id,root_execution_id,created_at)
+                 VALUES(?1,?2,?3,?4,?5)",
+                params![edge, parent, t.execution_id, t.root_execution_id, event.recorded_at],
+            )?;
         }
-        tx.execute("INSERT INTO watermarks(key,cursor) VALUES('snapshot_watermark',?1) ON CONFLICT(key) DO UPDATE SET cursor=excluded.cursor",[cursor.into_inner()])?;
+        tx.execute("INSERT INTO watermarks(key,cursor,created_at) VALUES('snapshot_watermark',?1,?2) ON CONFLICT(key) DO UPDATE SET cursor=excluded.cursor",params![cursor.into_inner(), event.recorded_at])?;
         tx.commit()?;
         *self.current_cursor.lock() = cursor;
         Ok(cursor)
@@ -253,7 +293,7 @@ impl ObservatoryStore {
             }
             boundary = *cursor;
         }
-        let mut pruned = prune_through(&mut db, boundary)?;
+        let mut pruned = prune_through(&mut db, boundary, "age")?;
 
         // Size: while the LIVE pages exceed the bound, prune the next oldest
         // batch and measure again. Measuring after each delete — rather than
@@ -261,7 +301,23 @@ impl ObservatoryStore {
         // indexes and the never-pruned projection tables — is what keeps one
         // pass from overshooting the bound. Freed pages go to the freelist
         // on commit, so `live_bytes` falls as soon as a batch lands.
-        while live_bytes(&db)? > self.retention_policy.max_bytes {
+        // Floor: the projection (nodes, edges, watermarks, archive) is never
+        // pruned. When it alone is over the bound, no amount of event pruning
+        // gets under it, and the loop would empty the log on every pass.
+        // Size-prune only while the event log is what is over.
+        // Only measured when over the bound: the SUM scans every envelope.
+        // `CAST AS BLOB` makes `length` count bytes, not characters.
+        let live_now = live_bytes(&db)?;
+        let size_bound_reachable = live_now <= self.retention_policy.max_bytes
+            || {
+                let event_bytes: u64 = db.query_row(
+                "SELECT COALESCE(SUM(length(CAST(envelope_json AS BLOB))),0) FROM observatory_events",
+                [],
+                |r| r.get(0),
+            )?;
+                live_now.saturating_sub(event_bytes) < self.retention_policy.max_bytes
+            };
+        while size_bound_reachable && live_bytes(&db)? > self.retention_policy.max_bytes {
             let batch_end: Option<u64> = db.query_row(
                 "SELECT MAX(cursor) FROM (SELECT cursor FROM observatory_events
                  WHERE cursor > ?1 AND cursor <= ?2 ORDER BY cursor LIMIT ?3)",
@@ -271,7 +327,7 @@ impl ObservatoryStore {
             let Some(end) = batch_end else {
                 break;
             };
-            pruned += prune_through(&mut db, end)?;
+            pruned += prune_through(&mut db, end, "size")?;
             boundary = end;
         }
         Ok(pruned)
@@ -351,8 +407,9 @@ fn live_bytes(db: &Connection) -> Result<u64> {
 }
 
 /// Delete every event at or below `boundary` in one transaction and record
-/// the new retention boundary. `0` is a no-op.
-fn prune_through(db: &mut Connection, boundary: u64) -> Result<usize> {
+/// the new retention boundary, archived under `reason` (`age` or `size`).
+/// `0` is a no-op.
+fn prune_through(db: &mut Connection, boundary: u64, reason: &str) -> Result<usize> {
     if boundary == 0 {
         return Ok(0);
     }
@@ -369,11 +426,21 @@ fn prune_through(db: &mut Connection, boundary: u64) -> Result<usize> {
         [boundary],
     )?;
     if count > 0 {
-        tx.execute("INSERT INTO retention_archive(pruned_at,from_cursor,to_cursor,count_events) VALUES(?1,?2,?3,?4)", params![chrono::Utc::now().to_rfc3339(), previous + 1, boundary, count])?;
-        tx.execute("INSERT INTO watermarks(key,cursor) VALUES('retention_boundary',?1) ON CONFLICT(key) DO UPDATE SET cursor=excluded.cursor", [boundary])?;
+        let now = chrono::Utc::now().to_rfc3339();
+        tx.execute("INSERT INTO retention_archive(pruned_at,from_cursor,to_cursor,reason,count_events) VALUES(?1,?2,?3,?4,?5)", params![now, previous + 1, boundary, reason, count])?;
+        tx.execute("INSERT INTO watermarks(key,cursor,created_at) VALUES('retention_boundary',?1,?2) ON CONFLICT(key) DO UPDATE SET cursor=excluded.cursor", params![boundary, now])?;
     }
     tx.commit()?;
     Ok(count)
+}
+
+/// The serde wire string of a unit enum (`kind`, `visibility`), so the column
+/// holds exactly what `envelope_json` holds.
+fn wire_str<T: serde::Serialize>(value: &T) -> Result<String> {
+    match serde_json::to_value(value)? {
+        serde_json::Value::String(s) => Ok(s),
+        other => Ok(other.to_string()),
+    }
 }
 
 fn phase(e: &EventEnvelope) -> String {
