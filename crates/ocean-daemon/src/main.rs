@@ -21632,6 +21632,166 @@ mod tests {
     /// and the live SSE endpoint hide the room, while transcript/snapshot retain
     /// a bounded audit view — which the snapshot body now labels `closed`, since
     /// a caller that hydrates here has no other route left to learn it from.
+    /// DoD 5.8 (daemon half): `docs/contracts/room-wire.json` is the room wire
+    /// ocean-surface vendors, and this holds it equal to what the daemon
+    /// actually serves — enum vocabularies through their serde names (an
+    /// exhaustive match, so a new variant will not compile until it is
+    /// listed), response keys from real route answers, and SSE event names
+    /// from the handlers' own `.event("…")` literals.
+    #[tokio::test]
+    async fn room_wire_contract_matches_the_daemon() {
+        use ocean_core::RoomAccessState;
+        use ocean_store::RoomStore as _;
+
+        let artifact: serde_json::Value =
+            serde_json::from_str(include_str!("../../../docs/contracts/room-wire.json"))
+                .expect("room-wire.json parses");
+        let names = |field: &str| -> Vec<String> {
+            let mut list: Vec<String> = artifact[field]
+                .as_array()
+                .unwrap_or_else(|| panic!("{field} is a list"))
+                .iter()
+                .map(|v| v.as_str().unwrap().to_string())
+                .collect();
+            list.sort();
+            list
+        };
+        let wire = |value: serde_json::Value| value.as_str().unwrap().to_string();
+        let sorted = |mut list: Vec<String>| {
+            list.sort();
+            list
+        };
+
+        let access = |state: RoomAccessState| match state {
+            RoomAccessState::Local
+            | RoomAccessState::Connecting
+            | RoomAccessState::Live
+            | RoomAccessState::Recovering
+            | RoomAccessState::Revoked => wire(json!(state)),
+        };
+        assert_eq!(
+            names("access_states"),
+            sorted(
+                [
+                    RoomAccessState::Local,
+                    RoomAccessState::Connecting,
+                    RoomAccessState::Live,
+                    RoomAccessState::Recovering,
+                    RoomAccessState::Revoked,
+                ]
+                .map(access)
+                .to_vec()
+            )
+        );
+        let kind = |kind: RoomMessageKind| match kind {
+            RoomMessageKind::Message
+            | RoomMessageKind::ParticipantJoined
+            | RoomMessageKind::ParticipantLeft
+            | RoomMessageKind::System => wire(json!(kind)),
+        };
+        assert_eq!(
+            names("message_kinds"),
+            sorted(
+                [
+                    RoomMessageKind::Message,
+                    RoomMessageKind::ParticipantJoined,
+                    RoomMessageKind::ParticipantLeft,
+                    RoomMessageKind::System,
+                ]
+                .map(kind)
+                .to_vec()
+            )
+        );
+        let participant = |kind: RoomParticipantKind| match kind {
+            RoomParticipantKind::Human
+            | RoomParticipantKind::Agent
+            | RoomParticipantKind::Bot
+            | RoomParticipantKind::Tool
+            | RoomParticipantKind::System => wire(json!(kind)),
+        };
+        assert_eq!(
+            names("participant_kinds"),
+            sorted(
+                [
+                    RoomParticipantKind::Human,
+                    RoomParticipantKind::Agent,
+                    RoomParticipantKind::Bot,
+                    RoomParticipantKind::Tool,
+                    RoomParticipantKind::System,
+                ]
+                .map(participant)
+                .to_vec()
+            )
+        );
+
+        // SSE event names, from the handler source itself.
+        let source = include_str!("persistent_rooms.rs");
+        let production = source
+            .split("\n#[cfg(test)]\nmod tests")
+            .next()
+            .unwrap();
+        let mut events: Vec<String> = production
+            .match_indices(".event(\"")
+            .map(|(at, lit)| {
+                let rest = &production[at + lit.len()..];
+                rest[..rest.find('"').unwrap()].to_string()
+            })
+            .collect();
+        events.sort();
+        events.dedup();
+        assert_eq!(names("sse_events"), events);
+
+        // Response keys, from real answers.
+        let _guard = AUTO_CONVENE_ENV_LOCK.lock().await;
+        let _env = TestEnvRestore::capture(&["OCEAN_CONFIG_DIR", "OCEAN_MODEL", "OCEAN_YOLO"]);
+        let tmp = tempfile::tempdir().unwrap();
+        let state = fake_convene_state(&tmp);
+        let key = RoomKey::new("wire-contract");
+        with_rooms(&state, |store| {
+            store.create(key.clone(), "Wire", None, Utc::now()).unwrap();
+        });
+        let app = room_routes().with_state(state);
+        for (path, field) in [
+            (
+                "/v1/rooms/persistent/wire-contract/snapshot",
+                "snapshot_keys",
+            ),
+            (
+                "/v1/rooms/persistent/wire-contract/transcript",
+                "transcript_keys",
+            ),
+        ] {
+            let (status, _, raw) = persistent_room_http_request(
+                app.clone(),
+                axum::http::Method::GET,
+                path,
+                None,
+                false,
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK, "{path}");
+            let body = persistent_room_http_json(&raw);
+            let keys = sorted(body.as_object().unwrap().keys().cloned().collect());
+            assert_eq!(names(field), keys, "{path}");
+        }
+        let (status, _, raw) = persistent_room_http_request(
+            app,
+            axum::http::Method::GET,
+            "/v1/rooms/persistent/never-was",
+            None,
+            false,
+        )
+        .await;
+        let not_open = &artifact["not_open"];
+        assert_eq!(
+            u64::from(status.as_u16()),
+            not_open["status"].as_u64().unwrap()
+        );
+        let body = persistent_room_http_json(&raw);
+        assert_eq!(body[not_open["marker"].as_str().unwrap()], true);
+        assert_eq!(body["code"], not_open["code"]);
+    }
+
     /// DoD 1.10: one daemon answer for "room not open" across every route a
     /// client can point at a closed or missing room — 404 with
     /// `room_not_open: true` and a code — while `/transcript` and `/snapshot`

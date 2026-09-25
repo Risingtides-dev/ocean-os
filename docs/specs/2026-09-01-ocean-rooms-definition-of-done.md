@@ -223,6 +223,10 @@ ocean-os 616293e, ocean-surface d58a145.
   in CI; ocean-tauri is clippy-gated. [surface, L]
 - 5.8 Cross-repo drift checks (ROADMAP item) cover the daemon-to-surface and
   daemon-to-Bedrock room contracts. [os, M]
+  Partial (2026-09-25): daemon-to-Bedrock is the vendored event pin (5.3);
+  daemon-to-surface now has a published `docs/contracts/room-wire.json` held
+  equal to the router by `room_wire_contract_matches_the_daemon`. The surface
+  must still vendor it and check its decoders against it.
 
 Exit: every line checked with its check named. Then the loop moves to a
 maintenance cadence rather than replenishing polish at the tail.
