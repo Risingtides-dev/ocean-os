@@ -10847,3 +10847,12 @@ area:      [backend]
 
 Closed the daemon half of Rooms DoD 1.10: one answer for a room that is not open. Before, room detail 404d with a bare error and no code, events said code room_not_found, attachment upload said unknown_room, messages said error room_not_found, the transcript served a closed room 200 without saying it was closed, and the attachment list answered even a room that never existed with an empty list. A room_not_open helper now marks every not-open 404 with room_not_open true and adds code room_not_found where the route had none, applied through room_store_error_response and the hand-built sites (detail, snapshot, events, messages, invoke, attachment upload). Existing error values and the attachment upload's unknown_room code are kept, because ocean-surface reads them. The audit reads (transcript, snapshot, attachment list) serve a soft-closed room 200 with closed true, and a never-existed room 404s. One test drives both a closed and a never-existed room through every route. Contract documented in OCEAN_ECOSYSTEM_CONTRACT.md. ocean-daemon 960 tests, clippy -D warnings.
 _________________________________________________________________________________ 15:47 fix/room-not-open-answer
+
+time:      [15:51] [25-09-26]
+agent:     [claude]
+worktree:  docs/dod-audit
+type:      [review]
+area:      [docs]
+
+Audited every open line of the Rooms definition-of-done against current code in ocean-os, ocean-surface and ocean-bedrock. Nine lines were already satisfied, so they are marked done with the check that proves each: 1.4 workspace binding, 1.8 agent owners and mentions, 1.9 local time, 1.12 desktop ceremony, deep link and notifications, 2.2 real mention turns, 2.4 thread replies, 3.7 serialized flushes, 5.1 route-doc parity, and 5.6 the room-runtime RPC test. Most were closed by the ocean-surface #211 integration squash, and their "Today:" text had gone stale. Still open with no ruling needed: 1.5 orphaned thread replies (surface PR #197), 1.6 pushed unread state, 2.1 host-matrix test, 4.4 store work off the tokio workers, 5.4 OCEAN_ROOMS_PRODUCT.md, 5.7 the Tauri harness, and 5.8 a daemon-to-surface contract check. The rest wait on live deploys or user rulings.
+_________________________________________________________________________________ 15:51 docs/dod-audit
