@@ -139,6 +139,8 @@ ocean-os 616293e, ocean-surface d58a145.
 - 3.4 Port attribution names a member (reads done in #108; table ruling owed). [bedrock, ruling]
 - 3.5 cargo deny is green on ocean-os (RUSTSEC-2026-0274 rtrb, yanked spin) and
   the ci.yml deny job is a required check or the reason it is not is written. [os, user ruling]
+  Green as of 2026-09-25 (#477, rustls 0.23.45 for RUSTSEC-2026-0285); the
+  required-check half is still the user's ruling.
 - 3.6 Room secrets are write-only, room commands never see Bedrock's environment,
   the Access verifier's adversarial suite is green, a new coworker never gets
   root scope. [bedrock, green]
@@ -150,7 +152,9 @@ ocean-os 616293e, ocean-surface d58a145.
 ## 4. Operated
 - 4.1 Room and federation metrics exist: access state by room, outbox depth and
   age, SSE reconnects and lag, redemption failures, admission refusals, store
-  lock wait. Today there are none. [os, M]
+  lock wait. [os, M] **Done** (verified 2026-09-25): `crates/ocean-daemon/src/metrics.rs`
+  §4.1 families, checked by the `room_metrics_*` tests there; `/health` carries
+  the sampled `rooms` block.
 - 4.2 A watchdog reads deploy:status and both /health cards on a schedule and
   reaches a human (triage Telegram path) on drift or 5xx. [bedrock, S]
 - 4.3 Room lifecycle: a route closes a room, transcript retention and attachment
@@ -179,7 +183,10 @@ ocean-os 616293e, ocean-surface d58a145.
   route (repo, build, CI, execs, purge are missing today), checked by the
   parity test. [bedrock, S to M]
 - 5.2 OCEAN_ECOSYSTEM_CONTRACT.md lists all 40 daemon room routes and
-  ARCHITECTURE.md's count is pinned by a test (11 and 80 today vs 40 and 124). [os, M]
+  ARCHITECTURE.md's count is pinned by a test. [os, M] **Done** (verified
+  2026-09-25): the table has every registered `/v1/rooms` route (54 today) and
+  `room_route_table_and_architecture_route_counts_are_in_parity` pins both it
+  and ARCHITECTURE.md's totals against the router.
 - 5.3 The Bedrock event vocabulary pin is refreshed by CI, not by hand; a new
   action reds the daemon build. [os, S]
 - 5.4 OCEAN_ROOMS_PRODUCT.md is corrected to the real wire shapes (access
