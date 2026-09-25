@@ -148,6 +148,12 @@ ocean-os 616293e, ocean-surface d58a145.
   last-write-wins on the durable tree is closed. [bedrock, M]
 - 3.8 The audit-history renderer has no raw fallback and author_id is bounded
   on render as well as write; a fifth audit writer turns a test red. [os, S]
+  **Done** (2026-09-25): `room_history_text` renders unknown or untyped
+  structured bodies as `[room audit]`; `bounded_member_id` refuses unsafe ids at
+  join and `rendered_author_id` filters them on every response; checks
+  `every_store_audit_writer_has_a_render_rule`,
+  `unknown_or_untyped_structured_bodies_never_render_raw`,
+  `author_ids_are_bounded_on_render`.
 
 ## 4. Operated
 - 4.1 Room and federation metrics exist: access state by room, outbox depth and
