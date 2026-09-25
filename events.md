@@ -10910,3 +10910,12 @@ area:      [backend]
 
 Delta review of the Observatory G1-G5 repair wave passed, with each finding closed on evidence. That opens the Gate 1 renderer gate in ROADMAP. The review's one cheap non-gating fix landed in the same PR: append_event publishes its cursor only after commit, so a refused append (a duplicate event_id, for example) cannot leave the in-memory watermark ahead of the durable log where a header could name a cursor a restart would reissue. Its test is a_failed_append_does_not_advance_the_cursor. The size bound was also corrected to count live pages (page_count minus freelist), since freed pages otherwise kept a once-full database reading as over the bound forever. Two follow-ups are recorded in the review doc: the size loop over-prunes because it subtracts raw JSON length from a page-measured excess, and ocean-surface's replay scrubber still asks snapshot?at= for earlier cursors and now gets 409s.
 _________________________________________________________________________________ 16:42 fix/observatory-g5-401
+
+time:      [16:45] [25-09-26]
+agent:     [claude]
+worktree:  fix/observatory-retention-remeasure
+type:      [bug-report]
+area:      [backend]
+
+Closed the Observatory delta review's size-loop follow-up. The size bound reduced a page-measured excess by raw JSON lengths, which ignores index overhead and the never-pruned projection tables, so a single over-size pass emptied the whole prunable log. apply_retention now prunes age first (the contiguous oldest run past max_age_days), then deletes in batches of 64 and re-measures live pages (page_count minus freelist) after each commit, stopping as soon as it is under the bound. It still never crosses a live execution's first cursor. The regression test now asserts an over-size pass keeps part of the log, where the old behavior emptied it. ocean-observatory and daemon Observatory tests green, clippy -D warnings.
+_________________________________________________________________________________ 16:45 fix/observatory-retention-remeasure

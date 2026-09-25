@@ -213,7 +213,15 @@ fn a_pass_after_the_size_prune_does_not_prune_again() {
         },
     )
     .unwrap();
-    assert!(s.apply_retention().unwrap() > 0, "an over-size log prunes");
+    let pruned = s.apply_retention().unwrap();
+    assert!(pruned > 0, "an over-size log prunes");
+    // Re-measuring after each batch stops once under the bound: an older
+    // estimate over-pruned and emptied the whole log here.
+    let kept = s.events_after(Cursor::new(0), None).unwrap().len();
+    assert!(
+        kept > 0,
+        "the size bound stops short of emptying the log (pruned {pruned})"
+    );
     // The pruned pages now sit on the freelist; the file did not shrink.
     // Fresh, small events after that must survive the next pass — with the
     // file's page_count as the measure they would all be pruned again.
@@ -226,7 +234,10 @@ fn a_pass_after_the_size_prune_does_not_prune_again() {
         0,
         "freed pages are not live size"
     );
-    assert_eq!(s.events_after(Cursor::new(0), None).unwrap().len(), 3);
+    assert_eq!(
+        s.events_after(Cursor::new(0), None).unwrap().len(),
+        kept + 3
+    );
 }
 
 /// A rejected append (duplicate event id) does not advance the watermark.
