@@ -352,3 +352,23 @@ fn an_append_waits_out_a_competing_writer() {
     assert_eq!(s.append_event(event()).unwrap(), Cursor::new(1));
     release.join().unwrap();
 }
+
+/// Manifest §4.3: a checkpoint truncates the WAL. (`journal_size_limit` is a
+/// per-connection pragma set in `open`; the daemon's 60 s loop keeps the file
+/// at zero between bursts.)
+#[test]
+fn checkpoint_truncates_the_wal() {
+    let d = tempdir().unwrap();
+    let path = d.path().join("obs.db");
+    let s = ObservatoryStore::open(&path, RetentionPolicy::default()).unwrap();
+    for i in 0..200 {
+        s.append_event(event_for(&format!("w{i}"), "wal", 0, true))
+            .unwrap();
+    }
+    let wal = d.path().join("obs.db-wal");
+    let wal_len = || std::fs::metadata(&wal).map(|m| m.len()).unwrap_or(0);
+    assert!(wal_len() > 0, "writes went to the WAL");
+    let report = s.checkpoint().unwrap();
+    assert!(!report.busy, "{report:?}");
+    assert_eq!(wal_len(), 0, "TRUNCATE empties the WAL");
+}

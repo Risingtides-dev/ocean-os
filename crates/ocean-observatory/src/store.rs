@@ -26,6 +26,21 @@ pub enum StoreError {
     ForeignKeyViolation { count: i64 },
 }
 pub type Result<T> = std::result::Result<T, StoreError>;
+/// Manifest §4.3 WAL bound.
+pub const WAL_SIZE_LIMIT_BYTES: i64 = 16 * 1024 * 1024;
+
+/// What one `checkpoint` did, from `PRAGMA wal_checkpoint(TRUNCATE)`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CheckpointReport {
+    /// A reader or writer held the database, so the checkpoint could not
+    /// complete; the next pass tries again.
+    pub busy: bool,
+    /// Frames in the WAL before the checkpoint.
+    pub log_frames: i64,
+    /// Frames copied back into the database.
+    pub checkpointed_frames: i64,
+}
+
 pub struct ObservatoryStore {
     db: Arc<Mutex<Connection>>,
     current_cursor: Arc<Mutex<Cursor>>,
@@ -69,6 +84,11 @@ impl ObservatoryStore {
         // wait never stalls an async worker.
         db.busy_timeout(BUSY_TIMEOUT)?;
         db.execute_batch("PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON;")?;
+        // Manifest §4.3: keep the WAL near 16 MiB. SQLite's passive
+        // auto-checkpoint copies frames back but never shrinks the file; this
+        // limit truncates it to the bound after each checkpoint, and
+        // `checkpoint` below truncates it fully on the daemon's 60 s cadence.
+        db.pragma_update(None, "journal_size_limit", WAL_SIZE_LIMIT_BYTES)?;
         // F2: versioned, idempotent, step-by-step to the §4.1 shape.
         crate::migration::migrate(&mut db)?;
         // G4: seed from EVERY durable record of how far the log reached, not
@@ -156,6 +176,21 @@ impl ObservatoryStore {
         tx.commit()?;
         *self.current_cursor.lock() = cursor;
         Ok(cursor)
+    }
+    /// Copy the WAL back into the database and truncate it to zero bytes
+    /// (manifest §4.3). Busy is not an error: an open reader just defers the
+    /// truncation to the next pass.
+    pub fn checkpoint(&self) -> Result<CheckpointReport> {
+        let db = self.db.lock();
+        let (busy, log_frames, checkpointed_frames): (i64, i64, i64) =
+            db.query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |r| {
+                Ok((r.get(0)?, r.get(1)?, r.get(2)?))
+            })?;
+        Ok(CheckpointReport {
+            busy: busy != 0,
+            log_frames,
+            checkpointed_frames,
+        })
     }
     pub fn latest_cursor(&self) -> Cursor {
         *self.current_cursor.lock()

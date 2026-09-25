@@ -11044,3 +11044,12 @@ area:      [testing]
 
 Recorded the Observatory admission-wiring gate (Task 9 review, rollout recommendation 5) as §9.4 of the Gate 1 manifest and made it executable. V1's admission and binding seam is record-only: nothing outside ocean-observatory calls validate_admission, consume_binding, strip_binding or validate_topology_edge. When the extension turn path is built, three things must land together: consumption and strip before provider serialization, a wire-level test named observation_binding_never_reaches_the_wire, and topology-edge validation connected to attestation. crates/ocean-observatory/tests/admission_wiring_gate.rs fails the moment any of those functions gains a production caller outside the crate while no such test is defined. It builds the searched definition at runtime so its own source cannot satisfy it. That was a real self-match, caught by the mutation check against a planted strip_binding caller.
 _________________________________________________________________________________ 18:59 docs/observatory-admission-gate
+
+time:      [19:04] [25-09-26]
+agent:     [claude]
+worktree:  feat/observatory-wal-checkpoint
+type:      [feature-request]
+area:      [backend]
+
+Implemented the Observatory WAL checkpoint from Gate 1 manifest §4.3, which the Task 9 review listed as missing under F10. SQLite's passive auto-checkpoint copies frames back but never shrinks the WAL file. The store now sets journal_size_limit to 16 MiB at open and exposes checkpoint(), a PRAGMA wal_checkpoint(TRUNCATE) returning busy, log and checkpointed counts, and the daemon runs it every 60 s on a blocking thread until shutdown next to the retention loop. A busy pass is logged at debug and retried. This also bounds the WAL growth left by the F2 migration's one-time rebuild. Tests cover a checkpoint emptying the WAL file and the paused-time loop truncating it and stopping on cancel. ocean-observatory 75 tests, ocean-daemon 987, clippy -D warnings.
+_________________________________________________________________________________ 19:04 feat/observatory-wal-checkpoint

@@ -1174,7 +1174,8 @@ async fn main() -> anyhow::Result<()> {
     // hourly, off the async workers, until shutdown.
     if let Some(store) = observatory_store.clone() {
         let cancel = shutdown.clone();
-        tokio::spawn(observatory::run_retention(store, cancel));
+        tokio::spawn(observatory::run_retention(store.clone(), cancel.clone()));
+        tokio::spawn(observatory::run_checkpoints(store, cancel));
     }
 
     // Keep the local proxy credential fresh without ever distributing the
