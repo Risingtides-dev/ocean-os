@@ -268,6 +268,14 @@ impl ObservatoryAdapter {
     /// Fixed interruption sweep for restart safety: every execution left in a
     /// nonterminal phase by the previous boot is closed as canceled. Returns
     /// the number of executions marked.
+    ///
+    /// Gate 0 decision 7 calls this state `interrupted`; the §3 wire enum has
+    /// no such phase, so the sweep writes `canceled` (Task 9 F12, recorded in
+    /// the Gate 0 decisions as R3). What tells an operator a restart closed
+    /// the execution is the event, not the phase: the sweep appends
+    /// `execution_phase_changed` to `canceled` from this boot's
+    /// `daemon_instance_id`, while a cancelled turn ends with
+    /// `execution_finished` carrying `turn_cancelled` or `turn_abandoned`.
     pub(crate) fn mark_interrupted(&self, store: &ObservatoryStore) -> usize {
         let Ok(nonterminal) = store.nonterminal_executions() else {
             tracing::error!("observatory restart sweep failed to read nonterminal executions");
@@ -747,6 +755,41 @@ mod tests {
         assert_eq!(snapshot.nodes[0].phase, "canceled");
         // Terminal stores sweep nothing.
         assert_eq!(adapter.mark_interrupted(&store), 0);
+    }
+
+    /// F12: the restart sweep's "interrupted" is `canceled` on the wire (no
+    /// `interrupted` phase exists), told apart from a cancelled turn by its
+    /// event: `execution_phase_changed` from the new boot, not
+    /// `execution_finished`.
+    #[test]
+    fn restart_sweep_records_interrupted_as_a_phase_change_to_canceled() {
+        let previous_boot = adapter();
+        let store = store();
+        let started = store
+            .append_event(
+                previous_boot
+                    .adapt(&AgentTurnEvent::TurnStarted {
+                        turn_id: turn_id(),
+                        session_id: session_id(),
+                        model: None,
+                    })
+                    .expect("turn"),
+            )
+            .expect("append");
+
+        let next_boot = ObservatoryAdapter::new(OBS_ID.to_owned(), "next-boot".to_owned());
+        assert_eq!(next_boot.mark_interrupted(&store), 1);
+
+        let swept = store.events_after(started, None).expect("events");
+        assert_eq!(swept.len(), 1);
+        let wire = serde_json::to_value(&swept[0]).expect("json");
+        assert_eq!(wire["kind"], "execution_phase_changed", "{wire}");
+        assert_eq!(wire["payload"]["data"]["to_phase"], "canceled", "{wire}");
+        assert_eq!(wire["daemon_instance_id"], "next-boot", "{wire}");
+        assert!(
+            serde_json::from_str::<ExecutionPhase>("\"interrupted\"").is_err(),
+            "an `interrupted` phase is a wire change; update Gate 0 R3 and the sweep with it"
+        );
     }
 
     /// Spec e2e: agent event → adapter → store → SSE route → subscriber.

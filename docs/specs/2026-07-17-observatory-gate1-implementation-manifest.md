@@ -1363,7 +1363,7 @@ Accept: application/json
 
 **Query Parameters:**
 - `at` (optional, string cursor): snapshot at this cursor. Defaults to latest watermark.
-- `detail` (optional, enum): `summary` (nodes + edges only, default) or `full` (include metadata).
+- `detail` (optional, enum): `summary` (nodes + edges only, default) or `full` (include metadata). Gate 1: `full` is reserved — no metadata field is defined yet, so it returns the `summary` shape; any other value is 400 `invalid_detail` (Task 9 F12).
 
 **Response (200 OK):**
 
@@ -1446,7 +1446,7 @@ Last-Event-ID: <cursor>
 
 **Query Parameters:**
 - `after` (optional, string cursor): resume after this cursor. Defaults to latest.
-- `scope` (optional, enum): `summary` (default) or future `content`.
+- `scope` (optional, enum): `summary` (default) or future `content`. Gate 1 serves `summary` only: any other value, including `content`, is an `event: error` frame with `invalid_scope`, the same in-band 400 form as `invalid_cursor` (Task 9 F12).
 
 **Headers:**
 - `Last-Event-ID`: SSE standard; client sends the last event ID it received. Daemon resumes after this cursor.

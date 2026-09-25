@@ -96,6 +96,10 @@ pub(super) struct TurnMetrics {
     /// Cumulative advisor attempt latency, including immediate saturation.
     advisor_latency_buckets: [std::sync::atomic::AtomicU64; ADVISOR_LATENCY_BUCKETS_MS.len()],
     advisor_latency_sum_ms: std::sync::atomic::AtomicU64,
+    /// Observatory summary-token rotations that failed (Task 9 F11). The
+    /// published `observatory-token` expires 30 minutes after it was written,
+    /// so a climbing value means local observers are heading for 401s.
+    observer_token_rotation_failures: std::sync::atomic::AtomicU64,
 }
 
 impl TurnMetrics {
@@ -119,6 +123,14 @@ impl TurnMetrics {
                 bucket.fetch_add(1, Relaxed);
             }
         }
+    }
+
+    /// Count one failed Observatory summary-token rotation and return the new
+    /// daemon-lifetime total.
+    pub(super) fn record_observer_token_rotation_failure(&self) -> u64 {
+        self.observer_token_rotation_failures
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            + 1
     }
 
     pub(super) fn record_advisor(&self, outcome: AdvisorOutcome, elapsed: std::time::Duration) {
@@ -277,6 +289,16 @@ impl TurnMetrics {
         );
         out.push_str("# TYPE ocean_sse_events_dropped_total counter\n");
         let _ = writeln!(out, "ocean_sse_events_dropped_total {sse_events_dropped}");
+
+        out.push_str(
+            "# HELP ocean_observatory_token_rotation_failures_total Observatory summary-token rotations that failed.\n",
+        );
+        out.push_str("# TYPE ocean_observatory_token_rotation_failures_total counter\n");
+        let _ = writeln!(
+            out,
+            "ocean_observatory_token_rotation_failures_total {}",
+            self.observer_token_rotation_failures.load(Relaxed)
+        );
 
         out
     }
@@ -1142,6 +1164,7 @@ mod tests {
             "ocean_persist_failures_total",
             "ocean_sse_lag_events_total",
             "ocean_sse_events_dropped_total",
+            "ocean_observatory_token_rotation_failures_total",
         ] {
             assert!(
                 body.contains(&format!("# HELP {stem} ")),

@@ -280,6 +280,12 @@ fn daemon_producer() -> ocean_observatory::Producer {
 
 // ── GET /v1/observatory/snapshot (§7.1) ────────────────────────────────────
 
+/// `detail` is `summary` (default) or `full` (manifest §7.1). `full` is
+/// reserved (Task 9 F12): §7.1 says it adds "metadata" but defines no field
+/// for it, and every node/edge fact the V1 projection holds is already in the
+/// summary shape, so `full` answers exactly what `summary` does. It is
+/// validated rather than refused so a client written against §7.1 keeps
+/// working when `full` gains fields; any other value is 400 `invalid_detail`.
 #[derive(Debug, Deserialize)]
 pub(crate) struct SnapshotQuery {
     at: Option<String>,
@@ -420,10 +426,15 @@ pub(crate) async fn snapshot(
 
 // ── GET /v1/observatory/events (§7.2, SSE) ─────────────────────────────────
 
+/// `scope` is `summary` (the default) or, per manifest §7.2, the future
+/// `content`. V1 serves summary only (F3 refuses any other token scope), so
+/// every value except `summary` is refused with an `invalid_scope` error frame
+/// — the §7.2 form of a 400 on this SSE route, as for `invalid_cursor` —
+/// rather than silently streaming summary events to a caller that asked for
+/// something else (Task 9 F12).
 #[derive(Debug, Deserialize)]
 pub(crate) struct EventsQuery {
     after: Option<String>,
-    #[allow(dead_code)]
     scope: Option<String>,
 }
 
@@ -437,6 +448,21 @@ pub(crate) async fn events(
         let headers = observatory_headers(Cursor::new(0), &services.daemon_instance_id);
         return store_unavailable(headers);
     };
+    if query
+        .scope
+        .as_deref()
+        .is_some_and(|scope| scope != "summary")
+    {
+        return sse_terminal(
+            "error",
+            None,
+            json!({
+                "error":"invalid_scope",
+                "message":"scope must be summary; content is reserved and not served in V1",
+            }),
+            &services.daemon_instance_id,
+        );
+    }
 
     // SSE resume contract: the standard Last-Event-ID header wins over the
     // explicit query parameter.
@@ -1362,6 +1388,75 @@ mod tests {
         let text = body_string(response).await;
         assert!(text.contains("event: error"), "{text}");
         assert!(text.contains("invalid_cursor"), "{text}");
+    }
+
+    /// F12: `?scope=` is validated, not ignored — `summary` streams, anything
+    /// else (including the reserved `content`) is one `invalid_scope` error
+    /// frame and no event.
+    #[tokio::test]
+    async fn events_rejects_an_unsupported_scope() {
+        for scope in ["content", "bogus", ""] {
+            let router = app(store_with(&[]));
+            let response = router
+                .oneshot(authed(&format!("/v1/observatory/events?scope={scope}")))
+                .await
+                .expect("response");
+            assert_eq!(response.status(), StatusCode::OK);
+            let text = body_string(response).await;
+            assert!(text.contains("event: error"), "{scope}: {text}");
+            assert!(text.contains("invalid_scope"), "{scope}: {text}");
+        }
+
+        let router = app(store_with(&[]));
+        let response = router
+            .oneshot(authed("/v1/observatory/events?scope=summary"))
+            .await
+            .expect("response");
+        assert_eq!(response.status(), StatusCode::OK);
+        use futures::StreamExt;
+        let first = tokio::time::timeout(
+            Duration::from_secs(5),
+            http_body_util::BodyExt::into_data_stream(response.into_body()).next(),
+        )
+        .await
+        .expect("keepalive within 5s")
+        .expect("a frame")
+        .expect("frame bytes");
+        let text = String::from_utf8_lossy(&first);
+        assert!(!text.contains("invalid_scope"), "{text}");
+    }
+
+    /// F12: `detail=full` is reserved and answers exactly what `summary`
+    /// does; an unknown value is 400.
+    #[tokio::test]
+    async fn snapshot_detail_full_is_a_reserved_alias_of_summary() {
+        let store = store_with(&[
+            envelope("e-1", EventKind::ExecutionAdmitted),
+            envelope("e-1", EventKind::ExecutionPhaseChanged),
+        ]);
+        let summary = body_string(
+            app(store.clone())
+                .oneshot(authed("/v1/observatory/snapshot?detail=summary"))
+                .await
+                .expect("response"),
+        )
+        .await;
+        let full = body_string(
+            app(store.clone())
+                .oneshot(authed("/v1/observatory/snapshot?detail=full"))
+                .await
+                .expect("response"),
+        )
+        .await;
+        assert!(summary.contains("\"e-1\""), "{summary}");
+        assert_eq!(summary, full);
+
+        let invalid = app(store)
+            .oneshot(authed("/v1/observatory/snapshot?detail=everything"))
+            .await
+            .expect("response");
+        assert_eq!(invalid.status(), StatusCode::BAD_REQUEST);
+        assert!(body_string(invalid).await.contains("invalid_detail"));
     }
 
     #[tokio::test]

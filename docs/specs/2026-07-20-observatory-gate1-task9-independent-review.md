@@ -275,7 +275,8 @@ the in-memory watermark ahead of the durable log
 
 The cheap non-gating items landed on branch `fix/observatory-hardening`, each
 with a regression test. F2, F7, F8, F11, F12 and the §4.3 checkpoint task stay
-open. (F2 later closed; see "F2 migration (2026-09-25)" below.)
+open. (F2 later closed; see "F2 migration (2026-09-25)" below. F11 and F12
+later closed; see "F11/F12 (2026-09-25)" below.)
 
 - **F1** — every Observatory store call except the in-memory `latest_cursor`
   runs on Tokio's blocking pool through `observatory::off_executor`
@@ -433,3 +434,54 @@ Operational notes: the first open after upgrade rewrites the database in one
 transaction (~2.5 s for the operator's 166 MB file) on the daemon's startup
 path, and the WAL grows to roughly the database size until checkpoint, so
 the volume needs that much headroom once.
+
+## F11/F12 (2026-09-25)
+
+Landed on branch `fix/observatory-f11-f12`, each item with a regression test.
+No wire shape changed except that `events?scope=` now refuses what it used to
+ignore.
+
+- **F11 — directory fsync.** `ObserverSecret::load_or_generate` fsyncs
+  `<ocean_dir>` after the hard link, and `write_summary_observer_token` after
+  the rename, so neither new directory entry can be lost to a crash after the
+  daemon started relying on it. A failed directory sync fails the call, like
+  every other secret I/O error. Loading an existing secret syncs nothing.
+  Test: `secret_link_and_token_rename_sync_the_parent_directory`.
+- **F11 — rotation failure.** The ten-minute rotation now runs through
+  `ObservatoryAuthState::rotate_summary_token`, which counts every failure on
+  `ocean_observatory_token_rotation_failures_total` (`GET /metrics`, a
+  `TurnMetrics` counter) and logs at `error` with the consecutive and
+  lifetime counts and `published_token_expired` (true from the third
+  consecutive failure: tokens live 30 minutes, rotation runs every 10). A
+  success after failures logs the recovery at `warn`. Test:
+  `failed_token_rotation_is_counted_on_metrics`.
+- **F11 — zero-lifetime tokens.** `validate_claims` refuses
+  `expires_at <= issued_at` as `InvalidClaims`; `expires_at == issued_at` used
+  to pass. Test: `zero_lifetime_token_is_rejected`.
+- **F11 — unix-only secret handling.** Left as is: the crate already imports
+  `std::os::unix` unconditionally, so it does not build off unix, and a
+  portable secret store is not a trivial fix.
+- **F12 — `?scope=`.** Manifest §7.2 defines `scope` as `summary` (default)
+  or future `content`, so it is validated rather than dropped: any value but
+  `summary` (including `content`, which V1 does not serve) gets a single
+  `event: error` frame with `{"error":"invalid_scope"}`. That is the
+  manifest's form of a 400 on this SSE route, the same one `invalid_cursor`
+  uses; the HTTP status stays 200 so an `EventSource` client can read the
+  reason. Manifest §7.2, the operator guide, and the daemon AGENTS.md say so.
+  Test: `events_rejects_an_unsupported_scope`.
+- **F12 — `detail=full`.** §7.1 says `full` "includes metadata" but defines
+  no field for it, and every fact the projection holds is already in the
+  summary shape, so there is nothing to add. It is documented as reserved
+  (route doc on `SnapshotQuery`, manifest §7.1, operator guide) and answers
+  exactly what `summary` does; other values stay 400 `invalid_detail`. Test:
+  `snapshot_detail_full_is_a_reserved_alias_of_summary`.
+- **F12 — `interrupted` vs `Canceled`.** `ExecutionPhase` has no
+  `Interrupted` variant, and adding one is a wire change, so the enum is
+  unchanged and the record is reconciled instead: Gate 0 decisions R3 and the
+  `mark_interrupted` doc say the restart sweep's "interrupted" is `canceled`
+  on the wire. Operators tell a restart-closed execution from a cancelled turn
+  by its terminal event: `execution_phase_changed` to `canceled` from the next
+  boot's `daemon_instance_id`, versus `execution_finished` with
+  `turn_cancelled`/`turn_abandoned`. Test:
+  `restart_sweep_records_interrupted_as_a_phase_change_to_canceled` (also
+  fails if an `interrupted` phase is ever added without updating R3).
