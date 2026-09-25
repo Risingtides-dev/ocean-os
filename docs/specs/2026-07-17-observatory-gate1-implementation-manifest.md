@@ -1847,6 +1847,26 @@ cargo test -p ocean-observatory schema_creation -- --nocapture
 
 ---
 
+### 9.4 Admission wiring gate (recorded 2026-09-25, Task 9 review rec 5)
+
+V1's admission/binding seam is record-only: no production path calls
+`validate_admission`, `consume_binding`, `strip_binding`, or
+`validate_topology_edge`. When the extension turn path is built, all of the
+following land in ONE change, or none do:
+
+1. admission consumption (`consume_binding`) and `strip_binding` are wired
+   together, before any provider serialization of the turn;
+2. an integration test named `observation_binding_never_reaches_the_wire`
+   proves `_observation_binding` is absent from every provider request body;
+3. `validate_topology_edge` is connected to attestation ingestion and emits
+   `TopologyAttestationRejected` on failure.
+
+`crates/ocean-observatory/tests/admission_wiring_gate.rs` enforces this. It
+fails the moment any of the four functions gains a production call site
+outside `ocean-observatory` while no test named
+`observation_binding_never_reaches_the_wire` exists in the workspace, so the
+gate cannot be crossed silently.
+
 ## 10. Non-Acceptance Conditions
 
 This manifest is not accepted if:
