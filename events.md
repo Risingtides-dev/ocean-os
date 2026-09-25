@@ -10883,3 +10883,12 @@ area:      [backend]
 
 Daemon half of Rooms DoD 5.8, the daemon-to-surface drift check. ocean-os now publishes docs/contracts/room-wire.json, the room wire facts ocean-surface branches on: the /events SSE event names, the access-state, message-kind and participant-kind vocabularies, the top-level keys of /snapshot and /transcript, and the DoD 1.10 not-open answer. room_wire_contract_matches_the_daemon holds it equal to the real daemon. Enum names come through serde from an exhaustive match, so a new variant will not compile until the artifact lists it. The response keys come from live /snapshot and /transcript answers and a never-existed room's 404, and the SSE names are scanned from the handlers' own .event literals. Both repos are public, so the surface can vendor and CI-check the file with no cross-repo credential. That surface half is next, and docs/contracts/README.md indexes the artifact. ocean-daemon 965 tests, clippy -D warnings, docs-check.
 _________________________________________________________________________________ 16:19 feat/room-wire-contract
+
+time:      [16:19] [25-09-26]
+agent:     [claude]
+worktree:  fix/fmt-483
+type:      [bug-report]
+area:      [infra]
+
+cargo fmt --check was red on main: a hand edit made after formatting in #483 (the widened test deadline) and the scan split in #484 were left unformatted. This is a format-only change to crates/ocean-daemon/src/persistent_rooms.rs and main.rs with no behavior change.
+_________________________________________________________________________________ 16:19 fix/fmt-483
