@@ -135,6 +135,36 @@ const RETENTION_INTERVAL: Duration = Duration::from_secs(60 * 60);
 /// First pass shortly after boot, off the startup critical path.
 const RETENTION_FIRST_DELAY: Duration = Duration::from_secs(60);
 
+/// Manifest §4.3 WAL checkpoint cadence.
+const CHECKPOINT_INTERVAL: Duration = Duration::from_secs(60);
+
+/// Manifest §4.3: checkpoint and truncate the Observatory WAL every 60 s until
+/// `cancel`, on a blocking thread. `journal_size_limit` (set at open) bounds
+/// the file between passes; a busy pass is retried on the next tick.
+pub(crate) async fn run_checkpoints(
+    store: Arc<ObservatoryStore>,
+    cancel: tokio_util::sync::CancellationToken,
+) {
+    loop {
+        tokio::select! {
+            () = cancel.cancelled() => return,
+            () = tokio::time::sleep(CHECKPOINT_INTERVAL) => {}
+        }
+        let pass_store = Arc::clone(&store);
+        match tokio::task::spawn_blocking(move || pass_store.checkpoint()).await {
+            Ok(Ok(report)) if report.busy => {
+                tracing::debug!(
+                    ?report,
+                    "observatory WAL checkpoint deferred: database busy"
+                );
+            }
+            Ok(Ok(_)) => {}
+            Ok(Err(error)) => tracing::warn!(%error, "observatory WAL checkpoint failed"),
+            Err(error) => tracing::warn!(%error, "observatory WAL checkpoint panicked"),
+        }
+    }
+}
+
 /// G3: apply the store's retention policy on a schedule until `cancel`.
 /// Each pass runs on a blocking thread (it reads and deletes SQLite rows);
 /// a failed pass is logged and the next one tries again.
@@ -973,6 +1003,41 @@ mod tests {
             store.append_event(event.clone()).expect("append");
         }
         Arc::new(store)
+    }
+
+    /// Manifest §4.3: the daemon's checkpoint loop truncates the WAL on its
+    /// cadence and stops on shutdown.
+    #[tokio::test(start_paused = true)]
+    async fn scheduled_checkpoints_truncate_the_wal_and_stop_on_shutdown() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("obs.db");
+        let store =
+            Arc::new(ObservatoryStore::open(&path, RetentionPolicy::default()).expect("open"));
+        for i in 0..50 {
+            store
+                .append_event(envelope(&format!("c-{i}"), EventKind::ExecutionFinished))
+                .expect("append");
+        }
+        let wal = dir.path().join("obs.db-wal");
+        let wal_len = || std::fs::metadata(&wal).map(|m| m.len()).unwrap_or(0);
+        assert!(wal_len() > 0);
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let task = tokio::spawn(run_checkpoints(Arc::clone(&store), cancel.clone()));
+        tokio::task::yield_now().await;
+        tokio::time::advance(CHECKPOINT_INTERVAL + Duration::from_secs(1)).await;
+        for _ in 0..200 {
+            if wal_len() == 0 {
+                break;
+            }
+            tokio::task::yield_now().await;
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert_eq!(wal_len(), 0, "the loop checkpointed and truncated the WAL");
+        cancel.cancel();
+        tokio::time::timeout(Duration::from_secs(5), task)
+            .await
+            .expect("checkpoint loop ends on shutdown")
+            .unwrap();
     }
 
     /// G3: the scheduled loop really runs retention (the policy used to have

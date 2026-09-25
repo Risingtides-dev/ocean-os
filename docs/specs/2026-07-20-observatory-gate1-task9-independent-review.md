@@ -502,3 +502,14 @@ with F11.
 The admission-wiring gate above is recorded as §9.4 of the Gate 1
 implementation manifest and enforced by
 `crates/ocean-observatory/tests/admission_wiring_gate.rs`.
+
+### §4.3 WAL checkpoint (2026-09-25)
+
+The manifest's §4.3 checkpoint task, listed under F10 as unimplemented, now
+exists. `ObservatoryStore::open` sets `journal_size_limit` to 16 MiB, and
+`ObservatoryStore::checkpoint` runs `PRAGMA wal_checkpoint(TRUNCATE)`. The
+daemon calls it every 60 s on a blocking thread until shutdown
+(`observatory::run_checkpoints`), and a busy pass is retried on the next tick.
+This also bounds the one-time WAL growth of the F2 migration's rebuild. Tests:
+`checkpoint_truncates_the_wal` and
+`scheduled_checkpoints_truncate_the_wal_and_stop_on_shutdown`.
