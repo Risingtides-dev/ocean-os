@@ -1033,6 +1033,41 @@ crash fixtures. No HTTP/CLI mutation routes, live supervisor reconciliation, or
 Git network acquisition. Tests invoke the internal authority and include
 acquisition outside the state lock.
 
+**A3a status (2026-09-25): implemented on `feat/extension-stage-a3a`, pending
+fresh independent review; not accepted.** The writer is
+`crates/ocean-daemon/src/extension_registry/transaction.rs`, a child of the
+registry module. Realization choices that review must ratify or reject:
+
+- *Durable marker.* `extensions/stage-a-publication.json`, strict
+  `{"schema_version":1,"first_state_revision":N}`, created immediately after the
+  first state-file rename and ensured by every roll-forward; never removed. The
+  shared reader fails closed on a missing `service-grants.json` whenever it
+  exists, and on a malformed marker or one naming a revision above the current
+  one. The accepted Phase 1 binary ignores it.
+- *Rename order.* `service-grants.json` is renamed first (the commit point),
+  then the marker, then `installs.json`, `trust.json`, `enabled.json`, so every
+  interrupted post-commit state is a revision mismatch rather than an A0-shaped
+  snapshot.
+- *Absent registry root.* The first install into a config directory with no
+  `extensions/` builds the complete root (lock, payload, four files, marker) in
+  a private `<config>/.extensions-bootstrap-<op>/` and publishes it with one
+  no-replace rename (the commit point). This keeps the A0 rule that only a wholly
+  absent root is empty while an acquisition is in flight.
+- *Acquisition capacity* is a non-blocking refusal (`acquisition_capacity`), not
+  a queue.
+- *Sparse files* are rejected when a file over 64 KiB has more than 64 KiB of
+  unallocated length.
+- *Retention.* Remove requires no connection directory under `state/<id>/tmp`;
+  post-commit payload and state-root deletion is journaled, and a failed step is
+  retried by the next recovery without blocking later mutations.
+- *Error codes* are fixed internal codes; A3b owns the HTTP mapping.
+
+Open for A3b or a ruling: startup recovery wiring (the manifest requires it
+before readers and services start; A3a exposes `RegistryWriter::recover` but no
+production caller can create a journal until A3b routes exist); the supervisor
+`ServiceActivity` binding used by update/remove; and Windows package management
+(§R5 "may manage"), since the writer is compiled only on Unix.
+
 ### A3b — HTTP/CLI mutation surfaces and supervisor reconciliation
 
 Add only §15's HTTP/CLI mutation surfaces, common committed response envelope,

@@ -93,6 +93,18 @@ M1; M3's route contract is §9 of the spec; M2 still needs its manifest.
 - [ ] M4 — Rooms invites and joins in the web UI, member id equal to the web
       login identity.
 
+## Ocean extension host (Crew Stage A)
+
+Governed by [`docs/specs/2026-07-27-ocean-extension-stage-a-implementation-manifest.md`](docs/specs/2026-07-27-ocean-extension-stage-a-implementation-manifest.md);
+A1, A2a, and A2b are accepted.
+
+- [ ] A3a — internal transactional registry writer, journal/recovery, retention,
+      grant diff, and the first-publication marker: implemented on
+      `feat/extension-stage-a3a`, awaiting fresh independent review.
+- [ ] A3b — HTTP/CLI mutation surfaces, startup recovery wiring, and
+      revision-serialized supervisor reconciliation (after A3a review).
+- [ ] A4 — pinned public Git acquisition; A5 — integrated Stage A gate.
+
 ## Ocean Observatory
 
 - [x] Gate 0 decisions accepted — see [`docs/specs/2026-07-17-observatory-gate0-decisions.md`](docs/specs/2026-07-17-observatory-gate0-decisions.md), including the operator's 90s-game visual-parity ruling on truthful events with a durable event store.
