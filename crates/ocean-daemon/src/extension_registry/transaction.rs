@@ -26,19 +26,18 @@
 // outside tests nothing calls it yet.
 #![cfg_attr(not(test), allow(dead_code))]
 
+use std::collections::BTreeMap;
 use std::ffi::{CStr, CString};
 use std::io::{self, Write as _};
 use std::os::fd::AsRawFd;
 use std::os::unix::fs::MetadataExt;
-use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::Mutex;
+use std::sync::{Condvar, Mutex};
 
 use super::*;
 
 const JOURNAL_SCHEMA_VERSION: u32 = 1;
 const ACQUISITION_PERMITS: usize = 4;
 const MAX_REMOVAL_DEPTH: usize = 128;
-const SPARSE_TOLERANCE: u64 = 64 * 1024;
 const GRANT_DIFF_DOMAIN: &[u8] = b"ocean-extension-grant-diff-v1\0";
 const BOOTSTRAP_PREFIX: &str = ".extensions-bootstrap-";
 
@@ -335,12 +334,65 @@ impl Failure {
     }
 }
 
-/// Four daemon-wide acquisition permits (§12.3 step 1).
-struct AcquisitionPermit(Arc<AtomicUsize>);
+/// Acquisition/sweep gate for one registry, shared by every `RegistryWriter`
+/// in the process that names the same canonical config directory. Keying the
+/// gate by registry (not by writer instance) is what makes the four-permit cap
+/// daemon-wide and lets an orphan sweep prove no acquisition is live: a second
+/// writer instance cannot hide its quarantine from another's recovery.
+#[derive(Default)]
+struct RegistryGate {
+    active: usize,
+    sweeping: bool,
+}
+
+static REGISTRY_GATES: Mutex<BTreeMap<PathBuf, RegistryGate>> = Mutex::new(BTreeMap::new());
+static REGISTRY_GATE_SIGNAL: Condvar = Condvar::new();
+
+fn registry_gates() -> std::sync::MutexGuard<'static, BTreeMap<PathBuf, RegistryGate>> {
+    REGISTRY_GATES
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner())
+}
+
+/// One of four daemon-wide acquisition permits (§12.3 step 1).
+struct AcquisitionPermit(PathBuf);
 
 impl Drop for AcquisitionPermit {
     fn drop(&mut self) {
-        self.0.fetch_sub(1, Ordering::AcqRel);
+        let mut gates = registry_gates();
+        if let Some(gate) = gates.get_mut(&self.0) {
+            gate.active = gate.active.saturating_sub(1);
+        }
+        drop(gates);
+        REGISTRY_GATE_SIGNAL.notify_all();
+    }
+}
+
+/// Exclusive orphan-sweep claim: while held, no acquisition can begin, and it
+/// is only granted when none is live. Released on drop.
+struct SweepClaim(PathBuf);
+
+impl SweepClaim {
+    /// `None` when an acquisition is live: the sweep is skipped, never raced.
+    fn try_claim(key: &FsPath) -> Option<Self> {
+        let mut gates = registry_gates();
+        let gate = gates.entry(key.to_path_buf()).or_default();
+        if gate.active > 0 || gate.sweeping {
+            return None;
+        }
+        gate.sweeping = true;
+        Some(Self(key.to_path_buf()))
+    }
+}
+
+impl Drop for SweepClaim {
+    fn drop(&mut self) {
+        let mut gates = registry_gates();
+        if let Some(gate) = gates.get_mut(&self.0) {
+            gate.sweeping = false;
+        }
+        drop(gates);
+        REGISTRY_GATE_SIGNAL.notify_all();
     }
 }
 
@@ -408,10 +460,14 @@ impl VerifiedQuarantine {
     }
 }
 
-/// The single daemon-owned registry writer.
+/// The daemon-owned registry writer.
+///
+/// Intended as one instance per daemon (A3b holds it in `AppState`), but the
+/// invariants do not depend on that: `.state.lock` serializes publication
+/// across instances and processes, and the acquisition/sweep gate is shared by
+/// every instance naming the same canonical config directory.
 pub(crate) struct RegistryWriter {
     config_dir: PathBuf,
-    acquisitions: Arc<AtomicUsize>,
     #[cfg(test)]
     crash_at: Mutex<Option<CrashPoint>>,
 }
@@ -420,7 +476,6 @@ impl RegistryWriter {
     pub(crate) fn new(config_dir: PathBuf) -> Self {
         Self {
             config_dir,
-            acquisitions: Arc::new(AtomicUsize::new(0)),
             #[cfg(test)]
             crash_at: Mutex::new(None),
         }
@@ -461,21 +516,27 @@ impl RegistryWriter {
         Ok(config)
     }
 
+    fn gate_key(&self) -> PathBuf {
+        fs::canonicalize(&self.config_dir).unwrap_or_else(|_| self.config_dir.clone())
+    }
+
+    /// Waits only while an orphan sweep holds the gate (bounded by that
+    /// sweep), then takes one of the four permits or refuses.
     fn try_permit(&self) -> Option<AcquisitionPermit> {
-        let mut current = self.acquisitions.load(Ordering::Acquire);
+        let key = self.gate_key();
+        let mut gates = registry_gates();
         loop {
-            if current >= ACQUISITION_PERMITS {
-                return None;
+            let gate = gates.entry(key.clone()).or_default();
+            if !gate.sweeping {
+                if gate.active >= ACQUISITION_PERMITS {
+                    return None;
+                }
+                gate.active += 1;
+                return Some(AcquisitionPermit(key));
             }
-            match self.acquisitions.compare_exchange(
-                current,
-                current + 1,
-                Ordering::AcqRel,
-                Ordering::Acquire,
-            ) {
-                Ok(_) => return Some(AcquisitionPermit(self.acquisitions.clone())),
-                Err(observed) => current = observed,
-            }
+            gates = REGISTRY_GATE_SIGNAL
+                .wait(gates)
+                .unwrap_or_else(|poison| poison.into_inner());
         }
     }
 
@@ -928,9 +989,12 @@ impl RegistryWriter {
 
     fn recover_inner(&self) -> Step<RecoveryReport> {
         let config = self.open_config()?;
-        let sweep = self.acquisitions.load(Ordering::Acquire) == 0;
+        // Held across both sweeps and the journal recovery between them, so an
+        // acquisition cannot begin (and have its quarantine or bootstrap
+        // directory deleted mid-copy) after the no-live-acquisition check.
+        let sweep = SweepClaim::try_claim(&self.gate_key());
         let mut report = RecoveryReport::default();
-        if sweep {
+        if sweep.is_some() {
             for name in raw_names(&config).map_err(unavailable)? {
                 if name.to_bytes().starts_with(BOOTSTRAP_PREFIX.as_bytes()) {
                     remove_tree_at(&config, &name, 0).map_err(unavailable)?;
@@ -950,7 +1014,7 @@ impl RegistryWriter {
         report.rolled_forward += journals.rolled_forward;
         report.cleanup_pending += journals.cleanup_pending;
         report.orphans_removed += journals.orphans_removed;
-        if sweep {
+        if sweep.is_some() {
             if let Some(quarantine) = open_optional_dir(&root, c"quarantine")? {
                 for name in raw_names(&quarantine).map_err(unavailable)? {
                     remove_tree_at(&quarantine, &name, 0).map_err(unavailable)?;
@@ -1070,6 +1134,14 @@ impl RegistryWriter {
                 None,
             ),
         };
+        // §12.3: the adopted (or created) `staging/<op>` entry and the
+        // `staging/` directory itself are durable before the prepared journal
+        // that names them.
+        if let Err(error) = fsync_dir(&staging_root).and_then(|()| fsync_dir(&root)) {
+            let _ = remove_tree_at(&staging_root, &operation_name, 0);
+            return Err(Failure::pre(old_revision)(unavailable(error)));
+        }
+        durability_trace("staging-root-synced");
         let files = match write_staged_files(&staging, &rendered) {
             Ok(files) => files,
             Err(fail) => {
@@ -1752,11 +1824,10 @@ fn copy_tree(source: &File, target: &File, depth: usize, budget: &mut CopyBudget
             return Err(Fail::Reject(PACKAGE_INVALID));
         }
         let length = before.len();
-        // Reject materially sparse files; small-file inline/compressed
-        // allocation quirks stay inside the fixed tolerance.
-        if length > SPARSE_TOLERANCE
-            && before.blocks().saturating_mul(512) + SPARSE_TOLERANCE < length
-        {
+        // Reject files with a hole, detected from the filesystem's own hole
+        // map rather than allocated blocks, which undercount legitimately
+        // compressed files (ZFS/btrfs compression, APFS decmpfs).
+        if has_hole(&entry, length).map_err(invalid_package)? {
             return Err(Fail::Reject(PACKAGE_INVALID));
         }
         budget.bytes = budget
@@ -1794,6 +1865,30 @@ fn copy_tree(source: &File, target: &File, depth: usize, budget: &mut CopyBudget
         output.sync_all().map_err(unavailable)?;
     }
     Ok(())
+}
+
+/// True when `SEEK_HOLE` reports a hole before end of file. A filesystem
+/// without hole tracking reports only the implicit hole at EOF, so dense
+/// files are never rejected; the read position is restored to 0.
+fn has_hole(file: &File, length: u64) -> io::Result<bool> {
+    if length == 0 {
+        return Ok(false);
+    }
+    // SAFETY: file is a live descriptor; lseek does not touch memory.
+    let hole = unsafe { libc::lseek(file.as_raw_fd(), 0, libc::SEEK_HOLE) };
+    if hole < 0 {
+        let error = io::Error::last_os_error();
+        // No hole-map support: nothing to detect, not a failure.
+        if error.raw_os_error() == Some(libc::EINVAL) {
+            return Ok(false);
+        }
+        return Err(error);
+    }
+    // SAFETY: as above.
+    if unsafe { libc::lseek(file.as_raw_fd(), 0, libc::SEEK_SET) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok((hole as u64) < length)
 }
 
 fn seal_inner(lease: AcquisitionLease) -> Step<VerifiedQuarantine> {
@@ -1843,6 +1938,9 @@ fn adopt(
     let operation = lease.operation_name();
     renameat_at(&lease.parent, &operation, staging_root, &operation).map_err(unavailable)?;
     lease.consumed = true;
+    // The rename's source directory; the destination is synced by the caller
+    // before the prepared journal.
+    fsync_dir(&lease.parent).map_err(unavailable)?;
     if let QuarantineHome::Bootstrap { config, name, .. } = &lease.home {
         let _ = remove_tree_at(config, name, 0);
     }
@@ -1951,7 +2049,23 @@ fn write_journal(root: &File, journal: &TransactionJournal) -> Step<()> {
     .map_err(unavailable)?;
     fsync_dir(&transactions).map_err(unavailable)?;
     fsync_dir(root).map_err(unavailable)?;
+    if journal.phase == JournalPhase::Prepared {
+        durability_trace("journal-prepared-durable");
+    }
     Ok(())
+}
+
+#[cfg(test)]
+thread_local! {
+    static DURABILITY_TRACE: std::cell::RefCell<Vec<&'static str>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// Test-only ordering evidence for fsync barriers; a no-op in production.
+fn durability_trace(event: &'static str) {
+    #[cfg(test)]
+    DURABILITY_TRACE.with(|trace| trace.borrow_mut().push(event));
+    let _ = event;
 }
 
 fn live_hash(root: &File, name: &'static str) -> Step<Option<String>> {
@@ -2071,6 +2185,9 @@ fn roll_forward(
     fsync_dir(root).map_err(unavailable)?;
     checkpoint(CrashPoint::AfterDirectoryFsync)?;
 
+    if journal.operation == OperationKind::Install {
+        retire_superseded_cleanups(root, journal)?;
+    }
     let cleanup_complete = apply_cleanup(root, journal);
     checkpoint(CrashPoint::AfterRetentionCleanup)?;
 
@@ -2086,7 +2203,12 @@ fn roll_forward(
     }
     if cleanup_complete {
         if let Some(transactions) = open_optional_dir(root, c"transactions")? {
-            unlink_at(&transactions, &journal_name(journal)).map_err(unavailable)?;
+            match unlink_at(&transactions, &journal_name(journal)) {
+                Ok(()) => {}
+                // Already retired by a superseding install.
+                Err(error) if error.raw_os_error() == Some(libc::ENOENT) => {}
+                Err(error) => return Err(unavailable(error)),
+            }
             fsync_dir(&transactions).map_err(unavailable)?;
         }
     }
@@ -2147,10 +2269,30 @@ fn rollback(root: &File, journal: &TransactionJournal) -> Step<()> {
 
 /// Post-commit §12.4 retention. Failures are retried by the next recovery;
 /// they never make a coherent registry generation incoherent.
+///
+/// Retention belongs to the removal that journaled it, never to a later
+/// generation of the same id. A retry is therefore gated on the live
+/// generation still not installing that id: once the id is installed again
+/// (reinstall after a remove whose cleanup stayed pending), its `data/`,
+/// `cache/`, `tmp/`, and store payloads belong to the new install, and the
+/// stale cleanup is retired without touching them. Unreadable installs defer
+/// the retry rather than guessing.
 fn apply_cleanup(root: &File, journal: &TransactionJournal) -> bool {
     let cleanup = journal.cleanup;
     if !cleanup.any() {
         return true;
+    }
+    match read_state_json_at::<InstallsFile>(root, "installs.json") {
+        Ok(installs)
+            if installs
+                .installs
+                .iter()
+                .any(|install| install.id == journal.extension_id) =>
+        {
+            return true;
+        }
+        Ok(_) => {}
+        Err(_) => return false,
     }
     let Ok(id) = CString::new(journal.extension_id.as_str()) else {
         return false;
@@ -2256,18 +2398,88 @@ fn parse_journal(transactions: &File, name: &CStr) -> Step<TransactionJournal> {
     Ok(journal)
 }
 
+#[derive(Debug, PartialEq, Eq)]
+enum TransactionEntry {
+    Journal,
+    Temporary,
+    Foreign,
+}
+
+fn canonical_uuid(text: &str) -> bool {
+    Uuid::parse_str(text).is_ok_and(|uuid| uuid.to_string() == text)
+}
+
+/// Only names this writer creates are interpreted: `<uuid>.json` journals,
+/// `<uuid>.json.tmp` journal drafts, and `stage-a-publication.json.<uuid>.tmp`
+/// marker drafts.
+fn classify_transaction_entry(name: &CStr) -> TransactionEntry {
+    let Ok(text) = name.to_str() else {
+        return TransactionEntry::Foreign;
+    };
+    if text.strip_suffix(".json.tmp").is_some_and(canonical_uuid)
+        || text
+            .strip_prefix(PUBLICATION_MARKER)
+            .and_then(|rest| rest.strip_prefix('.'))
+            .and_then(|rest| rest.strip_suffix(".tmp"))
+            .is_some_and(canonical_uuid)
+    {
+        return TransactionEntry::Temporary;
+    }
+    if text.strip_suffix(".json").is_some_and(canonical_uuid) {
+        return TransactionEntry::Journal;
+    }
+    TransactionEntry::Foreign
+}
+
+/// A committed install supersedes every earlier committed journal whose
+/// retention for the same id is still pending: that retention belonged to a
+/// removed generation, and must never later act on this install's state or on
+/// a subsequent removal with a different `purge_state` choice.
+fn retire_superseded_cleanups(root: &File, journal: &TransactionJournal) -> Step<()> {
+    let Some(transactions) = open_optional_dir(root, c"transactions")? else {
+        return Ok(());
+    };
+    for name in raw_names(&transactions).map_err(unavailable)? {
+        if classify_transaction_entry(&name) != TransactionEntry::Journal {
+            continue;
+        }
+        let Ok(prior) = parse_journal(&transactions, &name) else {
+            // Left for recovery, which fails closed on it.
+            continue;
+        };
+        if prior.operation_id != journal.operation_id
+            && prior.phase == JournalPhase::Committed
+            && prior.extension_id == journal.extension_id
+            && prior.cleanup.any()
+        {
+            match unlink_at(&transactions, &name) {
+                Ok(()) => {}
+                Err(error) if error.raw_os_error() == Some(libc::ENOENT) => {}
+                Err(error) => return Err(unavailable(error)),
+            }
+        }
+    }
+    fsync_dir(&transactions).map_err(unavailable)?;
+    Ok(())
+}
+
 /// Runs under the exclusive lock before any mutation and at startup.
 fn recover_locked(root: &File) -> Step<LockedRecovery> {
     let mut report = LockedRecovery::default();
     if let Some(transactions) = open_optional_dir(root, c"transactions")? {
         let mut journals = Vec::new();
         for name in raw_names(&transactions).map_err(unavailable)? {
-            let bytes = name.to_bytes();
-            if bytes.ends_with(b".tmp") {
+            match classify_transaction_entry(&name) {
                 // Never renamed into place: no journal was proven.
-                unlink_at(&transactions, &name).map_err(unavailable)?;
-            } else {
-                journals.push(parse_journal(&transactions, &name)?);
+                TransactionEntry::Temporary => {
+                    unlink_at(&transactions, &name).map_err(unavailable)?
+                }
+                // A journal-shaped name is authority: malformed content fails
+                // closed as `registry_recovery_required`.
+                TransactionEntry::Journal => journals.push(parse_journal(&transactions, &name)?),
+                // Foreign rows (`.DS_Store`, editor droppings) are not journals
+                // and carry no authority; they never block the registry.
+                TransactionEntry::Foreign => {}
             }
         }
         journals.sort_by_key(|journal| (journal.new_state_revision, journal.operation_id));
@@ -2562,8 +2774,8 @@ fn remove_tree_at(parent: &File, name: &CStr, depth: usize) -> io::Result<()> {
 mod tests {
     use super::*;
     use serde_json::{json, Value};
-    use std::collections::BTreeMap;
     use std::path::Path;
+    use std::sync::atomic::Ordering;
 
     const ID: &str = "example.noop";
     const DEFAULT_CAPABILITIES: &str =
@@ -3056,53 +3268,361 @@ mod tests {
         assert_eq!(h.revision(), 2);
     }
 
-    #[test]
-    fn a3a_acquisition_runs_outside_the_state_lock_with_four_permits() {
+    async fn route_json(app: axum::Router, uri: &str) -> (axum::http::StatusCode, Value) {
+        use http_body_util::BodyExt;
+        use tower::ServiceExt;
+
+        let response = app
+            .oneshot(
+                axum::http::Request::get(uri)
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let status = response.status();
+        let bytes = response.into_body().collect().await.unwrap().to_bytes();
+        (status, serde_json::from_slice(&bytes).unwrap())
+    }
+
+    /// §12.3 / §19.4: a long-running fetch holds a permit and quarantine for
+    /// the whole interval while list, inspect, and doctor keep answering from
+    /// coherent shared-lock reads, a mutation commits, and three further
+    /// acquisitions proceed. The fetch is released only after every read.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a3a_acquisition_runs_outside_the_state_lock_with_four_permits() {
+        use crate::tests::{fake_convene_state, TestEnvRestore, AUTO_CONVENE_ENV_LOCK};
+        use axum::routing::get;
+
+        let _guard = AUTO_CONVENE_ENV_LOCK.lock().await;
+        let _restore = TestEnvRestore::capture(&["OCEAN_CONFIG_DIR", "OCEAN_MODEL", "OCEAN_YOLO"]);
         let h = Harness::new();
         h.install(0, &h.noop("v1", "1.0.0"));
         let second = h.noop("v2", "2.0.0");
         let third = h.noop("v3", "3.0.0");
+        let app = axum::Router::new()
+            .route("/v1/extensions/{id}/inspect", get(super::super::inspect))
+            .route("/v1/extensions/{id}/doctor", get(super::super::doctor))
+            .with_state(fake_convene_state(&h.config));
 
-        // A held-open "fetch": the permit and quarantine are reserved while
-        // the operator keeps reading and mutating.
+        // The held-open fetch: begun on its own thread, it keeps its permit
+        // and quarantine until explicitly released (60 s ceiling).
         let (release, wait) = std::sync::mpsc::channel::<()>();
-        let (started, ready) = std::sync::mpsc::channel::<()>();
-        std::thread::scope(|scope| {
-            let writer = &h.writer;
-            scope.spawn(move || {
-                let lease = writer.begin_acquisition().unwrap();
-                started.send(()).unwrap();
-                wait.recv_timeout(Duration::from_secs(60)).unwrap();
-                drop(lease);
-            });
-            ready.recv().unwrap();
-
-            // Nobody holds `.state.lock`: it can be taken exclusively.
-            let lock = File::open(h.root().join(".state.lock")).unwrap();
-            fs2::FileExt::try_lock_exclusive(&lock).unwrap();
-            drop(lock);
-            // Coherent reads and a committed mutation proceed.
-            assert_eq!(h.inspect().state_revision, 1);
-            h.writer
-                .disable(ID, 1, EnablementScope::Global, &HashSet::new())
-                .unwrap();
-            // Three further acquisitions proceed concurrently; a fifth is
-            // refused rather than queued behind the lock.
-            let a = h.acquire(&second);
-            let b = h.acquire(&third);
-            let c = h.writer.begin_acquisition().unwrap();
-            assert_eq!(
-                h.writer.begin_acquisition().err().map(|error| error.code),
-                Some("acquisition_capacity")
-            );
-            assert_eq!(h.entries("quarantine").len(), 4);
-            assert_eq!(h.revision(), 2);
-            drop((a, b, c));
-            release.send(()).unwrap();
+        let (started, ready) = std::sync::mpsc::channel::<Uuid>();
+        let (finished, joined) = std::sync::mpsc::channel::<()>();
+        let config = h.config.path().to_path_buf();
+        let fetch = std::thread::spawn(move || {
+            let writer = RegistryWriter::new(config);
+            let lease = writer.begin_acquisition().unwrap();
+            started.send(lease.operation_id()).unwrap();
+            wait.recv_timeout(Duration::from_secs(60)).unwrap();
+            drop(lease);
+            finished.send(()).unwrap();
         });
+        let held = ready.recv().unwrap();
+        let quarantined = h.root().join("quarantine").join(held.to_string());
+        assert!(quarantined.is_dir());
+
+        // Nobody holds `.state.lock`: it can be taken exclusively.
+        let lock = File::open(h.root().join(".state.lock")).unwrap();
+        fs2::FileExt::try_lock_exclusive(&lock).unwrap();
+        drop(lock);
+        // list: the coherent reader list will serve (A3b adds its route).
+        let listed = h.state().unwrap();
+        assert_eq!(listed.snapshot.installs.len(), 1);
+        drop(listed);
+        let (status, body) = route_json(app.clone(), &format!("/v1/extensions/{ID}/inspect")).await;
+        assert_eq!(status, axum::http::StatusCode::OK);
+        assert_eq!(body["extension"]["state_revision"], 1);
+        let (status, body) = route_json(app.clone(), &format!("/v1/extensions/{ID}/doctor")).await;
+        assert_eq!(status, axum::http::StatusCode::OK);
+        assert_eq!(body["checks"]["coherent_state"], true);
+        assert_eq!(body["checks"]["package_code_executed"], false);
+        // A mutation commits while the fetch is still open.
+        h.writer
+            .disable(ID, 1, EnablementScope::Global, &HashSet::new())
+            .unwrap();
+        // Three further acquisitions proceed; a fifth is refused, not queued.
+        let a = h.acquire(&second);
+        let b = h.acquire(&third);
+        let c = h.writer.begin_acquisition().unwrap();
+        assert_eq!(
+            h.writer.begin_acquisition().err().map(|error| error.code),
+            Some("acquisition_capacity")
+        );
+        assert_eq!(h.entries("quarantine").len(), 4);
+        // Reads after the mutation still answer while the fetch is held.
+        let (status, body) = route_json(app.clone(), &format!("/v1/extensions/{ID}/doctor")).await;
+        assert_eq!(status, axum::http::StatusCode::OK);
+        assert_eq!(body["extension"]["state_revision"], 2);
+        assert!(quarantined.is_dir(), "held fetch must survive every read");
+        assert!(joined.try_recv().is_err(), "fetch released early");
+
+        release.send(()).unwrap();
+        joined.recv_timeout(Duration::from_secs(10)).unwrap();
+        fetch.join().unwrap();
+        drop((a, b, c));
         assert!(h.entries("quarantine").is_empty());
         assert!(h.writer.begin_acquisition().is_ok());
         h.assert_no_code_ran();
+    }
+
+    #[test]
+    fn a3a_recovery_sweep_and_acquisitions_share_one_registry_gate() {
+        // A second writer instance for the same registry sees the first
+        // one's live acquisitions: its sweep skips them and the permit cap is
+        // shared.
+        let h = Harness::new();
+        let other = RegistryWriter::new(h.config.path().to_path_buf());
+        let bootstrap = h.writer.begin_acquisition().unwrap();
+        let bootstrap_dir = h
+            .config
+            .path()
+            .join(format!("{BOOTSTRAP_PREFIX}{}", bootstrap.operation_id()));
+        assert_eq!(other.recover().unwrap().orphans_removed, 0);
+        assert!(bootstrap_dir.is_dir());
+        drop(bootstrap);
+
+        h.install(0, &h.noop("v1", "1.0.0"));
+        let leases: Vec<_> = (0..4)
+            .map(|_| h.writer.begin_acquisition().unwrap())
+            .collect();
+        assert_eq!(
+            other.begin_acquisition().err().map(|error| error.code),
+            Some("acquisition_capacity")
+        );
+        assert_eq!(other.recover().unwrap().orphans_removed, 0);
+        assert_eq!(h.entries("quarantine").len(), 4);
+        drop(leases);
+
+        // While a sweep holds the gate, an acquisition waits rather than
+        // creating a quarantine the sweep could delete mid-copy.
+        let claim = SweepClaim::try_claim(&h.writer.gate_key()).unwrap();
+        let (done, begun) = std::sync::mpsc::channel();
+        std::thread::scope(|scope| {
+            scope.spawn(|| {
+                let lease = other.begin_acquisition().unwrap();
+                let alive = h
+                    .root()
+                    .join("quarantine")
+                    .join(lease.operation_id().to_string())
+                    .is_dir();
+                done.send(alive).unwrap();
+            });
+            assert!(begun.recv_timeout(Duration::from_millis(200)).is_err());
+            assert!(h.entries("quarantine").is_empty());
+            drop(claim);
+            assert!(begun.recv_timeout(Duration::from_secs(10)).unwrap());
+        });
+        // A sweep cannot be claimed while an acquisition is live.
+        let lease = h.writer.begin_acquisition().unwrap();
+        assert!(SweepClaim::try_claim(&h.writer.gate_key()).is_none());
+        drop(lease);
+        assert!(SweepClaim::try_claim(&h.writer.gate_key()).is_some());
+    }
+
+    fn running_as_root() -> bool {
+        // SAFETY: geteuid has no preconditions.
+        unsafe { libc::geteuid() == 0 }
+    }
+
+    fn set_mode(path: &Path, mode: u32) {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(path, fs::Permissions::from_mode(mode)).unwrap();
+    }
+
+    #[test]
+    fn a3a_pending_cleanup_never_touches_a_reinstalled_generation() {
+        if running_as_root() {
+            return; // Permission obstacles do not bind root.
+        }
+        let h = Harness::new();
+        let v1 = h.noop("v1", "1.0.0");
+        h.install(0, &v1);
+        h.seed_state_roots();
+        let package = h.root().join("state").join(ID);
+        let cache = package.join("cache");
+        set_mode(&cache, 0o500);
+
+        // remove(purge_state=true) commits, but its retention is blocked.
+        let removed = h.writer.remove(ID, 1, true, &Stopped).unwrap();
+        assert!(removed.committed && removed.retention_cleanup_pending);
+        assert_eq!(h.entries("transactions").len(), 1);
+        assert!(package.join("data/kept").is_file());
+        // Still blocked: each recovery retries and keeps the journal.
+        assert_eq!(h.writer.recover().unwrap().cleanup_pending, 1);
+
+        // Reinstall, trust, and enable the same id. The install retires the
+        // superseded retention; the reinstalled generation owns state/<id>.
+        let digest = h.install(2, &v1).digest.unwrap();
+        assert!(h.entries("transactions").is_empty());
+        h.trust(3, &digest);
+        h.writer
+            .enable(ID, 4, EnablementScope::Global, &HashSet::new())
+            .unwrap();
+        fs::write(package.join("data/new-generation"), "live").unwrap();
+        fs::create_dir_all(package.join("tmp/lifecycle/live-connection")).unwrap();
+
+        // The obstacle clears; later mutations must not purge live state.
+        set_mode(&cache, 0o700);
+        h.writer
+            .disable(ID, 5, EnablementScope::Global, &HashSet::new())
+            .unwrap();
+        h.writer.recover().unwrap();
+        assert!(package.join("data/new-generation").is_file());
+        assert!(package.join("data/kept").is_file());
+        assert!(package.join("tmp/lifecycle/live-connection").is_dir());
+        assert!(cache.is_dir());
+
+        // A later remove(purge_state=false) keeps data even though the first
+        // remove had asked for a purge.
+        fs::remove_dir_all(package.join("tmp/lifecycle/live-connection")).unwrap();
+        h.writer.remove(ID, 6, false, &Stopped).unwrap();
+        h.writer.recover().unwrap();
+        assert!(package.join("data/new-generation").is_file());
+        assert!(!cache.exists());
+        h.assert_no_transaction_residue();
+    }
+
+    #[test]
+    fn a3a_pending_cleanup_is_retired_when_the_id_is_installed_again() {
+        // The gate alone: an install that crashed after its renames but
+        // before retiring superseded cleanups still protects the new state.
+        if running_as_root() {
+            return;
+        }
+        let h = Harness::new();
+        let v1 = h.noop("v1", "1.0.0");
+        h.install(0, &v1);
+        h.seed_state_roots();
+        let package = h.root().join("state").join(ID);
+        set_mode(&package.join("cache"), 0o500);
+        assert!(
+            h.writer
+                .remove(ID, 1, false, &Stopped)
+                .unwrap()
+                .retention_cleanup_pending
+        );
+
+        h.writer.crash_at(Some(CrashPoint::AfterDirectoryFsync));
+        assert_eq!(code(h.writer.install(2, h.acquire(&v1))), "simulated_crash");
+        h.writer.crash_at(None);
+        assert_eq!(h.entries("transactions").len(), 2);
+        fs::create_dir_all(package.join("tmp/lifecycle/live-connection")).unwrap();
+        set_mode(&package.join("cache"), 0o700);
+
+        // The older remove journal is recovered first: the id is installed
+        // again, so it retires without touching the new generation.
+        h.writer.recover().unwrap();
+        assert_eq!(h.revision(), 3);
+        assert!(package.join("tmp/lifecycle/live-connection").is_dir());
+        assert!(package.join("cache").is_dir());
+        h.assert_no_transaction_residue();
+    }
+
+    #[test]
+    fn a3a_holes_are_rejected_by_hole_map_not_block_count() {
+        let h = Harness::new();
+        // A dense, highly compressible file is legitimate on every
+        // filesystem, compressed or not.
+        let dense = h.noop("dense", "1.0.0");
+        fs::write(Path::new(&dense).join("zeros"), vec![0u8; 1024 * 1024]).unwrap();
+        drop(h.writer.acquire_local(&dense).unwrap());
+
+        let sparse = h.noop("sparse", "1.0.0");
+        let path = Path::new(&sparse).join("holey");
+        {
+            // Writing past EOF leaves a real hole (APFS, ext4, tmpfs, ...);
+            // extending with set_len alone may be materialized as zeros.
+            use std::io::{Seek, SeekFrom};
+            let mut file = File::create(&path).unwrap();
+            file.write_all(b"start").unwrap();
+            file.seek(SeekFrom::Start(64 * 1024 * 1024)).unwrap();
+            file.write_all(b"end").unwrap();
+        }
+        let probe = File::open(&path).unwrap();
+        let holey = has_hole(&probe, probe.metadata().unwrap().len()).unwrap();
+        if cfg!(any(target_os = "macos", target_os = "linux")) {
+            assert!(holey, "fixture must contain a hole on supported platforms");
+        } else if !holey {
+            return;
+        }
+        assert_eq!(
+            h.writer
+                .acquire_local(&sparse)
+                .err()
+                .map(|error| error.code),
+            Some(PACKAGE_INVALID)
+        );
+        assert!(h.entries("quarantine").is_empty());
+    }
+
+    #[test]
+    fn a3a_staging_is_durable_before_the_prepared_journal() {
+        let trace = || DURABILITY_TRACE.with(|trace| trace.borrow().clone());
+        let h = Harness::new();
+        h.write_a0(1);
+        for step in 0..2 {
+            DURABILITY_TRACE.with(|trace| trace.borrow_mut().clear());
+            if step == 0 {
+                // Adopted quarantine.
+                h.install(1, &h.noop("v1", "1.0.0"));
+            } else {
+                // Created staging directory.
+                h.writer
+                    .disable(ID, 2, EnablementScope::Global, &HashSet::new())
+                    .unwrap();
+            }
+            let events = trace();
+            let synced = events
+                .iter()
+                .position(|event| *event == "staging-root-synced");
+            let journal = events
+                .iter()
+                .position(|event| *event == "journal-prepared-durable");
+            assert!(
+                synced.is_some() && synced < journal,
+                "step {step}: {events:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a3a_foreign_transaction_rows_are_ignored_but_journal_names_fail_closed() {
+        let h = Harness::new();
+        h.install(0, &h.noop("v1", "1.0.0"));
+        let transactions = h.root().join("transactions");
+        fs::create_dir_all(&transactions).unwrap();
+        for foreign in [
+            ".DS_Store",
+            "notes.json",
+            "editor.swp.tmp",
+            "not-a-uuid.json.tmp",
+        ] {
+            fs::write(transactions.join(foreign), "foreign").unwrap();
+        }
+        let draft = transactions.join(format!("{}.json.tmp", Uuid::new_v4()));
+        fs::write(&draft, "{").unwrap();
+        h.writer
+            .disable(ID, 1, EnablementScope::Global, &HashSet::new())
+            .unwrap();
+        assert!(!draft.exists(), "journal drafts are discarded");
+        assert_eq!(h.entries("transactions").len(), 4);
+        assert_eq!(h.writer.recover().unwrap().rolled_back, 0);
+
+        let journal = transactions.join(format!("{}.json", Uuid::new_v4()));
+        fs::write(&journal, "{\"schema_version\":1}").unwrap();
+        assert_eq!(
+            code(
+                h.writer
+                    .disable(ID, 2, EnablementScope::Global, &HashSet::new())
+            ),
+            RECOVERY_REQUIRED
+        );
+        fs::remove_file(journal).unwrap();
+        h.writer
+            .disable(ID, 2, EnablementScope::Global, &HashSet::new())
+            .unwrap();
     }
 
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]

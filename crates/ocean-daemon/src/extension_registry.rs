@@ -715,9 +715,54 @@ fn open_dir_at(parent: &File, name: &OsStr, label: &'static str) -> Result<File,
     )
 }
 
+/// Open a regular file or directory entry without following it.
+///
+/// A no-follow `fstatat` type check runs first, so FIFOs, sockets, devices,
+/// and symlinks are refused before any `open(2)` side effect (a device open
+/// can have one). The opened descriptor must then be the same inode the check
+/// saw; `O_NOCTTY` ensures an opened entry can never become a controlling
+/// terminal.
 #[cfg(unix)]
 fn open_file_at(parent: &File, name: &OsStr, label: &'static str) -> Result<File, StateError> {
-    open_at(parent, name, libc::O_RDONLY | libc::O_NONBLOCK, label)
+    use std::os::unix::fs::MetadataExt;
+
+    let c_name = CString::new(name.as_bytes()).map_err(|_| StateError::InvalidComponent(label))?;
+    let mut status = std::mem::MaybeUninit::<libc::stat>::zeroed();
+    // SAFETY: parent is a live directory descriptor, the name is
+    // NUL-terminated, and status is writable.
+    if unsafe {
+        libc::fstatat(
+            parent.as_raw_fd(),
+            c_name.as_ptr(),
+            status.as_mut_ptr(),
+            libc::AT_SYMLINK_NOFOLLOW,
+        )
+    } != 0
+    {
+        return match std::io::Error::last_os_error().raw_os_error() {
+            Some(libc::ENOENT) => Err(StateError::MissingComponent(label)),
+            Some(libc::ENOTDIR) | Some(libc::ELOOP) => Err(StateError::InvalidComponent(label)),
+            _ => Err(StateError::Read(label)),
+        };
+    }
+    // SAFETY: fstatat initialized status on success.
+    let status = unsafe { status.assume_init() };
+    let kind = status.st_mode & libc::S_IFMT;
+    if kind != libc::S_IFREG && kind != libc::S_IFDIR {
+        return Err(StateError::InvalidComponent(label));
+    }
+    let file = open_at(
+        parent,
+        name,
+        libc::O_RDONLY | libc::O_NONBLOCK | libc::O_NOCTTY,
+        label,
+    )?;
+    let opened = file.metadata().map_err(|_| StateError::Read(label))?;
+    #[allow(clippy::unnecessary_cast)]
+    if opened.dev() != status.st_dev as u64 || opened.ino() != status.st_ino as u64 {
+        return Err(StateError::Read(label));
+    }
+    Ok(file)
 }
 
 fn open_regular_file_at(
@@ -3515,6 +3560,34 @@ env = ["EXAMPLE_ENV"]
         let started = Instant::now();
         assert!(snapshot_package(&directory).is_err());
         assert!(started.elapsed() < Duration::from_secs(1));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn open_file_at_type_checks_special_entries_before_opening() {
+        use std::os::unix::ffi::OsStrExt;
+
+        let directory = tempfile::tempdir().unwrap();
+        let fifo = CString::new(directory.path().join("fifo").as_os_str().as_bytes()).unwrap();
+        // SAFETY: fifo is NUL-terminated.
+        assert_eq!(unsafe { libc::mkfifo(fifo.as_ptr(), 0o600) }, 0);
+        let _socket =
+            std::os::unix::net::UnixListener::bind(directory.path().join("socket")).unwrap();
+        std::os::unix::fs::symlink("/etc/hosts", directory.path().join("link")).unwrap();
+        fs::write(directory.path().join("regular"), "ok").unwrap();
+        let parent = File::open(directory.path()).unwrap();
+        for special in ["fifo", "socket", "link"] {
+            assert_eq!(
+                open_file_at(&parent, OsStr::new(special), "entry").err(),
+                Some(StateError::InvalidComponent("entry")),
+                "{special}"
+            );
+        }
+        assert_eq!(
+            open_file_at(&parent, OsStr::new("absent"), "entry").err(),
+            Some(StateError::MissingComponent("entry"))
+        );
+        assert!(open_file_at(&parent, OsStr::new("regular"), "entry").is_ok());
     }
 
     #[cfg(unix)]

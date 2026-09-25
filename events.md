@@ -11062,3 +11062,21 @@ area:      [backend]
 
 Implemented Stage A slice A3a from the Stage A manifest (§12.1–§12.4, §13.1, §14, §17, §18 A3a, §19.4) as crates/ocean-daemon/src/extension_registry/transaction.rs, an internal writer with no route. Local acquisition copies a package into quarantine outside .state.lock, holding one of four permits, using a descriptor-relative no-follow copy that rejects symlinks, hardlinks, FIFOs, devices, sparse files and oversized or invalid-manifest trees, and hashes it with the frozen tree digest. The exclusive-lock writer recovers earlier journals, rechecks expected_state_revision, adopts quarantine as staging and fsyncs a prepared journal. It then publishes the store payload and renames service-grants.json first; that rename is the commit point. Next it creates the durable stage-a-publication.json marker and renames the three A0 files. Before the commit point it rolls back using journal evidence. After it, it rolls forward, or fails closed as registry_recovery_required when a staged file is missing or corrupt. Once the marker exists, a missing service-grants.json fails closed in both reader and writer. Existing A0 registries read exactly as before until their first A3a commit. A first install into a config dir with no registry root builds the whole root in a private bootstrap directory and publishes it with one no-replace rename. The writer also implements the exact §12.4 retention, grant preview/apply with a confirmation hash bound to revision and notice, and the enable, update and remove guards. The A0 reader's 64 KiB per-frame stack buffer was moved to the heap so a legal depth-64 package cannot overflow a 2 MiB thread. Tests: 16 a3a_ tests, including the crash matrix of 6 operations × 11 checkpoints. ocean-daemon passed 1003 tests; workspace clippy -D warnings, including legacy-chromium and all-features, passed; the Windows portability cross-build passed. Pending fresh independent review. A3b is next.
 _________________________________________________________________________________ 19:36 feat/extension-stage-a3a
+
+time:      [19:53] [25-09-26]
+agent:     [claude]
+worktree:  feat/extension-stage-a3a
+type:      [review]
+area:      [backend]
+
+Repaired the Stage A3a independent review of PR #501 (request-changes). The review ratified the marker name and format, the service-grants-first rename order and the bootstrap no-replace rename. Fixes:
+- HIGH: a committed retention cleanup now runs only while the live generation does not install its id, and a committed install retires every pending cleanup for its id. A stale purge can no longer delete a reinstalled package's data or tmp.
+- Holes are detected with SEEK_HOLE instead of block counts.
+- The four acquisition permits and the orphan-sweep claim are now one process-wide gate keyed by canonical config dir. The sweep holds it for its whole run, and an acquisition that starts during a sweep waits.
+- staging/ is fsynced before the prepared journal.
+- Foreign rows in transactions/ are ignored; malformed journal-named files still fail closed.
+- The shared file opener type-checks with a no-follow fstatat before open, uses O_NOCTTY, and requires the opened file to be the same inode.
+- The held-fetch test now holds across the list reader and the real inspect and doctor handlers.
+- The manifest status note records lock-held rehash and spawn_blocking as A3b considerations.
+Gates: ocean-daemon 1010 passed; workspace, legacy-chromium and all-features clippy -D warnings; fmt; docs-check; cargo deny; Windows portability cross-build all pass. Awaiting delta review.
+_________________________________________________________________________________ 19:53 feat/extension-stage-a3a

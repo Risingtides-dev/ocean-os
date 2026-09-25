@@ -1036,7 +1036,10 @@ acquisition outside the state lock.
 **A3a status (2026-09-25): implemented on `feat/extension-stage-a3a`, pending
 fresh independent review; not accepted.** The writer is
 `crates/ocean-daemon/src/extension_registry/transaction.rs`, a child of the
-registry module. Realization choices that review must ratify or reject:
+registry module. The first independent review (PR #501) requested changes and
+**ratified** the marker name/format, the rename order, and the bootstrap
+no-replace rename; its findings are repaired on the same branch and await
+delta review. Realization choices:
 
 - *Durable marker.* `extensions/stage-a-publication.json`, strict
   `{"schema_version":1,"first_state_revision":N}`, created immediately after the
@@ -1054,13 +1057,29 @@ registry module. Realization choices that review must ratify or reject:
   no-replace rename (the commit point). This keeps the A0 rule that only a wholly
   absent root is empty while an acquisition is in flight.
 - *Acquisition capacity* is a non-blocking refusal (`acquisition_capacity`), not
-  a queue.
-- *Sparse files* are rejected when a file over 64 KiB has more than 64 KiB of
-  unallocated length.
+  a queue. The four permits and the orphan-sweep claim form one process-wide
+  gate keyed by canonical config directory, so every writer instance for a
+  registry shares them; a sweep runs only when no acquisition is live and holds
+  the gate for its whole duration, and an acquisition begun meanwhile waits.
+- *Sparse files* are rejected when `SEEK_HOLE` reports a hole before EOF, never
+  from allocated-block counts (which undercount compressed files).
 - *Retention.* Remove requires no connection directory under `state/<id>/tmp`;
   post-commit payload and state-root deletion is journaled, and a failed step is
-  retried by the next recovery without blocking later mutations.
+  retried by the next recovery without blocking later mutations. A retry acts
+  only while the live generation does not install that id, and a committed
+  install retires every superseded pending cleanup for its id, so a stale
+  removal can never purge a reinstalled package's state.
+- *Transactions directory.* Only `<uuid>.json` journals and this writer's
+  `.tmp` drafts are interpreted; a malformed journal-named file fails closed,
+  and foreign rows are ignored.
 - *Error codes* are fixed internal codes; A3b owns the HTTP mapping.
+
+A3b considerations: the writer rehashes the adopted artifact and verifies
+artifacts while holding the exclusive lock, so shared readers can hit their
+250 ms `extension_state_busy` bound during a large install/update or trust;
+A3b should surface that as retryable. Lock acquisition sleeps and every step is
+blocking filesystem I/O, so A3b must call the writer (including
+`acquire_exclusive_lock`) through `spawn_blocking`, never on an async worker.
 
 Open for A3b or a ruling: startup recovery wiring (the manifest requires it
 before readers and services start; A3a exposes `RegistryWriter::recover` but no
