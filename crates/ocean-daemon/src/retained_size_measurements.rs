@@ -651,11 +651,12 @@ fn stalled_receiver_rows(rows: &[(usize, usize)]) {
 
 // ── 3. per-connection replay materialization ────────────────────────────────
 
-/// Every `/v1/agent/events` connect snapshots the ring under the history lock.
-/// `subscribe_with_replay` and `subscribe_with_full_replay` both call
-/// `merged_ordered()`, which deep-clones every retained envelope, even for a
-/// plain connect with no `Last-Event-ID` that then discards the clone. Measure
-/// the bytes one connection materializes and how long the lock is held.
+/// What a `/v1/agent/events` connect materializes under the history lock.
+/// Measured on 2026-09-25, a plain connect (no `Last-Event-ID`) deep-cloned the
+/// whole ring (~31 MiB) and discarded it; since the follow-up fix it builds no
+/// merged view at all, and an anchored resume clones only the suffix after
+/// its anchor. `?replay=1` full replay still clones the whole ring by design.
+/// Measure the bytes one connection materializes and how long the lock is held.
 #[test]
 fn connect_materializes_the_whole_replay_ring() {
     let bus = AgentEventBus::new(PROD_AGENT_BUS_CAPACITY);
@@ -721,10 +722,7 @@ fn connect_materializes_the_whole_replay_ring() {
         fmt_bytes(cloned),
         fmt_bytes(heavy_frames_bytes)
     );
-    println!(
-        "| plain connect, no `Last-Event-ID` | {} (discarded) | 0 B |",
-        fmt_bytes(cloned)
-    );
+    println!("| plain connect, no `Last-Event-ID` | 0 B (no merged view is built) | 0 B |");
     println!(
         "plain connect lock hold (debug build, this machine): full ring {full_ring_connect:?}, empty ring {empty_ring_connect:?}"
     );

@@ -224,3 +224,15 @@ The measurements do **not** justify these conclusions:
 - **Legacy-rail retention with large tool arguments.** A `write` call carrying a whole file was not swept.
 - **The `/v1/agent/events` replay path under concurrent reconnect storms.** Only one connect at a time was timed.
 - **HTTP/2 or proxied clients.** Every client here was a direct HTTP/1.1 loopback connection.
+
+## Follow-up (2026-09-25)
+
+The connect-cost finding was fixed right after these measurements landed. A
+plain `/v1/agent/events` connect (no anchor) no longer builds the merged
+replay view at all, and an anchored resume (`Last-Event-ID`) clones only the
+envelopes after its anchor, via a by-reference `merged_refs` in
+`crates/ocean-daemon/src/bus.rs`. Only `?replay=1&session_id=` full replay
+still clones the whole ring under the lock. `connect_materializes_the_whole_replay_ring`
+still runs and reports the new plain-connect timing next to the full-replay
+cost. The stalled-reader finding (1,024 events pinned outside the byte
+budget) is unchanged and remains an input to the channel-policy decision.

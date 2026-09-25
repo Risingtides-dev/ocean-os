@@ -250,11 +250,19 @@ impl AgentReplayHistory {
     /// strictly oldest-first), so they sort ahead; sorting by `seq` keeps the
     /// batch identical to plain ring order whenever the floor adds nothing.
     fn merged_ordered(&self) -> Vec<AgentEventEnvelope> {
+        self.merged_refs().into_iter().cloned().collect()
+    }
+
+    /// The same merged, emission-ordered view as [`Self::merged_ordered`], by
+    /// reference. Callers that need only a suffix (an anchored replay) or no
+    /// replay at all use this so a connect never deep-copies the whole ring —
+    /// tens of MiB at the byte cap — while holding the lock `emit` waits on.
+    fn merged_refs(&self) -> Vec<&AgentEventEnvelope> {
         let ring_ids: HashSet<Uuid> = self.envelopes.iter().map(|env| env.id).collect();
-        let mut merged: Vec<AgentEventEnvelope> = self.envelopes.iter().cloned().collect();
+        let mut merged: Vec<&AgentEventEnvelope> = self.envelopes.iter().collect();
         for env in self.floor.values() {
             if !ring_ids.contains(&env.id) {
-                merged.push(env.clone());
+                merged.push(env);
             }
         }
         merged.sort_by_key(|env| env.seq);
@@ -402,14 +410,16 @@ impl AgentEventBus {
         // Merge the resurrection floor into the ring snapshot in emission order
         // so a still-buffered anchor replays past it, and a floor-only terminal
         // (evicted from the ring) is still delivered after the anchor (TASK-62).
-        let merged = history.merged_ordered();
-        let replay = match last_event_id {
-            Some(want) => match merged.iter().position(|env| env.id == want) {
-                // Found: replay everything strictly after it.
-                Some(pos) => merged[pos + 1..].to_vec(),
-                // Not found (aged out / unknown id): no replay.
-                None => Vec::new(),
-            },
+        // No anchor: nothing to replay, so do not even build the merged view
+        // (the plain-connect path; measured at ~31 MiB copied per connect).
+        let Some(want) = last_event_id else {
+            return (Vec::new(), rx);
+        };
+        let merged = history.merged_refs();
+        let replay = match merged.iter().position(|env| env.id == want) {
+            // Found: replay everything strictly after it — clone only that.
+            Some(pos) => merged[pos + 1..].iter().map(|env| (*env).clone()).collect(),
+            // Not found (aged out / unknown id): no replay.
             None => Vec::new(),
         };
         (replay, rx)
@@ -432,8 +442,8 @@ impl AgentEventBus {
         // over the merged batch. A session's floored `TurnFinished` that the ring
         // has since evicted is now a valid, in-scope replay target and widens the
         // reset-required gap bounds instead of vanishing (TASK-62).
-        let merged = history.merged_ordered();
-        let in_scope = |env: &&AgentEventEnvelope| {
+        let merged = history.merged_refs();
+        let in_scope = |env: &&&AgentEventEnvelope| {
             expected_session
                 .map(|session_id| env.event.session_id() == Some(session_id))
                 .unwrap_or(true)
@@ -442,7 +452,7 @@ impl AgentEventBus {
             .iter()
             .position(|env| env.id == last_event_id && in_scope(&env))
         {
-            Some(pos) => Ok(merged[pos + 1..].to_vec()),
+            Some(pos) => Ok(merged[pos + 1..].iter().map(|env| (*env).clone()).collect()),
             None => {
                 let mut scoped = merged.iter().filter(in_scope);
                 let oldest = scoped.next().map(|env| env.id);
