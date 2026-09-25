@@ -335,3 +335,72 @@ carry a plan name the daemon can read without a provider call). The Surface
 side — a proxy allowlist that injects the operator key only for the signed-in
 owner's selected device and strips `Cookie`/`Origin`/`Referer`, plus the
 "Coding plans" panel — ships separately in ocean-surface.
+
+## 10. M2 proposal — linked-surface credentials (PROPOSED, awaiting operator)
+
+**Status:** proposed 2026-09-25. Not accepted; nothing below is authorized to
+build until the operator says yes. It answers open question 2 (records live in
+the proxy's store until a hub contract exists) and fixes the M2 gate's shape.
+
+### The problem this has to solve first
+
+Linking is not just "add a row to `users.json`". To serve a coworker's node the
+proxy needs three things it gets today only by hand: a reachable tailnet URL,
+that daemon's `observatory-token`, and its `operator.key` — the keys are copied
+onto the operator's Mac and named in `users.json`. Two defects follow. The
+observer token rotates each daemon boot, so a copied file goes stale; and the
+only way to revoke the proxy's authority over a node is to rotate that node's
+`operator.key`, which also breaks every local tool using it. Worse, a daemon
+bound to its tailnet address has **no authentication of its own** — any peer on
+the shared team tailnet can drive any coworker's daemon unless per-node ACLs
+were written by hand (ocean-surface `ops/README.md` says so out loud).
+
+### Proposed shape (one approach)
+
+1. **Linked-surface credential (daemon, new credential class).** The daemon
+   keeps `<config_dir>/linked-surfaces.json` (0600): one row per link
+   `{link_id, member_id, hub_origin, secret_sha256, created_at}`. A link's
+   secret is 32 random bytes shown to nothing but the pairing channel.
+   `X-Ocean-Link: <link_id>.<secret>` authorizes exactly what the proxy does
+   today with the operator key and observer token (operator routes,
+   Observatory), with the link id carried into audit rows. `ocean unlink`
+   deletes the row: revocation is instant and touches no other tool.
+2. **Tailnet bind requires a credential.** When the daemon binds a
+   non-loopback address, every request from a non-loopback peer must carry a
+   valid linked-surface credential (or the operator key); loopback callers
+   (TUI, `ocean-mcp`, local surfaces) are unchanged. This closes
+   coworker-to-coworker daemon access on the shared tailnet without relying on
+   hand-written ACLs.
+3. **Pairing.** `ocean link --hub https://ocean.agentsworld.org` (run by
+   `ops/onboard-teammate.sh`): the daemon mints the link secret and a poll
+   nonce, and `POST <hub>/api/link/offers` sends `{device_name, tailnet
+   daemon_url, link_id, link_secret, nonce_sha256}` over HTTPS. The hub answers
+   an 8-character code (A–Z2–9, 10 minutes, single use) that the CLI prints
+   with `https://ocean.agentsworld.org/link?code=…`. Signed in with GitHub,
+   the person sees "Link device <name> to your account?" and approves.
+   Before recording anything, the hub **proves the offer**: it calls the
+   daemon at the offered URL with the offered credential (`GET /v1/identity`
+   plus one credentialed call) and refuses unless both answer — the URL is
+   routing, the credential is identity (invariant 3). The CLI polls
+   `GET /api/link/offers/{code}` with its nonce and, on approval, writes
+   `member.toml` with the approving member id.
+4. **Proxy store.** Approved links live in
+   `~/.config/ocean-surface/linked-devices.json` (0600, atomic writes),
+   merged at runtime with `users.json` devices; the proxy stores the link
+   secret, never the node's `operator.key`. An org member who signs in with
+   GitHub and has no roster entry gets one auto-created from their
+   `github_id` with **zero devices** — and a zero-device person is routed
+   nowhere (today a device-less entry falls back to the operator's own
+   daemon, which this change must remove first), seeing only "Link your first
+   machine" with the one command to run.
+5. **Deferred, unchanged:** the Gate 0 device key (Phase 3), an outbound
+   relay, cross-person daemon access (a link only ever attaches a node to its
+   own person).
+
+### What the operator is deciding
+
+Yes/no on this shape — in particular on (2), which changes the daemon's
+behavior for every non-loopback caller, and on the proxy holding link secrets
+(revocable per node) in place of copied `operator.key` files. On yes, the next
+step is the exact route manifest for `/api/link/*`, `X-Ocean-Link`, and the
+bind rule, then implementation behind tests in both repos.
