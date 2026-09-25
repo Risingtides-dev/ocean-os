@@ -379,6 +379,19 @@ Decision 2's draft described a "non-cryptographic signature." Corrected: observe
 cryptographically signed (HMAC with a daemon-local secret) or opaque random tokens validated
 against daemon-held state. Unauthenticated token structure is not acceptable.
 
+### R3 — Restart sweep phase reconciled (2026-09-25)
+
+Decision 7 says the restart sweep moves previous nonterminal host executions to `interrupted`.
+The Gate 1 wire enum (`ExecutionPhase`: admitted, running, finished, error, canceled, timed_out)
+has no `interrupted` phase, and the implementation (`ObservatoryAdapter::mark_interrupted`) closes
+them as `canceled`. The decision's intent — a state change, not deletion, and never a false
+success — holds; only the name differs. Operator-visible note: an execution closed by a restart is
+the one whose terminal event is `execution_phase_changed` to `canceled`, appended by the next
+boot's `daemon_instance_id`; a turn cancelled while the daemon ran ends instead with
+`execution_finished` carrying `turn_cancelled` (or `turn_abandoned` for a queued turn). Adding an
+`interrupted` phase would be a wire change needing its own approval. Pinned by
+`restart_sweep_records_interrupted_as_a_phase_change_to_canceled` (Task 9 F12).
+
 ---
 
 ## References

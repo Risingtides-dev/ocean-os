@@ -697,8 +697,8 @@ GET    /v1/events                         global SSE stream (debug/legacy)
 POST   /v1/prompt                         synchronous one-shot prompt
 
 # Observatory (read-only, scoped observer token required)
-GET    /v1/observatory/snapshot           consistent projection at a watermark cursor (nodes, edges, attention, instance ids)
-GET    /v1/observatory/events             SSE live tail with durable resume (Last-Event-ID or ?after=), reset/gap frames, 3s keepalive
+GET    /v1/observatory/snapshot           consistent projection at a watermark cursor (nodes, edges, attention, instance ids); ?detail=summary (default) or full — full is reserved and currently returns the summary shape, anything else is 400 invalid_detail
+GET    /v1/observatory/events             SSE live tail with durable resume (Last-Event-ID or ?after=), reset/gap frames, 3s keepalive; ?scope=summary only (default) — any other value, including the reserved content, is a single `event: error` frame with invalid_scope
 GET    /v1/observatory/replay             ascending bounded JSON event pages (?after=<cursor>&through=&limit=&filter=), 410 on retention-crossed ranges
 
 # Extensions (read-only Phase 1 state; never executes package code)

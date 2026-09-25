@@ -40,6 +40,9 @@ manifest (`docs/specs/2026-07-17-observatory-gate1-implementation-manifest.md`).
   review doc's "F2 migration (2026-09-25)" section.
 - Retention never crosses the `first_cursor` of an admitted/running
   execution; a NULL `first_cursor` on such a row blocks pruning.
+- Secret and token files are published by write → `sync_all` → link/rename
+  → fsync of the parent directory; a new entry is not durable without the
+  last step. Token claims need `expires_at > issued_at`.
 - `envelope_json` is the replay/tail source of truth; the scalar columns are
   indexes over it, not a second copy the routes read.
 

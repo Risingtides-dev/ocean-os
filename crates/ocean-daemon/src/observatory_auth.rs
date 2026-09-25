@@ -13,6 +13,8 @@ use ocean_observatory::{
 use std::path::{Path, PathBuf};
 
 const OBSERVER_COOKIE_NAME: &str = "Authorization-Observer";
+/// How often the daemon rotates the published summary token (`main.rs`).
+pub(super) const ROTATION_INTERVAL_SECS: u64 = 10 * 60;
 
 /// Dedicated request-extension state for Observatory authentication.
 #[derive(Clone)]
@@ -44,6 +46,44 @@ impl ObservatoryAuthState {
     pub(super) fn refresh_summary_token(&self) -> Result<(), ocean_observatory::AuthError> {
         write_summary_observer_token(&self.ocean_dir, &self.daemon_instance_id, &self.secret)
             .map(|_| ())
+    }
+
+    /// One scheduled rotation (F11). A failure is counted on
+    /// `ocean_observatory_token_rotation_failures_total` and logged at `error`,
+    /// naming how long the last published token has left: it was minted for
+    /// 30 minutes and rotation runs every 10, so the third consecutive failure
+    /// means local observers are already getting 401s. Returns the new
+    /// consecutive-failure count (0 after a success).
+    pub(super) fn rotate_summary_token(
+        &self,
+        metrics: &crate::metrics::TurnMetrics,
+        consecutive_failures: u64,
+    ) -> u64 {
+        match self.refresh_summary_token() {
+            Ok(()) => {
+                if consecutive_failures > 0 {
+                    tracing::warn!(
+                        consecutive_failures,
+                        "observatory summary token rotation recovered"
+                    );
+                }
+                0
+            }
+            Err(error) => {
+                let consecutive = consecutive_failures + 1;
+                let total = metrics.record_observer_token_rotation_failure();
+                let published_token_expired = consecutive
+                    >= ocean_observatory::DEFAULT_TOKEN_LIFETIME_SECS / ROTATION_INTERVAL_SECS;
+                tracing::error!(
+                    %error,
+                    consecutive_failures = consecutive,
+                    rotation_failures_total = total,
+                    published_token_expired,
+                    "observatory summary token rotation failed; the published observer token is not being renewed"
+                );
+                consecutive
+            }
+        }
     }
 
     #[cfg(test)]
@@ -291,5 +331,42 @@ mod tests {
         assert_eq!(first.secret.key(), second.secret.key());
         assert_eq!(first.daemon_instance_id, "daemon-one");
         assert_eq!(second.daemon_instance_id, "daemon-two");
+    }
+
+    /// F11: a failed rotation is counted on the `/metrics` surface, not only
+    /// logged, and the consecutive count resets once a rotation succeeds.
+    #[test]
+    fn failed_token_rotation_is_counted_on_metrics() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let metrics = crate::metrics::TurnMetrics::default();
+        let state = ObservatoryAuthState::load(directory.path(), DAEMON_ID).expect("load");
+
+        // Make the ocean dir unusable: a regular file where the directory was.
+        let blocked = ObservatoryAuthState {
+            ocean_dir: directory.path().join("observatory-secret"),
+            ..state.clone()
+        };
+        assert_eq!(blocked.rotate_summary_token(&metrics, 0), 1);
+        assert_eq!(blocked.rotate_summary_token(&metrics, 1), 2);
+        let rendered = metrics.render_prometheus(0, 0, 0, 0);
+        assert_eq!(
+            crate::metrics::metric_value(
+                &rendered,
+                "ocean_observatory_token_rotation_failures_total"
+            ),
+            Some(2),
+            "{rendered}"
+        );
+
+        assert_eq!(state.rotate_summary_token(&metrics, 2), 0);
+        let rendered = metrics.render_prometheus(0, 0, 0, 0);
+        assert_eq!(
+            crate::metrics::metric_value(
+                &rendered,
+                "ocean_observatory_token_rotation_failures_total"
+            ),
+            Some(2),
+            "a success does not reset the lifetime counter"
+        );
     }
 }

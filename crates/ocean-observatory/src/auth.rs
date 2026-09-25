@@ -200,6 +200,10 @@ impl ObserverSecret {
             temp.write_all(&key).map_err(AuthError::secret_io)?;
             temp.sync_all().map_err(AuthError::secret_io)?;
             fs::hard_link(&temp_path, &secret_path).map_err(AuthError::secret_io)?;
+            // F11: the link is a directory-entry change; without syncing the
+            // directory a crash can lose it while the daemon already signed
+            // tokens with the key, and the next boot would mint a new secret.
+            sync_directory(ocean_dir)?;
             Ok(())
         })();
         let _ = fs::remove_file(&temp_path);
@@ -335,6 +339,9 @@ pub fn write_summary_observer_token(
         file.write_all(b"\n").map_err(AuthError::secret_io)?;
         file.sync_all().map_err(AuthError::secret_io)?;
         fs::rename(&temporary, &final_path).map_err(AuthError::secret_io)?;
+        // F11: make the rename itself durable, so a crash cannot roll the
+        // published credential back to an older (possibly expired) file.
+        sync_directory(ocean_dir)?;
         Ok(())
     })();
     let _ = fs::remove_file(&temporary);
@@ -469,7 +476,9 @@ fn validate_claims(
     if claims.principal != "observer"
         || claims.nonce.len() != NONCE_BYTES * 2
         || !claims.nonce.bytes().all(|byte| byte.is_ascii_hexdigit())
-        || claims.expires_at < claims.issued_at
+        // F11: a token must have a positive lifetime; `expires_at ==
+        // issued_at` is as malformed as an expiry before issuance.
+        || claims.expires_at <= claims.issued_at
     {
         return Err(AuthError::InvalidClaims);
     }
@@ -480,6 +489,16 @@ fn validate_claims(
         return Err(AuthError::WrongInstance);
     }
     Ok(())
+}
+
+/// fsync a directory so entry changes in it (a link, a rename) survive a
+/// crash. The file's own `sync_all` covers its contents, not its name.
+fn sync_directory(directory: &Path) -> Result<(), AuthError> {
+    #[cfg(test)]
+    tests::DIRECTORY_SYNCS.with(|syncs| syncs.borrow_mut().push(directory.to_path_buf()));
+    fs::File::open(directory)
+        .and_then(|handle| handle.sync_all())
+        .map_err(AuthError::secret_io)
 }
 
 fn unix_time_now() -> Result<u64, AuthError> {
@@ -514,6 +533,17 @@ mod tests {
     use super::*;
 
     const DAEMON_ID: &str = "a9f38dc1-fb42-46c4-9c64-0bf09aff3037";
+
+    thread_local! {
+        /// Directories [`sync_directory`] synced on this test thread.
+        pub(super) static DIRECTORY_SYNCS: std::cell::RefCell<Vec<std::path::PathBuf>> =
+            const { std::cell::RefCell::new(Vec::new()) };
+    }
+
+    fn take_directory_syncs() -> Vec<std::path::PathBuf> {
+        DIRECTORY_SYNCS.with(|syncs| std::mem::take(&mut *syncs.borrow_mut()))
+    }
+
     static ENV_LOCK: Mutex<()> = Mutex::new(());
 
     fn secret() -> ObserverSecret {
@@ -825,5 +855,45 @@ mod tests {
             .collect();
 
         assert!(keys.windows(2).all(|pair| pair[0] == pair[1]));
+    }
+
+    /// F11: creating the secret and publishing the token each fsync the
+    /// directory holding the new entry; loading an existing secret does not.
+    #[test]
+    fn secret_link_and_token_rename_sync_the_parent_directory() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        take_directory_syncs();
+
+        let secret = ObserverSecret::load_or_generate(directory.path()).expect("create secret");
+        assert_eq!(take_directory_syncs(), vec![directory.path().to_path_buf()]);
+
+        ObserverSecret::load_or_generate(directory.path()).expect("load secret");
+        assert!(
+            take_directory_syncs().is_empty(),
+            "loading an existing secret changes no directory entry"
+        );
+
+        write_summary_observer_token(directory.path(), DAEMON_ID, &secret).expect("mint token");
+        assert_eq!(take_directory_syncs(), vec![directory.path().to_path_buf()]);
+    }
+
+    /// F11: a token whose expiry equals its issuance has no lifetime and is
+    /// refused as invalid claims, not accepted for its single second.
+    #[test]
+    fn zero_lifetime_token_is_rejected() {
+        let mut claims = valid_claims(ObserverScope::Summary);
+        claims.issued_at = unix_time_now().expect("clock") + 60;
+        claims.expires_at = claims.issued_at;
+        assert!(matches!(
+            verify_token(&sign_token(&claims, &secret()), &secret(), DAEMON_ID),
+            Err(AuthError::InvalidClaims)
+        ));
+        assert!(matches!(
+            validate_claims(&claims, DAEMON_ID, claims.issued_at),
+            Err(AuthError::InvalidClaims)
+        ));
+
+        claims.expires_at = claims.issued_at + 1;
+        assert!(validate_claims(&claims, DAEMON_ID, claims.issued_at).is_ok());
     }
 }

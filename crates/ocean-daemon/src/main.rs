@@ -1179,16 +1179,22 @@ async fn main() -> anyhow::Result<()> {
     // a rotation while new clients always read the current credential.
     let observer_token_refresh = observatory_auth.clone();
     let observer_token_cancel = shutdown.clone();
+    // Built here rather than in `AppState` so the rotation task can count its
+    // failures (F11) on the same `/metrics` surface.
+    let turn_metrics = Arc::new(TurnMetrics::default());
+    let observer_token_metrics = turn_metrics.clone();
     tokio::spawn(async move {
-        let mut ticker = tokio::time::interval(std::time::Duration::from_secs(10 * 60));
+        let mut ticker = tokio::time::interval(std::time::Duration::from_secs(
+            observatory_auth::ROTATION_INTERVAL_SECS,
+        ));
         ticker.tick().await;
+        let mut consecutive_failures = 0_u64;
         loop {
             tokio::select! {
                 _ = observer_token_cancel.cancelled() => break,
                 _ = ticker.tick() => {
-                    if let Err(error) = observer_token_refresh.refresh_summary_token() {
-                        tracing::error!(%error, "observatory summary token rotation failed");
-                    }
+                    consecutive_failures = observer_token_refresh
+                        .rotate_summary_token(&observer_token_metrics, consecutive_failures);
                 }
             }
         }
@@ -1242,7 +1248,7 @@ async fn main() -> anyhow::Result<()> {
         // handlers and fired by the signal handler so live streams terminate.
         shutdown,
         // OCEAN-303: daemon-wide turn metrics behind `GET /metrics`.
-        metrics: Arc::new(TurnMetrics::default()),
+        metrics: turn_metrics,
         // Ocean Rooms DoD 4.1: room + federation metrics, rendered onto
         // `GET /metrics` (Prometheus) and `GET /health` (the JSON rooms card).
         room_metrics: Arc::new(RoomMetrics::default()),
