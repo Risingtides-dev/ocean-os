@@ -11080,3 +11080,12 @@ Repaired the Stage A3a independent review of PR #501 (request-changes). The revi
 - The manifest status note records lock-held rehash and spawn_blocking as A3b considerations.
 Gates: ocean-daemon 1010 passed; workspace, legacy-chromium and all-features clippy -D warnings; fmt; docs-check; cargo deny; Windows portability cross-build all pass. Awaiting delta review.
 _________________________________________________________________________________ 19:53 feat/extension-stage-a3a
+
+time:      [19:57] [25-09-26]
+agent:     [claude]
+worktree:  feat/extension-stage-a3a
+type:      [review]
+area:      [backend]
+
+Stage A3a passed its required independent review after one fix round. The first review found one high-severity bug: a stale remove-cleanup journal could delete a reinstalled package's state. It also raised medium findings on block-count sparse detection and a per-instance permit counter, plus low-severity fsync, stray-file and opener items, all fixed in 16670b05 with tests. The delta review approved with nits, and two were taken before merge: SEEK_HOLE now treats ENOTSUP like EINVAL on network mounts, and the writer resolves its process-wide gate key once at construction so its permit and sweep paths can never disagree. The review ratified the three choices the manifest leaves unnamed: the stage-a-publication.json marker, the service-grants-first rename order as the commit point, and the bootstrap no-replace rename. A3b, HTTP/CLI mutation surfaces and supervisor reconciliation, is next and must call the writer through spawn_blocking. ocean-daemon 1010 tests (22 a3a), clippy -D warnings.
+_________________________________________________________________________________ 19:57 feat/extension-stage-a3a

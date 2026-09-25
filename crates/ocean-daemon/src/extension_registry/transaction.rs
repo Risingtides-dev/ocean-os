@@ -468,14 +468,21 @@ impl VerifiedQuarantine {
 /// every instance naming the same canonical config directory.
 pub(crate) struct RegistryWriter {
     config_dir: PathBuf,
+    /// The process-wide gate key, resolved ONCE here so this writer's permit
+    /// and sweep paths can never disagree about which registry they guard
+    /// (a transient canonicalize failure between the two would otherwise
+    /// split them onto different keys).
+    gate_key: PathBuf,
     #[cfg(test)]
     crash_at: Mutex<Option<CrashPoint>>,
 }
 
 impl RegistryWriter {
     pub(crate) fn new(config_dir: PathBuf) -> Self {
+        let gate_key = fs::canonicalize(&config_dir).unwrap_or_else(|_| config_dir.clone());
         Self {
             config_dir,
+            gate_key,
             #[cfg(test)]
             crash_at: Mutex::new(None),
         }
@@ -517,7 +524,7 @@ impl RegistryWriter {
     }
 
     fn gate_key(&self) -> PathBuf {
-        fs::canonicalize(&self.config_dir).unwrap_or_else(|_| self.config_dir.clone())
+        self.gate_key.clone()
     }
 
     /// Waits only while an orphan sweep holds the gate (bounded by that
@@ -1878,8 +1885,12 @@ fn has_hole(file: &File, length: u64) -> io::Result<bool> {
     let hole = unsafe { libc::lseek(file.as_raw_fd(), 0, libc::SEEK_HOLE) };
     if hole < 0 {
         let error = io::Error::last_os_error();
-        // No hole-map support: nothing to detect, not a failure.
-        if error.raw_os_error() == Some(libc::EINVAL) {
+        // No hole-map support (EINVAL on most filesystems, ENOTSUP on some
+        // network mounts): nothing to detect, not a failure.
+        if matches!(
+            error.raw_os_error(),
+            Some(libc::EINVAL) | Some(libc::ENOTSUP)
+        ) {
             return Ok(false);
         }
         return Err(error);
