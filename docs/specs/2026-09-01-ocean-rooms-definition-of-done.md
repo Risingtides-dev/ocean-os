@@ -82,7 +82,9 @@ ocean-os 616293e, ocean-surface d58a145.
 - 1.10 Closed room: audit view, no composer, no tailing, no minting; and one
   consistent daemon answer for "room not open" across get, transcript,
   snapshot, events, summarize, attachments. Check: surface acceptance plus
-  daemon test. [surface green; os, S]
+  daemon test. [surface green; os, S] **Done** (2026-09-25): 404 with
+  `room_not_open: true` on every route, `closed: true` on the three audit
+  reads; `every_room_route_gives_one_answer_for_a_room_that_is_not_open`.
 - 1.11 Compute in the room from the surface and the CLI: provision, exec, files,
   ports with preview URLs that load over TLS from the open internet, secrets,
   repo bind and clone, build, CI pull with results in the room. Check:

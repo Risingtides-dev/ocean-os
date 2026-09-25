@@ -10838,3 +10838,12 @@ area:      [backend]
 
 Closed Rooms DoD 3.8. room_history_text, the one renderer behind every human and model view of a room, ended in a raw fallback: any structured system body whose type it had no rule for went out verbatim, ids and all, to a surface that markdown-renders rows, and the participant-retired line interpolated from and to unbounded. Unknown or untyped structured bodies now render as a fixed [room audit] line while plain system notices stay as written; retired from and to go through the member-id bound. Author ids are bounded on both sides: the join route refuses ids over 128 characters, with control characters, or with square brackets, and every response and agent history row renders such an id as [filtered], since older and federated rows exist. A test scans ocean-store's production sources for room.* audit type literals and fails when a writer has no render rule, which is the tripwire the DoD asked for. ocean-daemon 959 tests, clippy -D warnings.
 _________________________________________________________________________________ 15:30 fix/audit-render-bounds
+
+time:      [15:47] [25-09-26]
+agent:     [claude]
+worktree:  fix/room-not-open-answer
+type:      [bug-report]
+area:      [backend]
+
+Closed the daemon half of Rooms DoD 1.10: one answer for a room that is not open. Before, room detail 404d with a bare error and no code, events said code room_not_found, attachment upload said unknown_room, messages said error room_not_found, the transcript served a closed room 200 without saying it was closed, and the attachment list answered even a room that never existed with an empty list. A room_not_open helper now marks every not-open 404 with room_not_open true and adds code room_not_found where the route had none, applied through room_store_error_response and the hand-built sites (detail, snapshot, events, messages, invoke, attachment upload). Existing error values and the attachment upload's unknown_room code are kept, because ocean-surface reads them. The audit reads (transcript, snapshot, attachment list) serve a soft-closed room 200 with closed true, and a never-existed room 404s. One test drives both a closed and a never-existed room through every route. Contract documented in OCEAN_ECOSYSTEM_CONTRACT.md. ocean-daemon 960 tests, clippy -D warnings.
+_________________________________________________________________________________ 15:47 fix/room-not-open-answer
