@@ -8,9 +8,8 @@
 //! - the legacy `command`-only Bash schema and argument handling;
 //! - the spill threshold boundary, exact raw artifact round-trip, and
 //!   artifact-read bypass;
-//! - decorator forwarding, including the currently MISSING `concurrency`
-//!   forwarding (pinned as-is; repairing it changes live scheduling and needs
-//!   separate review);
+//! - decorator forwarding, including `concurrency` (repaired per §3.6 after
+//!   the M2b review; it was pinned missing until then);
 //! - one inner execution per call behind the permission gate, with live
 //!   `ToolExecutionEnd`, checkpoints, and the final transcript all carrying the
 //!   same raw tool text;
@@ -280,7 +279,7 @@ async fn artifact_read_bypasses_respill() {
 }
 
 #[test]
-fn spilling_decorator_forwarding_is_frozen_including_missing_concurrency() {
+fn spilling_decorator_forwards_every_scheduling_and_schema_method() {
     let store = ocean_runtime::artifacts::new_shared();
     let (inner, _) = fixed(String::new(), Concurrency::Shared);
     let wrapped = SpillingTool::new(inner.clone(), store);
@@ -289,12 +288,13 @@ fn spilling_decorator_forwarding_is_frozen_including_missing_concurrency() {
     assert_eq!(wrapped.description(), inner.description());
     assert_eq!(wrapped.parameters(), inner.parameters());
     assert_eq!(wrapped.requires_permission(), inner.requires_permission());
-    // CHARACTERIZATION: SpillingTool does not forward `concurrency()`, so a
-    // Shared inner tool is scheduled as Exclusive whenever artifact spill is
-    // enabled. The M2 design (§3.6) calls for repairing this, but the repair
-    // changes live batch scheduling for every artifact-enabled daemon turn and
-    // is held for separate review. Update this pin only with that repair.
+    // Repaired per M2 design §3.6: the wrapper used to hide `concurrency()`,
+    // so a Shared inner tool was batched as Exclusive whenever artifact spill
+    // was on. It now schedules exactly as the inner tool declares.
     assert_eq!(inner.concurrency(), Concurrency::Shared);
+    assert_eq!(wrapped.concurrency(), Concurrency::Shared);
+    let (exclusive, _) = fixed(String::new(), Concurrency::Exclusive);
+    let wrapped = SpillingTool::new(exclusive, ocean_runtime::artifacts::new_shared());
     assert_eq!(wrapped.concurrency(), Concurrency::Exclusive);
 }
 
