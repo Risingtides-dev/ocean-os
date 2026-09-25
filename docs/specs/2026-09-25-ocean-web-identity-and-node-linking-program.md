@@ -252,3 +252,86 @@ route's owning manifest.
 - **M4** proceeds on existing Rooms contracts once M2 identity records exist.
 - Nothing here authorizes a relay transport, remote resources, or moving any
   credential off the node.
+
+## 8. M1 amendment — match on the GitHub account id (2026-09-25)
+
+Independent review of the M1 implementation (ocean-surface PR #223) found that
+matching a roster entry on the GitHub **login** is unsafe: a login can be
+renamed and then registered by a stranger, who would inherit the old owner's
+entry and daemon. M1 therefore landed with a numeric `github_id` roster field
+(`gh api users/<login> --jq .id`) as the only matched value; the `github`
+string is a human label and is never consulted. The derived session token binds
+to the id, duplicate ids are refused at load, and the OAuth state cookie uses
+the `__Host-` prefix under HTTPS so a sibling `*.agentsworld.org` host cannot
+plant it. Org membership is checked at sign-in only; revocation is removing the
+roster entry (open question 1 stands).
+
+## 9. M3 route contract (manifest)
+
+**Status:** written and implemented 2026-09-25 under the operator's standing
+program mandate ("drive ocean dev indefinitely"); the operator may veto or
+amend it before the Surface panel ships.
+
+Routes, all in `crates/ocean-daemon/src/provider_auth.rs`, all
+operator-authenticated through `room_operator::OperatorIdentity::authorize`
+(the room-authority credential class: `X-Ocean-Operator` header only; a
+`Cookie` header or non-allowlisted `Origin`/`Referer` is refused on shape; an
+absent key file is 503 `operator_identity_unavailable`, a missing header 503
+`operator_credential_missing`, a wrong one 403):
+
+| Route | Success | Errors |
+|---|---|---|
+| `GET /v1/auth/providers` | 200 `{ok, providers:[…]}` | auth only |
+| `POST /v1/auth/providers/{provider}/login` | 202 `{ok, provider, attempt_id, state:"pending", authorize_url, same_machine_required:true}` | 404 `unknown_provider`; 409 `login_unavailable` (callback port would not bind) |
+| `GET /v1/auth/providers/{provider}/login/{attempt_id}` | 200 `{ok, provider, attempt_id, state, error?}` | 404 `unknown_provider` / `unknown_attempt` |
+| `DELETE /v1/auth/providers/{provider}/login/{attempt_id}` | 200, same body, `state:"cancelled"` when it was pending | 404 as above |
+| `POST /v1/auth/providers/{provider}/logout` | 200 `{ok, provider, removed}` | 404 `unknown_provider`; 500 `logout_failed` |
+
+`{provider}` is `claude` or `codex` (the `ocean-oauth` labels). Each status row
+is `{provider, label, kind:"oauth", status, source, expires_at_ms, login}`:
+
+- `status` — `signed_in` when the auth-file block has an access or refresh
+  token (an expired access token with a refresh token is still `signed_in`:
+  the turn-time refresh renews it), `expired` when the access token is past
+  expiry and there is no refresh token, `signed_out`, or `unknown` when the
+  auth file cannot be read.
+- `source` — `auth_file`; or, with no Ocean block, the provider resolver's
+  label for a credential the runtime would still use (`env`, `codex_cli`);
+  `null` when signed out.
+- `login` — the latest attempt projection or `null`.
+
+No field carries a token, refresh token, key, or prefix of one; a test asserts
+the serialized status contains neither token value.
+
+Attempts: held in memory only, at most one per provider (the latest), spawned
+and registered under one lock so no row exists without its task. Starting a
+login, cancelling, and logging out all cancel a pending attempt and wait (≤2 s)
+for its task to stop; a task already past its token exchange cannot be stopped,
+so when it turns out to have written tokens the attempt is recorded
+`succeeded`, never a false `cancelled`, and logout removes the block only after
+that write. A superseding start retries its bind for up to 2 s while the old
+callback listener — Codex's is fixed at `127.0.0.1:1455` — closes. States are
+`pending`, `succeeded`, `failed`, `cancelled`; `failed` carries only a fixed
+code (`timeout`, `denied`, `state_mismatch`, `exchange_failed`,
+`write_failed`, `login_failed`) because the flow's own text can hold a raw
+provider response, attacker-chosen callback `error_description`, or the auth
+file's path — the detail goes to the daemon log.
+
+Auth-file concurrency: every in-process writer — login, logout, and the
+turn-time refresher — takes `ocean_providers::auth_file_lock()` around its
+read-modify-write and uses a unique temp name; the refresher merges its result
+into a fresh read and only into a block still carrying the refresh token it
+spent. Review of this contract also found the refresher created its temp file
+with the default mode, leaving a refreshed `auth.json` world-readable; it now
+creates it 0600. A daemon restart
+forgets attempts, which is correct because their listeners died with it.
+Logout cancels a pending attempt, then removes only that provider's block
+through `ocean_oauth::logout` (atomic, 0600, other blocks preserved, a missing
+file is not created).
+
+Not in this contract: the remote code-paste fallback (open question 3),
+API-key providers (open question 4), and plan/account labels (the tokens do not
+carry a plan name the daemon can read without a provider call). The Surface
+side — a proxy allowlist that injects the operator key only for the signed-in
+owner's selected device and strips `Cookie`/`Origin`/`Referer`, plus the
+"Coding plans" panel — ships separately in ocean-surface.

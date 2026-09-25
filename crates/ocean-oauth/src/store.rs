@@ -12,6 +12,7 @@ use serde_json::{json, Value};
 
 /// Merge `block` under `key`, preserving every other key, and write atomically.
 pub(crate) fn merge_and_write(auth_file: &Path, key: &str, block: Value) -> Result<()> {
+    let _guard = write_lock();
     let mut root = read_root(auth_file)?;
     let map = root
         .as_object_mut()
@@ -20,6 +21,44 @@ pub(crate) fn merge_and_write(auth_file: &Path, key: &str, block: Value) -> Resu
     let serialized = serde_json::to_string_pretty(&root)?;
     atomic_write_private(auth_file, &serialized)?;
     Ok(())
+}
+
+/// Remove the block under `key`, preserving every other key. Returns whether a
+/// block was present. A missing file is "nothing to remove", not an error, and
+/// is left missing rather than created.
+pub(crate) fn remove_and_write(auth_file: &Path, key: &str) -> Result<bool> {
+    let _guard = write_lock();
+    if !auth_file.exists() {
+        return Ok(false);
+    }
+    let mut root = read_root(auth_file)?;
+    let map = root
+        .as_object_mut()
+        .context("auth file root is not a JSON object")?;
+    if map.remove(key).is_none() {
+        return Ok(false);
+    }
+    let serialized = serde_json::to_string_pretty(&root)?;
+    atomic_write_private(auth_file, &serialized)?;
+    Ok(true)
+}
+
+/// The process-wide auth.json write lock (`ocean_providers::auth_file_lock`),
+/// shared with the turn-time refresher. A poisoned lock guards no data of its
+/// own, so recover it rather than refuse every later login.
+fn write_lock() -> std::sync::MutexGuard<'static, ()> {
+    ocean_providers::auth_file_lock()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+/// Read one block without writing anything. `None` when the file or the key is
+/// absent.
+pub(crate) fn read_block(auth_file: &Path, key: &str) -> Result<Option<Value>> {
+    if !auth_file.exists() {
+        return Ok(None);
+    }
+    Ok(read_root(auth_file)?.get(key).cloned())
 }
 
 /// Read the existing root object, or an empty object when the file is missing
@@ -49,8 +88,8 @@ fn atomic_write_private(path: &Path, content: &str) -> Result<()> {
     std::fs::create_dir_all(parent)
         .with_context(|| format!("failed to create auth dir {}", parent.display()))?;
 
-    // Match oauth_refresh's temp-name convention exactly.
-    let tmp = parent.join(format!(".auth.json.tmp-{}", std::process::id()));
+    // Unique per write: two writers must never share a temp file.
+    let tmp = ocean_providers::auth_file_temp_path(path);
 
     {
         let mut file = std::fs::File::create(&tmp)

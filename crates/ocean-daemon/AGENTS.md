@@ -13,6 +13,11 @@ This crate owns the long-running Ocean HTTP service on `:4780`, including API ro
 ## Local Contracts
 
 - Daemon health is `GET /health`, not `/v1/health`.
+- `/v1/auth/providers*` (`provider_auth.rs`, web identity M3, contract in §9 of
+  `docs/specs/2026-09-25-ocean-web-identity-and-node-linking-program.md`) is
+  operator-authenticated on every route including status, never serializes a
+  token, keeps at most one in-memory login attempt per provider, and waits for
+  a superseded attempt's task to unwind before rebinding its callback port.
 - Restart the daemon only by specific PID; do not use blind `pkill` sweeps.
 - HTTP turn routes must resolve effective cwd from client cwd/project metadata and must never fall back to daemon process cwd.
 - Do not bypass runtime permission gates from daemon route code.

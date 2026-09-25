@@ -94,11 +94,13 @@ pub async fn ensure_fresh(auth_file: &Path) {
     let Ok(raw) = std::fs::read_to_string(auth_file) else {
         return;
     };
-    let Ok(mut json) = serde_json::from_str::<Value>(&raw) else {
+    let Ok(json) = serde_json::from_str::<Value>(&raw) else {
         return; // malformed file: resolution will surface it; don't touch
     };
 
-    let mut changed = false;
+    // Network refreshes happen WITHOUT the auth-file lock held; their results
+    // are merged afterwards against a fresh read (see `merge_refreshed`).
+    let mut refreshed: Vec<Refreshed> = Vec::new();
     for def in BLOCKS {
         let Some((refresh, needs)) = block_needs_refresh(&json, def.block) else {
             continue;
@@ -117,20 +119,16 @@ pub async fn ensure_fresh(auth_file: &Path) {
             std::env::var(def.client_id_env).unwrap_or_else(|_| def.default_client_id.to_string());
         match ocean_protocol::oauth::refresh_token(&endpoint, &client_id, &refresh).await {
             Ok(fresh) => {
-                let entry = json
-                    .get_mut(def.block)
-                    .and_then(Value::as_object_mut)
-                    .expect("block existed above");
-                entry.insert("access".into(), Value::String(fresh.access_token));
-                if let Some(rt) = fresh.refresh_token {
-                    entry.insert("refresh".into(), Value::String(rt));
-                }
-                if let Some(secs) = fresh.expires_in_secs {
-                    let expires_ms = (unix_secs() + secs) * 1_000;
-                    entry.insert("expires".into(), Value::from(expires_ms));
-                }
                 guard.cooldowns.remove(def.block);
-                changed = true;
+                refreshed.push(Refreshed {
+                    block: def.block,
+                    used_refresh: refresh,
+                    access: fresh.access_token,
+                    refresh: fresh.refresh_token,
+                    expires_ms: fresh
+                        .expires_in_secs
+                        .map(|secs| (unix_secs() + secs) * 1_000),
+                });
                 tracing::info!(block = %def.block, "refreshed OAuth token");
             }
             Err(e) => {
@@ -146,11 +144,72 @@ pub async fn ensure_fresh(auth_file: &Path) {
         }
     }
 
-    if changed {
-        if let Err(e) = write_atomically(auth_file, &json) {
+    if !refreshed.is_empty() {
+        if let Err(e) = merge_refreshed(auth_file, refreshed) {
             tracing::warn!(error = %e, "could not persist refreshed auth.json");
         }
     }
+}
+
+/// One successful refresh, waiting to be merged.
+struct Refreshed {
+    block: &'static str,
+    /// The refresh token the exchange spent. The merge applies only while the
+    /// block on disk still carries it.
+    used_refresh: String,
+    access: String,
+    refresh: Option<String>,
+    expires_ms: Option<i64>,
+}
+
+/// Merge refreshed tokens into a FRESH read of the auth file under the shared
+/// write lock. A block that was removed (logout) or replaced (a new login)
+/// while the network call ran no longer carries `used_refresh`, and is left
+/// exactly as that other writer left it — writing back the root read before
+/// the network call would resurrect the removed block or clobber the new one.
+fn merge_refreshed(auth_file: &Path, refreshed: Vec<Refreshed>) -> std::io::Result<()> {
+    let _guard = ocean_providers::auth_file_lock()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let raw = match std::fs::read_to_string(auth_file) {
+        Ok(raw) => raw,
+        // Removed entirely while we refreshed: nothing to merge into.
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => return Err(e),
+    };
+    let Ok(mut json) = serde_json::from_str::<Value>(&raw) else {
+        return Ok(());
+    };
+    let mut changed = false;
+    for update in refreshed {
+        let Some(entry) = json.get_mut(update.block).and_then(Value::as_object_mut) else {
+            tracing::info!(
+                block = update.block,
+                "block removed during refresh; not restoring it"
+            );
+            continue;
+        };
+        let current = entry.get("refresh").and_then(Value::as_str).map(str::trim);
+        if current != Some(update.used_refresh.as_str()) {
+            tracing::info!(
+                block = update.block,
+                "block replaced during refresh; keeping the newer one"
+            );
+            continue;
+        }
+        entry.insert("access".into(), Value::String(update.access));
+        if let Some(rt) = update.refresh {
+            entry.insert("refresh".into(), Value::String(rt));
+        }
+        if let Some(expires_ms) = update.expires_ms {
+            entry.insert("expires".into(), Value::from(expires_ms));
+        }
+        changed = true;
+    }
+    if changed {
+        write_atomically(auth_file, &json)?;
+    }
+    Ok(())
 }
 
 /// `Some((refresh_token, needs_refresh))` for an oauth block that HAS a
@@ -184,10 +243,21 @@ fn block_needs_refresh(json: &Value, block: &str) -> Option<(String, bool)> {
 /// loss (see `crate::durable`).
 fn write_atomically(path: &Path, json: &Value) -> std::io::Result<()> {
     use std::io::Write as _;
-    let dir = path.parent().unwrap_or_else(|| Path::new("."));
-    let tmp = dir.join(format!(".auth.json.tmp-{}", std::process::id()));
+    let tmp = ocean_providers::auth_file_temp_path(path);
     let pretty = serde_json::to_string_pretty(json).unwrap_or_else(|_| json.to_string());
     {
+        // 0600 from creation: this file holds subscription tokens, and a
+        // default-mode create would leave the replaced auth.json world-readable.
+        #[cfg(unix)]
+        let mut file = {
+            use std::os::unix::fs::OpenOptionsExt as _;
+            std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .mode(0o600)
+                .open(&tmp)?
+        };
+        #[cfg(not(unix))]
         let mut file = std::fs::File::create(&tmp)?;
         file.write_all(pretty.as_bytes())?;
         file.sync_all()?;
@@ -233,6 +303,68 @@ mod tests {
         );
         assert!(block_needs_refresh(&j, "api-key-block").is_none());
         assert!(block_needs_refresh(&j, "absent").is_none());
+    }
+
+    fn refreshed(block: &'static str, used: &str) -> Refreshed {
+        Refreshed {
+            block,
+            used_refresh: used.into(),
+            access: "fresh-access".into(),
+            refresh: Some("rotated".into()),
+            expires_ms: Some(42),
+        }
+    }
+
+    /// A logout or new login that lands while a refresh is on the network must
+    /// win: the merge re-reads under the lock and touches only a block that
+    /// still carries the refresh token it spent.
+    #[test]
+    fn merge_never_resurrects_a_removed_block_or_clobbers_a_newer_one() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("auth.json");
+        std::fs::write(
+            &path,
+            json!({
+                // Removed by a logout mid-refresh: absent here.
+                "openai-codex": { "type": "oauth", "access": "new-login", "refresh": "different" },
+                "anthropic-oauth": { "type": "oauth", "access": "stale", "refresh": "spent" },
+                "deepseek": { "api_key": "keep-me" }
+            })
+            .to_string(),
+        )
+        .unwrap();
+        merge_refreshed(
+            &path,
+            vec![
+                refreshed("claude-code", "spent"),
+                refreshed("openai-codex", "spent"),
+                refreshed("anthropic-oauth", "spent"),
+            ],
+        )
+        .unwrap();
+        let round: Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert!(
+            round.get("claude-code").is_none(),
+            "logged-out block stays gone"
+        );
+        assert_eq!(
+            round["openai-codex"]["access"], "new-login",
+            "newer login kept"
+        );
+        assert_eq!(round["anthropic-oauth"]["access"], "fresh-access");
+        assert_eq!(round["anthropic-oauth"]["refresh"], "rotated");
+        assert_eq!(round["anthropic-oauth"]["expires"], 42);
+        assert_eq!(round["deepseek"]["api_key"], "keep-me");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o600, "a refreshed auth.json stays owner-only");
+        }
+
+        std::fs::remove_file(&path).unwrap();
+        merge_refreshed(&path, vec![refreshed("claude-code", "spent")]).unwrap();
+        assert!(!path.exists(), "a deleted auth file is not recreated");
     }
 
     #[test]

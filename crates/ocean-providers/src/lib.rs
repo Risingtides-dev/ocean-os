@@ -1623,6 +1623,32 @@ fn base_url_host(base_url: &str) -> String {
         .to_string()
 }
 
+/// The one lock every in-process read-modify-write of Ocean's `auth.json`
+/// takes: fresh logins and logouts (`ocean-oauth`) and the turn-time token
+/// refresh (`ocean-agent::oauth_refresh`). Hold it only around the synchronous
+/// read → merge → write, never across a network call or an `.await`; a writer
+/// that did slow work first must re-read under the lock and merge only its own
+/// block, or it resurrects a block another writer just removed.
+pub fn auth_file_lock() -> &'static std::sync::Mutex<()> {
+    static LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
+    LOCK.get_or_init(|| std::sync::Mutex::new(()))
+}
+
+/// A temp path beside `auth_file` that no other write — in this process or
+/// another — shares: pid, a process-wide counter, and the clock. Two writers
+/// sharing one temp name can interleave into, or rename away, each other's
+/// half-written file.
+pub fn auth_file_temp_path(auth_file: &Path) -> PathBuf {
+    static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let n = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.subsec_nanos())
+        .unwrap_or_default();
+    let dir = auth_file.parent().unwrap_or_else(|| Path::new("."));
+    dir.join(format!(".auth.json.tmp-{}-{n}-{nanos}", std::process::id()))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

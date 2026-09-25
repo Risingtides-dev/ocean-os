@@ -3508,6 +3508,7 @@ dependencies = [
  "ocean-core",
  "ocean-extension",
  "ocean-longhouse",
+ "ocean-oauth",
  "ocean-observatory",
  "ocean-protocol",
  "ocean-providers",
