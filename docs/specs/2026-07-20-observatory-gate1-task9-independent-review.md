@@ -403,3 +403,33 @@ watermarks and an archive row), `running_the_migration_twice_is_a_no_op`
 `retention_still_prunes_a_migrated_database`, and
 `every_manifest_index_and_the_edge_foreign_key_exist` (fresh and migrated;
 the FK is enforced, not inert).
+
+### F2 review follow-ups (2026-09-25)
+
+Independent review requested changes; all four landed before merge:
+
+- **Downgrade safety.** Every NOT NULL column F2 added carries a DEFAULT
+  (`schema_version` 1, `kind` 'unknown', empty strings elsewhere), so an
+  older daemon binary opening a v2 database keeps appending with its pre-F2
+  column lists instead of failing every write
+  (`a_pre_f2_writer_can_still_append_to_a_v2_database`).
+- **No duplicate indexes.** `idx_observatory_events_cursor` (the cursor is the
+  rowid) and `idx_observatory_events_event_id`,
+  `idx_execution_nodes_execution_id`, `idx_execution_edges_edge_id` (UNIQUE
+  columns already carry an autoindex) are not created — a documented
+  deviation from §4.1's list; the remaining eight are
+  (`no_index_duplicates_a_primary_or_unique_key`).
+- **Orphan edges.** An edge whose child node does not exist cannot satisfy
+  the new child FK, so the migration drops it rather than failing
+  `foreign_key_check` on every boot and leaving the store permanently closed.
+- **Projection floor.** Size retention runs only while the event log is what
+  exceeds the bound; when the never-pruned projection alone is over it, the
+  bound is unreachable and the log is left intact rather than emptied every
+  pass (`a_bound_below_the_projection_floor_does_not_wipe_the_log`). The size
+  tests now use single-execution heavy events so their bound sits above that
+  floor.
+
+Operational notes: the first open after upgrade rewrites the database in one
+transaction (~2.5 s for the operator's 166 MB file) on the daemon's startup
+path, and the WAL grows to roughly the database size until checkpoint, so
+the volume needs that much headroom once.

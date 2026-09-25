@@ -301,7 +301,18 @@ impl ObservatoryStore {
         // indexes and the never-pruned projection tables — is what keeps one
         // pass from overshooting the bound. Freed pages go to the freelist
         // on commit, so `live_bytes` falls as soon as a batch lands.
-        while live_bytes(&db)? > self.retention_policy.max_bytes {
+        // Floor: the projection (nodes, edges, watermarks, archive) is never
+        // pruned. When it alone is over the bound, no amount of event pruning
+        // gets under it, and the loop would empty the log on every pass.
+        // Size-prune only while the event log is what is over.
+        let event_bytes: u64 = db.query_row(
+            "SELECT COALESCE(SUM(length(envelope_json)),0) FROM observatory_events",
+            [],
+            |r| r.get(0),
+        )?;
+        let floor = live_bytes(&db)?.saturating_sub(event_bytes);
+        let size_bound_reachable = floor < self.retention_policy.max_bytes;
+        while size_bound_reachable && live_bytes(&db)? > self.retention_policy.max_bytes {
             let batch_end: Option<u64> = db.query_row(
                 "SELECT MAX(cursor) FROM (SELECT cursor FROM observatory_events
                  WHERE cursor > ?1 AND cursor <= ?2 ORDER BY cursor LIMIT ?3)",

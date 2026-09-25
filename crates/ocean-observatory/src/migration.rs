@@ -64,10 +64,10 @@ const SCHEMA_V2: &str = "
 CREATE TABLE observatory_events_new (
     cursor INTEGER PRIMARY KEY,
     event_id TEXT NOT NULL UNIQUE,
-    schema_version INTEGER NOT NULL,
-    created_at TEXT NOT NULL,
-    kind TEXT NOT NULL,
-    producer_id TEXT NOT NULL,
+    schema_version INTEGER NOT NULL DEFAULT 1,
+    created_at TEXT NOT NULL DEFAULT '',
+    kind TEXT NOT NULL DEFAULT 'unknown',
+    producer_id TEXT NOT NULL DEFAULT '',
     visibility TEXT NOT NULL DEFAULT 'metadata',
     envelope_json TEXT NOT NULL
 );
@@ -76,10 +76,10 @@ CREATE TABLE execution_nodes_new (
     execution_id TEXT NOT NULL UNIQUE,
     root_execution_id TEXT NOT NULL,
     parent_execution_id TEXT,
-    session_id TEXT NOT NULL,
-    turn_id TEXT NOT NULL,
-    request_id TEXT NOT NULL,
-    producer_id TEXT NOT NULL,
+    session_id TEXT NOT NULL DEFAULT '',
+    turn_id TEXT NOT NULL DEFAULT '',
+    request_id TEXT NOT NULL DEFAULT '',
+    producer_id TEXT NOT NULL DEFAULT '',
     phase TEXT NOT NULL,
     first_cursor INTEGER,
     last_cursor INTEGER,
@@ -91,7 +91,7 @@ CREATE TABLE execution_edges_new (
     edge_id TEXT NOT NULL UNIQUE,
     parent_execution_id TEXT NOT NULL,
     child_execution_id TEXT NOT NULL,
-    root_execution_id TEXT NOT NULL,
+    root_execution_id TEXT NOT NULL DEFAULT '',
     created_at TEXT NOT NULL,
     FOREIGN KEY (child_execution_id) REFERENCES execution_nodes(execution_id)
 );
@@ -99,7 +99,7 @@ CREATE TABLE watermarks_new (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     key TEXT NOT NULL UNIQUE,
     cursor INTEGER NOT NULL,
-    created_at TEXT NOT NULL
+    created_at TEXT NOT NULL DEFAULT ''
 );
 CREATE TABLE retention_archive_new (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -148,7 +148,7 @@ ORDER BY n.rowid;
 INSERT INTO execution_edges_new(edge_id,parent_execution_id,child_execution_id,root_execution_id,created_at)
 SELECT g.edge_id, g.parent_execution_id, g.child_execution_id,
        COALESCE(n.root_execution_id, g.parent_execution_id), g.created_at
-FROM execution_edges g LEFT JOIN execution_nodes n ON n.execution_id = g.child_execution_id
+FROM execution_edges g JOIN execution_nodes n ON n.execution_id = g.child_execution_id
 ORDER BY g.rowid;
 
 INSERT INTO retention_archive_new(pruned_at,from_cursor,to_cursor,reason,count_events)
@@ -167,33 +167,30 @@ ALTER TABLE watermarks_new RENAME TO watermarks;
 ALTER TABLE retention_archive_new RENAME TO retention_archive;
 ";
 
-/// Every §4.1 index, by its manifest name.
+/// The §4.1 indexes, by their manifest names — minus four that would
+/// duplicate an index SQLite already keeps: `idx_observatory_events_cursor`
+/// (the cursor IS the rowid), and `idx_observatory_events_event_id`,
+/// `idx_execution_nodes_execution_id`, `idx_execution_edges_edge_id` (each
+/// column is UNIQUE, so it already has its autoindex). A duplicate costs every
+/// append and several MB at production size for no read benefit.
 const INDEXES_V2: &str = "
-CREATE INDEX IF NOT EXISTS idx_observatory_events_cursor ON observatory_events(cursor);
-CREATE INDEX IF NOT EXISTS idx_observatory_events_event_id ON observatory_events(event_id);
 CREATE INDEX IF NOT EXISTS idx_observatory_events_kind ON observatory_events(kind);
-CREATE INDEX IF NOT EXISTS idx_execution_nodes_execution_id ON execution_nodes(execution_id);
 CREATE INDEX IF NOT EXISTS idx_execution_nodes_root_id ON execution_nodes(root_execution_id);
 CREATE INDEX IF NOT EXISTS idx_execution_nodes_parent_id ON execution_nodes(parent_execution_id);
 CREATE INDEX IF NOT EXISTS idx_execution_nodes_phase ON execution_nodes(phase);
 CREATE INDEX IF NOT EXISTS idx_execution_nodes_session_id ON execution_nodes(session_id);
-CREATE INDEX IF NOT EXISTS idx_execution_edges_edge_id ON execution_edges(edge_id);
 CREATE INDEX IF NOT EXISTS idx_execution_edges_parent_id ON execution_edges(parent_execution_id);
 CREATE INDEX IF NOT EXISTS idx_execution_edges_child_id ON execution_edges(child_execution_id);
 CREATE INDEX IF NOT EXISTS idx_retention_archive_pruned_at ON retention_archive(pruned_at);
 ";
 
 /// The §4.1 index names [`migrate`] guarantees exist.
-pub const STORE_INDEXES: [&str; 12] = [
-    "idx_observatory_events_cursor",
-    "idx_observatory_events_event_id",
+pub const STORE_INDEXES: [&str; 8] = [
     "idx_observatory_events_kind",
-    "idx_execution_nodes_execution_id",
     "idx_execution_nodes_root_id",
     "idx_execution_nodes_parent_id",
     "idx_execution_nodes_phase",
     "idx_execution_nodes_session_id",
-    "idx_execution_edges_edge_id",
     "idx_execution_edges_parent_id",
     "idx_execution_edges_child_id",
     "idx_retention_archive_pruned_at",

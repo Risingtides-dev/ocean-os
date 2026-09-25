@@ -1377,18 +1377,22 @@ mod tests {
 
     #[tokio::test]
     async fn replay_pruned_range_yields_410_with_gap_shape() {
-        // Seed two finished events, then force retention past them.
-        let events = vec![
-            envelope("e-1", EventKind::ExecutionFinished),
-            envelope("e-2", EventKind::ExecutionFinished),
-        ];
+        // Seed two finished events old enough for age retention to prune.
+        let events: Vec<EventEnvelope> = ["e-1", "e-2"]
+            .into_iter()
+            .map(|id| {
+                let mut event = envelope(id, EventKind::ExecutionFinished);
+                event.recorded_at = (chrono::Utc::now() - chrono::Duration::days(30)).to_rfc3339();
+                event
+            })
+            .collect();
         let dir = tempfile::tempdir().expect("tempdir");
         let store = Arc::new(
             ObservatoryStore::open(
                 &dir.path().join("obs.db"),
                 RetentionPolicy {
                     max_age_days: 7,
-                    max_bytes: 1, // force pruning by size
+                    max_bytes: RetentionPolicy::default().max_bytes,
                 },
             )
             .expect("open"),

@@ -688,3 +688,75 @@ fn every_manifest_index_and_the_edge_foreign_key_exist() {
         assert!(orphan_child.is_err(), "{name}: FK not enforced");
     }
 }
+
+/// Review follow-ups on the F2 migration.
+mod f2_review {
+    use ocean_observatory::*;
+    use rusqlite::Connection;
+    use tempfile::tempdir;
+
+    /// An OLDER daemon binary opening a v2 database keeps working: its
+    /// pre-F2 insert column lists still satisfy every NOT NULL column.
+    #[test]
+    fn a_pre_f2_writer_can_still_append_to_a_v2_database() {
+        let d = tempdir().unwrap();
+        let path = d.path().join("obs.db");
+        drop(ObservatoryStore::open(&path, RetentionPolicy::default()).unwrap());
+        let db = Connection::open(&path).unwrap();
+        db.execute_batch(
+            "INSERT INTO observatory_events(cursor,event_id,envelope_json) VALUES(1,'old-writer','{}');
+             INSERT INTO execution_nodes(execution_id,root_execution_id,parent_execution_id,phase,created_at,first_cursor)
+               VALUES('x','x',NULL,'running','2026-09-25T00:00:00Z',1);
+             INSERT INTO execution_edges(edge_id,parent_execution_id,child_execution_id,created_at)
+               VALUES('e','p','x','2026-09-25T00:00:00Z');
+             INSERT INTO watermarks(key,cursor) VALUES('snapshot_watermark',1)
+               ON CONFLICT(key) DO UPDATE SET cursor=excluded.cursor;",
+        )
+        .expect("pre-F2 statements run against the v2 schema");
+    }
+
+    /// Duplicate indexes of the rowid / UNIQUE autoindexes are not created.
+    #[test]
+    fn no_index_duplicates_a_primary_or_unique_key() {
+        let d = tempdir().unwrap();
+        let path = d.path().join("obs.db");
+        drop(ObservatoryStore::open(&path, RetentionPolicy::default()).unwrap());
+        let db = Connection::open(&path).unwrap();
+        for dup in [
+            "idx_observatory_events_cursor",
+            "idx_observatory_events_event_id",
+            "idx_execution_nodes_execution_id",
+            "idx_execution_edges_edge_id",
+        ] {
+            let n: i64 = db
+                .query_row(
+                    "SELECT COUNT(*) FROM sqlite_master WHERE type='index' AND name=?1",
+                    [dup],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(n, 0, "{dup} duplicates an existing key index");
+        }
+    }
+
+    /// When the never-pruned projection alone exceeds the bound, retention
+    /// does not empty the event log trying to reach an unreachable size.
+    #[test]
+    fn a_bound_below_the_projection_floor_does_not_wipe_the_log() {
+        let d = tempdir().unwrap();
+        let path = d.path().join("obs.db");
+        let store = ObservatoryStore::open(
+            &path,
+            RetentionPolicy {
+                max_age_days: 365,
+                max_bytes: 1,
+            },
+        )
+        .unwrap();
+        let (kind, payload) = crate::finished();
+        let e = crate::envelope(0, "only", "only-exec", "only-exec", None, kind, payload, 0);
+        store.append_event(e).unwrap();
+        store.apply_retention().unwrap();
+        assert_eq!(store.events_after(Cursor::new(0), None).unwrap().len(), 1);
+    }
+}
