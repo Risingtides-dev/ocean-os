@@ -305,13 +305,18 @@ impl ObservatoryStore {
         // pruned. When it alone is over the bound, no amount of event pruning
         // gets under it, and the loop would empty the log on every pass.
         // Size-prune only while the event log is what is over.
-        let event_bytes: u64 = db.query_row(
-            "SELECT COALESCE(SUM(length(envelope_json)),0) FROM observatory_events",
-            [],
-            |r| r.get(0),
-        )?;
-        let floor = live_bytes(&db)?.saturating_sub(event_bytes);
-        let size_bound_reachable = floor < self.retention_policy.max_bytes;
+        // Only measured when over the bound: the SUM scans every envelope.
+        // `CAST AS BLOB` makes `length` count bytes, not characters.
+        let live_now = live_bytes(&db)?;
+        let size_bound_reachable = live_now <= self.retention_policy.max_bytes
+            || {
+                let event_bytes: u64 = db.query_row(
+                "SELECT COALESCE(SUM(length(CAST(envelope_json AS BLOB))),0) FROM observatory_events",
+                [],
+                |r| r.get(0),
+            )?;
+                live_now.saturating_sub(event_bytes) < self.retention_policy.max_bytes
+            };
         while size_bound_reachable && live_bytes(&db)? > self.retention_policy.max_bytes {
             let batch_end: Option<u64> = db.query_row(
                 "SELECT MAX(cursor) FROM (SELECT cursor FROM observatory_events
