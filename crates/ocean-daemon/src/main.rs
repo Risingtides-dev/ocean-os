@@ -21726,10 +21726,7 @@ mod tests {
 
         // SSE event names, from the handler source itself.
         let source = include_str!("persistent_rooms.rs");
-        let production = source
-            .split("\n#[cfg(test)]\nmod tests")
-            .next()
-            .unwrap();
+        let production = source.split("\n#[cfg(test)]\nmod tests").next().unwrap();
         let mut events: Vec<String> = production
             .match_indices(".event(\"")
             .map(|(at, lit)| {

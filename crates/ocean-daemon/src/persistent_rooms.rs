@@ -5833,8 +5833,7 @@ mod tests {
             let ticked = ticked.clone();
             tokio::spawn(async move {
                 with_rooms_handle(&rooms, |_store| {
-                    let deadline =
-                        std::time::Instant::now() + std::time::Duration::from_secs(5);
+                    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
                     while std::time::Instant::now() < deadline {
                         if ticked.load(std::sync::atomic::Ordering::SeqCst) {
                             return true;
