@@ -619,6 +619,14 @@ impl AgentTool for SpillingTool {
     fn requires_permission(&self) -> bool {
         self.inner.requires_permission()
     }
+    /// Forwarded (M2 design §3.6). The wrapper hid it before, so a read-only
+    /// `Shared` tool was batched as `Exclusive` whenever artifact spill was
+    /// on — the same tool ran concurrently without artifacts and serially
+    /// with them. Spilling is per-result and the store is lock-guarded, so
+    /// concurrent spills are safe.
+    fn concurrency(&self) -> crate::types::Concurrency {
+        self.inner.concurrency()
+    }
     async fn execute(&self, tool_call_id: &str, args: Value) -> Result<AgentToolResult, String> {
         // Direct callers never see a projection; dropping it releases the pin.
         self.execute_for_run(tool_call_id, args)

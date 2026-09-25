@@ -10990,3 +10990,12 @@ area:      [agent-building]
 
 Independent review of the minimizer M2 checkpoint approved it. With the gate off, production behavior is byte-for-byte unchanged: same trim bounds and provider clone, a dyn-compatible Any supertrait within the 1.88 MSRV, identical spill and artifact behavior, and m2a pinning legacy behavior in a tests-only commit. Its gate-on findings are recorded on the ROADMAP M2c line as prerequisites for going live. Argv mode currently runs any argv[0] and resolves it through the daemon's own PATH, where bash -lc re-reads the login profile, so a launchd daemon finds /usr/bin/git and no cargo. Permission prompts read args.command and show nothing for an argv call. The concurrency forwarding fix remains its own checkpoint. Both of the implementation's departures from the design, gating argv and deferring the concurrency forwarding, were judged correct.
 _________________________________________________________________________________ 17:55 feat/minimizer-m2-checkpoint
+
+time:      [17:57] [25-09-26]
+agent:     [claude]
+worktree:  fix/spilling-tool-concurrency
+type:      [bug-report]
+area:      [agent-building]
+
+Repaired the SpillingTool concurrency forwarding the minimizer M2 design (§3.6) calls for, as the separate checkpoint the M2b review asked for. The artifact-spill wrapper forwarded name, schema and permission but not concurrency(), so every Shared read-only tool (grep, ls, web_fetch, memory and room reads) was batched as Exclusive whenever artifacts were enabled: the same tool ran concurrently without artifacts and serially with them. The wrapper now forwards it. Spilling is per-result and the artifact store is lock-guarded, so concurrent spills are safe. The m2a characterization that pinned the missing forwarding now pins Shared and Exclusive both forwarded, and the runtime AGENTS.md and ROADMAP M2c line are updated. ocean-runtime all test binaries green.
+_________________________________________________________________________________ 17:57 fix/spilling-tool-concurrency
