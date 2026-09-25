@@ -10865,3 +10865,12 @@ area:      [backend]
 
 Rooms DoD 4.4, per-room wake buses. RoomWakeBus was one daemon-wide broadcast channel with 256 slots, so every open transcript tail woke on every room's message and filtered it out, and a busy room could overflow the shared buffer and force quiet rooms' tails to lag and re-page SQLite for traffic that was never theirs. It now keeps one bounded channel per room: created on first subscribe, skipped by publishes to rooms nobody tails, and pruned once the last receiver leaves. Tails still filter on hint.room as a backstop. Tests prove ten messages in one room neither reach nor overflow another room's receiver on a capacity-2 channel, and that untailed rooms hold no channel. The access and cursor buses stay daemon-wide (low volume), and moving store work off the tokio workers is the open half of 4.4. ocean-daemon 962 tests, clippy -D warnings.
 _________________________________________________________________________________ 15:55 perf/per-room-wake-bus
+
+time:      [16:04] [25-09-26]
+agent:     [claude]
+worktree:  perf/rooms-store-off-workers
+type:      [refactor]
+area:      [backend]
+
+Closed Rooms DoD 4.4: room store work no longer parks the async worker it runs on. All ~450 call sites reach synchronous SQLite behind a std mutex through the two adapters with_rooms and with_rooms_handle, so a slow write or a contended lock stalled every task queued on that worker. Both adapters now run their locked section through off_async_worker, which on the daemon's multi-thread runtime calls tokio::task::block_in_place, handing the worker's queue to a replacement worker, and elsewhere (current-thread test runtimes, spawn_blocking threads, plain tests) runs inline as before. No caller changed and the daemon has no LocalSet. The new multi-thread, single-worker test puts store work in a spawned task that occupies the only worker and proves a task queued behind it still runs; it was mutation-checked to fail with the plain call restored. Workspace 3391 tests, clippy -D warnings.
+_________________________________________________________________________________ 16:04 perf/rooms-store-off-workers

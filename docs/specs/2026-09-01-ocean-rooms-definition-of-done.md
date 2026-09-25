@@ -179,8 +179,10 @@ ocean-os 616293e, ocean-surface d58a145.
   production; store work off the tokio workers; per-room wake buses. [os, M to L]
   Partial (2026-09-25): WAL, busy_timeout and synchronous are set
   (`apply_durability_pragmas`); message wakes are per room
-  (`wake_channels_are_per_room_and_a_busy_room_cannot_lag_a_quiet_one`). Store
-  work still runs under a std mutex on tokio workers.
+  (`wake_channels_are_per_room_and_a_busy_room_cannot_lag_a_quiet_one`).
+  **Done** (2026-09-25): store work runs through `off_async_worker`
+  (`block_in_place` on the multi-thread runtime) inside both store adapters;
+  `slow_store_work_does_not_park_the_async_worker` fails without it.
 - 4.5 docs/OPERATIONS.md has a rooms and federation runbook; a migration
   rehearsal of a real rooms.db with rollback is recorded (manifest gate 4). [os, M]
 - 4.6 ledger:check is green in all three repos and the manifest-only question
