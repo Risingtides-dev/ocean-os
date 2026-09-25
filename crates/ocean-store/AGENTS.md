@@ -322,7 +322,14 @@ outbox, and the restart-safe federation core (S2 P2-A). One database file
   `room.agent.admission`, `.authority`, `.bootstrap`, `.output` — to
   `[room agent <kind> audit]`. It also maps profile created/updated and resource
   granted/resumed/suspended/revoked facts to fixed readable labels with no
-  decision ids, operator ids, aliases, or other audit metadata.
+  decision ids, operator ids, aliases, or other audit metadata. There is no raw
+  fallback: a structured system body whose `type` has no rule (or that has no
+  `type`) renders as `[room audit]`, and
+  `every_store_audit_writer_has_a_render_rule` scans this crate's production
+  sources for `room.*` type literals, so a writer added here without a render
+  rule turns that daemon test red in the same change. Author ids are bounded
+  on render as well (`[filtered]` past 128 chars, control characters, or
+  square brackets), and the join route refuses such ids on write.
   `projected_room_message` beside it applies
   that SAME function to `GET /v1/rooms/persistent/{key}`, `/transcript`,
   `/snapshot`, and the `/events` SSE tail. It was never one route: a client

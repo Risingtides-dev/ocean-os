@@ -190,7 +190,7 @@ fn summary_user_prompt(room: &RoomKey, room_name: &str, msgs: &[RoomMessage]) ->
         out.push_str(&format!(
             "[#{seq}] {author}: {body}\n",
             seq = m.seq,
-            author = m.author_id,
+            author = super::persistent_rooms::rendered_author_id(m.author_id.clone()),
             body = room_history_text(m.body.clone(), m.author_kind, m.kind),
         ));
     }
@@ -902,16 +902,12 @@ mod tests {
             "an ordinary body is not projected"
         );
 
-        // The author label is still raw, and this pins that rather than leaving
-        // it to be discovered. The bound did land where the id is MINTED:
-        // `room_agent_authority::validate_member_id` refuses exactly this string
-        // at both mutation routes. But that refusal is at the HTTP boundary and
-        // this fixture is not — it calls `add_participant` and
-        // `bootstrap_local_room_agent` in process, which still accept whatever
-        // the caller hands them, as every row written before the guard did. So
-        // the assertion stays green on purpose: a renderer may never assume the
-        // guard ran.
-        assert!(prompt.contains(&format!("{POISON_OWNER}:")));
+        // The author label is bounded too (DoD 3.8). The HTTP routes refuse
+        // this id where it is minted, but this fixture writes in process, as
+        // every row written before that guard did — so the renderer never
+        // assumes the guard ran, and the model reads `[filtered]`.
+        assert!(!prompt.contains(POISON_OWNER), "{prompt}");
+        assert!(prompt.contains("[filtered]:"), "{prompt}");
 
         // The ledger is untouched: this projects the read, never the record.
         let stored = with_rooms_handle(&rooms, |store| store.transcript(&key, None)).expect("read");

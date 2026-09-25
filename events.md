@@ -10829,3 +10829,12 @@ area:      [docs]
 
 Refreshed the Rooms definition-of-done and ROADMAP against the code: 4.1 (room and federation metrics) and 5.2 (every room route in the ecosystem contract, count pinned) were still listed open but are implemented and test-pinned — the room_metrics tests in metrics.rs and room_route_table_and_architecture_route_counts_are_in_parity — so both are marked done with their checks named. 3.5 records that cargo deny went green in #477 while the required-check half stays the user's ruling. The open list on this repo's side is now 0.5 and 0.6 (the operated daemon is behind main with federation off), 2.3 (Stage 2 manifest) and 3.1 (room-route auth design).
 _________________________________________________________________________________ 15:26 docs/dod-refresh
+
+time:      [15:30] [25-09-26]
+agent:     [claude]
+worktree:  fix/audit-render-bounds
+type:      [bug-report]
+area:      [backend]
+
+Closed Rooms DoD 3.8. room_history_text, the one renderer behind every human and model view of a room, ended in a raw fallback: any structured system body whose type it had no rule for went out verbatim, ids and all, to a surface that markdown-renders rows, and the participant-retired line interpolated from and to unbounded. Unknown or untyped structured bodies now render as a fixed [room audit] line while plain system notices stay as written; retired from and to go through the member-id bound. Author ids are bounded on both sides: the join route refuses ids over 128 characters, with control characters, or with square brackets, and every response and agent history row renders such an id as [filtered], since older and federated rows exist. A test scans ocean-store's production sources for room.* audit type literals and fails when a writer has no render rule, which is the tripwire the DoD asked for. ocean-daemon 959 tests, clippy -D warnings.
+_________________________________________________________________________________ 15:30 fix/audit-render-bounds

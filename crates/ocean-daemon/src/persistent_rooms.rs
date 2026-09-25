@@ -512,15 +512,54 @@ fn room_history_row(message: RoomMessage) -> ocean_agent::RoomHistoryRow {
     };
     ocean_agent::RoomHistoryRow {
         seq: message.seq,
-        author_id: message.author_id,
+        author_id: rendered_author_id(message.author_id),
         author_kind,
         text: room_history_text(message.body, message.author_kind, message.kind),
     }
 }
 
-/// A CLOSED whitelist, not a `room.` prefix: an audit `type` that is not
-/// listed below falls through raw to every audience, and no test goes red
-/// when it does. A new audit writer adds its `type` here in the same commit.
+/// A member id that is safe to store and to render in a markdown surface: not
+/// empty, bounded, and free of control characters and the square brackets a
+/// link needs. `None` means refuse it on write and filter it on render.
+pub(super) fn bounded_member_id(raw: &str) -> Option<&str> {
+    (!raw.is_empty()
+        && raw.chars().count() <= super::room_agent_authority::MEMBER_ID_MAX_CHARS
+        && !raw.chars().any(|c| c.is_control() || c == '[' || c == ']'))
+    .then_some(raw)
+}
+
+/// The id a response renders for a row's author. Rows written before the join
+/// route bounded ids are permanent, and federated rows arrive from elsewhere,
+/// so the bound is applied on the way out as well as on the way in.
+pub(super) fn rendered_author_id(raw: String) -> String {
+    if bounded_member_id(&raw).is_some() {
+        raw
+    } else {
+        "[filtered]".to_string()
+    }
+}
+
+/// Every audit `type` this renderer has a rule for. `ocean-store` is where the
+/// writers live; `every_store_audit_writer_has_a_render_rule` scans its
+/// sources and goes red when a writer mints a `room.*` type missing here.
+#[cfg(test)]
+const RENDERED_AUDIT_TYPES: &[&str] = &[
+    "room.agent.admission",
+    "room.agent.authority",
+    "room.agent.bootstrap",
+    "room.agent.output",
+    "room.participant.retired",
+    "room.profile.created",
+    "room.profile.updated",
+    "room.resource.granted",
+    "room.resource.resumed",
+    "room.resource.suspended",
+    "room.resource.revoked",
+];
+
+/// A CLOSED whitelist, not a `room.` prefix. A structured system body whose
+/// `type` is not listed renders as a fixed `[room audit]` line — never raw —
+/// and the scan test above goes red until the new writer gets its own rule.
 ///
 /// `pub(super)` for `room_summary.rs`, which shapes a model PROMPT rather than a
 /// response and so has no `RoomMessage` to hand to `projected_room_message`;
@@ -554,7 +593,7 @@ pub(super) fn room_history_text(
         .as_ref()
         .and_then(|v| v.get("agent_member_id"))
         .and_then(serde_json::Value::as_str)
-        .filter(|a| !a.is_empty() && !a.chars().any(|c| c.is_control() || c == '[' || c == ']'))
+        .and_then(bounded_member_id)
         .map(|a| format!(" {a}"))
         .unwrap_or_default();
     let refused = value
@@ -573,17 +612,16 @@ pub(super) fn room_history_text(
         Some("room.agent.bootstrap") => format!("[room agent bootstrap audit]{agent}"),
         Some("room.agent.output") => format!("[room agent output audit]{agent}"),
         Some("room.participant.retired") => {
-            let from = value
-                .as_ref()
-                .and_then(|v| v.get("from"))
-                .and_then(serde_json::Value::as_str)
-                .unwrap_or("?");
-            let to = value
-                .as_ref()
-                .and_then(|v| v.get("to"))
-                .and_then(serde_json::Value::as_str)
-                .unwrap_or("?");
-            format!("Participant retired: {from} -> {to}")
+            let side = |field: &str| {
+                value
+                    .as_ref()
+                    .and_then(|v| v.get(field))
+                    .and_then(serde_json::Value::as_str)
+                    .and_then(bounded_member_id)
+                    .unwrap_or("?")
+                    .to_string()
+            };
+            format!("Participant retired: {} -> {}", side("from"), side("to"))
         }
         Some("room.profile.created") => "Room profile created".into(),
         Some("room.profile.updated") => "Room profile updated".into(),
@@ -591,7 +629,14 @@ pub(super) fn room_history_text(
         Some("room.resource.resumed") => "Folder access resumed".into(),
         Some("room.resource.suspended") => "Folder access suspended".into(),
         Some("room.resource.revoked") => "Folder access revoked".into(),
-        _ => body,
+        // Structured but unrecognized: a ledger row this renderer has no rule
+        // for yet. Its ids and fields go to no audience raw.
+        Some(_) => "[room audit]".into(),
+        // Not a structured audit — a plain system notice (room closed, a
+        // marker) that its writer already bounded. A JSON object that carries
+        // no `type` is still structured, and is still never rendered raw.
+        None if value.as_ref().is_some_and(serde_json::Value::is_object) => "[room audit]".into(),
+        None => body,
     }
 }
 
@@ -629,6 +674,7 @@ pub(super) fn room_history_text(
 /// `crates/ocean-store/AGENTS.md`.
 fn projected_room_message(mut message: RoomMessage) -> RoomMessage {
     message.body = room_history_text(message.body, message.author_kind, message.kind);
+    message.author_id = rendered_author_id(message.author_id);
     message
 }
 
@@ -1770,13 +1816,13 @@ pub(super) async fn room_join(
     // self-inflicted denial with no way to discover the cause. Refuse it at the
     // door instead.
     let id = req.id.trim();
-    if id.is_empty() || id != req.id {
+    if id.is_empty() || id != req.id || bounded_member_id(id).is_none() {
         return (
             StatusCode::BAD_REQUEST,
             Json(json!({
                 "ok": false,
                 "code": "invalid_participant_id",
-                "error": "participant id must be non-empty and carry no leading or trailing whitespace",
+                "error": "participant id must be non-empty, at most 128 characters, with no surrounding whitespace, control characters, or square brackets",
             })),
         );
     }
@@ -3425,7 +3471,7 @@ were mentioned.\n\n",
         out.push_str(&format!(
             "[#{seq}] {author}: {body}{marker}\n",
             seq = m.seq,
-            author = m.author_id,
+            author = rendered_author_id(m.author_id.clone()),
             body = room_history_text(m.body.clone(), m.author_kind, m.kind),
             marker = marker,
         ));
@@ -11699,6 +11745,109 @@ env = { FIXTURE = "1" }
                 .any(|t| t.starts_with("[room agent authority audit] helper")),
             "{texts:?}"
         );
+    }
+
+    /// DoD 3.8: a new audit writer in ocean-store turns this red until the
+    /// renderer has a rule for its type, instead of falling through to
+    /// `[room audit]` unnoticed.
+    #[test]
+    fn every_store_audit_writer_has_a_render_rule() {
+        // Every production source that writes a room audit row. A new
+        // ocean-store module is caught by the file-count check below.
+        let sources = [
+            include_str!("../../ocean-store/src/lib.rs"),
+            include_str!("../../ocean-store/src/room_profile.rs"),
+            include_str!("../../ocean-store/src/room_resources.rs"),
+            include_str!("../../ocean-store/src/room_retirement.rs"),
+        ];
+        let store_modules =
+            std::fs::read_dir(concat!(env!("CARGO_MANIFEST_DIR"), "/../ocean-store/src"))
+                .expect("ocean-store sources")
+                .filter(|entry| {
+                    entry
+                        .as_ref()
+                        .is_ok_and(|e| e.path().extension().is_some_and(|x| x == "rs"))
+                })
+                .count();
+        assert_eq!(
+            store_modules,
+            sources.len(),
+            "ocean-store gained a source file; add it to this scan"
+        );
+        let mut found = std::collections::BTreeSet::new();
+        for source in sources {
+            let production = source.split("#[cfg(test)]").next().unwrap_or(source);
+            let mut rest = production;
+            while let Some(start) = rest.find("\"room.") {
+                let tail = &rest[start + 1..];
+                let end = tail.find('"').unwrap_or(tail.len());
+                let literal = &tail[..end];
+                // Every `"room.` literal counts; one the renderer's rules could
+                // not name (a hyphen, a digit, uppercase) fails here rather
+                // than slipping past the scan.
+                found.insert(literal.to_string());
+                rest = &tail[end.min(tail.len())..];
+            }
+        }
+        assert!(
+            found.len() >= 11,
+            "the scan stopped matching the writers: {found:?}"
+        );
+        for audit_type in &found {
+            assert!(
+                RENDERED_AUDIT_TYPES.contains(&audit_type.as_str()),
+                "ocean-store writes audit type {audit_type} with no render rule in room_history_text"
+            );
+        }
+        for audit_type in RENDERED_AUDIT_TYPES {
+            let rendered = room_history_text(
+                format!(r#"{{"type":"{audit_type}"}}"#),
+                RoomParticipantKind::System,
+                RoomMessageKind::System,
+            );
+            assert_ne!(
+                rendered, "[room audit]",
+                "{audit_type} has no rule of its own"
+            );
+        }
+    }
+
+    #[test]
+    fn unknown_or_untyped_structured_bodies_never_render_raw() {
+        let text = |body: &str| {
+            room_history_text(
+                body.to_string(),
+                RoomParticipantKind::System,
+                RoomMessageKind::System,
+            )
+        };
+        assert_eq!(
+            text(r#"{"type":"room.future.thing","owner_member_id":"[x](https://evil.co)"}"#),
+            "[room audit]"
+        );
+        assert_eq!(
+            text(r#"{"owner_member_id":"[x](https://evil.co)"}"#),
+            "[room audit]"
+        );
+        assert_eq!(
+            text("operator smaths closed the room"),
+            "operator smaths closed the room"
+        );
+        assert_eq!(
+            text(
+                r#"{"type":"room.participant.retired","from":"[x](https://evil.co)","to":"smaths"}"#
+            ),
+            "Participant retired: ? -> smaths"
+        );
+    }
+
+    #[test]
+    fn author_ids_are_bounded_on_render() {
+        assert_eq!(rendered_author_id("smaths".into()), "smaths");
+        assert_eq!(rendered_author_id("[click](x)".into()), "[filtered]");
+        assert_eq!(rendered_author_id("a\nb".into()), "[filtered]");
+        assert_eq!(rendered_author_id("x".repeat(129)), "[filtered]");
+        assert_eq!(rendered_author_id("x".repeat(128)), "x".repeat(128));
     }
 
     #[test]
