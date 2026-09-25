@@ -65,6 +65,7 @@ ocean-os 616293e, ocean-surface d58a145.
   on create and offers a bind control for existing rooms, and a room without one
   says so. Today every agent @mention in a surface-created room fails closed
   with workspace_unavailable. Check: surface acceptance plus daemon test. [surface, M]
+  **Done** (verified against code 2026-09-25): surface `tests/room_workspace_binding.rs`; daemon `room_update_binds_unbinds_and_preserves_the_workspace_root`, `unbound_room_convene_fails_closed_without_session_or_reply`.
 - 1.5 Read history: opens at the newest page, can ask for older history and see
   whether more exists, orphaned thread replies are reachable, live-follow never
   yanks a scrolled reader, return-to-latest re-pins. Check: surface acceptance. [surface, M]
@@ -77,8 +78,10 @@ ocean-os 616293e, ocean-surface d58a145.
 - 1.8 Roster: humans and agents, agent ownership visible with owner presence,
   add and remove, mention autocomplete. Today agent_owners is decoded by
   nothing. Check: surface acceptance. [surface, S]
+  **Done** (verified against code 2026-09-25): surface `tests/agent_ownership_rail.rs` decodes `agent_owners`; member add/remove and `mention_query_detects_partial_at_caret` cover the rest.
 - 1.9 Times read as local time with correct day separators. Today everything is
   UTC rendered as if local. Check: surface unit test with a fixed zone. [surface, S]
+  **Done** (verified against code 2026-09-25): surface `room_messages.rs` `local_day_key_crosses_the_boundary_in_both_directions` with fixed offsets; the viewer offset is taken per instant.
 - 1.10 Closed room: audit view, no composer, no tailing, no minting; and one
   consistent daemon answer for "room not open" across get, transcript,
   snapshot, events, summarize, attachments. Check: surface acceptance plus
@@ -93,6 +96,7 @@ ocean-os 616293e, ocean-surface d58a145.
 - 1.12 Desktop parity: the Tauri app can run the agent authorization ceremony,
   opens ocean://room/<key> deep links, and notifies on mentions. Today the
   desktop is read-only for the ceremony and has no room deep link. [surface, L]
+  **Done** (verified against code 2026-09-25): `the_native_shell_carries_the_privileged_transport`, `desktop_deep_link_registration.rs`, `deep_link_opens_a_room`, `room_mention_notification.rs`.
 
 ## 2. What an agent can do
 - 2.1 Bound to a room through the authorization ceremony from any host. Check:
@@ -107,6 +111,7 @@ ocean-os 616293e, ocean-surface d58a145.
   refusal (workspace_unavailable, room_history_unavailable) is rendered in the
   transcript, not lost in an audit row. Check: end-to-end wake against a real
   agent, recorded. [os, surface co_dispatch, M]
+  **Done** (verified against code 2026-09-25): real @mention turns recorded in events.md; refusal is a durable row rendered `[room agent admission refused: workspace_unavailable]`.
 - 2.3 Able to act: PHASE1_SAFE_CAPABILITIES is non-empty under an accepted
   Stage 2 manifest, so a room agent can at least read the bound repo and run
   the room's build. Today the set is empty. Check:
@@ -124,6 +129,7 @@ ocean-os 616293e, ocean-surface d58a145.
   refusal of a new dead value and clearing/re-sending the stored value; the
   Surface checks must prove the offered rows and their access-state holds.
   [os, surface, S]
+  **Done** (verified against code 2026-09-25): the `room_update_*thread_reply*` tests, surface `ci_failure_trigger_control.rs`, and `thread_reply_is_dead_in_a_federated_room`.
 - 2.5 Agents drive rooms through MCP and the CLI for every route a human has:
   build, CI, secrets, purge, port close. Today MCP stops at expose_port. Check:
   `node --test test/toolbox-manifest.test.mjs` in ocean-bedrock must pin the
@@ -148,6 +154,7 @@ ocean-os 616293e, ocean-surface d58a145.
   root scope. [bedrock, green]
 - 3.7 Concurrent exec and flush in one room are serialized or bounded;
   last-write-wins on the durable tree is closed. [bedrock, M]
+  **Done** (verified against code 2026-09-25): bedrock #146 per-room exclusive flush lock, `test/workspace-flush.test.mjs`; #154 pins concurrent execs and serialized flushes.
 - 3.8 The audit-history renderer has no raw fallback and author_id is bounded
   on render as well as write; a fifth audit writer turns a test red. [os, S]
   **Done** (2026-09-25): `room_history_text` renders unknown or untyped
@@ -190,6 +197,7 @@ ocean-os 616293e, ocean-surface d58a145.
 - 5.1 openapi parity green, and API.md plus OCEAN-ROOM-COMPUTE.md cover every
   route (repo, build, CI, execs, purge are missing today), checked by the
   parity test. [bedrock, S to M]
+  **Done** (verified against code 2026-09-25): bedrock `test/openapi-parity.test.mjs` and `test/route-doc-parity.test.mjs` hold API.md and OCEAN-ROOM-COMPUTE.md to the router.
 - 5.2 OCEAN_ECOSYSTEM_CONTRACT.md lists all 40 daemon room routes and
   ARCHITECTURE.md's count is pinned by a test. [os, M] **Done** (verified
   2026-09-25): the table has every registered `/v1/rooms` route (54 today) and
@@ -204,6 +212,7 @@ ocean-os 616293e, ocean-surface d58a145.
   container and are merge conditions. [bedrock, M]
 - 5.6 The Worker's request layer (13 routes) has executable tests, not regex
   pins. [bedrock, M to L]
+  **Done** (verified against code 2026-09-25): `cf/room-runtime/test/rpc.test.ts` drives the real fetch through a fake SDK, run by `room-runtime-unit-gate`.
 - 5.7 The isolated macOS Tauri rooms acceptance harness (#110) exists and runs
   in CI; ocean-tauri is clippy-gated. [surface, L]
 - 5.8 Cross-repo drift checks (ROADMAP item) cover the daemon-to-surface and
