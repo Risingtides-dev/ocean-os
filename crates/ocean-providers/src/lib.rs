@@ -1623,15 +1623,75 @@ fn base_url_host(base_url: &str) -> String {
         .to_string()
 }
 
-/// The one lock every in-process read-modify-write of Ocean's `auth.json`
-/// takes: fresh logins and logouts (`ocean-oauth`) and the turn-time token
-/// refresh (`ocean-agent::oauth_refresh`). Hold it only around the synchronous
-/// read → merge → write, never across a network call or an `.await`; a writer
-/// that did slow work first must re-read under the lock and merge only its own
-/// block, or it resurrects a block another writer just removed.
-pub fn auth_file_lock() -> &'static std::sync::Mutex<()> {
+/// Longest [`lock_auth_file`] waits on another process's file lock.
+pub const AUTH_FILE_LOCK_WAIT: std::time::Duration = std::time::Duration::from_secs(5);
+
+fn process_auth_lock() -> &'static std::sync::Mutex<()> {
     static LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
     LOCK.get_or_init(|| std::sync::Mutex::new(()))
+}
+
+/// Held while one writer owns `auth.json`. Dropping it releases both halves.
+pub struct AuthFileGuard {
+    // Field order is drop order: the file lock releases before the mutex, so
+    // no other thread in this process can reach flock while this one still
+    // holds it.
+    _file: Option<std::fs::File>,
+    _process: std::sync::MutexGuard<'static, ()>,
+}
+
+/// Take the lock every read-modify-write of Ocean's `auth.json` holds: fresh
+/// logins and logouts (`ocean-oauth`, from the TUI or the daemon) and the
+/// turn-time token refresh (`ocean-agent::oauth_refresh`).
+///
+/// Two halves: a process-wide mutex (threads in one process), then an
+/// exclusive `flock` on `.auth.json.lock` beside the file (separate processes —
+/// a TUI `/login` racing the daemon's refresher). Hold it only around the
+/// synchronous read → merge → write, never across a network call or an
+/// `.await`; a writer that did slow work first must re-read under the lock and
+/// merge only its own block, or it resurrects a block another writer removed.
+///
+/// If the lock file cannot be opened (read-only or missing directory) the
+/// process half still serializes this process; the write that follows fails
+/// loudly on its own if the directory really is unusable. The file half waits
+/// at most [`AUTH_FILE_LOCK_WAIT`]: callers run on async workers, and a stopped
+/// process holding the lock must not park one forever — past the deadline the
+/// write proceeds under the process half alone, as it did before this lock.
+pub fn lock_auth_file(auth_file: &Path) -> AuthFileGuard {
+    let process = process_auth_lock()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let dir = auth_file.parent().unwrap_or_else(|| Path::new("."));
+    let file = std::fs::create_dir_all(dir)
+        .ok()
+        .and_then(|()| {
+            std::fs::OpenOptions::new()
+                .create(true)
+                .truncate(false)
+                .write(true)
+                .open(dir.join(".auth.json.lock"))
+                .ok()
+        })
+        .filter(|file| {
+            let deadline = std::time::Instant::now() + AUTH_FILE_LOCK_WAIT;
+            loop {
+                if fs2::FileExt::try_lock_exclusive(file).is_ok() {
+                    return true;
+                }
+                if std::time::Instant::now() >= deadline {
+                    eprintln!(
+                        "ocean: auth.json lock held elsewhere for {}s; writing without it",
+                        AUTH_FILE_LOCK_WAIT.as_secs()
+                    );
+                    return false;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+        });
+    AuthFileGuard {
+        _file: file,
+        _process: process,
+    }
 }
 
 /// A temp path beside `auth_file` that no other write — in this process or
@@ -2808,5 +2868,26 @@ mod tests {
         assert_eq!(config.account_id.as_deref(), Some("cli-acct-456"));
 
         let _ = fs::remove_dir_all(&dir);
+    }
+}
+
+#[cfg(test)]
+mod auth_lock_tests {
+    use super::lock_auth_file;
+
+    /// The flock half is what serializes a TUI login against the daemon: a
+    /// second, independent open of the lock file cannot take it while held.
+    #[test]
+    fn the_file_half_excludes_another_opener_until_dropped() {
+        let dir = tempfile::tempdir().unwrap();
+        let auth = dir.path().join("auth.json");
+        let guard = lock_auth_file(&auth);
+        let other = std::fs::OpenOptions::new()
+            .write(true)
+            .open(dir.path().join(".auth.json.lock"))
+            .unwrap();
+        assert!(fs2::FileExt::try_lock_exclusive(&other).is_err());
+        drop(guard);
+        assert!(fs2::FileExt::try_lock_exclusive(&other).is_ok());
     }
 }

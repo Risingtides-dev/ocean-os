@@ -3732,8 +3732,10 @@ name = "ocean-providers"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "fs2",
  "serde",
  "serde_json",
+ "tempfile",
 ]
 
 [[package]]

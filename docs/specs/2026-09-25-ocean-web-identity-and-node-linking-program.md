@@ -318,7 +318,7 @@ provider response, attacker-chosen callback `error_description`, or the auth
 file's path — the detail goes to the daemon log.
 
 Auth-file concurrency: every in-process writer — login, logout, and the
-turn-time refresher — takes `ocean_providers::auth_file_lock()` around its
+turn-time refresher — takes `ocean_providers::lock_auth_file` (process mutex plus an exclusive `flock` on `.auth.json.lock`, so a TUI login in another process serializes too) around its
 read-modify-write and uses a unique temp name; the refresher merges its result
 into a fresh read and only into a block still carrying the refresh token it
 spent. Review of this contract also found the refresher created its temp file

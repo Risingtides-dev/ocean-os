@@ -10802,3 +10802,12 @@ area:      [docs]
 
 Proposed, not accepted: §10 of the web identity program spec lays out one shape for M2 self-serve node linking, for the operator's yes or no. Linking needs credentials the proxy today gets only by hand-copying a node's operator.key and boot-rotated observatory-token onto the operator's Mac, and a daemon bound to its tailnet address has no authentication at all, so any peer on the shared team tailnet can drive any coworker's daemon unless per-node ACLs were hand-written. The proposal adds a revocable per-link daemon credential (X-Ocean-Link, stored hashed in linked-surfaces.json, removed by ocean unlink), requires a credential from every non-loopback caller when the daemon binds off loopback, pairs through an 8-character single-use code approved while signed in with GitHub (the hub proves the offered URL and credential before recording), keeps approved links in a proxy-side linked-devices.json, auto-creates zero-device roster entries for org members, and removes today's fallback that routes a device-less person to the operator's own daemon. The Gate 0 device key, relay transport, and cross-person access stay deferred.
 _________________________________________________________________________________ 15:03 docs/m2-linking-proposal
+
+time:      [15:05] [25-09-26]
+agent:     [claude]
+worktree:  fix/auth-file-flock
+type:      [bug-report]
+area:      [backend]
+
+Closed the residual the M3 review left open: the shared auth.json lock was per process, so a TUI /login writing through ocean-oauth could still interleave with the daemon's refresher or a web login. ocean-providers now exposes lock_auth_file(path), a process mutex plus an exclusive flock on .auth.json.lock beside the file (fs2, already a workspace dependency), and ocean-oauth's merge and remove plus oauth_refresh's post-network merge take it instead of the process-only mutex. If the lock file cannot be opened the process half still serializes and the write itself fails loudly. A test proves a second independent open cannot take the file lock until the guard drops. Gates: ocean-providers 52, ocean-oauth 42 and 2, oauth_refresh 4, clippy -D warnings.
+_________________________________________________________________________________ 15:05 fix/auth-file-flock
