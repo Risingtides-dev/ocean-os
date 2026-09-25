@@ -157,7 +157,7 @@ pub fn oauth_block_status(
             if raw >= 1_000_000_000_000 {
                 raw
             } else {
-                raw * 1000
+                raw.saturating_mul(1000)
             }
         });
     Ok(OAuthBlockStatus {
@@ -416,10 +416,11 @@ mod status_tests {
     use super::{logout, oauth_block_status, OAuthProvider};
 
     fn auth_file(body: &str) -> (std::path::PathBuf, std::path::PathBuf) {
+        static N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         let dir = std::env::temp_dir().join(format!(
             "ocean-oauth-status-{}-{}",
             std::process::id(),
-            body.len()
+            N.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
         ));
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("auth.json");

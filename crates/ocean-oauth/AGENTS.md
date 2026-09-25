@@ -17,7 +17,7 @@ This crate owns browser OAuth 2.0 + PKCE login for provider subscriptions: bind 
 - Written blocks (`claude-code`, `openai-codex`) must stay consumable by `ocean-providers` credential resolution AND `ocean-agent::oauth_refresh` (`type:"oauth"`, `access`, `refresh`, `expires` in epoch ms, `accountId` for Codex).
 - This crate performs fresh logins only. Token refresh lives in `ocean-agent::oauth_refresh` / `ocean-protocol::oauth` — never duplicate it here.
 - Token endpoints honor the same env overrides as the refresh pass: `OCEAN_OAUTH_ANTHROPIC_TOKEN_URL`, `OCEAN_OAUTH_OPENAI_TOKEN_URL`.
-- Auth-file writes are atomic (`.auth.json.tmp-{pid}` + rename, 0600) and must preserve unrelated provider blocks.
+- Auth-file writes are atomic (a unique `ocean_providers::auth_file_temp_path` + rename, 0600), preserve unrelated provider blocks, and run the whole read-modify-write under `ocean_providers::auth_file_lock()` — the one lock shared with `ocean-agent::oauth_refresh`, whose post-network merge re-reads under it and applies only to a block still carrying the refresh token it spent, so a logout or new login is never reverted.
 - Plain API-key writes also serve isolated feature credentials such as `xai`
   and `openai-realtime`; they retain the same atomic 0600 merge contract and
   must never overwrite unrelated agent OAuth or API-key blocks.

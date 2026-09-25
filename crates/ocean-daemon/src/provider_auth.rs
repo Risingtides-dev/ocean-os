@@ -65,10 +65,13 @@ impl AttemptState {
     }
 }
 
+/// What a login task reports when it ends. `Ok` means tokens were written.
+type LoginTask = tokio::task::JoinHandle<Result<(), &'static str>>;
+
 struct Attempt {
     id: String,
     state: AttemptState,
-    task: Option<tokio::task::JoinHandle<()>>,
+    task: Option<LoginTask>,
 }
 
 /// The daemon's in-memory record of provider login attempts: at most one per
@@ -109,7 +112,7 @@ impl ProviderLogins {
     /// Cancel whatever attempt is pending for `provider`. Returns the aborted
     /// task so a caller about to bind the same callback port can wait for the
     /// old listener to actually close.
-    fn cancel_pending(&self, provider: OAuthProvider) -> Option<tokio::task::JoinHandle<()>> {
+    fn cancel_pending(&self, provider: OAuthProvider) -> Option<LoginTask> {
         let mut attempts = self.attempts();
         let attempt = attempts.get_mut(provider.label())?;
         if attempt.state != AttemptState::Pending {
@@ -119,6 +122,50 @@ impl ProviderLogins {
         let task = attempt.task.take()?;
         task.abort();
         Some(task)
+    }
+}
+
+/// Cancel `provider`'s pending attempt and wait (bounded) for its task to
+/// actually stop. `abort` only lands at the task's next `.await`; a task past
+/// its token exchange writes the auth file synchronously and cannot be stopped,
+/// so the wait is what lets the caller report — and a logout act on — what
+/// really happened. When the task turns out to have finished its login, the
+/// attempt is recorded as `succeeded`, never as a `cancelled` that is false.
+async fn cancel_and_settle(logins: &ProviderLogins, provider: OAuthProvider) {
+    let Some(task) = logins.cancel_pending(provider) else {
+        return;
+    };
+    let finished = matches!(
+        tokio::time::timeout(std::time::Duration::from_secs(2), task).await,
+        Ok(Ok(Ok(())))
+    );
+    if finished {
+        if let Some(attempt) = logins.attempts().get_mut(provider.label()) {
+            if attempt.state == AttemptState::Cancelled {
+                attempt.state = AttemptState::Succeeded;
+            }
+        }
+    }
+}
+
+/// A fixed failure code for the browser. The flow's own error text can carry a
+/// provider's raw response body, an attacker-chosen `error_description` from
+/// the localhost callback, or the auth file's absolute path, so it goes to the
+/// log and never to a client.
+fn failure_code(error: &anyhow::Error) -> &'static str {
+    let text = format!("{error:#}");
+    if text.contains("timed out") {
+        "timeout"
+    } else if text.contains("authorization failed") {
+        "denied"
+    } else if text.contains("state") && text.contains("mismatch") {
+        "state_mismatch"
+    } else if text.contains("token exchange failed") || text.contains("accountId") {
+        "exchange_failed"
+    } else if text.contains("auth file") || text.contains("auth dir") {
+        "write_failed"
+    } else {
+        "login_failed"
     }
 }
 
@@ -253,43 +300,49 @@ pub(crate) async fn start_inner(
     authorize(operator, headers).map_err(ApiError::response)?;
     let provider = provider_from_path(raw_provider).map_err(ApiError::response)?;
 
-    // A new login replaces a pending one. Abort it and wait for the task to
-    // unwind, which drops its callback listener: Codex's port is fixed at
-    // 1455, so binding before the old one closes would fail.
-    if let Some(previous) = logins.cancel_pending(provider) {
-        let _ = tokio::time::timeout(std::time::Duration::from_secs(2), previous).await;
-    }
-    let session = match ocean_oauth::begin(provider, logins.auth_file.clone()).await {
-        Ok(session) => session,
-        Err(error) => {
-            tracing::warn!(provider = provider.label(), %error, "provider login could not start");
-            return Err(ApiError::conflict("login_unavailable").response());
+    // A new login replaces a pending one: cancel it and wait for its task to
+    // stop, then bind. The old listener closes a beat after its task ends
+    // (Codex's port is fixed at 1455), so a superseding bind retries briefly.
+    let superseding = logins
+        .attempts()
+        .get(provider.label())
+        .is_some_and(|a| a.state == AttemptState::Pending);
+    cancel_and_settle(logins, provider).await;
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
+    let session = loop {
+        match ocean_oauth::begin(provider, logins.auth_file.clone()).await {
+            Ok(session) => break session,
+            Err(_) if superseding && tokio::time::Instant::now() < deadline => {
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            }
+            Err(error) => {
+                tracing::warn!(provider = provider.label(), %error, "provider login could not start");
+                return Err(ApiError::conflict("login_unavailable").response());
+            }
         }
     };
     let authorize_url = session.authorize_url.clone();
     let id = mint_attempt_id();
 
-    // Register the attempt BEFORE the task can finish, so a fast completion
-    // always finds its row.
-    logins.attempts().insert(
-        provider.label(),
-        Attempt {
-            id: id.clone(),
-            state: AttemptState::Pending,
-            task: None,
-        },
-    );
+    // Spawn and register under ONE lock acquisition: no window in which the row
+    // exists without its task (a concurrent cancel could not abort it) or the
+    // task exists without its row (a fast finish could not record itself).
     let task_logins = Arc::clone(logins);
     let task_id = id.clone();
+    let mut attempts = logins.attempts();
     let task = tokio::spawn(async move {
         let outcome = session.finish().await;
         let mut attempts = task_logins.attempts();
-        let Some(attempt) = attempts.get_mut(provider.label()) else {
-            return;
+        let result = match &outcome {
+            Ok(_) => Ok(()),
+            Err(error) => Err(failure_code(error)),
         };
-        // A newer attempt owns the row now; this result is stale.
+        let Some(attempt) = attempts.get_mut(provider.label()) else {
+            return result;
+        };
+        // A newer attempt owns the row, or a cancel already settled it.
         if attempt.id != task_id || attempt.state != AttemptState::Pending {
-            return;
+            return result;
         }
         attempt.task = None;
         attempt.state = match outcome {
@@ -298,16 +351,21 @@ pub(crate) async fn start_inner(
                 AttemptState::Succeeded
             }
             Err(error) => {
-                tracing::warn!(provider = provider.label(), %error, "provider login failed");
-                AttemptState::Failed(error.to_string())
+                tracing::warn!(provider = provider.label(), error = %format!("{error:#}"), "provider login failed");
+                AttemptState::Failed(failure_code(&error).to_string())
             }
         };
+        result
     });
-    if let Some(attempt) = logins.attempts().get_mut(provider.label()) {
-        if attempt.id == id && attempt.state == AttemptState::Pending {
-            attempt.task = Some(task);
-        }
-    }
+    attempts.insert(
+        provider.label(),
+        Attempt {
+            id: id.clone(),
+            state: AttemptState::Pending,
+            task: Some(task),
+        },
+    );
+    drop(attempts);
 
     Ok((
         StatusCode::ACCEPTED,
@@ -349,7 +407,7 @@ pub(crate) fn poll_inner(
     Ok((StatusCode::OK, Json(body)))
 }
 
-pub(crate) fn cancel_inner(
+pub(crate) async fn cancel_inner(
     operator: &OperatorIdentity,
     logins: &ProviderLogins,
     headers: &HeaderMap,
@@ -359,13 +417,13 @@ pub(crate) fn cancel_inner(
     authorize(operator, headers).map_err(ApiError::response)?;
     let provider = provider_from_path(raw_provider).map_err(ApiError::response)?;
     attempt_for(logins, provider, attempt_id).map_err(ApiError::response)?;
-    logins.cancel_pending(provider);
+    cancel_and_settle(logins, provider).await;
     let mut body = attempt_for(logins, provider, attempt_id).map_err(ApiError::response)?;
     body["ok"] = json!(true);
     Ok((StatusCode::OK, Json(body)))
 }
 
-pub(crate) fn logout_inner(
+pub(crate) async fn logout_inner(
     operator: &OperatorIdentity,
     logins: &ProviderLogins,
     headers: &HeaderMap,
@@ -373,7 +431,9 @@ pub(crate) fn logout_inner(
 ) -> RouteResult {
     authorize(operator, headers).map_err(ApiError::response)?;
     let provider = provider_from_path(raw_provider).map_err(ApiError::response)?;
-    logins.cancel_pending(provider);
+    // Settle a racing login FIRST, so tokens it was about to write land before
+    // the removal below rather than after it.
+    cancel_and_settle(logins, provider).await;
     let removed = ocean_oauth::logout(provider, logins.auth_file.clone()).map_err(|error| {
         tracing::warn!(provider = provider.label(), %error, "provider logout failed");
         ApiError::internal("logout_failed").response()
@@ -438,13 +498,16 @@ pub(crate) async fn cancel(
     Path((provider, attempt_id)): Path<(String, String)>,
     headers: HeaderMap,
 ) -> (StatusCode, Json<Value>) {
-    flatten(cancel_inner(
-        &state.room_operator,
-        &state.provider_logins,
-        &headers,
-        &provider,
-        &attempt_id,
-    ))
+    flatten(
+        cancel_inner(
+            &state.room_operator,
+            &state.provider_logins,
+            &headers,
+            &provider,
+            &attempt_id,
+        )
+        .await,
+    )
 }
 
 /// `POST /v1/auth/providers/{provider}/logout`.
@@ -453,12 +516,15 @@ pub(crate) async fn logout(
     Path(provider): Path<String>,
     headers: HeaderMap,
 ) -> (StatusCode, Json<Value>) {
-    flatten(logout_inner(
-        &state.room_operator,
-        &state.provider_logins,
-        &headers,
-        &provider,
-    ))
+    flatten(
+        logout_inner(
+            &state.room_operator,
+            &state.provider_logins,
+            &headers,
+            &provider,
+        )
+        .await,
+    )
 }
 
 #[cfg(test)]
@@ -495,8 +561,8 @@ mod tests {
         (status, value)
     }
 
-    #[test]
-    fn every_route_fails_closed_without_the_operator_key() {
+    #[tokio::test]
+    async fn every_route_fails_closed_without_the_operator_key() {
         let (_dir, logins) = logins(None);
         let operator = operator();
 
@@ -509,7 +575,7 @@ mod tests {
             crate::room_operator::OPERATOR_HEADER,
             HeaderValue::from_static("nope"),
         );
-        let (status, _) = body(logout_inner(&operator, &logins, &wrong, "claude"));
+        let (status, _) = body(logout_inner(&operator, &logins, &wrong, "claude").await);
         assert_eq!(status, StatusCode::FORBIDDEN);
 
         // A browser's ambient cookie is refused on shape, even with the key.
@@ -545,22 +611,22 @@ mod tests {
         assert_eq!(providers[1]["status"], "expired");
     }
 
-    #[test]
-    fn signed_out_when_the_file_is_absent_and_logout_is_idempotent() {
+    #[tokio::test]
+    async fn signed_out_when_the_file_is_absent_and_logout_is_idempotent() {
         let (_dir, logins) = logins(Some(r#"{"claude-code":{"type":"oauth","access":"a"}}"#));
-        let (_, value) = body(logout_inner(&operator(), &logins, &authed(), "claude"));
+        let (_, value) = body(logout_inner(&operator(), &logins, &authed(), "claude").await);
         assert_eq!(value["removed"], true);
-        let (_, value) = body(logout_inner(&operator(), &logins, &authed(), "claude"));
+        let (_, value) = body(logout_inner(&operator(), &logins, &authed(), "claude").await);
         assert_eq!(value["removed"], false);
         let (_, value) = body(list_inner(&operator(), &logins, &authed()));
         assert_eq!(value["providers"][0]["status"], "signed_out");
         assert_eq!(value["providers"][0]["login"], Value::Null);
     }
 
-    #[test]
-    fn unknown_providers_and_attempts_are_404() {
+    #[tokio::test]
+    async fn unknown_providers_and_attempts_are_404() {
         let (_dir, logins) = logins(None);
-        let (status, value) = body(logout_inner(&operator(), &logins, &authed(), "gemini"));
+        let (status, value) = body(logout_inner(&operator(), &logins, &authed(), "gemini").await);
         assert_eq!(status, StatusCode::NOT_FOUND);
         assert_eq!(value["error"], "unknown_provider");
         let (status, value) = body(poll_inner(
@@ -572,6 +638,68 @@ mod tests {
         ));
         assert_eq!(status, StatusCode::NOT_FOUND);
         assert_eq!(value["error"], "unknown_attempt");
+    }
+
+    #[tokio::test]
+    async fn a_foreign_origin_is_refused_even_with_the_key() {
+        let (_dir, logins) = logins(None);
+        let mut headers = authed();
+        headers.insert(
+            axum::http::header::ORIGIN,
+            HeaderValue::from_static("https://evil.example"),
+        );
+        let (status, value) = body(start_inner(&operator(), &logins, &headers, "claude").await);
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        assert_eq!(value["error"], "foreign_origin_rejected");
+        assert!(logins.attempts().is_empty(), "no login started");
+    }
+
+    #[test]
+    fn failures_reach_clients_as_fixed_codes_only() {
+        let cases = [
+            (
+                anyhow::anyhow!("login timed out waiting for browser callback after 300s"),
+                "timeout",
+            ),
+            (
+                anyhow::anyhow!("authorization failed: <script>attacker text</script>"),
+                "denied",
+            ),
+            (
+                anyhow::anyhow!("anthropic token exchange failed: 400 {{\"raw\":\"body\"}}"),
+                "exchange_failed",
+            ),
+            (
+                anyhow::anyhow!("boom").context("failed to finalize auth file /Users/x/auth.json"),
+                "write_failed",
+            ),
+            (anyhow::anyhow!("something else"), "login_failed"),
+        ];
+        for (error, code) in cases {
+            assert_eq!(failure_code(&error), code, "{error:#}");
+        }
+    }
+
+    #[tokio::test]
+    async fn logout_settles_a_pending_login_before_removing_the_block() {
+        let (_dir, logins) = logins(Some(r#"{"claude-code":{"type":"oauth","access":"a"}}"#));
+        let (_, started) = body(start_inner(&operator(), &logins, &authed(), "claude").await);
+        let attempt = started["attempt_id"].as_str().unwrap().to_string();
+        let (_, out) = body(logout_inner(&operator(), &logins, &authed(), "claude").await);
+        assert_eq!(out["removed"], true);
+        let (_, polled) = body(poll_inner(
+            &operator(),
+            &logins,
+            &authed(),
+            "claude",
+            &attempt,
+        ));
+        assert_eq!(polled["state"], "cancelled");
+        let entry = logins.attempts();
+        assert!(
+            entry.get("claude").is_some_and(|a| a.task.is_none()),
+            "the aborted task was taken and awaited, not left detached"
+        );
     }
 
     #[tokio::test]
@@ -610,13 +738,8 @@ mod tests {
         ));
         assert_eq!(status, StatusCode::NOT_FOUND);
 
-        let (_, cancelled) = body(cancel_inner(
-            &operator(),
-            &logins,
-            &authed(),
-            "claude",
-            &newer,
-        ));
+        let (_, cancelled) =
+            body(cancel_inner(&operator(), &logins, &authed(), "claude", &newer).await);
         assert_eq!(cancelled["state"], "cancelled");
     }
 }

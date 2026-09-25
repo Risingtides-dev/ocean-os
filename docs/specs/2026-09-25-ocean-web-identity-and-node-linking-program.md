@@ -303,11 +303,27 @@ is `{provider, label, kind:"oauth", status, source, expires_at_ms, login}`:
 No field carries a token, refresh token, key, or prefix of one; a test asserts
 the serialized status contains neither token value.
 
-Attempts: held in memory only, at most one per provider (the latest). Starting
-a login cancels a pending one and waits (≤2 s) for its task to unwind so the
-callback listener — Codex's is fixed at `127.0.0.1:1455` — is closed before the
-new bind. States are `pending`, `succeeded`, `failed` (with the flow's error,
-including the crate's 300 s callback timeout), `cancelled`. A daemon restart
+Attempts: held in memory only, at most one per provider (the latest), spawned
+and registered under one lock so no row exists without its task. Starting a
+login, cancelling, and logging out all cancel a pending attempt and wait (≤2 s)
+for its task to stop; a task already past its token exchange cannot be stopped,
+so when it turns out to have written tokens the attempt is recorded
+`succeeded`, never a false `cancelled`, and logout removes the block only after
+that write. A superseding start retries its bind for up to 2 s while the old
+callback listener — Codex's is fixed at `127.0.0.1:1455` — closes. States are
+`pending`, `succeeded`, `failed`, `cancelled`; `failed` carries only a fixed
+code (`timeout`, `denied`, `state_mismatch`, `exchange_failed`,
+`write_failed`, `login_failed`) because the flow's own text can hold a raw
+provider response, attacker-chosen callback `error_description`, or the auth
+file's path — the detail goes to the daemon log.
+
+Auth-file concurrency: every in-process writer — login, logout, and the
+turn-time refresher — takes `ocean_providers::auth_file_lock()` around its
+read-modify-write and uses a unique temp name; the refresher merges its result
+into a fresh read and only into a block still carrying the refresh token it
+spent. Review of this contract also found the refresher created its temp file
+with the default mode, leaving a refreshed `auth.json` world-readable; it now
+creates it 0600. A daemon restart
 forgets attempts, which is correct because their listeners died with it.
 Logout cancels a pending attempt, then removes only that provider's block
 through `ocean_oauth::logout` (atomic, 0600, other blocks preserved, a missing
