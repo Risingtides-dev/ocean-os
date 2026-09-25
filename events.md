@@ -11035,3 +11035,12 @@ area:      [testing]
 
 Added the guard asked for by the Observatory Task 9 review's rollout recommendation 6: nothing may inject OCEAN_OBSERVER_TOKEN into a child process environment, since every tool subprocess, bash included, would inherit a live Observatory credential. crates/ocean-observatory/tests/observer_token_env_guard.rs scans every crate's production source, skipping test modules and comments. The variable may appear only in ocean-observatory/src/auth.rs, and only as a read. Any .env(, .envs( or set_var( of it fails the test, as does the literal anywhere else. Mutation-checked against a planted Command::env in daemon code. The recommendation's other two parts, parent-directory fsync and the rotation-failure metric, landed with F11.
 _________________________________________________________________________________ 18:58 test/observer-token-env-guard
+
+time:      [18:59] [25-09-26]
+agent:     [claude]
+worktree:  docs/observatory-admission-gate
+type:      [feature-request]
+area:      [testing]
+
+Recorded the Observatory admission-wiring gate (Task 9 review, rollout recommendation 5) as §9.4 of the Gate 1 manifest and made it executable. V1's admission and binding seam is record-only: nothing outside ocean-observatory calls validate_admission, consume_binding, strip_binding or validate_topology_edge. When the extension turn path is built, three things must land together: consumption and strip before provider serialization, a wire-level test named observation_binding_never_reaches_the_wire, and topology-edge validation connected to attestation. crates/ocean-observatory/tests/admission_wiring_gate.rs fails the moment any of those functions gains a production caller outside the crate while no such test is defined. It builds the searched definition at runtime so its own source cannot satisfy it. That was a real self-match, caught by the mutation check against a planted strip_binding caller.
+_________________________________________________________________________________ 18:59 docs/observatory-admission-gate

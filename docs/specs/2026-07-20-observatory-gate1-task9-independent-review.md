@@ -496,3 +496,9 @@ anywhere but `ocean-observatory/src/auth.rs`, or is passed to a child through
 planted `Command::env` in daemon code. Parent-directory fsync and the
 rotation-failure metric, the other two parts of that recommendation, landed
 with F11.
+
+### Rollout recommendation 5 (2026-09-25)
+
+The admission-wiring gate above is recorded as §9.4 of the Gate 1
+implementation manifest and enforced by
+`crates/ocean-observatory/tests/admission_wiring_gate.rs`.
