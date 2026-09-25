@@ -13255,11 +13255,17 @@ mod tests {
         ];
 
         for (err, expected_status, expected_error) in cases {
+            let unknown_room = matches!(err, RoomStoreError::UnknownRoom(_));
             let (status, Json(body)) = room_store_error_response(err);
             assert_eq!(status, expected_status);
+            // DoD 1.10: a room that is not open carries the one shared marker.
+            let expected = if unknown_room {
+                json!({ "ok": false, "error": expected_error, "code": "room_not_found", "room_not_open": true })
+            } else {
+                json!({ "ok": false, "error": expected_error })
+            };
             assert_eq!(
-                body,
-                json!({ "ok": false, "error": expected_error }),
+                body, expected,
                 "the mapper owns an exact two-key typed error envelope"
             );
         }
@@ -13613,7 +13619,7 @@ mod tests {
         assert_eq!(status, StatusCode::NOT_FOUND);
         assert_eq!(
             persistent_room_http_json(&raw),
-            json!({ "ok": false, "error": "no room with key 'missing'" })
+            json!({ "ok": false, "error": "no room with key 'missing'", "code": "room_not_found", "room_not_open": true })
         );
 
         let (status, _, raw) = persistent_room_http_request(
@@ -21626,6 +21632,110 @@ mod tests {
     /// and the live SSE endpoint hide the room, while transcript/snapshot retain
     /// a bounded audit view — which the snapshot body now labels `closed`, since
     /// a caller that hydrates here has no other route left to learn it from.
+    /// DoD 1.10: one daemon answer for "room not open" across every route a
+    /// client can point at a closed or missing room — 404 with
+    /// `room_not_open: true` and a code — while `/transcript` and `/snapshot`
+    /// keep serving the audit view and admit it with `closed: true`.
+    #[tokio::test]
+    async fn every_room_route_gives_one_answer_for_a_room_that_is_not_open() {
+        use ocean_store::RoomStore as _;
+
+        let _guard = AUTO_CONVENE_ENV_LOCK.lock().await;
+        let _env = TestEnvRestore::capture(&["OCEAN_CONFIG_DIR", "OCEAN_MODEL", "OCEAN_YOLO"]);
+        let tmp = tempfile::tempdir().unwrap();
+        let state = fake_convene_state(&tmp);
+        let key = RoomKey::new("closed-one-answer");
+        with_rooms(&state, |store| {
+            store
+                .create(key.clone(), "Closed", None, Utc::now())
+                .unwrap();
+            store
+                .add_participant(
+                    &key,
+                    RoomParticipant {
+                        id: "alice".into(),
+                        kind: RoomParticipantKind::Human,
+                        display_name: "Alice".into(),
+                    },
+                    Utc::now(),
+                )
+                .unwrap();
+            store.close(&key).unwrap();
+        });
+        let app = room_routes().with_state(state);
+        let message = r#"{"author_id":"alice","author_kind":"human","body":"hi"}"#;
+
+        for room in ["closed-one-answer", "never-existed"] {
+            for (method, path, body) in [
+                (
+                    axum::http::Method::GET,
+                    format!("/v1/rooms/persistent/{room}"),
+                    None,
+                ),
+                (
+                    axum::http::Method::GET,
+                    format!("/v1/rooms/persistent/{room}/events"),
+                    None,
+                ),
+                (
+                    axum::http::Method::POST,
+                    format!("/v1/rooms/persistent/{room}/summarize"),
+                    Some(r#"{"requested_by":"alice"}"#.to_string()),
+                ),
+                (
+                    axum::http::Method::POST,
+                    format!("/v1/rooms/persistent/{room}/messages"),
+                    Some(message.to_string()),
+                ),
+            ] {
+                let json_body = body.is_some();
+                let (status, _, raw) = persistent_room_http_request(
+                    app.clone(),
+                    method.clone(),
+                    &path,
+                    body,
+                    json_body,
+                )
+                .await;
+                assert_eq!(status, StatusCode::NOT_FOUND, "{method} {path}: {raw}");
+                let answer = persistent_room_http_json(&raw);
+                assert_eq!(answer["ok"], false, "{method} {path}");
+                assert_eq!(answer["room_not_open"], true, "{method} {path}: {raw}");
+                assert!(answer["code"].is_string(), "{method} {path}: {raw}");
+            }
+        }
+
+        // The attachment list reads like the transcript: a closed room is an
+        // audit read, a room that never existed is not open.
+        let (status, _, raw) = persistent_room_http_request(
+            app.clone(),
+            axum::http::Method::GET,
+            "/v1/rooms/persistent/never-existed/attachments",
+            None,
+            false,
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "{raw}");
+        assert_eq!(persistent_room_http_json(&raw)["room_not_open"], true);
+
+        for path in [
+            "/v1/rooms/persistent/closed-one-answer/transcript",
+            "/v1/rooms/persistent/closed-one-answer/snapshot",
+            "/v1/rooms/persistent/closed-one-answer/attachments",
+        ] {
+            let (status, _, raw) = persistent_room_http_request(
+                app.clone(),
+                axum::http::Method::GET,
+                path,
+                None,
+                false,
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK, "{path}");
+            assert_eq!(persistent_room_http_json(&raw)["closed"], true, "{path}");
+        }
+    }
+
     /// Freeze the audit fallback's `limit=0` floor and cursor semantics, not
     /// `ocean-store`'s underlying SQL implementation.
     #[tokio::test]
@@ -21691,7 +21801,7 @@ mod tests {
         assert_eq!(status, StatusCode::NOT_FOUND);
         assert_eq!(
             persistent_room_http_json(&raw),
-            json!({ "ok": false, "error": "no room with key 'closed-audit'" })
+            json!({ "ok": false, "error": "no room with key 'closed-audit'", "code": "room_not_found", "room_not_open": true })
         );
 
         let (status, _, raw) = persistent_room_http_request(
@@ -21704,7 +21814,12 @@ mod tests {
         .await;
         assert_eq!(status, StatusCode::OK);
         let first_page = persistent_room_http_json(&raw);
-        assert_json_object_keys(&first_page, &["ok", "transcript", "next_seq", "has_more"]);
+        assert_json_object_keys(
+            &first_page,
+            &["ok", "transcript", "next_seq", "has_more", "closed"],
+        );
+        // The audit view says it is one, as the snapshot does.
+        assert_eq!(first_page["closed"], true);
         assert_eq!(first_page["transcript"].as_array().unwrap().len(), 1);
         assert_eq!(first_page["transcript"][0]["seq"], 0);
         assert_eq!(first_page["transcript"][0]["kind"], "participant_joined");

@@ -747,7 +747,41 @@ impl ocean_agent::RoomHistorySource for DurableRoomHistorySource {
 }
 
 /// Map a store error onto an HTTP status + typed JSON body.
+/// DoD 1.10: the ONE answer every room route gives when the room is not open
+/// (never existed, or soft-closed). Always a 404 whose body carries
+/// `room_not_open: true`, plus `code: "room_not_found"` where the route had no
+/// code of its own. A route that already published a code keeps it — the
+/// attachment routes' `unknown_room` is read by ocean-surface — so this is
+/// additive: a client can branch on one field on every route without any
+/// existing body changing meaning. `/transcript` and `/snapshot` are the
+/// deliberate exception: they answer a soft-closed room 200 as an audit view
+/// and say so with `closed: true`.
+pub(super) fn room_not_open(
+    (status, Json(mut body)): (StatusCode, Json<serde_json::Value>),
+) -> (StatusCode, Json<serde_json::Value>) {
+    if let Some(object) = body.as_object_mut() {
+        object.insert("room_not_open".into(), json!(true));
+        object
+            .entry("code")
+            .or_insert_with(|| json!("room_not_found"));
+    }
+    debug_assert_eq!(status, StatusCode::NOT_FOUND);
+    (StatusCode::NOT_FOUND, Json(body))
+}
+
 pub(super) fn room_store_error_response(
+    err: ocean_store::RoomStoreError,
+) -> (StatusCode, Json<serde_json::Value>) {
+    let unknown_room = matches!(err, ocean_store::RoomStoreError::UnknownRoom(_));
+    let response = room_store_error_response_inner(err);
+    if unknown_room {
+        room_not_open(response)
+    } else {
+        response
+    }
+}
+
+fn room_store_error_response_inner(
     err: ocean_store::RoomStoreError,
 ) -> (StatusCode, Json<serde_json::Value>) {
     use ocean_store::RoomStoreError::*;
@@ -1755,10 +1789,10 @@ pub(super) async fn room_get(
                     "aliases": aliases,
             })),
         ),
-        Ok(None) => (
+        Ok(None) => room_not_open((
             StatusCode::NOT_FOUND,
             Json(json!({ "ok": false, "error": format!("no room with key '{key}'") })),
-        ),
+        )),
         Err(e) => room_store_error_response(e),
     }
 }
@@ -2660,7 +2694,7 @@ pub(super) async fn room_post_message(
         }
         Err(LocalPostError::Rejected(rejection)) => return refuse_local_post(&state, rejection),
         Err(LocalPostError::Store(ocean_store::RoomStoreError::UnknownRoom(_))) => {
-            return intent_error_response(IntentError::NotFound)
+            return room_not_open(intent_error_response(IntentError::NotFound))
         }
         Err(LocalPostError::Store(ocean_store::RoomStoreError::FederationCorruption(_))) => {
             return intent_error_response(IntentError::Store)
@@ -2907,10 +2941,10 @@ pub(super) async fn room_agent_invoke(
     let (package_id, agent, federated) = match resolved {
         Ok(value) => value,
         Err(ocean_store::RoomStoreError::UnknownRoom(_)) => {
-            return (
+            return room_not_open((
                 StatusCode::NOT_FOUND,
                 Json(json!({"ok": false, "error": "room_not_found"})),
-            );
+            ));
         }
         Err(ocean_store::RoomStoreError::UnknownAgentBinding { .. }) => {
             return (
@@ -3929,16 +3963,22 @@ pub(super) async fn room_transcript(
 ) -> (StatusCode, Json<serde_json::Value>) {
     let key = RoomKey::new(key.trim());
     let result = with_rooms(&state, |reg| {
-        read_transcript_page(reg, &key, q.after_seq, q.limit)
+        let page = read_transcript_page(reg, &key, q.after_seq, q.limit)?;
+        // The page read serves a soft-closed room, so the body must admit to
+        // it. `is_open` is one indexed probe — never `get`, which hydrates the
+        // record and up to a thousand rows on every page poll.
+        let closed = !reg.is_open(&key)?;
+        Ok((page, closed))
     });
     match result {
-        Ok(page) => (
+        Ok((page, closed)) => (
             StatusCode::OK,
             Json(json!({
                 "ok": true,
                 "transcript": projected_transcript(page.messages),
                 "next_seq": page.next_seq,
                 "has_more": page.has_more,
+                "closed": closed,
             })),
         ),
         Err(e) => room_store_error_response(e),
@@ -4098,10 +4138,10 @@ pub(super) async fn room_snapshot(
                 })),
             )
         }
-        Ok(None) => (
+        Ok(None) => room_not_open((
             StatusCode::NOT_FOUND,
             Json(json!({ "ok": false, "error": format!("no room with key '{key}'") })),
-        ),
+        )),
         Err(e) => room_store_error_response(e),
     }
 }
@@ -4593,11 +4633,11 @@ pub(super) async fn room_events(
     }) {
         Ok(proj) => proj,
         Err(ocean_store::RoomStoreError::UnknownRoom(_)) => {
-            return Err(room_events_error(
+            return Err(room_not_open(room_events_error(
                 StatusCode::NOT_FOUND,
                 "room_not_found",
                 format!("no open room with key '{room}'"),
-            ));
+            )));
         }
         Err(error) => return Err(room_store_error_response(error)),
     };
@@ -6843,9 +6883,11 @@ mod tests {
         .await;
         assert_eq!(status, StatusCode::NOT_FOUND);
         assert_eq!(body.0["ok"], json!(false));
-        // Not `trigger_unwired`: a closed room is answered as absent, and is
-        // told nothing about whether it had federated.
-        assert_eq!(body.0["code"], json!(serde_json::Value::Null));
+        // Not `trigger_unwired`: a closed room is answered as absent (the one
+        // DoD 1.10 not-open answer), and is told nothing about whether it had
+        // federated.
+        assert_eq!(body.0["code"], json!("room_not_found"));
+        assert_eq!(body.0["room_not_open"], json!(true));
     }
 
     /// The property the refusal turns on, and the reason it is a TRANSITION
@@ -8037,7 +8079,10 @@ mod tests {
         )
         .await;
         assert_eq!(status, StatusCode::NOT_FOUND);
-        assert_eq!(body, json!({"ok":false,"error":"room_not_found"}));
+        assert_eq!(
+            body,
+            json!({"ok":false,"error":"room_not_found","code":"room_not_found","room_not_open":true})
+        );
 
         let closed = RoomKey::new("closed-message-room");
         let corrupt = RoomKey::new("nonlocal-without-credential");
@@ -8061,7 +8106,10 @@ mod tests {
         )
         .await;
         assert_eq!(status, StatusCode::NOT_FOUND);
-        assert_eq!(body, json!({"ok":false,"error":"room_not_found"}));
+        assert_eq!(
+            body,
+            json!({"ok":false,"error":"room_not_found","code":"room_not_found","room_not_open":true})
+        );
 
         let (status, Json(body)) = room_post_message(
             State(state.clone()),

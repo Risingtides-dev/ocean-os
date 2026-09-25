@@ -486,14 +486,14 @@ pub(super) async fn room_upload_attachment(
         .map(|rec| rec.is_some())
         .unwrap_or(false);
     if !room_known {
-        return (
+        return super::persistent_rooms::room_not_open((
             StatusCode::NOT_FOUND,
             Json(json!({
                 "ok": false,
                 "code": "unknown_room",
                 "error": format!("no open room with key '{key}'"),
             })),
-        );
+        ));
     }
     if let Some(refusal) = forged_author_response(&state, &key, uploader) {
         return refusal;
@@ -549,20 +549,28 @@ pub(super) async fn room_upload_attachment(
 
 /// `GET /v1/rooms/persistent/{key}/attachments` — what is in this room.
 ///
-/// Metadata only; the bytes are one more request away. An unknown room returns
-/// an empty list rather than a 404, matching `room_list_artifacts`. That is a
-/// wart — the upload route on the same path 404s — but two sibling endpoints
-/// disagreeing about a missing room is worse than one consistent wart, and
-/// changing the artifact behavior is not this feature's business.
+/// Metadata only; the bytes are one more request away. A soft-closed room is
+/// served as an audit read, like `/transcript` and `/snapshot`, and says so with
+/// `closed: true`; a room that never existed gets the one DoD 1.10 not-open
+/// answer instead of the empty list it used to (which read as "an open room
+/// with nothing in it").
 pub(super) async fn room_list_attachments(
     State(state): State<AppState>,
     Path(key): Path<String>,
 ) -> (StatusCode, Json<serde_json::Value>) {
     let key = RoomKey::new(key.trim());
-    match with_rooms(&state, |store| store.attachments(&key)) {
-        Ok(attachments) => (
+    let listed = with_rooms(&state, |store| {
+        // Existence probes, not `get`: no record hydration to answer a flag.
+        if !store.room_exists_including_closed(&key)? {
+            return Err(ocean_store::RoomStoreError::UnknownRoom(key.clone()));
+        }
+        let closed = !store.is_open(&key)?;
+        Ok((store.attachments(&key)?, closed))
+    });
+    match listed {
+        Ok((attachments, closed)) => (
             StatusCode::OK,
-            Json(json!({ "ok": true, "attachments": attachments })),
+            Json(json!({ "ok": true, "attachments": attachments, "closed": closed })),
         ),
         Err(e) => room_store_error_response(e),
     }
