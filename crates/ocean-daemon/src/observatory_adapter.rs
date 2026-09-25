@@ -384,6 +384,44 @@ fn classify_reroute(reason: &str) -> String {
     }
 }
 
+/// The durability pump: every runtime event the bus carries is adapted and,
+/// when it maps to a fact, appended to the store — in bus order, one at a time.
+///
+/// F1: the append runs on the blocking pool. It holds the store's connection
+/// for a whole SQLite transaction and can wait out the busy timeout behind a
+/// competing writer; inline, that stalled an async worker on every turn event.
+/// Awaiting each append before the next `recv` keeps the durable order equal
+/// to the bus order, which the cursor sequence depends on.
+pub(crate) async fn run_durability_pump(
+    store: std::sync::Arc<ObservatoryStore>,
+    adapter: std::sync::Arc<ObservatoryAdapter>,
+    mut rx: tokio::sync::broadcast::Receiver<crate::bus::AgentEventEnvelope>,
+) {
+    loop {
+        match rx.recv().await {
+            Ok(envelope) => {
+                let Some(fact) = adapter.adapt(&envelope.event) else {
+                    continue;
+                };
+                match crate::observatory::off_executor(&store, move |store| {
+                    store.append_event(fact)
+                })
+                .await
+                {
+                    Some(Ok(_)) | None => {}
+                    Some(Err(error)) => {
+                        tracing::error!(%error, "observatory fact append failed");
+                    }
+                }
+            }
+            Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
+                tracing::warn!(skipped, "observatory pump lagged; facts were lost");
+            }
+            Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -597,6 +635,36 @@ mod tests {
                 session_id: session,
                 component_id: "c-1".to_owned(),
             },
+            // F9: the other four skipped arms, pinned so a refactor that
+            // moves one to a mapped arm fails here.
+            AgentTurnEvent::ComponentRender {
+                session_id: session,
+                component_id: "c-2".to_owned(),
+                kind: "markdown".to_owned(),
+                props: serde_json::json!({"body": "rendered content"}),
+                replace: false,
+            },
+            AgentTurnEvent::SurfacePatch {
+                session_id: session,
+                turn_id: turn,
+                canvas_id: ocean_agent_sdk::surface::CanvasId::new("canvas-1"),
+                patches: Vec::new(),
+            },
+            AgentTurnEvent::SlackCanvas {
+                session_id: session,
+                turn_id: turn,
+                op: ocean_agent_sdk::slack_canvas::SlackCanvasOp::Append {
+                    canvas_id: ocean_agent_sdk::slack_canvas::SlackCanvasId::new("F123"),
+                    markdown: "canvas body".to_owned(),
+                },
+                result: ocean_agent_sdk::slack_canvas::SlackCanvasResult::pending_list(),
+            },
+            AgentTurnEvent::SessionConfigChanged {
+                session_id: session,
+                model: "kimi-k2.6".to_owned(),
+                provider: "kimi".to_owned(),
+                config_revision: 3,
+            },
             AgentTurnEvent::Extension {
                 extension: "council".to_owned(),
                 payload: serde_json::json!({"raw": "anything"}),
@@ -606,6 +674,44 @@ mod tests {
         for event in skipped {
             assert!(adapter.adapt(&event).is_none(), "{event:?}");
         }
+    }
+
+    /// F1: the pump appends on the blocking pool. With the store wedged
+    /// behind a writer the (current-thread) executor keeps running, and the
+    /// fact lands once the writer lets go.
+    #[tokio::test]
+    async fn durability_pump_appends_off_the_executor() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("obs.db");
+        let store = std::sync::Arc::new(
+            ObservatoryStore::open(&path, RetentionPolicy::default()).expect("open"),
+        );
+        let adapter = std::sync::Arc::new(adapter());
+        let bus = crate::bus::AgentEventBus::new(16);
+        let (_replay, rx) = bus.subscribe_with_full_replay();
+        let pump = tokio::spawn(run_durability_pump(
+            std::sync::Arc::clone(&store),
+            std::sync::Arc::clone(&adapter),
+            rx,
+        ));
+        let wedge =
+            crate::observatory::StoreWedge::engage(&path, &store, adapter.daemon_started("0.0.0"));
+        bus.emit(AgentTurnEvent::TurnStarted {
+            turn_id: turn_id(),
+            session_id: session_id(),
+            model: None,
+        });
+        crate::observatory::assert_executor_stays_live().await;
+        wedge.release();
+        let landed = async {
+            while store.latest_cursor() < ocean_observatory::Cursor::new(2) {
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        };
+        tokio::time::timeout(std::time::Duration::from_secs(10), landed)
+            .await
+            .expect("pumped fact lands once the store is free");
+        pump.abort();
     }
 
     #[test]

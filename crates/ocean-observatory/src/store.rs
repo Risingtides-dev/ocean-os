@@ -1,7 +1,7 @@
 use crate::{Cursor, EventEnvelope, RetentionPolicy};
 use parking_lot::Mutex;
 use rusqlite::{params, Connection};
-use std::{path::Path, sync::Arc};
+use std::{path::Path, sync::Arc, time::Duration};
 use thiserror::Error;
 #[derive(Debug, Error)]
 pub enum StoreError {
@@ -54,6 +54,11 @@ const SCHEMA:&str="CREATE TABLE IF NOT EXISTS observatory_events (cursor INTEGER
 impl ObservatoryStore {
     pub fn open(path: &Path, retention_policy: RetentionPolicy) -> Result<Self> {
         let db = Connection::open(path)?;
+        // F10: wait for a competing writer (a checkpoint, an operator's
+        // sqlite3 shell) instead of failing the append with SQLITE_BUSY at
+        // once. Callers run store methods on blocking threads (F1), so the
+        // wait never stalls an async worker.
+        db.busy_timeout(BUSY_TIMEOUT)?;
         db.execute_batch("PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON;")?;
         db.execute_batch(SCHEMA)?;
         // Manifest §4.1/§4.2: the cursor at which each execution first
@@ -191,7 +196,10 @@ impl ObservatoryStore {
             events,
             next_after: next,
             has_more: more,
-            complete: !more && end == self.latest_cursor(),
+            // §7.3: complete when this page reaches `through` (or, unbounded,
+            // the watermark read above). The old `end == latest` test made a
+            // `through`-bounded page below the watermark never complete (F4).
+            complete: !more,
         })
     }
     /// Apply the retention policy (G3; manifest §4.2) and record the boundary.
@@ -323,6 +331,9 @@ impl ObservatoryStore {
         })
     }
 }
+/// How long an append or read waits on a competing SQLite lock (F10).
+const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
+
 /// How many events one size-bound step removes before measuring again.
 const RETENTION_BATCH: u64 = 64;
 
@@ -346,12 +357,19 @@ fn prune_through(db: &mut Connection, boundary: u64) -> Result<usize> {
         return Ok(0);
     }
     let tx = db.transaction()?;
+    // F10: this pass pruned the span just past the previous boundary, not
+    // everything from cursor 1.
+    let previous: u64 = tx.query_row(
+        "SELECT COALESCE((SELECT cursor FROM watermarks WHERE key='retention_boundary'),0)",
+        [],
+        |r| r.get(0),
+    )?;
     let count = tx.execute(
         "DELETE FROM observatory_events WHERE cursor <= ?1",
         [boundary],
     )?;
     if count > 0 {
-        tx.execute("INSERT INTO retention_archive(pruned_at,from_cursor,to_cursor,count_events) VALUES(?1,?2,?3,?4)", params![chrono::Utc::now().to_rfc3339(), 1u64, boundary, count])?;
+        tx.execute("INSERT INTO retention_archive(pruned_at,from_cursor,to_cursor,count_events) VALUES(?1,?2,?3,?4)", params![chrono::Utc::now().to_rfc3339(), previous + 1, boundary, count])?;
         tx.execute("INSERT INTO watermarks(key,cursor) VALUES('retention_boundary',?1) ON CONFLICT(key) DO UPDATE SET cursor=excluded.cursor", [boundary])?;
     }
     tx.commit()?;

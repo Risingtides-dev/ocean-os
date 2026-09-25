@@ -8,7 +8,7 @@ use axum::extract::FromRequestParts;
 use axum::http::{header, request::Parts, StatusCode};
 use axum::response::{IntoResponse, Response};
 use ocean_observatory::{
-    verify_token, write_summary_observer_token, ObserverPrincipal, ObserverSecret,
+    verify_token, write_summary_observer_token, ObserverPrincipal, ObserverScope, ObserverSecret,
 };
 use std::path::{Path, PathBuf};
 
@@ -74,9 +74,17 @@ where
             .ok_or_else(rejection)?;
         let token = request_token(parts).ok_or_else(rejection)?;
 
-        verify_token(token, &auth_state.secret, &auth_state.daemon_instance_id)
-            .map(Self)
-            .map_err(|_| rejection())
+        let principal = verify_token(token, &auth_state.secret, &auth_state.daemon_instance_id)
+            .map_err(|_| rejection())?;
+        // F3: every V1 Observatory route serves `observatory:summary` only
+        // (manifest §3.3; content and extension scopes are future). A valid
+        // token of any other scope is refused here, with the same 401 as any
+        // credential failure (the manifest defines no 403), so no route can
+        // serve a wider principal once a second mint path exists.
+        if principal.scope != ObserverScope::Summary {
+            return Err(rejection());
+        }
+        Ok(Self(principal))
     }
 }
 
@@ -151,7 +159,7 @@ fn request_token(parts: &Parts) -> Option<&str> {
 #[cfg(test)]
 mod tests {
     use axum::http::Request;
-    use ocean_observatory::{sign_token, ObserverScope, ObserverToken};
+    use ocean_observatory::{sign_token, ObserverToken};
 
     use super::*;
 
@@ -174,22 +182,34 @@ mod tests {
             .map_err(|rejection| rejection.status())
     }
 
+    fn bearer(scope: ObserverScope) -> Request<axum::body::Body> {
+        Request::builder()
+            .header(header::AUTHORIZATION, format!("Bearer {}", token(scope)))
+            .body(axum::body::Body::empty())
+            .expect("request")
+    }
+
     #[tokio::test]
-    async fn observatory_auth_extracts_bearer_header_for_all_scopes() {
+    async fn observatory_auth_extracts_summary_bearer_header() {
+        let auth = extract(bearer(ObserverScope::Summary))
+            .await
+            .expect("authenticated");
+        assert_eq!(auth.0.scope, ObserverScope::Summary);
+    }
+
+    /// F3: a correctly signed, unexpired token for this daemon is still
+    /// refused when its scope is not `observatory:summary`.
+    #[tokio::test]
+    async fn observatory_auth_rejects_non_summary_scopes_as_401() {
         for scope in [
-            ObserverScope::Summary,
             ObserverScope::Content,
             ObserverScope::ExtensionProducer("producer-a".to_owned()),
         ] {
-            let request = Request::builder()
-                .header(
-                    header::AUTHORIZATION,
-                    format!("Bearer {}", token(scope.clone())),
-                )
-                .body(axum::body::Body::empty())
-                .expect("request");
-            let auth = extract(request).await.expect("authenticated");
-            assert_eq!(auth.0.scope, scope);
+            assert_eq!(
+                extract(bearer(scope.clone())).await,
+                Err(StatusCode::UNAUTHORIZED),
+                "{scope}"
+            );
         }
     }
 

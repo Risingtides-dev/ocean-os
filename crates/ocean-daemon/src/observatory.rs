@@ -225,6 +225,32 @@ fn store_unavailable(headers: HeaderMap) -> Response {
     )
 }
 
+/// Run a store call on Tokio's blocking pool (F1).
+///
+/// Every `ObservatoryStore` method except `latest_cursor` takes the store's
+/// connection mutex and runs rusqlite, and an append can hold that mutex for
+/// up to the store's busy timeout while it waits on a competing writer. Done
+/// inline, that wait parks an async worker — on a current-thread runtime, the
+/// whole daemon. `spawn_blocking` rather than `block_in_place`: it works on
+/// every runtime flavor (`block_in_place` panics on a current-thread runtime,
+/// which is what `#[tokio::test]` builds) and needs no care about which task
+/// holds what. `None` means the blocking task panicked; callers treat that as
+/// the store being unavailable.
+pub(crate) async fn off_executor<T, F>(store: &Arc<ObservatoryStore>, call: F) -> Option<T>
+where
+    T: Send + 'static,
+    F: FnOnce(&ObservatoryStore) -> T + Send + 'static,
+{
+    let store = Arc::clone(store);
+    match tokio::task::spawn_blocking(move || call(&store)).await {
+        Ok(value) => Some(value),
+        Err(error) => {
+            tracing::error!(%error, "observatory store call panicked");
+            None
+        }
+    }
+}
+
 fn parse_cursor(raw: &str) -> Option<Cursor> {
     Cursor::from_string(raw).ok()
 }
@@ -298,12 +324,13 @@ pub(crate) async fn snapshot(
         },
         None => None,
     };
-    let boundary = match store.retention_boundary() {
-        Ok(boundary) => boundary,
-        Err(error) => {
+    let boundary = match off_executor(store, |store| store.retention_boundary()).await {
+        Some(Ok(boundary)) => boundary,
+        Some(Err(error)) => {
             tracing::error!(%error, "observatory snapshot retention-boundary read failed");
             return store_unavailable(headers);
         }
+        None => return store_unavailable(headers),
     };
     if let Some(at) = at {
         if at > latest {
@@ -326,11 +353,12 @@ pub(crate) async fn snapshot(
         }
     }
 
-    let projection = match store.snapshot_at(at) {
-        Ok(projection) => projection,
+    let projection = match off_executor(store, move |store| store.snapshot_at(at)).await {
+        None => return store_unavailable(headers),
+        Some(Ok(projection)) => projection,
         // G1: Gate 1 serves the current projection only; an earlier `at` is
         // refused instead of answered with current state under its label.
-        Err(ocean_observatory::StoreError::HistoricalSnapshot { .. }) => {
+        Some(Err(ocean_observatory::StoreError::HistoricalSnapshot { .. })) => {
             return error_response(
                 StatusCode::CONFLICT,
                 headers,
@@ -338,7 +366,7 @@ pub(crate) async fn snapshot(
                 "Only the current watermark can be snapshotted; omit `at` and tail from the returned watermark",
             );
         }
-        Err(error) => {
+        Some(Err(error)) => {
             tracing::error!(%error, "observatory snapshot read failed");
             return store_unavailable(headers);
         }
@@ -442,10 +470,12 @@ pub(crate) async fn events(
             &services.daemon_instance_id,
         );
     }
-    let earliest = match store.earliest_available_cursor() {
-        Ok(cursor) => cursor,
-        Err(error) => {
-            tracing::error!(%error, "observatory events earliest-cursor read failed");
+    let earliest = match off_executor(&store, |store| store.earliest_available_cursor()).await {
+        Some(Ok(cursor)) => cursor,
+        failed => {
+            if let Some(Err(error)) = failed {
+                tracing::error!(%error, "observatory events earliest-cursor read failed");
+            }
             let headers = observatory_headers(latest, &services.daemon_instance_id);
             return store_unavailable(headers);
         }
@@ -469,10 +499,33 @@ pub(crate) async fn events(
     tokio::spawn(async move {
         let mut last = after;
         'tail: loop {
-            let batch = match store.events_after(last, Some(LIVE_READ_BATCH)) {
-                Ok(events) => events,
-                Err(error) => {
-                    tracing::error!(%error, "observatory live tail read failed");
+            // F1: one blocking-pool read per poll: the batch, plus the
+            // earliest surviving cursor when the batch skips (to name the
+            // gap's reason) — never a rusqlite call on the async worker.
+            let read = off_executor(&store, move |store| {
+                let batch = store.events_after(last, Some(LIVE_READ_BATCH))?;
+                let skips = batch
+                    .iter()
+                    .scan(last, |prev, envelope| {
+                        let skipped = envelope.cursor != prev.next();
+                        *prev = envelope.cursor;
+                        Some(skipped)
+                    })
+                    .any(|skipped| skipped);
+                let earliest = if skips {
+                    Some(store.earliest_available_cursor()?)
+                } else {
+                    None
+                };
+                Ok::<_, ocean_observatory::StoreError>((batch, earliest))
+            })
+            .await;
+            let (batch, earliest) = match read {
+                Some(Ok(read)) => read,
+                failed => {
+                    if let Some(Err(error)) = failed {
+                        tracing::error!(%error, "observatory live tail read failed");
+                    }
                     let frame = axum::response::sse::Event::default().event("error").data(
                         r#"{"error":"store_read_failed","message":"Durable log read failed"}"#,
                     );
@@ -485,25 +538,29 @@ pub(crate) async fn events(
                 if envelope.cursor != expected {
                     // Durable log skipped: retention pruned (or a cursor jump).
                     // Say so explicitly instead of silently jumping.
-                    let reason = match store.earliest_available_cursor() {
-                        Ok(boundary) if boundary > expected => "retention_boundary",
+                    let reason = match earliest {
+                        Some(boundary) if boundary > expected => "retention_boundary",
                         _ => "cursor_jump",
                     };
-                    let gap = axum::response::sse::Event::default()
-                        .event("message")
-                        .id(envelope.cursor.as_string())
-                        .data(
-                            json!({
-                                "cursor": expected.as_string(),
-                                "kind": "stream.gap",
-                                "payload": {
-                                    "from_cursor": last.as_string(),
-                                    "to_cursor": envelope.cursor.as_string(),
-                                    "reason": reason,
-                                }
-                            })
-                            .to_string(),
-                        );
+                    // F5: no `id:`. The gap is not an event the client has
+                    // consumed, so it must not move the browser's last-event
+                    // id: reusing the post-gap event's cursor here meant a
+                    // client dropped between the two frames resumed AFTER an
+                    // event it never saw. Without an id, a resume starts from
+                    // the last real event and meets the gap again (or a
+                    // `reset`, if retention caused it).
+                    let gap = axum::response::sse::Event::default().event("message").data(
+                        json!({
+                            "cursor": expected.as_string(),
+                            "kind": "stream.gap",
+                            "payload": {
+                                "from_cursor": last.as_string(),
+                                "to_cursor": envelope.cursor.as_string(),
+                                "reason": reason,
+                            }
+                        })
+                        .to_string(),
+                    );
                     if tx.send(Ok(gap)).await.is_err() {
                         break 'tail;
                     }
@@ -522,6 +579,11 @@ pub(crate) async fn events(
                 if tx.send(Ok(frame)).await.is_err() {
                     break 'tail; // client disconnected
                 }
+            }
+            // A client that left while nothing new arrived never fails a
+            // send; stop polling the store for it.
+            if tx.is_closed() {
+                break 'tail;
             }
             tokio::time::sleep(LIVE_POLL_INTERVAL).await;
         }
@@ -654,12 +716,13 @@ pub(crate) async fn replay(
         None => None,
     };
 
-    let boundary = match store.retention_boundary() {
-        Ok(boundary) => boundary,
-        Err(error) => {
+    let boundary = match off_executor(store, |store| store.retention_boundary()).await {
+        Some(Ok(boundary)) => boundary,
+        Some(Err(error)) => {
             tracing::error!(%error, "observatory replay retention-boundary read failed");
             return store_unavailable(headers);
         }
+        None => return store_unavailable(headers),
     };
     // A range that starts inside pruned history is a hard 410 with the exact
     // unavailable span, never a silent skip. `after` at the natural log start
@@ -683,13 +746,15 @@ pub(crate) async fn replay(
         }
     }
 
-    let page = match store.replay_page(after, through, limit) {
-        Ok(page) => page,
-        Err(error) => {
-            tracing::error!(%error, "observatory replay read failed");
-            return store_unavailable(headers);
-        }
-    };
+    let page =
+        match off_executor(store, move |store| store.replay_page(after, through, limit)).await {
+            Some(Ok(page)) => page,
+            Some(Err(error)) => {
+                tracing::error!(%error, "observatory replay read failed");
+                return store_unavailable(headers);
+            }
+            None => return store_unavailable(headers),
+        };
 
     let events: Vec<ReplayEvent> = page
         .events
@@ -722,7 +787,10 @@ pub(crate) async fn replay(
                 url.push_str(&format!("&through={through}"));
             }
             if let Some(raw) = query.filter.as_deref() {
-                url.push_str(&format!("&filter={raw}"));
+                // F6: the filter value is caller text; encode it so it
+                // cannot add or rewrite query parameters.
+                url.push_str("&filter=");
+                url.push_str(&encode_query_value(raw));
             }
             url
         })
@@ -747,6 +815,20 @@ pub(crate) async fn replay(
     (StatusCode::OK, headers, Json(body)).into_response()
 }
 
+/// Percent-encode everything outside RFC 3986's unreserved set, so a value
+/// is always exactly one query parameter value.
+fn encode_query_value(raw: &str) -> String {
+    let mut out = String::with_capacity(raw.len());
+    for byte in raw.bytes() {
+        if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'.' | b'_' | b'~') {
+            out.push(byte as char);
+        } else {
+            out.push_str(&format!("%{byte:02X}"));
+        }
+    }
+    out
+}
+
 fn matches_filter(envelope: &EventEnvelope, filter: Option<&(&str, String)>) -> bool {
     let Some((name, value)) = filter else {
         return true;
@@ -765,6 +847,53 @@ fn matches_filter(envelope: &EventEnvelope, filter: Option<&(&str, String)>) -> 
 }
 
 // ── Tests ───────────────────────────────────────────────────────────────────
+
+/// F1 test support: wedge a store the way production can — an append that
+/// holds the store's connection mutex while it waits (busy timeout) on
+/// another connection's write lock. Anything that then touches the store
+/// blocks until `release`; on the async executor, that would freeze it.
+#[cfg(test)]
+pub(crate) struct StoreWedge {
+    blocker: rusqlite::Connection,
+    append: std::thread::JoinHandle<()>,
+}
+
+#[cfg(test)]
+impl StoreWedge {
+    pub(crate) fn engage(path: &Path, store: &Arc<ObservatoryStore>, event: EventEnvelope) -> Self {
+        let blocker = rusqlite::Connection::open(path).expect("blocker connection");
+        blocker
+            .execute_batch("BEGIN IMMEDIATE")
+            .expect("take write lock");
+        let wedged = Arc::clone(store);
+        let append = std::thread::spawn(move || {
+            wedged.append_event(event).expect("wedged append lands");
+        });
+        // Let the append take the store mutex and start waiting.
+        std::thread::sleep(Duration::from_millis(150));
+        Self { blocker, append }
+    }
+
+    pub(crate) fn release(self) {
+        self.blocker
+            .execute_batch("COMMIT")
+            .expect("release write lock");
+        self.append.join().expect("wedged append thread");
+    }
+}
+
+/// F1: a 20 ms timer on this (current-thread) runtime must fire promptly
+/// while store calls wait; it cannot if a store call is blocking the thread.
+#[cfg(test)]
+pub(crate) async fn assert_executor_stays_live() {
+    let started = std::time::Instant::now();
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    assert!(
+        started.elapsed() < Duration::from_secs(1),
+        "executor stalled {:?} behind a store call",
+        started.elapsed()
+    );
+}
 
 #[cfg(test)]
 mod tests {
@@ -1279,5 +1408,141 @@ mod tests {
         assert_eq!(body["error"], json!("retention_boundary_crossed"));
         assert!(body["gap_from"].is_string(), "{body}");
         assert!(body["earliest_available"].is_string(), "{body}");
+    }
+    /// F1: snapshot, replay and the SSE tail do their store work on the
+    /// blocking pool. With the store wedged behind a writer, all three
+    /// requests wait — and the (current-thread) executor keeps running.
+    #[tokio::test]
+    async fn store_calls_do_not_stall_the_executor() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("obs.db");
+        let store =
+            Arc::new(ObservatoryStore::open(&path, RetentionPolicy::default()).expect("open"));
+        store
+            .append_event(envelope("e-1", EventKind::ExecutionAdmitted))
+            .expect("append");
+        let router = app(Arc::clone(&store));
+        let wedge = StoreWedge::engage(
+            &path,
+            &store,
+            envelope("e-1", EventKind::ExecutionPhaseChanged),
+        );
+        let requests: Vec<_> = [
+            "/v1/observatory/snapshot",
+            "/v1/observatory/replay?after=0",
+            "/v1/observatory/events?after=0",
+        ]
+        .into_iter()
+        .map(|path| tokio::spawn(router.clone().oneshot(authed(path))))
+        .collect();
+        assert_executor_stays_live().await;
+        wedge.release();
+        for request in requests {
+            let response = tokio::time::timeout(Duration::from_secs(10), request)
+                .await
+                .expect("request finishes once the store is free")
+                .expect("task")
+                .expect("response");
+            assert_eq!(response.status(), StatusCode::OK);
+        }
+    }
+
+    /// F3: a valid token of a non-summary scope is refused on every route
+    /// with the same 401 shape as a bad credential.
+    #[tokio::test]
+    async fn routes_reject_a_content_scope_token() {
+        let router = app(store_with(&[]));
+        for path in [
+            "/v1/observatory/snapshot",
+            "/v1/observatory/events",
+            "/v1/observatory/replay?after=0",
+        ] {
+            let request = Request::builder()
+                .uri(path)
+                .header(
+                    header::AUTHORIZATION,
+                    format!(
+                        "Bearer {}",
+                        token(ocean_observatory::ObserverScope::Content)
+                    ),
+                )
+                .body(Body::empty())
+                .expect("request");
+            let response = router.clone().oneshot(request).await.expect("response");
+            assert_eq!(response.status(), StatusCode::UNAUTHORIZED, "{path}");
+            assert!(response.headers().contains_key("x-observatory-cursor"));
+            let body: Value = serde_json::from_str(&body_string(response).await).expect("json");
+            assert_eq!(body["error"], "unauthorized", "{path}");
+            assert_eq!(body["http_status"], 401, "{path}");
+        }
+    }
+
+    /// F5: the `stream.gap` frame has no SSE `id:`, so it never duplicates
+    /// the post-gap event's id or moves a client's Last-Event-ID past an
+    /// event it has not received.
+    #[tokio::test]
+    async fn stream_gap_frame_carries_no_event_id() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("obs.db");
+        let store =
+            Arc::new(ObservatoryStore::open(&path, RetentionPolicy::default()).expect("open"));
+        for id in ["e-1", "e-2", "e-3"] {
+            store
+                .append_event(envelope(id, EventKind::ExecutionPhaseChanged))
+                .expect("append");
+        }
+        // Punch a hole at cursor 2 so a tail from 1 must report a gap.
+        rusqlite::Connection::open(&path)
+            .expect("open raw")
+            .execute("DELETE FROM observatory_events WHERE cursor = 2", [])
+            .expect("delete");
+        let response = app(store)
+            .oneshot(authed("/v1/observatory/events?after=1"))
+            .await
+            .expect("response");
+        use futures::StreamExt;
+        let mut body = http_body_util::BodyExt::into_data_stream(response.into_body());
+        let mut text = String::new();
+        while !text.contains("\"cursor\":\"3\"") {
+            let chunk = tokio::time::timeout(Duration::from_secs(5), body.next())
+                .await
+                .expect("frame within 5s")
+                .expect("stream open")
+                .expect("chunk");
+            text.push_str(&String::from_utf8_lossy(&chunk));
+        }
+        let frames: Vec<&str> = text
+            .split("\n\n")
+            .filter(|f| !f.trim().is_empty())
+            .collect();
+        let gap = frames
+            .iter()
+            .find(|f| f.contains("stream.gap"))
+            .unwrap_or_else(|| panic!("no gap frame: {text}"));
+        assert!(!gap.lines().any(|line| line.starts_with("id:")), "{gap}");
+        assert!(gap.contains("\"to_cursor\":\"3\""), "{gap}");
+        assert_eq!(text.matches("id: 3").count(), 1, "{text}");
+    }
+
+    /// F6: the filter value is percent-encoded into continuation_url, so a
+    /// value carrying `&`/`=` cannot smuggle extra query parameters.
+    #[tokio::test]
+    async fn replay_continuation_url_encodes_the_filter() {
+        let events: Vec<EventEnvelope> = (0..3)
+            .map(|i| envelope(&format!("e-{i}"), EventKind::ExecutionPhaseChanged))
+            .collect();
+        let response = app(store_with(&events))
+            .oneshot(authed(
+                "/v1/observatory/replay?after=0&limit=1&filter=producer%3Aa%26through%3D1%20b",
+            ))
+            .await
+            .expect("response");
+        assert_eq!(response.status(), StatusCode::OK);
+        let page: Value = serde_json::from_str(&body_string(response).await).expect("json");
+        let url = page["continuation_url"].as_str().expect("continuation");
+        assert_eq!(
+            url,
+            "/v1/observatory/replay?after=1&limit=1&filter=producer%3Aa%26through%3D1%20b"
+        );
     }
 }
