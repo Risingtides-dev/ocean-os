@@ -10811,3 +10811,12 @@ area:      [backend]
 
 Closed the residual the M3 review left open: the shared auth.json lock was per process, so a TUI /login writing through ocean-oauth could still interleave with the daemon's refresher or a web login. ocean-providers now exposes lock_auth_file(path), a process mutex plus an exclusive flock on .auth.json.lock beside the file (fs2, already a workspace dependency), and ocean-oauth's merge and remove plus oauth_refresh's post-network merge take it instead of the process-only mutex. If the lock file cannot be opened the process half still serializes and the write itself fails loudly. A test proves a second independent open cannot take the file lock until the guard drops. Gates: ocean-providers 52, ocean-oauth 42 and 2, oauth_refresh 4, clippy -D warnings.
 _________________________________________________________________________________ 15:05 fix/auth-file-flock
+
+time:      [15:25] [25-09-26]
+agent:     [claude]
+worktree:  fix/cargo-deny
+type:      [bug-report]
+area:      [infra]
+
+cargo deny was red on main, one of the open Rooms definition-of-done items (3.5): the only failure was RUSTSEC-2026-0285, rustls 0.23.40 accepting TLS 1.3 handshake messages across encryption-level boundaries. A lockfile-only cargo update -p rustls moves it to the patched 0.23.45, with rustls-webpki 0.103.13 to 0.103.15. cargo deny check now passes advisories, bans, licenses and sources; cargo check --workspace and the full workspace test suite (3383 passed, 0 failed) are green. The duplicate-crate warnings are unchanged and non-fatal.
+_________________________________________________________________________________ 15:25 fix/cargo-deny
