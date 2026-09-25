@@ -15,8 +15,9 @@
 //!   `next_after`/`has_more`/`complete` and 410 on retention-crossed ranges.
 //!
 //! V1 projection limits (Task 6 wires real daemon facts): the store's
-//! `execution_nodes` projection does not yet carry session/turn/request ids,
-//! so those wire fields are empty strings, and the attention shelf is empty
+//! `execution_nodes` rows carry session/turn/request ids since F2, but the
+//! snapshot does not read them yet, so those wire fields are still empty
+//! strings, and the attention shelf is empty
 //! (no waiting-phase derivation exists at the projection layer). The wire
 //! shape itself is the accepted `ocean_observatory::snapshot` contract.
 //!

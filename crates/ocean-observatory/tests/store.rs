@@ -204,12 +204,15 @@ fn a_pass_after_the_size_prune_does_not_prune_again() {
         s.append_event(e).unwrap();
     }
     drop(s);
-    // A bound between "all rows" and "a few rows" of live data.
+    // A bound between "all rows" and "a few rows" of live data. F2's §4.1
+    // node columns and indexes put the never-pruned projection of these 400
+    // executions near 190 KiB (the whole database near 750 KiB), so the
+    // bound sits above the projection alone.
     let s = ObservatoryStore::open(
         &path,
         RetentionPolicy {
             max_age_days: 365,
-            max_bytes: 96 * 1024,
+            max_bytes: 384 * 1024,
         },
     )
     .unwrap();
