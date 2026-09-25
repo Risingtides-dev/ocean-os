@@ -560,11 +560,11 @@ pub(super) async fn room_list_attachments(
 ) -> (StatusCode, Json<serde_json::Value>) {
     let key = RoomKey::new(key.trim());
     let listed = with_rooms(&state, |store| {
-        let closed = match store.get(&key)? {
-            Some(_) => false,
-            None if store.get_including_closed(&key)?.is_some() => true,
-            None => return Err(ocean_store::RoomStoreError::UnknownRoom(key.clone())),
-        };
+        // Existence probes, not `get`: no record hydration to answer a flag.
+        if !store.room_exists_including_closed(&key)? {
+            return Err(ocean_store::RoomStoreError::UnknownRoom(key.clone()));
+        }
+        let closed = !store.is_open(&key)?;
         Ok((store.attachments(&key)?, closed))
     });
     match listed {

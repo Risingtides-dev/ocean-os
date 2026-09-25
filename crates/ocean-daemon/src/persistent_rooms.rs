@@ -3964,9 +3964,10 @@ pub(super) async fn room_transcript(
     let key = RoomKey::new(key.trim());
     let result = with_rooms(&state, |reg| {
         let page = read_transcript_page(reg, &key, q.after_seq, q.limit)?;
-        // The page read serves a soft-closed room; `get` filters on openness,
-        // so its answer is the closedness signal the body must admit to.
-        let closed = reg.get(&key)?.is_none();
+        // The page read serves a soft-closed room, so the body must admit to
+        // it. `is_open` is one indexed probe — never `get`, which hydrates the
+        // record and up to a thousand rows on every page poll.
+        let closed = !reg.is_open(&key)?;
         Ok((page, closed))
     });
     match result {
