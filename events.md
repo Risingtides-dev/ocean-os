@@ -10919,3 +10919,12 @@ area:      [backend]
 
 Closed the Observatory delta review's size-loop follow-up. The size bound reduced a page-measured excess by raw JSON lengths, which ignores index overhead and the never-pruned projection tables, so a single over-size pass emptied the whole prunable log. apply_retention now prunes age first (the contiguous oldest run past max_age_days), then deletes in batches of 64 and re-measures live pages (page_count minus freelist) after each commit, stopping as soon as it is under the bound. It still never crosses a live execution's first cursor. The regression test now asserts an over-size pass keeps part of the log, where the old behavior emptied it. ocean-observatory and daemon Observatory tests green, clippy -D warnings.
 _________________________________________________________________________________ 16:45 fix/observatory-retention-remeasure
+
+time:      [16:55] [25-09-26]
+agent:     [claude]
+worktree:  fix/observatory-hardening
+type:      [bug-report]
+area:      [backend]
+
+Landed the cheap non-gating hardening items from the Observatory Gate 1 Task 9 review, each with a regression test. F1: every Observatory store call except the in-memory latest_cursor now runs on the blocking pool through observatory::off_executor (spawn_blocking, because block_in_place panics on a current-thread runtime), covering the snapshot and replay handlers, the SSE tail's per-poll read and the durability pump, which moved into observatory_adapter::run_durability_pump and still appends in bus order. Two tests wedge the store behind a competing writer and fail with a 5 s executor stall if calls go inline. F3: ObservatoryAuth refuses any non-Summary scope with the same 401. F4: events_page complete is !has_more, so a through-bounded page that reaches through is complete. F5: the stream.gap frame has no SSE id, so it never moves Last-Event-ID past an unseen event. F6: continuation_url percent-encodes filter. F9: the skipped-variant test pins ComponentRender, SurfacePatch, SlackCanvas and SessionConfigChanged. F10 (partial): a 5 s busy_timeout, and retention_archive.from_cursor records the previous boundary + 1. The review doc gained a Hardening wave section. F2, F7, F8, F11, F12 and the §4.3 checkpoint stay open. ocean-observatory and ocean-daemon suites green, clippy -D warnings, fmt and docs-check clean.
+_________________________________________________________________________________ 16:55 fix/observatory-hardening

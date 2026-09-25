@@ -1152,26 +1152,12 @@ async fn main() -> anyhow::Result<()> {
             tracing::error!(%error, "observatory daemon-started append failed");
         }
 
-        let (_replay, mut observatory_rx) = agent_event_bus.subscribe_with_full_replay();
-        let pump_store = Arc::clone(store);
-        let pump_adapter = Arc::clone(&observatory_adapter);
-        tokio::spawn(async move {
-            loop {
-                match observatory_rx.recv().await {
-                    Ok(envelope) => {
-                        if let Some(fact) = pump_adapter.adapt(&envelope.event) {
-                            if let Err(error) = pump_store.append_event(fact) {
-                                tracing::error!(%error, "observatory fact append failed");
-                            }
-                        }
-                    }
-                    Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
-                        tracing::warn!(skipped, "observatory pump lagged; facts were lost");
-                    }
-                    Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
-                }
-            }
-        });
+        let (_replay, observatory_rx) = agent_event_bus.subscribe_with_full_replay();
+        tokio::spawn(observatory_adapter::run_durability_pump(
+            Arc::clone(store),
+            Arc::clone(&observatory_adapter),
+            observatory_rx,
+        ));
     }
 
     let rooms = Arc::new(Mutex::new(room_store));

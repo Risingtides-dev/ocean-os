@@ -255,3 +255,76 @@ fn a_failed_append_does_not_advance_the_cursor() {
     next.event_id = "event-2".into();
     assert_eq!(s.append_event(next).unwrap(), Cursor::new(2));
 }
+
+/// F4 (§7.3): a `through`-bounded page that reaches `through` is complete,
+/// even while the watermark sits past it; a page cut short by `limit` is not.
+#[test]
+fn a_through_bounded_page_that_reaches_through_is_complete() {
+    let d = tempdir().unwrap();
+    let s = ObservatoryStore::open(&d.path().join("obs.db"), RetentionPolicy::default()).unwrap();
+    for i in 0..5 {
+        s.append_event(event_for(&format!("e{i}"), "x", 0, false))
+            .unwrap();
+    }
+    assert_eq!(s.latest_cursor(), Cursor::new(5));
+    let page = s
+        .replay_page(Cursor::new(0), Some(Cursor::new(3)), 10)
+        .unwrap();
+    assert_eq!(page.events.len(), 3);
+    assert!(!page.has_more);
+    assert!(page.complete, "reached through=3 below watermark 5");
+
+    let short = s
+        .replay_page(Cursor::new(0), Some(Cursor::new(3)), 2)
+        .unwrap();
+    assert!(short.has_more);
+    assert!(!short.complete, "limit stopped the page before through");
+}
+
+/// F10: each retention_archive row records the span that pass pruned — from
+/// just past the previous boundary — not a hardcoded 1.
+#[test]
+fn retention_archive_records_each_passes_real_from_cursor() {
+    let d = tempdir().unwrap();
+    let path = d.path().join("obs.db");
+    let s = ObservatoryStore::open(
+        &path,
+        RetentionPolicy {
+            max_age_days: 365,
+            max_bytes: 1,
+        },
+    )
+    .unwrap();
+    // 100 events: the size loop prunes 1..=64, then 65..=100.
+    for i in 0..100 {
+        s.append_event(event_for(&format!("e{i}"), &format!("x{i}"), 0, true))
+            .unwrap();
+    }
+    assert_eq!(s.apply_retention().unwrap(), 100);
+    let db = rusqlite::Connection::open(&path).unwrap();
+    let rows: Vec<(u64, u64, u64)> = db
+        .prepare("SELECT from_cursor,to_cursor,count_events FROM retention_archive ORDER BY rowid")
+        .unwrap()
+        .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+        .unwrap()
+        .collect::<std::result::Result<_, _>>()
+        .unwrap();
+    assert_eq!(rows, vec![(1, 64, 64), (65, 100, 36)]);
+}
+
+/// F10: an append that meets another connection's write lock waits for it
+/// (busy_timeout) instead of failing at once with SQLITE_BUSY.
+#[test]
+fn an_append_waits_out_a_competing_writer() {
+    let d = tempdir().unwrap();
+    let path = d.path().join("obs.db");
+    let s = ObservatoryStore::open(&path, RetentionPolicy::default()).unwrap();
+    let blocker = rusqlite::Connection::open(&path).unwrap();
+    blocker.execute_batch("BEGIN IMMEDIATE").unwrap();
+    let release = std::thread::spawn(move || {
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        blocker.execute_batch("COMMIT").unwrap();
+    });
+    assert_eq!(s.append_event(event()).unwrap(), Cursor::new(1));
+    release.join().unwrap();
+}

@@ -270,3 +270,45 @@ the in-memory watermark ahead of the durable log
 - ocean-surface's Replay scrubber asks `snapshot?at=<earlier cursor>`, which
   now answers 409 (it previously got current state under the wrong label); it
   must move to `/replay` or be disabled before the renderer relies on it.
+
+## Hardening wave (2026-09-25)
+
+The cheap non-gating items landed on branch `fix/observatory-hardening`, each
+with a regression test. F2, F7, F8, F11, F12 and the §4.3 checkpoint task stay
+open.
+
+- **F1** — every Observatory store call except the in-memory `latest_cursor`
+  runs on Tokio's blocking pool through `observatory::off_executor`
+  (`spawn_blocking`): the snapshot and replay handlers, the SSE tail's
+  per-poll read, and the durability pump, now
+  `observatory_adapter::run_durability_pump`, which awaits each append before
+  the next `recv` so durable order stays bus order. `spawn_blocking` over
+  `block_in_place` because the latter panics on a current-thread runtime. The
+  tail also stops polling once its client is gone. Tests:
+  `store_calls_do_not_stall_the_executor`,
+  `durability_pump_appends_off_the_executor` (both wedge the store behind a
+  competing writer and fail with a 5 s executor stall if the calls run
+  inline).
+- **F3** — `ObservatoryAuth` refuses any verified principal whose scope is not
+  `ObserverScope::Summary`, with the same 401 `ObservatoryUnauthorized` (§7.1
+  defines no 403). Tests: `routes_reject_a_content_scope_token`,
+  `observatory_auth_rejects_non_summary_scopes_as_401`.
+- **F4** — `events_page` sets `complete` to `!has_more`, so a page that
+  reaches `through` below the watermark is complete. Test:
+  `a_through_bounded_page_that_reaches_through_is_complete`.
+- **F5** — the `stream.gap` frame carries no SSE `id:`. The gap is not an
+  event the client consumed, so it must not move Last-Event-ID; a client
+  dropped between the gap and the next event resumes from the last real event
+  and meets the gap (or a `reset`) again. Test:
+  `stream_gap_frame_carries_no_event_id`.
+- **F6** — `continuation_url` percent-encodes the `filter` value (everything
+  outside RFC 3986 unreserved). Test:
+  `replay_continuation_url_encodes_the_filter`.
+- **F9** — `forbidden_variants_are_skipped` also pins `ComponentRender`,
+  `SurfacePatch`, `SlackCanvas` and `SessionConfigChanged`.
+- **F10 (partial)** — the store connection sets a 5 s `busy_timeout`, and
+  `retention_archive.from_cursor` records the previous retention boundary + 1.
+  Tests: `an_append_waits_out_a_competing_writer`,
+  `retention_archive_records_each_passes_real_from_cursor`. (The burned cursor on
+  a failed commit was already closed by the repair wave's cursor-after-commit
+  fix.) The §4.3 checkpoint task remains open.
