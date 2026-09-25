@@ -1623,6 +1623,9 @@ fn base_url_host(base_url: &str) -> String {
         .to_string()
 }
 
+/// Longest [`lock_auth_file`] waits on another process's file lock.
+pub const AUTH_FILE_LOCK_WAIT: std::time::Duration = std::time::Duration::from_secs(5);
+
 fn process_auth_lock() -> &'static std::sync::Mutex<()> {
     static LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
     LOCK.get_or_init(|| std::sync::Mutex::new(()))
@@ -1650,7 +1653,10 @@ pub struct AuthFileGuard {
 ///
 /// If the lock file cannot be opened (read-only or missing directory) the
 /// process half still serializes this process; the write that follows fails
-/// loudly on its own if the directory really is unusable.
+/// loudly on its own if the directory really is unusable. The file half waits
+/// at most [`AUTH_FILE_LOCK_WAIT`]: callers run on async workers, and a stopped
+/// process holding the lock must not park one forever — past the deadline the
+/// write proceeds under the process half alone, as it did before this lock.
 pub fn lock_auth_file(auth_file: &Path) -> AuthFileGuard {
     let process = process_auth_lock()
         .lock()
@@ -1666,7 +1672,22 @@ pub fn lock_auth_file(auth_file: &Path) -> AuthFileGuard {
                 .open(dir.join(".auth.json.lock"))
                 .ok()
         })
-        .filter(|file| fs2::FileExt::lock_exclusive(file).is_ok());
+        .filter(|file| {
+            let deadline = std::time::Instant::now() + AUTH_FILE_LOCK_WAIT;
+            loop {
+                if fs2::FileExt::try_lock_exclusive(file).is_ok() {
+                    return true;
+                }
+                if std::time::Instant::now() >= deadline {
+                    eprintln!(
+                        "ocean: auth.json lock held elsewhere for {}s; writing without it",
+                        AUTH_FILE_LOCK_WAIT.as_secs()
+                    );
+                    return false;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+        });
     AuthFileGuard {
         _file: file,
         _process: process,
