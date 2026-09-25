@@ -10946,3 +10946,12 @@ area:      [backend]
 
 Addressed the independent review of the F2 Observatory migration before merge. Every NOT NULL column F2 added now has a DEFAULT, so an older daemon binary that opens a migrated database keeps writing with its old column lists instead of failing every append. Four §4.1 indexes that duplicated the rowid or a UNIQUE autoindex are not created, which is a documented deviation. Orphan edges without a child node are dropped during migration, because otherwise the new child FK would fail foreign_key_check on every boot and leave the store closed. Size retention stops when the never-pruned projection alone exceeds the bound, rather than emptying the event log every pass. The size tests were reworked around heavy single-execution events so their bounds sit above that floor. New tests cover pre-F2 writers on a v2 database, the absence of duplicate indexes, and the projection floor. ocean-observatory 69 tests, ocean-daemon 973, clippy -D warnings, fmt.
 _________________________________________________________________________________ 17:17 feat/observatory-f2-schema
+
+time:      [17:24] [25-09-26]
+agent:     [claude]
+worktree:  feat/session-wire-contract
+type:      [feature-request]
+area:      [backend]
+
+Extended the cross-repo drift checks from ROADMAP to the session contract. docs/contracts/session-wire.json publishes the agent-event tag and all seventeen event type names on /v1/agent/events, plus the request fields and response keys of POST /v1/agent/sessions. session_wire_contract_matches_the_daemon holds it equal to the code. It derives event names from the AgentTurnEvent source, pinning the tag = "type", rename_all = "snake_case" attribute and refusing per-variant renames so the derivation stays valid. Request fields come from a fully populated create request, and response keys from a real create. Mutation-checked: dropping an event name from the artifact fails it. Test and docs only, with no runtime change. Voice and component contracts, and consumers vendoring these files, remain.
+_________________________________________________________________________________ 17:24 feat/session-wire-contract

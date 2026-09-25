@@ -1,0 +1,35 @@
+{
+  "note": "The session and agent-event wire facts first-party surfaces depend on, published by ocean-daemon and held equal to the code by session_wire_contract_matches_the_daemon (crates/ocean-daemon). See docs/contracts/README.md.",
+  "version": 1,
+  "agent_event_tag": "type",
+  "agent_event_types": [
+    "assistant_text_delta",
+    "browser_activity",
+    "component_render",
+    "component_unmount",
+    "extension",
+    "model_rerouted",
+    "provider_retrying",
+    "session_config_changed",
+    "session_created",
+    "slack_canvas",
+    "surface_patch",
+    "thinking_delta",
+    "tool_call_chunk",
+    "tool_call_finished",
+    "tool_call_started",
+    "turn_finished",
+    "turn_started"
+  ],
+  "session_create_request_fields": [
+    "client_type",
+    "model",
+    "project_id",
+    "workspace_root"
+  ],
+  "session_create_response_keys": [
+    "client_type",
+    "cwd",
+    "session_id"
+  ]
+}

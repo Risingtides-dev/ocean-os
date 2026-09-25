@@ -14867,6 +14867,112 @@ mod tests {
         );
     }
 
+    /// ROADMAP drift checks: `docs/contracts/session-wire.json` is the session
+    /// and agent-event wire first-party surfaces decode, held equal to the
+    /// code. Agent event names come from the `AgentTurnEvent` source (with its
+    /// `tag = "type"`, `rename_all = "snake_case"` attribute pinned so the
+    /// derivation stays valid), and the create keys from a real create.
+    #[tokio::test]
+    async fn session_wire_contract_matches_the_daemon() {
+        let artifact: serde_json::Value =
+            serde_json::from_str(include_str!("../../../docs/contracts/session-wire.json"))
+                .expect("session-wire.json parses");
+        let names = |field: &str| -> Vec<String> {
+            artifact[field]
+                .as_array()
+                .unwrap_or_else(|| panic!("{field} is a list"))
+                .iter()
+                .map(|v| v.as_str().unwrap().to_string())
+                .collect()
+        };
+
+        let sdk = include_str!("../../ocean-agent-sdk/src/lib.rs");
+        let start = sdk
+            .find("pub enum AgentTurnEvent")
+            .expect("AgentTurnEvent is defined");
+        let header = &sdk[..start];
+        let attribute_line = header
+            .lines()
+            .rev()
+            .find(|l| l.contains("#[serde("))
+            .unwrap();
+        assert_eq!(
+            attribute_line.trim(),
+            r#"#[serde(tag = "type", rename_all = "snake_case")]"#,
+            "the derivation below assumes this exact tagging"
+        );
+        assert_eq!(artifact["agent_event_tag"], "type");
+        let body = &sdk[start..];
+        let body = &body[..body.find("\n}\n").unwrap()];
+        assert!(
+            !body.contains("serde(rename"),
+            "a per-variant rename would break the snake_case derivation"
+        );
+        let mut events: Vec<String> = body
+            .lines()
+            .filter_map(|line| {
+                let rest = line.strip_prefix("    ")?;
+                let first = rest.chars().next()?;
+                if !first.is_ascii_uppercase() {
+                    return None;
+                }
+                let name: String = rest
+                    .chars()
+                    .take_while(|c| c.is_ascii_alphanumeric())
+                    .collect();
+                let mut snake = String::new();
+                for (i, c) in name.chars().enumerate() {
+                    if c.is_ascii_uppercase() {
+                        if i > 0 {
+                            snake.push('_');
+                        }
+                        snake.push(c.to_ascii_lowercase());
+                    } else {
+                        snake.push(c);
+                    }
+                }
+                Some(snake)
+            })
+            .collect();
+        events.sort();
+        assert_eq!(names("agent_event_types"), events);
+
+        let full_request = serde_json::to_value(AgentSessionCreateRequest {
+            workspace_root: "/w".into(),
+            project_id: Some(uuid::Uuid::nil()),
+            model: Some("m".into()),
+            client_type: Some("surface-web".into()),
+        })
+        .unwrap();
+        let mut request_keys: Vec<String> =
+            full_request.as_object().unwrap().keys().cloned().collect();
+        request_keys.sort();
+        assert_eq!(names("session_create_request_fields"), request_keys);
+
+        let state = capped_turn_state(1);
+        let workspace = tempfile::tempdir().expect("workspace");
+        let (status, created) = agent_sessions_create(
+            State(state),
+            Json(AgentSessionCreateRequest {
+                workspace_root: workspace.path().to_string_lossy().into_owned(),
+                project_id: None,
+                model: None,
+                client_type: Some("surface-web".to_owned()),
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let mut response_keys: Vec<String> = serde_json::to_value(&created.0)
+            .unwrap()
+            .as_object()
+            .unwrap()
+            .keys()
+            .cloned()
+            .collect();
+        response_keys.sort();
+        assert_eq!(names("session_create_response_keys"), response_keys);
+    }
+
     #[tokio::test]
     async fn explicit_session_create_publishes_only_the_successful_authoritative_fact() {
         use ocean_agent_sdk::extension_lifecycle::LifecycleEventKind;
