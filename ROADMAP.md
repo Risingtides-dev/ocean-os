@@ -77,14 +77,16 @@ Program approved 2026-09-25 in
 [`docs/specs/2026-09-25-ocean-web-identity-and-node-linking-program.md`](docs/specs/2026-09-25-ocean-web-identity-and-node-linking-program.md):
 coworkers sign in at `ocean.agentsworld.org`, link their own node, manage its
 coding-plan logins, and use Rooms under one identity. The program authorizes
-M1 only; M2 and M3 each need an accepted route/contract manifest first.
+M1; M3's route contract is §9 of the spec; M2 still needs its manifest.
 
 - [ ] M1 — GitHub sign-in on the proxy, gated on active `KINGMAKER-SYSTEMS`
-      membership and mapped through a `github` roster field (ocean-surface).
+      membership and mapped through a numeric `github_id` roster field (ocean-surface; see §8 of the spec).
 - [ ] M2 — Self-serve node linking: `ocean link` pairing code approved on the
       web, device key per Gate 0 Decision 2, `member.toml` written to match.
 - [ ] M3 — Coding plans over HTTP: operator-authenticated daemon provider
       status/login/logout routes and a Surface "Coding plans" panel; never tokens.
+      Daemon side landed against the §9 route contract; the Surface proxy
+      allowlist and panel remain.
 - [ ] M4 — Rooms invites and joins in the web UI, member id equal to the web
       login identity.
 

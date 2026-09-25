@@ -146,6 +146,8 @@ mod observatory_auth;
 mod persistent_rooms;
 /// Project registry CRUD, pagination, git enrichment, and session association adapters.
 mod project_registry;
+// Web identity M3: coding-plan (Claude / Codex OAuth) status and login over HTTP.
+mod provider_auth;
 /// In-memory quorum-of-recall tally storage and bounded synchronous mutations.
 mod recall_registry;
 /// In-memory request and permission control records plus bounded lifecycle mutations.
@@ -319,6 +321,9 @@ struct AppState {
     rooms: RoomStoreHandle,
     /// Fail-closed local principal for room-agent authority mutations.
     room_operator: Arc<room_operator::OperatorIdentity>,
+    /// In-flight provider (Claude / Codex) logins started over HTTP. Gated by
+    /// `room_operator`; see [`provider_auth`].
+    provider_logins: Arc<provider_auth::ProviderLogins>,
     /// Root of the room-attachment blob tree, resolved ONCE at startup.
     ///
     /// `ocean-store` indexes attachments; their bytes live on disk under this
@@ -746,6 +751,20 @@ fn app_router(cors: CorsLayer) -> Router<AppState> {
         // Rooms S0: who this daemon says its human is (member.toml, then
         // OCEAN_MEMBER_ID, never the process user). Credential-free.
         .route("/v1/identity", get(identity::identity))
+        // Web identity M3: operator-only coding-plan status and login.
+        .route("/v1/auth/providers", get(provider_auth::list))
+        .route(
+            "/v1/auth/providers/{provider}/login",
+            post(provider_auth::start),
+        )
+        .route(
+            "/v1/auth/providers/{provider}/login/{attempt_id}",
+            get(provider_auth::poll).delete(provider_auth::cancel),
+        )
+        .route(
+            "/v1/auth/providers/{provider}/logout",
+            post(provider_auth::logout),
+        )
         .route("/v1/agent/turns", post(agent_turn))
         .route("/v1/agent/voice", post(agent_voice))
         .route("/v1/agent/events", get(agent_events))
@@ -1206,6 +1225,7 @@ async fn main() -> anyhow::Result<()> {
         longhouse,
         rooms,
         room_operator,
+        provider_logins: Arc::default(),
         room_attachments_root: Arc::new(room_attachments_root),
         room_maintenance_config,
         room_maintenance,
@@ -1631,6 +1651,11 @@ fn banner_routes() -> &'static [&'static str] {
         "GET /ready",
         "GET /metrics",
         "GET /v1/identity",
+        "GET /v1/auth/providers",
+        "POST /v1/auth/providers/{provider}/login",
+        "GET /v1/auth/providers/{provider}/login/{attempt_id}",
+        "DELETE /v1/auth/providers/{provider}/login/{attempt_id}",
+        "POST /v1/auth/providers/{provider}/logout",
         "POST /v1/agent/turns",
         "POST /v1/agent/voice",
         "GET /v1/agent/events",
@@ -14541,6 +14566,7 @@ mod tests {
             permissions: Arc::new(RwLock::new(HashMap::new())),
             longhouse: Arc::new(Mutex::new(ocean_longhouse::LonghouseRegistry::new())),
             rooms,
+            provider_logins: Arc::default(),
             room_operator: Arc::new(room_operator::OperatorIdentity::for_test(
                 Some("test-room-operator"),
                 vec!["http://127.0.0.1:8790".into()],
@@ -16414,6 +16440,7 @@ mod tests {
             permissions: Arc::new(RwLock::new(HashMap::new())),
             longhouse: Arc::new(Mutex::new(ocean_longhouse::LonghouseRegistry::new())),
             rooms,
+            provider_logins: Arc::default(),
             room_operator: Arc::new(room_operator::OperatorIdentity::for_test(
                 Some("test-room-operator"),
                 vec!["http://127.0.0.1:8790".into()],
@@ -16877,6 +16904,7 @@ mod tests {
             permissions: Arc::new(RwLock::new(HashMap::new())),
             longhouse: Arc::new(Mutex::new(ocean_longhouse::LonghouseRegistry::new())),
             rooms,
+            provider_logins: Arc::default(),
             room_operator: Arc::new(room_operator::OperatorIdentity::for_test(
                 Some("test-room-operator"),
                 vec!["http://127.0.0.1:8790".into()],
@@ -18990,6 +19018,7 @@ mod tests {
             permissions: Arc::new(RwLock::new(HashMap::new())),
             longhouse: Arc::new(Mutex::new(ocean_longhouse::LonghouseRegistry::new())),
             rooms,
+            provider_logins: Arc::default(),
             room_operator: Arc::new(room_operator::OperatorIdentity::for_test(
                 Some("test-room-operator"),
                 vec!["http://127.0.0.1:8790".into()],
@@ -27092,9 +27121,12 @@ mod tests {
         // daemon's human from member.toml then OCEAN_MEMBER_ID (null when
         // neither is set, never the process user) so every client on a
         // box converges on one member id instead of minting one.
+        // 139 -> 144: web identity M3 coding plans — operator-only status,
+        // login start/poll/cancel, and logout for the Claude and Codex OAuth
+        // blocks, so a surface can manage a node's plans without the TUI.
         assert_eq!(
             banner.len(),
-            139,
+            144,
             "route baseline changed; review the manifest"
         );
 

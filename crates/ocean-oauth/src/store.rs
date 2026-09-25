@@ -22,6 +22,34 @@ pub(crate) fn merge_and_write(auth_file: &Path, key: &str, block: Value) -> Resu
     Ok(())
 }
 
+/// Remove the block under `key`, preserving every other key. Returns whether a
+/// block was present. A missing file is "nothing to remove", not an error, and
+/// is left missing rather than created.
+pub(crate) fn remove_and_write(auth_file: &Path, key: &str) -> Result<bool> {
+    if !auth_file.exists() {
+        return Ok(false);
+    }
+    let mut root = read_root(auth_file)?;
+    let map = root
+        .as_object_mut()
+        .context("auth file root is not a JSON object")?;
+    if map.remove(key).is_none() {
+        return Ok(false);
+    }
+    let serialized = serde_json::to_string_pretty(&root)?;
+    atomic_write_private(auth_file, &serialized)?;
+    Ok(true)
+}
+
+/// Read one block without writing anything. `None` when the file or the key is
+/// absent.
+pub(crate) fn read_block(auth_file: &Path, key: &str) -> Result<Option<Value>> {
+    if !auth_file.exists() {
+        return Ok(None);
+    }
+    Ok(read_root(auth_file)?.get(key).cloned())
+}
+
 /// Read the existing root object, or an empty object when the file is missing
 /// or blank.
 fn read_root(path: &Path) -> Result<Value> {

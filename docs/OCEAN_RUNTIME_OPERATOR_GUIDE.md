@@ -639,6 +639,13 @@ GET    /metrics                           Prometheus text (v0.0.4); Content-Type
 # Identity (Rooms S0)
 GET    /v1/identity                       who this daemon says its human is — {ok, member_id|null, display_name|null, source: "member.toml"|"env"|"unset"} from <config_dir>/member.toml (member_id = "...", optional display_name = "..."; the dir that holds operator.key and rooms.db) then OCEAN_MEMBER_ID; null when neither is set and NEVER the process user; credential-free; read per request, so writing the file needs no restart. Same file and same rules as ocean-mcp, so a terminal and the desktop app on one box are one person
 
+# Coding plans (web identity M3) — every route needs X-Ocean-Operator; a Cookie or foreign Origin is refused
+GET    /v1/auth/providers                 Claude/Codex OAuth status {providers:[{provider, label, kind, status: signed_in|expired|signed_out|unknown, source: auth_file|env|codex_cli|null, expires_at_ms, login}]}; never a token
+POST   /v1/auth/providers/{provider}/login  start a browser login (claude|codex) → 202 {attempt_id, authorize_url, same_machine_required: true}; replaces a pending attempt; 409 login_unavailable when the callback port cannot bind
+GET    /v1/auth/providers/{provider}/login/{attempt_id}  poll → {state: pending|succeeded|failed|cancelled, error?}; the flow times out as failed after 300s
+DELETE /v1/auth/providers/{provider}/login/{attempt_id}  cancel a pending attempt and release its callback port
+POST   /v1/auth/providers/{provider}/logout  remove the provider's auth-file block (other blocks preserved) → {removed}
+
 # Agent product API (session-scoped — first-party surfaces)
 POST   /v1/agent/turns                    submit a turn { prompt, cwd, session_id, ... }
 POST   /v1/agent/voice                    submit a voice turn (transcribed prompt; voice surface)

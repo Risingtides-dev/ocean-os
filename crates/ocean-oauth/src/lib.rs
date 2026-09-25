@@ -61,6 +61,18 @@ impl OAuthProvider {
         }
     }
 
+    /// Parse the short identifier [`OAuthProvider::label`] produces.
+    pub fn from_label(label: &str) -> Option<Self> {
+        match label {
+            "claude" => Some(OAuthProvider::Claude),
+            "codex" => Some(OAuthProvider::Codex),
+            _ => None,
+        }
+    }
+
+    /// Every provider this crate can log in, in display order.
+    pub const ALL: [OAuthProvider; 2] = [OAuthProvider::Claude, OAuthProvider::Codex];
+
     fn token_url_env(self) -> &'static str {
         match self {
             OAuthProvider::Claude => ENV_ANTHROPIC_TOKEN_URL,
@@ -101,6 +113,65 @@ pub struct LoginOutcome {
     /// Account identifier carried by the token, when available
     /// (`account.uuid` for Claude, the JWT `chatgpt_account_id` for Codex).
     pub account_id: Option<String>,
+}
+
+/// What Ocean's auth file says about one provider's OAuth block. Never carries
+/// a token: this is the shape a status route may hand to a browser.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct OAuthBlockStatus {
+    /// A `type:"oauth"` block with a non-empty access or refresh token exists.
+    pub present: bool,
+    /// The block carries a refresh token, so an expired access token renews at
+    /// turn time without a new browser login.
+    pub refreshable: bool,
+    /// Access-token expiry in ms since the epoch, normalized from seconds when
+    /// the file stored seconds. `None` when unknown.
+    pub expires_ms: Option<i64>,
+}
+
+/// Read `provider`'s OAuth block status from the auth file. A missing file or
+/// block is `present: false`, not an error; an unreadable or non-JSON file is.
+pub fn oauth_block_status(
+    provider: OAuthProvider,
+    auth_file: Option<PathBuf>,
+) -> Result<OAuthBlockStatus> {
+    let path = resolve_auth_path(auth_file)?;
+    let Some(block) = store::read_block(&path, provider.auth_json_key())? else {
+        return Ok(OAuthBlockStatus::default());
+    };
+    let non_empty = |key: &str| {
+        block
+            .get(key)
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|value| !value.trim().is_empty())
+    };
+    let is_oauth = block.get("type").and_then(serde_json::Value::as_str) == Some("oauth");
+    let refreshable = is_oauth && non_empty("refresh");
+    let present = is_oauth && (non_empty("access") || refreshable);
+    // `expires` is ms when large, seconds otherwise — the same rule
+    // `ocean-providers` applies when it reads this block.
+    let expires_ms = block
+        .get("expires")
+        .and_then(serde_json::Value::as_i64)
+        .map(|raw| {
+            if raw >= 1_000_000_000_000 {
+                raw
+            } else {
+                raw * 1000
+            }
+        });
+    Ok(OAuthBlockStatus {
+        present,
+        refreshable,
+        expires_ms: present.then_some(expires_ms).flatten(),
+    })
+}
+
+/// Sign `provider` out by removing its block from the auth file, preserving
+/// every other block. Returns whether a block was removed.
+pub fn logout(provider: OAuthProvider, auth_file: Option<PathBuf>) -> Result<bool> {
+    let path = resolve_auth_path(auth_file)?;
+    store::remove_and_write(&path, provider.auth_json_key())
 }
 
 /// Resolve the Ocean auth file path: an explicit argument wins, otherwise the
@@ -337,5 +408,75 @@ mod tests {
         assert_eq!(v["deepseek"]["api_key"], "sk-ds");
         #[cfg(unix)]
         assert!(mode_is_0600(&auth));
+    }
+}
+
+#[cfg(test)]
+mod status_tests {
+    use super::{logout, oauth_block_status, OAuthProvider};
+
+    fn auth_file(body: &str) -> (std::path::PathBuf, std::path::PathBuf) {
+        let dir = std::env::temp_dir().join(format!(
+            "ocean-oauth-status-{}-{}",
+            std::process::id(),
+            body.len()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("auth.json");
+        std::fs::write(&path, body).unwrap();
+        (dir, path)
+    }
+
+    #[test]
+    fn status_reads_presence_refreshability_and_normalized_expiry() {
+        let (dir, path) = auth_file(
+            r#"{"claude-code":{"type":"oauth","access":"a","refresh":"r","expires":1700000000},
+                "openai-codex":{"type":"oauth","access":"","refresh":""},
+                "deepseek":{"api_key":"k"}}"#,
+        );
+        let claude = oauth_block_status(OAuthProvider::Claude, Some(path.clone())).unwrap();
+        assert!(claude.present && claude.refreshable);
+        assert_eq!(claude.expires_ms, Some(1_700_000_000_000));
+        let codex = oauth_block_status(OAuthProvider::Codex, Some(path.clone())).unwrap();
+        assert!(!codex.present);
+        assert_eq!(codex.expires_ms, None);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn missing_file_is_signed_out_and_logout_preserves_other_blocks() {
+        let missing = std::env::temp_dir().join("ocean-oauth-status-missing/auth.json");
+        assert!(
+            !oauth_block_status(OAuthProvider::Claude, Some(missing.clone()))
+                .unwrap()
+                .present
+        );
+        assert!(!logout(OAuthProvider::Claude, Some(missing.clone())).unwrap());
+        assert!(!missing.exists(), "logout must not create an auth file");
+
+        let (dir, path) = auth_file(
+            r#"{"claude-code":{"type":"oauth","access":"a"},"deepseek":{"api_key":"k"},"x":1}"#,
+        );
+        assert!(logout(OAuthProvider::Claude, Some(path.clone())).unwrap());
+        let root: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert!(root.get("claude-code").is_none());
+        assert_eq!(root["deepseek"]["api_key"], "k");
+        assert!(!logout(OAuthProvider::Claude, Some(path.clone())).unwrap());
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o600);
+        }
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn labels_round_trip() {
+        for provider in OAuthProvider::ALL {
+            assert_eq!(OAuthProvider::from_label(provider.label()), Some(provider));
+        }
+        assert_eq!(OAuthProvider::from_label("gemini"), None);
     }
 }
