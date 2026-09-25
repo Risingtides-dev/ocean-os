@@ -1,11 +1,14 @@
-//! Sole read-only authority for the daemon-owned extension registry.
+//! Sole authority for the daemon-owned extension registry.
 //!
 //! The accepted Phase 1 install/trust/enable schemas remain unchanged. Stage A2a
 //! adds the strict `service-grants.json` companion, with the one ratified upgrade
 //! exception: absence means an empty grant set for an otherwise coherent A0
-//! three-file snapshot. State and package traversal remain descriptor-relative
-//! under one shared lock; this module is also the only source of supervised
-//! activation records consumed by `extension_service`.
+//! three-file snapshot that no Stage A publication has touched. Stage A3a adds
+//! the internal journaled writer (`transaction`) and the durable
+//! first-publication marker after which that absence fails closed. State and
+//! package traversal remain descriptor-relative under one shared lock; this
+//! module is also the only source of supervised activation records consumed by
+//! `extension_service`.
 
 #![cfg_attr(
     all(feature = "registry-portability-check", not(test)),
@@ -57,6 +60,13 @@ use uuid::Uuid;
 #[cfg(any(test, not(feature = "registry-portability-check")))]
 use super::AppState;
 
+/// Stage A3a transactional writer: local quarantine, journaled four-file
+/// publication, crash recovery, retention, grant diff, and expected-revision
+/// concurrency. It is a child of this module so the reader and writer share one
+/// schema/validation authority. A3a exposes no route; A3b owns HTTP/CLI.
+#[cfg(all(unix, any(test, not(feature = "registry-portability-check"))))]
+pub(crate) mod transaction;
+
 const STATE_SCHEMA_VERSION: u32 = 1;
 const STATE_FILE_LIMIT: u64 = 1024 * 1024;
 const MANIFEST_FILE_LIMIT: u64 = 1024 * 1024;
@@ -84,7 +94,7 @@ fn inspection_limiter() -> Arc<Semaphore> {
         .clone()
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct InstallsFile {
     schema_version: u32,
@@ -92,7 +102,7 @@ struct InstallsFile {
     installs: Vec<InstalledArtifact>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct TrustFile {
     schema_version: u32,
@@ -100,7 +110,7 @@ struct TrustFile {
     grants: Vec<ArtifactTrustGrant>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct EnabledFile {
     schema_version: u32,
@@ -108,7 +118,7 @@ struct EnabledFile {
     extensions: Vec<ExtensionEnablement>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct ServiceGrantsFile {
     schema_version: u32,
@@ -116,7 +126,7 @@ struct ServiceGrantsFile {
     service_grants: Vec<ServiceGrant>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct ServiceGrant {
     id: String,
@@ -126,7 +136,7 @@ pub(crate) struct ServiceGrant {
     secret_bindings: Vec<SecretBinding>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct SecretBinding {
     pub(crate) target_env: String,
@@ -160,18 +170,18 @@ enum InstallSourceKind {
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
-struct CapabilitySet {
+pub(crate) struct CapabilitySet {
     #[serde(default)]
-    network: Vec<String>,
+    pub(crate) network: Vec<String>,
     #[serde(default)]
-    filesystem: Vec<String>,
+    pub(crate) filesystem: Vec<String>,
     #[serde(default)]
-    env: Vec<String>,
+    pub(crate) env: Vec<String>,
     #[serde(default)]
-    secrets: Vec<String>,
+    pub(crate) secrets: Vec<String>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct ArtifactTrustGrant {
     id: String,
@@ -180,7 +190,7 @@ struct ArtifactTrustGrant {
     capabilities: CapabilitySet,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct ExtensionEnablement {
     id: String,
@@ -189,7 +199,7 @@ struct ExtensionEnablement {
     projects: Vec<ProjectEnablement>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct ProjectEnablement {
     project_id: Uuid,
@@ -477,11 +487,28 @@ fn read_locked_state(config_dir: &FsPath) -> Result<LockedState, StateError> {
     };
     let lock = open_regular_file_at(&root, OsStr::new(".state.lock"), ".state.lock")?;
     acquire_shared_lock(&lock)?;
+    let (snapshot, service_authority) = read_coherent_generation(&root)?;
 
-    let installs: InstallsFile = read_state_json_at(&root, "installs.json")?;
-    let trust: TrustFile = read_state_json_at(&root, "trust.json")?;
-    let enabled: EnabledFile = read_state_json_at(&root, "enabled.json")?;
-    let service_grants = read_optional_service_grants(&root)?;
+    Ok(LockedState {
+        root: Some(root),
+        snapshot,
+        service_authority,
+        _lock: Some(lock),
+    })
+}
+
+/// Parse and fully validate one four-file generation from an anchored root.
+///
+/// The caller must already hold `.state.lock` (shared for readers, exclusive
+/// for the A3a writer) so no mixed generation can be observed.
+fn read_coherent_generation(
+    root: &File,
+) -> Result<(StateSnapshot, Vec<ValidatedServiceAuthority>), StateError> {
+    let installs: InstallsFile = read_state_json_at(root, "installs.json")?;
+    let trust: TrustFile = read_state_json_at(root, "trust.json")?;
+    let enabled: EnabledFile = read_state_json_at(root, "enabled.json")?;
+    let service_grants = read_optional_service_grants(root)?;
+    let marker = read_optional_publication_marker(root)?;
 
     for (file, schema) in [
         ("installs.json", installs.schema_version),
@@ -507,30 +534,59 @@ fn read_locked_state(config_dir: &FsPath) -> Result<LockedState, StateError> {
     {
         return Err(StateError::RevisionMismatch);
     }
+    if let Some(marker) = &marker {
+        if marker.schema_version != STATE_SCHEMA_VERSION {
+            return Err(StateError::UnsupportedSchema(PUBLICATION_MARKER));
+        }
+        if marker.first_state_revision == 0 || marker.first_state_revision > installs.state_revision
+        {
+            return Err(StateError::InvalidRecord("publication-marker"));
+        }
+    }
+    // The sole A0 upgrade exception is absence => empty, and it exists only
+    // while no Stage A publication has ever committed. The A3a writer creates
+    // the durable marker immediately after the first four-file commit point,
+    // so once it exists a missing companion is incomplete state, never the
+    // empty grant set. No file is written here.
+    if service_grants.is_none() && marker.is_some() {
+        return Err(StateError::MissingComponent("service-grants.json"));
+    }
 
     let mut snapshot = StateSnapshot {
         revision: installs.state_revision,
         installs: installs.installs,
         grants: trust.grants,
         enablement: enabled.extensions,
-        // The sole A0 upgrade exception is absence => empty. A2a owns no
-        // mutation or durable "first Stage A publication" marker, so it cannot
-        // distinguish a later deleted companion without preempting A3a. A3a
-        // must add that marker atomically and make this branch fail closed when
-        // the marker is present. No file is written here.
         service_grants: service_grants
             .map(|grants| grants.service_grants)
             .unwrap_or_default(),
     };
     validate_snapshot(&mut snapshot)?;
-    let service_authority = validate_service_grants_against_artifacts(&root, &snapshot)?;
+    let service_authority = validate_service_grants_against_artifacts(root, &snapshot)?;
+    Ok((snapshot, service_authority))
+}
 
-    Ok(LockedState {
-        root: Some(root),
-        snapshot,
-        service_authority,
-        _lock: Some(lock),
-    })
+/// Durable first-Stage-A-publication marker.
+///
+/// Created exactly once, by the A3a writer, immediately after the first
+/// successful four-file commit point (and by journal-proven roll-forward).
+/// It is never removed. The accepted Phase 1 binary ignores it, so downgrade
+/// readability of the three A0 schemas is unchanged.
+const PUBLICATION_MARKER: &str = "stage-a-publication.json";
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PublicationMarker {
+    schema_version: u32,
+    first_state_revision: u64,
+}
+
+fn read_optional_publication_marker(root: &File) -> Result<Option<PublicationMarker>, StateError> {
+    match read_state_json_at(root, PUBLICATION_MARKER) {
+        Ok(marker) => Ok(Some(marker)),
+        Err(StateError::MissingComponent(PUBLICATION_MARKER)) => Ok(None),
+        Err(error) => Err(error),
+    }
 }
 
 fn open_extensions_root(config_dir: &FsPath) -> Result<Option<File>, StateError> {
@@ -659,9 +715,54 @@ fn open_dir_at(parent: &File, name: &OsStr, label: &'static str) -> Result<File,
     )
 }
 
+/// Open a regular file or directory entry without following it.
+///
+/// A no-follow `fstatat` type check runs first, so FIFOs, sockets, devices,
+/// and symlinks are refused before any `open(2)` side effect (a device open
+/// can have one). The opened descriptor must then be the same inode the check
+/// saw; `O_NOCTTY` ensures an opened entry can never become a controlling
+/// terminal.
 #[cfg(unix)]
 fn open_file_at(parent: &File, name: &OsStr, label: &'static str) -> Result<File, StateError> {
-    open_at(parent, name, libc::O_RDONLY | libc::O_NONBLOCK, label)
+    use std::os::unix::fs::MetadataExt;
+
+    let c_name = CString::new(name.as_bytes()).map_err(|_| StateError::InvalidComponent(label))?;
+    let mut status = std::mem::MaybeUninit::<libc::stat>::zeroed();
+    // SAFETY: parent is a live directory descriptor, the name is
+    // NUL-terminated, and status is writable.
+    if unsafe {
+        libc::fstatat(
+            parent.as_raw_fd(),
+            c_name.as_ptr(),
+            status.as_mut_ptr(),
+            libc::AT_SYMLINK_NOFOLLOW,
+        )
+    } != 0
+    {
+        return match std::io::Error::last_os_error().raw_os_error() {
+            Some(libc::ENOENT) => Err(StateError::MissingComponent(label)),
+            Some(libc::ENOTDIR) | Some(libc::ELOOP) => Err(StateError::InvalidComponent(label)),
+            _ => Err(StateError::Read(label)),
+        };
+    }
+    // SAFETY: fstatat initialized status on success.
+    let status = unsafe { status.assume_init() };
+    let kind = status.st_mode & libc::S_IFMT;
+    if kind != libc::S_IFREG && kind != libc::S_IFDIR {
+        return Err(StateError::InvalidComponent(label));
+    }
+    let file = open_at(
+        parent,
+        name,
+        libc::O_RDONLY | libc::O_NONBLOCK | libc::O_NOCTTY,
+        label,
+    )?;
+    let opened = file.metadata().map_err(|_| StateError::Read(label))?;
+    #[allow(clippy::unnecessary_cast)]
+    if opened.dev() != status.st_dev as u64 || opened.ino() != status.st_ino as u64 {
+        return Err(StateError::Read(label));
+    }
+    Ok(file)
 }
 
 fn open_regular_file_at(
@@ -1549,7 +1650,9 @@ fn walk_package_dir(
         let mut file_digest = Sha256::new();
         file_digest.update(FILE_DIGEST_DOMAIN);
         let mut observed = 0u64;
-        let mut buffer = [0u8; 64 * 1024];
+        // Heap buffer: this frame recurses to MAX_PACKAGE_DEPTH, and a 64 KiB
+        // stack array per level overflows a 2 MiB blocking-thread stack.
+        let mut buffer = vec![0u8; 64 * 1024];
         loop {
             let count = entry
                 .read(&mut buffer)
@@ -3457,6 +3560,34 @@ env = ["EXAMPLE_ENV"]
         let started = Instant::now();
         assert!(snapshot_package(&directory).is_err());
         assert!(started.elapsed() < Duration::from_secs(1));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn open_file_at_type_checks_special_entries_before_opening() {
+        use std::os::unix::ffi::OsStrExt;
+
+        let directory = tempfile::tempdir().unwrap();
+        let fifo = CString::new(directory.path().join("fifo").as_os_str().as_bytes()).unwrap();
+        // SAFETY: fifo is NUL-terminated.
+        assert_eq!(unsafe { libc::mkfifo(fifo.as_ptr(), 0o600) }, 0);
+        let _socket =
+            std::os::unix::net::UnixListener::bind(directory.path().join("socket")).unwrap();
+        std::os::unix::fs::symlink("/etc/hosts", directory.path().join("link")).unwrap();
+        fs::write(directory.path().join("regular"), "ok").unwrap();
+        let parent = File::open(directory.path()).unwrap();
+        for special in ["fifo", "socket", "link"] {
+            assert_eq!(
+                open_file_at(&parent, OsStr::new(special), "entry").err(),
+                Some(StateError::InvalidComponent("entry")),
+                "{special}"
+            );
+        }
+        assert_eq!(
+            open_file_at(&parent, OsStr::new("absent"), "entry").err(),
+            Some(StateError::MissingComponent("entry"))
+        );
+        assert!(open_file_at(&parent, OsStr::new("regular"), "entry").is_ok());
     }
 
     #[cfg(unix)]
