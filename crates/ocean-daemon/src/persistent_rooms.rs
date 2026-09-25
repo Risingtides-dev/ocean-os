@@ -518,16 +518,12 @@ fn room_history_row(message: RoomMessage) -> ocean_agent::RoomHistoryRow {
     }
 }
 
-/// The longest member id a room accepts or renders — the same ceiling
-/// `room_agent_authority::validate_member_id` enforces on authority routes.
-const ROOM_MEMBER_ID_MAX_CHARS: usize = 128;
-
 /// A member id that is safe to store and to render in a markdown surface: not
 /// empty, bounded, and free of control characters and the square brackets a
 /// link needs. `None` means refuse it on write and filter it on render.
 pub(super) fn bounded_member_id(raw: &str) -> Option<&str> {
     (!raw.is_empty()
-        && raw.chars().count() <= ROOM_MEMBER_ID_MAX_CHARS
+        && raw.chars().count() <= super::room_agent_authority::MEMBER_ID_MAX_CHARS
         && !raw.chars().any(|c| c.is_control() || c == '[' || c == ']'))
     .then_some(raw)
 }
@@ -535,7 +531,7 @@ pub(super) fn bounded_member_id(raw: &str) -> Option<&str> {
 /// The id a response renders for a row's author. Rows written before the join
 /// route bounded ids are permanent, and federated rows arrive from elsewhere,
 /// so the bound is applied on the way out as well as on the way in.
-fn rendered_author_id(raw: String) -> String {
+pub(super) fn rendered_author_id(raw: String) -> String {
     if bounded_member_id(&raw).is_some() {
         raw
     } else {
@@ -597,7 +593,7 @@ pub(super) fn room_history_text(
         .as_ref()
         .and_then(|v| v.get("agent_member_id"))
         .and_then(serde_json::Value::as_str)
-        .filter(|a| !a.is_empty() && !a.chars().any(|c| c.is_control() || c == '[' || c == ']'))
+        .and_then(bounded_member_id)
         .map(|a| format!(" {a}"))
         .unwrap_or_default();
     let refused = value
@@ -3475,7 +3471,7 @@ were mentioned.\n\n",
         out.push_str(&format!(
             "[#{seq}] {author}: {body}{marker}\n",
             seq = m.seq,
-            author = m.author_id,
+            author = rendered_author_id(m.author_id.clone()),
             body = room_history_text(m.body.clone(), m.author_kind, m.kind),
             marker = marker,
         ));
@@ -11756,12 +11752,28 @@ env = { FIXTURE = "1" }
     /// `[room audit]` unnoticed.
     #[test]
     fn every_store_audit_writer_has_a_render_rule() {
+        // Every production source that writes a room audit row. A new
+        // ocean-store module is caught by the file-count check below.
         let sources = [
             include_str!("../../ocean-store/src/lib.rs"),
             include_str!("../../ocean-store/src/room_profile.rs"),
             include_str!("../../ocean-store/src/room_resources.rs"),
             include_str!("../../ocean-store/src/room_retirement.rs"),
         ];
+        let store_modules =
+            std::fs::read_dir(concat!(env!("CARGO_MANIFEST_DIR"), "/../ocean-store/src"))
+                .expect("ocean-store sources")
+                .filter(|entry| {
+                    entry
+                        .as_ref()
+                        .is_ok_and(|e| e.path().extension().is_some_and(|x| x == "rs"))
+                })
+                .count();
+        assert_eq!(
+            store_modules,
+            sources.len(),
+            "ocean-store gained a source file; add it to this scan"
+        );
         let mut found = std::collections::BTreeSet::new();
         for source in sources {
             let production = source.split("#[cfg(test)]").next().unwrap_or(source);
@@ -11770,12 +11782,10 @@ env = { FIXTURE = "1" }
                 let tail = &rest[start + 1..];
                 let end = tail.find('"').unwrap_or(tail.len());
                 let literal = &tail[..end];
-                if literal
-                    .chars()
-                    .all(|c| c.is_ascii_lowercase() || c == '.' || c == '_')
-                {
-                    found.insert(literal.to_string());
-                }
+                // Every `"room.` literal counts; one the renderer's rules could
+                // not name (a hyphen, a digit, uppercase) fails here rather
+                // than slipping past the scan.
+                found.insert(literal.to_string());
                 rest = &tail[end.min(tail.len())..];
             }
         }

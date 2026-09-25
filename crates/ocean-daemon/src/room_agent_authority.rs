@@ -588,7 +588,7 @@ pub(super) fn validate_decision_id(raw: &str) -> Result<String, ApiError> {
 /// afford the tighter number because nothing is lost by refusing — the request
 /// simply does not happen. Real ids sit far below either: a federated member id
 /// is a UUID, a local participant id is a roster or folder-agent name.
-const MEMBER_ID_MAX_CHARS: usize = 128;
+pub(super) const MEMBER_ID_MAX_CHARS: usize = 128;
 
 /// Refuse a caller-supplied member id that is not shaped like an identity.
 ///
