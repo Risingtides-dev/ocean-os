@@ -65,13 +65,12 @@ across those computers. The architecture does not itself authorize code changes.
       [`docs/specs/2026-09-01-ocean-rooms-definition-of-done.md`](docs/specs/2026-09-01-ocean-rooms-definition-of-done.md):
       every line checked with its named executable check across ocean-os,
       ocean-surface and ocean-bedrock. Open on this repo's side as of
-      2026-09-01: the operated daemon is behind `main` with federation off
+      2026-09-25: the operated daemon is behind `main` with federation off
       (0.5, 0.6); `PHASE1_SAFE_CAPABILITIES` is deliberately empty pending a
-      Stage 2 manifest (2.3); room routes are unauthenticated (3.1); there are
-      no room or federation metrics (4.1); `OCEAN_ECOSYSTEM_CONTRACT.md` lists
-      11 of the 40 room routes (5.2). `cargo deny` is green again as of
-      2026-09-25 (rustls 0.23.45 clears RUSTSEC-2026-0285); making the deny job
-      a required check is still the user's ruling (3.5).
+      Stage 2 manifest (2.3); room routes are unauthenticated (3.1); making the
+      now-green `cargo deny` job a required check is the user's ruling (3.5).
+      Room/federation metrics (4.1) and the full contract route table (5.2)
+      are done and test-pinned.
 
 ## Ocean web identity and node linking
 

@@ -10820,3 +10820,12 @@ area:      [infra]
 
 cargo deny was red on main, one of the open Rooms definition-of-done items (3.5): the only failure was RUSTSEC-2026-0285, rustls 0.23.40 accepting TLS 1.3 handshake messages across encryption-level boundaries. A lockfile-only cargo update -p rustls moves it to the patched 0.23.45, with rustls-webpki 0.103.13 to 0.103.15. cargo deny check now passes advisories, bans, licenses and sources; cargo check --workspace and the full workspace test suite (3383 passed, 0 failed) are green. The duplicate-crate warnings are unchanged and non-fatal.
 _________________________________________________________________________________ 15:25 fix/cargo-deny
+
+time:      [15:26] [25-09-26]
+agent:     [claude]
+worktree:  docs/dod-refresh
+type:      [review]
+area:      [docs]
+
+Refreshed the Rooms definition-of-done and ROADMAP against the code: 4.1 (room and federation metrics) and 5.2 (every room route in the ecosystem contract, count pinned) were still listed open but are implemented and test-pinned — the room_metrics tests in metrics.rs and room_route_table_and_architecture_route_counts_are_in_parity — so both are marked done with their checks named. 3.5 records that cargo deny went green in #477 while the required-check half stays the user's ruling. The open list on this repo's side is now 0.5 and 0.6 (the operated daemon is behind main with federation off), 2.3 (Stage 2 manifest) and 3.1 (room-route auth design).
+_________________________________________________________________________________ 15:26 docs/dod-refresh
