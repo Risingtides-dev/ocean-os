@@ -202,6 +202,7 @@ This crate owns the long-running Ocean HTTP service on `:4780`, including API ro
 ## Verification
 
 - `cargo test -p ocean-daemon bus::tests::`
+- `cargo test -p ocean-daemon retained_size_measurements -- --nocapture --test-threads=1` — measurement-only bus/SSE retained-size and slow-client tables (`src/retained_size_measurements.rs`; add `--include-ignored` for the heavy sweep). Keep `docs/specs/2026-09-25-retained-size-and-slow-client-measurements.md` in step when a bus capacity or replay cap changes.
 - `cargo test -p ocean-daemon fulfillment -- --nocapture`
 - `cargo test -p ocean-daemon cors::tests:: -- --nocapture`
 - `cargo test -p ocean-daemon component_event_ -- --nocapture`

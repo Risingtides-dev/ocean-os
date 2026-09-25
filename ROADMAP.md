@@ -180,7 +180,13 @@ Ocean ports mechanisms into current owners rather than reproducing OMP package b
 - [ ] Establish artifact-backed large tool results before increasing retained
       event or transcript payload limits.
 - [ ] Add end-to-end retained-size and slow-client measurements before changing
-      history/event architecture.
+      history/event architecture. Measurements now exist:
+      [`docs/specs/2026-09-25-retained-size-and-slow-client-measurements.md`](docs/specs/2026-09-25-retained-size-and-slow-client-measurements.md)
+      (buffer inventory, exact lag thresholds, real-socket slow clients, and
+      persisted-transcript size and write volume). The item stays open: the
+      per-turn MPSC under a starved bridge, release-build timings, and real
+      traffic shapes are not yet measured, and no architecture decision has
+      been made from these numbers.
 - [ ] Continue process-tree portability work beyond the current Unix
       process-group guarantee if non-Unix execution becomes supported.
 

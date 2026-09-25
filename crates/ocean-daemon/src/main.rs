@@ -152,6 +152,10 @@ mod provider_auth;
 mod recall_registry;
 /// In-memory request and permission control records plus bounded lifecycle mutations.
 mod request_control;
+/// Test-only retained-size and slow-client measurements (ROADMAP "Reliability
+/// and scale"); see `docs/specs/2026-09-25-retained-size-and-slow-client-measurements.md`.
+#[cfg(test)]
+mod retained_size_measurements;
 mod room_agent_authority;
 /// Room attachment BYTES: blob path derivation, the size cap, server-minted
 /// ids, and the upload/list/download/delete adapters over `ocean-store`'s index.
