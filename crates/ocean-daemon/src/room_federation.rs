@@ -9654,7 +9654,7 @@ mod tests {
             .unwrap();
         let rooms = Arc::new(std::sync::Mutex::new(store));
         let inner = test_supervisor_inner(rooms.clone());
-        let mut message_rx = inner.room_wakes.test_subscribe();
+        let mut message_rx = inner.room_wakes.test_subscribe(&key);
 
         let row = || WireLedgerRow {
             id: "ledger-ws-1".into(),
@@ -10346,7 +10346,7 @@ mod tests {
         let rooms = Arc::new(std::sync::Mutex::new(store));
         let room_wakes = RoomWakeBus::default();
         let access_wakes = RoomAccessWakeBus::default();
-        let mut message_rx = room_wakes.test_subscribe();
+        let mut message_rx = room_wakes.test_subscribe(&key);
         let mut access_rx = access_wakes.test_subscribe();
         let fake = FakeBedrock::new(key.as_str(), "secret-bearer");
         *fake.members.lock().await = json!({

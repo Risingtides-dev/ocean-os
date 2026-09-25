@@ -10856,3 +10856,12 @@ area:      [docs]
 
 Audited every open line of the Rooms definition-of-done against current code in ocean-os, ocean-surface and ocean-bedrock. Nine lines were already satisfied, so they are marked done with the check that proves each: 1.4 workspace binding, 1.8 agent owners and mentions, 1.9 local time, 1.12 desktop ceremony, deep link and notifications, 2.2 real mention turns, 2.4 thread replies, 3.7 serialized flushes, 5.1 route-doc parity, and 5.6 the room-runtime RPC test. Most were closed by the ocean-surface #211 integration squash, and their "Today:" text had gone stale. Still open with no ruling needed: 1.5 orphaned thread replies (surface PR #197), 1.6 pushed unread state, 2.1 host-matrix test, 4.4 store work off the tokio workers, 5.4 OCEAN_ROOMS_PRODUCT.md, 5.7 the Tauri harness, and 5.8 a daemon-to-surface contract check. The rest wait on live deploys or user rulings.
 _________________________________________________________________________________ 15:51 docs/dod-audit
+
+time:      [15:55] [25-09-26]
+agent:     [claude]
+worktree:  perf/per-room-wake-bus
+type:      [refactor]
+area:      [backend]
+
+Rooms DoD 4.4, per-room wake buses. RoomWakeBus was one daemon-wide broadcast channel with 256 slots, so every open transcript tail woke on every room's message and filtered it out, and a busy room could overflow the shared buffer and force quiet rooms' tails to lag and re-page SQLite for traffic that was never theirs. It now keeps one bounded channel per room: created on first subscribe, skipped by publishes to rooms nobody tails, and pruned once the last receiver leaves. Tails still filter on hint.room as a backstop. Tests prove ten messages in one room neither reach nor overflow another room's receiver on a capacity-2 channel, and that untailed rooms hold no channel. The access and cursor buses stay daemon-wide (low volume), and moving store work off the tokio workers is the open half of 4.4. ocean-daemon 962 tests, clippy -D warnings.
+_________________________________________________________________________________ 15:55 perf/per-room-wake-bus
