@@ -220,17 +220,11 @@ impl ObservatoryStore {
             (0, _) | (_, None) => i64::MAX as u64,
             (_, Some(first)) => first.saturating_sub(1),
         };
-        // LIVE pages only. A DELETE returns pages to SQLite's freelist but not
-        // to the filesystem, so `page_count` alone never shrinks after a prune
-        // and a database that once crossed the bound would read as over it
-        // forever — pruning everything prunable every hour.
-        let db_bytes: u64 = db.query_row(
-            "SELECT (page_count - freelist_count) * page_size
-             FROM pragma_page_count(), pragma_freelist_count(), pragma_page_size()",
-            [],
-            |r| r.get(0),
-        )?;
-        let mut over = db_bytes.saturating_sub(self.retention_policy.max_bytes);
+        let cutoff =
+            chrono::Utc::now() - chrono::Duration::days(self.retention_policy.max_age_days as i64);
+
+        // Age: the contiguous run of oldest prunable events recorded before
+        // the cutoff.
         let mut stmt = db.prepare(
             "SELECT cursor, envelope_json FROM observatory_events WHERE cursor <= ?1 ORDER BY cursor",
         )?;
@@ -240,33 +234,39 @@ impl ObservatoryStore {
             })?
             .collect::<std::result::Result<Vec<_>, _>>()?;
         drop(stmt);
-        let cutoff =
-            chrono::Utc::now() - chrono::Duration::days(self.retention_policy.max_age_days as i64);
         let mut boundary = 0;
         for (cursor, raw) in &rows {
             let event: EventEnvelope = serde_json::from_str(raw)?;
             let old = chrono::DateTime::parse_from_rfc3339(&event.recorded_at)
                 .map(|t| t.with_timezone(&chrono::Utc).lt(&cutoff))
                 .unwrap_or(false);
-            if old || over > 0 {
-                boundary = *cursor;
-                over = over.saturating_sub(raw.len() as u64);
-            } else {
+            if !old {
                 break;
             }
+            boundary = *cursor;
         }
-        if boundary == 0 {
-            return Ok(0);
+        let mut pruned = prune_through(&mut db, boundary)?;
+
+        // Size: while the LIVE pages exceed the bound, prune the next oldest
+        // batch and measure again. Measuring after each delete — rather than
+        // subtracting JSON lengths from a page-measured excess, which ignores
+        // indexes and the never-pruned projection tables — is what keeps one
+        // pass from overshooting the bound. Freed pages go to the freelist
+        // on commit, so `live_bytes` falls as soon as a batch lands.
+        while live_bytes(&db)? > self.retention_policy.max_bytes {
+            let batch_end: Option<u64> = db.query_row(
+                "SELECT MAX(cursor) FROM (SELECT cursor FROM observatory_events
+                 WHERE cursor > ?1 AND cursor <= ?2 ORDER BY cursor LIMIT ?3)",
+                params![boundary, prunable_through, RETENTION_BATCH],
+                |r| r.get(0),
+            )?;
+            let Some(end) = batch_end else {
+                break;
+            };
+            pruned += prune_through(&mut db, end)?;
+            boundary = end;
         }
-        let tx = db.transaction()?;
-        let count = tx.execute(
-            "DELETE FROM observatory_events WHERE cursor <= ?1",
-            [boundary],
-        )?;
-        tx.execute("INSERT INTO retention_archive(pruned_at,from_cursor,to_cursor,count_events) VALUES(?1,?2,?3,?4)", params![chrono::Utc::now().to_rfc3339(), 1u64, boundary, count])?;
-        tx.execute("INSERT INTO watermarks(key,cursor) VALUES('retention_boundary',?1) ON CONFLICT(key) DO UPDATE SET cursor=excluded.cursor", [boundary])?;
-        tx.commit()?;
-        Ok(count)
+        Ok(pruned)
     }
     /// The current projection, labelled with the watermark it actually
     /// reflects (G1). The watermark is read INSIDE the database lock that
@@ -323,6 +323,41 @@ impl ObservatoryStore {
         })
     }
 }
+/// How many events one size-bound step removes before measuring again.
+const RETENTION_BATCH: u64 = 64;
+
+/// Bytes in LIVE database pages. A DELETE returns pages to SQLite's freelist
+/// but not to the filesystem, so `page_count` alone never shrinks after a
+/// prune and a database that once crossed the bound would read as over it
+/// forever.
+fn live_bytes(db: &Connection) -> Result<u64> {
+    Ok(db.query_row(
+        "SELECT (page_count - freelist_count) * page_size
+         FROM pragma_page_count(), pragma_freelist_count(), pragma_page_size()",
+        [],
+        |r| r.get(0),
+    )?)
+}
+
+/// Delete every event at or below `boundary` in one transaction and record
+/// the new retention boundary. `0` is a no-op.
+fn prune_through(db: &mut Connection, boundary: u64) -> Result<usize> {
+    if boundary == 0 {
+        return Ok(0);
+    }
+    let tx = db.transaction()?;
+    let count = tx.execute(
+        "DELETE FROM observatory_events WHERE cursor <= ?1",
+        [boundary],
+    )?;
+    if count > 0 {
+        tx.execute("INSERT INTO retention_archive(pruned_at,from_cursor,to_cursor,count_events) VALUES(?1,?2,?3,?4)", params![chrono::Utc::now().to_rfc3339(), 1u64, boundary, count])?;
+        tx.execute("INSERT INTO watermarks(key,cursor) VALUES('retention_boundary',?1) ON CONFLICT(key) DO UPDATE SET cursor=excluded.cursor", [boundary])?;
+    }
+    tx.commit()?;
+    Ok(count)
+}
+
 fn phase(e: &EventEnvelope) -> String {
     match &e.payload {
         crate::EventPayload::ExecutionAdmitted { phase, .. }
