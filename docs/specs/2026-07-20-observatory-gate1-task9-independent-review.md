@@ -257,4 +257,16 @@ regression test:
   headers and the §7.1 `{error: "unauthorized", message, http_status: 401}`
   body. Test: `routes_require_observer_auth` asserts both.
 
-The delta review this wave requires is recorded in the PR that lands it.
+**Delta review: PASS (2026-09-25, ocean-os PR #486)** — every G closed with
+evidence. One non-gating finding was fixed in the same PR: `append_event`
+now publishes its cursor only after commit, so a refused append never leaves
+the in-memory watermark ahead of the durable log
+(`a_failed_append_does_not_advance_the_cursor`). Open, non-gating:
+
+- The size loop reduces a page-measured excess by raw JSON length, ignoring
+  index overhead and the never-pruned projection tables, so one over-size pass
+  over-prunes; re-measure after the delete or keep a margin. WAL size is not
+  counted.
+- ocean-surface's Replay scrubber asks `snapshot?at=<earlier cursor>`, which
+  now answers 409 (it previously got current state under the wrong label); it
+  must move to `/replay` or be disabled before the renderer relies on it.

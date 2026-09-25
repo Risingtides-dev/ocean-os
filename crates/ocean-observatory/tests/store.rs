@@ -228,3 +228,19 @@ fn a_pass_after_the_size_prune_does_not_prune_again() {
     );
     assert_eq!(s.events_after(Cursor::new(0), None).unwrap().len(), 3);
 }
+
+/// A rejected append (duplicate event id) does not advance the watermark.
+#[test]
+fn a_failed_append_does_not_advance_the_cursor() {
+    let d = tempdir().unwrap();
+    let s = ObservatoryStore::open(&d.path().join("obs.db"), RetentionPolicy::default()).unwrap();
+    s.append_event(event()).unwrap();
+    assert!(
+        s.append_event(event()).is_err(),
+        "duplicate event_id refused"
+    );
+    assert_eq!(s.latest_cursor(), Cursor::new(1));
+    let mut next = event();
+    next.event_id = "event-2".into();
+    assert_eq!(s.append_event(next).unwrap(), Cursor::new(2));
+}

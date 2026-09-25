@@ -86,11 +86,13 @@ impl ObservatoryStore {
     pub fn append_event(&self, mut event: EventEnvelope) -> Result<Cursor> {
         let mut db = self.db.lock();
         let tx = db.transaction()?;
-        let cursor = {
-            let mut c = self.current_cursor.lock();
-            *c = c.next();
-            *c
-        };
+        // The next cursor, published only after the commit below: a failed
+        // insert (a duplicate event_id, a full disk) must not leave the
+        // in-memory watermark ahead of anything durable, where a header or a
+        // snapshot label could name a cursor a restart would reissue. The db
+        // guard held for this whole function keeps the read-then-publish
+        // race-free.
+        let cursor = self.current_cursor.lock().next();
         event.cursor = cursor;
         let json = serde_json::to_string(&event)?;
         tx.execute(
@@ -107,6 +109,7 @@ impl ObservatoryStore {
         }
         tx.execute("INSERT INTO watermarks(key,cursor) VALUES('snapshot_watermark',?1) ON CONFLICT(key) DO UPDATE SET cursor=excluded.cursor",[cursor.into_inner()])?;
         tx.commit()?;
+        *self.current_cursor.lock() = cursor;
         Ok(cursor)
     }
     pub fn latest_cursor(&self) -> Cursor {
