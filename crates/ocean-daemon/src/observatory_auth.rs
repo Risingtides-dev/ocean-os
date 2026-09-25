@@ -72,8 +72,10 @@ impl ObservatoryAuthState {
             Err(error) => {
                 let consecutive = consecutive_failures + 1;
                 let total = metrics.record_observer_token_rotation_failure();
-                let published_token_expired = consecutive
-                    >= ocean_observatory::DEFAULT_TOKEN_LIFETIME_SECS / ROTATION_INTERVAL_SECS;
+                // Multiply rather than floor-divide: with a lifetime that is not
+                // a multiple of the interval, division flags one failure early.
+                let published_token_expired = consecutive * ROTATION_INTERVAL_SECS
+                    >= ocean_observatory::DEFAULT_TOKEN_LIFETIME_SECS;
                 tracing::error!(
                     %error,
                     consecutive_failures = consecutive,

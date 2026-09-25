@@ -493,12 +493,31 @@ fn validate_claims(
 
 /// fsync a directory so entry changes in it (a link, a rename) survive a
 /// crash. The file's own `sync_all` covers its contents, not its name.
+///
+/// Best effort where the filesystem cannot do it: network, FUSE and exFAT
+/// mounts answer a directory sync with EINVAL / ENOTSUP / EBADF, and the
+/// link or rename has already happened by then — refusing to boot, or
+/// reporting a published token as not renewed, would be a false alarm about
+/// a durability guarantee that mount never offered. A real I/O failure
+/// (EIO and the rest) still fails the call.
 fn sync_directory(directory: &Path) -> Result<(), AuthError> {
     #[cfg(test)]
     tests::DIRECTORY_SYNCS.with(|syncs| syncs.borrow_mut().push(directory.to_path_buf()));
-    fs::File::open(directory)
-        .and_then(|handle| handle.sync_all())
-        .map_err(AuthError::secret_io)
+    match fs::File::open(directory).and_then(|handle| handle.sync_all()) {
+        Ok(()) => Ok(()),
+        Err(error) if directory_sync_unsupported(&error) => Ok(()),
+        Err(error) => Err(AuthError::secret_io(error)),
+    }
+}
+
+fn directory_sync_unsupported(error: &std::io::Error) -> bool {
+    matches!(
+        error.raw_os_error(),
+        Some(code) if code == libc::EINVAL
+            || code == libc::ENOTSUP
+            || code == libc::EOPNOTSUPP
+            || code == libc::EBADF
+    )
 }
 
 fn unix_time_now() -> Result<u64, AuthError> {
@@ -526,6 +545,18 @@ fn encode_hex(bytes: &[u8]) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_mount_that_cannot_sync_directories_is_not_a_failure() {
+        for code in [libc::EINVAL, libc::ENOTSUP, libc::EOPNOTSUPP, libc::EBADF] {
+            assert!(super::directory_sync_unsupported(
+                &std::io::Error::from_raw_os_error(code)
+            ));
+        }
+        assert!(!super::directory_sync_unsupported(
+            &std::io::Error::from_raw_os_error(libc::EIO)
+        ));
+    }
+
     use std::os::unix::fs::{symlink, PermissionsExt};
     use std::sync::{Arc, Barrier, Mutex};
     use std::thread;
