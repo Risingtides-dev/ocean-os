@@ -221,3 +221,52 @@ an integration test that `_observation_binding` never appears on the wire, and
   5/5 pass.
 - Direct re-read of every gating claim against `6ba2cef` source (G1–G5
   spot-verified by the consolidating agent).
+
+## Repair wave (2026-09-25)
+
+G1–G5 landed together on branch `fix/observatory-g5-401`, each with its own
+regression test:
+
+- **G1** — `snapshot_at` reads the watermark inside the database lock that
+  `append_event` holds for its whole transaction, and an `at` other than that
+  watermark is `StoreError::HistoricalSnapshot` (daemon: 409
+  `snapshot_not_historical`) instead of current state under an old label. This
+  pins Gate 1 to current-only snapshots; historical projection stays future
+  work. Tests: `snapshot_is_point_in_time_and_tail_from_its_watermark_is_disjoint`,
+  `snapshot_refuses_a_historical_cursor`.
+- **G2** — `ReplayEvent` carries the full §7.3 envelope (`recorded_at`,
+  `truth`, `producer`, `topology`, `correlation`, `visibility`); the SSE tail
+  already sent the whole envelope, so no new field reaches any caller. The
+  §7.2 heartbeat text now says 3 seconds, matching `SSE_KEEPALIVE_INTERVAL`.
+  Test: `replay_pages_events_with_continuation` asserts exactly the twelve
+  fields.
+- **G3** — `apply_retention` uses the manifest cutoff (never past the
+  `first_cursor` of an admitted/running execution, now persisted per node by an
+  additive migration) and measures live database size from SQLite's page
+  accounting minus the freelist (a DELETE frees pages without shrinking the
+  file, so page_count alone would read as over the bound forever); the daemon runs it one minute after boot and hourly on a blocking
+  thread until shutdown (`observatory::run_retention`). Tests:
+  `retention_prunes_old_events_but_keeps_a_live_executions_history`,
+  `retention_enforces_the_size_bound_from_real_db_size`,
+  `scheduled_retention_prunes_and_stops_on_shutdown`,
+  `a_pass_after_the_size_prune_does_not_prune_again`.
+- **G4** — `ObservatoryStore::open` seeds the cursor from the maximum of the
+  surviving events and every `watermarks` row (snapshot watermark and
+  retention boundary). Test: `reopen_after_full_prune_continues_the_cursor`.
+- **G5** — `ObservatoryAuth` rejects with `ObservatoryUnauthorized`: the §7.4
+  headers and the §7.1 `{error: "unauthorized", message, http_status: 401}`
+  body. Test: `routes_require_observer_auth` asserts both.
+
+**Delta review: PASS (2026-09-25, ocean-os PR #486)** — every G closed with
+evidence. One non-gating finding was fixed in the same PR: `append_event`
+now publishes its cursor only after commit, so a refused append never leaves
+the in-memory watermark ahead of the durable log
+(`a_failed_append_does_not_advance_the_cursor`). Open, non-gating:
+
+- The size loop reduces a page-measured excess by raw JSON length, ignoring
+  index overhead and the never-pruned projection tables, so one over-size pass
+  over-prunes; re-measure after the delete or keep a margin. WAL size is not
+  counted.
+- ocean-surface's Replay scrubber asks `snapshot?at=<earlier cursor>`, which
+  now answers 409 (it previously got current state under the wrong label); it
+  must move to `/replay` or be disabled before the renderer relies on it.
