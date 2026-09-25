@@ -3753,6 +3753,7 @@ dependencies = [
  "ocean-agent-sdk",
  "ocean-browser",
  "ocean-hashline",
+ "ocean-minimizer",
  "ocean-protocol",
  "proptest",
  "regex",

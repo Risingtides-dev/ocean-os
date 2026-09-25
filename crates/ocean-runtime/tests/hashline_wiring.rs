@@ -44,6 +44,7 @@ async fn hashline_read_then_edit_roundtrip() {
         hashline: true,
         artifacts: false,
         code_intelligence: true,
+        command_output_minimization: false,
     };
 
     // 1. read emits a [path#HASH] tag.
@@ -115,6 +116,7 @@ async fn repeated_noop_hashline_edit_trips_the_loop_guard() {
         hashline: true,
         artifacts: false,
         code_intelligence: true,
+        command_output_minimization: false,
     };
 
     // Read to record a snapshot + get the live tag.
@@ -191,6 +193,7 @@ async fn non_hashline_profile_is_untagged_and_has_no_edit_tool() {
         hashline: false,
         artifacts: false,
         code_intelligence: true,
+        command_output_minimization: false,
     };
 
     let read = tool_named(&provider, &ctx, "read")

@@ -1360,4 +1360,16 @@ mod tests {
         assert_eq!(thinking_budget(ThinkingLevel::High), Some(16384));
         assert_eq!(thinking_budget(ThinkingLevel::Xhigh), Some(24576));
     }
+
+    #[test]
+    fn bash_argv_schema_fixture_is_carried_verbatim() {
+        let (tool, ctx) = crate::providers::bash_argv_fixture();
+        let body = build_body(&ctx, &StreamOptions::default());
+        let decls = body["tools"][0]["functionDeclarations"]
+            .as_array()
+            .expect("function declarations");
+        assert_eq!(decls.len(), 1);
+        assert_eq!(decls[0]["name"], "bash");
+        assert_eq!(decls[0]["parameters"], tool.parameters);
+    }
 }

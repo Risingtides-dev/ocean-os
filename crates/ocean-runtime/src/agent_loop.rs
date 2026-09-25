@@ -17,9 +17,52 @@ use tracing::{instrument, Instrument};
 
 use crate::error::{AgentError, Result};
 use crate::types::{
-    AgentConfig, AgentEvent, AgentTool, AgentToolResult, PermissionDecision, RetryScope,
-    ToolSideEffect,
+    AgentConfig, AgentEvent, AgentTool, AgentToolResult, PermissionDecision, ProviderProjection,
+    RetryScope, ToolSideEffect,
 };
+
+/// Active-run, provider-request-only tool-result replacements (minimizer M2).
+///
+/// `messages` in [`run_agent_with_history`] is append-only for the life of a
+/// run, so a message's index is its monotonic run-local execution ordinal.
+/// Each override is bound to exactly one ordinal and carries the expected
+/// tool-call id only as a pairing assertion, never as identity — a later round
+/// that reuses a provider id (`call_1`) cannot retarget it. Overrides (and the
+/// artifact leases that keep their recovery URIs reachable) are dropped when
+/// the run returns on success, error, or cancellation; they are never emitted,
+/// checkpointed, or persisted.
+#[derive(Default)]
+struct ProviderOverrides {
+    by_ordinal: HashMap<usize, (String, ProviderProjection)>,
+}
+
+impl ProviderOverrides {
+    fn record(&mut self, ordinal: usize, expected_call_id: &str, projection: ProviderProjection) {
+        self.by_ordinal
+            .insert(ordinal, (expected_call_id.to_string(), projection));
+    }
+
+    /// Clone the provider-valid kept messages, replacing only the exact
+    /// aligned tool results. With no overrides this is exactly the clone the
+    /// loop sent before M2.
+    fn provider_messages(&self, messages: &[Message], kept: &[usize]) -> Vec<Message> {
+        kept.iter()
+            .map(|&ordinal| {
+                let message = &messages[ordinal];
+                match (message, self.by_ordinal.get(&ordinal)) {
+                    (Message::ToolResult(result), Some((expected_id, projection)))
+                        if result.tool_call_id == *expected_id =>
+                    {
+                        let mut projected = result.clone();
+                        projected.content = cap_tool_content(projection.content.clone());
+                        Message::ToolResult(projected)
+                    }
+                    _ => message.clone(),
+                }
+            })
+            .collect()
+    }
+}
 
 const DYNAMIC_SEARCH_TOOL: &str = "search_tools";
 const MAX_DYNAMIC_TOOLS: usize = 16;
@@ -481,6 +524,10 @@ pub async fn run_agent_with_history(
     // delta since the previous valid boundary, avoiding a full-history clone on
     // every browser/tool round while preserving provider ordering.
     let mut checkpointed_messages = messages.len();
+    // Minimizer M2 provider-only projections for this run (empty unless the
+    // default-off gate produced one). Dropped — releasing every artifact pin —
+    // on every return path.
+    let mut provider_overrides = ProviderOverrides::default();
 
     'outer: while turn < config.max_turns {
         // Honor a cancellation request before starting another round. The daemon
@@ -547,12 +594,13 @@ pub async fn run_agent_with_history(
         } else {
             tool_defs.clone()
         };
-        let trimmed_messages = trim_to_context_window(
+        let kept = trim_indices_to_context_window(
             &messages,
             &system_prompt,
             config.model.context_window,
             config.model.max_tokens,
         );
+        let trimmed_messages = provider_overrides.provider_messages(&messages, &kept);
         let dynamic_tool_declarations = if dynamic_tool_mode {
             dynamic_declarations_for_messages(&trimmed_messages, &loaded_state, &tool_defs)
         } else {
@@ -1115,7 +1163,7 @@ pub async fn run_agent_with_history(
                     unreachable!("segment holds only Run entries");
                 };
                 let outcome = outcome.expect("every segment member completed");
-                if finalize_outcome(&mut messages, id, name, outcome) {
+                if finalize_outcome(&mut messages, &mut provider_overrides, id, name, outcome) {
                     any_terminate = true;
                 }
             }
@@ -1154,7 +1202,13 @@ pub async fn run_agent_with_history(
                         Gated::Run { id, name, .. } => {
                             let cancelled =
                                 cancelled_tool_outcome("cancelled before tool execution started");
-                            let _ = finalize_outcome(&mut messages, id, name, cancelled);
+                            let _ = finalize_outcome(
+                                &mut messages,
+                                &mut provider_overrides,
+                                id,
+                                name,
+                                cancelled,
+                            );
                         }
                     }
                 }
@@ -1285,6 +1339,8 @@ struct Outcome {
     terminate: bool,
     side_effects: Vec<ToolSideEffect>,
     details: Value,
+    /// Sealed minimizer M2 provider-only projection, never emitted.
+    projection: Option<ProviderProjection>,
 }
 
 fn cancelled_tool_outcome(message: &str) -> Outcome {
@@ -1294,6 +1350,7 @@ fn cancelled_tool_outcome(message: &str) -> Outcome {
         terminate: false,
         side_effects: Vec::new(),
         details: serde_json::json!({ "cancelled": true }),
+        projection: None,
     }
 }
 
@@ -1319,25 +1376,33 @@ async fn run_one(
         tool_call_id = %id
     );
     match tool {
-        Some(tool) => match tool.execute(&id, args).instrument(tool_span).await {
-            Ok(AgentToolResult {
-                content,
-                details,
-                terminate,
-                side_effects,
-            }) => Outcome {
-                content,
-                is_error: false,
-                terminate,
-                side_effects,
-                details,
-            },
+        Some(tool) => match tool.execute_for_run(&id, args).instrument(tool_span).await {
+            Ok(execution) => {
+                let (
+                    AgentToolResult {
+                        content,
+                        details,
+                        terminate,
+                        side_effects,
+                    },
+                    projection,
+                ) = execution.into_parts();
+                Outcome {
+                    content,
+                    is_error: false,
+                    terminate,
+                    side_effects,
+                    details,
+                    projection,
+                }
+            }
             Err(e) => Outcome {
                 content: vec![Content::text(format!("tool error: {e}"))],
                 is_error: true,
                 terminate: false,
                 side_effects: Vec::new(),
                 details: Value::Null,
+                projection: None,
             },
         },
         None => Outcome {
@@ -1346,6 +1411,7 @@ async fn run_one(
             terminate: false,
             side_effects: Vec::new(),
             details: Value::Null,
+            projection: None,
         },
     }
 }
@@ -1452,12 +1518,20 @@ fn emit_outcome_events(
 /// every future turn of the session, so an uncapped dump would be paid for in
 /// input tokens indefinitely. Returns whether the tool asked to terminate the
 /// run. The live `ToolExecutionEnd` was already emitted (completion order) by
-/// [`emit_outcome_events`].
-fn finalize_outcome(messages: &mut Vec<Message>, id: &str, name: &str, outcome: Outcome) -> bool {
+/// [`emit_outcome_events`]. A minimizer M2 projection is bound to the pushed
+/// message's ordinal for provider requests only; the pushed row stays raw.
+fn finalize_outcome(
+    messages: &mut Vec<Message>,
+    overrides: &mut ProviderOverrides,
+    id: &str,
+    name: &str,
+    outcome: Outcome,
+) -> bool {
     let Outcome {
         content,
         is_error,
         terminate,
+        projection,
         ..
     } = outcome;
     let tr = ToolResultMessage {
@@ -1468,6 +1542,9 @@ fn finalize_outcome(messages: &mut Vec<Message>, id: &str, name: &str, outcome: 
         timestamp: ocean_protocol::now_ms(),
     };
     messages.push(Message::ToolResult(tr));
+    if let Some(projection) = projection {
+        overrides.record(messages.len() - 1, id, projection);
+    }
     terminate
 }
 
@@ -1627,6 +1704,21 @@ pub fn trim_to_context_window(
     context_window: u32,
     max_tokens: u32,
 ) -> Vec<Message> {
+    trim_indices_to_context_window(messages, system_prompt, context_window, max_tokens)
+        .into_iter()
+        .map(|index| messages[index].clone())
+        .collect()
+}
+
+/// [`trim_to_context_window`] expressed as the ordered indices of the kept
+/// messages, so request-only projections stay aligned to exact transcript
+/// ordinals through every trim.
+fn trim_indices_to_context_window(
+    messages: &[Message],
+    system_prompt: &str,
+    context_window: u32,
+    max_tokens: u32,
+) -> Vec<usize> {
     if messages.is_empty() {
         return Vec::new();
     }
@@ -1686,8 +1778,8 @@ pub fn trim_to_context_window(
     // input shape, not just the well-ordered call-then-result histories the
     // loop normally produces.
     let mut seen_calls: HashSet<&str> = HashSet::new();
-    let mut out: Vec<Message> = Vec::with_capacity(suffix.len());
-    for msg in suffix {
+    let mut out: Vec<usize> = Vec::with_capacity(suffix.len());
+    for (offset, msg) in suffix.iter().enumerate() {
         if let Message::Assistant(a) = msg {
             for c in &a.content {
                 if let Content::ToolCall { id, .. } = c {
@@ -1700,18 +1792,17 @@ pub fn trim_to_context_window(
                 continue; // orphan — its ToolCall is not in the kept window
             }
         }
-        out.push(msg.clone());
+        out.push(keep_from + offset);
     }
     // Last resort: if every kept message was an orphan tool result (a history
     // whose final tool result has no matching call anywhere), keep the most
     // recent non-tool-result message so we never hand back an empty request.
     if out.is_empty() && !messages.is_empty() {
-        if let Some(msg) = messages
+        if let Some(index) = messages
             .iter()
-            .rev()
-            .find(|m| !matches!(m, Message::ToolResult(_)))
+            .rposition(|m| !matches!(m, Message::ToolResult(_)))
         {
-            out.push(msg.clone());
+            out.push(index);
         }
     }
 
@@ -2403,9 +2494,16 @@ mod tests {
                     "index": index,
                     "blob": details_blob,
                 }),
+                projection: None,
             };
             emit_outcome_events(&events, &sid, &call_id, "stress_tool", &outcome);
-            let terminate = finalize_outcome(&mut messages, &call_id, "stress_tool", outcome);
+            let terminate = finalize_outcome(
+                &mut messages,
+                &mut ProviderOverrides::default(),
+                &call_id,
+                "stress_tool",
+                outcome,
+            );
             assert!(!terminate);
         }
 
@@ -2526,5 +2624,97 @@ mod tests {
                 "unset session must stay None: {ev:?}"
             );
         }
+    }
+
+    fn call_message(id: &str) -> Message {
+        Message::Assistant(AssistantMessage {
+            content: vec![Content::ToolCall {
+                id: id.into(),
+                name: "bash".into(),
+                arguments: serde_json::json!({}),
+            }],
+            api: "mock".into(),
+            provider: "mock".into(),
+            model: "mock".into(),
+            usage: Usage::default(),
+            stop_reason: StopReason::ToolUse,
+            error_message: None,
+            timestamp: 0,
+        })
+    }
+
+    fn projection(store: &crate::artifacts::SharedArtifacts, text: &str) -> ProviderProjection {
+        ProviderProjection {
+            content: vec![Content::text(text)],
+            lease: crate::artifacts::PinBudget::default()
+                .pin(store, "bash", "raw".into())
+                .expect("pin"),
+        }
+    }
+
+    fn result_text(message: &Message) -> String {
+        match message {
+            Message::ToolResult(r) => r.content[0].as_text().unwrap().to_string(),
+            _ => panic!("expected a tool result"),
+        }
+    }
+
+    /// Minimizer M2: overrides bind to exact ordinals. A repeated provider id
+    /// cannot retarget a projection, trimming away the bound row drops the
+    /// projection with it, and a pairing mismatch fails open to raw.
+    #[test]
+    fn provider_overrides_bind_to_ordinals_not_repeated_call_ids() {
+        let store = crate::artifacts::new_shared();
+        let messages = vec![
+            user("go"),
+            call_message("call_1"),
+            tool_result("call_1", "RAW-A"),
+            call_message("call_1"),
+            tool_result("call_1", "RAW-B"),
+        ];
+        let mut overrides = ProviderOverrides::default();
+        overrides.record(2, "call_1", projection(&store, "MIN-A"));
+
+        let all: Vec<usize> = (0..messages.len()).collect();
+        let sent = overrides.provider_messages(&messages, &all);
+        assert_eq!(result_text(&sent[2]), "MIN-A");
+        assert_eq!(result_text(&sent[4]), "RAW-B", "same id, different ordinal");
+        assert_eq!(result_text(&messages[2]), "RAW-A", "authority stays raw");
+
+        let trimmed = overrides.provider_messages(&messages, &[3, 4]);
+        assert_eq!(trimmed.len(), 2);
+        assert_eq!(result_text(&trimmed[1]), "RAW-B");
+
+        let mut mismatched = ProviderOverrides::default();
+        mismatched.record(4, "call_other", projection(&store, "MIN-X"));
+        let sent = mismatched.provider_messages(&messages, &all);
+        assert_eq!(
+            result_text(&sent[4]),
+            "RAW-B",
+            "pairing mismatch fails open"
+        );
+
+        drop(overrides);
+        drop(mismatched);
+        assert_eq!(store.lock().unwrap().pinned_len(), 0, "leases released");
+    }
+
+    /// With no overrides the provider clone is exactly the pre-M2 trimmed clone.
+    #[test]
+    fn empty_overrides_reproduce_the_legacy_trimmed_clone() {
+        let mut messages = vec![user("go")];
+        for i in 0..40 {
+            messages.push(call_message(&format!("c{i}")));
+            messages.push(tool_result(&format!("c{i}"), &"x".repeat(2_000)));
+        }
+        messages.push(user("again"));
+        let legacy = trim_to_context_window(&messages, "sys", 8_000, 1_000);
+        let kept = trim_indices_to_context_window(&messages, "sys", 8_000, 1_000);
+        let sent = ProviderOverrides::default().provider_messages(&messages, &kept);
+        assert!(sent.len() < messages.len(), "the window really trimmed");
+        assert_eq!(
+            serde_json::to_value(&sent).unwrap(),
+            serde_json::to_value(&legacy).unwrap()
+        );
     }
 }

@@ -1,0 +1,15 @@
+{
+  "type": "object",
+  "properties": {
+    "command": {
+      "type": "string",
+      "description": "Shell source run via `bash -lc`. Provide exactly one of `command` or `argv`."
+    },
+    "argv": {
+      "type": "array",
+      "items": {"type": "string"},
+      "description": "Program and arguments executed directly without a shell: no aliases, functions, expansion, redirection, or pipes. Provide exactly one of `command` or `argv`."
+    },
+    "timeout_ms": {"type": "integer", "default": 120000}
+  }
+}

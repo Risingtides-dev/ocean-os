@@ -2086,4 +2086,14 @@ mod tests {
         r2.on_done(&json!({"type": "reasoning"}), &mut next);
         assert!(r2.finalize().is_empty(), "id-less items can't be replayed");
     }
+
+    #[test]
+    fn bash_argv_schema_fixture_is_carried_verbatim() {
+        let (tool, ctx) = crate::providers::bash_argv_fixture();
+        let body = build_body(&codex_model(), &ctx, &StreamOptions::default());
+        let tools = body["tools"].as_array().expect("tools array");
+        assert_eq!(tools.len(), 1);
+        assert_eq!(tools[0]["name"], "bash");
+        assert_eq!(tools[0]["parameters"], tool.parameters);
+    }
 }

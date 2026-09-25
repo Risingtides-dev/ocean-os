@@ -54,6 +54,11 @@ This crate owns the multi-provider LLM wire protocol layer for Anthropic, OpenAI
   is a fixed `RetryReason` vocabulary classified from the error type — never
   provider body text, which is attacker-influenced, unbounded, and fans out to
   every connected client.
+- Tool `parameters` are carried verbatim by every provider encoder. The minimizer
+  M2 plain-object `command`/`argv` Bash schema fixture
+  (`tests/fixtures/bash_argv_tool_schema.json`) is pinned against Anthropic,
+  OpenAI, Codex, and Gemini request bodies and must match `ocean-runtime`'s
+  `argv_mode_parameters()`; do not add provider-specific schema rewriting.
 - `OCEAN_PROMPT_CAPTURE_DIR` is an opt-in local diagnostics path: capture the
   complete serialized JSON body only (never request headers or endpoint URLs),
   warn-and-continue on capture failures, and retain owner-only permissions

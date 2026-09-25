@@ -15,8 +15,15 @@
 //! is evicted first. A single artifact larger than the byte cap is kept anyway
 //! (the model must be able to read back the thing the notice pointed it at) —
 //! the byte cap only evicts *older* entries, never the sole/just-added one.
+//!
+//! Turn-pinned entries (minimizer M2): an active agent run may pin the exact raw
+//! text behind a provider-only minimized projection through a [`PinBudget`].
+//! Pinned entries are skipped by ordinary eviction until their
+//! [`ArtifactLease`] drops, bounded per run by [`MAX_PINNED_ENTRIES_PER_RUN`] and
+//! [`MAX_PINNED_BYTES_PER_RUN`]; dropping a lease immediately reapplies normal
+//! eviction. Pins never outlive the in-memory store and are never persisted.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::{Arc, Mutex};
 
 /// Total bytes retained across all artifacts in one session before the oldest
@@ -27,6 +34,12 @@ pub const MAX_TOTAL_BYTES: usize = 8 * 1024 * 1024;
 /// Max number of artifacts retained in one session before the oldest is
 /// evicted, independent of byte size.
 pub const MAX_ENTRIES: usize = 64;
+
+/// Max artifacts one active run may hold pinned at once (minimizer M2).
+pub const MAX_PINNED_ENTRIES_PER_RUN: usize = 32;
+
+/// Max original bytes one active run may hold pinned at once (minimizer M2).
+pub const MAX_PINNED_BYTES_PER_RUN: usize = 1024 * 1024;
 
 /// One spilled tool output.
 #[derive(Debug, Clone)]
@@ -55,6 +68,8 @@ pub struct ArtifactStore {
     total_bytes: usize,
     max_total_bytes: usize,
     max_entries: usize,
+    /// Ids held by a live [`ArtifactLease`]; ordinary eviction skips them.
+    pinned: HashSet<String>,
 }
 
 impl Default for ArtifactStore {
@@ -74,27 +89,50 @@ impl ArtifactStore {
             total_bytes: 0,
             max_total_bytes,
             max_entries,
+            pinned: HashSet::new(),
         }
     }
 
     /// Spill `text` produced by `tool`, returning the new artifact id. Enforces
     /// the count + byte bounds afterwards, evicting oldest-first.
     pub fn put(&mut self, tool: impl Into<String>, text: impl Into<String>) -> String {
+        self.insert(tool.into(), text.into(), false)
+    }
+
+    fn insert(&mut self, tool: String, text: String, pin: bool) -> String {
         self.seq += 1;
         let id = format!("a{}", self.seq);
-        let text = text.into();
         let bytes = text.len();
         let artifact = Artifact {
             id: id.clone(),
-            tool: tool.into(),
+            tool,
             created_seq: self.seq,
             text,
         };
         self.total_bytes += bytes;
         self.entries.insert(id.clone(), artifact);
         self.order.push_back(id.clone());
+        if pin {
+            self.pinned.insert(id.clone());
+        }
         self.evict();
         id
+    }
+
+    /// Whether `id` is currently held by a live [`ArtifactLease`].
+    pub fn is_pinned(&self, id: &str) -> bool {
+        self.pinned.contains(id)
+    }
+
+    /// Number of artifacts currently held by live leases.
+    pub fn pinned_len(&self) -> usize {
+        self.pinned.len()
+    }
+
+    fn unpin(&mut self, id: &str) {
+        if self.pinned.remove(id) {
+            self.evict();
+        }
     }
 
     /// Fetch an artifact by id.
@@ -128,6 +166,8 @@ impl ArtifactStore {
     /// Enforce bounds: drop oldest entries until under the count cap, then under
     /// the byte cap. The byte cap never evicts the last remaining entry — a lone
     /// artifact bigger than the cap is kept so the model can still read it back.
+    /// Pinned entries are skipped; they may hold the store above its ordinary
+    /// targets only within the explicit per-run pin bounds.
     fn evict(&mut self) {
         while self.entries.len() > self.max_entries {
             if !self.pop_oldest() {
@@ -141,10 +181,18 @@ impl ArtifactStore {
         }
     }
 
-    /// Remove the oldest live artifact. Returns false if there was nothing to
-    /// remove (order queue drained).
+    /// Remove the oldest live, unpinned artifact other than the newest one.
+    /// Returns false if nothing is evictable (only the newest entry remains or
+    /// every older entry is pinned). Never evicting the newest entry keeps the
+    /// just-added artifact reachable even when pins hold older bytes.
     fn pop_oldest(&mut self) -> bool {
-        while let Some(id) = self.order.pop_front() {
+        let mut index = 0;
+        while index + 1 < self.order.len() {
+            if self.pinned.contains(&self.order[index]) {
+                index += 1;
+                continue;
+            }
+            let id = self.order.remove(index).expect("index is in bounds");
             if let Some(a) = self.entries.remove(&id) {
                 self.total_bytes = self.total_bytes.saturating_sub(a.text.len());
                 return true;
@@ -163,6 +211,116 @@ pub type SharedArtifacts = Arc<Mutex<ArtifactStore>>;
 /// Create a fresh shared store with production bounds.
 pub fn new_shared() -> SharedArtifacts {
     Arc::new(Mutex::new(ArtifactStore::default()))
+}
+
+#[derive(Debug, Default)]
+struct PinUsage {
+    entries: usize,
+    bytes: usize,
+}
+
+/// Per-run accounting for turn-pinned artifacts (minimizer M2).
+///
+/// Counts only pins whose [`ArtifactLease`] is still alive, so the bounds are
+/// "at most N entries / B bytes pinned by this run at any moment". A lease drop
+/// returns its share. Cloning shares the same accounting.
+#[derive(Debug, Clone)]
+pub struct PinBudget {
+    usage: Arc<Mutex<PinUsage>>,
+    max_entries: usize,
+    max_bytes: usize,
+}
+
+impl Default for PinBudget {
+    fn default() -> Self {
+        Self::new(MAX_PINNED_ENTRIES_PER_RUN, MAX_PINNED_BYTES_PER_RUN)
+    }
+}
+
+impl PinBudget {
+    /// Budget with explicit bounds; production uses [`PinBudget::default`].
+    pub fn new(max_entries: usize, max_bytes: usize) -> Self {
+        Self {
+            usage: Arc::new(Mutex::new(PinUsage::default())),
+            max_entries,
+            max_bytes,
+        }
+    }
+
+    /// Atomically store `text` in `store` and pin it for the lease's lifetime.
+    ///
+    /// Fails open (`None`, and no artifact is created) when the budget cannot
+    /// accept the entry or either lock is poisoned.
+    pub fn pin(&self, store: &SharedArtifacts, tool: &str, text: String) -> Option<ArtifactLease> {
+        let bytes = text.len();
+        {
+            let mut usage = self.usage.lock().ok()?;
+            if usage.entries + 1 > self.max_entries || usage.bytes + bytes > self.max_bytes {
+                return None;
+            }
+            usage.entries += 1;
+            usage.bytes += bytes;
+        }
+        let id = match store.lock() {
+            Ok(mut store) => store.insert(tool.to_string(), text, true),
+            Err(_) => {
+                self.release(bytes);
+                return None;
+            }
+        };
+        Some(ArtifactLease {
+            store: store.clone(),
+            id,
+            bytes,
+            budget: self.clone(),
+        })
+    }
+
+    /// Live pinned entries and bytes charged to this budget.
+    pub fn usage(&self) -> (usize, usize) {
+        self.usage
+            .lock()
+            .map(|usage| (usage.entries, usage.bytes))
+            .unwrap_or((0, 0))
+    }
+
+    fn release(&self, bytes: usize) {
+        let mut usage = match self.usage.lock() {
+            Ok(usage) => usage,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        usage.entries = usage.entries.saturating_sub(1);
+        usage.bytes = usage.bytes.saturating_sub(bytes);
+    }
+}
+
+/// Keeps one turn-pinned artifact reachable. Dropping it unpins the entry,
+/// reapplies ordinary eviction, and returns the budget share.
+#[derive(Debug)]
+pub struct ArtifactLease {
+    store: SharedArtifacts,
+    id: String,
+    bytes: usize,
+    budget: PinBudget,
+}
+
+impl ArtifactLease {
+    /// Opaque artifact id, the token in `read artifact://<id>`.
+    pub fn id(&self) -> &str {
+        &self.id
+    }
+}
+
+impl Drop for ArtifactLease {
+    fn drop(&mut self) {
+        let mut store = match self.store.lock() {
+            Ok(store) => store,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        store.unpin(&self.id);
+        drop(store);
+        self.budget.release(self.bytes);
+    }
 }
 
 #[cfg(test)]
@@ -229,6 +387,68 @@ mod tests {
         let id = s.put("t", "this is way bigger than four bytes");
         assert_eq!(s.len(), 1, "lone oversize entry kept");
         assert!(s.get(&id).is_some());
+    }
+
+    #[test]
+    fn pinned_entries_survive_count_and_byte_pressure_until_the_lease_drops() {
+        let store: SharedArtifacts = Arc::new(Mutex::new(ArtifactStore::new(8, 2)));
+        let budget = PinBudget::default();
+        let lease = budget.pin(&store, "bash", "pinned".into()).expect("pin");
+        assert_eq!(lease.id(), "a1");
+        for text in ["aaaa", "bbbb", "cccc"] {
+            store.lock().unwrap().put("t", text);
+        }
+        {
+            let s = store.lock().unwrap();
+            assert!(s.get("a1").is_some(), "pinned entry skipped by eviction");
+            assert!(s.is_pinned("a1"));
+            assert_eq!(budget.usage(), (1, 6));
+        }
+        drop(lease);
+        let s = store.lock().unwrap();
+        assert!(
+            s.get("a1").is_none(),
+            "unpin reapplies eviction immediately"
+        );
+        assert_eq!(s.pinned_len(), 0);
+        assert_eq!(budget.usage(), (0, 0));
+    }
+
+    #[test]
+    fn pin_budget_fails_open_without_creating_an_artifact() {
+        let store = new_shared();
+        let budget = PinBudget::new(1, 10);
+        let _held = budget.pin(&store, "bash", "12345".into()).expect("fits");
+        assert!(
+            budget.pin(&store, "bash", "x".into()).is_none(),
+            "entry cap"
+        );
+        let bytes = PinBudget::new(4, 10);
+        assert!(
+            bytes.pin(&store, "bash", "x".repeat(11)).is_none(),
+            "byte cap"
+        );
+        assert_eq!(store.lock().unwrap().len(), 1, "no artifact on refusal");
+    }
+
+    #[test]
+    fn production_pin_bounds_are_fixed() {
+        assert_eq!(MAX_PINNED_ENTRIES_PER_RUN, 32);
+        assert_eq!(MAX_PINNED_BYTES_PER_RUN, 1024 * 1024);
+    }
+
+    #[test]
+    fn poisoned_store_fails_open_and_returns_budget() {
+        let store = new_shared();
+        let poisoner = store.clone();
+        let _ = std::thread::spawn(move || {
+            let _guard = poisoner.lock().unwrap();
+            panic!("poison the store");
+        })
+        .join();
+        let budget = PinBudget::default();
+        assert!(budget.pin(&store, "bash", "x".into()).is_none());
+        assert_eq!(budget.usage(), (0, 0));
     }
 
     #[test]

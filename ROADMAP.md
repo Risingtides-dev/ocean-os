@@ -144,7 +144,20 @@ Ocean ports mechanisms into current owners rather than reproducing OMP package b
       tokenized model-invoked Bash argv, keeps live/checkpoint/session history raw, minimizes only
       active-run provider request clones, and pins exact recovery artifacts for that run; design
       acceptance did not enable a harness-profile capability.
-- [ ] Implement the reviewed minimizer M2 design as a characterization-first checkpoint.
+- [x] Implement the reviewed minimizer M2 design as a characterization-first checkpoint (M2a
+      characterization + M2b runtime mechanism in `ocean-runtime`). It sits behind
+      `SessionContext::command_output_minimization`, which defaults off and which no daemon or
+      agent path sets, so nothing is live; the argv schema is offered only under that gate.
+- [ ] Minimizer M2c: after fresh review of the M2b checkpoint and its recorded open decisions
+      (argv exposure policy, `SpillingTool::concurrency` forwarding, `default-members`), thread
+      the third effective capability daemon → `PromptControl` → `SessionContext` per the design
+      matrix. Only this step may describe minimization as live. The M2b review
+      (2026-09-25, PR #493: approve, gate-OFF byte-for-byte) adds gate-ON
+      prerequisites: argv mode must refuse non-eligible `argv[0]` and resolve
+      PATH the way `bash -lc` does (a launchd daemon's bare PATH finds
+      `/usr/bin/git`, not Homebrew's, and no `cargo`); permission prompts must
+      render an argv call (they read `args.command` today); and the concurrency
+      forwarding fix is its own checkpoint (design line 165).
 - [x] Port the standalone shared walker mechanism as an independent M1 crate. It is
       intentionally outside `default-members`; only the standalone typed-search crate consumes it,
       and neither crate is wired into production runtime capabilities.

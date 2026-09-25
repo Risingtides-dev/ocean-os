@@ -11,11 +11,12 @@ pub mod artifacts;
 pub mod capability;
 pub mod error;
 pub mod fake_tool_provider;
+mod output_economy;
 pub mod tools;
 pub mod types;
 
 pub use agent_loop::{run_agent, run_agent_with_history, AgentRun};
-pub use artifacts::{Artifact, ArtifactStore, SharedArtifacts};
+pub use artifacts::{Artifact, ArtifactLease, ArtifactStore, PinBudget, SharedArtifacts};
 pub use capability::{
     BuiltinProvider, CapabilityProvider, CapabilityRegistry, ProviderHealth, SessionContext,
     SharedTool,
@@ -27,5 +28,5 @@ pub use fake_tool_provider::{
 };
 pub use types::{
     tool_def, AgentConfig, AgentEvent, AgentTool, AgentToolResult, AllowAllPolicy, Concurrency,
-    PermissionDecision, PermissionPolicy,
+    PermissionDecision, PermissionPolicy, ToolExecutionResult,
 };

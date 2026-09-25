@@ -2304,6 +2304,10 @@ impl AgentRuntime {
             hashline: hashline_edits,
             artifacts: artifact_spill,
             code_intelligence,
+            // Minimizer M2 is a runtime-only, default-off checkpoint: no
+            // `PromptControl`/harness-profile field feeds this gate until the
+            // separately reviewed M2c profile wiring lands.
+            command_output_minimization: false,
         };
         let tools = self.capabilities.tools_for_session(&tool_ctx).await;
         // `tools_disabled` is a fail-closed authorization boundary. Unlike an

@@ -2794,4 +2794,14 @@ mod tests {
         assert!(chunk.usage.is_none());
         assert!(chunk.error.is_none());
     }
+
+    #[test]
+    fn bash_argv_schema_fixture_is_carried_verbatim() {
+        let (tool, ctx) = crate::providers::bash_argv_fixture();
+        let body = build_body(&openai_model(), &ctx, &StreamOptions::default()).expect("body");
+        let tools = body["tools"].as_array().expect("tools array");
+        assert_eq!(tools.len(), 1);
+        assert_eq!(tools[0]["function"]["name"], "bash");
+        assert_eq!(tools[0]["function"]["parameters"], tool.parameters);
+    }
 }

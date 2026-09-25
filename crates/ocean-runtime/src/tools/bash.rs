@@ -18,6 +18,83 @@ const MAX_CAPTURE_BYTES: usize = 2 * 1024 * 1024;
 
 pub struct BashTool {
     cwd: Option<PathBuf>,
+    /// Minimizer M2 additive argv mode. Off by default: the tool then offers
+    /// exactly the legacy `command`-only schema and argument handling. The
+    /// built-in provider enables it only for turns whose `SessionContext`
+    /// carries the (default-off) command-output-minimization gate.
+    argv_mode: bool,
+}
+
+/// Description offered when argv mode is enabled.
+const ARGV_MODE_DESCRIPTION: &str =
+    "Run a command. Provide exactly one of `command` (shell source run via \
+`bash -lc <cmd>`) or `argv` (a program and its arguments executed directly, \
+with no shell). Returns combined stdout/stderr and exit code.";
+
+/// The provider-portable plain-object schema offered in argv mode: optional
+/// `command`, optional string-array `argv`, optional `timeout_ms`, no
+/// `oneOf`/`anyOf`/`required`. The XOR contract is stated in the descriptions
+/// and enforced at runtime before spawn.
+pub fn argv_mode_parameters() -> Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "command": {
+                "type": "string",
+                "description": "Shell source run via `bash -lc`. Provide exactly one of `command` or `argv`."
+            },
+            "argv": {
+                "type": "array",
+                "items": {"type": "string"},
+                "description": "Program and arguments executed directly without a shell: no aliases, functions, expansion, redirection, or pipes. Provide exactly one of `command` or `argv`."
+            },
+            "timeout_ms": {"type": "integer", "default": 120000}
+        }
+    })
+}
+
+/// Which execution mode a validated argv-mode call selected.
+enum Invocation<'a> {
+    Command(&'a str),
+    Argv(Vec<&'a str>),
+}
+
+/// Validate the argv-mode XOR contract before anything is spawned.
+fn parse_argv_mode_args(args: &Value) -> Result<Invocation<'_>, String> {
+    let command = args.get("command").filter(|v| !v.is_null());
+    let argv = args.get("argv").filter(|v| !v.is_null());
+    match (command, argv) {
+        (Some(_), Some(_)) => Err("provide exactly one of 'command' or 'argv', not both".into()),
+        (None, None) => Err("provide exactly one of 'command' or 'argv'".into()),
+        (Some(command), None) => command
+            .as_str()
+            .map(Invocation::Command)
+            .ok_or_else(|| "'command' must be a string".into()),
+        (None, Some(argv)) => {
+            let items = argv
+                .as_array()
+                .ok_or("'argv' must be an array of strings")?;
+            let tokens = items
+                .iter()
+                .map(|item| item.as_str().ok_or("'argv' must be an array of strings"))
+                .collect::<Result<Vec<_>, _>>()?;
+            match tokens.first() {
+                None => Err("'argv' must not be empty".into()),
+                Some(&"") => Err("'argv' executable must not be empty".into()),
+                Some(_) => Ok(Invocation::Argv(tokens)),
+            }
+        }
+    }
+}
+
+/// The already-validated direct argv of an argv-mode call, when the call used
+/// `argv` (never `command`). Used by the output-economy wrapper to derive M1
+/// invocation identity; returns `None` for every other shape.
+pub(crate) fn direct_argv(args: &Value) -> Option<Vec<String>> {
+    match parse_argv_mode_args(args).ok()? {
+        Invocation::Argv(tokens) => Some(tokens.into_iter().map(str::to_owned).collect()),
+        Invocation::Command(_) => None,
+    }
 }
 
 /// Unix shell commands run in their own process group. Dropping an in-flight
@@ -69,11 +146,29 @@ impl Default for BashTool {
 
 impl BashTool {
     pub fn new() -> Self {
-        Self { cwd: None }
+        Self {
+            cwd: None,
+            argv_mode: false,
+        }
     }
 
     pub fn for_cwd(cwd: PathBuf) -> Self {
-        Self { cwd: Some(cwd) }
+        Self {
+            cwd: Some(cwd),
+            argv_mode: false,
+        }
+    }
+
+    /// Enable the additive, explicitly tokenized `argv` mode (minimizer M2).
+    #[must_use]
+    pub fn with_argv_mode(mut self) -> Self {
+        self.argv_mode = true;
+        self
+    }
+
+    /// Whether the additive `argv` mode is enabled for this instance.
+    pub fn argv_mode(&self) -> bool {
+        self.argv_mode
     }
 }
 
@@ -112,9 +207,16 @@ impl AgentTool for BashTool {
         true
     }
     fn description(&self) -> &str {
-        "Run a shell command via `bash -lc <cmd>`. Returns combined stdout/stderr and exit code."
+        if self.argv_mode {
+            ARGV_MODE_DESCRIPTION
+        } else {
+            "Run a shell command via `bash -lc <cmd>`. Returns combined stdout/stderr and exit code."
+        }
     }
     fn parameters(&self) -> Value {
+        if self.argv_mode {
+            return argv_mode_parameters();
+        }
         json!({
             "type": "object",
             "properties": {
@@ -125,17 +227,47 @@ impl AgentTool for BashTool {
         })
     }
     async fn execute(&self, _id: &str, args: Value) -> Result<AgentToolResult, String> {
-        let cmd = args
-            .get("command")
-            .and_then(|v| v.as_str())
-            .ok_or("missing 'command'")?;
         let timeout_ms = args
             .get("timeout_ms")
             .and_then(|v| v.as_u64())
             .unwrap_or(120_000);
+        let command = if self.argv_mode {
+            match parse_argv_mode_args(&args)? {
+                Invocation::Command(cmd) => shell_command(cmd),
+                Invocation::Argv(tokens) => {
+                    // Direct execution: no shell, alias, function, expansion,
+                    // redirection, pipeline, or re-tokenization.
+                    let mut command = Command::new(tokens[0]);
+                    command.args(&tokens[1..]);
+                    command
+                }
+            }
+        } else {
+            let cmd = args
+                .get("command")
+                .and_then(|v| v.as_str())
+                .ok_or("missing 'command'")?;
+            shell_command(cmd)
+        };
+        self.run_captured(command, timeout_ms).await
+    }
+}
 
-        let mut command = Command::new("bash");
-        command.arg("-lc").arg(cmd);
+fn shell_command(cmd: &str) -> Command {
+    let mut command = Command::new("bash");
+    command.arg("-lc").arg(cmd);
+    command
+}
+
+impl BashTool {
+    /// Shared capture path for both modes: cwd, closed stdin, piped streams,
+    /// timeout, Unix process group, `kill_on_drop`, capture caps, lossy
+    /// decoding, and the generated stderr/cap/exit markers.
+    async fn run_captured(
+        &self,
+        mut command: Command,
+        timeout_ms: u64,
+    ) -> Result<AgentToolResult, String> {
         if let Some(cwd) = &self.cwd {
             command.current_dir(cwd);
         }

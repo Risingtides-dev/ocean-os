@@ -1,3 +1,4 @@
+use std::any::Any;
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -71,6 +72,85 @@ impl AgentToolResult {
     }
 }
 
+/// A request-only replacement for one tool result, visible to the provider
+/// only during the active run (minimizer M2).
+///
+/// Crate-private: only the runtime's output-economy wrapper can construct one,
+/// so external [`AgentTool`] implementations cannot forge a projection. The
+/// lease keeps the exact raw recovery artifact reachable while the projection's
+/// `read artifact://<id>` footer can be sent.
+pub(crate) struct ProviderProjection {
+    pub(crate) content: Vec<Content>,
+    pub(crate) lease: crate::artifacts::ArtifactLease,
+}
+
+/// The outcome of one tool execution as the agent loop consumes it.
+///
+/// Opaque by design: it always carries the ordinary [`AgentToolResult`] (the
+/// authority for live events, checkpoints, and saved history) and may carry a
+/// sealed provider-only projection that the runtime alone can create. It is
+/// never serialized or emitted.
+pub struct ToolExecutionResult {
+    result: AgentToolResult,
+    projection: Option<ProviderProjection>,
+}
+
+impl ToolExecutionResult {
+    /// The ordinary result with no provider projection.
+    pub fn plain(result: AgentToolResult) -> Self {
+        Self {
+            result,
+            projection: None,
+        }
+    }
+
+    pub(crate) fn with_projection(result: AgentToolResult, projection: ProviderProjection) -> Self {
+        Self {
+            result,
+            projection: Some(projection),
+        }
+    }
+
+    /// The ordinary (raw) tool result.
+    pub fn result(&self) -> &AgentToolResult {
+        &self.result
+    }
+
+    /// Discard any provider projection (releasing its artifact lease) and
+    /// return the ordinary result.
+    pub fn into_result(self) -> AgentToolResult {
+        self.result
+    }
+
+    /// Whether a sealed provider-only projection is attached.
+    pub fn has_provider_projection(&self) -> bool {
+        self.projection.is_some()
+    }
+
+    /// The provider-only replacement content, when a projection is attached.
+    pub fn provider_content(&self) -> Option<&[Content]> {
+        self.projection.as_ref().map(|p| p.content.as_slice())
+    }
+
+    /// The pinned recovery artifact id, when a projection is attached.
+    pub fn recovery_artifact_id(&self) -> Option<&str> {
+        self.projection.as_ref().map(|p| p.lease.id())
+    }
+
+    pub(crate) fn into_parts(self) -> (AgentToolResult, Option<ProviderProjection>) {
+        (self.result, self.projection)
+    }
+}
+
+impl std::fmt::Debug for ToolExecutionResult {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // Never print content: results can carry file bodies or secrets.
+        f.debug_struct("ToolExecutionResult")
+            .field("has_provider_projection", &self.projection.is_some())
+            .finish_non_exhaustive()
+    }
+}
+
 /// How a tool may be scheduled relative to the other tool calls in the same
 /// assistant batch.
 ///
@@ -141,8 +221,12 @@ impl PermissionPolicy for AllowAllPolicy {
 }
 
 /// Tool execution trait — analog of `AgentTool.execute` in TS.
+///
+/// `Any` lets the runtime recognize its own built-in tools (the minimizer M2
+/// output-economy wrapper only ever minimizes the built-in `BashTool`); every
+/// `'static` implementor satisfies it automatically.
 #[async_trait]
-pub trait AgentTool: Send + Sync {
+pub trait AgentTool: Send + Sync + Any {
     fn name(&self) -> &str;
     fn label(&self) -> &str {
         self.name()
@@ -163,6 +247,20 @@ pub trait AgentTool: Send + Sync {
         Concurrency::Exclusive
     }
     async fn execute(&self, tool_call_id: &str, args: Value) -> Result<AgentToolResult, String>;
+
+    /// The agent loop's single execution entry point. The default runs
+    /// [`AgentTool::execute`] and attaches no provider projection; only the
+    /// runtime's output-economy wrapper overrides it. Callers outside the loop
+    /// should keep using `execute`.
+    async fn execute_for_run(
+        &self,
+        tool_call_id: &str,
+        args: Value,
+    ) -> Result<ToolExecutionResult, String> {
+        self.execute(tool_call_id, args)
+            .await
+            .map(ToolExecutionResult::plain)
+    }
 }
 
 pub fn tool_def(t: &dyn AgentTool) -> Tool {
