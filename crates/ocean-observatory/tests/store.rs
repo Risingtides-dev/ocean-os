@@ -185,3 +185,46 @@ fn snapshot_is_point_in_time_and_tail_from_its_watermark_is_disjoint() {
         Cursor::new(3)
     );
 }
+
+/// G3: once a prune brings the live size under the bound, the next pass
+/// prunes nothing — freed pages sit on SQLite's freelist and must not keep
+/// the database reading as over the bound.
+#[test]
+fn a_pass_after_the_size_prune_does_not_prune_again() {
+    let d = tempdir().unwrap();
+    let path = d.path().join("obs.db");
+    let s = ObservatoryStore::open(&path, RetentionPolicy::default()).unwrap();
+    for i in 0..400 {
+        let mut e = event_for(&format!("e{i}"), &format!("x{i}"), 0, true);
+        e.payload = EventPayload::ExecutionFinished {
+            phase: ExecutionPhase::Finished,
+            duration_millis: i,
+            error_classification: Some("x".repeat(400)),
+        };
+        s.append_event(e).unwrap();
+    }
+    drop(s);
+    // A bound between "all rows" and "a few rows" of live data.
+    let s = ObservatoryStore::open(
+        &path,
+        RetentionPolicy {
+            max_age_days: 365,
+            max_bytes: 96 * 1024,
+        },
+    )
+    .unwrap();
+    assert!(s.apply_retention().unwrap() > 0, "an over-size log prunes");
+    // The pruned pages now sit on the freelist; the file did not shrink.
+    // Fresh, small events after that must survive the next pass — with the
+    // file's page_count as the measure they would all be pruned again.
+    for i in 0..3 {
+        s.append_event(event_for(&format!("fresh{i}"), "fresh", 0, true))
+            .unwrap();
+    }
+    assert_eq!(
+        s.apply_retention().unwrap(),
+        0,
+        "freed pages are not live size"
+    );
+    assert_eq!(s.events_after(Cursor::new(0), None).unwrap().len(), 3);
+}

@@ -242,12 +242,14 @@ regression test:
   fields.
 - **G3** — `apply_retention` uses the manifest cutoff (never past the
   `first_cursor` of an admitted/running execution, now persisted per node by an
-  additive migration) and measures real database size from SQLite's page
-  count; the daemon runs it one minute after boot and hourly on a blocking
+  additive migration) and measures live database size from SQLite's page
+  accounting minus the freelist (a DELETE frees pages without shrinking the
+  file, so page_count alone would read as over the bound forever); the daemon runs it one minute after boot and hourly on a blocking
   thread until shutdown (`observatory::run_retention`). Tests:
   `retention_prunes_old_events_but_keeps_a_live_executions_history`,
   `retention_enforces_the_size_bound_from_real_db_size`,
-  `scheduled_retention_prunes_and_stops_on_shutdown`.
+  `scheduled_retention_prunes_and_stops_on_shutdown`,
+  `a_pass_after_the_size_prune_does_not_prune_again`.
 - **G4** — `ObservatoryStore::open` seeds the cursor from the maximum of the
   surviving events and every `watermarks` row (snapshot watermark and
   retention boundary). Test: `reopen_after_full_prune_continues_the_cursor`.

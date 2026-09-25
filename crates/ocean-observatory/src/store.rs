@@ -194,9 +194,9 @@ impl ObservatoryStore {
     /// Apply the retention policy (G3; manifest §4.2) and record the boundary.
     ///
     /// Events older than `max_age_days` are pruned, oldest first, and so are
-    /// the oldest events while the database file is over `max_bytes` —
-    /// measured as SQLite's real page usage, not an estimate from envelope
-    /// lengths. Neither rule may cross the first cursor of any non-terminal
+    /// the oldest events while the database's live pages exceed `max_bytes` —
+    /// measured from SQLite's page accounting (freelist excluded), not an
+    /// estimate from envelope lengths. Neither rule may cross the first cursor of any non-terminal
     /// execution: an execution still admitted or running keeps its whole
     /// history. A non-terminal row written before `first_cursor` existed has
     /// no recorded start, so it blocks pruning until the restart sweep closes
@@ -217,8 +217,13 @@ impl ObservatoryStore {
             (0, _) | (_, None) => i64::MAX as u64,
             (_, Some(first)) => first.saturating_sub(1),
         };
+        // LIVE pages only. A DELETE returns pages to SQLite's freelist but not
+        // to the filesystem, so `page_count` alone never shrinks after a prune
+        // and a database that once crossed the bound would read as over it
+        // forever — pruning everything prunable every hour.
         let db_bytes: u64 = db.query_row(
-            "SELECT page_count * page_size FROM pragma_page_count(), pragma_page_size()",
+            "SELECT (page_count - freelist_count) * page_size
+             FROM pragma_page_count(), pragma_freelist_count(), pragma_page_size()",
             [],
             |r| r.get(0),
         )?;
