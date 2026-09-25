@@ -12,7 +12,7 @@ use serde_json::{json, Value};
 
 /// Merge `block` under `key`, preserving every other key, and write atomically.
 pub(crate) fn merge_and_write(auth_file: &Path, key: &str, block: Value) -> Result<()> {
-    let _guard = write_lock();
+    let _guard = ocean_providers::lock_auth_file(auth_file);
     let mut root = read_root(auth_file)?;
     let map = root
         .as_object_mut()
@@ -27,7 +27,7 @@ pub(crate) fn merge_and_write(auth_file: &Path, key: &str, block: Value) -> Resu
 /// block was present. A missing file is "nothing to remove", not an error, and
 /// is left missing rather than created.
 pub(crate) fn remove_and_write(auth_file: &Path, key: &str) -> Result<bool> {
-    let _guard = write_lock();
+    let _guard = ocean_providers::lock_auth_file(auth_file);
     if !auth_file.exists() {
         return Ok(false);
     }
@@ -41,15 +41,6 @@ pub(crate) fn remove_and_write(auth_file: &Path, key: &str) -> Result<bool> {
     let serialized = serde_json::to_string_pretty(&root)?;
     atomic_write_private(auth_file, &serialized)?;
     Ok(true)
-}
-
-/// The process-wide auth.json write lock (`ocean_providers::auth_file_lock`),
-/// shared with the turn-time refresher. A poisoned lock guards no data of its
-/// own, so recover it rather than refuse every later login.
-fn write_lock() -> std::sync::MutexGuard<'static, ()> {
-    ocean_providers::auth_file_lock()
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
 /// Read one block without writing anything. `None` when the file or the key is

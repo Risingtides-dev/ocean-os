@@ -168,9 +168,7 @@ struct Refreshed {
 /// exactly as that other writer left it — writing back the root read before
 /// the network call would resurrect the removed block or clobber the new one.
 fn merge_refreshed(auth_file: &Path, refreshed: Vec<Refreshed>) -> std::io::Result<()> {
-    let _guard = ocean_providers::auth_file_lock()
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let _guard = ocean_providers::lock_auth_file(auth_file);
     let raw = match std::fs::read_to_string(auth_file) {
         Ok(raw) => raw,
         // Removed entirely while we refreshed: nothing to merge into.
