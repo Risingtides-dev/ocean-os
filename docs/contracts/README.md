@@ -9,6 +9,7 @@ turns that test red.
 |---|---|---|
 | `room-wire.json` | ocean-surface (Rooms) | `room_wire_contract_matches_the_daemon` in `crates/ocean-daemon/src/main.rs` |
 | `session-wire.json` | every first-party surface (sessions, agent events) | `session_wire_contract_matches_the_daemon` in `crates/ocean-daemon/src/main.rs` |
+| `component-wire.json` | surfaces that render agent components | `component_wire_contract_matches_the_runtime` in `crates/ocean-runtime/src/tools/component.rs` |
 
 `room-wire.json` covers what a Rooms client branches on: the `/events` SSE
 event names, the access-state, message-kind and participant-kind vocabularies,
@@ -23,3 +24,8 @@ of agent-event type names on `/v1/agent/events`, and the request fields and
 response keys of `POST /v1/agent/sessions`. Event names are derived from the
 `AgentTurnEvent` source, and its tagging attribute is pinned so that
 derivation stays valid.
+
+`component-wire.json` lists the component kinds the runtime's component tools
+accept, in `VALID_KINDS` order, and its test also requires a section per kind
+in `docs/AGENT_RENDER_PROTOCOL.md`, so the protocol doc cannot fall behind the
+code again. It was one kind short (`dashboard`) when this landed.

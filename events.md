@@ -10955,3 +10955,12 @@ area:      [backend]
 
 Extended the cross-repo drift checks from ROADMAP to the session contract. docs/contracts/session-wire.json publishes the agent-event tag and all seventeen event type names on /v1/agent/events, plus the request fields and response keys of POST /v1/agent/sessions. session_wire_contract_matches_the_daemon holds it equal to the code. It derives event names from the AgentTurnEvent source, pinning the tag = "type", rename_all = "snake_case" attribute and refusing per-variant renames so the derivation stays valid. Request fields come from a fully populated create request, and response keys from a real create. Mutation-checked: dropping an event name from the artifact fails it. Test and docs only, with no runtime change. Voice and component contracts, and consumers vendoring these files, remain.
 _________________________________________________________________________________ 17:24 feat/session-wire-contract
+
+time:      [17:26] [25-09-26]
+agent:     [claude]
+worktree:  feat/component-wire-contract
+type:      [feature-request]
+area:      [docs]
+
+Added the component contract to docs/contracts. component-wire.json lists the 19 kinds the runtime's component tools accept, in VALID_KINDS order, plus the render and unmount event type names. component_wire_contract_matches_the_runtime (crates/ocean-runtime) holds it equal to VALID_KINDS and also requires a section per kind in docs/AGENT_RENDER_PROTOCOL.md and a correct kind count there. It found the protocol doc already stale: dashboard had no section and the header said 18 kinds and omitted deck. Both are fixed, and dashboard is documented from the tool's own props description. The voice contract and consumer vendoring remain on the ROADMAP item.
+_________________________________________________________________________________ 17:26 feat/component-wire-contract

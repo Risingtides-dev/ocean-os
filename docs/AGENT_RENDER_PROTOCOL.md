@@ -27,10 +27,10 @@ pub struct RenderEvent {
     /// Opaque component id, scoped to the session. The agent picks it,
     /// the client echoes it back on interactions.
     pub id: String,
-    /// Component kind — one of the 18 built-in kinds (see "Built-in component
+    /// Component kind — one of the 19 built-in kinds (see "Built-in component
     /// kinds" below): kanban, form, table, progress, markdown, dashboard, chart,
     /// interactive_plot, timeline, stat, file_tree, diff, code, callout, gallery,
-    /// confirm, map, video.
+    /// confirm, map, video, deck.
     pub kind: String,
     /// Component props — a JSON object whose schema is defined per kind.
     pub props: serde_json::Value,
@@ -165,6 +165,25 @@ No interactions — display only.
 
 This is the default renderer for assistant text anyway, but explicit `markdown`
 components let the agent place rendered blocks anywhere in a dashboard layout.
+
+#### `dashboard`
+
+```json
+{
+    "id": "d1",
+    "kind": "dashboard",
+    "props": {
+        "children": [
+            { "id": "d1-a", "width": 2, "kind": "stat", "props": { "label": "Open", "value": 12 } },
+            { "id": "d1-b", "width": 1, "kind": "markdown", "props": { "content": "Notes" } }
+        ]
+    }
+}
+```
+
+A grid of cells. `width` is in fr units; a cell with an inline `kind` and
+`props` renders that component in place. Reach for it when several of the
+other kinds belong on one screen.
 
 #### `chart`
 

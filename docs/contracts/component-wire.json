@@ -1,0 +1,27 @@
+{
+  "note": "Component kinds the runtime's component tools accept, published for surfaces that render them and held equal to VALID_KINDS by component_wire_contract_matches_the_runtime (crates/ocean-runtime). Unknown kinds are still forwarded with a warning; see docs/AGENT_RENDER_PROTOCOL.md for each kind's props.",
+  "version": 1,
+  "render_event_type": "component_render",
+  "unmount_event_type": "component_unmount",
+  "kinds": [
+    "kanban",
+    "form",
+    "table",
+    "progress",
+    "markdown",
+    "dashboard",
+    "chart",
+    "interactive_plot",
+    "timeline",
+    "stat",
+    "file_tree",
+    "diff",
+    "code",
+    "callout",
+    "gallery",
+    "confirm",
+    "map",
+    "video",
+    "deck"
+  ]
+}
