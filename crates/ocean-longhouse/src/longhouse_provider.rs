@@ -323,6 +323,7 @@ mod tests {
             hashline: false,
             artifacts: false,
             code_intelligence: true,
+            command_output_minimization: false,
         }
     }
 

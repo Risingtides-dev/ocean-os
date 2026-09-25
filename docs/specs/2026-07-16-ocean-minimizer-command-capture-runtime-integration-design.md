@@ -2,7 +2,7 @@
 
 - **Date:** 2026-07-16
 - **Type:** bounded runtime integration design
-- **Status:** Reviewed and accepted design; implementation not started
+- **Status:** Reviewed and accepted design. M2a characterization and the M2b runtime mechanism are implemented in `ocean-runtime` behind the default-off `SessionContext::command_output_minimization` gate (branch `feat/minimizer-m2-checkpoint`, pending fresh review); M2c profile wiring is not started, so nothing is live.
 - **Owner:** Ocean OS
 - **Authoring baseline:** `ocean-os` `5b9e23a8a99aacf216cd0c93e66fef5de163e9df`
 - **Mechanism baseline:** `ocean-minimizer` M1, merged by PR #298 at `c21f45a8f2052b3a89d4204603c7b5ca98002077`

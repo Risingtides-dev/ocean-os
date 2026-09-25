@@ -11,6 +11,9 @@ human command output from already-tokenized invocations.
 - **Parent contracts:** `../../AGENTS.md` and `../AGENTS.md`
 - **Does not own:** shell parsing/execution, daemon/runtime/agent/TUI wiring,
   harness policy, capture, configuration, artifacts, or persistence
+- **Consumer:** `ocean-runtime` output-economy wrapper (minimizer M2), reached
+  only behind the default-off `SessionContext::command_output_minimization`
+  gate that no production path sets yet; the dependency is one-way
 
 ## Local Contracts
 
@@ -25,9 +28,9 @@ human command output from already-tokenized invocations.
 
 ## Work Guidance
 
-Prefer passthrough when a shape cannot be proven safe. Any future runtime
-integration is a separate reviewed checkpoint and must not be smuggled into
-filter work.
+Prefer passthrough when a shape cannot be proven safe. Runtime integration
+lives in `ocean-runtime` (M2, default-off); profile enablement (M2c) is a
+separate reviewed checkpoint and must not be smuggled into filter work.
 
 ## Verification
 

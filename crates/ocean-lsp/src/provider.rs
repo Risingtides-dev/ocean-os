@@ -54,6 +54,7 @@ mod task26_tests {
             hashline: false,
             artifacts: false,
             code_intelligence,
+            command_output_minimization: false,
         }
     }
 

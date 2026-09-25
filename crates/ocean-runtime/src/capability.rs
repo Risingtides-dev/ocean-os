@@ -21,9 +21,9 @@ use async_trait::async_trait;
 use ocean_protocol::Content;
 use serde_json::Value;
 
-use crate::artifacts::{ArtifactStore, SharedArtifacts};
+use crate::artifacts::{ArtifactStore, PinBudget, SharedArtifacts};
 use crate::tools::default_tools;
-use crate::types::{AgentTool, AgentToolResult};
+use crate::types::{AgentTool, AgentToolResult, ToolExecutionResult};
 
 /// Shared, reference-counted tool handle. The loop and registry pass these
 /// around; cloning is a cheap `Arc` bump.
@@ -110,6 +110,24 @@ pub struct SessionContext {
     /// off for voice; direct legacy callers default off. Resolved per-turn from
     /// the daemon's effective `HarnessProfile`.
     pub artifacts: bool,
+    /// Minimizer M2 command-output-minimization gate. Default OFF, and no
+    /// daemon/agent path sets it yet (profile wiring is the separate M2c
+    /// checkpoint). When true together with `artifacts` and a bound session
+    /// store, the built-in `bash` offers the additive explicitly tokenized
+    /// `argv` mode and eligible direct-argv results may receive a
+    /// provider-only minimized projection with a turn-pinned
+    /// `read artifact://<id>` recovery footer. Live events, checkpoints, and
+    /// saved session history always keep the raw tool text.
+    pub command_output_minimization: bool,
+}
+
+impl SessionContext {
+    /// Whether this turn may use minimizer M2: the gate itself plus the
+    /// artifact capability and a bound session (the recovery store is keyed
+    /// by session). Minimization can never produce an unrecoverable rewrite.
+    fn minimization_enabled(&self) -> bool {
+        self.command_output_minimization && self.artifacts && self.session_id.is_some()
+    }
 }
 
 /// Manual impl because `code_intelligence` must default TRUE: the derived
@@ -126,6 +144,7 @@ impl Default for SessionContext {
             hashline: false,
             code_intelligence: true,
             artifacts: false,
+            command_output_minimization: false,
         }
     }
 }
@@ -318,7 +337,15 @@ impl CapabilityProvider for BuiltinProvider {
                         ));
                     }
                     "bash" => {
-                        *tool = Arc::new(crate::tools::bash::BashTool::for_cwd(ctx.cwd.clone()));
+                        let bash = crate::tools::bash::BashTool::for_cwd(ctx.cwd.clone());
+                        // Minimizer M2: the additive argv mode is offered only
+                        // under the default-off minimization gate, so every
+                        // other turn keeps the exact legacy schema.
+                        *tool = Arc::new(if ctx.minimization_enabled() {
+                            bash.with_argv_mode()
+                        } else {
+                            bash
+                        });
                     }
                     "read" => {
                         // Hashline profile: `read` tags output + records snapshots
@@ -449,15 +476,40 @@ impl CapabilityRegistry {
                     .iter()
                     .find_map(|p| p.artifacts_store(session_id))
                 {
+                    // Minimizer M2 (default-off gate): one per-turn pin budget
+                    // shared by this turn's wrappers. Only the surviving
+                    // built-in argv-mode `BashTool` receives the policy.
+                    let budget = ctx.minimization_enabled().then(PinBudget::default);
                     out = out
                         .into_iter()
-                        .map(|t| Arc::new(SpillingTool::new(t, store.clone())) as SharedTool)
+                        .map(|t| {
+                            let spill = match &budget {
+                                Some(budget) if is_builtin_argv_bash(&t) => {
+                                    SpillingTool::with_command_minimization(
+                                        t,
+                                        store.clone(),
+                                        budget.clone(),
+                                    )
+                                }
+                                _ => SpillingTool::new(t, store.clone()),
+                            };
+                            Arc::new(spill) as SharedTool
+                        })
                         .collect();
                 }
             }
         }
         out
     }
+}
+
+/// Whether `tool` is the runtime's own built-in `bash` with argv mode enabled.
+/// A downcast (not a name or provider-id check) so an MCP/plugin tool that
+/// happens to be called `bash` can never receive the minimization policy.
+fn is_builtin_argv_bash(tool: &SharedTool) -> bool {
+    let any: &dyn std::any::Any = tool.as_ref();
+    any.downcast_ref::<crate::tools::bash::BashTool>()
+        .is_some_and(crate::tools::bash::BashTool::argv_mode)
 }
 
 /// Byte threshold above which a single tool-result text block is spilled to an
@@ -482,14 +534,43 @@ pub const SPILL_HEAD_BYTES: usize = 16_000;
 /// `put` into the store. Under-threshold blocks, non-text blocks, `details`,
 /// `terminate`, and `side_effects` pass through untouched — so with the same
 /// input a small result is byte-identical to the undecorated tool.
+///
+/// Minimizer M2 extends this one wrapper (rather than stacking a second one)
+/// with an optional command-minimization policy that only the registry
+/// attaches, only to the built-in argv-mode `bash`, only under the default-off
+/// gate. Its fixed order in [`AgentTool::execute_for_run`] is: execute the
+/// inner tool exactly once; preserve the artifact-read bypass; if any text
+/// block exceeds [`SPILL_THRESHOLD_BYTES`] perform only today's spill; otherwise
+/// attempt a sealed provider-only projection. The ordinary result is never
+/// changed by the policy.
 pub struct SpillingTool {
     inner: SharedTool,
     store: SharedArtifacts,
+    /// Minimizer M2 policy: the per-turn pin budget. `None` = plain spill.
+    minimization: Option<PinBudget>,
 }
 
 impl SpillingTool {
     pub fn new(inner: SharedTool, store: SharedArtifacts) -> Self {
-        Self { inner, store }
+        Self {
+            inner,
+            store,
+            minimization: None,
+        }
+    }
+
+    /// Crate-private: the registry attaches the policy only to the built-in
+    /// argv-mode `BashTool` (see [`is_builtin_argv_bash`]).
+    pub(crate) fn with_command_minimization(
+        inner: SharedTool,
+        store: SharedArtifacts,
+        budget: PinBudget,
+    ) -> Self {
+        Self {
+            inner,
+            store,
+            minimization: Some(budget),
+        }
     }
 
     /// Spill one oversized text block: `put` the full text and return the HEAD +
@@ -539,6 +620,16 @@ impl AgentTool for SpillingTool {
         self.inner.requires_permission()
     }
     async fn execute(&self, tool_call_id: &str, args: Value) -> Result<AgentToolResult, String> {
+        // Direct callers never see a projection; dropping it releases the pin.
+        self.execute_for_run(tool_call_id, args)
+            .await
+            .map(ToolExecutionResult::into_result)
+    }
+    async fn execute_for_run(
+        &self,
+        tool_call_id: &str,
+        args: Value,
+    ) -> Result<ToolExecutionResult, String> {
         // A `read artifact://<id>` is the model deliberately pulling spilled
         // content back. Re-spilling that output would be circular — it would
         // mint a fresh artifact of an artifact and stop the model ever
@@ -551,9 +642,29 @@ impl AgentTool for SpillingTool {
                 .and_then(|p| p.as_str())
                 .map(|p| p.starts_with("artifact://"))
                 .unwrap_or(false);
+        // Minimizer M2 identity comes only from the already-authorized direct
+        // argv, derived before the single inner execution.
+        let invocation = self
+            .minimization
+            .as_ref()
+            .and_then(|_| crate::output_economy::invocation_for_args(&args));
         let mut result = self.inner.execute(tool_call_id, args).await?;
         if is_artifact_read {
-            return Ok(result);
+            return Ok(ToolExecutionResult::plain(result));
+        }
+        let oversized = result
+            .content
+            .iter()
+            .any(|c| matches!(c, Content::Text { text } if text.len() > SPILL_THRESHOLD_BYTES));
+        if !oversized {
+            if let (Some(budget), Some(invocation)) = (&self.minimization, &invocation) {
+                if let Some(projection) =
+                    crate::output_economy::project(invocation, &result, &self.store, budget)
+                {
+                    return Ok(ToolExecutionResult::with_projection(result, projection));
+                }
+            }
+            return Ok(ToolExecutionResult::plain(result));
         }
         let tool = self.inner.name().to_string();
         result.content = result
@@ -566,7 +677,7 @@ impl AgentTool for SpillingTool {
                 other => other,
             })
             .collect();
-        Ok(result)
+        Ok(ToolExecutionResult::plain(result))
     }
 }
 
@@ -583,6 +694,7 @@ mod tests {
             hashline: false,
             artifacts: false,
             code_intelligence: true,
+            command_output_minimization: false,
         }
     }
 
@@ -965,6 +1077,7 @@ mod tests {
             hashline: false,
             artifacts: false,
             code_intelligence: true,
+            command_output_minimization: false,
         };
         let got = provider.tools(&no_sess).await;
         let wait = got
@@ -1025,6 +1138,7 @@ mod tests {
             hashline: false,
             artifacts: false,
             code_intelligence: true,
+            command_output_minimization: false,
         };
         let got = provider.tools(&no_sess).await;
         let tool = got

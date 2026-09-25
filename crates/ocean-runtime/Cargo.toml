@@ -25,6 +25,7 @@ ocean-protocol = { path = "../ocean-protocol" }
 ocean-agent-sdk = { workspace = true }
 ocean-browser = { workspace = true, optional = true }
 ocean-hashline = { path = "../ocean-hashline" }
+ocean-minimizer = { path = "../ocean-minimizer" }
 regex.workspace = true
 reqwest.workspace = true
 serde.workspace = true
