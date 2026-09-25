@@ -24,6 +24,9 @@ ocean-os 616293e, ocean-surface d58a145.
 - 0.2 Every migration under db/ is applied to production and `npm run db:check`
   proves it: the check must probe 009, 010, 011, 012 (and 013 once merged),
   which it does not today. [bedrock, S]
+  `db:check` now tells the truth (ocean-bedrock #160, 2026-09-25): `ok` is
+  true only when every readiness flag holds, otherwise it names the gaps in
+  `notReady` and exits 1; the rooms smoke checks exit status equals `ok`.
 - 0.3 The triage cron service runs the same master build as the service. [bedrock]
 - 0.4 deploy-drift CI is armed (OCEAN_ROOM_RUNTIME_URL repo variable set) and
   green, with no acknowledged gap older than one working day. [bedrock, user]
@@ -135,6 +138,13 @@ ocean-os 616293e, ocean-surface d58a145.
   `node --test test/toolbox-manifest.test.mjs` in ocean-bedrock must pin the
   complete tool inventory, and `npm run rooms:compute-smoke` must execute each
   MCP/CLI verb against its disposable room workspace. [bedrock, M]
+  **Done** (2026-09-25): ocean-bedrock #161 pins all 39 MCP tools by name in
+  `test/toolbox-manifest.test.mjs` (the "stops at expose_port" note was
+  stale — every human route exists); #162 makes `rooms:compute-smoke` drive
+  all 24 `bedrock_workspace_*` tools through the real stdio MCP server and
+  every room CLI verb with asserted outcomes, and
+  `test/compute-smoke-verb-coverage.test.mjs` fails if a pinned tool or verb
+  is not driven.
 
 ## 3. Safe
 - 3.1 The daemon's room routes authenticate the caller; identity is not a
