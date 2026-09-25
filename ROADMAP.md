@@ -14,9 +14,9 @@ approved design or permission to alter public contracts.
       shell component guidance, while the daemon harness seam intentionally
       retains CLI-compatible hashline/artifact gates pending cross-repo policy.
 - [ ] Keep cross-repository session, voice, component, and room contracts under
-      executable drift checks rather than prose-only synchronization. Room and
-      session contracts are published in `docs/contracts/` and pinned to the
-      daemon; voice and component remain, as does each consumer vendoring them.
+      executable drift checks rather than prose-only synchronization. Room,
+      session and component contracts are published in `docs/contracts/` and
+      pinned to the code; voice remains, as does each consumer vendoring them.
 
 ## Ocean Rooms distributed workspace
 

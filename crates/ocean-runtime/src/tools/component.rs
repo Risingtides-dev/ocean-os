@@ -425,6 +425,42 @@ impl AgentTool for ComponentWaitTool {
 
 #[cfg(test)]
 mod tests {
+    /// ROADMAP drift checks: `docs/contracts/component-wire.json` lists the
+    /// kinds this tool accepts, and `docs/AGENT_RENDER_PROTOCOL.md` documents
+    /// each one — a kind added here without both turns this red.
+    #[test]
+    fn component_wire_contract_matches_the_runtime() {
+        let artifact: serde_json::Value = serde_json::from_str(include_str!(
+            "../../../../docs/contracts/component-wire.json"
+        ))
+        .expect("component-wire.json parses");
+        let listed: Vec<&str> = artifact["kinds"]
+            .as_array()
+            .expect("kinds")
+            .iter()
+            .map(|v| v.as_str().unwrap())
+            .collect();
+        assert_eq!(
+            listed,
+            super::VALID_KINDS,
+            "published kinds equal VALID_KINDS, in order"
+        );
+        let protocol = include_str!("../../../../docs/AGENT_RENDER_PROTOCOL.md");
+        for kind in super::VALID_KINDS {
+            assert!(
+                protocol.contains(&format!("#### `{kind}`")),
+                "AGENT_RENDER_PROTOCOL.md has no section for `{kind}`"
+            );
+        }
+        assert!(
+            protocol.contains(&format!(
+                "one of the {} built-in kinds",
+                super::VALID_KINDS.len()
+            )),
+            "the protocol's kind count is stale"
+        );
+    }
+
     use super::*;
     use crate::types::AgentTool;
 
