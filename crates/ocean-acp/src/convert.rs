@@ -293,3 +293,108 @@ pub fn stop_reason_for(status: &AgentTurnStatus) -> agent_client_protocol::schem
         AgentTurnStatus::Queued | AgentTurnStatus::Running => StopReason::EndTurn,
     }
 }
+
+#[cfg(test)]
+mod contract_tests {
+    /// Production source only, so this module's text cannot satisfy a scan.
+    fn production_source() -> &'static str {
+        include_str!("convert.rs")
+            .split("\n#[cfg(test)]\nmod contract_tests {")
+            .next()
+            .unwrap()
+    }
+
+    fn function_body(name: &str) -> &'static str {
+        let source = production_source();
+        let start = source
+            .find(&format!("fn {name}("))
+            .unwrap_or_else(|| panic!("{name} is defined"));
+        let body = &source[start..];
+        &body[..body.find("\n}\n").unwrap()]
+    }
+
+    fn published(json: &str, field: &str) -> Vec<String> {
+        let wire: serde_json::Value = serde_json::from_str(json).expect("contract parses");
+        wire[field]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_str().unwrap().to_string())
+            .collect()
+    }
+
+    /// Consumer half of the session contract: `event_to_update` names every
+    /// published agent event type exactly once and uses no wildcard, so a new
+    /// published event cannot fall silently into a catch-all.
+    #[test]
+    fn event_to_update_covers_the_published_session_wire() {
+        let body = function_body("event_to_update");
+        let mut handled: Vec<String> = body
+            .match_indices("AgentTurnEvent::")
+            .map(|(at, needle)| {
+                let name: String = body[at + needle.len()..]
+                    .chars()
+                    .take_while(|c| c.is_ascii_alphanumeric())
+                    .collect();
+                let mut snake = String::new();
+                for (i, c) in name.chars().enumerate() {
+                    if c.is_ascii_uppercase() && i > 0 {
+                        snake.push('_');
+                    }
+                    snake.push(c.to_ascii_lowercase());
+                }
+                snake
+            })
+            .collect();
+        handled.sort();
+        let mut types = published(
+            include_str!("../../../docs/contracts/session-wire.json"),
+            "agent_event_types",
+        );
+        types.sort();
+        assert_eq!(handled, types);
+        assert!(
+            !body
+                .lines()
+                .any(|line| line.trim_start().starts_with("_ =>")),
+            "event_to_update must name every event rather than use a wildcard"
+        );
+    }
+
+    /// Consumer half of the component contract: every kind
+    /// `render_component_markdown` special-cases is a published kind, and a
+    /// fallback arm renders the rest.
+    #[test]
+    fn component_kinds_are_inside_the_published_component_wire() {
+        let body = function_body("render_component_markdown");
+        let kinds = published(
+            include_str!("../../../docs/contracts/component-wire.json"),
+            "kinds",
+        );
+        let arms: Vec<String> = body
+            .lines()
+            .filter(|line| line.starts_with("        \"") && line.contains("=>"))
+            .flat_map(|line| {
+                line.split("=>")
+                    .next()
+                    .unwrap()
+                    .split('"')
+                    .skip(1)
+                    .step_by(2)
+                    .map(str::to_string)
+                    .collect::<Vec<_>>()
+            })
+            .collect();
+        assert!(arms.len() >= 3, "the scan found the special-cased kinds");
+        for kind in &arms {
+            assert!(
+                kinds.contains(kind),
+                "the bridge branches on unpublished component kind {kind}"
+            );
+        }
+        assert!(
+            body.lines().any(|line| line.starts_with("        _ =>")),
+            "render_component_markdown keeps a fallback arm"
+        );
+    }
+}

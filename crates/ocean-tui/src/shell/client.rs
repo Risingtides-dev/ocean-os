@@ -112,12 +112,7 @@ impl DaemonClient {
         model: Option<&str>,
         on_retry: impl FnMut(usize, usize),
     ) -> Result<AgentSessionCreateResponse, String> {
-        let req = AgentSessionCreateRequest {
-            workspace_root: workspace_root.to_string(),
-            project_id: None,
-            model: model.map(str::to_string),
-            client_type: Some("tui".into()),
-        };
+        let req = session_create_request(workspace_root, model);
         let url = format!("{}/v1/agent/sessions", self.base);
         self.post_json_retrying(&url, &req, on_retry).await
     }
@@ -972,8 +967,8 @@ impl DaemonClient {
     pub async fn transcribe_voice(&self, wav: Vec<u8>) -> Result<String, String> {
         let response = self
             .http
-            .post(format!("{}/v1/voice/stt", self.base))
-            .header(reqwest::header::CONTENT_TYPE, "audio/wav")
+            .post(format!("{}{STT_PATH}", self.base))
+            .header(reqwest::header::CONTENT_TYPE, STT_CONTENT_TYPE)
             .body(wav)
             .send()
             .await
@@ -985,13 +980,13 @@ impl DaemonClient {
             .map_err(|error| format!("dictation response was not valid JSON: {error}"))?;
         if !status.is_success() {
             return Err(payload
-                .get("error")
+                .get(VOICE_ERROR_KEY)
                 .and_then(serde_json::Value::as_str)
                 .unwrap_or("dictation transcription failed")
                 .to_string());
         }
         let text = payload
-            .get("text")
+            .get(STT_TEXT_KEY)
             .and_then(serde_json::Value::as_str)
             .unwrap_or("")
             .trim()
@@ -1092,6 +1087,26 @@ fn parse_sse_data<T: serde::de::DeserializeOwned>(frame: &str) -> Option<T> {
 
 /// Pull the `data:` payload(s) out of one SSE frame and decode the JSON
 /// `AgentTurnEvent`. Ignores `id:`/`event:`/comment lines.
+/// The `POST /v1/agent/sessions` body this client sends. Its keys are held
+/// inside `docs/contracts/session-wire.json` by
+/// `session_client_is_inside_the_published_session_wire`.
+fn session_create_request(workspace_root: &str, model: Option<&str>) -> AgentSessionCreateRequest {
+    AgentSessionCreateRequest {
+        workspace_root: workspace_root.to_string(),
+        project_id: None,
+        model: model.map(str::to_string),
+        client_type: Some("tui".into()),
+    }
+}
+
+// The voice wire dictation depends on. Each literal is held inside
+// `docs/contracts/voice-wire.json` by
+// `stt_client_is_inside_the_published_voice_wire`.
+const STT_PATH: &str = "/v1/voice/stt";
+const STT_CONTENT_TYPE: &str = "audio/wav";
+const STT_TEXT_KEY: &str = "text";
+const VOICE_ERROR_KEY: &str = "error";
+
 fn status_proves_turn_rejection(status: reqwest::StatusCode) -> bool {
     status.is_client_error() && status != reqwest::StatusCode::REQUEST_TIMEOUT
 }
@@ -1112,6 +1127,136 @@ fn parse_sse_frame(frame: &str) -> Option<AgentTurnEvent> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn contract(json: &str) -> serde_json::Value {
+        serde_json::from_str(json).expect("contract parses")
+    }
+
+    fn strings(value: &serde_json::Value) -> Vec<String> {
+        value
+            .as_array()
+            .unwrap_or_else(|| panic!("{value} is a list"))
+            .iter()
+            .map(|v| v.as_str().unwrap().to_string())
+            .collect()
+    }
+
+    fn object_keys(value: serde_json::Value) -> Vec<String> {
+        value.as_object().unwrap().keys().cloned().collect()
+    }
+
+    /// Consumer half of the voice contract: dictation posts to a published
+    /// route, labels its body with a WAV type the daemon accepts, and reads
+    /// only published response and error keys.
+    #[test]
+    fn stt_client_is_inside_the_published_voice_wire() {
+        let voice = contract(include_str!("../../../../docs/contracts/voice-wire.json"));
+        assert!(
+            strings(&voice["routes"]).contains(&format!("POST {STT_PATH}")),
+            "{STT_PATH} is a published voice route"
+        );
+        assert!(
+            strings(&voice["stt"]["wav_content_types"]).contains(&STT_CONTENT_TYPE.to_string()),
+            "{STT_CONTENT_TYPE} is a published STT WAV type"
+        );
+        assert!(
+            strings(&voice["stt"]["response_keys"]).contains(&STT_TEXT_KEY.to_string()),
+            "{STT_TEXT_KEY} is a published STT response key"
+        );
+        assert_eq!(voice["error_key"], VOICE_ERROR_KEY);
+    }
+
+    /// Consumer half of the session contract. The TUI decodes agent events
+    /// with the shared `AgentTurnEvent`, so it must know every published
+    /// event type (a published type the decoder rejects as an unknown variant
+    /// would be dropped silently by `parse_sse_frame`), every variant the TUI
+    /// branches on must be published, and the session-create body it sends
+    /// and the response it decodes must stay inside the published keys.
+    #[test]
+    fn session_client_is_inside_the_published_session_wire() {
+        let session = contract(include_str!("../../../../docs/contracts/session-wire.json"));
+        assert_eq!(session["agent_event_tag"], "type");
+        let published = strings(&session["agent_event_types"]);
+        for name in &published {
+            // A bare tag usually lacks the variant's fields; what matters is
+            // that the failure is never "unknown variant".
+            if let Err(error) =
+                serde_json::from_value::<AgentTurnEvent>(serde_json::json!({ "type": name }))
+            {
+                assert!(
+                    !error.to_string().contains("unknown variant"),
+                    "the TUI's event decoder does not know published type {name}: {error}"
+                );
+            }
+        }
+
+        // Every agent-event variant the TUI names in its source, in snake_case.
+        let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let mut stack = vec![src];
+        let mut named = std::collections::BTreeSet::new();
+        while let Some(dir) = stack.pop() {
+            for entry in std::fs::read_dir(dir).unwrap() {
+                let path = entry.unwrap().path();
+                if path.is_dir() {
+                    stack.push(path);
+                    continue;
+                }
+                if path.extension().is_none_or(|ext| ext != "rs") {
+                    continue;
+                }
+                let text = std::fs::read_to_string(&path).unwrap();
+                for (at, needle) in text.match_indices("AgentTurnEvent::") {
+                    let name: String = text[at + needle.len()..]
+                        .chars()
+                        .take_while(|c| c.is_ascii_alphanumeric())
+                        .collect();
+                    if !name.starts_with(|c: char| c.is_ascii_uppercase()) {
+                        continue;
+                    }
+                    let mut snake = String::new();
+                    for (i, c) in name.chars().enumerate() {
+                        if c.is_ascii_uppercase() && i > 0 {
+                            snake.push('_');
+                        }
+                        snake.push(c.to_ascii_lowercase());
+                    }
+                    named.insert(snake);
+                }
+            }
+        }
+        assert!(
+            named.contains("turn_finished"),
+            "the scan found the TUI's matches"
+        );
+        for name in &named {
+            assert!(
+                published.contains(name),
+                "the TUI branches on unpublished agent event {name}"
+            );
+        }
+
+        let request_fields = strings(&session["session_create_request_fields"]);
+        let sent = serde_json::to_value(session_create_request("/w", Some("m"))).unwrap();
+        for key in object_keys(sent) {
+            assert!(
+                request_fields.contains(&key),
+                "the TUI sends unpublished session-create field {key}"
+            );
+        }
+        let response_keys = strings(&session["session_create_response_keys"]);
+        let decoded = serde_json::to_value(AgentSessionCreateResponse {
+            session_id: AgentSessionId(uuid::Uuid::nil()),
+            cwd: "/w".into(),
+            client_type: Some("tui".into()),
+        })
+        .unwrap();
+        for key in object_keys(decoded) {
+            assert!(
+                response_keys.contains(&key),
+                "the TUI decodes unpublished session-create key {key}"
+            );
+        }
+    }
 
     #[test]
     fn only_pre_execution_4xx_statuses_are_rejections() {

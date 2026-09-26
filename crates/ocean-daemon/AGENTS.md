@@ -56,6 +56,13 @@ This crate owns the long-running Ocean HTTP service on `:4780`, including API ro
   fields and purposes, the response keys, the realtime tool names, the STT WAV
   types, the TTS default voice, and the handoff kinds. A change to any of
   these updates the artifact in the same commit.
+- `tests/buddy_voice_contract.rs` is the consumer half for Ocean Buddy: it
+  reads Buddy's Swift source and holds its client-secret route, body keys,
+  `purpose`, decoded response keys, tool names, and handoff route, body, role,
+  kind and acknowledgement inside `voice-wire.json`. It lives here only
+  because the daemon crate owns the contract and the workspace cannot compile
+  Swift; the other in-repo consumers pin themselves in their own crates (see
+  `docs/contracts/README.md`).
 
 - `POST /v1/ocean-buddy/events` is the deliberately narrow first Buddy ingress: it accepts only a typed mocked `attached` lifecycle event, carries attachment metadata but no image bytes, performs no camera/session/tool work, and returns a typed Watch result card. Watch approval remains in the Watch-to-iPhone adapter flow.
 - Session behavior lives in `ocean-agent`; route changes must not create a separate session model.

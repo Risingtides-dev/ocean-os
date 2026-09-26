@@ -24,6 +24,14 @@ Watch apps while Ocean OS remains the session, credential, and tool authority.
 
 ## Local Contracts
 
+- The voice wire literals in `RealtimeSecretClient.swift`,
+  `RealtimeModels.swift` and `RealtimeToolBroker.swift` (route, body keys,
+  `purpose`, decoded response keys, tool names, handoff route/body/role/kind,
+  `ok` acknowledgement) are held inside `docs/contracts/voice-wire.json` by
+  `crates/ocean-daemon/tests/buddy_voice_contract.rs`, which scans this Swift
+  source. Keep them as plain string literals in those shapes; renaming or
+  moving one means updating that scan in the same change, and `cargo test -p
+  ocean-daemon --test buddy_voice_contract` is part of Buddy's validation.
 - Reuse `POST /v1/voice/realtime/client-secret`; never store or ship an OpenAI
   provider key. Mint through a fresh ephemeral, cache-disabled URL session.
 - Release/default credential minting permits HTTPS and cleartext loopback only.
