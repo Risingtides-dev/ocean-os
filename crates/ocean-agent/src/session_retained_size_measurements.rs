@@ -110,6 +110,8 @@ struct Report {
     /// Sum of every save's size across all turns, when measured exactly.
     written_bytes: Option<usize>,
     saves: usize,
+    /// The persisted transcript after the last turn's final save.
+    final_messages: Vec<Message>,
 }
 
 /// Run `turns` turns through the same load → compact → accept-save → checkpoint
@@ -169,6 +171,7 @@ fn simulate(shape: TurnShape, turns: usize, context_window: u32, exact_saves: bo
         elided_total,
         written_bytes: exact_saves.then_some(written),
         saves,
+        final_messages: session.messages,
     }
 }
 
@@ -282,5 +285,148 @@ fn persisted_session_write_volume_exact() {
         };
         let (small, huge) = (max(32 * KIB), max(2 * MIB));
         assert!(huge.abs_diff(small) * 20 < small, "{huge} vs {small}");
+    }
+}
+
+// ---------------------------------------------------------------------------
+// H1 checkpoint save stall (bounded turn event channel proposal, slice 1).
+// ---------------------------------------------------------------------------
+
+/// One provider round's `TurnCheckpoint` delta: an assistant tool call and its
+/// (runtime-capped) result, exactly the shape `simulate` persists per round.
+fn checkpoint_round(shape: TurnShape, sample: usize) -> Vec<Message> {
+    let id = format!("toolu_stall_{sample:04}");
+    vec![
+        assistant(
+            vec![Content::ToolCall {
+                id: id.clone(),
+                name: "bash".into(),
+                arguments: serde_json::json!({ "command": "a".repeat(shape.args_bytes) }),
+            }],
+            StopReason::ToolUse,
+        ),
+        Message::ToolResult(ToolResultMessage {
+            tool_call_id: id,
+            tool_name: "bash".into(),
+            content: vec![Content::text(runtime_capped(shape.output_bytes))],
+            is_error: false,
+            timestamp: 1_758_800_000_000,
+        }),
+    ]
+}
+
+struct StallReport {
+    context_window: u32,
+    file_bytes: usize,
+    messages: usize,
+    samples: Vec<std::time::Duration>,
+}
+
+impl StallReport {
+    fn percentile(&self, pct: usize) -> std::time::Duration {
+        let mut sorted = self.samples.clone();
+        sorted.sort_unstable();
+        sorted[(sorted.len() * pct / 100).min(sorted.len() - 1)]
+    }
+}
+
+/// Time the work `run_prompt`'s H1 receive loop does inline for one
+/// `TurnCheckpoint` (`crates/ocean-agent/src/lib.rs`, the `TurnCheckpoint`
+/// arm): extend the in-turn prefix, `cap_session_history(clone)`,
+/// `replace_messages`, and `session::save` (pretty JSON, write, fsync, durable
+/// rename). While this runs the loop does not `recv`, so it is the H1
+/// consumer stall per checkpoint.
+///
+/// Each sample starts from the same steady-state transcript (the 200-message
+/// cap bound, `compact_history` applied as at turn start) plus one new round,
+/// so every sample saves a file of the same size. The file saw-tooths with the
+/// turn count (see §6 of the measurements doc), so a size point is a
+/// (context window, turns) pair.
+fn measure_checkpoint_stall(context_window: u32, turns: usize, samples: usize) -> StallReport {
+    let shape = TurnShape::with_output(32 * KIB);
+    let mut base = simulate(shape, turns, context_window, false).final_messages;
+    compact_history(&mut base, context_window);
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let mut session =
+        session::Session::new_with_id(ocean_core::SessionId::new_v4(), &model(context_window));
+    // Warm the file and directory once so the first sample is not a create.
+    session.replace_messages(base.clone());
+    session::save(tmp.path(), &session).expect("warm save");
+
+    let mut timings = Vec::with_capacity(samples);
+    let mut file_bytes = 0;
+    let mut messages = 0;
+    for sample in 0..samples {
+        let mut checkpoint_messages = base.clone();
+        let delta = checkpoint_round(shape, sample);
+        let started = std::time::Instant::now();
+        checkpoint_messages.extend(delta);
+        let persisted = cap_session_history(checkpoint_messages.clone());
+        session.replace_messages(persisted);
+        let path = session::save(tmp.path(), &session).expect("checkpoint save");
+        timings.push(started.elapsed());
+        file_bytes = std::fs::metadata(path).expect("metadata").len() as usize;
+        messages = session.messages.len();
+    }
+    StallReport {
+        context_window,
+        file_bytes,
+        messages,
+        samples: timings,
+    }
+}
+
+/// Slice 1 of `docs/specs/2026-09-26-bounded-turn-event-channel-proposal.md`:
+/// the H1 consumer stall per `TurnCheckpoint` at the proposal's two
+/// steady-state file sizes, 539,534 B (300k window, 21 turns) and 1,029,539 B
+/// (600k window, 23 turns), both at the 200-message cap with 32 KiB tool
+/// results. Timing only, so it is `#[ignore]`d; run it in release for the
+/// recorded figures:
+///
+/// ```text
+/// cargo test --release -p ocean-agent checkpoint_save_stall -- --ignored --nocapture --test-threads=1
+/// ```
+#[test]
+#[ignore = "timing measurement (30 fsynced saves per size); run with --release --ignored --nocapture"]
+fn checkpoint_save_stall_at_steady_state() {
+    const SAMPLES: usize = 30;
+    // (context window, turns, expected file bytes)
+    const POINTS: [(u32, usize, usize); 2] = [(300_000, 21, 539_534), (600_000, 23, 1_029_539)];
+    let reports: Vec<StallReport> = POINTS
+        .into_iter()
+        .map(|(window, turns, _)| measure_checkpoint_stall(window, turns, SAMPLES))
+        .collect();
+    println!(
+        "\nH1 checkpoint stall: cap_session_history(clone) + session::save + fsync, {SAMPLES} saves each"
+    );
+    println!("| context window | file | messages | p50 | p90 | max |");
+    println!("|---|---|---|---|---|---|");
+    for report in &reports {
+        println!(
+            "| {} | {} ({} B) | {} | {:.1} ms | {:.1} ms | {:.1} ms |",
+            report.context_window,
+            fmt_bytes(report.file_bytes),
+            report.file_bytes,
+            report.messages,
+            report.percentile(50).as_secs_f64() * 1e3,
+            report.percentile(90).as_secs_f64() * 1e3,
+            report.percentile(100).as_secs_f64() * 1e3,
+        );
+    }
+    for (report, (_, _, expected)) in reports.iter().zip(POINTS) {
+        assert_eq!(report.samples.len(), SAMPLES);
+        // The size point is the one the proposal records (±1 %).
+        assert!(
+            report.file_bytes.abs_diff(expected) * 100 <= expected,
+            "file {} B, expected about {expected} B",
+            report.file_bytes
+        );
+        // The 200-message cap binds; one orphan leading tool result may be
+        // dropped after the cut.
+        assert!(
+            (199..=200).contains(&report.messages),
+            "the 200-message cap binds, got {}",
+            report.messages
+        );
     }
 }

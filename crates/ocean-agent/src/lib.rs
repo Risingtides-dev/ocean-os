@@ -2471,26 +2471,24 @@ impl AgentRuntime {
         // control events, so this stays `false` and failover is allowed.
         let mut streamed_output = false;
         while let Some(ev) = rx.recv().await {
-            if let Some(sink) = event_sink.as_ref() {
-                let _ = sink.send(ev.clone());
-            }
-            match ev {
+            // This turn's own outputs, read by reference so the event can be
+            // moved (not cloned) onto the event sink below.
+            match &ev {
                 AgentEvent::TextDelta { delta, .. } => {
                     streamed_output = true;
-                    stdout.push_str(&delta)
+                    stdout.push_str(delta)
                 }
                 AgentEvent::ThinkingDelta { delta, .. } => {
                     streamed_output = true;
                     stderr.push_str("thinking: ");
-                    stderr.push_str(&delta);
+                    stderr.push_str(delta);
                     stderr.push('\n');
-                }
-                AgentEvent::AssistantMessage { .. } if !stdout.ends_with('\n') => {
-                    streamed_output = true;
-                    stdout.push('\n');
                 }
                 AgentEvent::AssistantMessage { .. } => {
                     streamed_output = true;
+                    if !stdout.ends_with('\n') {
+                        stdout.push('\n');
+                    }
                 }
                 AgentEvent::ToolExecutionStart {
                     tool_name, args, ..
@@ -2506,7 +2504,7 @@ impl AgentRuntime {
                     streamed_output = true;
                     stderr.push_str(&format!(
                         "← {tool_name} {}\n",
-                        if is_error { "error" } else { "ok" }
+                        if *is_error { "error" } else { "ok" }
                     ));
                 }
                 AgentEvent::PermissionDenied {
@@ -2515,6 +2513,9 @@ impl AgentRuntime {
                     streamed_output = true;
                     stderr.push_str(&format!("✗ permission denied for {tool_name}: {reason}\n"));
                 }
+                _ => {}
+            }
+            match ev {
                 AgentEvent::TurnCheckpoint { messages, .. } => {
                     // A checkpoint is emitted only after the runtime has paired
                     // assistant tool calls with all results in provider-valid
@@ -2529,7 +2530,28 @@ impl AgentRuntime {
                     session.replace_messages(persisted);
                     session::save(&self.config_dir, &session)?;
                 }
-                _ => {}
+                // Not forwarded to the event sink: the daemon bridge, its only
+                // consumer, discards every one of these (OCEAN-373, the named
+                // no-relay arm in `ocean-daemon`'s turn bridge). `AgentEnd`
+                // carries the whole message history and `TurnCheckpoint` (above)
+                // every durability delta, so forwarding them only copied
+                // history-sized payloads into a queue that dropped them
+                // (bounded turn event channel proposal, slice 2). Relaying one
+                // later means adding it to the bridge AND removing it here.
+                AgentEvent::AgentStart { .. }
+                | AgentEvent::AgentEnd { .. }
+                | AgentEvent::TurnStart { .. }
+                | AgentEvent::TurnEnd { .. }
+                | AgentEvent::AssistantMessage { .. }
+                | AgentEvent::UserMessage { .. } => {}
+                // Everything else is relayed, moved rather than cloned. A new
+                // runtime variant is forwarded by default, so the bridge's
+                // exhaustive match still forces a relay-or-document decision.
+                ev => {
+                    if let Some(sink) = event_sink.as_ref() {
+                        let _ = sink.send(ev);
+                    }
+                }
             }
         }
 
@@ -7398,6 +7420,130 @@ done
             deltas[0].0.as_deref(),
             Some(session_id.to_string().as_str())
         );
+
+        let _ = std::fs::remove_dir_all(config_dir);
+    }
+
+    /// The runtime `AgentEvent` kind, for golden event-order assertions.
+    fn agent_event_kind(ev: &AgentEvent) -> &'static str {
+        match ev {
+            AgentEvent::AgentStart { .. } => "AgentStart",
+            AgentEvent::AgentEnd { .. } => "AgentEnd",
+            AgentEvent::TurnStart { .. } => "TurnStart",
+            AgentEvent::TurnEnd { .. } => "TurnEnd",
+            AgentEvent::TurnCheckpoint { .. } => "TurnCheckpoint",
+            AgentEvent::AssistantMessage { .. } => "AssistantMessage",
+            AgentEvent::UserMessage { .. } => "UserMessage",
+            AgentEvent::TextDelta { .. } => "TextDelta",
+            AgentEvent::ThinkingDelta { .. } => "ThinkingDelta",
+            AgentEvent::ToolExecutionStart { .. } => "ToolExecutionStart",
+            AgentEvent::ToolExecutionEnd { .. } => "ToolExecutionEnd",
+            AgentEvent::PermissionDenied { .. } => "PermissionDenied",
+            AgentEvent::ModelRerouted { .. } => "ModelRerouted",
+            AgentEvent::ProviderRetrying { .. } => "ProviderRetrying",
+            AgentEvent::Render { .. } => "Render",
+            AgentEvent::Unmount { .. } => "Unmount",
+            AgentEvent::BrowserActivity { .. } => "BrowserActivity",
+            AgentEvent::SurfacePatch { .. } => "SurfacePatch",
+            AgentEvent::SlackCanvas { .. } => "SlackCanvas",
+        }
+    }
+
+    /// Bounded turn event channel proposal, slice 2: the H1 forwarder in
+    /// `run_prompt` no longer puts on the event sink (H2) the variants the
+    /// daemon bridge discards — `AgentEnd` (the whole history),
+    /// `TurnCheckpoint` (durability deltas), `AssistantMessage`,
+    /// `UserMessage`, `AgentStart/End`, `TurnStart/End`. A scripted
+    /// `fake-tool` turn through the real loop puts exactly the relayed kinds
+    /// on the sink, in order, while `stdout`/`stderr` and the persisted
+    /// transcript (the checkpoints' consumer) are unchanged.
+    #[tokio::test]
+    async fn event_sink_carries_only_bridge_relayed_events_for_a_scripted_turn() {
+        let config_dir = temp_config_dir("sink-relayed");
+        std::fs::create_dir_all(&config_dir).unwrap();
+        let target = config_dir.join("fake-tool-target.txt");
+        std::env::set_var(ocean_runtime::FAKE_TOOL_TARGET_ENV, &target);
+        let runtime = runtime(
+            config_dir.clone(),
+            provider_config(ProviderId::Fake, ocean_runtime::FAKE_TOOL_MODEL, false),
+        );
+
+        let (tx, mut rx) = mpsc::unbounded_channel::<AgentEvent>();
+        let res = runtime
+            .prompt(
+                PromptRequest {
+                    prompt: "write the file".into(),
+                    images: None,
+                    request_id: None,
+                    session_id: None,
+                    create_if_missing: true,
+                    max_turns: None,
+                    yolo: true,
+                    cwd: config_dir.to_string_lossy().into_owned(),
+                    project_id: None,
+                    client_type: None,
+                    decision_token: None,
+                },
+                PromptControl::yolo(true).with_event_sink(tx),
+            )
+            .await;
+        assert!(res.ok, "scripted turn failed: {}", res.stderr);
+        assert!(target.exists(), "the scripted write did not run");
+
+        // The H1 consumer's own outputs are unchanged by what it forwards. The
+        // leading newline is the tool-call round's `AssistantMessage` on an
+        // empty `stdout`, exactly as before.
+        assert_eq!(res.stdout, "\ndone\n");
+        let path = target.to_string_lossy();
+        assert_eq!(
+            res.stderr,
+            format!(
+                "→ write({})\n← write ok\n",
+                serde_json::json!({ "path": path, "content": ocean_runtime::FAKE_TOOL_CONTENT })
+            )
+        );
+        // Checkpoints are still persisted: user, tool call, tool result, reply.
+        let detail = runtime.session_detail(res.session_id.unwrap()).unwrap();
+        assert_eq!(detail.messages.len(), 4);
+
+        let mut events = Vec::new();
+        while let Ok(ev) = rx.try_recv() {
+            events.push(ev);
+        }
+        let kinds: Vec<&str> = events.iter().map(agent_event_kind).collect();
+        const BRIDGE_DISCARDED: [&str; 7] = [
+            "AgentStart",
+            "AgentEnd",
+            "TurnStart",
+            "TurnEnd",
+            "TurnCheckpoint",
+            "AssistantMessage",
+            "UserMessage",
+        ];
+        // Golden: the kinds the bridge relays, in emission order. This holds
+        // with and without slice 2.
+        let relayed: Vec<&str> = kinds
+            .iter()
+            .copied()
+            .filter(|kind| !BRIDGE_DISCARDED.contains(kind))
+            .collect();
+        assert_eq!(
+            relayed,
+            ["ToolExecutionStart", "ToolExecutionEnd", "TextDelta"],
+            "relayed event sequence changed"
+        );
+        // Slice 2: nothing the bridge discards reaches the sink at all.
+        for discarded in BRIDGE_DISCARDED {
+            assert!(
+                !kinds.contains(&discarded),
+                "{discarded} reached the event sink: {kinds:?}"
+            );
+        }
+        assert_eq!(kinds, relayed);
+        let session_id = res.session_id.unwrap().to_string();
+        assert!(events
+            .iter()
+            .all(|ev| ev.session_id() == Some(session_id.as_str())));
 
         let _ = std::fs::remove_dir_all(config_dir);
     }

@@ -7332,6 +7332,12 @@ async fn agent_turn(
                 //     turn — echoing it back over SSE tells the client nothing new.
                 //   - TurnCheckpoint: internal session-durability deltas. They are
                 //     consumed and persisted by ocean-agent, never exposed on SSE.
+                //
+                // ocean-agent's H1 forwarder (`run_prompt`) no longer sends any
+                // of these to this bridge (bounded turn event channel proposal,
+                // slice 2), so this arm is unreachable today. It stays named so
+                // the match remains exhaustive and the decision greppable. To
+                // relay one, add its wire arm here AND stop filtering it there.
                 AgentEvent::AgentStart { .. }
                 | AgentEvent::AgentEnd { .. }
                 | AgentEvent::TurnStart { .. }
@@ -17332,6 +17338,82 @@ mod tests {
             "session reuse must not weaken the boundary"
         );
         assert!(state.permissions.read().await.is_empty());
+    }
+
+    /// Bounded turn event channel proposal
+    /// (`docs/specs/2026-09-26-bounded-turn-event-channel-proposal.md`),
+    /// slice 2 golden: a scripted `fake-tool` turn through the real handler,
+    /// runtime, H1 forwarder, and bridge puts exactly this client-visible
+    /// sequence on the agent event bus. Slice 2 stopped forwarding the runtime
+    /// variants the bridge discards; this sequence must be identical with and
+    /// without that change.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn scripted_turn_bridge_visible_event_stream_matches_golden() {
+        let _guard = AUTO_CONVENE_ENV_LOCK.lock().await;
+        let _env = TestEnvRestore::capture(&[
+            "OCEAN_CONFIG_DIR",
+            "OCEAN_MODEL",
+            "OCEAN_YOLO",
+            ocean_runtime::FAKE_TOOL_TARGET_ENV,
+        ]);
+        let tmp = tempfile::tempdir().unwrap();
+        // YOLO (set by the fixture), so the scripted `write` runs ungated.
+        let mut state = fake_convene_state(&tmp);
+        std::env::set_var("OCEAN_MODEL", ocean_runtime::FAKE_TOOL_MODEL);
+        let target = tmp.path().join("fake-tool-target.txt");
+        std::env::set_var(ocean_runtime::FAKE_TOOL_TARGET_ENV, &target);
+        state.runtime = Arc::new(
+            AgentRuntime::with_config_dir(tmp.path().to_path_buf()).expect("fake-tool runtime"),
+        );
+
+        let mut turn = sample_agent_turn();
+        turn.prompt = "write the file".into();
+        turn.cwd = tmp.path().to_string_lossy().into_owned();
+        let (status, Json(ack)) = agent_turn(State(state.clone()), Json(turn)).await;
+        assert_eq!(status, StatusCode::ACCEPTED, "{ack:?}");
+        let session = serde_json::to_value(ack.session_id).unwrap();
+
+        let session_events = || -> Vec<serde_json::Value> {
+            let (history, _live) = state.agent_events.subscribe_with_full_replay();
+            history
+                .iter()
+                .map(|envelope| serde_json::to_value(&envelope.event).unwrap())
+                .filter(|event| event["session_id"] == session)
+                .collect()
+        };
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+        let events = loop {
+            let events = session_events();
+            if events.iter().any(|event| event["type"] == "turn_finished") {
+                break events;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "scripted turn never finished: {events:?}"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        };
+        assert!(target.exists(), "the scripted write did not run");
+
+        let kinds: Vec<&str> = events
+            .iter()
+            .map(|event| event["type"].as_str().unwrap_or_default())
+            .collect();
+        assert_eq!(
+            kinds,
+            [
+                "session_created",
+                "turn_started",
+                "tool_call_started",
+                "tool_call_finished",
+                "assistant_text_delta",
+                "turn_finished",
+            ],
+            "bridge-visible event stream changed: {events:#?}"
+        );
+        assert_eq!(events[2]["call"]["name"], "write");
+        assert_eq!(events[4]["delta"], "done");
+        assert_eq!(events[5]["status"], "completed");
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
