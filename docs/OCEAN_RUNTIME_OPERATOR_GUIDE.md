@@ -515,7 +515,7 @@ the `health` and `ready` route handlers in `crates/ocean-daemon/src/main.rs`.
   state.
 - Body: `{"ok":true,"service":"ocean-daemon","version":"<v>","backend":"<name>","persist_failures_total":<n>}`.
   `persist_failures_total` mirrors `ocean_persist_failures_total` in `GET /metrics` — it is the count of dropped call-transcript writes since daemon start. `0` is healthy; a non-zero value means the SQLite room store is silently losing writes.
-- The body also carries a `rooms` object: the room and federation metrics (rooms by access state, outbox depth and oldest-item age, federation SSE reconnects and lag, redemption failures, admission refusals, store lock wait), including the per-room `rooms[]` list that the `ocean_room_*` Prometheus families in `GET /metrics` cannot carry because a room id may not be a fixed-cardinality label. Room-derived numbers are sampled without blocking the probe: `rooms.sampled: false` means the store lock was busy and the numbers beside it are the previous sample, aged by `rooms.sample_age_ms`. `rooms[].outbox_oldest_age_seconds` is measured from this daemon process's first sighting of the row (the `outbox` table stores no timestamp), so it restarts at zero when the daemon does.
+- The body also carries a `rooms` object: the room and federation metrics (rooms by access state, outbox depth and oldest-item age, federation SSE reconnects and lag, redemption failures, admission refusals, store lock wait, federated actor substitutions), including the per-room `rooms[]` list that the `ocean_room_*` Prometheus families in `GET /metrics` cannot carry because a room id may not be a fixed-cardinality label. Room-derived numbers are sampled without blocking the probe: `rooms.sampled: false` means the store lock was busy and the numbers beside it are the previous sample, aged by `rooms.sample_age_ms`. `rooms[].outbox_oldest_age_seconds` is measured from this daemon process's first sighting of the row (the `outbox` table stores no timestamp), so it restarts at zero when the daemon does.
 - Says nothing about whether a provider/credential is configured. A daemon with
   no API key still answers `/health` with 200.
 
@@ -1005,6 +1005,8 @@ curl -s http://127.0.0.1:4780/metrics
 ```
 
 Point Prometheus or any compatible scraper at `:4780/metrics`. A non-zero `ocean_persist_failures_total` means the SQLite room store is silently losing transcript writes — investigate immediately.
+
+The same body also carries the `ocean_room_*` room and federation families listed under "Reading the bridge" in `docs/OPERATIONS.md`. One of them, `ocean_room_federated_actor_substituted_total{route="post"|"workspace_read"|"workspace_command"}`, counts federated-room writes where the caller named a member other than this node's human and the daemon acted as the node human anyway (the room's single Bedrock identity). It refuses nothing; it is evidence for the member-lane enforcement decision. Each increment also logs one `warn` line with the room key and route, never the member ids. `/health` `rooms.federated_actor_substituted` mirrors it by route with a `_total`.
 
 ### Longhouse governance routes
 
