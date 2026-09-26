@@ -11264,3 +11264,12 @@ area:      [testing]
 
 Ubuntu CI on this PR failed stage_a_gate_crash_resume_backoff_circuit_and_explicit_retry. The failure was unrelated to the fixture reaping. It measured a 1629 ms gap for the 1 s backoff step against the +500 ms upper slack that the A5 delta review had tightened, and that review had flagged it as load-sensitive. The upper slack is now +900 ms, still under 1000 ms, so a 1 s to 2 s step change still fails. Re-running mutation M11b (BACKOFF[2] set to 2 s) failed the test at 2068 ms, and the clean test passed twice. The evidence doc's step-8 row and its M11b row now say +900 ms and why.
 _________________________________________________________________________________ 09:15 test/gate-fixture-reaping
+
+time:      [09:32] [26-09-26]
+agent:     [claude] [opus 5.5]
+worktree:  fix/observatory-size-loop-margin
+type:      [bug-report]
+area:      [backend]
+
+Went to implement the Observatory Task 9 review's "size-loop margin" follow-up and found it already closed. The name comes from the PR #486 delta-review comment; the review doc's matching item is "the size loop reduces a page-measured excess by raw JSON length", which PR #487 fixed (age prune first, then batches of 64 with a live-page re-measure after each commit, guarded by the projection-floor check from the F2 review). Neither the review nor manifest §4.2 defines any further margin, such as a hysteresis target below the bound or counting the WAL, so adding one would be new policy and would need a manifest decision. No code changed. The ROADMAP line that still listed the size-loop follow-up as open now points at PR #487 and leaves only the Surface replay scrubber, and the review doc's struck-through item names the PR and records the reconciliation.
+_________________________________________________________________________________ 09:32 fix/observatory-size-loop-margin
