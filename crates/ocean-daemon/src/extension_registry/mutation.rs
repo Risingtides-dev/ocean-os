@@ -31,10 +31,12 @@
 //!   incomplete pass with backoff.
 //! - No response carries a path, secret value, package byte, or stderr: codes
 //!   are closed and messages are fixed text.
-//! - Git sources are part of the §15 body grammar but belong to slice A4. Until
-//!   A4 lands they fail closed as `git_connection_pinning_unavailable` before
-//!   any acquisition, exactly the code §13.2 reserves for "pinned Git is not
-//!   available here"; there is no unpinned fallback.
+//! - Git sources (slice A4) acquire through the writer's pinned §13.2 path in
+//!   the same detached blocking task as a local source: strict grammar before
+//!   any permit, one DNS resolution checked for public-only answers, one
+//!   pinned `git` process per attempt, and the same seal and publication.
+//!   Where pinning is impossible the code is `git_connection_pinning_unavailable`
+//!   and there is no unpinned fallback. No Git output reaches a response.
 
 use std::collections::HashSet;
 
@@ -57,7 +59,7 @@ use crate::AppState;
 #[cfg(unix)]
 use super::transaction::{
     ActivitySnapshot, EnablementScope, MutationError, MutationOutcome, RegistryWriter,
-    ServiceActivity, TrustRequest, TrustResult,
+    ServiceActivity, TrustRequest, TrustResult, VerifiedQuarantine,
 };
 
 /// Codes a caller may simply retry after a short wait: nothing was written.
@@ -71,20 +73,15 @@ const RETRYABLE: [&str; 3] = [
 // Request bodies. Every object denies unknown fields (§15).
 // ---------------------------------------------------------------------------
 
-/// Install/update source. `local-path` is live in A3b; `git` parses so the
-/// grammar is exact (no `subdir`, no extra field) but is refused until A4.
+/// Install/update source: a local directory or one exact public Git commit
+/// (no `subdir`, no extra field).
 #[derive(Debug, Clone, Deserialize)]
 #[serde(tag = "kind", deny_unknown_fields)]
 pub(crate) enum SourceRequest {
     #[serde(rename = "local-path")]
     LocalPath { path: String },
     #[serde(rename = "git")]
-    Git {
-        #[allow(dead_code)]
-        url: String,
-        #[allow(dead_code)]
-        revision: String,
-    },
+    Git { url: String, revision: String },
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -261,7 +258,12 @@ pub(crate) fn precommit_status(code: &str) -> StatusCode {
         | "native_process_ack_required"
         | "invalid_secret_binding"
         | "unknown_service"
-        | "invalid_capability_grant" => StatusCode::BAD_REQUEST,
+        | "invalid_capability_grant"
+        | "invalid_git_source"
+        | "git_host_not_public"
+        | "git_revision_mismatch"
+        | "git_tree_unsupported"
+        | "git_acquisition_limit" => StatusCode::BAD_REQUEST,
         "extension_not_installed" | "extension_not_found" | "project_not_found" => {
             StatusCode::NOT_FOUND
         }
@@ -284,6 +286,8 @@ pub(crate) fn precommit_status(code: &str) -> StatusCode {
         | "ambient_credential_rejected"
         | "foreign_origin_rejected" => StatusCode::FORBIDDEN,
         "git_connection_pinning_unavailable" => StatusCode::NOT_IMPLEMENTED,
+        "git_resolution_failed" | "git_fetch_failed" => StatusCode::BAD_GATEWAY,
+        "git_acquisition_timeout" => StatusCode::GATEWAY_TIMEOUT,
         _ => StatusCode::INTERNAL_SERVER_ERROR,
     }
 }
@@ -555,13 +559,16 @@ async fn committed(
         .into_response()
 }
 
+/// Quarantine one install/update source without `.state.lock`: a local
+/// directory copy, or the pinned public Git acquisition (§13.2).
 #[cfg(unix)]
-fn local_path(source: SourceRequest) -> Result<String, Refusal> {
+fn acquire(
+    writer: &RegistryWriter,
+    source: &SourceRequest,
+) -> Result<VerifiedQuarantine, MutationError> {
     match source {
-        SourceRequest::LocalPath { path } => Ok(path),
-        // Slice A4 owns pinned public Git acquisition (§13.2). Refuse before
-        // any permit, quarantine, DNS, or process.
-        SourceRequest::Git { .. } => Err("git_connection_pinning_unavailable"),
+        SourceRequest::LocalPath { path } => writer.acquire_local(path),
+        SourceRequest::Git { url, revision } => writer.acquire_git(url, revision),
     }
 }
 
@@ -609,13 +616,10 @@ pub(crate) async fn install(
     };
     #[cfg(unix)]
     {
-        let path = match local_path(request.source) {
-            Ok(path) => path,
-            Err(code) => return refuse(code),
-        };
+        let source = request.source;
         let expected = request.expected_state_revision;
         detached(commit_and_reconcile(state, None, move |writer| {
-            let quarantine = writer.acquire_local(&path)?;
+            let quarantine = acquire(&writer, &source)?;
             writer.install(expected, quarantine)
         }))
         .await
@@ -646,17 +650,14 @@ pub(crate) async fn update(
         if ocean_extension::validate_extension_id(&id).is_err() {
             return refuse("invalid_extension_id");
         }
-        let path = match local_path(request.source) {
-            Ok(path) => path,
-            Err(code) => return refuse(code),
-        };
+        let source = request.source;
         let expected = request.expected_state_revision;
         let activity = activity(&state);
         detached(commit_and_reconcile(
             state,
             Some(ActivationReset::Reconfigured),
             move |writer| {
-                let quarantine = writer.acquire_local(&path)?;
+                let quarantine = acquire(&writer, &source)?;
                 writer.update(&id, expected, quarantine, &activity)
             },
         ))

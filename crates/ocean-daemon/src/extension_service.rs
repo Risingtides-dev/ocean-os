@@ -3733,7 +3733,7 @@ async fn wait_for_group_exit_until(
 }
 
 #[cfg(target_os = "linux")]
-fn group_has_live_members(pgid: libc::pid_t) -> io::Result<bool> {
+pub(crate) fn group_has_live_members(pgid: libc::pid_t) -> io::Result<bool> {
     for entry in fs::read_dir("/proc")? {
         let entry = entry?;
         let Some(pid) = entry
@@ -3766,7 +3766,7 @@ fn group_has_live_members(pgid: libc::pid_t) -> io::Result<bool> {
 }
 
 #[cfg(target_os = "macos")]
-fn group_has_live_members(pgid: libc::pid_t) -> io::Result<bool> {
+pub(crate) fn group_has_live_members(pgid: libc::pid_t) -> io::Result<bool> {
     const PROC_PGRP_ONLY: u32 = 2;
     let mut pids = vec![0_i32; 256];
     loop {

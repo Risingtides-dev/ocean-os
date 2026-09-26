@@ -18,13 +18,14 @@
 //!   missing or corrupt after the commit point;
 //! - the exact §12.4 retention transitions and §14 grant preview/apply.
 //!
-//! It exposes no HTTP/CLI route itself, performs no supervisor
-//! reconciliation, and acquires no Git source: A3b's sibling `mutation`
-//! module composes it into the §15 routes (always through `spawn_blocking`)
-//! and reconciles the supervisor after each commit, and daemon startup calls
-//! [`RegistryWriter::recover`] before any reader or service starts; Git is A4.
-//! Nothing here executes package code: acquisition copies and hashes bytes
-//! only.
+//! It exposes no HTTP/CLI route itself and performs no supervisor
+//! reconciliation: A3b's sibling `mutation` module composes it into the §15
+//! routes (always through `spawn_blocking`) and reconciles the supervisor after
+//! each commit, and daemon startup calls [`RegistryWriter::recover`] before any
+//! reader or service starts. Stage A4's child [`git`] module fills the same
+//! quarantine from one pinned public Git commit (§13.2). Nothing here executes
+//! package code: acquisition copies and hashes bytes only, and Git acquisition
+//! runs only the stripped-environment host `git` tool.
 
 use std::collections::BTreeMap;
 use std::ffi::{CStr, CString};
@@ -56,6 +57,11 @@ const STATE_FILES: [&str; 4] = [
 /// Exact §2/§14 native-authority notice. It is part of the confirmation hash so
 /// acknowledgement cannot be detached from the diff it was shown with.
 pub(crate) const NATIVE_AUTHORITY_NOTICE: &str = "Stage A native activation grants daemon-user-equivalent authority. The process may attempt network access, read or modify any daemon-user-accessible filesystem data including registry/store bytes, and act outside assigned roots regardless of declared capabilities; declarations and assigned paths are not containment.";
+
+/// Stage A4 pinned public Git acquisition (§13.2) into this writer's
+/// quarantine. A child of the writer so it shares the descriptor-relative
+/// primitives and lease without widening their visibility.
+pub(crate) mod git;
 
 const STATE_UNAVAILABLE: &str = "extension_state_unavailable";
 const RECOVERY_REQUIRED: &str = "registry_recovery_required";
@@ -132,6 +138,22 @@ impl MutationError {
             }
             "package_identity_mismatch" => "package manifest id does not match the extension",
             "acquisition_capacity" => "extension acquisition capacity is exhausted",
+            "invalid_git_source" => {
+                "Git source must be an HTTPS URL on a public host at an exact 40- or 64-hex commit id"
+            }
+            "git_connection_pinning_unavailable" => {
+                "pinned public Git acquisition is not available in this daemon"
+            }
+            "git_host_not_public" => "Git host resolved to a non-public address",
+            "git_resolution_failed" => "Git host could not be resolved",
+            "git_fetch_failed" => "pinned fetch of the exact Git revision failed",
+            "git_acquisition_timeout" => "Git acquisition exceeded its deadline",
+            "git_acquisition_limit" => "Git acquisition exceeded its object and temp size ceiling",
+            "git_revision_mismatch" => "fetched object is not the exact requested commit",
+            "git_tree_unsupported" => {
+                "Git tree has a symlink, submodule, LFS or filter attribute, or unsafe path"
+            }
+            "git_process_cleanup_failed" => "Git process-group cleanup could not be proven",
             REVISION_CONFLICT => "extension registry revision changed; inspect and retry",
             "already_installed" => "extension is already installed",
             "extension_not_installed" => "extension is not installed",
@@ -452,12 +474,17 @@ enum QuarantineHome {
 pub(crate) struct AcquisitionLease {
     operation_id: Uuid,
     home: QuarantineHome,
+    /// Canonical path of `quarantine` for tools that take paths (A4's host
+    /// `git`). It is proven to name the retained descriptor before use.
+    path: PathBuf,
     parent: File,
     quarantine: File,
     artifact: File,
     source: Option<InstallSource>,
     consumed: bool,
-    _permit: AcquisitionPermit,
+    /// `None` only after A4 deliberately retains the permit for a git process
+    /// group whose cleanup could not be proven.
+    permit: Option<AcquisitionPermit>,
 }
 
 impl AcquisitionLease {
@@ -608,30 +635,37 @@ impl RegistryWriter {
         operation_id: Uuid,
         permit: AcquisitionPermit,
     ) -> Step<AcquisitionLease> {
+        let canonical = fs::canonicalize(&self.config_dir).map_err(unavailable)?;
         let config = self.open_config()?;
         let operation = CString::new(operation_id.to_string()).expect("uuid has no NUL");
-        let (home, parent) = match open_dir_at(&config, OsStr::new("extensions"), "extensions/") {
-            Ok(root) => {
-                let parent = mkdir_open(&root, c"quarantine", 0o700, true).map_err(unavailable)?;
-                (QuarantineHome::Root, parent)
-            }
-            Err(StateError::MissingComponent(_)) => {
-                let name = CString::new(format!("{BOOTSTRAP_PREFIX}{operation_id}"))
-                    .expect("uuid has no NUL");
-                let directory = mkdir_open(&config, &name, 0o700, false).map_err(unavailable)?;
-                let parent =
-                    mkdir_open(&directory, c"quarantine", 0o700, false).map_err(unavailable)?;
-                (
-                    QuarantineHome::Bootstrap {
-                        config,
-                        name,
-                        directory,
-                    },
-                    parent,
-                )
-            }
-            Err(error) => return Err(error.into()),
-        };
+        let (home, parent, path) =
+            match open_dir_at(&config, OsStr::new("extensions"), "extensions/") {
+                Ok(root) => {
+                    let parent =
+                        mkdir_open(&root, c"quarantine", 0o700, true).map_err(unavailable)?;
+                    let path = canonical.join("extensions").join("quarantine");
+                    (QuarantineHome::Root, parent, path)
+                }
+                Err(StateError::MissingComponent(_)) => {
+                    let bootstrap = format!("{BOOTSTRAP_PREFIX}{operation_id}");
+                    let path = canonical.join(&bootstrap).join("quarantine");
+                    let name = CString::new(bootstrap).expect("uuid has no NUL");
+                    let directory =
+                        mkdir_open(&config, &name, 0o700, false).map_err(unavailable)?;
+                    let parent =
+                        mkdir_open(&directory, c"quarantine", 0o700, false).map_err(unavailable)?;
+                    (
+                        QuarantineHome::Bootstrap {
+                            config,
+                            name,
+                            directory,
+                        },
+                        parent,
+                        path,
+                    )
+                }
+                Err(error) => return Err(error.into()),
+            };
         let discard_home = |home: &QuarantineHome| {
             if let QuarantineHome::Bootstrap { config, name, .. } = home {
                 let _ = remove_tree_at(config, name, 0);
@@ -655,12 +689,13 @@ impl RegistryWriter {
         Ok(AcquisitionLease {
             operation_id,
             home,
+            path: path.join(operation_id.to_string()),
             parent,
             quarantine,
             artifact,
             source: None,
             consumed: false,
-            _permit: permit,
+            permit: Some(permit),
         })
     }
 

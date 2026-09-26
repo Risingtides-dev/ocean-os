@@ -1095,8 +1095,8 @@ Status exposure is read-only/non-probing cached runtime projection, never a
 package probe. Its committed-202, CLI exit, active-service, and retry/reinspect
 tests land here. No Git network acquisition.
 
-**A3b status (2026-09-25): implemented on `feat/extension-stage-a3b` (draft PR),
-pending fresh independent review; not accepted. A4 is next after that review.**
+**A3b status (2026-09-25): merged to `main` by PR #502. A4 followed on
+`feat/extension-stage-a4`.**
 The HTTP adapters are `crates/ocean-daemon/src/extension_registry/mutation.rs`
 (a child of the registry module, beside the A3a writer); route composition stays
 in `main.rs`; the CLI verbs are `crates/ocean-cli/src/extension.rs`. Realization
@@ -1241,6 +1241,196 @@ Add only §13.2 Git source handling to install/update, with URL/DNS-to-connectio
 pinning, Git capability/version fail-closed behavior, credential/proxy isolation,
 generation-safe process groups, timeout/byte/revision/root-tree/no-submodule/LFS/
 filter/script constraints, and rollback tests.
+
+**A4 status (2026-09-25): implemented on `feat/extension-stage-a4` (draft PR),
+pending fresh independent review; not accepted. A5 is next after that review.**
+A3b merged to `main` in PR #502 before A4 began.
+The acquisition is `crates/ocean-daemon/src/extension_registry/transaction/git.rs`,
+a child of the A3a writer so it fills the same `AcquisitionLease` with the same
+descriptor-relative primitives; the §15 install/update routes now send a Git
+source to it inside the existing detached `spawn_blocking` task instead of
+refusing with 501. No route, CLI verb, schema, or persisted field is added: the
+installed source stays A0's `{kind:"git", locator, revision}`. Realization
+choices:
+
+- *Grammar.* `https://<host>[:443]/<path>[.git]` with a 40- or 64-hex lowercase
+  object id, refused as `invalid_git_source` (400) before any permit,
+  quarantine, DNS, or process. The host must be a lowercase LDH name with at
+  least two labels and an alphabetic (or `xn--`) top-level label that is not
+  special-use (`alt`, `arpa`, `example`, `internal`, `invalid`, `local`,
+  `localdomain`, `localhost`, `onion`, `test`), which also rules out every IP
+  literal spelling. The path allows only `[A-Za-z0-9._~-]` segments, no `.`/`..`
+  or empty segment; `%`, `@`, `?`, `#`, `\`, brackets, whitespace, and non-ASCII
+  are refused. Accepted A0's reader grammar (which still reads historical
+  `ssh://`/`git@` rows) is unchanged; A4 only admits HTTPS for new installs.
+- *Address policy.* One resolution per acquisition through an injectable
+  `HostResolver` (production: `getaddrinfo` on a helper thread bounded by the
+  remaining deadline). Answers are canonicalized (IPv4-mapped → IPv4) and
+  deduplicated; one non-public member refuses the whole set as
+  `git_host_not_public`. Public means: IPv4 outside 0/8, 10/8, 100.64/10, 127/8,
+  169.254/16, 172.16/12, 192.0.0/24, 192.0.2/24, 192.88.99/24, 192.168/16,
+  198.18/15, 198.51.100/24, 203.0.113/24, 224/4 and 240/4; IPv6 inside
+  `2000::/3` and outside 2001::/23, 2001:db8::/32, 2002::/16, and 3fff::/20.
+  No answer or a timeout is `git_resolution_failed` (502).
+- *Pinning.* Each attempt is a fresh bare repository and a fresh `git` given
+  exactly one `-c http.curloptResolve=<host>:443:<address>` (IPv6 bracketed, no
+  leading `+`); the URL keeps the hostname, `http.sslVerify=true` is explicit,
+  and fallback walks the checked set in order under the one deadline. A failed
+  attempt on every address is `git_fetch_failed` (502); a timeout, size
+  excess, or cleanup failure stops fallback.
+- *Capability.* The tool is the first executable of `/usr/bin/git`,
+  `/usr/local/bin/git`, `/opt/homebrew/bin/git` (never a `PATH` lookup). It must
+  report `git version` ≥ 2.37.0 (vendor suffixes ignored, unparseable refused)
+  and `--exec-path` must be absolute and contain `git-remote-https`. Anything
+  else, and every platform other than macOS/Linux, is
+  `git_connection_pinning_unavailable` (501).
+- *Isolation.* `env_clear` plus exactly `PATH=/usr/bin:/bin`, `HOME=<empty 0700
+  quarantine/<op>/fetch/home>`, `GIT_CONFIG_NOSYSTEM=1`,
+  `GIT_CONFIG_GLOBAL=/dev/null`, `GIT_TERMINAL_PROMPT=0`,
+  `GIT_ASKPASS=/usr/bin/false`, `GIT_OPTIONAL_LOCKS=0`,
+  `GIT_NO_REPLACE_OBJECTS=1`, `GIT_PROTOCOL_FROM_USER=0`, `LC_ALL=C`. Every
+  invocation carries a fixed `-c` list: `protocol.allow=never` plus only
+  `protocol.https.allow=always`; `http.followRedirects=false`; empty
+  `http.proxy`, `remote.origin.proxy`, `http.extraHeader`, `http.cookieFile`,
+  and `credential.helper`; `http.emptyAuth=false`; `core.askPass` and
+  `core.sshCommand` set to `/usr/bin/false`; `core.hooksPath=/dev/null`;
+  `core.fsmonitor=false`; submodule recursion off; `fetch.fsckObjects` and
+  `transfer.fsckObjects` on; commit-graph, auto-gc and maintenance off; and the
+  LFS filter driver emptied. `git init --bare --template=` (no sample hooks,
+  `--object-format=sha256` for a 64-hex id) and `fetch --quiet --no-tags
+  --no-recurse-submodules --no-auto-gc --depth=1 --end-of-options <url> <id>`.
+  Git's stderr is discarded; no response, log, or state carries Git output,
+  a resolved address, or anything but the accepted URL.
+- *Verification and extraction.* `FETCH_HEAD` must hold exactly one line
+  beginning with the requested id, and `cat-file -t` must answer `commit`
+  (a fetched tree or blob id is `git_revision_mismatch`, 400). `ls-tree -r -l -z
+  --full-tree` (output capped at 64 MiB, records at 8 KiB) is validated whole
+  before a byte is extracted: only `100644`/`100755` blobs; a symlink (`120000`),
+  gitlink (`160000`), any `.gitmodules`, `.lfsconfig`, `.git` (any case), empty,
+  `.`/`..`, over-255-byte, control-character, or non-UTF-8 component is
+  `git_tree_unsupported` (400), and the A0 entry/depth/byte limits are
+  `package_invalid` (400). Bytes come from `cat-file --batch` (no filters, no
+  text conversion); every header must match the listing and trailing bytes are
+  refused. A `.gitattributes` that assigns any `filter=` driver, directly or via
+  an `[attr]` macro, is `git_tree_unsupported`. Files and directories are
+  created descriptor-relative with `O_EXCL` and exact modes 0644/0755/0755, and
+  a directory that already exists without this writer having made it (a
+  case-folding or normalization collision) is refused rather than merged, so
+  Git and local sources of the same tree produce the same `sha256-tree-v1`
+  digest. The Git scratch directory is removed before the unchanged A3a seal.
+- *Bounds and process groups.* One 60-second deadline covers DNS, the probe,
+  every attempt, verification, listing, and `cat-file`. Everything under
+  `quarantine/<op>/fetch` is measured every 200 ms while a process runs and
+  again after it exits; over 512 MiB is `git_acquisition_limit` (400). Each
+  `git` leads a new process group; the leader is observed with
+  `waitid(WNOWAIT)` and reaped only after `group_has_live_members` proves the
+  group empty. Timeout or size excess follows §10.5 (SIGTERM, 2 s, SIGKILL,
+  2 s); a leader that exits on its own has any surviving member killed while
+  its zombie still pins the PGID. A group that cannot be proven empty is
+  `git_process_cleanup_failed` (500) and its leader is left unreaped, so its
+  PGID is never reused under a signal. Timeout is `git_acquisition_timeout`
+  (504). Every failure deletes the quarantine and leaves the revision unchanged.
+
+Tests (`transaction/git/tests.rs`, plus a route test in `mutation/tests.rs`) run
+offline: extraction uses a test-only `file://` remote reached only after the
+full resolution and public-address check; argv, environment, capability, and
+process-group cases use a scripted fake `git`; and connection pinning points the
+real host `git` at a loopback listener under a `.invalid` hostname DNS can never
+answer (the listener sees the pinned connection with the hostname as the HTTP
+authority and as TLS SNI; an unpinned control makes no connection; a 302 is
+never followed; a 401 is never answered with credentials). Each guard was
+mutation-checked by breaking it and confirming its test fails: pin removed,
+redirects followed, non-public answers admitted, symlink blobs materialized,
+filter attributes ignored, leader-only signaling, version floor lowered,
+`env_clear` removed, non-commit ids accepted, temp ceiling unmeasured, hostname
+policy skipped, `.gitmodules` admitted, and control-character paths admitted all
+fail a test. The separately recorded exact public-commit smoke
+(`a4_public_commit_smoke`, `#[ignore]`d network test) fetched
+`https://github.com/octocat/Hello-World.git` at
+`7fd1a60b01f91b314f59955a4e4d4e80d8edf11d` through a pinned connection with the
+system resolver and host Git 2.50.1 on 2026-09-25 and extracted its tree.
+
+*Independent review follow-up (Knox on PR #503: no blockers; one medium, seven
+lows, six nits), repaired on the same branch:*
+
+- *Aliasing paths (medium).* The tree listing is refused as
+  `git_tree_unsupported` when two distinct paths, or a file and a directory,
+  share one collision key (Unicode lowercase, then NFC via the `icu_normalizer`
+  crate already in the lock through `idna`), so `README`+`readme`, NFC+NFD
+  `café`, and `DIR/`+`dir/` fail on every host, not only on a case-insensitive
+  or normalizing filesystem. The filesystem-level `TreeWriter` guard (never
+  merge into a directory this writer did not create) stays as the second layer
+  and has its own deterministic test.
+- *Local commands carry no transport.* `init`, `ls-tree`, `cat-file`, and the
+  version/exec-path probe get `protocol.allow=never` and no per-protocol
+  allowance; only `fetch` gets exactly one. `transfer.bundleURI=false` and an
+  empty `fetch.uriProtocols` join the fixed hardening (no bundle-URI or
+  packfile-URI side channel).
+- *Tree bomb.* `ls-tree` output is read as it grows and the group is killed
+  (§10.5) once it passes the A0 entry cap in records or 64 MiB, as
+  `package_invalid`.
+- *Resolver threads.* At most four `getaddrinfo` helper threads may be in
+  flight daemon-wide; each holds its slot until the lookup itself returns, and a
+  full cap refuses without spawning as `git_resolution_failed`.
+- *Address walk.* At most eight members of the checked answer set are tried.
+- *Codes.* A failing `cat-file -t` is `git_revision_mismatch`, not 501; a
+  resource-exhaustion spawn failure (`EAGAIN`, `ENOMEM`, `EMFILE`, `ENFILE`) is
+  the transient `git_fetch_failed`, not 501.
+- *macOS shim.* `/usr/bin/git` is chosen only when the `xcode-select` choice
+  (read from `/var/db/xcode_select_link`, never by invoking the shim) or, with
+  no choice recorded, the Xcode or Command Line Tools default holds a real
+  `usr/bin/git`; otherwise the next fixed candidate (Homebrew) is used, so an
+  acquisition can never open the CLT install dialog.
+- *Permit after unproven cleanup.* On `git_process_cleanup_failed` the lease
+  keeps its acquisition permit until daemon restart (its quarantine is still
+  deleted), so stuck tools can never exceed the four-acquisition cap; while it
+  is held the orphan sweep is skipped, never raced.
+- *Tests added:* the three aliasing trees end to end plus a synthetic-listing
+  fold test and a `TreeWriter` test; direct `safe_component` assertions; a
+  scripted two-line/foreign/malformed `FETCH_HEAD` and a wrong-size blob header
+  (each with a passing control); a `file://` target refused under the `https`
+  allowance (with a `file` control); a `::1` twin of the pinning test (skipped
+  only when IPv6 loopback is unavailable); the address and resolver caps; the
+  spawn-code and shim decisions; and permit retention. Each new guard was
+  mutation-checked: removing the fold check, the writer guard, the `.git`
+  refusal, the one-line `FETCH_HEAD` rule, the header check, the streaming
+  listing watch, the local no-transport rule, `transfer.bundleURI`, the address
+  cap, the resolver cap, either code mapping, the `xcode-select` precedence,
+  permit retention, or the IPv6 pin fails a test; the protocol policy is two
+  layers (`protocol.allow=never` and `GIT_PROTOCOL_FROM_USER=0`) and removing
+  both fails the `file://` test. On APFS the end-to-end aliasing test fails
+  only when both collision layers are removed, which is the intended defense
+  in depth; each layer's own test fails when that layer alone is removed.
+
+Recorded boundaries, not decided here:
+
+1. §13.2's "any indication that the pin was not honored" has no production
+   signal beyond the version gate: Git ignores unknown config keys, and libcurl
+   reports nothing about resolve-cache use. The conformance test proves the pin
+   on the host that runs it; a runtime self-check would need a loopback probe
+   per acquisition and is not built.
+2. `getaddrinfo` cannot be cancelled. A lookup that outlives the deadline fails
+   the acquisition and finishes on its helper thread afterwards, holding one of
+   the four resolver slots until it does.
+3. The deadline bounds every process; the in-process copy of already-fetched,
+   already-listed bytes (at most 256 MiB) after `cat-file` exits is bounded
+   work, not deadline-interrupted.
+4. `/usr/local/bin/git` and `/opt/homebrew/bin/git` are typically writable by
+   the operator account. They are fixed, package-independent paths, but an
+   operator-controlled binary there is trusted like any daemon-user tool. The
+   macOS shim check reads developer-tool locations, not `DEVELOPER_DIR`
+   (the environment is cleared for every `git`, so the shim ignores it too).
+7. The aliasing rule refuses paths that are distinct on a case-sensitive
+   filesystem. Local acquisition does not apply it (a local tree already
+   exists on one filesystem); whether local sources should share it is left to
+   review.
+5. The `.gitattributes` `filter=` refusal, and refusing `.gitmodules`/
+   `.lfsconfig` anywhere in the tree, are this builder's reading of "no
+   submodules, Git LFS, … smudge/clean filter": content is never filtered, so
+   these only turn a source that would install as LFS pointer files or a
+   hollow submodule into an explicit refusal.
+6. §17's shared-service project-disable boundary and the credential-class
+   ruling recorded under A3b are untouched by A4.
 
 ### A5 — integrated Stage A gate and closeout
 

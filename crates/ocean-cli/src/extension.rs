@@ -49,8 +49,9 @@ pub(crate) enum ExtensionCmd {
     },
     /// Show the supervisor's cached runtime status (never probes).
     Status { id: String },
-    /// Install a package from a local directory (or, once available, a
-    /// pinned public Git revision). Grants nothing and starts nothing.
+    /// Install a package from a local directory, or from one exact commit of
+    /// a public HTTPS Git repository (`--git URL --rev HEX`, fetched by the
+    /// daemon through a DNS-pinned connection). Grants nothing, starts nothing.
     #[command(group(ArgGroup::new("source").required(true).args(["path", "git"])))]
     Install {
         #[arg(long, conflicts_with = "git")]
