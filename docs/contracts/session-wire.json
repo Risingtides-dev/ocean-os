@@ -26,6 +26,7 @@
     "client_type",
     "model",
     "project_id",
+    "title",
     "workspace_root"
   ],
   "session_create_response_keys": [

@@ -59,6 +59,12 @@ This crate owns the long-running Ocean HTTP service on `:4780`, including API ro
   kinds, and the Buddy event, attachment, response and card shapes with the
   one state, target and mime type the mock slice accepts. A change to any of
   these updates the artifact in the same commit.
+- `POST /v1/agent/sessions` accepts an optional `title` display hint and
+  adopts it through `Session::ensure_title` (squashed, truncated, blank
+  ignored, first write wins, so the first turn cannot relabel it). Turn
+  `canvas` (Surface's live canvas snapshot) is not accepted and is dropped
+  by serde; that is an open operator decision recorded in
+  `docs/contracts/README.md`, not a bug to fix in passing.
 - `session_wire_contract_matches_the_daemon` also pins the agent-stream
   route and its `event: error` reset frame (`AgentReplayGap`), the
   `ocean.session_changed` invalidation, the open `client_type` set with the

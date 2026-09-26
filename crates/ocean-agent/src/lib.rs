@@ -1980,17 +1980,23 @@ impl AgentRuntime {
         cwd: &str,
         client_type: Option<String>,
     ) -> anyhow::Result<(SessionId, String, Option<String>)> {
-        self.create_session_with_model(cwd, client_type, None)
+        self.create_session_with_model(cwd, client_type, None, None)
     }
 
     /// Atomically mint a session with an optional already-resolved catalog
     /// model/provider pair. Explicit model creation advances config revision to
     /// one in the same persisted write; no post-create PATCH window exists.
+    ///
+    /// `title`, when supplied, is the caller's display-title hint. It is
+    /// adopted through [`session::Session::ensure_title`], so it is squashed and
+    /// truncated like a first-turn title, a blank hint is ignored, and the
+    /// first turn cannot relabel a session that already has one.
     pub fn create_session_with_model(
         &self,
         cwd: &str,
         client_type: Option<String>,
         initial_model: Option<(String, String)>,
+        title: Option<&str>,
     ) -> anyhow::Result<(SessionId, String, Option<String>)> {
         anyhow::ensure!(
             !cwd.trim().is_empty(),
@@ -2009,6 +2015,9 @@ impl AgentRuntime {
         session.bind_workspace(Path::new(cwd));
         if client_type.is_some() {
             session.client_type = client_type.clone();
+        }
+        if let Some(title) = title {
+            session.ensure_title(title);
         }
         session::save(&self.config_dir, &session)?;
         Ok((session.id, cwd.to_string(), session.client_type))
@@ -5719,6 +5728,67 @@ done
 
         // An empty cwd has nothing to bind to and is rejected.
         assert!(runtime.create_session("   ", None).is_err());
+
+        let _ = std::fs::remove_dir_all(config_dir);
+    }
+
+    /// `POST /v1/agent/sessions` title hint: adopted at create with the
+    /// first-turn title rules, a blank hint is ignored, and the first turn
+    /// never relabels a session that already carries the hint.
+    #[tokio::test]
+    async fn create_session_title_hint_is_adopted_once_and_survives_the_first_turn() {
+        let config_dir = temp_config_dir("create-session-title-hint");
+        let runtime = runtime(
+            config_dir.clone(),
+            provider_config(ProviderId::Fake, "fake-ok", false),
+        );
+
+        let (id, _, _) = runtime
+            .create_session_with_model(
+                ".",
+                Some("surface-web".into()),
+                None,
+                Some("  plan   the\nrelease  "),
+            )
+            .unwrap();
+        assert_eq!(
+            runtime.session_detail(id).unwrap().title,
+            "plan the release"
+        );
+
+        let res = runtime
+            .prompt(
+                PromptRequest {
+                    prompt: "a different first prompt".into(),
+                    images: None,
+                    request_id: None,
+                    session_id: Some(id),
+                    create_if_missing: false,
+                    max_turns: None,
+                    yolo: false,
+                    cwd: ".".into(),
+                    project_id: None,
+                    client_type: Some("surface-web".into()),
+                    decision_token: None,
+                },
+                PromptControl::yolo(false)
+                    .with_display_title(Some("a different first prompt".into())),
+            )
+            .await;
+        assert!(res.ok, "fake turn should succeed: {}", res.stderr);
+        assert_eq!(
+            runtime.session_detail(id).unwrap().title,
+            "plan the release",
+            "the create hint is the first title written, so the turn keeps it"
+        );
+
+        let (blank, _, _) = runtime
+            .create_session_with_model(".", None, None, Some("   "))
+            .unwrap();
+        let stored = session::load_resumable(&config_dir, blank)
+            .unwrap()
+            .expect("session persisted");
+        assert_eq!(stored.title, None, "a blank hint sets no title");
 
         let _ = std::fs::remove_dir_all(config_dir);
     }

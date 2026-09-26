@@ -8241,6 +8241,7 @@ async fn agent_sessions_create(
         project_id,
         model,
         client_type,
+        title,
     } = req;
 
     // Resolve the working directory with the same precedence the turn path uses:
@@ -8300,10 +8301,12 @@ async fn agent_sessions_create(
         None => None,
     };
 
-    match state
-        .runtime
-        .create_session_with_model(&cwd, client_type, initial_model)
-    {
+    match state.runtime.create_session_with_model(
+        &cwd,
+        client_type,
+        initial_model,
+        title.as_deref(),
+    ) {
         Ok((core_id, bound_cwd, stored_client_type)) => {
             let session_id = sdk_sid(core_id);
             let lifecycle_scope = state.extension_lifecycle.source_scope(
@@ -15175,6 +15178,7 @@ mod tests {
             project_id: Some(uuid::Uuid::nil()),
             model: Some("m".into()),
             client_type: Some("surface-web".into()),
+            title: Some("t".into()),
         })
         .unwrap();
         let mut request_keys: Vec<String> =
@@ -15191,6 +15195,7 @@ mod tests {
                 project_id: None,
                 model: None,
                 client_type: Some("surface-web".to_owned()),
+                title: None,
             }),
         )
         .await;
@@ -15351,6 +15356,7 @@ mod tests {
                 project_id: None,
                 model: None,
                 client_type: Some(unlisted.to_owned()),
+                title: None,
             }),
         )
         .await;
@@ -16807,6 +16813,47 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn explicit_session_create_adopts_the_title_hint() {
+        let state = capped_turn_state(1);
+        let workspace = tempfile::tempdir().expect("workspace");
+        let (status, created) = agent_sessions_create(
+            State(state.clone()),
+            Json(AgentSessionCreateRequest {
+                workspace_root: workspace.path().to_string_lossy().into_owned(),
+                project_id: None,
+                model: None,
+                client_type: Some("surface-web".to_owned()),
+                title: Some("ship the  surface\ndrift fix".to_owned()),
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let detail = state
+            .runtime
+            .session_detail(core_sid(created.session_id))
+            .expect("created session");
+        assert_eq!(detail.title, "ship the surface drift fix");
+
+        let (status, untitled) = agent_sessions_create(
+            State(state.clone()),
+            Json(AgentSessionCreateRequest {
+                workspace_root: workspace.path().to_string_lossy().into_owned(),
+                project_id: None,
+                model: None,
+                client_type: Some("surface-web".to_owned()),
+                title: None,
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let detail = state
+            .runtime
+            .session_detail(core_sid(untitled.session_id))
+            .expect("created session");
+        assert_eq!(detail.title, "", "no hint and no turn leaves no title");
+    }
+
+    #[tokio::test]
     async fn explicit_session_create_publishes_only_the_successful_authoritative_fact() {
         use ocean_agent_sdk::extension_lifecycle::LifecycleEventKind;
 
@@ -16823,6 +16870,7 @@ mod tests {
                 project_id: None,
                 model: Some(known.id.clone()),
                 client_type: Some("cli".to_owned()),
+                title: None,
             }),
         )
         .await;
@@ -16851,6 +16899,7 @@ mod tests {
                 project_id: None,
                 model: Some("not-a-catalog-model".into()),
                 client_type: Some("cli".to_owned()),
+                title: None,
             }),
         )
         .await;
@@ -16908,6 +16957,7 @@ mod tests {
                 project_id: Some(project_b.id),
                 model: None,
                 client_type: Some("test".into()),
+                title: None,
             }),
         )
         .await;

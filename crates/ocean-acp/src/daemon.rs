@@ -500,6 +500,7 @@ fn session_create_request(cwd: &str) -> AgentSessionCreateRequest {
         project_id: None,
         model: None,
         client_type: Some(CLIENT_TYPE.to_string()),
+        title: None,
     }
 }
 

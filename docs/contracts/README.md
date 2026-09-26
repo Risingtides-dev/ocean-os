@@ -83,7 +83,12 @@ answer, whose text the TUI matches to wait and retry). `client_type` is an
 open set: the daemon accepts and echoes any string, and the published `known`
 values are the ones `HarnessProfile::from_client_type` maps (anything else
 runs with the CLI profile). The test proves both by source and by creating a
-session with an unlisted value.
+session with an unlisted value. The create body's optional `title` is a
+display-title hint. The daemon adopts it the way it adopts a first-turn title:
+whitespace squashed, truncated to the switcher length, a blank hint ignored,
+and the first title written wins, so the first turn does not relabel it. The
+create response does not echo it; read it back from the session list or
+detail `title`.
 
 `session-wire.json` also covers every other daemon route an in-repo consumer
 calls: `POST /v1/agent/sessions` itself (`session_create_route`), `GET
@@ -178,6 +183,33 @@ them.
 
 These additions kept every artifact at `version: 1`. Nothing here asks for a
 bump on an additive change, and every consumer reads by key.
+
+## Fields Surface sends that the daemon drops
+
+`AgentTurnRequest` does not deny unknown fields, so a field a client sends
+and the daemon does not declare is dropped without an error. One such field
+is open:
+
+- Turn `canvas`. When the operator's canvas holds at least one placed
+  component, Surface (`dispatch_prompt` in
+  `ocean-surface-ui/src/daemon.rs`, since ocean-surface a9a6acd, 2026-07-11)
+  adds `canvas` to `POST /v1/agent/turns`: a `CanvasContext` with an optional
+  `active_canvas_id` and one entry per non-empty canvas (`canvas_id`, up to
+  128 `components` each with `id`, `kind`, optional `title`/`body`/`value`/
+  `status` text capped at 280 characters, and a `rect` `[x, y, w, h]` in canvas
+  units; `edges` with `id`, `from`, `to`, `kind`, optional `label`; and an
+  `omitted_components` count). The field has never been declared on the daemon
+  side: no ocean-os commit has added it and no spec defines how the daemon
+  consumes it. Surface's own doc comment says that consumption "lives with the
+  ocean-os team (inject as turn context, never as the prompt itself)", and
+  `docs/OCEAN_CANVAS_CONVERGENT_MERGE.md` assumes a next-turn canvas context.
+  Today the snapshot is dropped and the model never sees the canvas. This is
+  an operator decision, not a wire repair. Either the daemon accepts `canvas`
+  (a typed, bounded field on `AgentTurnRequest`, sanitized the way
+  `client_context.browser` is, rendered into turn context separately from the
+  prompt and kept out of the persisted display title, then published in
+  `agent_turn.request_fields`), or Surface stops sending it until that exists.
+  Until one of those lands, Surface's pin lists it as known-unpublished.
 
 ## Not published, on purpose
 
