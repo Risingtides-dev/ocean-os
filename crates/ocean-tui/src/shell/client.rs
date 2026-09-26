@@ -94,7 +94,7 @@ impl DaemonClient {
 
     pub async fn health(&self) -> Result<HealthResponse, String> {
         self.http
-            .get(format!("{}/health", self.base))
+            .get(format!("{}{HEALTH_PATH}", self.base))
             .send()
             .await
             .and_then(|r| r.error_for_status())
@@ -113,7 +113,7 @@ impl DaemonClient {
         on_retry: impl FnMut(usize, usize),
     ) -> Result<AgentSessionCreateResponse, String> {
         let req = session_create_request(workspace_root, model);
-        let url = format!("{}/v1/agent/sessions", self.base);
+        let url = format!("{}{SESSIONS_PATH}", self.base);
         self.post_json_retrying(&url, &req, on_retry).await
     }
 
@@ -130,7 +130,7 @@ impl DaemonClient {
     ) -> Result<AgentTurnResponse, TurnSubmitError> {
         const RETRY_DELAYS_MS: &[u64] = &[500, 1000, 2000, 3000, 4000, 5000];
         let total = RETRY_DELAYS_MS.len() + 1;
-        let url = format!("{}/v1/agent/turns", self.base);
+        let url = format!("{}{AGENT_TURNS_PATH}", self.base);
         let mut attempt = 0usize;
         loop {
             attempt += 1;
@@ -161,7 +161,7 @@ impl DaemonClient {
                 let rejection = response.json::<AgentTurnResponse>().await.ok();
                 if status == reqwest::StatusCode::CONFLICT
                     && rejection.as_ref().and_then(|body| body.error.as_deref())
-                        == Some("session has an active operation; try again shortly")
+                        == Some(SESSION_ACTIVE_OPERATION)
                 {
                     return Err(TurnSubmitError::SessionBusy);
                 }
@@ -253,10 +253,14 @@ impl DaemonClient {
         // the subscription lands after the turn's first deltas. A resumed chat
         // already loaded its transcript from disk — replay would duplicate it.
         let url = format!(
-            "{}{AGENT_EVENTS_PATH}?session_id={}{}",
+            "{}{AGENT_EVENTS_PATH}?{AGENT_EVENTS_SESSION_QUERY}={}{}",
             self.base,
             session_id,
-            if replay_first { "&replay=1" } else { "" }
+            if replay_first {
+                format!("&{AGENT_EVENTS_REPLAY_QUERY}=1")
+            } else {
+                String::new()
+            }
         );
         tokio::spawn(async move {
             let mut last_event_id = initial_last_event_id;
@@ -359,7 +363,9 @@ impl DaemonClient {
                 };
 
                 let snapshot_response = http
-                    .get(format!("{base}/v1/observatory/snapshot?detail=summary"))
+                    .get(format!(
+                        "{base}{OBSERVATORY_SNAPSHOT_PATH}?{OBSERVATORY_DETAIL_QUERY}={OBSERVATORY_SUMMARY}"
+                    ))
                     .bearer_auth(&token)
                     .send()
                     .await;
@@ -397,11 +403,11 @@ impl DaemonClient {
 
                 let response = http
                     .get(format!(
-                        "{base}/v1/observatory/events?after={}&scope=summary",
+                        "{base}{OBSERVATORY_EVENTS_PATH}?{OBSERVATORY_AFTER_QUERY}={}&{OBSERVATORY_SCOPE_QUERY}={OBSERVATORY_SUMMARY}",
                         cursor.as_string()
                     ))
                     .bearer_auth(&token)
-                    .header("Last-Event-ID", cursor.as_string())
+                    .header(OBSERVATORY_RESUME_HEADER, cursor.as_string())
                     .timeout(Duration::from_secs(60 * 60 * 24 * 365))
                     .send()
                     .await;
@@ -489,7 +495,7 @@ impl DaemonClient {
     /// `EventEnvelope` onto the action channel. Fire-and-forget task.
     pub fn spawn_global_event_stream(&self, actions: mpsc::UnboundedSender<Action>) {
         let http = self.http.clone();
-        let url = format!("{}/v1/events", self.base);
+        let url = format!("{}{EVENTS_PATH}", self.base);
         tokio::spawn(async move {
             loop {
                 let req = http
@@ -604,8 +610,9 @@ impl DaemonClient {
         let response = self
             .http
             .post(format!(
-                "{}/v1/sessions/{}/compact",
-                self.base, session_id.0
+                "{}{}",
+                self.base,
+                SESSION_COMPACT_PATH.replace("{id}", &session_id.0.to_string())
             ))
             .send()
             .await
@@ -632,13 +639,8 @@ impl DaemonClient {
             });
         }
         if !status.is_success() {
-            let documented_precommit_rejection = !compact.ok
-                && matches!(
-                    status,
-                    reqwest::StatusCode::NOT_FOUND
-                        | reqwest::StatusCode::CONFLICT
-                        | reqwest::StatusCode::TOO_MANY_REQUESTS
-                );
+            let documented_precommit_rejection =
+                !compact.ok && COMPACT_PRECOMMIT_REJECTIONS.contains(&status.as_u16());
             return Err(CompactFailure {
                 message: if compact.stderr.trim().is_empty() {
                     format!("compact failed ({status})")
@@ -694,7 +696,11 @@ impl DaemonClient {
     pub async fn cancel_request(&self, request_id: RequestId) -> Result<String, String> {
         let response = self
             .http
-            .post(format!("{}/v1/requests/{request_id}/cancel", self.base))
+            .post(format!(
+                "{}{}",
+                self.base,
+                REQUEST_CANCEL_PATH.replace("{id}", &request_id.to_string())
+            ))
             .send()
             .await
             .map_err(|error| error.to_string())?;
@@ -704,11 +710,11 @@ impl DaemonClient {
             .await
             .map_err(|error| error.to_string())?;
         let ok = value
-            .get("ok")
+            .get(CANCEL_OK_KEY)
             .and_then(serde_json::Value::as_bool)
             .unwrap_or(false);
         let message = value
-            .get("message")
+            .get(CANCEL_MESSAGE_KEY)
             .and_then(serde_json::Value::as_str)
             .unwrap_or("cancel request failed")
             .to_string();
@@ -727,20 +733,12 @@ impl DaemonClient {
         allow: bool,
         decision_token: Option<String>,
     ) -> Result<(), String> {
-        let decision = if allow {
-            PermissionDecision::Allow
-        } else {
-            PermissionDecision::Deny { reason: None }
-        };
-        let body = PermissionDecisionRequest {
-            permission_id,
-            decision,
-            decision_token,
-        };
+        let body = permission_decision_body(permission_id, allow, decision_token);
         self.http
             .post(format!(
-                "{}/v1/permissions/{permission_id}/decision",
-                self.base
+                "{}{}",
+                self.base,
+                PERMISSION_DECISION_PATH.replace("{id}", &permission_id.to_string())
             ))
             .json(&body)
             .send()
@@ -754,7 +752,7 @@ impl DaemonClient {
     pub async fn permission_settings(&self) -> Result<PermissionSettingsResponse, String> {
         let response = self
             .http
-            .get(format!("{}/v1/settings/permissions", self.base))
+            .get(format!("{}{PERMISSION_SETTINGS_PATH}", self.base))
             .send()
             .await
             .and_then(|r| r.error_for_status())
@@ -779,7 +777,7 @@ impl DaemonClient {
     ) -> Result<PermissionSettingsResponse, String> {
         let response = self
             .http
-            .post(format!("{}/v1/settings/permissions", self.base))
+            .post(format!("{}{PERMISSION_SETTINGS_PATH}", self.base))
             .json(&PermissionSettingsRequest { mode })
             .send()
             .await
@@ -803,6 +801,7 @@ impl DaemonClient {
 /// `ready` defaults to true so a pre-readiness daemon still yields a fully
 /// selectable menu instead of an all-grey one.
 #[derive(Debug, Clone, serde::Deserialize)]
+#[cfg_attr(test, derive(serde::Serialize))]
 pub struct ModelEntry {
     pub id: String,
     pub provider: String,
@@ -817,12 +816,14 @@ fn bool_true() -> bool {
 
 /// The daemon's currently-selected global model.
 #[derive(Debug, Clone, serde::Deserialize)]
+#[cfg_attr(test, derive(serde::Serialize))]
 pub struct CurrentModel {
     pub model: String,
 }
 
 /// Response shape of `GET /v1/models`.
 #[derive(Debug, Clone, serde::Deserialize)]
+#[cfg_attr(test, derive(serde::Serialize))]
 pub struct ModelsResponse {
     pub current: CurrentModel,
     #[serde(default)]
@@ -864,10 +865,48 @@ fn session_config_url(base: &str, session_id: AgentSessionId) -> String {
         SESSION_CONFIG_PATH.replace("{id}", &session_id.to_string())
     )
 }
+
+// The rest of the daemon wire this client calls. Each literal is held inside
+// `docs/contracts/session-wire.json` by
+// `daemon_routes_are_inside_the_published_session_wire`, and the Observatory
+// ones inside `docs/contracts/observatory-wire.json` by
+// `observatory_client_is_inside_the_published_observatory_wire`.
+const HEALTH_PATH: &str = "/health";
+const SESSIONS_PATH: &str = "/v1/agent/sessions";
+const AGENT_TURNS_PATH: &str = "/v1/agent/turns";
+const AGENT_EVENTS_SESSION_QUERY: &str = "session_id";
+const AGENT_EVENTS_REPLAY_QUERY: &str = "replay";
+const SESSION_COMPACT_PATH: &str = "/v1/sessions/{id}/compact";
+/// Compact statuses whose typed `ok:false` body proves the daemon refused
+/// before touching the transcript.
+const COMPACT_PRECOMMIT_REJECTIONS: [u16; 3] = [404, 409, 429];
+const REQUEST_CANCEL_PATH: &str = "/v1/requests/{id}/cancel";
+const CANCEL_OK_KEY: &str = "ok";
+const CANCEL_MESSAGE_KEY: &str = "message";
+const PERMISSION_DECISION_PATH: &str = "/v1/permissions/{id}/decision";
+const PERMISSION_SETTINGS_PATH: &str = "/v1/settings/permissions";
+const MODELS_PATH: &str = "/v1/models";
+const MEMORY_PATH: &str = "/v1/memory";
+const LSP_PATH: &str = "/v1/lsp";
+const LSP_CWD_QUERY: &str = "cwd";
+const EVENTS_PATH: &str = "/v1/events";
+const OBSERVATORY_SNAPSHOT_PATH: &str = "/v1/observatory/snapshot";
+const OBSERVATORY_EVENTS_PATH: &str = "/v1/observatory/events";
+const OBSERVATORY_DETAIL_QUERY: &str = "detail";
+const OBSERVATORY_AFTER_QUERY: &str = "after";
+const OBSERVATORY_SCOPE_QUERY: &str = "scope";
+/// The `detail` and `scope` value the TUI asks for on both Observatory routes.
+const OBSERVATORY_SUMMARY: &str = "summary";
+const OBSERVATORY_RESUME_HEADER: &str = "Last-Event-ID";
+/// The Observatory frames that end a tail and force a fresh snapshot.
+const OBSERVATORY_RESET_FRAME: &str = "reset";
+const OBSERVATORY_ERROR_FRAME: &str = "error";
+
 const SESSION_MODEL_RETRY_DELAY: Duration = Duration::from_millis(if cfg!(test) { 5 } else { 500 });
 
 /// One retained memory from `GET /v1/memory`, for the `/memory` browser.
 #[derive(Debug, Clone, serde::Deserialize)]
+#[cfg_attr(test, derive(serde::Serialize))]
 pub struct MemoryEntry {
     pub kind: String,
     pub text: String,
@@ -875,6 +914,7 @@ pub struct MemoryEntry {
 
 /// Response shape of `GET /v1/memory`.
 #[derive(Debug, Clone, serde::Deserialize)]
+#[cfg_attr(test, derive(serde::Serialize))]
 pub struct MemoryResponse {
     #[serde(default)]
     pub memories: Vec<MemoryEntry>,
@@ -885,7 +925,7 @@ impl DaemonClient {
     /// `/models` picker overlay.
     pub async fn models(&self) -> Result<ModelsResponse, String> {
         self.http
-            .get(format!("{}/v1/models", self.base))
+            .get(format!("{}{MODELS_PATH}", self.base))
             .send()
             .await
             .and_then(|r| r.error_for_status())
@@ -971,7 +1011,7 @@ impl DaemonClient {
     /// `GET /v1/memory` — the operator's retained memories, for `/memory`.
     pub async fn memory(&self) -> Result<MemoryResponse, String> {
         self.http
-            .get(format!("{}/v1/memory", self.base))
+            .get(format!("{}{MEMORY_PATH}", self.base))
             .send()
             .await
             .and_then(|r| r.error_for_status())
@@ -1021,8 +1061,8 @@ impl DaemonClient {
     /// workspace + their install/ready state, for the `/lsp` panel.
     pub async fn lsp(&self, cwd: &str) -> Result<LspResponse, String> {
         self.http
-            .get(format!("{}/v1/lsp", self.base))
-            .query(&[("cwd", cwd)])
+            .get(format!("{}{LSP_PATH}", self.base))
+            .query(&[(LSP_CWD_QUERY, cwd)])
             .send()
             .await
             .and_then(|r| r.error_for_status())
@@ -1035,6 +1075,7 @@ impl DaemonClient {
 
 /// One language server from `GET /v1/lsp`, for the `/lsp` panel.
 #[derive(Debug, Clone, serde::Deserialize)]
+#[cfg_attr(test, derive(serde::Serialize))]
 pub struct LspServer {
     pub name: String,
     pub command: String,
@@ -1046,6 +1087,7 @@ pub struct LspServer {
 
 /// Response shape of `GET /v1/lsp`.
 #[derive(Debug, Clone, serde::Deserialize)]
+#[cfg_attr(test, derive(serde::Serialize))]
 pub struct LspResponse {
     #[serde(default)]
     pub servers: Vec<LspServer>,
@@ -1075,7 +1117,10 @@ enum ObservatoryFrame {
 }
 
 fn parse_observatory_frame(frame: &str) -> ObservatoryFrame {
-    if matches!(parse_sse_event(frame), Some("reset" | "error")) {
+    if matches!(
+        parse_sse_event(frame),
+        Some(OBSERVATORY_RESET_FRAME | OBSERVATORY_ERROR_FRAME)
+    ) {
         return ObservatoryFrame::Rebaseline;
     }
     // Keepalive/comment frames carry no data. Any data frame on this typed
@@ -1115,6 +1160,23 @@ fn session_create_request(workspace_root: &str, model: Option<&str>) -> AgentSes
         project_id: None,
         model: model.map(str::to_string),
         client_type: Some(TUI_CLIENT_TYPE.into()),
+    }
+}
+
+/// The `POST /v1/permissions/{id}/decision` body this client sends.
+fn permission_decision_body(
+    permission_id: PermissionId,
+    allow: bool,
+    decision_token: Option<String>,
+) -> PermissionDecisionRequest {
+    PermissionDecisionRequest {
+        permission_id,
+        decision: if allow {
+            PermissionDecision::Allow
+        } else {
+            PermissionDecision::Deny { reason: None }
+        },
+        decision_token,
     }
 }
 
@@ -1365,6 +1427,454 @@ mod tests {
         assert_eq!(config["error_key"], SESSION_CONFIG_ERROR_KEY);
         assert_eq!(config["busy"]["status"], 409);
         assert_eq!(config["busy"]["error"], SESSION_ACTIVE_OPERATION);
+    }
+
+    /// Records the field (struct) or variant (unit enum) names a `Deserialize`
+    /// derive hands its deserializer, renames applied: the same probe the
+    /// daemon's contract tests use, so both sides read names from the types.
+    struct SerdeNames<'a>(&'a mut Option<&'static [&'static str]>);
+
+    impl<'de> serde::Deserializer<'de> for SerdeNames<'_> {
+        type Error = serde::de::value::Error;
+
+        fn deserialize_any<V: serde::de::Visitor<'de>>(
+            self,
+            _: V,
+        ) -> Result<V::Value, Self::Error> {
+            Err(serde::de::Error::custom("serde name probe"))
+        }
+
+        fn deserialize_struct<V: serde::de::Visitor<'de>>(
+            self,
+            _: &'static str,
+            fields: &'static [&'static str],
+            _: V,
+        ) -> Result<V::Value, Self::Error> {
+            *self.0 = Some(fields);
+            Err(serde::de::Error::custom("serde name probe"))
+        }
+
+        fn deserialize_enum<V: serde::de::Visitor<'de>>(
+            self,
+            _: &'static str,
+            variants: &'static [&'static str],
+            _: V,
+        ) -> Result<V::Value, Self::Error> {
+            *self.0 = Some(variants);
+            Err(serde::de::Error::custom("serde name probe"))
+        }
+
+        serde::forward_to_deserialize_any! {
+            bool i8 i16 i32 i64 i128 u8 u16 u32 u64 u128 f32 f64 char str string
+            bytes byte_buf option unit unit_struct newtype_struct seq tuple
+            tuple_struct map identifier ignored_any
+        }
+    }
+
+    fn serde_names<T: serde::de::DeserializeOwned>() -> Vec<String> {
+        let mut captured = None;
+        let _ = T::deserialize(SerdeNames(&mut captured));
+        captured
+            .unwrap_or_else(|| panic!("{} exposes no derived names", std::any::type_name::<T>()))
+            .iter()
+            .map(|name| (*name).to_string())
+            .collect()
+    }
+
+    /// Assert every name is in the published list.
+    fn inside<S: AsRef<str>>(
+        published: &serde_json::Value,
+        names: impl IntoIterator<Item = S>,
+        what: &str,
+    ) {
+        let published = strings(published);
+        for name in names {
+            assert!(
+                published.iter().any(|p| p == name.as_ref()),
+                "the TUI relies on unpublished {what} {:?}",
+                name.as_ref()
+            );
+        }
+    }
+
+    fn codes(value: &serde_json::Value) -> Vec<u16> {
+        value
+            .as_array()
+            .unwrap_or_else(|| panic!("{value} is a list"))
+            .iter()
+            .map(|v| u16::try_from(v.as_u64().unwrap()).unwrap())
+            .collect()
+    }
+
+    /// Every `Type::Variant` the TUI's source names, as written.
+    fn named_variants(prefix: &str) -> std::collections::BTreeSet<String> {
+        let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let mut stack = vec![src];
+        let mut named = std::collections::BTreeSet::new();
+        while let Some(dir) = stack.pop() {
+            for entry in std::fs::read_dir(dir).unwrap() {
+                let path = entry.unwrap().path();
+                if path.is_dir() {
+                    stack.push(path);
+                    continue;
+                }
+                if path.extension().is_none_or(|ext| ext != "rs") {
+                    continue;
+                }
+                let text = std::fs::read_to_string(&path).unwrap();
+                for (at, needle) in text.match_indices(prefix) {
+                    let name: String = text[at + needle.len()..]
+                        .chars()
+                        .take_while(|c| c.is_ascii_alphanumeric())
+                        .collect();
+                    if name.starts_with(|c: char| c.is_ascii_uppercase()) {
+                        named.insert(name);
+                    }
+                }
+            }
+        }
+        named
+    }
+
+    fn snake_case(name: &str) -> String {
+        let mut snake = String::new();
+        for (i, c) in name.chars().enumerate() {
+            if c.is_ascii_uppercase() && i > 0 {
+                snake.push('_');
+            }
+            snake.push(c.to_ascii_lowercase());
+        }
+        snake
+    }
+
+    /// Consumer half of the daemon-control part of the session contract:
+    /// every route the TUI calls besides the session stream, sync, config and
+    /// dictation is published, with the bodies it sends and the keys and
+    /// statuses it relies on.
+    #[test]
+    fn daemon_routes_are_inside_the_published_session_wire() {
+        let session = contract(include_str!("../../../../docs/contracts/session-wire.json"));
+        assert_eq!(
+            session["session_create_route"],
+            format!("POST {SESSIONS_PATH}")
+        );
+
+        let health = &session["health"];
+        assert_eq!(health["route"], format!("GET {HEALTH_PATH}"));
+        inside(
+            &health["response_fields"],
+            serde_names::<HealthResponse>(),
+            "health key",
+        );
+
+        // Turns: the shared request and acknowledgement, the busy answer the
+        // TUI matches, and a deliberate branch for every published status.
+        let turn = &session["agent_turn"];
+        assert_eq!(turn["route"], format!("POST {AGENT_TURNS_PATH}"));
+        inside(
+            &turn["request_fields"],
+            serde_names::<AgentTurnRequest>(),
+            "turn field",
+        );
+        inside(
+            &turn["response_fields"],
+            serde_names::<AgentTurnResponse>(),
+            "turn key",
+        );
+        assert_eq!(turn["busy"]["status"], 409);
+        assert_eq!(turn["busy"]["error"], SESSION_ACTIVE_OPERATION);
+        for code in codes(&turn["statuses"]) {
+            let status = reqwest::StatusCode::from_u16(code).unwrap();
+            assert!(
+                status.is_success()
+                    || status.is_server_error()
+                    || status_proves_turn_rejection(status),
+                "published turn status {code} has no deliberate branch"
+            );
+        }
+
+        inside(
+            &session["agent_events_query_fields"],
+            [AGENT_EVENTS_SESSION_QUERY, AGENT_EVENTS_REPLAY_QUERY],
+            "agent events query",
+        );
+
+        let compact = &session["session_compact"];
+        assert_eq!(compact["route"], format!("POST {SESSION_COMPACT_PATH}"));
+        inside(
+            &compact["response_fields"],
+            serde_names::<CompactResponse>(),
+            "compact key",
+        );
+        for code in COMPACT_PRECOMMIT_REJECTIONS {
+            assert!(
+                codes(&compact["statuses"]).contains(&code),
+                "the TUI treats unpublished compact status {code} as a pre-commit refusal"
+            );
+        }
+
+        let cancel = &session["request_cancel"];
+        assert_eq!(cancel["route"], format!("POST {REQUEST_CANCEL_PATH}"));
+        inside(
+            &cancel["response_fields"],
+            [CANCEL_OK_KEY, CANCEL_MESSAGE_KEY],
+            "cancel key",
+        );
+
+        let decision = &session["permission_decision"];
+        assert_eq!(
+            decision["route"],
+            format!("POST {PERMISSION_DECISION_PATH}")
+        );
+        for allow in [true, false] {
+            let body = serde_json::to_value(permission_decision_body(
+                uuid::Uuid::nil(),
+                allow,
+                Some("t".into()),
+            ))
+            .unwrap();
+            inside(
+                &decision["request_fields"],
+                object_keys(body.clone()),
+                "decision field",
+            );
+            inside(
+                &decision["decisions"],
+                [body["decision"].as_str().unwrap()],
+                "decision",
+            );
+        }
+
+        let settings = &session["permission_settings"];
+        for method in ["GET", "POST"] {
+            inside(
+                &settings["routes"],
+                [format!("{method} {PERMISSION_SETTINGS_PATH}")],
+                "settings route",
+            );
+        }
+        inside(
+            &settings["request_fields"],
+            serde_names::<PermissionSettingsRequest>(),
+            "settings field",
+        );
+        inside(
+            &settings["response_fields"],
+            serde_names::<PermissionSettingsResponse>(),
+            "settings key",
+        );
+        inside(
+            &settings["modes"],
+            serde_names::<PermissionMode>(),
+            "permission mode",
+        );
+
+        let models = &session["models"];
+        assert_eq!(models["route"], format!("GET {MODELS_PATH}"));
+        let decoded = serde_json::to_value(ModelsResponse {
+            current: CurrentModel { model: "m".into() },
+            models: vec![ModelEntry {
+                id: "i".into(),
+                provider: "p".into(),
+                label: "l".into(),
+                ready: true,
+            }],
+        })
+        .unwrap();
+        inside(
+            &models["response_fields"],
+            object_keys(decoded.clone()),
+            "models key",
+        );
+        inside(
+            &models["current_fields"],
+            object_keys(decoded["current"].clone()),
+            "current-model key",
+        );
+        inside(
+            &models["model_fields"],
+            object_keys(decoded["models"][0].clone()),
+            "model key",
+        );
+
+        let memory = &session["memory"];
+        assert_eq!(memory["route"], format!("GET {MEMORY_PATH}"));
+        let decoded = serde_json::to_value(MemoryResponse {
+            memories: vec![MemoryEntry {
+                kind: "k".into(),
+                text: "t".into(),
+            }],
+        })
+        .unwrap();
+        inside(
+            &memory["response_fields"],
+            object_keys(decoded.clone()),
+            "memory key",
+        );
+        inside(
+            &memory["memory_fields"],
+            object_keys(decoded["memories"][0].clone()),
+            "memory entry key",
+        );
+
+        let lsp = &session["lsp"];
+        assert_eq!(lsp["route"], format!("GET {LSP_PATH}"));
+        inside(&lsp["query_fields"], [LSP_CWD_QUERY], "lsp query");
+        let decoded = serde_json::to_value(LspResponse {
+            servers: vec![LspServer {
+                name: "n".into(),
+                command: "c".into(),
+                extensions: Vec::new(),
+                ready: true,
+            }],
+        })
+        .unwrap();
+        inside(
+            &lsp["response_fields"],
+            object_keys(decoded.clone()),
+            "lsp key",
+        );
+        inside(
+            &lsp["server_fields"],
+            object_keys(decoded["servers"][0].clone()),
+            "lsp server key",
+        );
+
+        // GET /v1/events: the shared decoder knows every published event type,
+        // every event the TUI branches on is published, and the envelope it
+        // decodes is inside the published fields.
+        let events = &session["events"];
+        assert_eq!(events["route"], format!("GET {EVENTS_PATH}"));
+        assert_eq!(events["event_tag"], "type");
+        let published = strings(&events["event_types"]);
+        for name in &published {
+            if let Err(error) = serde_json::from_value::<ocean_core::OceanEvent>(
+                serde_json::json!({ "type": name }),
+            ) {
+                assert!(
+                    !error.to_string().contains("unknown variant"),
+                    "the TUI's event decoder does not know published type {name}: {error}"
+                );
+            }
+        }
+        let named = named_variants("OceanEvent::");
+        assert!(
+            named.contains("PermissionRequest"),
+            "the scan found the TUI's matches"
+        );
+        for name in &named {
+            assert!(
+                published.contains(&snake_case(name)),
+                "the TUI branches on unpublished event {name}"
+            );
+        }
+        let mut envelope = EventEnvelope::new(ocean_core::OceanEvent::SessionCreated);
+        envelope.session_id = Some(uuid::Uuid::nil());
+        envelope.request_id = Some(uuid::Uuid::nil());
+        envelope.permission_id = Some(uuid::Uuid::nil());
+        envelope.origin = Some("o".into());
+        let mut decoded = serde_json::to_value(envelope).unwrap();
+        decoded.as_object_mut().unwrap().remove("type");
+        inside(
+            &events["envelope_fields"],
+            object_keys(decoded),
+            "envelope key",
+        );
+    }
+
+    /// Consumer half of the Observatory contract: the two routes, the query
+    /// fields and values, the bearer scheme and the `401` the TUI answers by
+    /// dropping its environment token, the frames it rebaselines on, the
+    /// synthesized gap frame (not an envelope, so it must rebaseline too),
+    /// the snapshot and envelope it decodes, and the payload kinds it names.
+    #[test]
+    fn observatory_client_is_inside_the_published_observatory_wire() {
+        let wire = contract(include_str!(
+            "../../../../docs/contracts/observatory-wire.json"
+        ));
+        assert_eq!(
+            wire["auth_scheme"], "Bearer",
+            "reqwest's bearer_auth sends Bearer"
+        );
+
+        let snapshot = &wire["snapshot"];
+        assert_eq!(
+            snapshot["route"],
+            format!("GET {OBSERVATORY_SNAPSHOT_PATH}")
+        );
+        inside(
+            &snapshot["query_fields"],
+            [OBSERVATORY_DETAIL_QUERY],
+            "snapshot query",
+        );
+        inside(
+            &snapshot["detail_values"],
+            [OBSERVATORY_SUMMARY],
+            "detail value",
+        );
+        assert!(codes(&snapshot["statuses"]).contains(&401));
+        inside(
+            &snapshot["response_fields"],
+            serde_names::<ObservatorySnapshot>(),
+            "snapshot key",
+        );
+
+        let events = &wire["events"];
+        assert_eq!(events["route"], format!("GET {OBSERVATORY_EVENTS_PATH}"));
+        inside(
+            &events["query_fields"],
+            [OBSERVATORY_AFTER_QUERY, OBSERVATORY_SCOPE_QUERY],
+            "events query",
+        );
+        inside(
+            &events["scope_values"],
+            [OBSERVATORY_SUMMARY],
+            "scope value",
+        );
+        assert!(events["resume_header"]
+            .as_str()
+            .unwrap()
+            .eq_ignore_ascii_case(OBSERVATORY_RESUME_HEADER));
+        assert!(codes(&events["statuses"]).contains(&401));
+        inside(
+            &events["envelope_fields"],
+            serde_names::<ObservatoryEventEnvelope>(),
+            "envelope key",
+        );
+
+        let frames = strings(&events["frames"]);
+        inside(
+            &events["frames"],
+            [OBSERVATORY_RESET_FRAME, OBSERVATORY_ERROR_FRAME],
+            "frame",
+        );
+        for frame in &frames {
+            let parsed = parse_observatory_frame(&format!("event: {frame}\ndata: {{}}"));
+            assert!(
+                matches!(parsed, ObservatoryFrame::Rebaseline),
+                "a published {frame} frame without an envelope must rebaseline"
+            );
+        }
+        let gap = format!(
+            "event: message\ndata: {}",
+            serde_json::json!({
+                "cursor": "2",
+                "kind": events["gap_kind"],
+                "payload": { "from_cursor": "1", "to_cursor": "3", "reason": "cursor_jump" },
+            })
+        );
+        assert!(
+            matches!(parse_observatory_frame(&gap), ObservatoryFrame::Rebaseline),
+            "the published gap frame is not an envelope; the TUI must rebaseline on it"
+        );
+
+        assert_eq!(events["payload_tag"], "kind");
+        let named = named_variants("EventPayload::");
+        assert!(
+            named.contains("StreamGap"),
+            "the scan found the TUI's matches"
+        );
+        inside(&events["payload_kinds"], named, "payload kind");
     }
 
     #[test]

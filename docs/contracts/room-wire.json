@@ -1,6 +1,16 @@
 {
   "note": "The room wire facts ocean-surface and the in-repo room clients depend on, published by ocean-daemon and held equal to the router by room_wire_contract_matches_the_daemon (crates/ocean-daemon). ocean-surface vendors this file; see docs/contracts/README.md.",
   "version": 1,
+  "routes": {
+    "list": "GET /v1/rooms/persistent",
+    "snapshot": "GET /v1/rooms/persistent/{key}/snapshot",
+    "transcript": "GET /v1/rooms/persistent/{key}/transcript",
+    "events": "GET /v1/rooms/persistent/{key}/events",
+    "message_post": "POST /v1/rooms/persistent/{key}/messages",
+    "participant_join": "POST /v1/rooms/persistent/{key}/participants",
+    "inspect": "GET /v1/rooms/persistent/{key}/inspect",
+    "resources": "GET /v1/rooms/persistent/{key}/resources"
+  },
   "sse_events": [
     "room_access",
     "room_message",
@@ -46,6 +56,11 @@
     "next_seq",
     "ok",
     "transcript"
+  ],
+  "snapshot_query_fields": [
+    "after_seq",
+    "before_seq",
+    "limit"
   ],
   "not_open": {
     "status": 404,
@@ -94,6 +109,18 @@
   "message_post_queued_keys": [
     "access",
     "ok"
+  ],
+  "message_post_request_fields": [
+    "author_id",
+    "author_kind",
+    "body",
+    "thread_parent_seq"
+  ],
+  "participant_join_request_fields": [
+    "display_name",
+    "id",
+    "kind",
+    "owner_id"
   ],
   "access_fields": [
     "last_confirmed_global_sequence",

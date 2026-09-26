@@ -1,0 +1,98 @@
+{
+  "note": "The Observatory read wire the TUI's live graph decodes: the snapshot and the live event tail, their bearer auth, statuses, query fields, frame names and wire types. Published by ocean-daemon and held equal to the code by observatory_wire_contract_matches_the_daemon (crates/ocean-daemon). See docs/contracts/README.md.",
+  "version": 1,
+  "auth_scheme": "Bearer",
+  "error_fields": [
+    "error",
+    "http_status",
+    "message"
+  ],
+  "snapshot": {
+    "route": "GET /v1/observatory/snapshot",
+    "statuses": [200, 400, 401, 409, 410, 503],
+    "query_fields": [
+      "at",
+      "detail"
+    ],
+    "detail_values": [
+      "full",
+      "summary"
+    ],
+    "response_fields": [
+      "attention",
+      "daemon_instance_id",
+      "earliest_available_cursor",
+      "edges",
+      "nodes",
+      "observatory_id",
+      "watermark_cursor"
+    ]
+  },
+  "events": {
+    "route": "GET /v1/observatory/events",
+    "statuses": [200, 401, 503],
+    "query_fields": [
+      "after",
+      "scope"
+    ],
+    "envelope_fields": [
+      "correlation",
+      "cursor",
+      "daemon_instance_id",
+      "event_id",
+      "kind",
+      "observatory_id",
+      "occurred_at",
+      "payload",
+      "producer",
+      "recorded_at",
+      "schema_version",
+      "topology",
+      "truth",
+      "visibility"
+    ],
+    "event_kinds": [
+      "daemon_started",
+      "daemon_stopping",
+      "execution_admitted",
+      "execution_finished",
+      "execution_heartbeat",
+      "execution_phase_changed",
+      "model_rerouted",
+      "permission_resolved",
+      "permission_waiting",
+      "stream_gap",
+      "stream_reset",
+      "tool_finished",
+      "tool_started",
+      "topology_attestation_rejected"
+    ],
+    "frames": [
+      "error",
+      "message",
+      "reset"
+    ],
+    "gap_kind": "stream.gap",
+    "payload_kinds": [
+      "DaemonStarted",
+      "DaemonStopping",
+      "ExecutionAdmitted",
+      "ExecutionFinished",
+      "ExecutionHeartbeat",
+      "ExecutionPhaseChanged",
+      "ModelRerouted",
+      "PermissionResolved",
+      "PermissionWaiting",
+      "StreamGap",
+      "StreamReset",
+      "ToolFinished",
+      "ToolStarted",
+      "TopologyAttestationRejected"
+    ],
+    "payload_tag": "kind",
+    "resume_header": "last-event-id",
+    "scope_values": [
+      "summary"
+    ]
+  }
+}

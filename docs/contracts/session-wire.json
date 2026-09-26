@@ -1,5 +1,5 @@
 {
-  "note": "The session and agent-event wire facts first-party surfaces depend on, published by ocean-daemon and held equal to the code by session_wire_contract_matches_the_daemon (crates/ocean-daemon). See docs/contracts/README.md.",
+  "note": "The session, turn and daemon-control wire facts first-party surfaces depend on (sessions and agent events, turns and prompts, compact, cancel, permissions, models, memory, LSP, health, identity, the legacy event stream), published by ocean-daemon and held equal to the code by session_wire_contract_matches_the_daemon and session_wire_consumer_routes_match_the_daemon (crates/ocean-daemon). See docs/contracts/README.md.",
   "version": 1,
   "agent_event_tag": "type",
   "agent_event_types": [
@@ -21,6 +21,7 @@
     "turn_finished",
     "turn_started"
   ],
+  "session_create_route": "POST /v1/agent/sessions",
   "session_create_request_fields": [
     "client_type",
     "model",
@@ -33,6 +34,11 @@
     "session_id"
   ],
   "agent_events_route": "GET /v1/agent/events",
+  "agent_events_query_fields": [
+    "all",
+    "replay",
+    "session_id"
+  ],
   "agent_events_error": {
     "event": "error",
     "fields": [
@@ -110,5 +116,362 @@
       "status": 409,
       "error": "session has an active operation; try again shortly"
     }
+  },
+  "health": {
+    "route": "GET /health",
+    "statuses": [200],
+    "response_fields": [
+      "backend",
+      "gc_failures_total",
+      "ok",
+      "persist_failures_total",
+      "rev",
+      "room_maintenance",
+      "rooms",
+      "service",
+      "version"
+    ]
+  },
+  "identity": {
+    "route": "GET /v1/identity",
+    "statuses": [200],
+    "response_fields": [
+      "display_name",
+      "member_id",
+      "ok",
+      "source"
+    ],
+    "sources": [
+      "env",
+      "member.toml",
+      "unset"
+    ]
+  },
+  "agent_turn": {
+    "route": "POST /v1/agent/turns",
+    "statuses": [202, 400, 409, 429, 503],
+    "request_fields": [
+      "advisor",
+      "agent",
+      "client_context",
+      "client_type",
+      "cwd",
+      "decision_token",
+      "guidance",
+      "images",
+      "model_id",
+      "project_id",
+      "prompt",
+      "role",
+      "session_id",
+      "thinking_level"
+    ],
+    "busy": {
+      "error": "session has an active operation; try again shortly",
+      "status": 409
+    },
+    "response_fields": [
+      "cache_read_tokens",
+      "context_usage",
+      "error",
+      "event_id_prefix",
+      "input_tokens",
+      "ok",
+      "output_tokens",
+      "session_id",
+      "status",
+      "tokens_per_second",
+      "turn_id",
+      "wall_ms"
+    ]
+  },
+  "session_list": {
+    "route": "GET /v1/agent/sessions",
+    "statuses": [200],
+    "query_fields": [
+      "all",
+      "cursor",
+      "cwd",
+      "limit",
+      "workspace"
+    ],
+    "response_fields": [
+      "error",
+      "has_more",
+      "next_cursor",
+      "ok",
+      "sessions"
+    ],
+    "summary_fields": [
+      "active_state",
+      "active_turn",
+      "cwd",
+      "git_branch",
+      "id",
+      "owning_project",
+      "title",
+      "turn_count",
+      "updated_at",
+      "workspace_root"
+    ]
+  },
+  "session_detail": {
+    "route": "GET /v1/agent/sessions/{id}",
+    "statuses": [200, 400, 404],
+    "response_fields": [
+      "error",
+      "ok",
+      "session",
+      "turns"
+    ],
+    "session_fields": [
+      "active_turn",
+      "client_type",
+      "created_at",
+      "cwd",
+      "id",
+      "title",
+      "updated_at"
+    ]
+  },
+  "legacy_session_list": {
+    "route": "GET /v1/sessions",
+    "statuses": [200],
+    "query_fields": [
+      "all",
+      "cursor",
+      "cwd",
+      "limit",
+      "workspace"
+    ],
+    "response_fields": [
+      "error",
+      "has_more",
+      "next_cursor",
+      "ok",
+      "sessions",
+      "workspace"
+    ],
+    "summary_fields": [
+      "git_branch",
+      "id",
+      "model",
+      "title",
+      "turns",
+      "updated_ms",
+      "workspace_root"
+    ]
+  },
+  "legacy_session_detail": {
+    "route": "GET /v1/sessions/{id}",
+    "statuses": [200, 404, 500],
+    "response_fields": [
+      "error",
+      "ok",
+      "session"
+    ]
+  },
+  "session_compact": {
+    "route": "POST /v1/sessions/{id}/compact",
+    "statuses": [200, 404, 409, 429, 500],
+    "response_fields": [
+      "elided_messages",
+      "fence",
+      "ok",
+      "session_id",
+      "stderr",
+      "sync",
+      "wall_ms"
+    ]
+  },
+  "request_cancel": {
+    "route": "POST /v1/requests/{id}/cancel",
+    "statuses": [200],
+    "response_fields": [
+      "message",
+      "ok",
+      "request_id",
+      "state"
+    ]
+  },
+  "permission_decision": {
+    "route": "POST /v1/permissions/{id}/decision",
+    "statuses": [200, 400, 403, 404],
+    "request_fields": [
+      "decision",
+      "decision_token",
+      "permission_id",
+      "reason"
+    ],
+    "decisions": [
+      "allow",
+      "allow_session",
+      "deny"
+    ],
+    "response_fields": [
+      "message",
+      "ok",
+      "permission_id"
+    ]
+  },
+  "permission_settings": {
+    "routes": [
+      "GET /v1/settings/permissions",
+      "POST /v1/settings/permissions"
+    ],
+    "statuses": {
+      "GET /v1/settings/permissions": [200],
+      "POST /v1/settings/permissions": [200]
+    },
+    "request_fields": [
+      "mode"
+    ],
+    "modes": [
+      "automatic",
+      "manual",
+      "skip_all"
+    ],
+    "response_fields": [
+      "effective",
+      "env_override",
+      "error",
+      "ok",
+      "persisted"
+    ]
+  },
+  "models": {
+    "route": "GET /v1/models",
+    "statuses": [200],
+    "current_fields": [
+      "model",
+      "provider"
+    ],
+    "model_fields": [
+      "credential_source",
+      "id",
+      "label",
+      "provider",
+      "ready"
+    ],
+    "response_fields": [
+      "current",
+      "models",
+      "ok"
+    ]
+  },
+  "model_set": {
+    "route": "POST /v1/model",
+    "statuses": [200],
+    "request_fields": [
+      "model"
+    ],
+    "response_fields": [
+      "error",
+      "model",
+      "ok",
+      "provider"
+    ]
+  },
+  "memory": {
+    "route": "GET /v1/memory",
+    "statuses": [200],
+    "memory_fields": [
+      "id",
+      "kind",
+      "text",
+      "updated_at"
+    ],
+    "response_fields": [
+      "memories",
+      "ok"
+    ]
+  },
+  "lsp": {
+    "route": "GET /v1/lsp",
+    "statuses": [200],
+    "query_fields": [
+      "cwd"
+    ],
+    "response_fields": [
+      "ok",
+      "servers"
+    ],
+    "server_fields": [
+      "binary_available",
+      "command",
+      "extensions",
+      "name",
+      "ready",
+      "root"
+    ]
+  },
+  "agents": {
+    "route": "GET /v1/agents",
+    "statuses": [200],
+    "response_fields": [
+      "agents",
+      "ok",
+      "root"
+    ]
+  },
+  "events": {
+    "route": "GET /v1/events",
+    "envelope_fields": [
+      "at",
+      "id",
+      "origin",
+      "permission_id",
+      "request_id",
+      "session_id"
+    ],
+    "event_tag": "type",
+    "event_types": [
+      "assistant_delta",
+      "call_agent_spoke",
+      "call_ended",
+      "call_started",
+      "call_summary_updated",
+      "call_task_detected",
+      "call_transcript_segment",
+      "call_wake_triggered",
+      "cancelled",
+      "error",
+      "permission_decision",
+      "permission_request",
+      "session_created",
+      "tool_ended",
+      "tool_output",
+      "tool_started",
+      "turn_finished",
+      "user_message"
+    ]
+  },
+  "prompt": {
+    "route": "POST /v1/prompt",
+    "statuses": [200, 400, 409, 429],
+    "request_fields": [
+      "client_type",
+      "create_if_missing",
+      "cwd",
+      "decision_token",
+      "images",
+      "max_turns",
+      "project_id",
+      "prompt",
+      "request_id",
+      "session_id",
+      "yolo"
+    ],
+    "response_fields": [
+      "code",
+      "cwd",
+      "ok",
+      "request_id",
+      "session_id",
+      "stderr",
+      "stdout",
+      "usage",
+      "wall_ms"
+    ]
   }
 }

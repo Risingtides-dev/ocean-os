@@ -9,6 +9,18 @@ use std::io::{IsTerminal, Write};
 mod extension;
 use extension::ExtensionCmd;
 
+// The daemon routes and query fields the CLI uses outside `ocean extension`.
+// Each is held inside `docs/contracts/session-wire.json` by
+// `daemon_routes_are_inside_the_published_session_wire`.
+const HEALTH_PATH: &str = "/health";
+const EVENTS_PATH: &str = "/v1/events";
+const PROMPT_PATH: &str = "/v1/prompt";
+const PERMISSION_DECISION_PATH: &str = "/v1/permissions/{id}/decision";
+const SESSIONS_PATH: &str = "/v1/sessions";
+const SESSIONS_CWD_QUERY: &str = "cwd";
+const SESSION_PATH: &str = "/v1/sessions/{id}";
+const CLIENT_TYPE: &str = "cli";
+
 /// How the CLI answers a daemon `PermissionRequest` when it is NOT attached to
 /// an interactive terminal (piped / CI). In a TTY the operator is prompted
 /// directly and this mode is ignored.
@@ -299,6 +311,32 @@ fn check_response(res: &PromptResponse) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// The `POST /v1/prompt` body the CLI sends.
+fn prompt_request(
+    request_id: uuid::Uuid,
+    prompt: String,
+    max_turns: Option<u32>,
+    yolo: bool,
+    cwd: String,
+    decision_token: String,
+) -> PromptRequest {
+    PromptRequest {
+        request_id: Some(request_id),
+        prompt,
+        images: None,
+        session_id: None,
+        create_if_missing: true,
+        max_turns,
+        yolo,
+        cwd,
+        project_id: None,
+        client_type: Some(CLIENT_TYPE.into()),
+        // OCEAN-185: bind this turn's permission gate to us. Sent even
+        // under yolo (harmless — no gate fires); required when gated.
+        decision_token: Some(decision_token),
+    }
+}
+
 fn urlencoding(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     for byte in s.bytes() {
@@ -333,9 +371,9 @@ async fn post_decision(
         decision_token,
     };
     let url = format!(
-        "{}/v1/permissions/{}/decision",
+        "{}{}",
         base_url.trim_end_matches('/'),
-        permission_id
+        PERMISSION_DECISION_PATH.replace("{id}", &permission_id.to_string())
     );
     client
         .post(&url)
@@ -478,7 +516,7 @@ async fn main() -> anyhow::Result<()> {
     match cli.cmd {
         Cmd::Health => {
             let res: HealthResponse = client
-                .get(format!("{}/health", cli.url))
+                .get(format!("{}{HEALTH_PATH}", cli.url))
                 .send()
                 .await?
                 .error_for_status()?
@@ -526,7 +564,7 @@ async fn main() -> anyhow::Result<()> {
                 None
             } else {
                 match client
-                    .get(format!("{}/v1/events", cli.url.trim_end_matches('/')))
+                    .get(format!("{}{EVENTS_PATH}", cli.url.trim_end_matches('/')))
                     .header("Accept", "text/event-stream")
                     .send()
                     .await
@@ -550,24 +588,17 @@ async fn main() -> anyhow::Result<()> {
                 }
             };
 
-            let req = PromptRequest {
-                request_id: Some(request_id),
+            let req = prompt_request(
+                request_id,
                 prompt,
-                images: None,
-                session_id: None,
-                create_if_missing: true,
                 max_turns,
                 yolo,
-                cwd: resolve_cwd(cli.project.as_deref()),
-                project_id: None,
-                client_type: Some("cli".into()),
-                // OCEAN-185: bind this turn's permission gate to us. Sent even
-                // under yolo (harmless — no gate fires); required when gated.
-                decision_token: Some(decision_token.clone()),
-            };
+                resolve_cwd(cli.project.as_deref()),
+                decision_token.clone(),
+            );
             let res: anyhow::Result<PromptResponse> = async {
                 Ok(client
-                    .post(format!("{}/v1/prompt", cli.url))
+                    .post(format!("{}{PROMPT_PATH}", cli.url))
                     .json(&req)
                     .send()
                     .await?
@@ -594,7 +625,7 @@ async fn main() -> anyhow::Result<()> {
         Cmd::Sessions => {
             let cwd = resolve_cwd(cli.project.as_deref());
             let url = format!(
-                "{}/v1/sessions?cwd={}",
+                "{}{SESSIONS_PATH}?{SESSIONS_CWD_QUERY}={}",
                 cli.url.trim_end_matches('/'),
                 urlencoding(&cwd)
             );
@@ -610,7 +641,11 @@ async fn main() -> anyhow::Result<()> {
         }
         Cmd::Session { id } => {
             let response = client
-                .get(format!("{}/v1/sessions/{id}", cli.url))
+                .get(format!(
+                    "{}{}",
+                    cli.url,
+                    SESSION_PATH.replace("{id}", &id.to_string())
+                ))
                 .send()
                 .await?;
             let status = response.status();
@@ -751,6 +786,153 @@ fn agents_lint_cmd(subcmd: AgentsCmd) -> anyhow::Result<()> {
 mod tests {
     use super::*;
     use ocean_core::TokenUsage;
+
+    /// Consumer half of the session contract for the CLI: every daemon route
+    /// it calls outside `ocean extension` is published, with the bodies and
+    /// query fields it sends, the keys it decodes, and the events it branches
+    /// on.
+    #[test]
+    fn daemon_routes_are_inside_the_published_session_wire() {
+        let wire: serde_json::Value =
+            serde_json::from_str(include_str!("../../../docs/contracts/session-wire.json"))
+                .expect("session-wire.json parses");
+        let inside = |section: &str, field: &str, names: Vec<String>| {
+            let published: Vec<&str> = wire[section][field]
+                .as_array()
+                .unwrap_or_else(|| panic!("{section}.{field} is a list"))
+                .iter()
+                .map(|v| v.as_str().unwrap())
+                .collect();
+            for name in names {
+                assert!(
+                    published.contains(&name.as_str()),
+                    "the CLI relies on unpublished {section}.{field} entry {name}"
+                );
+            }
+        };
+        let keys = |value: serde_json::Value| -> Vec<String> {
+            value.as_object().unwrap().keys().cloned().collect()
+        };
+        let route = |section: &str, method: &str, path: &str| {
+            assert_eq!(
+                wire[section]["route"],
+                format!("{method} {path}"),
+                "{section}"
+            );
+        };
+
+        route("health", "GET", HEALTH_PATH);
+        let health = HealthResponse {
+            ok: true,
+            service: "s".into(),
+            version: "v".into(),
+            backend: "b".into(),
+            persist_failures_total: 0,
+            gc_failures_total: 0,
+        };
+        inside(
+            "health",
+            "response_fields",
+            keys(serde_json::to_value(health).unwrap()),
+        );
+
+        route("prompt", "POST", PROMPT_PATH);
+        let sent = prompt_request(
+            uuid::Uuid::nil(),
+            "p".into(),
+            Some(1),
+            true,
+            "/w".into(),
+            "t".into(),
+        );
+        inside(
+            "prompt",
+            "request_fields",
+            keys(serde_json::to_value(sent).unwrap()),
+        );
+        let mut answered = response(true);
+        answered.request_id = Some(uuid::Uuid::nil());
+        answered.session_id = Some(uuid::Uuid::nil());
+        answered.code = Some(0);
+        inside(
+            "prompt",
+            "response_fields",
+            keys(serde_json::to_value(answered).unwrap()),
+        );
+
+        route("permission_decision", "POST", PERMISSION_DECISION_PATH);
+        for decision in [
+            PermissionDecision::Allow,
+            PermissionDecision::AllowSession,
+            PermissionDecision::Deny {
+                reason: Some("r".into()),
+            },
+        ] {
+            let body = serde_json::to_value(PermissionDecisionRequest {
+                permission_id: uuid::Uuid::nil(),
+                decision,
+                decision_token: Some("t".into()),
+            })
+            .unwrap();
+            inside("permission_decision", "request_fields", keys(body.clone()));
+            inside(
+                "permission_decision",
+                "decisions",
+                vec![body["decision"].as_str().unwrap().to_string()],
+            );
+        }
+
+        // GET /v1/events: every event the permission bridge branches on is
+        // published, and the envelope it decodes is inside the published
+        // fields.
+        route("events", "GET", EVENTS_PATH);
+        let source = include_str!("main.rs");
+        let source = source.split("\n#[cfg(test)]\n").next().unwrap();
+        let mut branched = Vec::new();
+        for (at, needle) in source.match_indices("OceanEvent::") {
+            let name: String = source[at + needle.len()..]
+                .chars()
+                .take_while(|c| c.is_ascii_alphanumeric())
+                .collect();
+            let mut snake = String::new();
+            for (i, c) in name.chars().enumerate() {
+                if c.is_ascii_uppercase() && i > 0 {
+                    snake.push('_');
+                }
+                snake.push(c.to_ascii_lowercase());
+            }
+            branched.push(snake);
+        }
+        assert!(
+            branched.iter().any(|name| name == "permission_request"),
+            "the scan found the bridge's matches"
+        );
+        inside("events", "event_types", branched);
+        let mut envelope = EventEnvelope::new(OceanEvent::SessionCreated);
+        envelope.session_id = Some(uuid::Uuid::nil());
+        envelope.request_id = Some(uuid::Uuid::nil());
+        envelope.permission_id = Some(uuid::Uuid::nil());
+        envelope.origin = Some("o".into());
+        let mut decoded = serde_json::to_value(envelope).unwrap();
+        decoded.as_object_mut().unwrap().remove("type");
+        inside("events", "envelope_fields", keys(decoded));
+
+        route("legacy_session_list", "GET", SESSIONS_PATH);
+        inside(
+            "legacy_session_list",
+            "query_fields",
+            vec![SESSIONS_CWD_QUERY.to_string()],
+        );
+        route("legacy_session_detail", "GET", SESSION_PATH);
+        let answered = SessionResponse {
+            ok: false,
+            session: None,
+            error: Some("e".into()),
+        };
+        let mut read = keys(serde_json::to_value(answered).unwrap());
+        read.push("session".into());
+        inside("legacy_session_detail", "response_fields", read);
+    }
 
     #[test]
     fn onboarding_record_captures_box_and_principal() {

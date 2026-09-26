@@ -29,6 +29,23 @@ pub const DEFAULT_BASE_URL: &str = "http://127.0.0.1:4780";
 /// Client surface tag reported to the daemon so it can tailor responses.
 const CLIENT_TYPE: &str = "acp-zed";
 
+// The daemon routes, query fields and literal keys this client uses. Each is
+// held inside `docs/contracts/session-wire.json` by
+// `daemon_routes_are_inside_the_published_session_wire`.
+const MODELS_PATH: &str = "/v1/models";
+const MODEL_SET_PATH: &str = "/v1/model";
+const MODEL_SET_FIELD: &str = "model";
+const SESSIONS_PATH: &str = "/v1/agent/sessions";
+const SESSION_DETAIL_PATH: &str = "/v1/agent/sessions/{id}";
+const SESSION_LIST_CWD_QUERY: &str = "cwd";
+const SESSION_LIST_CURSOR_QUERY: &str = "cursor";
+const AGENT_TURNS_PATH: &str = "/v1/agent/turns";
+const AGENT_EVENTS_PATH: &str = "/v1/agent/events";
+const AGENT_EVENTS_ALL_QUERY: &str = "all";
+const EVENTS_PATH: &str = "/v1/events";
+const PERMISSION_DECISION_PATH: &str = "/v1/permissions/{id}/decision";
+const REQUEST_CANCEL_PATH: &str = "/v1/requests/{id}/cancel";
+
 /// A boxed byte stream that yields `io::Result<Bytes>`, suitable for `StreamReader`.
 type IoByteStream = Pin<Box<dyn Stream<Item = std::io::Result<bytes::Bytes>> + Send>>;
 
@@ -55,7 +72,7 @@ impl DaemonClient {
     /// Fetch the daemon's model roster + currently selected model.
     /// Mirrors `GET /v1/models` — the same endpoint the TUI/surfaces read.
     pub async fn list_models(&self) -> Result<ModelsResponse> {
-        let url = format!("{}/v1/models", self.base_url);
+        let url = format!("{}{MODELS_PATH}", self.base_url);
         self.http
             .get(&url)
             .send()
@@ -78,11 +95,11 @@ impl DaemonClient {
     /// operator CLI), hence `allow(dead_code)`.
     #[allow(dead_code)]
     pub async fn set_model(&self, model: &str) -> Result<(String, String)> {
-        let url = format!("{}/v1/model", self.base_url);
+        let url = format!("{}{MODEL_SET_PATH}", self.base_url);
         let resp: ModelSetResponse = self
             .http
             .post(&url)
-            .json(&serde_json::json!({ "model": model }))
+            .json(&model_set_body(model))
             .send()
             .await
             .with_context(|| format!("POST {url}"))?
@@ -114,7 +131,7 @@ impl DaemonClient {
     /// a *local* id the daemon never knew, and the daemon→ACP mapping (learned
     /// lazily, held only in memory) was lost on restart.
     pub async fn create_session(&self, cwd: &str) -> Result<AgentSessionCreateResponse> {
-        let url = format!("{}/v1/agent/sessions", self.base_url);
+        let url = format!("{}{SESSIONS_PATH}", self.base_url);
         let body = session_create_request(cwd);
         let resp = self
             .http
@@ -146,7 +163,11 @@ impl DaemonClient {
     /// `env::current_dir()`. Returns `Ok(None)` if the session is unknown or
     /// carries no cwd.
     pub async fn session_cwd(&self, session_id: &str) -> Result<Option<String>> {
-        let url = format!("{}/v1/agent/sessions/{}", self.base_url, session_id);
+        let url = format!(
+            "{}{}",
+            self.base_url,
+            SESSION_DETAIL_PATH.replace("{id}", session_id)
+        );
         let resp = self
             .http
             .get(&url)
@@ -177,7 +198,7 @@ impl DaemonClient {
         cwd: Option<&Path>,
         cursor: Option<&str>,
     ) -> Result<AgentSessionsResponse> {
-        let mut url = reqwest::Url::parse(&format!("{}/v1/agent/sessions", self.base_url))
+        let mut url = reqwest::Url::parse(&format!("{}{SESSIONS_PATH}", self.base_url))
             .context("build sessions URL")?;
         {
             let mut query = url.query_pairs_mut();
@@ -189,10 +210,10 @@ impl DaemonClient {
                 .map(|c| c.to_string_lossy().into_owned())
                 .filter(|value| !value.trim().is_empty())
             {
-                query.append_pair("cwd", &cwd);
+                query.append_pair(SESSION_LIST_CWD_QUERY, &cwd);
             }
             if let Some(cursor) = cursor.filter(|value| !value.trim().is_empty()) {
-                query.append_pair("cursor", cursor);
+                query.append_pair(SESSION_LIST_CURSOR_QUERY, cursor);
             }
         }
 
@@ -260,7 +281,7 @@ impl DaemonClient {
             advisor: None,
         };
 
-        let url = format!("{}/v1/agent/turns", self.base_url);
+        let url = format!("{}{AGENT_TURNS_PATH}", self.base_url);
         let resp = self
             .http
             .post(&url)
@@ -294,7 +315,10 @@ impl DaemonClient {
     /// hangs. This is the daemon-sanctioned escape hatch and re-opens no bleed
     /// for first-party surfaces, which keep using a scoped `?session_id`.
     pub async fn event_stream(&self) -> Result<EventStream> {
-        let url = format!("{}/v1/agent/events?all=1", self.base_url);
+        let url = format!(
+            "{}{AGENT_EVENTS_PATH}?{AGENT_EVENTS_ALL_QUERY}=1",
+            self.base_url
+        );
         let resp = self
             .http
             .get(&url)
@@ -323,7 +347,7 @@ impl DaemonClient {
     /// forward a pending tool approval to the editor. Yields decoded
     /// [`EventEnvelope`]s; filter by `request_id` / `session_id` downstream.
     pub async fn ocean_event_stream(&self) -> Result<OceanEventStream> {
-        let url = format!("{}/v1/events", self.base_url);
+        let url = format!("{}{EVENTS_PATH}", self.base_url);
         let resp = self
             .http
             .get(&url)
@@ -356,19 +380,11 @@ impl DaemonClient {
         // wrong token is rejected 403.
         decision_token: Option<String>,
     ) -> Result<()> {
-        let decision = if allow {
-            PermissionDecision::Allow
-        } else {
-            PermissionDecision::Deny { reason }
-        };
-        let body = PermissionDecisionRequest {
-            permission_id,
-            decision,
-            decision_token,
-        };
+        let body = permission_decision_body(permission_id, allow, reason, decision_token);
         let url = format!(
-            "{}/v1/permissions/{}/decision",
-            self.base_url, permission_id
+            "{}{}",
+            self.base_url,
+            PERMISSION_DECISION_PATH.replace("{id}", &permission_id.to_string())
         );
         self.http
             .post(&url)
@@ -385,7 +401,11 @@ impl DaemonClient {
     /// `POST /v1/requests/{id}/cancel`. The daemon's turn `request_id` IS the
     /// `turn_id` returned by `submit_turn`, so callers pass that through.
     pub async fn cancel_request(&self, request_id: uuid::Uuid) -> Result<()> {
-        let url = format!("{}/v1/requests/{}/cancel", self.base_url, request_id);
+        let url = format!(
+            "{}{}",
+            self.base_url,
+            REQUEST_CANCEL_PATH.replace("{id}", &request_id.to_string())
+        );
         self.http
             .post(&url)
             .send()
@@ -483,6 +503,29 @@ fn session_create_request(cwd: &str) -> AgentSessionCreateRequest {
     }
 }
 
+/// The `POST /v1/model` body the bridge sends.
+fn model_set_body(model: &str) -> serde_json::Value {
+    serde_json::json!({ MODEL_SET_FIELD: model })
+}
+
+/// The `POST /v1/permissions/{id}/decision` body the bridge sends.
+fn permission_decision_body(
+    permission_id: uuid::Uuid,
+    allow: bool,
+    reason: Option<String>,
+    decision_token: Option<String>,
+) -> PermissionDecisionRequest {
+    PermissionDecisionRequest {
+        permission_id,
+        decision: if allow {
+            PermissionDecision::Allow
+        } else {
+            PermissionDecision::Deny { reason }
+        },
+        decision_token,
+    }
+}
+
 fn parse_session_id(s: &str) -> Result<uuid::Uuid> {
     uuid::Uuid::parse_str(s).with_context(|| format!("invalid session id: {s:?}"))
 }
@@ -495,6 +538,7 @@ fn parse_session_id(s: &str) -> Result<uuid::Uuid> {
 /// repopulate a resumed session, so we decode the one field and let serde
 /// ignore the rest.
 #[derive(Debug, Clone, Deserialize)]
+#[cfg_attr(test, derive(serde::Serialize))]
 struct SessionDetailSlice {
     #[serde(default)]
     cwd: String,
@@ -502,6 +546,7 @@ struct SessionDetailSlice {
 
 /// Subset of `GET /v1/agent/sessions/{id}`'s response body.
 #[derive(Debug, Clone, Deserialize)]
+#[cfg_attr(test, derive(serde::Serialize))]
 struct AgentSessionResponse {
     #[serde(default)]
     session: Option<SessionDetailSlice>,
@@ -511,6 +556,7 @@ struct AgentSessionResponse {
 
 /// One selectable model, as the daemon reports it.
 #[derive(Debug, Clone, Deserialize)]
+#[cfg_attr(test, derive(serde::Serialize))]
 pub struct ModelInfo {
     pub id: String,
     #[serde(default)]
@@ -533,6 +579,7 @@ impl ModelInfo {
 
 /// The currently-selected model.
 #[derive(Debug, Clone, Deserialize)]
+#[cfg_attr(test, derive(serde::Serialize))]
 pub struct CurrentModel {
     /// Provider backing the current model (kept for parity / future display).
     #[serde(default)]
@@ -543,6 +590,7 @@ pub struct CurrentModel {
 
 /// Response body of `GET /v1/models`.
 #[derive(Debug, Clone, Deserialize)]
+#[cfg_attr(test, derive(serde::Serialize))]
 pub struct ModelsResponse {
     pub current: CurrentModel,
     #[serde(default)]
@@ -554,6 +602,7 @@ pub struct ModelsResponse {
 /// the per-session path; hence `allow(dead_code)`.
 #[allow(dead_code)]
 #[derive(Debug, Clone, Deserialize)]
+#[cfg_attr(test, derive(serde::Serialize))]
 struct ModelSetResponse {
     ok: bool,
     #[serde(default)]
@@ -616,5 +665,235 @@ mod contract_tests {
                 "the bridge decodes unpublished session-create key {key}"
             );
         }
+    }
+
+    /// Records the field names a struct's `Deserialize` derive hands its
+    /// deserializer, renames applied: the probe the daemon's contract tests
+    /// use, so both sides read the names from the types.
+    struct FieldNames<'a>(&'a mut Option<&'static [&'static str]>);
+
+    impl<'de> serde::Deserializer<'de> for FieldNames<'_> {
+        type Error = serde::de::value::Error;
+
+        fn deserialize_any<V: serde::de::Visitor<'de>>(
+            self,
+            _: V,
+        ) -> Result<V::Value, Self::Error> {
+            Err(serde::de::Error::custom("serde name probe"))
+        }
+
+        fn deserialize_struct<V: serde::de::Visitor<'de>>(
+            self,
+            _: &'static str,
+            fields: &'static [&'static str],
+            _: V,
+        ) -> Result<V::Value, Self::Error> {
+            *self.0 = Some(fields);
+            Err(serde::de::Error::custom("serde name probe"))
+        }
+
+        serde::forward_to_deserialize_any! {
+            bool i8 i16 i32 i64 i128 u8 u16 u32 u64 u128 f32 f64 char str string
+            bytes byte_buf option unit unit_struct newtype_struct seq tuple
+            tuple_struct map identifier ignored_any enum
+        }
+    }
+
+    fn field_names<T: serde::de::DeserializeOwned>() -> Vec<String> {
+        let mut captured = None;
+        let _ = T::deserialize(FieldNames(&mut captured));
+        captured
+            .unwrap_or_else(|| panic!("{} exposes no field names", std::any::type_name::<T>()))
+            .iter()
+            .map(|name| (*name).to_string())
+            .collect()
+    }
+
+    /// Consumer half of the rest of the session contract: every other daemon
+    /// route the bridge calls is published, with the bodies and query fields
+    /// it sends and the keys it decodes.
+    #[test]
+    fn daemon_routes_are_inside_the_published_session_wire() {
+        let wire: serde_json::Value =
+            serde_json::from_str(include_str!("../../../docs/contracts/session-wire.json"))
+                .expect("session-wire.json parses");
+        let inside = |section: &str, field: &str, names: Vec<String>| {
+            let published: Vec<&str> = wire[section][field]
+                .as_array()
+                .unwrap_or_else(|| panic!("{section}.{field} is a list"))
+                .iter()
+                .map(|v| v.as_str().unwrap())
+                .collect();
+            for name in names {
+                assert!(
+                    published.contains(&name.as_str()),
+                    "the bridge relies on unpublished {section}.{field} entry {name}"
+                );
+            }
+        };
+        let keys = |value: serde_json::Value| -> Vec<String> {
+            value.as_object().unwrap().keys().cloned().collect()
+        };
+        let route = |section: &str, method: &str, path: &str| {
+            assert_eq!(
+                wire[section]["route"],
+                format!("{method} {path}"),
+                "{section}"
+            );
+        };
+
+        assert_eq!(
+            wire["session_create_route"],
+            format!("POST {SESSIONS_PATH}")
+        );
+        route("models", "GET", MODELS_PATH);
+        let decoded = serde_json::to_value(ModelsResponse {
+            current: CurrentModel {
+                provider: Some("p".into()),
+                model: "m".into(),
+            },
+            models: vec![ModelInfo {
+                id: "i".into(),
+                label: Some("l".into()),
+                provider: Some("p".into()),
+            }],
+        })
+        .unwrap();
+        inside("models", "response_fields", keys(decoded.clone()));
+        inside("models", "current_fields", keys(decoded["current"].clone()));
+        inside("models", "model_fields", keys(decoded["models"][0].clone()));
+
+        route("model_set", "POST", MODEL_SET_PATH);
+        inside("model_set", "request_fields", keys(model_set_body("m")));
+        inside(
+            "model_set",
+            "response_fields",
+            field_names::<ModelSetResponse>(),
+        );
+
+        route("session_detail", "GET", SESSION_DETAIL_PATH);
+        inside(
+            "session_detail",
+            "response_fields",
+            field_names::<AgentSessionResponse>(),
+        );
+        inside(
+            "session_detail",
+            "session_fields",
+            field_names::<SessionDetailSlice>(),
+        );
+
+        route("session_list", "GET", SESSIONS_PATH);
+        inside(
+            "session_list",
+            "query_fields",
+            vec![
+                SESSION_LIST_CWD_QUERY.to_string(),
+                SESSION_LIST_CURSOR_QUERY.to_string(),
+            ],
+        );
+        inside(
+            "session_list",
+            "response_fields",
+            field_names::<AgentSessionsResponse>(),
+        );
+        inside(
+            "session_list",
+            "summary_fields",
+            field_names::<ocean_agent_sdk::AgentSessionSummary>(),
+        );
+
+        route("agent_turn", "POST", AGENT_TURNS_PATH);
+        inside(
+            "agent_turn",
+            "request_fields",
+            field_names::<AgentTurnRequest>(),
+        );
+        inside(
+            "agent_turn",
+            "response_fields",
+            field_names::<AgentTurnResponse>(),
+        );
+
+        assert_eq!(
+            wire["agent_events_route"],
+            format!("GET {AGENT_EVENTS_PATH}")
+        );
+        let query: Vec<&str> = wire["agent_events_query_fields"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_str().unwrap())
+            .collect();
+        assert!(
+            query.contains(&AGENT_EVENTS_ALL_QUERY),
+            "{AGENT_EVENTS_ALL_QUERY} is published"
+        );
+
+        // GET /v1/events: the shared envelope decoder knows every published
+        // event type, every event the bridge branches on is published, and
+        // the envelope it decodes is inside the published fields.
+        route("events", "GET", EVENTS_PATH);
+        let bridge = include_str!("main.rs");
+        let mut branched = Vec::new();
+        for (at, needle) in bridge.match_indices("OceanEvent::") {
+            let name: String = bridge[at + needle.len()..]
+                .chars()
+                .take_while(|c| c.is_ascii_alphanumeric())
+                .collect();
+            if !name.starts_with(|c: char| c.is_ascii_uppercase()) {
+                continue;
+            }
+            let mut snake = String::new();
+            for (i, c) in name.chars().enumerate() {
+                if c.is_ascii_uppercase() && i > 0 {
+                    snake.push('_');
+                }
+                snake.push(c.to_ascii_lowercase());
+            }
+            branched.push(snake);
+        }
+        assert!(
+            branched.iter().any(|name| name == "permission_request"),
+            "the scan found the bridge's matches"
+        );
+        inside("events", "event_types", branched);
+        for name in wire["events"]["event_types"].as_array().unwrap() {
+            if let Err(error) = serde_json::from_value::<ocean_core::OceanEvent>(
+                serde_json::json!({ "type": name }),
+            ) {
+                assert!(
+                    !error.to_string().contains("unknown variant"),
+                    "the bridge's event decoder does not know published type {name}: {error}"
+                );
+            }
+        }
+        let mut envelope = EventEnvelope::new(ocean_core::OceanEvent::SessionCreated);
+        envelope.session_id = Some(uuid::Uuid::nil());
+        envelope.request_id = Some(uuid::Uuid::nil());
+        envelope.permission_id = Some(uuid::Uuid::nil());
+        envelope.origin = Some("o".into());
+        let mut decoded = serde_json::to_value(envelope).unwrap();
+        decoded.as_object_mut().unwrap().remove("type");
+        inside("events", "envelope_fields", keys(decoded));
+
+        route("permission_decision", "POST", PERMISSION_DECISION_PATH);
+        for allow in [true, false] {
+            let body = serde_json::to_value(permission_decision_body(
+                uuid::Uuid::nil(),
+                allow,
+                Some("r".into()),
+                Some("t".into()),
+            ))
+            .unwrap();
+            inside("permission_decision", "request_fields", keys(body.clone()));
+            inside(
+                "permission_decision",
+                "decisions",
+                vec![body["decision"].as_str().unwrap().to_string()],
+            );
+        }
+
+        route("request_cancel", "POST", REQUEST_CANCEL_PATH);
     }
 }
