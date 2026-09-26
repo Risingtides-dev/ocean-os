@@ -53,11 +53,19 @@ new crate (§6), so A5 did not add one. The script has everything else §20 asks
 of the fixture: handshake, a cursor persisted under `data/`, pong, ACK, a
 cooperative grandchild, and a secret echo on stderr in the dedicated redaction
 case. Because the script only records lines, the gate proves host-side
-conformance itself: every recorded host→child frame is decoded with
+conformance itself. Each recording service test decodes every host→child
+frame it recorded, after supervisor shutdown so the `shutdown` frame is
+included. Those tests are local, crash, permission/tool, widening, secret, and
+pinned Git. The stalled test records only its `host_hello` and `ready`,
+because it never reads again. Each frame is decoded with
 `ocean_agent_sdk::extension_lifecycle::decode_frame` into its declared v1 type
 (`HostHello`, `Ready`, `LifecycleEvent`, `Lag`, `Reset`, `Ping`, `Shutdown`) and
-must re-encode to the identical bytes. Child→host strictness stays proven by the
-SDK and transport tests (§4.1).
+must re-encode to the identical bytes. That covers every `host_hello`, `ready`,
+`event`, `reset`, and `shutdown` frame the gate produces. No gate service
+received a `lag` or a `ping`, so their content stays unit-proven
+(`SVC5::a5_live_queue_…`, `SVC5::a5_control_lane_…`, and the SDK golden
+fixtures). Child→host strictness stays proven by the SDK and transport tests
+(§4.1).
 
 ## 2. §20 gate steps
 
@@ -68,9 +76,9 @@ SDK and transport tests (§4.1).
 | 1 local install offline; no marker/process | `G::stage_a_gate_local_noop_package_end_to_end` (committed, untrusted, no `state/`, no start, no canary) and the same test's counting resolver and Git canary, which are never touched | proven |
 | 2 inspect/doctor/list/status execute nothing | same test (`package_code_executed: false`, empty status, zero starts, canaries) | proven |
 | 3 trust preview notice; exact grant; not enabled, not running | same test (notice equals `NATIVE_AUTHORITY_NOTICE`, exact `service-grants.json` row at revision 2, `enabled:false`, zero starts) | proven |
-| 4 enable: identity, roots, minimal env, readiness, one group | same test: `host_hello` identity equals digest, revision, epoch, and floor. `HOME`/`XDG_*`/`TMPDIR`/`PWD`/cwd/argv[0] are checked against the assigned roots by inode. The host passes descriptor-derived paths (`/.vol/<dev>/<ino>` on macOS, `/proc/self/fd/<n>` on Linux) that only the child can resolve, so the child records the inode each one names and the gate compares it. The environment names are exactly the §11.3 set, a planted daemon variable is absent, and leader and grandchild share one PGID. | proven |
+| 4 enable: identity, roots, minimal env, readiness, one group | same test: `host_hello` identity equals digest, revision, epoch, and floor. `HOME`/`XDG_*`/`TMPDIR`/`PWD`/cwd/argv[0] are checked against the assigned roots by inode. The host passes descriptor-derived paths (`/.vol/<dev>/<ino>` on macOS, `/proc/self/fd/<n>` on Linux) that only the child can resolve, so the child records the inode each one names and the gate compares it. Comparing inodes alone is sound because the store, the state roots, and the connection temp root all live under one config directory, on one filesystem; the device number would be equal for every pair. The environment names are exactly the §11.3 set, a planted daemon variable is absent, and leader and grandchild share one PGID. | proven |
 | 5 new/resumed sessions with permission and tools: scoped metadata, no payloads, client/SSE compatibility | same test: kinds are exactly `session_started, turn_started, turn_finished, turn_started, turn_finished` (the resumed turn has no `session_started`); the prompt and cwd sentinels are absent from every frame; the ACK and ordinary client event types equal a no-extension baseline. Permission and tool: `G::stage_a_gate_live_permission_and_tool_facts_are_metadata_only`. A `fake-tool` turn asks for `write`, the real daemon policy suspends it on a waiter, and the operator allows it through that waiter. The service receives exactly `session_started, turn_started, permission_requested, permission_resolved(allowed), tool_started(write), tool_finished(write, success), turn_finished`, with host-UUID `permission_id`/`tool_call_id`, and no path, content, prompt, or runtime tool-call id. A denied second turn yields `permission_resolved(denied)` and no tool facts. | proven. The ordinary client/SSE comparison uses the no-tool turn only. |
-| 6 lag, then retained replay and reset; turns stay responsive | Lag under real backpressure: `G::stage_a_gate_stalled_service_never_delays_ordinary_turns`. It fires 160 concurrent ordinary turns (at least 480 facts, far beyond the 256-frame queue and the 64 KiB pipe) at a service that never reads stdin again. It proves `lag_count > 0`, that every turn finishes within its bound, and that the blocked write fails the connection (`stopping`, `protocol_violation`) no earlier than 2 s after the burst began and within 3.5 s of its end, followed by bounded cleanup and reap. Replay: `G::stage_a_gate_crash_resume_backoff_circuit_and_explicit_retry` (a same-epoch resume after a process failure replays exactly the unprocessed facts, with no reset). Reset: step 7 and step 9. | proven. The stalled child never reads, so the *content* of a delivered `lag` frame is proven at unit level (`SVC5::a5_live_queue_bounds_count_and_bytes_with_computed_replay_availability`), not on a live wire. |
+| 6 lag, then retained replay and reset; turns stay responsive | Lag under real backpressure: `G::stage_a_gate_stalled_service_never_delays_ordinary_turns`. A service stops reading stdin after its handshake. A synchronous flood of 600 eligible facts (far beyond the 256-frame queue and the 64 KiB pipe) is published in a few milliseconds, which pins when the pipe fills. The gate proves `lag_count > 0`. It proves the connection fails (`stopping`, `protocol_violation`, timed by the row's `observed_at`) within [2 s, 2.6 s] of the pinned fill. While that write is blocked, 160 concurrent ordinary turns all finish within their bound, and the group is reaped. Replay: `G::stage_a_gate_crash_resume_backoff_circuit_and_explicit_retry` (a same-epoch resume after a process failure replays exactly the unprocessed facts, with no reset). Reset: step 7 and step 9. | proven. The *content* of a delivered `lag` frame is unit-proven (`SVC5::a5_live_queue_bounds_count_and_bytes_with_computed_replay_availability`); the stalled child never reads one. |
 | 7 disable → events → stale re-enable; project widening | `G::stage_a_gate_local_noop_package_end_to_end` (new epoch, floor ≥ interval high-water mark, `reset: activation_changed`, no interval sequence or session delivered). Widening, live: `G::stage_a_gate_project_scope_widening_never_replays_interval_facts`. Two projects are created through the real route and the service is enabled for A: A's facts arrive carrying A's `project_id`, and B's facts never arrive. Widening to A+B mints a new epoch with a floor at or above every B interval fact, the stale cursor gets `reset: activation_changed`, no B interval fact is ever delivered, and B's facts after the widening are delivered. | proven |
 | 8 crash loop: numeric backoff, circuit, generation-safe cleanup | `G::stage_a_gate_crash_resume_backoff_circuit_and_explicit_retry`: measured gaps of 1 s and 2 s between crash starts (tolerance −60/+500 ms, so a 1 s→2 s change fails, M11b), `circuit_open` with `restart_count 4`, every leader and grandchild dead, no timer re-close within 5 s (past the 4 s step an un-opened circuit would take), and disable → enable retries with fresh history | proven |
 | 9 daemon restart | `G::stage_a_gate_local_noop_package_end_to_end`: `shutdown reason daemon_stopping`, leader and grandchild gone, a new dispatcher boot id through the production `start_extension_host`, a stale cursor gets `reset: boot_changed`, every event is on the new boot, `data/` is retained, and exactly one service runs | proven |
@@ -146,7 +154,7 @@ Abbreviations: `LC` = `extension_lifecycle::tests`, `SVC` =
 | Disable → events → re-enable, and widening, cannot replay the interval | global: `G::stage_a_gate_local_…`; widening: `SVC::activation_epoch_replay_…` (unit) and `G::stage_a_gate_project_scope_widening_never_replays_interval_facts` (live) | A5 |
 | Abrupt exit, invalid stdout, stderr flood, startup timeout, ping timeout, crash loop, open circuit are fail-soft | `SVC::abrupt_leader_exit_cleans_surviving_grandchild_before_reap`, `SVC::post_ready_clean_eof_racing_leader_poll_is_always_unexpected_exit`, `SVC::malformed_post_ready_frame_is_a_protocol_violation`, `SVC::supervisor_production_path_cleans_protocol_circuit_and_shutdown`, `SVC::stderr_binary_newline_free_and_rate_flood_stay_bounded_and_redacted`, `SVC::startup_timeout_cleans_process_group_and_preserves_reason`, `SVC::three_missed_pongs_trigger_ping_timeout_and_full_cleanup`, `SVC::on_failure_crash_loop_opens_circuit_after_exact_threshold`, `SVC::scope_only_epoch_change_preserves_open_circuit_and_does_not_respawn`; live: `G::stage_a_gate_crash_…` | proven |
 | Oversize stdout | `SVC::transport_rejects_oversize_duplicate_unknown_and_resume_frames` (reader) | proven at the reader |
-| Blocked stdin fails at 2 s | `SVC::blocked_stdin_fails_at_the_two_second_connection_deadline` (unit); live: `G::stage_a_gate_stalled_…` (the connection fails as `protocol_violation` no earlier than 2 s after the burst began and within 3.5 s of its end; raising the deadline to 6 s (M25) or cutting it to 200 ms (M26) fails the test) | A5 |
+| Blocked stdin fails at 2 s | Exact 2 s: `SVC::blocked_stdin_fails_at_the_two_second_connection_deadline` (unit). Live: `G::stage_a_gate_stalled_…` shows the blocked write fails within a bounded deadline, [2 s, 2.6 s] after the pinned pipe fill. Its upper bound always fails a 3 s deadline (M25b, 3 of 3 runs). Its lower bound caught a 1 s deadline in only some runs (M26b). The write deadline is per frame, and macOS can grow a blocked pipe's buffer, which completes the frame and restarts the clock, so a 1 s deadline sometimes fails at about 2 s. | unit: exact. Live: bounded, with the upper bound deterministic. |
 | Backoff sequence | `SVC::restart_backoff_schedule_and_circuit_threshold_match_the_ratified_policy` (constants); measured: `G::stage_a_gate_crash_…` (1 s, 2 s) | A5 |
 | Rolling 60 s window | `SVC5::a5_rolling_window_prunes_failures_older_than_sixty_seconds` (four failures 30 s old plus one open the circuit; 61 s old do not) | A5 |
 | Stable 5-minute reset | `SVC5::a5_stable_reset_after_five_healthy_minutes_restores_the_first_backoff` (`#[ignore]`, real time, ~5.5 min; run and recorded in §8) | A5 (ignored test, recorded run) |
@@ -228,6 +236,7 @@ cover any of them.
 | O-6 | Grandchild probe after a health (ping) failure | The cleanup path is the same `killpg` group path proven for disable/circuit/shutdown, but the ping-timeout test has no grandchild | Add a grandchild to `three_missed_pongs…` |
 | O-7 | All four acquisitions held while the lock and reads are rechecked; `list` read over HTTP during the held fetch | The A3a test checks lock freedom with one live acquisition and reads inspect/doctor over HTTP | Reorder the A3a test as the §19.4 report suggests |
 | O-8 | Repeat-preview stability for narrowing, binding-only, native-ack-only, and widening-an-existing-grant diffs | Confirmation binds the canonical diff and notice; repeat-preview equality is tested only for widening from nothing | Repeat-preview pairs in `TX::a3a_grant_diff…` |
+| O-10 | The permission gate writes the runtime's fixed `FAKE_TOOL_TARGET_PATH` (`/tmp/ocean-fake-tool-test.txt`), not a per-test path | The path is a constant in `ocean-runtime`'s fake provider, and changing it is a runtime change outside A5. Both daemon users hold `AUTO_CONVENE_ENV_LOCK`, so they are serialized within the daemon test binary. | A test-only target override in the fake-tool provider |
 | O-9 | A permission waiter under live service backpressure | The stalled gate drives no-tool turns; the permission producer is the same non-blocking `publish` | Run the `fake-tool` permission round-trip during the stalled burst |
 
 ## 7. Mutation checks
@@ -264,12 +273,23 @@ restored after each run.
 | M23 | the stable reset never applies | `SVC5::a5_stable_reset_…` (ignored test, run for the check) |
 | M24 | the CLI sends a mutation twice | `CLI::a5_mutations_are_sent_exactly_once_…` |
 | M25 | the stdin write deadline raised from 2 s to 6 s | `G::stage_a_gate_stalled_…` |
-| M26 | the stdin write deadline cut from 2 s to 200 ms | `G::stage_a_gate_stalled_…` |
+| M25b | the stdin write deadline raised from 2 s to 3 s | `G::stage_a_gate_stalled_…` (3 of 3 runs, upper bound) |
+| M26 | the stdin write deadline cut from 2 s to 200 ms | `G::stage_a_gate_stalled_…` (checked against the first version of the test; superseded by M26b) |
+| M26b | the stdin write deadline cut from 2 s to 1 s | `G::stage_a_gate_stalled_…` in 2 of 6 runs only. This is a known limit: a per-frame deadline can restart when the kernel accepts more bytes. The exact value is unit-proven. |
 | M27 | frames refused by a full queue dropped without `lag` | `G::stage_a_gate_stalled_…` |
 | M8b | a new epoch's replay floor set to 0 | `G::stage_a_gate_project_scope_widening_…` |
 | M28 | an allowed permission published as `denied` | `G::stage_a_gate_live_permission_and_tool_facts_…` |
 | M30 | the 1 MiB byte bound made exclusive | `SVC5::a5_live_queue_…` |
 | M31 | stderr redactions not counted | `G::stage_a_gate_bound_secret_…` |
+
+There is no M29. That number was skipped when the second round was planned,
+and no mutation was dropped. The M25, M26, M27, M28, M30, and M31 runs
+restored the source by moving a backup into place. That kept an old mtime, so
+a later build could run a stale mutated binary. Every result above was
+re-established after touching all sources, and the M25b/M26b runs rewrite the
+file with a fresh mtime. After the delta-review rewrite of the stalled test
+(the pinned flood) and the move of grandchild checks to bounded `wait_for`,
+M25, M27, and M10 were re-run against the current tests. All three fail.
 
 Not mutation-checked, with the reason:
 - The secret-sentinel gate is a negative scan. Its positive control is that the child sees exactly the bound value.
@@ -288,6 +308,7 @@ Local results on macOS arm64 (Darwin 25.5), rustc stable, host Git 2.50.1, 2026-
 | `cargo check --workspace` | pass |
 | `cargo test -p ocean-daemon` | 1094 passed, 0 failed, 4 ignored |
 | `cargo test -p ocean-daemon stage_a_gate` | 9 passed, three consecutive runs with no flake |
+| Ubuntu CI (`check (ubuntu-latest)`, run 36222286365 at `be979464`) | all nine `stage_a_gate` tests ran and passed on Linux |
 | `cargo test -p ocean-daemon a5_` | 13 passed, 1 ignored, three consecutive runs with no flake |
 | `cargo test -p ocean-daemon a5_stable_reset -- --ignored` | passed (310.5 s) on the first A5 head. Neither the test nor any production code has changed since. |
 | `cargo test -p ocean-cli` | 21 passed |
@@ -296,7 +317,7 @@ Local results on macOS arm64 (Darwin 25.5), rustc stable, host Git 2.50.1, 2026-
 | `cargo clippy -p ocean-daemon --all-targets --all-features -- -D warnings` | pass |
 | `cargo fmt --all -- --check` | pass |
 | `cargo xtask docs-check` | pass (30 packages, 167 active Markdown files, 209 local links) |
-| `node scripts/check-ledger.mjs` | pass (655 entries) |
+| `node scripts/check-ledger.mjs` | pass (656 entries) |
 | `cargo deny check` | advisories, bans, licenses, and sources ok |
 | `git diff --check` | clean |
 

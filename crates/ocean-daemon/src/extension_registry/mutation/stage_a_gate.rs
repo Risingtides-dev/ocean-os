@@ -217,6 +217,31 @@ async fn wait_for(what: &str, done: impl Fn() -> bool) {
     }
 }
 
+/// `kill(pid, 0)` also succeeds on a zombie. A killed grandchild is
+/// re-parented to init and may sit unreaped for a moment, so "dead" for a
+/// process this test did not parent means gone or a zombie, polled within a
+/// bound. Service leaders are the supervisor's own children, so they are
+/// checked strictly with `process_alive` wherever reap-before-return is the
+/// claim.
+fn dead_or_zombie(pid: i64) -> bool {
+    if !process_alive(pid) {
+        return true;
+    }
+    std::process::Command::new("ps")
+        .args(["-o", "stat=", "-p", &pid.to_string()])
+        .output()
+        .map(|out| {
+            String::from_utf8_lossy(&out.stdout)
+                .trim_start()
+                .starts_with('Z')
+        })
+        .unwrap_or(false)
+}
+
+async fn assert_dead(what: &str, pid: i64) {
+    wait_for(what, || dead_or_zombie(pid)).await;
+}
+
 async fn healthy(app: &Router) -> (i64, Value) {
     let body = wait_for_status(app, ID, |body| {
         body["services"][0]["state"] == "healthy" && body["services"][0]["pid"].is_u64()
@@ -695,10 +720,7 @@ async fn stage_a_gate_local_noop_package_end_to_end() {
     assert_eq!(status, StatusCode::OK, "{disabled}");
     assert_eq!(disabled["mutation"]["reap"], "complete");
     assert!(!process_alive(first), "disable returned before reap");
-    assert!(
-        !process_alive(child_of_first),
-        "the grandchild survived disable"
-    );
+    assert_dead("the grandchild survived disable", child_of_first).await;
     let shutdown = frames_of(&fixture, first);
     assert_eq!(
         shutdown.last().unwrap()["frame"],
@@ -758,11 +780,11 @@ async fn stage_a_gate_local_noop_package_end_to_end() {
     let child_of_second = grandchild(&fixture, second);
     state.extension_lifecycle.stop_publication();
     supervisor.shutdown().await;
+    // Every host frame this service ever received, shutdown included, is a
+    // strict canonical v1 frame.
+    let _ = frames(&fixture);
     assert!(!process_alive(second), "daemon shutdown left the service");
-    assert!(
-        !process_alive(child_of_second),
-        "daemon shutdown left a grandchild"
-    );
+    assert_dead("daemon shutdown left a grandchild", child_of_second).await;
     let stopped = frames_of(&fixture, second);
     assert_eq!(stopped.last().unwrap()["frame"], "shutdown");
     assert_eq!(stopped.last().unwrap()["reason"], "daemon_stopping");
@@ -832,7 +854,8 @@ async fn stage_a_gate_local_noop_package_end_to_end() {
     let child_of_third = grandchild(&fixture, third);
     let (status, _) = scope(&app, ID, "disable", revision).await;
     assert_eq!(status, StatusCode::OK);
-    assert!(!process_alive(third) && !process_alive(child_of_third));
+    assert!(!process_alive(third));
+    assert_dead("a grandchild survived disable", child_of_third).await;
     let (status, updated) = post_op(
         &app,
         &format!("/v1/extensions/{ID}/update"),
@@ -932,7 +955,8 @@ async fn stage_a_gate_local_noop_package_end_to_end() {
     assert!(trust_rows.to_string().contains(&digest_v2), "{trust_rows}");
     let (status, _) = scope(&app, ID, "disable", revision + 6).await;
     assert_eq!(status, StatusCode::OK);
-    assert!(!process_alive(fourth) && !process_alive(child_of_fourth));
+    assert!(!process_alive(fourth));
+    assert_dead("a grandchild survived disable", child_of_fourth).await;
     let (status, purged) = send(
         &app,
         Method::DELETE,
@@ -966,6 +990,9 @@ async fn stage_a_gate_local_noop_package_end_to_end() {
     assert_eq!(client_shape(&absent_ack, &absent_types), baseline);
 
     supervisor.shutdown().await;
+    // Every host frame this service ever received, shutdown included, is a
+    // strict canonical v1 frame.
+    let _ = frames(&fixture);
     fixture.assert_no_canary_ran();
 }
 
@@ -974,16 +1001,30 @@ async fn stage_a_gate_local_noop_package_end_to_end() {
 // ---------------------------------------------------------------------------
 
 /// A service that completes its handshake and then never reads stdin again
-/// cannot delay ordinary turns. A burst of concurrent turns publishes far more
-/// than the 256-frame data queue and the 64 KiB pipe hold, so the host both
-/// coalesces lost frames into `lag` and blocks on a full stdin. Every turn
-/// is still acknowledged and finishes within its bound. The blocked write
-/// fails the connection at the 2 s deadline (as a protocol failure), no
-/// earlier than 2 s after the burst began and within a bounded slack of its
-/// end, and the process group is reaped.
+/// cannot delay ordinary turns, and its blocked stdin fails the connection at
+/// the ratified 2 s write deadline.
+///
+/// The moment the pipe fills is pinned: a synchronous flood of 600 eligible
+/// facts, far more than the 64 KiB pipe and the 256-frame queue hold, is
+/// published in a few milliseconds, so the first blocked write starts inside
+/// `[flood_started, flood_ended]`. The connection must then fail (`stopping`,
+/// `protocol_violation`, timed by the status row's `observed_at`) no earlier
+/// than 2 s after `flood_started` and no later than 2 s plus scheduling slack
+/// after `flood_ended`. The upper bound is deterministic: a 3 s deadline always
+/// fails it. The lower bound is only probabilistic against a shorter deadline.
+/// The deadline is per frame, and the kernel can accept more bytes into a
+/// blocked pipe (macOS grows pipe buffers), which completes the frame and
+/// restarts the clock. So a 1 s deadline sometimes lands at about 2 s. The
+/// exact 2 s value is unit-proven by
+/// `extension_service::tests::blocked_stdin_fails_at_the_two_second_connection_deadline`. While that write is
+/// blocked, 160 concurrent ordinary turns are all acknowledged and finish
+/// within their bound. The overflow is recorded as lag, and the group is
+/// reaped.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn stage_a_gate_stalled_service_never_delays_ordinary_turns() {
+    const FLOOD: usize = 600;
     const BURST: usize = 160;
+    const SLACK: Duration = Duration::from_millis(600);
     let _guard = AUTO_CONVENE_ENV_LOCK.lock().await;
     let _restore = TestEnvRestore::capture(&["OCEAN_CONFIG_DIR", "OCEAN_MODEL", "OCEAN_YOLO"]);
     let fixture = Fixture::new();
@@ -991,7 +1032,7 @@ async fn stage_a_gate_stalled_service_never_delays_ordinary_turns() {
     let supervisor = with_supervisor(&mut state, fixture.config.path()).await;
     let app = router(state.clone());
     let stalled = format!(
-        "#!/bin/sh\nIFS= read -r hello\nprintf '%s\\n' '{{\"protocol\":\"ocean.extension.service\",\"version\":1,\"frame\":\"service_hello\",\"subscriptions\":{SUBSCRIPTIONS},\"resume\":null}}'\nIFS= read -r ready\nprintf stalled > \"$HOME/stalled\"\nexec sleep 600\n"
+        "#!/bin/sh\nIFS= read -r hello\nprintf '%s\\n' \"$hello\" > \"$HOME/host-hello\"\nprintf '%s\\n' '{{\"protocol\":\"ocean.extension.service\",\"version\":1,\"frame\":\"service_hello\",\"subscriptions\":{SUBSCRIPTIONS},\"resume\":null}}'\nIFS= read -r ready\nprintf '%s\\n' \"$ready\" >> \"$HOME/host-hello\"\nprintf stalled > \"$HOME/stalled\"\nexec sleep 600\n"
     );
     let package = gate_package_with(&fixture, "stalled", "1.0.0", "", &stalled);
     let (_, installed) = install_local(&app, 0, &package).await;
@@ -1001,17 +1042,45 @@ async fn stage_a_gate_stalled_service_never_delays_ordinary_turns() {
     let (status, _) = scope(&app, ID, "enable", 2).await;
     assert_eq!(status, StatusCode::OK);
     let (pid, _) = healthy(&app).await;
-    let child = {
-        wait_for("stalled marker", || {
-            data_dir(&fixture).join("stalled").exists()
-        })
-        .await;
-        pid
-    };
+    wait_for("stalled marker", || {
+        data_dir(&fixture).join("stalled").exists()
+    })
+    .await;
+    // The two frames the child did read are strict, canonical v1 frames.
+    for line in fs::read_to_string(data_dir(&fixture).join("host-hello"))
+        .unwrap()
+        .lines()
+    {
+        assert_strict_host_frame(line);
+    }
 
-    let cwd = fixture.sources.path().to_str().unwrap().to_owned();
+    // Pin the moment the pipe fills.
     let before = state.extension_lifecycle.current_sequence().0;
-    let burst_started = tokio::time::Instant::now();
+    let flood_started = tokio::time::Instant::now();
+    let flood_started_wall = chrono::Utc::now();
+    for _ in 0..FLOOD {
+        let lifecycle = &state.extension_lifecycle;
+        lifecycle.publish(LifecycleSource::ExplicitSessionCreated {
+            succeeded: true,
+            scope: lifecycle.source_scope(None, Some(Uuid::new_v4()), None, None, None),
+            stamp: crate::lifecycle_stamp(),
+            title: String::new(),
+            cwd: String::new(),
+        });
+    }
+    let flood_ended = tokio::time::Instant::now();
+    let flood_ended_wall = chrono::Utc::now();
+    assert_eq!(
+        state.extension_lifecycle.current_sequence().0 - before,
+        FLOOD as u64
+    );
+    assert!(
+        flood_ended.duration_since(flood_started) < Duration::from_millis(500),
+        "the flood was too slow to pin the blocked write"
+    );
+
+    // Ordinary turns run while the write is blocked.
+    let cwd = fixture.sources.path().to_str().unwrap().to_owned();
     let mut turns = tokio::task::JoinSet::new();
     for _ in 0..BURST {
         let state = state.clone();
@@ -1038,6 +1107,50 @@ async fn stage_a_gate_stalled_service_never_delays_ordinary_turns() {
             started.elapsed()
         });
     }
+
+    // `stopping` (with its fixed reason) is published the moment the
+    // connection fails, and the row's `observed_at` records that moment; the
+    // terminal `unhealthy` follows the §10.5 bounded cleanup (shutdown write
+    // deadline, TERM, KILL, reap), so `stopping` lasts at least that shutdown
+    // write deadline and polling cannot miss it. The failure time is taken
+    // from `observed_at`, not from when this (possibly starved) poll saw it.
+    let stopping_at = loop {
+        let (_, body) = get_json(&app, &format!("/v1/extensions/{ID}/status")).await;
+        let row = &body["services"][0];
+        if row["state"] == "stopping" {
+            assert_eq!(row["reason"], "protocol_violation", "{body}");
+            break chrono::DateTime::parse_from_rfc3339(row["observed_at"].as_str().unwrap())
+                .unwrap()
+                .with_timezone(&chrono::Utc);
+        }
+        assert_eq!(
+            row["state"], "healthy",
+            "the stopping state was missed: {body}"
+        );
+        assert!(
+            flood_ended.elapsed() < Duration::from_secs(10),
+            "the blocked write never failed: {body}"
+        );
+        tokio::time::sleep(Duration::from_millis(2)).await;
+    };
+    // `observed_at` has millisecond precision (truncated), hence 2 ms of slack
+    // on the lower bound.
+    let after_start = (stopping_at - flood_started_wall)
+        .to_std()
+        .unwrap_or_default();
+    let after_end = (stopping_at - flood_ended_wall)
+        .to_std()
+        .unwrap_or_default();
+    assert!(
+        after_start + Duration::from_millis(2) >= Duration::from_secs(2),
+        "the connection failed {after_start:?} after the pipe filled, before its 2 s deadline"
+    );
+    assert!(
+        after_end < Duration::from_secs(2) + SLACK,
+        "the blocked write failed {after_end:?} after the pipe filled, past its 2 s deadline"
+    );
+    let stopping_at = tokio::time::Instant::now();
+
     let mut slowest = Duration::ZERO;
     while let Some(elapsed) = tokio::time::timeout(Duration::from_secs(30), turns.join_next())
         .await
@@ -1045,47 +1158,11 @@ async fn stage_a_gate_stalled_service_never_delays_ordinary_turns() {
     {
         slowest = slowest.max(elapsed.unwrap());
     }
-    let burst_ended = tokio::time::Instant::now();
     assert!(
         slowest < Duration::from_secs(20),
         "slowest turn took {slowest:?}"
     );
-    let published = state.extension_lifecycle.current_sequence().0 - before;
-    assert!(
-        published as usize >= 3 * BURST,
-        "the burst published {published} facts"
-    );
 
-    // The stalled connection lagged and then failed at the write deadline:
-    // `stopping` (with its fixed reason) is published the moment the
-    // connection fails, and the terminal `unhealthy` follows the §10.5
-    // bounded cleanup (shutdown write deadline, TERM, KILL, reap).
-    let stopping_at = loop {
-        let (_, body) = get_json(&app, &format!("/v1/extensions/{ID}/status")).await;
-        let state = body["services"][0]["state"].clone();
-        if state == "stopping" || state == "unhealthy" {
-            assert_eq!(
-                body["services"][0]["reason"], "protocol_violation",
-                "{body}"
-            );
-            break tokio::time::Instant::now();
-        }
-        assert_eq!(state, "healthy", "{body}");
-        assert!(
-            burst_ended.elapsed() < Duration::from_secs(10),
-            "the blocked write never failed: {body}"
-        );
-        tokio::time::sleep(Duration::from_millis(5)).await;
-    };
-    assert!(
-        stopping_at.duration_since(burst_started) >= Duration::from_secs(2),
-        "the connection failed before its 2 s write deadline"
-    );
-    assert!(
-        stopping_at.duration_since(burst_ended) < Duration::from_millis(3500),
-        "the blocked write outlived its 2 s deadline: {:?} after the burst",
-        stopping_at.duration_since(burst_ended)
-    );
     let failed =
         wait_for_status(&app, ID, |body| body["services"][0]["state"] == "unhealthy").await;
     assert!(
@@ -1099,8 +1176,11 @@ async fn stage_a_gate_stalled_service_never_delays_ordinary_turns() {
     );
     assert_eq!(row["reason"], "protocol_violation", "{failed}");
     assert_eq!(row["pid"], Value::Null);
-    assert!(!process_alive(child), "the stalled group was not reaped");
+    wait_for("stalled group reaped", || !process_alive(pid)).await;
     supervisor.shutdown().await;
+    // Every host frame this service ever received, shutdown included, is a
+    // strict canonical v1 frame.
+    let _ = frames(&fixture);
     fixture.assert_no_canary_ran();
 }
 
@@ -1317,6 +1397,9 @@ async fn stage_a_gate_live_permission_and_tool_facts_are_metadata_only() {
     assert!(!raw.contains("a5-deny-reason-sentinel"));
 
     supervisor.shutdown().await;
+    // Every host frame this service ever received, shutdown included, is a
+    // strict canonical v1 frame.
+    let _ = frames(&fixture);
     let _ = fs::remove_file(target);
     fixture.assert_no_canary_ran();
 }
@@ -1453,6 +1536,9 @@ async fn stage_a_gate_project_scope_widening_never_replays_interval_facts() {
     );
 
     supervisor.shutdown().await;
+    // Every host frame this service ever received, shutdown included, is a
+    // strict canonical v1 frame.
+    let _ = frames(&fixture);
     fixture.assert_no_canary_ran();
 }
 
@@ -1574,13 +1660,16 @@ async fn stage_a_gate_bound_secret_never_leaves_the_spawn_environment() {
         &sentinel,
         Some(&fixture.root().join("state").join(ID).join("data")),
     );
-    let frames = fs::read_to_string(data_dir(&fixture).join("frames")).unwrap();
+    let recorded = fs::read_to_string(data_dir(&fixture).join("frames")).unwrap();
     assert!(
-        !frames.contains(&sentinel),
+        !recorded.contains(&sentinel),
         "an event frame carried the secret"
     );
 
     supervisor.shutdown().await;
+    // Every host frame this service ever received, shutdown included, is a
+    // strict canonical v1 frame.
+    let _ = frames(&fixture);
     fixture.assert_no_canary_ran();
 }
 
@@ -1690,10 +1779,7 @@ async fn stage_a_gate_crash_resume_backoff_circuit_and_explicit_retry() {
         assert_eq!(body["services"][0]["restart_count"], 1);
         body["services"][0]["pid"].as_i64().unwrap()
     };
-    assert!(
-        !process_alive(first_child),
-        "the failed leader's grandchild survived"
-    );
+    assert_dead("the failed leader's grandchild survived", first_child).await;
     wait_for("replayed facts", || {
         events_of(&fixture, second)
             .iter()
@@ -1769,7 +1855,7 @@ async fn stage_a_gate_crash_resume_backoff_circuit_and_explicit_retry() {
             "backoff gap {gap} ms is not the ratified {delay} ms"
         );
     }
-    assert!(!process_alive(second_child));
+    assert_dead("a grandchild survived the crash", second_child).await;
     let pids: Vec<i64> = fs::read_to_string(data_dir(&fixture).join("starts"))
         .unwrap()
         .lines()
@@ -1777,10 +1863,11 @@ async fn stage_a_gate_crash_resume_backoff_circuit_and_explicit_retry() {
         .collect();
     for pid in &pids {
         assert!(!process_alive(*pid), "service {pid} survived the circuit");
-        assert!(
-            !process_alive(grandchild(&fixture, *pid)),
-            "a grandchild of {pid} survived"
-        );
+        assert_dead(
+            "a grandchild survived the circuit",
+            grandchild(&fixture, *pid),
+        )
+        .await;
     }
     // The open circuit never closes on a timer: wait past the next (4 s)
     // backoff step that an un-opened circuit would have taken.
@@ -1800,7 +1887,13 @@ async fn stage_a_gate_crash_resume_backoff_circuit_and_explicit_retry() {
     assert_ne!(body["services"][0]["activation_epoch"], epoch);
 
     supervisor.shutdown().await;
-    assert!(!process_alive(retried));
+    // Every host frame this service ever received, shutdown included, is a
+    // strict canonical v1 frame.
+    let _ = frames(&fixture);
+    wait_for("the retried service was reaped at shutdown", || {
+        !process_alive(retried)
+    })
+    .await;
     fixture.assert_no_canary_ran();
 }
 
@@ -1960,7 +2053,8 @@ async fn stage_a_gate_pinned_git_noop_installs_untrusted_and_activates_only_afte
     let child = grandchild(&fixture, pid);
     let (status, disabled) = scope(&app, ID, "disable", 3).await;
     assert_eq!(status, StatusCode::OK, "{disabled}");
-    assert!(!process_alive(pid) && !process_alive(child));
+    assert!(!process_alive(pid));
+    assert_dead("a grandchild survived disable", child).await;
 
     // A pinned Git update to an exact second commit installs a new, untrusted
     // digest, keeps the Git provenance, and starts nothing.
@@ -1990,6 +2084,9 @@ async fn stage_a_gate_pinned_git_noop_installs_untrusted_and_activates_only_afte
     assert_eq!(starts(&fixture), starts_before);
 
     supervisor.shutdown().await;
+    // Every host frame this service ever received, shutdown included, is a
+    // strict canonical v1 frame.
+    let _ = frames(&fixture);
     fixture.assert_no_canary_ran();
     local.assert_no_canary_ran();
 }

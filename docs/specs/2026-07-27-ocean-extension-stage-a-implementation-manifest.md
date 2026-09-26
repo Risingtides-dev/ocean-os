@@ -1522,9 +1522,14 @@ helpers, and a `doctor` route on the test-only router. Realization choices:
     `fake-tool` model and the real policy waiter, for both allow and deny.
   - Project-scope widening runs live, with projects created through the real
     route.
-  - Backpressure is real: 160 concurrent turns overflow the 256-frame queue and
-    the pipe of a service that never reads. That proves `lag` and the 2 s
-    blocked-write failure while every turn stays bounded.
+  - Backpressure is real. A synchronous 600-fact flood overflows the 256-frame
+    queue and the pipe of a service that never reads, which pins when the pipe
+    fills. The gate proves `lag`, and that the blocked write fails within a
+    bounded deadline of [2 s, 2.6 s] after the fill; a 3 s deadline always
+    fails it. Meanwhile 160 concurrent turns stay bounded. The exact 2 s value
+    is unit-proven by `blocked_stdin_fails_at_the_two_second_connection_deadline`,
+    because a per-frame deadline can restart when macOS grows a blocked pipe's
+    buffer.
 - *Gap closures.* Rows the earlier suites proved only in part now have tests:
   - every reset reason by name;
   - the full control-lane order;
