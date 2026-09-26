@@ -59,7 +59,7 @@ fn model(context_window: u32) -> Model {
 }
 
 #[derive(Clone, Copy, Debug)]
-struct TurnShape {
+pub(crate) struct TurnShape {
     user_bytes: usize,
     tools: usize,
     args_bytes: usize,
@@ -68,7 +68,7 @@ struct TurnShape {
 }
 
 impl TurnShape {
-    const fn with_output(output_bytes: usize) -> Self {
+    pub(crate) const fn with_output(output_bytes: usize) -> Self {
         Self {
             user_bytes: 400,
             tools: 4,
@@ -98,7 +98,7 @@ fn pretty_bytes(session: &session::Session) -> usize {
         .len()
 }
 
-struct Report {
+pub(crate) struct Report {
     context_window: u32,
     output_bytes: usize,
     turns: usize,
@@ -111,13 +111,18 @@ struct Report {
     written_bytes: Option<usize>,
     saves: usize,
     /// The persisted transcript after the last turn's final save.
-    final_messages: Vec<Message>,
+    pub(crate) final_messages: Vec<Message>,
 }
 
 /// Run `turns` turns through the same load → compact → accept-save → checkpoint
 /// saves → final-save sequence `run_turn_inner` uses, with one tool call per
 /// provider round.
-fn simulate(shape: TurnShape, turns: usize, context_window: u32, exact_saves: bool) -> Report {
+pub(crate) fn simulate(
+    shape: TurnShape,
+    turns: usize,
+    context_window: u32,
+    exact_saves: bool,
+) -> Report {
     let model = model(context_window);
     let mut session = session::Session::new_with_id(ocean_core::SessionId::new_v4(), &model);
     let mut end_of_turn_bytes = Vec::with_capacity(turns);
@@ -294,7 +299,7 @@ fn persisted_session_write_volume_exact() {
 
 /// One provider round's `TurnCheckpoint` delta: an assistant tool call and its
 /// (runtime-capped) result, exactly the shape `simulate` persists per round.
-fn checkpoint_round(shape: TurnShape, sample: usize) -> Vec<Message> {
+pub(crate) fn checkpoint_round(shape: TurnShape, sample: usize) -> Vec<Message> {
     let id = format!("toolu_stall_{sample:04}");
     vec![
         assistant(

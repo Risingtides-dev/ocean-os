@@ -74,7 +74,7 @@ Environment: macOS 26.5.2 on an arm64 Mac mini (Mac16,10), with `rustc 1.97.0 (2
 | Room tail → SSE queue | `room_message_tail` `mpsc` | messages | 64 (access 16, cursor 16) | no, but bounded by count | Tail task awaits (backpressure on its own task only). |
 | Per-connection replay snapshot | `subscribe_with_replay*` → `merged_ordered()` | the replay ring | whole ring, up to 32 MiB | inherits | Transient, one per connect. See failure mode 3. |
 | Per-connection hyper write buffer + socket | axum/hyper | hyper's HTTP/1 buffer limit | 94–102 × 4 KiB frames observed (~380–410 KiB) | effectively yes | hyper stops polling the stream, and the broadcast receiver falls behind. |
-| Runtime → daemon per-turn queue | `main.rs` `unbounded_channel::<AgentEvent>` | nothing | unbounded | **no** | Not measured. See "Not measured". |
+| Runtime → daemon per-turn queue | `main.rs` `unbounded_channel::<AgentEvent>` | nothing | unbounded | **no** | The producer never waits and nothing is dropped. *Measured 2026-09-26, see §7:* peak ≤ 6 events on H1. H2 holds whatever the bridge has not read: 406 events / 49.2 KiB for a whole-turn stall, and 8,394,780 B for four 2 MiB spill-off results. |
 | Persisted session transcript | `ocean-agent` `session::save` | 200 messages (`MAX_SESSION_MESSAGES`), 32 KiB per tool-result text block (runtime), token-trigger elision (`compact_history`) | ≤ ~0.53 MiB (200k window) / ≤ ~2 MiB (1M window), measured | yes, indirectly | Oldest messages are dropped, and old tool results are elided to a marker. |
 | Extension lifecycle boot ring | `extension_lifecycle.rs` | events and bytes | 2,048 / 8 MiB | yes | Out of scope here; listed because the turn bridge also publishes rendered tool output to it. |
 
@@ -229,12 +229,37 @@ The measurements do **not** justify these conclusions:
 
 ## Not measured
 
-- **The per-turn `unbounded_channel::<AgentEvent>`** in `agent_turn`, under a starved bridge.
+- **The per-turn `unbounded_channel::<AgentEvent>`** in `agent_turn`, under a starved bridge. *Measured 2026-09-26; see §7.*
 - **Timing figures in release builds.** All timings above come from a debug build.
 - **The Observatory pump's real lag rate** under SQLite write load.
 - **Legacy-rail retention with large tool arguments.** A `write` call carrying a whole file was not swept.
 - **The `/v1/agent/events` replay path under concurrent reconnect storms.** Only one connect at a time was timed.
 - **HTTP/2 or proxied clients.** Every client here was a direct HTTP/1.1 loopback connection.
+
+### 7. Per-turn queue under a stalled consumer (added 2026-09-26)
+
+This section was added after the original measurements. It closes the "per-turn queue: not measured" row. The full method, all scenarios, and three-run ranges are in [`2026-09-26-bounded-turn-event-channel-proposal.md`](2026-09-26-bounded-turn-event-channel-proposal.md) §8, "Slice 1 completion".
+
+- **Test.** `turn_channel_queue_peaks_under_stalled_consumers` (`crates/ocean-agent/src/turn_channel_queue_measurements.rs`, `#[ignore]`d).
+- **What runs.** The real turn path through `prompt`, with a paced scripted provider (24 B deltas every 5 ms) and the real `bash` tool. Spill is off.
+- **H1.** The real consumer, with its real checkpoint saves.
+- **H2.** A harness consumer standing in for the bridge. It stalls for a fixed time, then drains.
+- **Units.** This section alone uses the proposal's §4 in-memory estimate: string lengths plus 64 B per event. That is the unit the proposed budget is written in, not serialized JSON.
+- **Setup.** Release build, this machine, three runs.
+
+| Scenario | H1 peak | H2 peak |
+|---|---|---|
+| Deltas, bridge stalled 1 s | 4 events | 119–130 events / 14.4–15.8 KiB |
+| Deltas, bridge stalled for the whole ~3 s turn | 3–4 events | 406 events / 49.2 KiB (all of it) |
+| Checkpoint saves at 539,788 B / 1,029,793 B, bridge live | 3–5 events; 2–5 queued behind one save | 2–5 events / ≤ 620 B |
+| One 2 MiB bash result, bridge stalled for the whole turn | 3–5 events, one 2 MiB event | 42 events / 2.01 MiB |
+| Four 2 MiB bash results in one segment, bridge stalled for the whole turn | 3–4 events | 48 events / 8,394,780 B |
+
+Findings:
+
+- **H1 stays shallow.** A checkpoint save at either size leaves a backlog of a few events.
+- **H2 grows with the stall.** It holds exactly what the producer emitted while the bridge was not polling.
+- **Against the proposed 8 MiB / 1,024 bounds.** Only the last row crosses one: the byte budget, by 6,172 B. No row approaches 1,024 events.
 
 ## Follow-up (2026-09-25)
 

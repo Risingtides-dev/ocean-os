@@ -1,7 +1,7 @@
 # Bounded Per-Turn Event Channel — Proposal
 
 **Date:** 2026-09-26
-**Status:** PROPOSED. Needs an operator yes/no on slices 3–6. Slices 1–2 do not depend on the open questions and are **landed, pending review** on `perf/turn-channel-slices-1-2` (see §8). No bound, backpressure, coalescing, channel type, or metric exists yet.
+**Status:** PROPOSED. Needs an operator yes/no on slices 3–6. Slices 1–2 do not depend on the open questions and are **merged** (#517). The slice-1 stalled-consumer queue harness is on `perf/turn-channel-queue-measurement`, pending review (see §8). No bound, backpressure, coalescing, channel type, or metric exists yet.
 **Baseline:** `origin/main` at `bd2f9abb`.
 **ROADMAP item:** "Reliability and scale" → *Design a bounded policy for the runtime-to-daemon per-turn event channel*.
 **Evidence:** [`2026-09-25-retained-size-and-slow-client-measurements.md`](2026-09-25-retained-size-and-slow-client-measurements.md) (cited below as **M**), plus the measurements in §2.
@@ -156,7 +156,7 @@ Permission decisions do not travel through either hop.
 
 Each slice is one PR with its own tests. Every slice runs `cargo xtask ci`.
 
-1. **Measure first: the channel harness.** *Save-stall half LANDED, pending review (§8). The stalled-consumer peak-bytes harness is not built yet.* Land the H1 save-stall measurement from §2 as an `#[ignore]` test. Add a runtime-level harness that runs the fake provider (`FAKE_TOOL_MODEL`) against a consumer stalled for a controlled time and records the peak queued bytes and items per hop.
+1. **Measure first: the channel harness.** *Save-stall half LANDED (§8). The stalled-consumer peak-bytes harness is built on `perf/turn-channel-queue-measurement`, pending review; its numbers are in §8.* Land the H1 save-stall measurement from §2 as an `#[ignore]` test. Add a runtime-level harness that runs the fake provider (`FAKE_TOOL_MODEL`) against a consumer stalled for a controlled time and records the peak queued bytes and items per hop.
    - *Accept:* the numbers land in the measurements doc's "Not measured" section, and that row closes.
 2. **Stop forwarding discarded variants, and move instead of clone** (`ocean-agent/src/lib.rs:2474`). *LANDED, pending review (§8).*
    - *Tests:* a daemon test in which a turn's `AgentEnd`/`TurnCheckpoint` never reaches the bridge, and SSE output is byte-identical for a fake-tool turn.
@@ -214,7 +214,7 @@ cargo test --release -p ocean-agent checkpoint_save_stall -- --ignored --nocaptu
 
 These agree with the scratch figures in §2. The H1 consumer stalls for about 10 ms per checkpoint at both sizes, so the save is dominated by the fsync, not by the bytes.
 
-**Not done in this slice.** §6 slice 1 also asks for a runtime-level harness that runs `FAKE_TOOL_MODEL` against a consumer stalled for a controlled time and records peak queued bytes and items per hop. It is not built, so the "Runtime → daemon per-turn queue" row in the measurements doc stays "Not measured". Slice 2's acceptance line ("peak H2 bytes drop by the size of the history") depends on that harness and is therefore not yet measured either. Slice 2's effect is proven structurally instead: the history-sized events no longer enter H2 at all.
+**Not done in this slice.** §6 slice 1 also asks for a runtime-level harness that runs `FAKE_TOOL_MODEL` against a consumer stalled for a controlled time and records peak queued bytes and items per hop. It was not built here. It landed separately; see "Slice 1 completion" below.
 
 ### Slice 2: stop forwarding what the bridge discards
 
@@ -286,3 +286,77 @@ The second round ran against the review revision. The runtime column is the unit
 | K5: classify `TextDelta` as not relayed | **fails** | **fails** | pass | **fails** | **fails** / **fails** / pass |
 
 The cancelled golden has no text delta, so K4 and K5 do not reach it.
+
+### Slice 1 completion: the stalled-consumer queue harness (2026-09-26)
+
+Branch `perf/turn-channel-queue-measurement`, from `origin/main` at `636cb269`, pending review. Measurement only: no bound, backpressure, coalescing, or production behavior was added.
+
+**What runs.** `turn_channel_queue_peaks_under_stalled_consumers` in `crates/ocean-agent/src/turn_channel_queue_measurements.rs`. It is `#[ignore]`d and never runs in CI:
+
+```text
+cargo test --release -p ocean-agent turn_channel_queue -- --ignored --nocapture --test-threads=1
+```
+
+- The real `AgentRuntime::prompt` → `run_prompt` → `run_agent_with_history` path, on a multi-thread tokio runtime as in the daemon.
+- The real H1 channel and its real consumer (the `run_prompt` receive loop, with the synchronous `TurnCheckpoint` save), the real `bash` tool, and a real H2 channel passed in through `with_event_sink`, as the daemon passes it.
+- The provider is a scripted paced stream (`PacedProvider`), injected like `fake-tool` is. Text deltas are 24 B, one every 5 ms. That is faster than a real provider streams text, so queues err high.
+- The H2 consumer stands in for the daemon bridge. It does not `recv` for a fixed stall, then drains. The bridge's own per-event cost (µs, M §5) is not modelled.
+- Artifact spill is off (the `PromptControl` default, the voice profile's setting), so live tool output is not cut to a 16 KB head.
+
+**How the queue is measured.** Nothing wraps the channels. At every dequeue the consumer records `rx.len()` (what is still queued) and the event. Both hops are FIFO, so the queue just before dequeue *i* held events *i* … *i* + `len`. Each of those is dequeued later, so the queue's count and bytes are exact after the turn. The maximum over all dequeues is the peak, because a queue grows only between dequeues. `len()` is read just after the dequeue, so a peak can be over by one event, never under.
+
+- **H1 probe.** A `#[cfg(test)]` field on `AgentRuntime`, read in the receive loop. It does not exist in any non-test build. It clones each event, which can only lengthen the H1 consumer's stalls, so H1 peaks err high.
+- **H2.** The harness is the consumer, so it records directly.
+- **Bytes.** The §4 method, the estimate the 8 MiB budget is defined in: string and byte lengths (object keys included), 8 B per number, bool, or null, plus 64 B per event, with `Value` fields walked recursively. `AgentEvent` has no wire encoding, so typed payloads (`Message`, `Content`, patches, Slack ops) are walked through their `serde_json::Value` form.
+- **"H1 after a save"** is the largest queue found at the dequeue directly after a `TurnCheckpoint` dequeue: the backlog one synchronous save left behind.
+
+**Scenarios.**
+
+1. **H2 stalled while deltas stream.** Four rounds of 100 deltas. The first three rounds each end in a `printf ok` bash call. About 3 s per turn. The bridge stalls for 0, 100 ms, 1 s, or the whole turn.
+2. **H1 stalled by real checkpoint saves.** The session is preloaded with exactly the file `checkpoint_save_stall_at_steady_state` saves: 539,788 B and 1,029,793 B. That is the §2 sizes plus 254 B, because this session's model and provider strings differ. Nine rounds of 50 deltas follow, eight of them ending in a small bash call. That makes eight checkpoint saves at that size while the next round streams. Saves grow the file by 1 % over the turn. Deltas arrive every 5 ms, and every 1 ms as a burst rate. H2 is not stalled.
+3. **Large tool output, spill off.** 20 deltas, then one bash call, or four calls in one assistant message, each printing exactly 2 MiB, then 20 closing deltas. The bridge stalls for 0, 100 ms, 1 s, or the whole turn. The turn is 0.4–0.7 s long, so the 1 s stall covers the whole turn.
+
+**Result.** Release build, APFS, Mac16,10, three consecutive runs; ranges are min–max over the runs. Byte counts use the §4 estimate. Budget is 8 MiB (8,388,608 B) and 1,024 events per hop.
+
+| Scenario | H2 stall | H1 peak events | H1 peak bytes | H1 after a save | H2 peak events | H2 peak bytes | H2 over the turn | Bound binds? |
+|---|---|---|---|---|---|---|---|---|
+| 1 deltas | none | 3–4 | 10.8 KiB | 2 ev | 1–2 | 145–254 B | 406 ev / 49.2 KiB | no |
+| 1 deltas | 100 ms | 3–4 | 10.8 KiB | 2 ev | 2–6 | 254–744 B | 406 ev / 49.2 KiB | no |
+| 1 deltas | 1 s | 4 | 10.8 KiB | 2–3 ev | 119–130 | 14.4–15.8 KiB | 406 ev / 49.2 KiB | no |
+| 1 deltas | whole turn | 3–4 | 10.8 KiB | 2 ev | 406 | 49.2 KiB | 406 ev / 49.2 KiB | no |
+| 2 save at 539,788 B, 5 ms deltas | none | 3–4 | 497.8 KiB | 2–3 ev | 2 | 254 B | 466 ev / 56.6 KiB | no |
+| 2 save at 539,788 B, 1 ms deltas | none | 5 | 497.8 KiB | 5 ev | 4–5 | 496–620 B | 466 ev / 56.6 KiB | no |
+| 2 save at 1,029,793 B, 5 ms deltas | none | 4 | 976.3 KiB | 2 ev | 2 | 254 B | 466 ev / 56.6 KiB | no |
+| 2 save at 1,029,793 B, 1 ms deltas | none | 5 | 976.3 KiB | 5 ev | 4–5 | 496–620 B | 466 ev / 56.6 KiB | no |
+| 3 one 2 MiB bash | none | 3 | 2.00 MiB | 2 ev | 2 | 2.00 MiB | 42 ev / 2.01 MiB | no |
+| 3 one 2 MiB bash | 100 ms | 3–4 | 2.00 MiB | 2 ev | 8–9 | 2.00 MiB | 42 ev / 2.01 MiB | no |
+| 3 one 2 MiB bash | 1 s / whole turn | 3–5 | 2.00–2.03 MiB | 2 ev | 42 | 2.01 MiB | 42 ev / 2.01 MiB | no |
+| 3 four 2 MiB bash | none | 3–4 | 2.00 MiB | 2 ev | 2 | 2.00 MiB | 48 ev / 8.01 MiB | no |
+| 3 four 2 MiB bash | 100 ms | 3–4 | 2.00 MiB | 2 ev | 7–9 | 2.00 MiB | 48 ev / 8.01 MiB | no |
+| 3 four 2 MiB bash | 1 s / whole turn | 3–4 | 2.00 MiB | 2 ev | 48 | **8.01 MiB** (8,394,780 B) | 48 ev / 8.01 MiB | **H2 bytes, by 6,172 B** |
+
+The H1 byte peaks are each a single event, not a backlog:
+
+- In scenarios 1 and 2 it is `AgentEnd`, which carries the whole history: 976.3 KiB at the 1 MB file.
+- In scenario 3 it is the 2 MiB `ToolExecutionEnd`.
+
+The backlog one checkpoint save leaves behind is 2–3 events at the realistic rate and 5 at the 1 ms burst rate. The H2 figures for scenario 2 show that `AgentEnd` no longer crosses H2. The largest H2 event there is a 254 B delta pair, while H1 still carries the 976.3 KiB history. That is slice 2's acceptance line ("peak H2 bytes on a 1M-window turn drop by the size of the history"), now measured.
+
+**Would the proposed 8 MiB / 1,024 per-hop bounds ever bind here?**
+
+- **H1: never.** The peak was 6 events. The byte peak was one event (≤ 2.03 MiB). A checkpoint save at either proposal size queues 2–5 events.
+- **H2, count (1,024): never in these scenarios.** A bridge that stalled for a whole 3 s turn held 406 events.
+  - *Derived, not measured:* at this harness's 200 deltas/s, a bridge stall would have to last about 5 s to reach 1,024. At a real provider's few tens of deltas per second it would take tens of seconds.
+- **H2, bytes (8 MiB): yes, in exactly one case.** Four 2 MiB spill-off bash results in one segment, with the bridge stalled for the whole segment (1 s here; 100 ms was not enough). The queue reached 8,394,780 B, 6,172 B over. The exact figure is from a fourth run, after the printout gained exact bytes, and was the same in both stalled rows. The four outputs alone are 4 × 2,097,152 B = 8,388,608 B, exactly the budget. So under §4 the four results are admitted, and the next event (a delta or the checkpoint) waits for the bridge.
+  - This contradicts §4's "a voice segment of four parallel 2 MiB tools never blocks", but only when the bridge is stalled. With a live bridge, H2 held one 2 MiB result at a time.
+  - Nothing on a spill-on profile came close.
+- **Source note (not measured).** `bash` caps stdout and stderr at 2 MiB **each** (`bash.rs:17`), so one call can carry about 4 MiB. Two such calls fill a hop. That is relevant to Q2 (voice spill for the live event).
+
+**For the operator's open questions.** A realistic stall never approaches either bound on either hop. The byte bound engages only on a voice turn that returns several near-cap tool outputs at once while the bridge is not polling. The count bound needs a multi-second bridge stall. So Q1 (backpressure versus drop) decides what happens in a rare case, not a common one. Q2 decides whether that rare case can happen at all: with voice spill on for the live event, the largest live tool event drops to ~16 KB.
+
+**Unit tests (normal suite, fast).**
+
+- `hop_peak_reconstructs_the_queue_from_dequeue_lengths` pins the prefix-sum reconstruction.
+- `event_bytes_follows_the_proposal_estimate` pins the byte method.
+
+The ignored test also asserts that H2 carried exactly the relayed subsequence of H1, that a whole-turn stall queued everything, that the 2 MiB result arrived unspilled, and that the preloaded files are the proposal's sizes (±1 %).
