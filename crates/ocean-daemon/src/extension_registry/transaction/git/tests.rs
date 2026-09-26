@@ -1402,8 +1402,8 @@ fn a4_case_and_normalization_aliases_are_refused_on_every_host() {
         TREE_UNSUPPORTED
     );
     assert_no_acquisition_residue(config.path());
-    assert_eq!(fold_path("DIR/Caf\u{c9}"), fold_path("dir/cafe\u{301}"));
-    assert_ne!(fold_path("dir/a"), fold_path("dir/b"));
+    assert_eq!(fold_component("Caf\u{c9}"), fold_component("cafe\u{301}"));
+    assert_ne!(fold_component("a"), fold_component("b"));
 }
 
 /// The filesystem-level guard beneath the fold check: a directory the writer
@@ -1756,29 +1756,135 @@ fn a4_macos_git_shim_is_used_only_when_developer_tools_back_it() {
     assert!(macos_shim_backed(Some(&clt), &[&xcode]));
 }
 
+/// Polls `condition` for up to `limit`.
+fn eventually(limit: Duration, condition: impl Fn() -> bool) -> bool {
+    let until = Instant::now() + limit;
+    loop {
+        if condition() {
+            return true;
+        }
+        if Instant::now() >= until {
+            return false;
+        }
+        std::thread::sleep(Duration::from_millis(25));
+    }
+}
+
+/// An unproven group cleanup keeps its acquisition's permit only while the
+/// group is live: the detached waiter releases it (and reaps the leader) once
+/// the group is proven empty, so four such failures no longer exhaust the
+/// gate until restart. The fake's fetch leaves a short-lived member behind and
+/// the acquirer reports every synchronous cleanup as unprovable.
 #[test]
-fn a4_cleanup_failure_keeps_its_acquisition_permit() {
+fn a4_unproven_cleanup_holds_its_permit_only_until_the_group_is_empty() {
+    let fake = FakeGit::new(
+        "git version 2.40.1",
+        "sleep 3 & echo $! > \"$LOG/grandchild.pid\"; exit 1",
+    );
     let config = tempfile::tempdir().unwrap();
     let writer = RegistryWriter::new(config.path().to_path_buf());
     let key = writer.gate_key();
     let active = || registry_gates().get(&key).map_or(0, |gate| gate.active);
-    for (fail, retained) in [
-        (Fail::Reject(TIMEOUT), 0),
-        (Fail::Reject(FETCH_FAILED), 0),
-        (Fail::Reject(CLEANUP_FAILED), 1),
-    ] {
-        let mut lease = writer.begin_acquisition().unwrap();
-        let quarantine = lease.path.clone();
-        assert_eq!(active(), 1);
-        retain_permit_after(&mut lease, &fail);
-        drop(lease);
-        assert!(!quarantine.exists(), "the quarantine is always deleted");
-        assert_eq!(active(), retained, "{fail:?}");
-        // Undo the deliberate retention for the shared per-process gate.
-        if retained == 1 {
-            registry_gates().get_mut(&key).unwrap().active -= 1;
-        }
-    }
+    let acquirer = GitAcquirer::system()
+        .with_program(fake.program())
+        .with_resolver(Arc::new(Fixed(vec![PUBLIC_V4])))
+        .with_unprovable_cleanup();
+    assert_eq!(
+        code(writer.acquire_git_with(&acquirer, URL, "0123456789abcdef0123456789abcdef01234567")),
+        CLEANUP_FAILED
+    );
+    let grandchild = fake.grandchild();
+    // The member is still running: the permit is held and the quarantine is
+    // already gone.
+    // SAFETY: probing with signal 0 sends nothing.
+    assert_eq!(unsafe { libc::kill(grandchild, 0) }, 0, "member still live");
+    assert_eq!(active(), 1, "a live stranded group keeps its permit");
+    assert_no_acquisition_residue(config.path());
+    // The member exits on its own; the waiter proves the group empty, reaps
+    // the leader, and releases the permit.
+    assert!(
+        eventually(Duration::from_secs(15), || active() == 0),
+        "the permit was never released"
+    );
+    assert!(pid_gone(grandchild));
+    assert_eq!(fake.invocations("fetch").len(), 1, "fallback stops");
+    // Capacity is back: four fresh acquisitions can begin.
+    let leases: Vec<_> = (0..4)
+        .map(|_| writer.begin_acquisition().unwrap())
+        .collect();
+    drop(leases);
+}
+
+/// The waiter never releases early or leaks: a permit handed over with a
+/// running group stays held until that group exits, and the leader is reaped.
+#[test]
+fn a4_stranded_group_waiter_releases_only_after_exit() {
+    use std::os::unix::process::CommandExt as _;
+    let config = tempfile::tempdir().unwrap();
+    let writer = RegistryWriter::new(config.path().to_path_buf());
+    let key = writer.gate_key();
+    let active = || registry_gates().get(&key).map_or(0, |gate| gate.active);
+    let mut lease = writer.begin_acquisition().unwrap();
+    let child = Command::new("/bin/sh")
+        .args(["-c", "sleep 1"])
+        .process_group(0)
+        .spawn()
+        .unwrap();
+    let leader = libc::pid_t::try_from(child.id()).unwrap();
+    let group = ToolGroup::new(child).unwrap();
+    release_permit_when_empty(vec![group], lease.permit.take());
+    drop(lease);
+    std::thread::sleep(Duration::from_millis(300));
+    assert_eq!(active(), 1, "released while the group was live");
+    assert!(
+        eventually(Duration::from_secs(15), || active() == 0),
+        "never released after the group exited"
+    );
+    // Reaped: no zombie remains under this pid.
+    // SAFETY: probing with signal 0 sends nothing.
+    assert!(eventually(Duration::from_secs(5), || unsafe {
+        libc::kill(leader, 0) != 0
+    }));
+}
+
+/// The macOS shim gate at its call site: the shim is skipped for the next
+/// candidate unless developer tools back it, consulted only when reached, and
+/// non-executables are never chosen.
+#[test]
+fn a4_locate_git_skips_an_unbacked_shim_for_the_next_candidate() {
+    let dir = tempfile::tempdir().unwrap();
+    let make = |name: &str, mode: u32| {
+        let path = dir.path().join(name);
+        fs::write(&path, b"#!/bin/sh\n").unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(mode)).unwrap();
+        path
+    };
+    let shim = make("shim-git", 0o755);
+    let brew = make("brew-git", 0o755);
+    let plain = make("plain", 0o644);
+    let candidates = [shim.as_path(), brew.as_path()];
+    assert_eq!(
+        locate_git_from(&candidates, Some(&shim), || false).as_deref(),
+        Some(brew.as_path())
+    );
+    assert_eq!(
+        locate_git_from(&candidates, Some(&shim), || true).as_deref(),
+        Some(shim.as_path())
+    );
+    // Off macOS there is no shim: the first executable wins.
+    assert_eq!(
+        locate_git_from(&candidates, None, || false).as_deref(),
+        Some(shim.as_path())
+    );
+    // The gate is not consulted for other candidates.
+    assert_eq!(
+        locate_git_from(&[plain.as_path(), brew.as_path()], Some(&shim), || {
+            panic!("shim gate consulted for a non-shim")
+        })
+        .as_deref(),
+        Some(brew.as_path())
+    );
+    assert_eq!(locate_git_from(&[plain.as_path()], None, || true), None);
 }
 
 #[test]
@@ -1797,6 +1903,12 @@ fn a4_listing_fold_collisions_are_refused_before_any_filesystem_write() {
         &["DIR/one", "dir/two"],
         &["Docs", "docs/inner"],
         &["a/B/x", "a/b/y"],
+        // Full, not simple, case folding (APFS collides all of these).
+        &["stra\u{df}e", "strasse"],
+        &["\u{3b1}\u{3c2}", "\u{3b1}\u{3c3}"],
+        &["\u{fb01}le", "file"],
+        &["x\u{345}", "x\u{3b9}"],
+        &["dir/stra\u{df}e/a", "DIR/STRASSE/b"],
     ] {
         assert!(
             matches!(
@@ -1806,6 +1918,16 @@ fn a4_listing_fold_collisions_are_refused_before_any_filesystem_write() {
             "{paths:?}"
         );
     }
+    // Turkish dotless and dotted i stay distinct (so does APFS): folding is
+    // the default, not the Turkic, mapping.
+    assert_eq!(
+        acquirer
+            .parse_tree(listing(&["\u{131}", "i"]).as_bytes(), 40)
+            .unwrap()
+            .len(),
+        2
+    );
+    assert_ne!(fold_component("\u{131}"), fold_component("i"));
     // Siblings under one directory are fine.
     assert_eq!(
         acquirer

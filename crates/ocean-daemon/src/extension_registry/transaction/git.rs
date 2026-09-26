@@ -420,6 +420,10 @@ pub(crate) struct GitAcquirer {
     /// resolution and address check, so extraction is exercised offline.
     #[cfg(test)]
     file_remote: Option<PathBuf>,
+    /// Test-only: treat every pinned fetch group's synchronous cleanup as
+    /// unprovable, so a real live group reaches the detached waiter.
+    #[cfg(test)]
+    unprovable_cleanup: bool,
 }
 
 impl GitAcquirer {
@@ -434,6 +438,8 @@ impl GitAcquirer {
             max_bytes: MAX_PACKAGE_BYTES,
             #[cfg(test)]
             file_remote: None,
+            #[cfg(test)]
+            unprovable_cleanup: false,
         }
     }
 
@@ -479,6 +485,13 @@ impl GitAcquirer {
         }
         let work = Workspace::create(lease)?;
         let result = self.fill_in(&work, &lease.artifact, source, deadline);
+        // A group whose exit could not be proven keeps this acquisition's
+        // permit; a detached waiter releases it once the group is proven
+        // empty, so capacity is not lost until restart.
+        let stranded = work.strands.take();
+        if !stranded.is_empty() {
+            release_permit_when_empty(stranded, lease.permit.take());
+        }
         // Git's scratch never reaches staging. On failure the dropped lease
         // deletes the whole quarantine anyway.
         let removed = remove_tree_at(&lease.quarantine, c"fetch", 0);
@@ -749,10 +762,10 @@ impl GitAcquirer {
     fn parse_tree(&self, reader: impl BufRead, oid_len: usize) -> Step<Vec<TreeEntry>> {
         let mut entries = Vec::new();
         let mut directories: BTreeSet<String> = BTreeSet::new();
-        // Case-folded, NFC-normalized path → the exact path that claimed it.
-        // Two distinct paths with one fold would collide on a case-insensitive
-        // or normalizing filesystem (APFS, NTFS) and are refused everywhere,
-        // so a package means the same bytes on every host.
+        // Collision key ([`fold_component`] per component) → the exact path
+        // that claimed it. Two distinct paths with one key would collide on a
+        // case-insensitive or normalizing filesystem (APFS, NTFS) and are
+        // refused everywhere, so a package means the same bytes on every host.
         let mut folded: HashMap<String, (String, bool)> = HashMap::new();
         let mut bytes = 0u64;
         for record in reader.split(0) {
@@ -796,10 +809,19 @@ impl GitAcquirer {
             if components.len() - 1 > self.max_depth {
                 return Err(Fail::Reject(PACKAGE_INVALID));
             }
-            for depth in 1..=components.len() {
-                let prefix = components[..depth].join("/");
-                let directory = depth < components.len();
-                match folded.entry(fold_path(&prefix)) {
+            // Each component is folded once; the exact and folded prefix keys
+            // grow one component at a time.
+            let mut prefix = String::with_capacity(path.len());
+            let mut key = String::with_capacity(path.len());
+            for (depth, component) in components.iter().enumerate() {
+                if depth > 0 {
+                    prefix.push('/');
+                    key.push('/');
+                }
+                prefix.push_str(component);
+                key.push_str(&fold_component(component));
+                let directory = depth + 1 < components.len();
+                match folded.entry(key.clone()) {
                     std::collections::hash_map::Entry::Vacant(slot) => {
                         slot.insert((prefix.clone(), directory));
                     }
@@ -814,7 +836,7 @@ impl GitAcquirer {
                     }
                 }
                 if directory {
-                    directories.insert(prefix);
+                    directories.insert(prefix.clone());
                 }
             }
             bytes = bytes
@@ -996,12 +1018,21 @@ impl GitAcquirer {
     ) -> Step<ExitStatus> {
         let command = command(program, work, scheme, pin, args, stdin, stdout);
         let ceiling = self.temp_ceiling;
-        let status = run_group(command, deadline, || {
-            if work.bytes() > ceiling {
-                return Some(LIMIT);
-            }
-            watch()
-        })?;
+        #[cfg(test)]
+        work.strands
+            .unprovable
+            .set(self.unprovable_cleanup && pin.is_some());
+        let status = run_group(
+            command,
+            deadline,
+            || {
+                if work.bytes() > ceiling {
+                    return Some(LIMIT);
+                }
+                watch()
+            },
+            &work.strands,
+        )?;
         if work.bytes() > ceiling {
             return Err(Fail::Reject(LIMIT));
         }
@@ -1027,20 +1058,38 @@ fn git_dir(repo: &Path) -> OsString {
 }
 
 fn locate_git() -> Option<PathBuf> {
+    locate_git_from(
+        &GIT_CANDIDATES.map(Path::new),
+        cfg!(target_os = "macos").then_some(Path::new("/usr/bin/git")),
+        || {
+            macos_shim_backed(
+                fs::read_link("/var/db/xcode_select_link").ok().as_deref(),
+                &[
+                    Path::new("/Applications/Xcode.app/Contents/Developer"),
+                    Path::new("/Library/Developer/CommandLineTools"),
+                ],
+            )
+        },
+    )
+}
+
+/// The first executable regular file among `candidates`; `shim` (macOS's
+/// `/usr/bin/git` `xcrun` shim) counts only when `shim_backed` says developer
+/// tools stand behind it, and is consulted only when it is reached.
+fn locate_git_from(
+    candidates: &[&Path],
+    shim: Option<&Path>,
+    shim_backed: impl Fn() -> bool,
+) -> Option<PathBuf> {
     use std::os::unix::fs::PermissionsExt as _;
-    GIT_CANDIDATES.iter().map(PathBuf::from).find(|candidate| {
-        fs::metadata(candidate)
-            .is_ok_and(|metadata| metadata.is_file() && metadata.permissions().mode() & 0o111 != 0)
-            && (!cfg!(target_os = "macos")
-                || candidate != Path::new("/usr/bin/git")
-                || macos_shim_backed(
-                    fs::read_link("/var/db/xcode_select_link").ok().as_deref(),
-                    &[
-                        Path::new("/Applications/Xcode.app/Contents/Developer"),
-                        Path::new("/Library/Developer/CommandLineTools"),
-                    ],
-                ))
-    })
+    candidates
+        .iter()
+        .find(|candidate| {
+            fs::metadata(candidate).is_ok_and(|metadata| {
+                metadata.is_file() && metadata.permissions().mode() & 0o111 != 0
+            }) && (Some(**candidate) != shim || shim_backed())
+        })
+        .map(|candidate| candidate.to_path_buf())
 }
 
 /// macOS `/usr/bin/git` is an `xcrun` shim; without developer tools, running
@@ -1091,12 +1140,19 @@ fn safe_component(component: &str) -> bool {
         && !component.chars().any(char::is_control)
 }
 
-/// The collision key for one tree path: Unicode lowercase, then NFC. Distinct
-/// paths sharing a key would alias on a case-insensitive or
-/// normalization-insensitive filesystem.
-fn fold_path(path: &str) -> String {
+/// The collision key for one path component: `NFC(full_casefold(NFD(s)))`,
+/// Unicode's canonical caseless match rendered as a string. Full (not simple)
+/// folding is what makes `straße`/`strasse`, final `ς`/`σ`, `ﬁ`/`fi`, and
+/// U+0345/`ι` collide as they do on APFS; the default (non-Turkic) mappings
+/// keep dotless `ı` distinct from `i`, as APFS does. Distinct paths sharing a
+/// key would alias on a case-insensitive or normalization-insensitive
+/// filesystem. `/` is untouched by all three steps, so a path's key is its
+/// components' keys joined by `/`.
+fn fold_component(component: &str) -> String {
+    let decomposed = icu_normalizer::DecomposingNormalizerBorrowed::new_nfd().normalize(component);
+    let folded = icu_casemap::CaseMapper::new().fold_string(&decomposed);
     icu_normalizer::ComposingNormalizerBorrowed::new_nfc()
-        .normalize(&path.to_lowercase())
+        .normalize(&folded)
         .into_owned()
 }
 
@@ -1224,6 +1280,7 @@ struct Workspace {
     dir: File,
     path: PathBuf,
     home: PathBuf,
+    strands: Strands,
 }
 
 impl Workspace {
@@ -1241,6 +1298,7 @@ impl Workspace {
             home: path.join("home"),
             dir,
             path,
+            strands: Strands::default(),
         })
     }
 
@@ -1372,42 +1430,91 @@ impl<'a> TreeWriter<'a> {
 // Generation-safe process groups (§10.5 applied to the acquisition tool).
 // ---------------------------------------------------------------------------
 
+/// Process groups whose cleanup could not be proven during one acquisition,
+/// handed to [`release_permit_when_empty`] with its permit.
+#[derive(Default)]
+struct Strands {
+    groups: std::cell::RefCell<Vec<ToolGroup>>,
+    #[cfg(test)]
+    unprovable: std::cell::Cell<bool>,
+}
+
+impl Strands {
+    /// Keep an unproven group (leader still unreaped) and report the failure.
+    fn keep(&self, group: ToolGroup) -> Fail {
+        self.groups.borrow_mut().push(group);
+        Fail::Reject(CLEANUP_FAILED)
+    }
+
+    fn take(&self) -> Vec<ToolGroup> {
+        self.groups.take()
+    }
+}
+
 /// Spawn `command` as the leader of a new process group and wait for it
-/// under `deadline`, polling `over_limit` while it runs.
+/// under `deadline`, polling `over_limit` while it runs. A group that cannot
+/// be proven empty is kept in `strands`, never dropped.
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 fn run_group(
     mut command: Command,
     deadline: Instant,
     mut over_limit: impl FnMut() -> Option<&'static str>,
+    strands: &Strands,
 ) -> Step<ExitStatus> {
     let child = command.spawn().map_err(|error| spawn_failure(&error))?;
     let group = ToolGroup::new(child)?;
+    #[cfg(test)]
+    let group = ToolGroup {
+        unprovable: strands.unprovable.get(),
+        ..group
+    };
     let mut next_measure = Instant::now() + MEASURE_INTERVAL;
-    loop {
+    let code = loop {
         match group.leader_exited() {
-            Some(true) => break,
+            Some(true) => return group.finish().map_err(|group| strands.keep(group)),
             Some(false) => {}
             // Ownership is unprovable: never signal a group we cannot pin.
-            None => return Err(Fail::Reject(CLEANUP_FAILED)),
+            None => return Err(strands.keep(group)),
         }
         let now = Instant::now();
         if now >= deadline {
-            return Err(group.terminate(TIMEOUT));
+            break TIMEOUT;
         }
         if now >= next_measure {
             if let Some(code) = over_limit() {
-                return Err(group.terminate(code));
+                break code;
             }
             next_measure = now + MEASURE_INTERVAL;
         }
         std::thread::sleep(POLL_INTERVAL);
+    };
+    match group.terminate() {
+        Ok(()) => Err(Fail::Reject(code)),
+        Err(group) => Err(strands.keep(group)),
     }
-    group.finish()
 }
 
 #[cfg(not(any(target_os = "macos", target_os = "linux")))]
-fn run_group(_: Command, _: Instant, _: impl FnMut() -> Option<&'static str>) -> Step<ExitStatus> {
+fn run_group(
+    _: Command,
+    _: Instant,
+    _: impl FnMut() -> Option<&'static str>,
+    _: &Strands,
+) -> Step<ExitStatus> {
     Err(Fail::Reject(GIT_UNAVAILABLE))
+}
+
+/// No generation-safe group primitive exists elsewhere, so no group is ever
+/// spawned or stranded.
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+enum ToolGroup {}
+
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+fn release_permit_when_empty(groups: Vec<ToolGroup>, _: Option<AcquisitionPermit>) {
+    match groups.into_iter().next() {
+        None => {}
+        Some(group) => match group {},
+    }
 }
 
 /// A spawned group leader that is never reaped until its group is proven
@@ -1419,6 +1526,9 @@ fn run_group(_: Command, _: Instant, _: impl FnMut() -> Option<&'static str>) ->
 struct ToolGroup {
     child: Option<Child>,
     leader: libc::pid_t,
+    /// Test-only: the synchronous cleanup reports failure without acting.
+    #[cfg(test)]
+    unprovable: bool,
 }
 
 #[cfg(any(target_os = "macos", target_os = "linux"))]
@@ -1428,6 +1538,8 @@ impl ToolGroup {
         Ok(Self {
             child: Some(child),
             leader,
+            #[cfg(test)]
+            unprovable: false,
         })
     }
 
@@ -1465,10 +1577,17 @@ impl ToolGroup {
         io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH)
     }
 
+    fn group_empty(&self) -> bool {
+        matches!(
+            crate::extension_service::group_has_live_members(self.leader),
+            Ok(false)
+        )
+    }
+
     fn wait_empty(&self, grace: Duration) -> bool {
         let until = Instant::now() + grace;
         loop {
-            if let Ok(false) = crate::extension_service::group_has_live_members(self.leader) {
+            if self.group_empty() {
                 return true;
             }
             if Instant::now() >= until {
@@ -1483,40 +1602,89 @@ impl ToolGroup {
     }
 
     /// §10.5: SIGTERM, grace, SIGKILL, grace, then reap only a proven-empty
-    /// group. Returns the failure to report.
-    fn terminate(mut self, code: &'static str) -> Fail {
+    /// group. An unproven group comes back to the caller.
+    fn terminate(mut self) -> Result<(), Self> {
+        #[cfg(test)]
+        if self.unprovable {
+            return Err(self);
+        }
         let emptied = (self.signal(libc::SIGTERM) && self.wait_empty(GROUP_GRACE))
             || (self.signal(libc::SIGKILL) && self.wait_empty(GROUP_GRACE));
         if emptied && self.reap().is_some() {
-            Fail::Reject(code)
+            Ok(())
         } else {
-            Fail::Reject(CLEANUP_FAILED)
+            Err(self)
         }
     }
 
     /// The leader exited on its own: kill any member that outlived it (the
     /// zombie leader still pins the PGID), prove the group empty, then reap.
-    fn finish(mut self) -> Step<ExitStatus> {
-        let empty = matches!(
-            crate::extension_service::group_has_live_members(self.leader),
-            Ok(false)
-        ) || (self.signal(libc::SIGKILL) && self.wait_empty(GROUP_GRACE));
-        if !empty {
-            return Err(Fail::Reject(CLEANUP_FAILED));
+    /// An unproven group comes back to the caller.
+    fn finish(mut self) -> Result<ExitStatus, Self> {
+        #[cfg(test)]
+        if self.unprovable {
+            return Err(self);
         }
-        self.reap().ok_or(Fail::Reject(CLEANUP_FAILED))
+        let empty =
+            self.group_empty() || (self.signal(libc::SIGKILL) && self.wait_empty(GROUP_GRACE));
+        if !empty {
+            return Err(self);
+        }
+        self.reap().ok_or(self)
+    }
+
+    /// The detached waiter's check: `true` once the group is proven empty and
+    /// the leader is no longer running, reaping the leader if it is still our
+    /// zombie. It never signals: every strand was already signaled or never
+    /// pinned, and observation alone is enough to prove an exit.
+    fn settled(&mut self) -> bool {
+        if !self.group_empty() {
+            return false;
+        }
+        match self.leader_exited() {
+            // A leader that left its own group and still runs keeps the permit.
+            Some(false) => false,
+            Some(true) => {
+                self.reap();
+                true
+            }
+            None => true,
+        }
     }
 }
 
-/// A git process group whose exit could not be proven may still be running.
-/// Its lease keeps one of the four acquisition permits until the daemon
-/// restarts, so stuck tools can never exceed the daemon-wide acquisition cap;
-/// the quarantine itself is still deleted. While such a permit is held the
-/// orphan sweep is skipped (never raced), exactly as for a live acquisition.
-fn retain_permit_after(lease: &mut AcquisitionLease, fail: &Fail) {
-    if matches!(fail, Fail::Reject(CLEANUP_FAILED)) {
-        std::mem::forget(lease.permit.take());
-    }
+/// First and longest pause between a stranded group's re-checks.
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+const STRAND_BACKOFF: (Duration, Duration) = (Duration::from_millis(50), Duration::from_secs(10));
+
+/// A git process group whose exit could not be proven may still be running,
+/// so its acquisition keeps its permit: stuck tools can never exceed the
+/// daemon-wide acquisition cap, and the orphan sweep is skipped (never raced)
+/// while it is held. A detached waiter re-checks each group with bounded
+/// exponential backoff and releases the permit only once every group is
+/// proven empty (reaping each leader). If the waiter cannot be spawned the
+/// permit is retained until restart, as before, rather than released early.
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn release_permit_when_empty(groups: Vec<ToolGroup>, permit: Option<AcquisitionPermit>) {
+    // ManuallyDrop: a failed spawn drops the closure, and that must never
+    // release the permit while a group may be live.
+    let permit = std::mem::ManuallyDrop::new(permit);
+    let mut groups = groups;
+    let waiter = move || {
+        let (mut pause, longest) = STRAND_BACKOFF;
+        loop {
+            groups.retain_mut(|group| !group.settled());
+            if groups.is_empty() {
+                drop(std::mem::ManuallyDrop::into_inner(permit));
+                return;
+            }
+            std::thread::sleep(pause);
+            pause = (pause * 2).min(longest);
+        }
+    };
+    let _ = std::thread::Builder::new()
+        .name("ocean-git-strand".into())
+        .spawn(waiter);
 }
 
 // ---------------------------------------------------------------------------
@@ -1555,7 +1723,6 @@ impl RegistryWriter {
         let mut lease = self.begin_acquisition()?;
         let operation_id = lease.operation_id;
         if let Err(fail) = acquirer.fill(&mut lease, &source, started + acquirer.deadline) {
-            retain_permit_after(&mut lease, &fail);
             return Err(self.error(operation_id, Failure::pre(0)(fail)));
         }
         self.seal(lease)
@@ -1640,6 +1807,11 @@ pub(crate) mod test_support {
 
         pub(crate) fn with_file_remote(mut self, remote: PathBuf) -> Self {
             self.file_remote = Some(remote);
+            self
+        }
+
+        pub(crate) fn with_unprovable_cleanup(mut self) -> Self {
+            self.unprovable_cleanup = true;
             self
         }
     }

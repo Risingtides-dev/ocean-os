@@ -1355,10 +1355,10 @@ lows, six nits), repaired on the same branch:*
 
 - *Aliasing paths (medium).* The tree listing is refused as
   `git_tree_unsupported` when two distinct paths, or a file and a directory,
-  share one collision key (Unicode lowercase, then NFC via the `icu_normalizer`
-  crate already in the lock through `idna`), so `README`+`readme`, NFC+NFD
-  `café`, and `DIR/`+`dir/` fail on every host, not only on a case-insensitive
-  or normalizing filesystem. The filesystem-level `TreeWriter` guard (never
+  share one collision key, so `README`+`readme`, NFC+NFD `café`, and
+  `DIR/`+`dir/` fail on every host, not only on a case-insensitive or
+  normalizing filesystem. (The key is now full case folding; see the delta
+  follow-up below.) The filesystem-level `TreeWriter` guard (never
   merge into a directory this writer did not create) stays as the second layer
   and has its own deterministic test.
 - *Local commands carry no transport.* `init`, `ls-tree`, `cat-file`, and the
@@ -1382,9 +1382,10 @@ lows, six nits), repaired on the same branch:*
   `usr/bin/git`; otherwise the next fixed candidate (Homebrew) is used, so an
   acquisition can never open the CLT install dialog.
 - *Permit after unproven cleanup.* On `git_process_cleanup_failed` the lease
-  keeps its acquisition permit until daemon restart (its quarantine is still
-  deleted), so stuck tools can never exceed the four-acquisition cap; while it
-  is held the orphan sweep is skipped, never raced.
+  keeps its acquisition permit while the group may be live (its quarantine is
+  still deleted), so stuck tools can never exceed the four-acquisition cap;
+  while it is held the orphan sweep is skipped, never raced. (Release is now
+  by a detached waiter; see the delta follow-up below.)
 - *Tests added:* the three aliasing trees end to end plus a synthetic-listing
   fold test and a `TreeWriter` test; direct `safe_component` assertions; a
   scripted two-line/foreign/malformed `FETCH_HEAD` and a wrong-size blob header
@@ -1401,6 +1402,51 @@ lows, six nits), repaired on the same branch:*
   both fails the `file://` test. On APFS the end-to-end aliasing test fails
   only when both collision layers are removed, which is the intended defense
   in depth; each layer's own test fails when that layer alone is removed.
+
+*Independent delta review follow-up (two lows, one nit), repaired on
+`fix/extension-a4-followups`:*
+
+- *Full case folding (low).* The collision key is now, per path component,
+  `NFC(full_casefold(NFD(s)))` — Unicode's canonical caseless match as a
+  string — so `straße`/`strasse`, final `ς`/`σ`, `ﬁ`/`fi`, and U+0345/`ι`
+  collide on every host as they do on APFS, while Turkish dotless `ı` and `i`
+  stay distinct (default, not Turkic, mappings; APFS keeps them apart too).
+  Folding is `icu_casemap` 2.2 (compiled data only), a new package from the
+  same ICU4X 2.2 release, license, and provider/`zerovec` stack as the
+  `icu_normalizer` already locked through `idna`; `unicase`, the only folding
+  crate already in the lock, offers case-insensitive equality but no folded
+  string to normalize afterwards. `cargo deny check` passes. Each component is
+  folded once and the exact and folded prefix keys are built incrementally.
+- *Stranded permits (low).* The first builder's retention held the permit
+  until restart, so four `git_process_cleanup_failed` results exhausted the
+  gate for local installs too and skipped the orphan sweep for good. Now an
+  unproven group (its leader still unreaped, so the PGID stays pinned) is
+  handed with the permit to a detached waiter thread that re-checks the group
+  with exponential backoff from 50 ms capped at 10 s. It never signals; it
+  releases the permit only once `group_has_live_members` proves the group
+  empty and the leader is not running, reaping the leader first. Callers still
+  see `git_process_cleanup_failed` and, while four groups are live,
+  `acquisition_capacity`, which is now truthful as retryable. If the waiter
+  thread cannot be spawned the permit is retained until restart, never
+  released early.
+- *Shim gate at its call site (nit).* `locate_git` now delegates to
+  `locate_git_from(candidates, shim, shim_backed)`, which a test drives with
+  temporary executables: an unbacked shim yields the next candidate, a backed
+  one is chosen, no shim means the first executable, and the gate is not
+  consulted for other candidates.
+- *Tests and mutations.* The fold test adds `straße`/`strasse`, `ας`/`ασ`,
+  `ﬁle`/`file`, `x`+U+0345/`xι`, a nested `straße` directory, and a negative
+  `ı`/`i` case. An end-to-end test drives a fake `git` whose fetch leaves a
+  3-second member behind under a test-only "cleanup unprovable" switch: the
+  permit is held while the member lives, released after it exits, and four
+  fresh acquisitions then succeed; a unit test hands a live group to the
+  waiter directly. Mutations that fail a test: the old lowercase+NFC key, an
+  over-fold of `ı` to `i`, an unfolded prefix key, a waiter that releases
+  immediately, one that never releases, `fill` never handing off, a waiter that
+  skips the emptiness proof, a dropped strand from the leader-exit path, and
+  the shim gate forced true or ignoring its backing check. The strand on the
+  lost-ownership path (`waitid` fails on our own child) cannot be provoked in a
+  test and is covered by review only.
 
 Recorded boundaries, not decided here:
 
