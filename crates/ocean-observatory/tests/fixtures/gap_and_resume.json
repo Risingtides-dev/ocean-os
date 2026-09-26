@@ -72,23 +72,23 @@
     },
     {
       "cursor": "5", "event_id": "gap-event",
+      "observatory_id": "obs-fixture", "daemon_instance_id": "daemon-fixture",
       "schema_version": 1,
       "occurred_at": "2026-07-17T18:03:00.000Z",
-      "recorded_at": "2026-07-17T18:03:00.001Z",
-      "kind": "stream.gap", "truth": "host_observed",
+      "recorded_at": "2026-07-17T18:03:00.000Z",
+      "kind": "stream_gap", "truth": "derived",
       "producer": { "kind": "daemon", "id": "ocean-daemon" },
       "topology": {
-        "execution_id": "00000000-0000-0000-0000-000000000000",
-        "root_execution_id": "00000000-0000-0000-0000-000000000000",
+        "execution_id": "", "root_execution_id": "",
         "parent_execution_id": null, "edge_id": null,
         "session_id": "", "turn_id": "", "request_id": ""
       },
       "correlation": { "tool_call_id": null, "permission_id": null },
       "visibility": "metadata",
       "payload": {
-        "kind": "stream.gap",
+        "kind": "StreamGap",
         "data": {
-          "from_cursor": "5",
+          "from_cursor": "4",
           "to_cursor": "10",
           "reason": "retention_boundary"
         }
@@ -163,11 +163,11 @@
       "pending_permissions": 1
     },
     "5": {
-      "description": "StreamGap event received. Reducer must freeze state at cursor 5, mark in-flight activity as interrupted. Transition to gap phase.",
+      "description": "StreamGap envelope received, shaped as the daemon's live tail sends it: cursor is the first missing cursor (from_cursor + 1), truth derived, empty topology. Reducer must freeze state, mark in-flight activity as interrupted, and request a fresh snapshot. Transition to gap phase.",
       "daemon_running": true,
       "phase_gap": true,
       "frozen_cursor": 5,
-      "gap_from": 5,
+      "gap_from": 4,
       "gap_to": 10
     },
     "10": {

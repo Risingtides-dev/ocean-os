@@ -7,8 +7,9 @@
 //!   cursor (nodes, edges, attention, earliest cursor, instance ids).
 //! - `GET /v1/observatory/events` — SSE live tail with durable resume via
 //!   `Last-Event-ID` or `?after=`, explicit `reset`/`error` frames for
-//!   expired/malformed/future cursors, and `stream.gap` frames when the
-//!   durable log skips (retention prune or jump). History is always replayed
+//!   expired/malformed/future cursors, and a typed `StreamGap` envelope
+//!   (manifest §2.1 Property 4, §7.2) when the durable log skips (retention
+//!   prune or jump). History is always replayed
 //!   from the durable store before live attach; the stream never silently
 //!   attaches live with unknown history.
 //! - `GET /v1/observatory/replay` — ascending bounded JSON pages with
@@ -36,8 +37,9 @@ use serde_json::{json, Value};
 use tokio_stream::wrappers::ReceiverStream;
 
 use ocean_observatory::{
-    AttentionItem, Cursor, EventEnvelope, ObservatorySnapshot, ObservatoryStore, ReplayEvent,
-    ReplayMeta, ReplayPage, RetentionPolicy, SnapshotEdge, SnapshotNode,
+    AttentionItem, Correlation, Cursor, EventEnvelope, EventKind, EventPayload,
+    ObservatorySnapshot, ObservatoryStore, Producer, ProducerKind, ReplayEvent, ReplayMeta,
+    ReplayPage, RetentionPolicy, SnapshotEdge, SnapshotNode, Topology, TruthProvenance, Visibility,
 };
 
 use crate::bus::SSE_KEEPALIVE_INTERVAL;
@@ -553,6 +555,8 @@ pub(crate) async fn events(
     }
 
     let (tx, rx) = tokio::sync::mpsc::channel::<Result<axum::response::sse::Event, Infallible>>(64);
+    let observatory_id = services.observatory_id.clone();
+    let daemon_instance_id = services.daemon_instance_id.clone();
     tokio::spawn(async move {
         let mut last = after;
         'tail: loop {
@@ -606,19 +610,28 @@ pub(crate) async fn events(
                     // event it never saw. Without an id, a resume starts from
                     // the last real event and meets the gap again (or a
                     // `reset`, if retention caused it).
-                    let gap = axum::response::sse::Event::default().event("message").data(
-                        json!({
-                            "cursor": expected.as_string(),
-                            "kind": "stream.gap",
-                            "payload": {
-                                "from_cursor": last.as_string(),
-                                "to_cursor": envelope.cursor.as_string(),
-                                "reason": reason,
-                            }
-                        })
-                        .to_string(),
+                    //
+                    // The frame is a full `EventEnvelope` (§7.2: "SSE `data`
+                    // field: JSON EventEnvelope") of kind `StreamGap` (§2.1
+                    // Property 4), so a typed client decodes it and acts on
+                    // it deliberately instead of tripping over a decode error.
+                    let gap = gap_envelope(
+                        last,
+                        envelope.cursor,
+                        reason,
+                        &observatory_id,
+                        &daemon_instance_id,
                     );
-                    if tx.send(Ok(gap)).await.is_err() {
+                    let frame = match serde_json::to_string(&gap) {
+                        Ok(data) => axum::response::sse::Event::default()
+                            .event("message")
+                            .data(data),
+                        Err(error) => {
+                            tracing::error!(%error, "observatory gap serialization failed");
+                            break 'tail;
+                        }
+                    };
+                    if tx.send(Ok(frame)).await.is_err() {
                         break 'tail;
                     }
                 }
@@ -657,6 +670,62 @@ pub(crate) async fn events(
             .text("heartbeat"),
     );
     (StatusCode::OK, headers, sse).into_response()
+}
+
+/// The live tail's gap signal: a `StreamGap` [`EventEnvelope`] for the hole
+/// between `from` (the last cursor the client received) and `to` (the next
+/// surviving cursor).
+///
+/// It is synthesized, never appended to the durable log, so its truth is
+/// `derived` (manifest §1.2: "computed … not in durable log") and it carries
+/// no execution topology. For the same reason `recorded_at` is the time the
+/// tail built the frame, not the §1.2 durable-write time; the contract README
+/// tells consumers never to treat a gap envelope as a durable record. Its
+/// cursor is `from + 1`, the first missing cursor,
+/// as in the §7.2 example; the SSE frame carries no `id:` (Task 9 F5), so the
+/// cursor never becomes a client's `Last-Event-ID`.
+pub(crate) fn gap_envelope(
+    from: Cursor,
+    to: Cursor,
+    reason: &str,
+    observatory_id: &str,
+    daemon_instance_id: &str,
+) -> EventEnvelope {
+    let now = chrono::Utc::now().to_rfc3339();
+    EventEnvelope {
+        schema_version: ocean_observatory::SCHEMA_VERSION,
+        cursor: from.next(),
+        event_id: uuid::Uuid::new_v4().to_string(),
+        observatory_id: observatory_id.to_owned(),
+        daemon_instance_id: daemon_instance_id.to_owned(),
+        occurred_at: now.clone(),
+        recorded_at: now,
+        kind: EventKind::StreamGap,
+        truth: TruthProvenance::Derived,
+        producer: Producer {
+            kind: ProducerKind::Daemon,
+            id: "ocean-daemon".to_owned(),
+        },
+        topology: Topology {
+            execution_id: String::new(),
+            root_execution_id: String::new(),
+            parent_execution_id: None,
+            edge_id: None,
+            session_id: String::new(),
+            turn_id: String::new(),
+            request_id: String::new(),
+        },
+        correlation: Correlation {
+            tool_call_id: None,
+            permission_id: None,
+        },
+        visibility: Visibility::Metadata,
+        payload: EventPayload::StreamGap {
+            from_cursor: from,
+            to_cursor: to,
+            reason: reason.to_owned(),
+        },
+    }
 }
 
 /// A stream that emits exactly one terminal frame (`reset` or `error`) and
@@ -1642,9 +1711,10 @@ mod tests {
         }
     }
 
-    /// F5: the `stream.gap` frame has no SSE `id:`, so it never duplicates
-    /// the post-gap event's id or moves a client's Last-Event-ID past an
-    /// event it has not received.
+    /// F5: the gap frame has no SSE `id:`, so it never duplicates the
+    /// post-gap event's id or moves a client's Last-Event-ID past an event it
+    /// has not received. Manifest §2.1/§7.2: it is a typed `StreamGap`
+    /// `EventEnvelope` on the ordinary `message` frame, naming the hole.
     #[tokio::test]
     async fn stream_gap_frame_carries_no_event_id() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -1682,11 +1752,106 @@ mod tests {
             .collect();
         let gap = frames
             .iter()
-            .find(|f| f.contains("stream.gap"))
+            .find(|f| f.contains("StreamGap"))
             .unwrap_or_else(|| panic!("no gap frame: {text}"));
         assert!(!gap.lines().any(|line| line.starts_with("id:")), "{gap}");
-        assert!(gap.contains("\"to_cursor\":\"3\""), "{gap}");
+        assert!(gap.lines().any(|line| line == "event: message"), "{gap}");
+        let data = gap
+            .lines()
+            .find_map(|line| line.strip_prefix("data: "))
+            .unwrap_or_else(|| panic!("gap frame has data: {gap}"));
+        let decoded: EventEnvelope = serde_json::from_str(data)
+            .unwrap_or_else(|e| panic!("gap is an envelope ({e}): {gap}"));
+        assert_eq!(decoded.kind, EventKind::StreamGap, "{gap}");
+        assert_eq!(decoded.cursor, Cursor::new(2), "first missing cursor");
+        assert_eq!(decoded.daemon_instance_id, DAEMON_ID);
+        assert_eq!(decoded.observatory_id, OBS_ID);
+        assert_eq!(decoded.truth, TruthProvenance::Derived);
+        match decoded.payload {
+            EventPayload::StreamGap {
+                from_cursor,
+                to_cursor,
+                reason,
+            } => {
+                assert_eq!(from_cursor, Cursor::new(1));
+                assert_eq!(to_cursor, Cursor::new(3));
+                assert_eq!(reason, "cursor_jump");
+            }
+            other => panic!("gap payload is StreamGap, got {other:?}"),
+        }
         assert_eq!(text.matches("id: 3").count(), 1, "{text}");
+    }
+
+    /// A hole the tail meets because retention pruned past the client's
+    /// position is named `retention_boundary`, not `cursor_jump`. Retention
+    /// has to prune while the tail is attached (at attach time the same state
+    /// is a `reset`), so the prune and the arrival of the next event land in
+    /// one raw transaction the tail sees atomically.
+    #[tokio::test]
+    async fn live_tail_names_a_retention_pruned_gap() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("obs.db");
+        let store =
+            Arc::new(ObservatoryStore::open(&path, RetentionPolicy::default()).expect("open"));
+        for id in ["e-1", "e-2", "e-3", "e-4", "e-5", "e-6"] {
+            store
+                .append_event(envelope(id, EventKind::ExecutionPhaseChanged))
+                .expect("append");
+        }
+        // Hold back 4..=6 so a tail attached at 3 has nothing to read yet.
+        let raw = rusqlite::Connection::open(&path).expect("open raw");
+        raw.execute_batch(
+            "CREATE TABLE held AS SELECT * FROM observatory_events WHERE cursor >= 4;
+             DELETE FROM observatory_events WHERE cursor >= 4;",
+        )
+        .expect("hold back");
+        let response = app(store)
+            .oneshot(authed("/v1/observatory/events?after=3"))
+            .await
+            .expect("response");
+        // Attached with 1..=3 retained. Now, atomically: cursor 6 arrives and
+        // retention prunes everything through 5, including 4 and 5 the client
+        // never received.
+        raw.execute_batch(
+            "BEGIN IMMEDIATE;
+             INSERT INTO observatory_events SELECT * FROM held WHERE cursor = 6;
+             DELETE FROM observatory_events WHERE cursor <= 5;
+             COMMIT;",
+        )
+        .expect("prune");
+        use futures::StreamExt;
+        let mut body = http_body_util::BodyExt::into_data_stream(response.into_body());
+        let mut text = String::new();
+        while !text.contains("id: 6") {
+            let chunk = tokio::time::timeout(Duration::from_secs(5), body.next())
+                .await
+                .expect("frame within 5s")
+                .expect("stream open")
+                .expect("chunk");
+            text.push_str(&String::from_utf8_lossy(&chunk));
+        }
+        let gap = text
+            .split("\n\n")
+            .find(|f| f.contains("StreamGap"))
+            .unwrap_or_else(|| panic!("no gap frame: {text}"));
+        let data = gap
+            .lines()
+            .find_map(|line| line.strip_prefix("data: "))
+            .unwrap_or_else(|| panic!("gap frame has data: {gap}"));
+        let decoded: EventEnvelope = serde_json::from_str(data).expect("gap is an envelope");
+        assert_eq!(decoded.cursor, Cursor::new(4), "first missing cursor");
+        match decoded.payload {
+            EventPayload::StreamGap {
+                from_cursor,
+                to_cursor,
+                reason,
+            } => {
+                assert_eq!(from_cursor, Cursor::new(3));
+                assert_eq!(to_cursor, Cursor::new(6));
+                assert_eq!(reason, "retention_boundary");
+            }
+            other => panic!("gap payload is StreamGap, got {other:?}"),
+        }
     }
 
     /// F6: the filter value is percent-encoded into continuation_url, so a

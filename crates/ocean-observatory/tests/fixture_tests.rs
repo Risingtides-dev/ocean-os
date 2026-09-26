@@ -252,19 +252,36 @@ mod fixtures {
         );
     }
 
+    /// The gap entry is the envelope the daemon's live tail sends
+    /// (`gap_envelope` in ocean-daemon): a typed `StreamGap` envelope whose
+    /// cursor is the first missing cursor (from_cursor + 1, so a client never
+    /// drops it as a duplicate of the last event), with `truth: derived` and
+    /// no execution topology.
     #[test]
     fn test_gap_has_gap_event() {
         let fixture = load_fixture("gap_and_resume.json");
-        let kinds: Vec<&str> = fixture
+        let gap = fixture
             .events
             .iter()
-            .map(|e| e["kind"].as_str().unwrap())
-            .collect();
-
-        assert!(kinds.contains(&"stream.gap"), "missing stream.gap");
-        let gap_idx = kinds.iter().position(|&k| k == "stream.gap").unwrap();
-        let gap_cursor = fixture.events[gap_idx]["cursor"].as_str().unwrap();
-        assert_eq!(gap_cursor, "5", "gap should be at cursor 5");
+            .find(|e| e["kind"] == "stream_gap")
+            .expect("missing stream_gap");
+        let envelope: ocean_observatory::EventEnvelope =
+            serde_json::from_value(gap.clone()).expect("the gap is a typed EventEnvelope");
+        assert_eq!(envelope.kind, ocean_observatory::EventKind::StreamGap);
+        assert_eq!(envelope.truth, ocean_observatory::TruthProvenance::Derived);
+        assert!(envelope.topology.execution_id.is_empty());
+        assert!(envelope.topology.root_execution_id.is_empty());
+        let ocean_observatory::EventPayload::StreamGap {
+            from_cursor,
+            to_cursor,
+            ..
+        } = envelope.payload
+        else {
+            panic!("gap payload is StreamGap");
+        };
+        assert_eq!(envelope.cursor, from_cursor.next(), "cursor = from + 1");
+        assert_eq!(envelope.cursor, ocean_observatory::Cursor::new(5));
+        assert_eq!(to_cursor, ocean_observatory::Cursor::new(10));
     }
 
     // -----------------------------------------------------------------------
