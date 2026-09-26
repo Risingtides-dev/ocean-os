@@ -1525,8 +1525,8 @@ helpers, and a `doctor` route on the test-only router. Realization choices:
   - Backpressure is real. A synchronous 600-fact flood overflows the 256-frame
     queue and the pipe of a service that never reads, which pins when the pipe
     fills. The gate proves `lag`, and that the blocked write fails within a
-    bounded deadline of [2 s, 8 s] after the fill (a hosted macOS runner
-    observed 4.26 s, so the live upper bound is a liveness bound). Meanwhile 160 concurrent turns stay bounded. The exact 2 s value
+    bounded deadline of [2 s, 30 s] after the fill (hosted macOS runners
+    observed 4.26 s and 8.98 s, so the live upper bound is a liveness bound). Meanwhile 160 concurrent turns stay bounded. The exact 2 s value
     is unit-proven by `blocked_stdin_fails_at_the_two_second_connection_deadline`,
     because a per-frame deadline can restart when macOS grows a blocked pipe's
     buffer.

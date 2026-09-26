@@ -1009,10 +1009,10 @@ async fn stage_a_gate_local_noop_package_end_to_end() {
 /// published in a few milliseconds, so the first blocked write starts inside
 /// `[flood_started, flood_ended]`. The connection must then fail (`stopping`,
 /// `protocol_violation`, timed by the status row's `observed_at`) no earlier
-/// than 2 s after `flood_started` and no later than 8 s after `flood_ended`.
+/// than 2 s after `flood_started` and no later than 30 s after `flood_ended`.
 /// Both bounds are liveness bounds, not the exact deadline: the lower bound is
 /// only probabilistic against a shorter deadline, and the upper bound tolerates
-/// clock restarts (a hosted macOS runner observed 4.26 s). The deadline is per frame, and the kernel can accept more bytes into a
+/// clock restarts (hosted macOS runners observed 4.26 s and 8.98 s). The deadline is per frame, and the kernel can accept more bytes into a
 /// blocked pipe (macOS grows pipe buffers), which completes the frame and
 /// restarts the clock. So a 1 s deadline sometimes lands at about 2 s. The
 /// exact 2 s value is unit-proven by
@@ -1026,8 +1026,9 @@ async fn stage_a_gate_stalled_service_never_delays_ordinary_turns() {
     const BURST: usize = 160;
     // A per-frame deadline restarts whenever the kernel accepts more bytes
     // into the blocked pipe, so the live upper bound is a liveness bound, not
-    // the exact deadline (CI once observed 4.26 s after the fill).
-    const SLACK: Duration = Duration::from_secs(6);
+    // the exact deadline (hosted macOS CI observed 4.26 s and 8.98 s after the
+    // fill).
+    const SLACK: Duration = Duration::from_secs(28);
     let _guard = AUTO_CONVENE_ENV_LOCK.lock().await;
     let _restore = TestEnvRestore::capture(&["OCEAN_CONFIG_DIR", "OCEAN_MODEL", "OCEAN_YOLO"]);
     let fixture = Fixture::new();
@@ -1131,7 +1132,7 @@ async fn stage_a_gate_stalled_service_never_delays_ordinary_turns() {
             "the stopping state was missed: {body}"
         );
         assert!(
-            flood_ended.elapsed() < Duration::from_secs(10),
+            flood_ended.elapsed() < Duration::from_secs(2) + SLACK + Duration::from_secs(5),
             "the blocked write never failed: {body}"
         );
         tokio::time::sleep(Duration::from_millis(2)).await;
