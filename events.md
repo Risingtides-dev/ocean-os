@@ -11255,3 +11255,12 @@ area:      [testing]
 
 Stage A gate tests no longer orphan their fixture services when they fail mid-way. A control run with a panic injected right after the service started (the end-to-end test and the stalled-service test) left the gate's `sleep 600` grandchild and the stalled `exec sleep 600` leader running after the test binary exited; that is what the M41/M42 review saw. The mutation `Fixture` in `extension_registry/mutation/tests.rs`, which every gate test already uses, now has a Drop that calls one helper, `reap_fixture_groups`: it lists processes, keeps those whose cwd is inside the fixture's tempdirs and whose process group is not the test binary's, and SIGKILLs each one only if `getpgid` still names that group right before the signal, the O-6 rule generalised, so a recycled pid is never touched. Same injected panics with the helper on: nothing survives (`pgrep -f "sleep 600"` empty). About 1 ms per fixture drop over ~880 pids; the gate ran 3x green at ~40 s as before. Tests only, no production code. Daemon AGENTS notes the helper.
 _________________________________________________________________________________ 08:51 test/gate-fixture-reaping
+
+time:      [09:15] [26-09-26]
+agent:     [claude]
+worktree:  test/gate-fixture-reaping
+type:      [gh-actions]
+area:      [testing]
+
+Ubuntu CI on this PR failed stage_a_gate_crash_resume_backoff_circuit_and_explicit_retry. The failure was unrelated to the fixture reaping. It measured a 1629 ms gap for the 1 s backoff step against the +500 ms upper slack that the A5 delta review had tightened, and that review had flagged it as load-sensitive. The upper slack is now +900 ms, still under 1000 ms, so a 1 s to 2 s step change still fails. Re-running mutation M11b (BACKOFF[2] set to 2 s) failed the test at 2068 ms, and the clean test passed twice. The evidence doc's step-8 row and its M11b row now say +900 ms and why.
+_________________________________________________________________________________ 09:15 test/gate-fixture-reaping
