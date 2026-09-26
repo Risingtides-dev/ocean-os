@@ -17,6 +17,12 @@ This crate owns the Ocean agent loop and permission-gated tool execution runtime
   and the loop's own clean-round replay — emit `AgentEvent::ProviderRetrying`
   with a `RetryScope`. Silent retrying is what makes a degraded network
   indistinguishable from a hung agent; do not add a third quiet wait.
+- `AgentEvent::is_wire_relayed` is the single source of truth for which runtime
+  variants reach the client wire. It is an exhaustive match: a new variant must
+  be classified there, and `ocean-agent` forwards to its event sink exactly the
+  relayed ones. The daemon's `turn_bridge_relays_exactly_the_wire_relayed_variants`
+  holds the turn bridge's own exhaustive match equal to it, so changing a
+  classification means changing the bridge arm too.
 - Permission gates are mandatory; do not add execution paths that bypass them.
   `PermissionPolicy::should_check` owns the approval-mode boundary: manual may
   broaden checks to all known tools, automatic follows each tool's conservative

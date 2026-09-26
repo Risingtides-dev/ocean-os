@@ -43,6 +43,7 @@ This crate owns Ocean's agent session/history layer and project prompt loading. 
   main checkout; path aliases such as macOS `/var` and `/private/var` are the same
   authority boundary, not project-less sessions.
 - Turn persistence is incremental: save the accepted user message before provider execution, then save only at provider-valid round boundaries where every assistant tool call has its ordered tool result. Never persist an orphan tool-call batch.
+- `run_prompt`'s H1 forwarder moves (never clones) onto `PromptControl::event_sink` exactly the events for which `AgentEvent::is_wire_relayed()` (in `ocean-runtime`) is true. It keeps no classification of its own. `AgentStart/End`, `TurnStart/End`, `TurnCheckpoint`, `AssistantMessage`, and `UserMessage` never reach the sink, and each `TurnCheckpoint` is saved to disk as it arrives, not only at turn end. The daemon is the only production sink owner.
 - Spawned agent loops must remain owned by the parent turn future. Dropping the parent must abort the child; Tokio's default detached-on-`JoinHandle`-drop behavior is unsafe for side-effecting tools.
 - Pre-stream provider failover must pin one session id and hold one per-session turn lock across the complete primary/fallback transaction, reusing the primary attempt's durable accepted-user row; never allow an intervening turn, append the operator prompt twice, or orphan an acceptance-only session.
 - Track-0 room prompt guidance is retired; prompt assembly must not infer a closed room role from agent-turn input.
@@ -122,6 +123,9 @@ This crate owns Ocean's agent session/history layer and project prompt loading. 
 - `cargo test -p ocean-agent system_prompt`
 - `cargo test -p ocean-agent session`
 - `cargo test -p ocean-agent session_retained_size_measurements -- --nocapture --test-threads=1` — measurement-only persisted-transcript size table (mirrors the runtime's private 32 KiB tool-result cap; see `docs/specs/2026-09-25-retained-size-and-slow-client-measurements.md`).
+- `cargo test --release -p ocean-agent checkpoint_save_stall -- --ignored --nocapture --test-threads=1` — `#[ignore]`d timing-only measurement of the H1 checkpoint stall (`cap_session_history` + `session::save` + fsync) at 539,534 B and 1,029,539 B; figures in `docs/specs/2026-09-26-bounded-turn-event-channel-proposal.md` §2.
+- `cargo test -p ocean-agent event_sink_carries_only_bridge_relayed_events` — the H1 forwarder puts only bridge-relayed kinds on the event sink, in golden order, with unchanged `stdout`/`stderr`/transcript.
+- `cargo test -p ocean-agent turn_checkpoint_is_persisted_mid_turn` — a cancelled turn (no turn-end save) still has its round-1 checkpoint on disk.
 - `cargo test -p ocean-agent project_prompt_loads_ocean_agents_md_from_ancestor`
 - `cargo test -p ocean-agent`
 - `cargo check --workspace`

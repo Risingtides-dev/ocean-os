@@ -1,7 +1,7 @@
 # Bounded Per-Turn Event Channel — Proposal
 
 **Date:** 2026-09-26
-**Status:** PROPOSED. Needs an operator yes/no. No code has changed.
+**Status:** PROPOSED. Needs an operator yes/no on slices 3–6. Slices 1–2 do not depend on the open questions and are **landed, pending review** on `perf/turn-channel-slices-1-2` (see §8). No bound, backpressure, coalescing, channel type, or metric exists yet.
 **Baseline:** `origin/main` at `bd2f9abb`.
 **ROADMAP item:** "Reliability and scale" → *Design a bounded policy for the runtime-to-daemon per-turn event channel*.
 **Evidence:** [`2026-09-25-retained-size-and-slow-client-measurements.md`](2026-09-25-retained-size-and-slow-client-measurements.md) (cited below as **M**), plus the measurements in §2.
@@ -41,7 +41,7 @@ Neither hop has a bound. A backlog is held in full and drained later. Nothing is
 
 | Stall source | Hop | Measured | Method |
 |---|---|---|---|
-| Checkpoint `cap_session_history(clone)` + `session::save` + fsync at steady state (200 messages, 32 KiB tool results) | H1 | **file 539 KB: p50 9.1 ms, p90 10.0 ms, max 22.3 ms. File 1.03 MB: p50 11.0 ms, p90 12.8 ms, max 13.1 ms** (30 saves each) | Scratch `#[ignore]` test on top of `session_retained_size_measurements.rs` (same `TurnShape`, `compact_history`, `cap_session_history`, `session::save`), release build, APFS, Mac16,10. Not committed. §6 slice 1 lands it as a permanent measurement. |
+| Checkpoint `cap_session_history(clone)` + `session::save` + fsync at steady state (200 messages, 32 KiB tool results) | H1 | **file 539 KB: p50 9.1 ms, p90 10.0 ms, max 22.3 ms. File 1.03 MB: p50 11.0 ms, p90 12.8 ms, max 13.1 ms** (30 saves each) | `#[ignore]` test `checkpoint_save_stall_at_steady_state` in `crates/ocean-agent/src/session_retained_size_measurements.rs` (same `TurnShape`, `compact_history`, `cap_session_history`, `session::save`), release build, APFS, Mac16,10. Originally a scratch test; landed permanently by slice 1 (§8), which re-ran it. |
 | `AgentEventBus::emit`, slowest single call under load | H2 | 118 µs – 1.3 ms, debug build | M §5 |
 | History lock held by a full-ring `?replay=1&session_id=` connect (the only connect that still clones the ring after #496) | H2 | 0.9–1.2 ms for a 31 MiB ring. Re-run today: a plain connect holds the lock **320 ns** (full ring) / 233 ns (empty). | M §4, debug build. The full-clone figure was taken when a plain connect still cloned the ring, which is the same operation `?replay=1` still performs. Re-ran `connect_materializes_the_whole_replay_ring` at `bd2f9abb` for the plain-connect figure. |
 | A tokio worker blocked by a sync call elsewhere, or a panicked bridge | H2 | unbounded | not measurable; a failure mode, not a rate |
@@ -156,9 +156,9 @@ Permission decisions do not travel through either hop.
 
 Each slice is one PR with its own tests. Every slice runs `cargo xtask ci`.
 
-1. **Measure first: the channel harness.** Land the H1 save-stall measurement from §2 as an `#[ignore]` test. Add a runtime-level harness that runs the fake provider (`FAKE_TOOL_MODEL`) against a consumer stalled for a controlled time and records the peak queued bytes and items per hop.
+1. **Measure first: the channel harness.** *Save-stall half LANDED, pending review (§8). The stalled-consumer peak-bytes harness is not built yet.* Land the H1 save-stall measurement from §2 as an `#[ignore]` test. Add a runtime-level harness that runs the fake provider (`FAKE_TOOL_MODEL`) against a consumer stalled for a controlled time and records the peak queued bytes and items per hop.
    - *Accept:* the numbers land in the measurements doc's "Not measured" section, and that row closes.
-2. **Stop forwarding discarded variants, and move instead of clone** (`ocean-agent/src/lib.rs:2474`).
+2. **Stop forwarding discarded variants, and move instead of clone** (`ocean-agent/src/lib.rs:2474`). *LANDED, pending review (§8).*
    - *Tests:* a daemon test in which a turn's `AgentEnd`/`TurnCheckpoint` never reaches the bridge, and SSE output is byte-identical for a fake-tool turn.
    - *Accept:* peak H2 bytes on a 1M-window turn drop by the size of the history, measured by the slice 1 harness.
 3. **Add `TurnEventChannel` as a standalone type in `ocean-runtime`.** No callers yet. Tests:
@@ -188,3 +188,101 @@ Each slice is one PR with its own tests. Every slice runs `cargo xtask ci`.
 2. **Voice raw output.** Voice turns are the only live path that carries up to 2 MiB per tool. Should voice get spill on for the *live event only* (the transcript is unchanged)? That is part of the artifact-backed large-results ROADMAP item. It would drop the worst-case event from 2 MiB to ~16 KB, and the 8 MiB budget could then shrink to 1 MiB. Out of scope here unless you say otherwise.
 3. **Surface delta handling.** OK to require a one-line confirmation in `ocean-surface` that deltas are concatenated and not counted, before slice 5 lands?
 4. **Live image cap.** Images have no live size cap in any profile. Should the live event take the transcript's 256 KiB image cap (a behavior change, separate slice), or should oversize images keep relying on the empty-queue admit rule?
+
+## 8. Slices 1–2 implementation record (2026-09-26)
+
+Branch `perf/turn-channel-slices-1-2`, from `origin/main` at `c8fad6ce`. Both slices are **landed, pending review**. Neither adds a bound, backpressure, coalescing, a channel type, or a metric; those are slices 3–6 and still wait for the operator's answers in §7.
+
+### Slice 1: the H1 save-stall measurement
+
+**Method.** `checkpoint_save_stall_at_steady_state` is `#[ignore]`d, following the measurements doc's convention for heavier or timing-only sweeps. It never runs in the normal suite and prints its table only when asked:
+
+```text
+cargo test --release -p ocean-agent checkpoint_save_stall -- --ignored --nocapture --test-threads=1
+```
+
+1. Build a steady-state transcript with the existing `simulate` (4 tool rounds per turn, 32 KiB tool results through the runtime's cap, `compact_history` at every turn start, the 200-message cap), then apply `compact_history` once more, as `run_prompt` does at turn start.
+2. The file saw-tooths with the turn count (measurements doc §6), so a size is a (context window, turns) pair. The two points reproduce the sizes in §2 exactly: **539,534 B** (300k window, 21 turns) and **1,029,539 B** (600k window, 23 turns). Both are at the cap (199 messages after the orphan-result trim). The test asserts each size to ±1 %.
+3. Each of 30 samples starts from that transcript plus one new round (assistant tool call + result). It times exactly what the `TurnCheckpoint` arm does inline: `extend`, `cap_session_history(clone)`, `replace_messages`, and `session::save` (pretty JSON, write, `sync_all`, durable rename). The file is written once beforehand, so no sample is a create.
+
+**Result** (release, APFS, Mac16,10, three consecutive runs):
+
+| File | p50 | p90 | max |
+|---|---|---|---|
+| 539,534 B | 9.0–9.8 ms | 9.9–11.9 ms | 11.0–13.9 ms |
+| 1,029,539 B | 10.0–12.8 ms | 10.8–14.4 ms | 11.7–18.9 ms |
+
+These agree with the scratch figures in §2. The H1 consumer stalls for about 10 ms per checkpoint at both sizes, so the save is dominated by the fsync, not by the bytes.
+
+**Not done in this slice.** §6 slice 1 also asks for a runtime-level harness that runs `FAKE_TOOL_MODEL` against a consumer stalled for a controlled time and records peak queued bytes and items per hop. It is not built, so the "Runtime → daemon per-turn queue" row in the measurements doc stays "Not measured". Slice 2's acceptance line ("peak H2 bytes drop by the size of the history") depends on that harness and is therefore not yet measured either. Slice 2's effect is proven structurally instead: the history-sized events no longer enter H2 at all.
+
+### Slice 2: stop forwarding what the bridge discards
+
+**Change.**
+
+- **One source of truth.** `AgentEvent::is_wire_relayed()` (`crates/ocean-runtime/src/types.rs`) is an exhaustive match with no wildcard. It classifies the seven OCEAN-373 variants as not relayed and everything else as relayed. It replaces the hand-kept copies that used to exist: the daemon's test-only `classify_agent_event`/`RelayClass`, and the filter lists in `ocean-agent` and its test.
+- **The H1 forwarder** in `run_prompt` (`crates/ocean-agent/src/lib.rs`):
+  - updates `stdout`, `stderr`, and `streamed_output` by reference;
+  - **moves** every event where `ev.is_wire_relayed()` is true into the event sink (H2). The old `sink.send(ev.clone())` is gone;
+  - for the rest, persists `TurnCheckpoint` locally (a move of its delta, as before) and drops everything else.
+
+  It has no catch-all of its own. A new runtime variant forces a decision in `is_wire_relayed` in `ocean-runtime` and in the bridge's exhaustive match in `ocean-daemon`.
+- **The bridge.** Its body moved verbatim out of `agent_turn` into `run_turn_bridge` (`crates/ocean-daemon/src/main.rs`) so a test can drive it. Its named no-relay arm is now unreachable and is kept for exhaustiveness.
+- The direct `ModelRerouted` and fake-provider `TextDelta` sends are unchanged.
+
+**Consumer audit.** Every holder of H2, and every other reader of runtime `AgentEvent`s, at `c8fad6ce`:
+
+| Consumer | Reads H2? | What it reads | Relies on a dropped variant? |
+|---|---|---|---|
+| Daemon turn bridge (`run_turn_bridge`, fed by `with_event_sink(event_tx)`) | yes, the only production sink | `TextDelta`, `ThinkingDelta`, `ModelRerouted`, `ProviderRetrying`, `ToolExecutionStart/End` (also sent to the lifecycle dispatcher), `PermissionDenied`, `Render`, `Unmount`, `BrowserActivity`, `SurfacePatch`, `SlackCanvas`, plus a debug-only `session_id` assert on every event | no. All seven are in its `=> {}` arm, and a parity test proves it. |
+| `ocean-agent` unit test `fake_provider_streams_assistant_text_delta_on_event_sink` | yes (test) | `TextDelta` from the `fake-ok` path, which does not use H1 | no |
+| `ocean-cli` | no | depends on `ocean-agent` only for `agentdir` and `config_dir_from_env`. Its output comes from the daemon or `stdout`. | no |
+| `ocean-tui`, `ocean-acp`, `ocean-surface`, MCP, Observatory, extension services | no | wire `AgentTurnEvent`s over SSE or the bus, produced by the bridge. None depends on `ocean-agent`, and none sets an event sink. | no. Their input is pinned by the golden tests below. |
+| `ocean-runtime` tests, daemon `run_agent_with_history` tests | no | their own runtime channels (H1-shaped), not `ocean-agent`'s sink | no |
+| Transcript and checkpoints | no | `ocean-agent` persists each `TurnCheckpoint` as it arrives and the final `run.messages` at turn end, as before | no |
+
+**Tests.**
+
+- **`ocean-runtime` `wire_relay_classification_pins_the_ocean_373_filter`:** the seven variants are not relayed, and representative content variants are.
+- **`ocean-daemon` `turn_bridge_relays_exactly_the_wire_relayed_variants`:** sends one sample of each of the 19 variants through the real `run_turn_bridge`. It asserts the bridge put something on the agent bus exactly when `is_wire_relayed()` is true. It also asserts one sample per variant.
+- **`ocean-daemon` `scripted_turn_bridge_visible_event_stream_matches_golden`:** runs a YOLO `fake-tool` turn through `agent_turn`, the real runtime, H1, and the bridge. It asserts:
+  - the sequence is exactly `session_created, turn_started, tool_call_started, tool_call_finished, assistant_text_delta, turn_finished`;
+  - the finished `call_id` equals the started `call.id`;
+  - `result.ok` is true, the delta is `done`, and the status is `completed`.
+
+  It passes before and after slice 2.
+- **`ocean-daemon` `scripted_denied_turn_bridge_visible_event_stream_matches_golden`:** the gated `write` is denied through the real waiter. It asserts:
+  - the same six-event sequence, with a paired `call_id` and `result.ok: false`;
+  - the scripted reply `done`, and status `completed`;
+  - the lifecycle facts are exactly `session_started, turn_started, permission_requested, permission_resolved, turn_finished`.
+- **`ocean-daemon` `scripted_cancelled_turn_bridge_visible_event_stream_matches_golden`:** the turn is cancelled through `cancel_request` while it waits on its permission. It asserts:
+  - the events `session_created, turn_started, tool_call_started, tool_call_finished` (`ok: false`, "request cancelled while waiting for permission"), then `turn_finished` with status `cancelled`;
+  - the same five lifecycle facts, with nothing left open.
+- **Not done: a failing scripted-provider turn.** No keyless fake model fails, and pointing `OCEAN_MODEL` at a real provider could make a live call with this machine's credentials. The cancelled turn covers the non-`completed` terminal and the no-leaked-lifecycle-frames check.
+- **`ocean-agent` `event_sink_carries_only_bridge_relayed_events_for_a_scripted_turn`:** the same scripted turn at the `ocean-agent` layer. It checks:
+  - `stdout` (`"\ndone\n"`), `stderr`, and the final transcript (4 messages) are unchanged;
+  - the relayed subsequence is `ToolExecutionStart, ToolExecutionEnd, TextDelta`;
+  - the sink holds nothing else.
+- **`ocean-agent` `turn_checkpoint_is_persisted_mid_turn_without_a_final_save`:** pins the mid-turn checkpoint save. A permission policy cancels the turn from inside its check, before the `write` runs. The runtime closes the call with a cancelled result, emits the round's `TurnCheckpoint`, and fails. A failed turn does no turn-end save, so only the checkpoint arm can put the round on disk. The stored transcript must be `user, assistant, toolResult`. The test is deterministic and needs no timing.
+- **Env handling.** Both `ocean-agent` scripted tests hold `FAKE_TOOL_TARGET_LOCK` and set `OCEAN_FAKE_TOOL_TARGET_PATH` through a restore-on-drop guard. The daemon tests use the existing `AUTO_CONVENE_ENV_LOCK` and `TestEnvRestore`.
+
+**Mutation checks.** Sources were restored and `touch`ed after each mutation, and every test is green after restore. The first round ran against the first revision of this slice:
+
+| Mutation | `ocean-agent` sink test | daemon golden test |
+|---|---|---|
+| M1: restore the pre-slice-2 loop (clone and forward everything) | **fails** (`AgentStart reached the event sink`), after its `stdout`/`stderr`/transcript and relayed-golden asserts pass | passes. The bridge-visible stream is identical before and after. |
+| M2: also stop forwarding `TextDelta` | **fails** | **fails** (`assistant_text_delta` missing) |
+| M3: forward `AgentEnd` again | **fails** | passes (the bridge discards it) |
+| M4: forward a cloned `TurnCheckpoint` again | **fails** | passes (the bridge discards it) |
+
+The second round ran against the review revision. The runtime column is the unit test, the agent columns are the sink test and the checkpoint test, the parity column is the bridge-parity test, and the goldens are allowed / denied / cancelled:
+
+| Mutation | runtime | agent sink | agent checkpoint | bridge parity | goldens (allowed / denied / cancelled) |
+|---|---|---|---|---|---|
+| K1: delete the checkpoint arm's `replace_messages` + `save` | pass | pass | **fails** | pass | pass / pass / pass |
+| K2: forward every event (cloned) regardless of class | pass | **fails** | **fails** | pass | pass / pass / pass |
+| K3: classify `AgentEnd` as relayed | **fails** | **fails** | pass | **fails** (disagree on `AgentEnd`) | pass / pass / pass |
+| K4: the bridge drops non-empty `TextDelta` | pass | pass | pass | **fails** | **fails** / **fails** / pass |
+| K5: classify `TextDelta` as not relayed | **fails** | **fails** | pass | **fails** | **fails** / **fails** / pass |
+
+The cancelled golden has no text delta, so K4 and K5 do not reach it.
