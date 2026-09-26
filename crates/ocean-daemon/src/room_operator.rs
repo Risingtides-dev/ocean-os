@@ -238,7 +238,7 @@ impl OperatorIdentity {
 
 /// Scheme + authority of a URL-ish header value, lowercased. A `Referer`
 /// carries a full path; only its origin is meaningful here.
-fn origin_of(raw: &str) -> String {
+pub(crate) fn origin_of(raw: &str) -> String {
     let raw = raw.trim();
     let Some((scheme, rest)) = raw.split_once("://") else {
         return raw.to_ascii_lowercase();

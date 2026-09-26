@@ -128,6 +128,15 @@ It now only accepts:
 
 The surface proxy and other native HTTP callers do not send a browser `Origin`. Direct browser, extension, and Tauri webview requests are origin-checked against the policy above.
 
+#### Cross-site write guard
+
+CORS alone cannot stop a browser "simple" request (no custom header; no body, `text/plain`, form, or multipart), because the browser sends it without a preflight and the handler runs before CORS has a say. So every daemon request whose method is not `GET`, `HEAD`, or `OPTIONS` also passes a guard that answers a fixed 403 with the operator lane's codes:
+
+- a `Cookie` header → `{"ok":false,"code":"ambient_credential_rejected",…}`;
+- an `Origin` or `Referer` that is present and not in the trusted set above (the same set, including `OCEAN_ALLOWED_ORIGINS`; the opaque `null` origin is refused) → `{"ok":false,"code":"foreign_origin_rejected",…}`.
+
+A request with neither `Origin` nor `Referer` passes, so `ocean`, `ocean-mcp`, the TUI, `curl`, and the surface proxy (which rebuilds each upstream request and never forwards browser `Origin`, `Referer`, or `Cookie`) are unaffected. Reads are not guarded. If a phone or tunnel page talks to the daemon directly rather than through the proxy, its origin must be in `OCEAN_ALLOWED_ORIGINS` for writes as well as for CORS.
+
 ### Daemon URL for clients
 
 Clients default to `http://127.0.0.1:4780`.

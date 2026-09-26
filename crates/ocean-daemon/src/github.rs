@@ -1959,7 +1959,7 @@ mod tests {
     }
 
     fn github_router(state: AppState, service: GitHubService) -> Router {
-        crate::app_router(crate::cors_layer(Vec::new()))
+        crate::app_router(crate::cors::BrowserOrigins::default())
             .with_state(state)
             .layer(Extension(service))
     }

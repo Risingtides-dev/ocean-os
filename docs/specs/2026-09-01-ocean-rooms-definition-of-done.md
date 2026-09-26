@@ -161,6 +161,7 @@ ocean-os 616293e, ocean-surface d58a145.
 - 3.1 The daemon's room routes authenticate the caller; identity is not a
   caller-asserted author_id; invite mint and redeem require an operator; CORS
   does not trust every chrome-extension origin. [os, M to L, design ruling]
+  **Progress** (2026-09-26): no-preflight cross-site writes are closed daemon-wide. `cross_site_write.rs` refuses every non-GET/HEAD/OPTIONS request that carries `Cookie` or a present `Origin`/`Referer` outside the CORS trust set (403 `ambient_credential_rejected` / `foreign_origin_rejected`; absent `Origin` passes, matching the operator lane), so a visited web page can no longer close a room or upload an attachment under a roster member's `?actor_id=`. The member lane is still roster-asserted rather than authenticated, and the chrome-extension half is unchanged.
 - 3.2 Token ids are never projected (gate green; every new auth_tokens
   reference claimed the day it is written). [bedrock, green]
 - 3.3 Preview URL tokens are salted and rotatable, or a written ruling names who
