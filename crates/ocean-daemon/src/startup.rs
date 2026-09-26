@@ -45,6 +45,7 @@ pub fn validate_startup_config() -> anyhow::Result<()> {
     let mut errors: Vec<ConfigError> = Vec::new();
 
     validate_bind(&mut errors);
+    validate_allowed_hosts(&mut errors);
     validate_livekit_url(&mut errors);
     validate_caller_number(&mut errors);
     validate_u64_envs(&mut errors);
@@ -115,6 +116,24 @@ fn validate_bind(errors: &mut Vec<ConfigError>) {
                 var: "OCEAN_BIND",
                 value: bind,
                 reason: "not a valid host:port socket address".to_string(),
+            });
+        }
+    }
+}
+
+/// Every `OCEAN_ALLOWED_HOSTS` entry must parse. A malformed entry used to be
+/// dropped silently, after which every request by that name got a 421 with no
+/// hint why; failing boot names the entry instead.
+fn validate_allowed_hosts(errors: &mut Vec<ConfigError>) {
+    let Some(raw) = opt(crate::host_guard::ALLOWED_HOSTS_ENV) else {
+        return;
+    };
+    for (entry, parsed) in crate::host_guard::allowed_host_entries(&raw) {
+        if let Err(reason) = parsed {
+            errors.push(ConfigError {
+                var: crate::host_guard::ALLOWED_HOSTS_ENV,
+                value: entry,
+                reason,
             });
         }
     }
@@ -527,12 +546,35 @@ mod tests {
         "XAI_API_KEY",
         "ANTHROPIC_API_KEY",
         "OPENAI_API_KEY",
+        "OCEAN_ALLOWED_HOSTS",
     ];
 
     fn clear_all() {
         for v in ALL_VARS {
             env::remove_var(v);
         }
+    }
+
+    #[test]
+    fn allowed_hosts_accepts_urls_and_host_ports_but_fails_boot_on_garbage() {
+        let _g = ENV_LOCK.lock().unwrap();
+        clear_all();
+        env::set_var(
+            "OCEAN_ALLOWED_HOSTS",
+            "http://mini.ts.net:4780/, studio, [fd7a::1]:4780, 100.64.0.7",
+        );
+        assert!(validate_startup_config().is_ok());
+        env::set_var("OCEAN_ALLOWED_HOSTS", "studio, mini.ts.net:47x0");
+        let err = validate_startup_config().unwrap_err().to_string();
+        assert!(err.contains("OCEAN_ALLOWED_HOSTS"), "got: {err}");
+        assert!(
+            err.contains("mini.ts.net:47x0"),
+            "names the bad entry: {err}"
+        );
+        env::set_var("OCEAN_ALLOWED_HOSTS", "user@mini.ts.net");
+        let err = validate_startup_config().unwrap_err().to_string();
+        assert!(err.contains("userinfo"), "got: {err}");
+        clear_all();
     }
 
     #[test]

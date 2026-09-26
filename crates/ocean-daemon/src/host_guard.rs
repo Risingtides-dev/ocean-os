@@ -46,13 +46,62 @@ use crate::room_operator::origin_of;
 /// Stable wire code for a refused `Host`.
 pub(crate) const HOST_NOT_ALLOWED: &str = "host_not_allowed";
 
+/// Env var naming extra hosts the daemon answers to.
+pub(crate) const ALLOWED_HOSTS_ENV: &str = "OCEAN_ALLOWED_HOSTS";
+
+/// The longest refused host echoed back in a 421 body.
+const MAX_ECHOED_HOST: usize = 253;
+
 /// The set of hosts this daemon answers to. Built once at startup.
 #[derive(Clone, Debug)]
 pub(crate) struct AllowedHosts {
-    /// Lowercased DNS names (no port, no trailing dot).
-    names: Arc<[String]>,
-    /// The IP the daemon is bound to.
-    bind_ip: IpAddr,
+    /// Lowercased DNS names from `OCEAN_ALLOWED_HOSTS` (no port, no trailing dot).
+    explicit: Arc<[String]>,
+    /// Lowercased hosts derived from `OCEAN_ALLOWED_ORIGINS` entries.
+    origin_hosts: Arc<[String]>,
+    /// IP literals from `OCEAN_ALLOWED_HOSTS` (e.g. a tailnet IP that a
+    /// `tailscale serve` or socat front forwards to a loopback bind).
+    ips: Arc<[IpAddr]>,
+    /// The address the daemon is bound to.
+    bind: SocketAddr,
+}
+
+/// A parsed allowed-host entry: the lowercased host and whether it is an IP
+/// literal, or a message naming what is wrong with the entry.
+pub(crate) type ParsedHost = Result<(String, bool), String>;
+
+/// Parse one `OCEAN_ALLOWED_HOSTS` entry. Accepts a bare host, `host:port`,
+/// `[v6]:port`, or a URL (`http://mini.ts.net:4780/`): a scheme and anything
+/// from the first `/`, `?`, or `#` on are stripped first, because operators
+/// paste daemon URLs here. Returns the lowercased host and whether it is an IP
+/// literal, or a message naming what is wrong. Never silently drops an entry:
+/// startup validation fails the daemon on an `Err`.
+pub(crate) fn parse_allowed_host(raw: &str) -> ParsedHost {
+    let lowered = raw.trim().to_ascii_lowercase();
+    let without_scheme = lowered
+        .split_once("://")
+        .map_or(lowered.as_str(), |(_, rest)| rest);
+    let authority = without_scheme
+        .split(['/', '?', '#'])
+        .next()
+        .unwrap_or_default();
+    if authority.contains('@') {
+        return Err(format!(
+            "`{raw}` carries userinfo; give only a host, host:port, or URL"
+        ));
+    }
+    split_host(authority)
+        .ok_or_else(|| format!("`{raw}` is not a host, host:port, [ipv6]:port, or http(s) URL"))
+}
+
+/// Split a comma-separated `OCEAN_ALLOWED_HOSTS` value into its non-empty
+/// entries, each parsed by [`parse_allowed_host`].
+pub(crate) fn allowed_host_entries(raw: &str) -> Vec<(String, ParsedHost)> {
+    raw.split(',')
+        .map(str::trim)
+        .filter(|entry| !entry.is_empty())
+        .map(|entry| (entry.to_string(), parse_allowed_host(entry)))
+        .collect()
 }
 
 impl Default for AllowedHosts {
@@ -66,25 +115,64 @@ impl AllowedHosts {
     /// `origins` are the normalized `OCEAN_ALLOWED_ORIGINS` entries; their
     /// hosts are admitted so a tunnel origin's own requests are not refused.
     /// `extra_hosts` are `OCEAN_ALLOWED_HOSTS` entries (`host` or `host:port`).
+    /// Entries that fail [`parse_allowed_host`] are skipped here only because
+    /// `startup::validate_startup_config` has already refused to boot on them.
     pub(crate) fn new(bind: SocketAddr, origins: &[String], extra_hosts: Vec<String>) -> Self {
-        let mut names: Vec<String> = Vec::new();
+        let mut origin_hosts: Vec<String> = Vec::new();
         for origin in origins {
             let origin = origin_of(origin);
             let authority = origin.split_once("://").map_or(origin.as_str(), |(_, a)| a);
             if let Some((host, _)) = split_host(authority) {
-                names.push(host);
+                origin_hosts.push(host);
             }
         }
+        let mut explicit: Vec<String> = Vec::new();
+        let mut ips: Vec<IpAddr> = Vec::new();
         for raw in extra_hosts {
-            if let Some((host, _)) = split_host(&raw.trim().to_ascii_lowercase()) {
-                names.push(host);
+            match parse_allowed_host(&raw) {
+                Ok((host, true)) => {
+                    if let Ok(ip) = host.parse::<IpAddr>() {
+                        ips.push(ip);
+                    }
+                }
+                Ok((host, false)) => explicit.push(host),
+                Err(_) => {}
             }
         }
-        names.retain(|name| !name.is_empty());
         Self {
-            names: names.into(),
-            bind_ip: bind.ip(),
+            explicit: explicit.into(),
+            origin_hosts: origin_hosts.into(),
+            ips: ips.into(),
+            bind,
         }
+    }
+
+    /// Whether the daemon answers on every interface, so every IP literal is
+    /// its own.
+    pub(crate) fn any_ip(&self) -> bool {
+        self.bind.ip().is_unspecified()
+    }
+
+    /// The effective allowlist as one structured line, logged once at startup
+    /// so an operator can see why a host is or is not answered.
+    pub(crate) fn summary(&self) -> serde_json::Value {
+        json!({
+            "bind": self.bind.to_string(),
+            "loopback": ["localhost", "127.0.0.0/8", "::1"],
+            "allowed_hosts": self.explicit.iter().cloned()
+                .chain(self.ips.iter().map(ToString::to_string))
+                .collect::<Vec<_>>(),
+            "origin_hosts": self.origin_hosts.to_vec(),
+            "any_ip": self.any_ip(),
+        })
+    }
+
+    /// Log [`Self::summary`] once.
+    pub(crate) fn log_effective(&self) {
+        tracing::info!(
+            allowlist = %self.summary(),
+            "Host allowlist (DNS-rebinding guard); add names to OCEAN_ALLOWED_HOSTS"
+        );
     }
 
     /// Whether a `Host` header value (`host[:port]`) is one this daemon answers to.
@@ -96,9 +184,12 @@ impl AllowedHosts {
             let Ok(ip) = host.parse::<IpAddr>() else {
                 return false;
             };
-            return ip.is_loopback() || self.bind_ip.is_unspecified() || ip == self.bind_ip;
+            return ip.is_loopback()
+                || self.any_ip()
+                || ip == self.bind.ip()
+                || self.ips.contains(&ip);
         }
-        host == "localhost" || self.names.contains(&host)
+        host == "localhost" || self.explicit.contains(&host) || self.origin_hosts.contains(&host)
     }
 }
 
@@ -140,13 +231,22 @@ fn split_host(authority: &str) -> Option<(String, bool)> {
     Some((host.to_string(), is_ip))
 }
 
-fn refusal() -> Response {
+/// The fixed-shape 421 body: `ok`, `code`, the refused `host` (bounded;
+/// `null` when it was not readable text), an actionable `hint`, and `error`.
+fn refusal(host: Option<&str>) -> Response {
+    let host = host.map(|h| h.chars().take(MAX_ECHOED_HOST).collect::<String>());
+    let error = match &host {
+        Some(h) => format!("request Host `{h}` is not an address this daemon answers to"),
+        None => "request Host is not readable text".to_string(),
+    };
     (
         StatusCode::MISDIRECTED_REQUEST,
         Json(json!({
             "ok": false,
             "code": HOST_NOT_ALLOWED,
-            "error": "request Host is not an address this daemon answers to",
+            "host": host,
+            "hint": format!("add it to {ALLOWED_HOSTS_ENV}"),
+            "error": error,
         })),
     )
         .into_response()
@@ -163,7 +263,7 @@ pub(crate) async fn refuse_foreign_hosts(
     for value in request.headers().get_all(header::HOST) {
         match value.to_str() {
             Ok(raw) => presented.push(raw.to_string()),
-            Err(_) => return refusal(),
+            Err(_) => return refusal(None),
         }
     }
     if let Some(authority) = request.uri().authority() {
@@ -176,7 +276,7 @@ pub(crate) async fn refuse_foreign_hosts(
             code = HOST_NOT_ALLOWED,
             "refused request for a foreign Host"
         );
-        return refusal();
+        return refusal(Some(bad));
     }
     next.run(request).await
 }
@@ -262,6 +362,85 @@ mod tests {
         assert!(!hosts.allows("evil.example"));
     }
 
+    #[test]
+    fn allowed_host_entries_accept_pasted_urls_and_name_what_is_wrong() {
+        for (raw, host, is_ip) in [
+            ("http://mini.ts.net:4780/", "mini.ts.net", false),
+            ("https://Mini.TS.net/rooms?x=1#y", "mini.ts.net", false),
+            ("mini.ts.net:4780", "mini.ts.net", false),
+            (" studio ", "studio", false),
+            ("100.64.0.7", "100.64.0.7", true),
+            ("http://[fd7a:115c::1]:4780/", "fd7a:115c::1", true),
+        ] {
+            assert_eq!(
+                parse_allowed_host(raw),
+                Ok((host.to_string(), is_ip)),
+                "{raw}"
+            );
+        }
+        for raw in [
+            "mini.ts.net:47x0",
+            "http://",
+            "[not-v6]",
+            "user@mini.ts.net",
+            ":4780",
+        ] {
+            let err = parse_allowed_host(raw).unwrap_err();
+            assert!(err.contains(raw.trim()), "{raw}: {err}");
+        }
+        let entries = allowed_host_entries(" a.test , ,b.test:1,");
+        assert_eq!(
+            entries.iter().map(|(e, _)| e.as_str()).collect::<Vec<_>>(),
+            vec!["a.test", "b.test:1"]
+        );
+    }
+
+    #[test]
+    fn a_pasted_url_and_an_ip_entry_are_both_answered() {
+        let hosts = AllowedHosts::new(
+            "127.0.0.1:4780".parse().unwrap(),
+            &[],
+            vec!["http://mini.ts.net:4780/".into(), "100.64.0.7".into()],
+        );
+        assert!(hosts.allows("mini.ts.net:4780"));
+        assert!(
+            hosts.allows("100.64.0.7:443"),
+            "a loopback bind fronted by tailscale serve on its tailnet IP"
+        );
+        assert!(!hosts.allows("100.64.0.8:443"));
+    }
+
+    #[test]
+    fn the_startup_summary_names_every_source() {
+        let hosts = AllowedHosts::new(
+            "0.0.0.0:4780".parse().unwrap(),
+            &["https://tunnel.test".into()],
+            vec!["studio".into(), "100.64.0.7".into()],
+        );
+        let summary = hosts.summary();
+        assert_eq!(summary["bind"], json!("0.0.0.0:4780"));
+        assert_eq!(summary["any_ip"], json!(true));
+        assert_eq!(summary["allowed_hosts"], json!(["studio", "100.64.0.7"]));
+        assert_eq!(summary["origin_hosts"], json!(["tunnel.test"]));
+        assert_eq!(
+            summary["loopback"],
+            json!(["localhost", "127.0.0.0/8", "::1"])
+        );
+        assert_eq!(loopback().summary()["any_ip"], json!(false));
+    }
+
+    /// The startup log is observability only, so it is pinned by source: the
+    /// daemon must build its allowlist and log it before serving.
+    #[test]
+    fn main_logs_the_effective_allowlist_once_at_startup() {
+        let main = include_str!("main.rs");
+        let production = main.split("\n#[cfg(test)]\nmod tests").next().unwrap();
+        assert_eq!(
+            production.matches("allowed_hosts.log_effective();").count(),
+            1
+        );
+    }
+
     /// End-to-end through the production router.
     mod through_the_router {
         use super::*;
@@ -322,6 +501,17 @@ mod tests {
             let (status, body) = send(&app, Method::GET, &uri, Some("evil.example:4780")).await;
             assert_eq!(status, StatusCode::MISDIRECTED_REQUEST, "{body}");
             assert_eq!(body["code"], json!(HOST_NOT_ALLOWED));
+            assert_eq!(body["ok"], json!(false));
+            assert_eq!(
+                body["host"],
+                json!("evil.example:4780"),
+                "the refused host is named"
+            );
+            assert_eq!(body["hint"], json!("add it to OCEAN_ALLOWED_HOSTS"));
+            assert!(body["error"]
+                .as_str()
+                .unwrap()
+                .contains("evil.example:4780"));
             assert!(!body.to_string().contains("PRIVATE KEY"));
 
             let (status, body) = send(&app, Method::GET, &uri, Some("127.0.0.1:4780")).await;
@@ -368,6 +558,19 @@ mod tests {
             assert_eq!(status, StatusCode::OK);
             let (status, _) = send(&app, Method::GET, "/health", Some("localhost:4780")).await;
             assert_eq!(status, StatusCode::OK);
+        }
+
+        #[tokio::test]
+        async fn an_echoed_host_is_bounded() {
+            let _env = AUTO_CONVENE_ENV_LOCK.lock().await;
+            let tmp = tempfile::tempdir().unwrap();
+            let state = fake_convene_state(&tmp);
+            let app = crate::app_router(BrowserOrigins::default(), AllowedHosts::default())
+                .with_state(state);
+            let long = format!("{}.example", "a".repeat(400));
+            let (status, body) = send(&app, Method::GET, "/health", Some(&long)).await;
+            assert_eq!(status, StatusCode::MISDIRECTED_REQUEST);
+            assert_eq!(body["host"].as_str().unwrap().len(), MAX_ECHOED_HOST);
         }
 
         #[tokio::test]

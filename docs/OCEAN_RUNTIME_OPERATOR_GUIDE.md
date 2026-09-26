@@ -145,18 +145,30 @@ A request with neither `Origin` nor `Referer` passes, exactly as on the operator
 
 #### Host allowlist (DNS rebinding) — `OCEAN_ALLOWED_HOSTS`
 
-Origin checks cannot stop DNS rebinding: a page on `evil.example:4780` that re-resolves its name to `127.0.0.1` is same-origin with its own requests, so it can read responses — `GET /v1/fs/file` would return any file under `$HOME`. Every request, on every method, is therefore refused with `421 {"ok":false,"code":"host_not_allowed",…}` unless its `Host` is one of:
+Origin checks cannot stop DNS rebinding: a page on `evil.example:4780` that re-resolves its name to `127.0.0.1` is same-origin with its own requests, so it can read responses — `GET /v1/fs/file` would return any file under `$HOME`. Every request, on every method, is therefore refused with a fixed-shape 421 that names the refused host and says what to do:
+
+```json
+{"ok":false,"code":"host_not_allowed","host":"mini.tailnet.ts.net:4780","hint":"add it to OCEAN_ALLOWED_HOSTS","error":"request Host `mini.tailnet.ts.net:4780` is not an address this daemon answers to"}
+```
+
+A request is answered only when its `Host` is one of:
 
 - `localhost`, or any loopback IP literal (`127.0.0.1`, `[::1]` — the IPv6 companion listener), on any port;
 - the IP literal of `OCEAN_BIND`, or ANY IP literal when `OCEAN_BIND` is unspecified (`0.0.0.0:4780`), since an IP literal cannot be rebound;
 - the host of each `OCEAN_ALLOWED_ORIGINS` entry;
-- an entry of `OCEAN_ALLOWED_HOSTS` (comma-separated host names, port optional).
+- an entry of `OCEAN_ALLOWED_HOSTS` (comma-separated). An entry may be a host name, `host:port`, `[ipv6]:port`, an IP literal, or a pasted daemon URL such as `http://mini.tailnet.ts.net:4780/`: the scheme and any path are stripped. An entry that still does not parse (a non-numeric port, userinfo, an empty host) fails daemon startup naming the entry, rather than being dropped and turning every request by that name into a 421.
 
-The supervised daemon leaves `OCEAN_BIND` unset (loopback), so its clients — the CLI, MCP, TUI, the surface proxy's default `http://127.0.0.1:4780` upstream, the Tauri webview, and the side panel — are unaffected. A daemon reached by NAME from another machine needs that name here, for example a MagicDNS name for a tailnet bind, or the Buddy development build's `risings-mac-mini.local`:
+At startup the daemon logs the effective allowlist once (`Host allowlist (DNS-rebinding guard)`): the bind address, the loopback set, the `OCEAN_ALLOWED_HOSTS` entries, the hosts derived from `OCEAN_ALLOWED_ORIGINS`, and `any_ip` (true only when bound unspecified).
+
+The supervised daemon leaves `OCEAN_BIND` unset (loopback), so its clients — the CLI, MCP, TUI, the surface proxy's default `http://127.0.0.1:4780` upstream, the Tauri webview, and the side panel — are unaffected. A daemon reached by NAME from another machine needs that name here, for example the MagicDNS name of an approved tailnet bind (bind the tailnet IP, never `0.0.0.0` — see [Security concern](#security-concern) below):
 
 ```bash
-(cd "$HOME" && OCEAN_BIND=0.0.0.0:4780 OCEAN_ALLOWED_HOSTS="mini.tailnet.ts.net,risings-mac-mini.local" "$OCEAN_DAEMON_BIN")
+(cd "$HOME" && OCEAN_BIND=100.64.0.7:4780 OCEAN_ALLOWED_HOSTS="mini.tailnet.ts.net" "$OCEAN_DAEMON_BIN")
 ```
+
+The tailnet IP itself needs no entry, since it is the bind address. The same applies to the Buddy development build, which dials `risings-mac-mini.local`: that name must be listed.
+
+A loopback-bound daemon that is exposed through `tailscale serve`, socat, or any other forwarder, and reached by a non-loopback IP or name, gets 421 until that host is in `OCEAN_ALLOWED_HOSTS` whenever the forwarder keeps the client's `Host` (a TCP forwarder such as socat always does).
 
 A literal `null` entry in `OCEAN_ALLOWED_ORIGINS` or `OCEAN_OPERATOR_ALLOWED_ORIGINS` is dropped at parse time; the opaque origin is never trusted.
 

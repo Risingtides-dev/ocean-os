@@ -1400,14 +1400,16 @@ async fn main() -> anyhow::Result<()> {
     // bind IP (any IP literal when bound unspecified), the hosts of the extra
     // origins above, and `OCEAN_ALLOWED_HOSTS`. See `host_guard.rs`.
     let addr: SocketAddr = bind.parse().context("invalid OCEAN_BIND")?;
-    let extra_hosts: Vec<String> = env::var("OCEAN_ALLOWED_HOSTS")
-        .unwrap_or_default()
-        .split(',')
-        .map(str::trim)
-        .filter(|h| !h.is_empty())
-        .map(str::to_string)
-        .collect();
+    // Entries were validated in `validate_startup_config`; a malformed one has
+    // already failed boot rather than being dropped here.
+    let extra_hosts: Vec<String> = host_guard::allowed_host_entries(
+        &env::var(host_guard::ALLOWED_HOSTS_ENV).unwrap_or_default(),
+    )
+    .into_iter()
+    .map(|(entry, _)| entry)
+    .collect();
     let allowed_hosts = AllowedHosts::new(addr, &extra_origins, extra_hosts);
+    allowed_hosts.log_effective();
     let github_service = github::GitHubService::new()?;
     let app = app_router(BrowserOrigins::new(extra_origins), allowed_hosts);
 
