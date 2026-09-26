@@ -1,5 +1,5 @@
 {
-  "note": "The room wire facts ocean-surface depends on, published by ocean-daemon and held equal to the router by room_wire_contract_matches_the_daemon (crates/ocean-daemon). ocean-surface vendors this file; see docs/contracts/README.md.",
+  "note": "The room wire facts ocean-surface and the in-repo room clients depend on, published by ocean-daemon and held equal to the router by room_wire_contract_matches_the_daemon (crates/ocean-daemon). ocean-surface vendors this file; see docs/contracts/README.md.",
   "version": 1,
   "sse_events": [
     "room_access",
@@ -51,5 +51,130 @@
     "status": 404,
     "marker": "room_not_open",
     "code": "room_not_found"
-  }
+  },
+  "message_fields": [
+    "attachment_id",
+    "author_id",
+    "author_kind",
+    "body",
+    "created_at",
+    "federated",
+    "kind",
+    "seq",
+    "session_id",
+    "thread_parent_seq"
+  ],
+  "participant_fields": [
+    "display_name",
+    "id",
+    "kind"
+  ],
+  "room_fields": [
+    "created_at",
+    "id",
+    "name",
+    "participants",
+    "trigger_policy",
+    "updated_at",
+    "workspace_root"
+  ],
+  "list_keys": [
+    "attention",
+    "has_more",
+    "next_cursor",
+    "ok",
+    "read_states",
+    "rooms"
+  ],
+  "message_post_keys": [
+    "message",
+    "ok",
+    "triggers_fired"
+  ],
+  "message_post_queued_keys": [
+    "access",
+    "ok"
+  ],
+  "access_fields": [
+    "last_confirmed_global_sequence",
+    "members",
+    "outbox",
+    "self_member_id",
+    "state"
+  ],
+  "inspect_keys": [
+    "access",
+    "agents",
+    "aliases",
+    "credential_slots",
+    "execution",
+    "federated",
+    "ok",
+    "owner",
+    "participants",
+    "profile",
+    "resources",
+    "room"
+  ],
+  "inspect_execution_keys": [
+    "cwd",
+    "cwd_source",
+    "node"
+  ],
+  "inspect_agent_keys": [
+    "activation_policy",
+    "agent_definition_digest",
+    "agent_definition_revision",
+    "agent_member_id",
+    "agent_package_id",
+    "authorized_at",
+    "context_policy",
+    "display_name",
+    "effective_capabilities",
+    "execution",
+    "execution_node",
+    "generation",
+    "memory_scope",
+    "operator_intersection_capabilities",
+    "owner_member_id",
+    "requested_capabilities",
+    "revoked_at",
+    "room_capability_grants",
+    "room_id",
+    "session_exists",
+    "session_id",
+    "status"
+  ],
+  "inspect_agent_execution_keys": [
+    "cwd",
+    "cwd_source",
+    "grant_generation",
+    "resource_id"
+  ],
+  "inspect_credential_slot_keys": [
+    "name",
+    "required",
+    "resolver",
+    "status"
+  ],
+  "inspect_resource_keys": [
+    "access_mode",
+    "authorized_agent_member_ids",
+    "decision_id",
+    "display_name",
+    "expires_at",
+    "generation",
+    "granted_at",
+    "granted_by",
+    "owner_node",
+    "resource_id",
+    "resource_kind",
+    "revoked_at",
+    "room_id",
+    "status"
+  ],
+  "resources_keys": [
+    "ok",
+    "resources"
+  ]
 }

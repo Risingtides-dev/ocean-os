@@ -1,5 +1,5 @@
 {
-  "note": "The voice wire facts first-party surfaces (ocean-surface web and Tauri, Ocean Buddy, the TUI dictation client) depend on, published by ocean-daemon and held equal to the code by voice_wire_contract_matches_the_daemon (crates/ocean-daemon). See docs/contracts/README.md.",
+  "note": "The voice wire facts first-party surfaces (ocean-surface web and Tauri, Ocean Buddy, the TUI dictation client) depend on, plus Ocean Buddy's event ingress, published by ocean-daemon and held equal to the code by voice_wire_contract_matches_the_daemon (crates/ocean-daemon). See docs/contracts/README.md.",
   "version": 1,
   "routes": [
     "POST /v1/agent/voice",
@@ -80,6 +80,28 @@
         "propose_handoff",
         "read_workspace_file"
       ]
+    },
+    "tool_arguments": {
+      "list_workspace": [
+        "path"
+      ],
+      "propose_handoff": [
+        "acceptance_criteria",
+        "constraints",
+        "goals",
+        "non_goals",
+        "open_questions",
+        "problem",
+        "requirements",
+        "title",
+        "users"
+      ],
+      "read_workspace_file": [
+        "path"
+      ],
+      "write_handoff": [
+        "note"
+      ]
     }
   },
   "stt": {
@@ -116,6 +138,64 @@
     ],
     "response_keys": [
       "ok"
+    ]
+  },
+  "buddy_events": {
+    "route": "POST /v1/ocean-buddy/events",
+    "statuses": [200, 422],
+    "request_fields": [
+      "action",
+      "attachment",
+      "card",
+      "causation_id",
+      "event_id",
+      "failure",
+      "flow_id",
+      "occurred_at",
+      "state",
+      "target"
+    ],
+    "states": [
+      "approved",
+      "attached",
+      "capture_completed",
+      "capture_started",
+      "failed",
+      "requested",
+      "result",
+      "uploaded"
+    ],
+    "accepted_state": "attached",
+    "accepted_target": "current_ocean_context",
+    "attachment_fields": [
+      "byte_count",
+      "filename",
+      "id",
+      "kind",
+      "mime_type",
+      "mock_capture"
+    ],
+    "accepted_mime_type": "image/jpeg",
+    "response_fields": [
+      "accepted",
+      "card",
+      "received_event_id"
+    ],
+    "card_fields": [
+      "actions",
+      "detail",
+      "id",
+      "kind",
+      "title"
+    ],
+    "card_kinds": [
+      "approval_card",
+      "error_card",
+      "result_card"
+    ],
+    "rejection_keys": [
+      "accepted",
+      "error"
     ]
   }
 }

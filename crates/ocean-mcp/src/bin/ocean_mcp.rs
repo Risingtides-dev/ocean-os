@@ -340,16 +340,66 @@ mod room_wire {
     /// Participant kinds the bridge sends (posts, joins) or reads (room list).
     pub const PARTICIPANT_HUMAN: &str = "human";
     pub const PARTICIPANT_AGENT: &str = "agent";
+    /// Transcript row fields `render_row` reads.
+    pub const ROW_SEQ: &str = "seq";
+    pub const ROW_AUTHOR_ID: &str = "author_id";
+    pub const ROW_KIND: &str = "kind";
+    pub const ROW_BODY: &str = "body";
+    pub const ROW_THREAD_PARENT_SEQ: &str = "thread_parent_seq";
+    /// `GET /v1/rooms/persistent`: the list key, and the room and participant
+    /// fields `ocean_rooms` reads.
+    pub const LIST_ROOMS: &str = "rooms";
+    pub const ROOM_ID: &str = "id";
+    pub const ROOM_NAME: &str = "name";
+    pub const ROOM_PARTICIPANTS: &str = "participants";
+    pub const PARTICIPANT_ID: &str = "id";
+    pub const PARTICIPANT_KIND: &str = "kind";
+    /// `POST .../messages`: the keys `ocean_room_post` reads.
+    pub const POST_MESSAGE: &str = "message";
+    pub const POST_TRIGGERS_FIRED: &str = "triggers_fired";
+    /// `GET .../inspect`: the keys `ocean_room_inspect` reads.
+    pub const INSPECT_ACCESS: &str = "access";
+    pub const ACCESS_STATE: &str = "state";
+    pub const INSPECT_FEDERATED: &str = "federated";
+    pub const INSPECT_EXECUTION: &str = "execution";
+    pub const INSPECT_AGENTS: &str = "agents";
+    pub const AGENT_MEMBER_ID: &str = "agent_member_id";
+    pub const AGENT_STATUS: &str = "status";
+    pub const AGENT_GENERATION: &str = "generation";
+    pub const AGENT_SESSION_ID: &str = "session_id";
+    pub const AGENT_EXECUTION: &str = "execution";
+    pub const AGENT_CWD_SOURCE: &str = "cwd_source";
+    pub const INSPECT_CREDENTIAL_SLOTS: &str = "credential_slots";
+    pub const SLOT_NAME: &str = "name";
+    pub const SLOT_STATUS: &str = "status";
+    pub const SLOT_REQUIRED: &str = "required";
+    pub const INSPECT_RESOURCES: &str = "resources";
+    pub const RESOURCE_DISPLAY_NAME: &str = "display_name";
+    pub const RESOURCE_ID: &str = "resource_id";
+    pub const RESOURCE_ACCESS_MODE: &str = "access_mode";
+    pub const RESOURCE_STATUS: &str = "status";
+    pub const RESOURCE_AGENTS: &str = "authorized_agent_member_ids";
+    /// `GET .../resources`: the key `ocean_room_resources` reads.
+    pub const RESOURCES_LIST: &str = "resources";
 }
 
 fn render_row(row: &Value) -> String {
-    let seq = row.get("seq").and_then(Value::as_u64).unwrap_or(0);
-    let author = row.get("author_id").and_then(Value::as_str).unwrap_or("?");
+    let seq = row
+        .get(room_wire::ROW_SEQ)
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    let author = row
+        .get(room_wire::ROW_AUTHOR_ID)
+        .and_then(Value::as_str)
+        .unwrap_or("?");
     let kind = row
-        .get("kind")
+        .get(room_wire::ROW_KIND)
         .and_then(Value::as_str)
         .unwrap_or(room_wire::MESSAGE_KIND_MESSAGE);
-    let body = row.get("body").and_then(Value::as_str).unwrap_or("");
+    let body = row
+        .get(room_wire::ROW_BODY)
+        .and_then(Value::as_str)
+        .unwrap_or("");
     let body = if kind == room_wire::MESSAGE_KIND_SYSTEM {
         serde_json::from_str::<Value>(body)
             .ok()
@@ -363,7 +413,7 @@ fn render_row(row: &Value) -> String {
         body.to_string()
     };
     let thread = row
-        .get("thread_parent_seq")
+        .get(room_wire::ROW_THREAD_PARENT_SEQ)
         .and_then(Value::as_u64)
         .map(|p| format!(" (reply to #{p})"))
         .unwrap_or_default();
@@ -387,7 +437,7 @@ async fn call_tool(daemon: &Daemon, name: &str, args: &Value) -> Result<String> 
         "ocean_rooms" => {
             let v = daemon.get("/v1/rooms/persistent").await?;
             let rooms = v
-                .get("rooms")
+                .get(room_wire::LIST_ROOMS)
                 .and_then(Value::as_array)
                 .cloned()
                 .unwrap_or_default();
@@ -396,15 +446,17 @@ async fn call_tool(daemon: &Daemon, name: &str, args: &Value) -> Result<String> 
             }
             let mut out = String::new();
             for r in rooms {
-                let members: Vec<String> = r["participants"]
+                let members: Vec<String> = r[room_wire::ROOM_PARTICIPANTS]
                     .as_array()
                     .map(|ps| {
                         ps.iter()
                             .map(|p| {
                                 format!(
                                     "{}{}",
-                                    p["id"].as_str().unwrap_or("?"),
-                                    if p["kind"] == room_wire::PARTICIPANT_AGENT {
+                                    p[room_wire::PARTICIPANT_ID].as_str().unwrap_or("?"),
+                                    if p[room_wire::PARTICIPANT_KIND]
+                                        == room_wire::PARTICIPANT_AGENT
+                                    {
                                         " (agent)"
                                     } else {
                                         ""
@@ -416,8 +468,8 @@ async fn call_tool(daemon: &Daemon, name: &str, args: &Value) -> Result<String> 
                     .unwrap_or_default();
                 out.push_str(&format!(
                     "- {} — {} — members: {}\n",
-                    r["id"].as_str().unwrap_or("?"),
-                    r["name"].as_str().unwrap_or(""),
+                    r[room_wire::ROOM_ID].as_str().unwrap_or("?"),
+                    r[room_wire::ROOM_NAME].as_str().unwrap_or(""),
                     if members.is_empty() {
                         "none".to_string()
                     } else {
@@ -479,8 +531,13 @@ async fn call_tool(daemon: &Daemon, name: &str, args: &Value) -> Result<String> 
                     Duration::from_secs(30),
                 )
                 .await?;
-            let seq = v["message"]["seq"].as_u64().unwrap_or(0);
-            let fired = v["triggers_fired"].as_array().map(|t| t.len()).unwrap_or(0);
+            let seq = v[room_wire::POST_MESSAGE][room_wire::ROW_SEQ]
+                .as_u64()
+                .unwrap_or(0);
+            let fired = v[room_wire::POST_TRIGGERS_FIRED]
+                .as_array()
+                .map(|t| t.len())
+                .unwrap_or(0);
             Ok(format!(
                 "posted #{seq} to {room} as {}{}",
                 member,
@@ -514,52 +571,56 @@ async fn call_tool(daemon: &Daemon, name: &str, args: &Value) -> Result<String> 
                 .await?;
             let mut out = format!(
                 "room {} — access {} — federated {}\n",
-                room, v["access"]["state"], v["federated"]
+                room,
+                v[room_wire::INSPECT_ACCESS][room_wire::ACCESS_STATE],
+                v[room_wire::INSPECT_FEDERATED]
             );
             out.push_str(&format!(
                 "execution: {}\n",
-                serde_json::to_string(&v["execution"]).unwrap_or_default()
+                serde_json::to_string(&v[room_wire::INSPECT_EXECUTION]).unwrap_or_default()
             ));
-            match v["agents"].as_array() {
+            match v[room_wire::INSPECT_AGENTS].as_array() {
                 Some(agents) if !agents.is_empty() => {
                     out.push_str("agents:\n");
                     for a in agents {
                         out.push_str(&format!(
                             "- {} status={} generation={} session={} cwd_source={}\n",
-                            a["agent_member_id"].as_str().unwrap_or("?"),
-                            a["status"].as_str().unwrap_or("?"),
-                            a["generation"].as_str().unwrap_or("?"),
-                            a["session_id"].as_str().unwrap_or("?"),
-                            a["execution"]["cwd_source"].as_str().unwrap_or("?")
+                            a[room_wire::AGENT_MEMBER_ID].as_str().unwrap_or("?"),
+                            a[room_wire::AGENT_STATUS].as_str().unwrap_or("?"),
+                            a[room_wire::AGENT_GENERATION].as_str().unwrap_or("?"),
+                            a[room_wire::AGENT_SESSION_ID].as_str().unwrap_or("?"),
+                            a[room_wire::AGENT_EXECUTION][room_wire::AGENT_CWD_SOURCE]
+                                .as_str()
+                                .unwrap_or("?")
                         ));
                     }
                 }
                 _ => out.push_str("agents: none authorized\n"),
             }
-            if let Some(slots) = v["credential_slots"].as_array() {
+            if let Some(slots) = v[room_wire::INSPECT_CREDENTIAL_SLOTS].as_array() {
                 if !slots.is_empty() {
                     out.push_str("credential slots:\n");
                     for s in slots {
                         out.push_str(&format!(
                             "- {} {} required={}\n",
-                            s["name"].as_str().unwrap_or("?"),
-                            s["status"].as_str().unwrap_or("?"),
-                            s["required"]
+                            s[room_wire::SLOT_NAME].as_str().unwrap_or("?"),
+                            s[room_wire::SLOT_STATUS].as_str().unwrap_or("?"),
+                            s[room_wire::SLOT_REQUIRED]
                         ));
                     }
                 }
             }
-            if let Some(resources) = v["resources"].as_array() {
+            if let Some(resources) = v[room_wire::INSPECT_RESOURCES].as_array() {
                 if !resources.is_empty() {
                     out.push_str("contributed folders:\n");
                     for r in resources {
                         out.push_str(&format!(
                             "- {} ({}) {} status={} agents={}\n",
-                            r["display_name"].as_str().unwrap_or("?"),
-                            r["resource_id"].as_str().unwrap_or("?"),
-                            r["access_mode"].as_str().unwrap_or("?"),
-                            r["status"].as_str().unwrap_or("?"),
-                            serde_json::to_string(&r["authorized_agent_member_ids"])
+                            r[room_wire::RESOURCE_DISPLAY_NAME].as_str().unwrap_or("?"),
+                            r[room_wire::RESOURCE_ID].as_str().unwrap_or("?"),
+                            r[room_wire::RESOURCE_ACCESS_MODE].as_str().unwrap_or("?"),
+                            r[room_wire::RESOURCE_STATUS].as_str().unwrap_or("?"),
+                            serde_json::to_string(&r[room_wire::RESOURCE_AGENTS])
                                 .unwrap_or_default()
                         ));
                     }
@@ -572,7 +633,7 @@ async fn call_tool(daemon: &Daemon, name: &str, args: &Value) -> Result<String> 
             let v = daemon
                 .get(&format!("/v1/rooms/persistent/{room}/resources"))
                 .await?;
-            Ok(serde_json::to_string_pretty(&v["resources"]).unwrap_or_default())
+            Ok(serde_json::to_string_pretty(&v[room_wire::RESOURCES_LIST]).unwrap_or_default())
         }
         "ocean_agents" => {
             let v = daemon.get("/v1/agents").await?;
@@ -893,7 +954,10 @@ async fn doctor(daemon: &Daemon) -> Result<()> {
     )?;
     match daemon.get("/v1/rooms/persistent").await {
         Ok(v) => {
-            let n = v["rooms"].as_array().map(|r| r.len()).unwrap_or(0);
+            let n = v[room_wire::LIST_ROOMS]
+                .as_array()
+                .map(|r| r.len())
+                .unwrap_or(0);
             writeln!(out, "rooms: {n}")?;
         }
         Err(err) => writeln!(out, "rooms: could not list — {err:#}")?,
@@ -950,8 +1014,9 @@ fn identity_line(member: Option<&str>, daemon_identity: &Result<Value>) -> Strin
 mod tests {
     use super::*;
 
-    /// Consumer half of the room contract: every snapshot key, message kind
-    /// and participant kind the bridge depends on is one the daemon publishes.
+    /// Consumer half of the room contract: every snapshot key, message kind,
+    /// participant kind, transcript row field and list, post, inspect and
+    /// resources response key the bridge reads is one the daemon publishes.
     #[test]
     fn room_literals_are_inside_the_published_room_wire() {
         let wire: Value =
@@ -974,6 +1039,63 @@ mod tests {
         published("message_kinds", room_wire::MESSAGE_KIND_SYSTEM);
         published("participant_kinds", room_wire::PARTICIPANT_HUMAN);
         published("participant_kinds", room_wire::PARTICIPANT_AGENT);
+
+        // The response shapes the room tools read.
+        for field in [
+            room_wire::ROW_SEQ,
+            room_wire::ROW_AUTHOR_ID,
+            room_wire::ROW_KIND,
+            room_wire::ROW_BODY,
+            room_wire::ROW_THREAD_PARENT_SEQ,
+        ] {
+            published("message_fields", field);
+        }
+        published("list_keys", room_wire::LIST_ROOMS);
+        published("room_fields", room_wire::ROOM_ID);
+        published("room_fields", room_wire::ROOM_NAME);
+        published("room_fields", room_wire::ROOM_PARTICIPANTS);
+        published("participant_fields", room_wire::PARTICIPANT_ID);
+        published("participant_fields", room_wire::PARTICIPANT_KIND);
+        published("message_post_keys", room_wire::POST_MESSAGE);
+        published("message_post_keys", room_wire::POST_TRIGGERS_FIRED);
+        for key in [
+            room_wire::INSPECT_ACCESS,
+            room_wire::INSPECT_FEDERATED,
+            room_wire::INSPECT_EXECUTION,
+            room_wire::INSPECT_AGENTS,
+            room_wire::INSPECT_CREDENTIAL_SLOTS,
+            room_wire::INSPECT_RESOURCES,
+        ] {
+            published("inspect_keys", key);
+        }
+        published("access_fields", room_wire::ACCESS_STATE);
+        for key in [
+            room_wire::AGENT_MEMBER_ID,
+            room_wire::AGENT_STATUS,
+            room_wire::AGENT_GENERATION,
+            room_wire::AGENT_SESSION_ID,
+            room_wire::AGENT_EXECUTION,
+        ] {
+            published("inspect_agent_keys", key);
+        }
+        published("inspect_agent_execution_keys", room_wire::AGENT_CWD_SOURCE);
+        for key in [
+            room_wire::SLOT_NAME,
+            room_wire::SLOT_STATUS,
+            room_wire::SLOT_REQUIRED,
+        ] {
+            published("inspect_credential_slot_keys", key);
+        }
+        for key in [
+            room_wire::RESOURCE_DISPLAY_NAME,
+            room_wire::RESOURCE_ID,
+            room_wire::RESOURCE_ACCESS_MODE,
+            room_wire::RESOURCE_STATUS,
+            room_wire::RESOURCE_AGENTS,
+        ] {
+            published("inspect_resource_keys", key);
+        }
+        published("resources_keys", room_wire::RESOURCES_LIST);
     }
     use axum::{routing::get, routing::post, Json, Router};
 

@@ -31,5 +31,84 @@
     "client_type",
     "cwd",
     "session_id"
-  ]
+  ],
+  "agent_events_route": "GET /v1/agent/events",
+  "agent_events_error": {
+    "event": "error",
+    "fields": [
+      "code",
+      "newest_available_event_id",
+      "oldest_available_event_id",
+      "requested_event_id",
+      "reset_required"
+    ],
+    "codes": [
+      "anchor_unavailable",
+      "live_lag",
+      "malformed_anchor"
+    ]
+  },
+  "session_changed_extension": "ocean.session_changed",
+  "session_create_client_types": {
+    "open": true,
+    "known": [
+      "acp-zed",
+      "call-voice",
+      "cli",
+      "leo-voice",
+      "surface-extension",
+      "surface-web",
+      "tui"
+    ]
+  },
+  "session_sync": {
+    "route": "GET /v1/sessions/{id}/sync",
+    "statuses": [200, 404, 409, 500],
+    "response_fields": [
+      "error",
+      "fence",
+      "ok",
+      "session_id",
+      "snapshot"
+    ],
+    "snapshot_fields": [
+      "config_revision",
+      "model",
+      "provider",
+      "session_id",
+      "transcript",
+      "truncated_messages",
+      "truncated_text_bytes"
+    ],
+    "fence_fields": [
+      "event_id"
+    ]
+  },
+  "session_config": {
+    "routes": [
+      "GET /v1/agent/sessions/{id}/config",
+      "PATCH /v1/agent/sessions/{id}/config"
+    ],
+    "statuses": {
+      "GET /v1/agent/sessions/{id}/config": [200, 404, 500],
+      "PATCH /v1/agent/sessions/{id}/config": [200, 400, 404, 409, 500]
+    },
+    "patch_request_fields": [
+      "model"
+    ],
+    "response_keys": [
+      "client_type",
+      "config_revision",
+      "model",
+      "model_source",
+      "permission_mode",
+      "provider",
+      "session_id"
+    ],
+    "error_key": "error",
+    "busy": {
+      "status": 409,
+      "error": "session has an active operation; try again shortly"
+    }
+  }
 }
