@@ -28,7 +28,7 @@ check is equality.
 | `ocean-tui` session stream | `session-wire.json` | its decoder knows every published event type; every event variant it branches on is published; its session-create body and decoded response stay inside the published keys | `session_client_is_inside_the_published_session_wire` in `crates/ocean-tui/src/shell/client.rs` |
 | `ocean-tui` stream recovery, sync and config | `session-wire.json` | the `/v1/agent/events` route and its `error` reset frame, the `ocean.session_changed` extension, the `tui` client type, `/v1/sessions/{id}/sync` and the sync keys it decodes, the config routes, PATCH body, decoded keys, `error` key and busy answer | `session_stream_sync_and_config_are_inside_the_published_session_wire` in `crates/ocean-tui/src/shell/client.rs` |
 | `ocean-tui` daemon routes | `session-wire.json` | the session-create, health, turn, compact, cancel, permission-decision, permission-settings, models, memory, LSP and `/v1/events` routes; the turn body and acknowledgement, its busy answer, and a deliberate branch for every published turn status; the `session_id` and `replay` stream query fields; the compact keys and the pre-commit refusal statuses it trusts; the cancel keys; the decision body and decision values; the settings bodies and modes; the model, memory and LSP keys and the `cwd` query; and on `/v1/events`, a decoder that knows every published event type, a published type for every event it branches on, and the envelope fields it decodes | `daemon_routes_are_inside_the_published_session_wire` in `crates/ocean-tui/src/shell/client.rs` |
-| `ocean-tui` Observatory graph | `observatory-wire.json` | the snapshot and events routes, the `detail`, `after` and `scope` query fields and the `summary` value it asks for, the resume header, the Bearer scheme and the `401` it answers by dropping its environment token, the `reset` and `error` frames it rebaselines on, the synthesized gap frame (not an envelope, so it must rebaseline), the snapshot and envelope fields, and the payload kinds it branches on | `observatory_client_is_inside_the_published_observatory_wire` in `crates/ocean-tui/src/shell/client.rs` |
+| `ocean-tui` Observatory graph | `observatory-wire.json` | the snapshot and events routes, the `detail`, `after` and `scope` query fields and the `summary` value it asks for, the resume header, the Bearer scheme and the `401` it answers by dropping its environment token, the `reset` and `error` frames it rebaselines on, the typed `StreamGap` gap envelope it decodes and rebaselines on by name, the snapshot and envelope fields, and the payload kinds it branches on | `observatory_client_is_inside_the_published_observatory_wire` in `crates/ocean-tui/src/shell/client.rs` |
 | `ocean-tui` component projection | `component-wire.json` | every kind `component_lines` and the pinned-height table branch on is published, and both keep a fallback arm | `component_kinds_are_inside_the_published_component_wire` in `crates/ocean-tui/src/shell/components/chat.rs` |
 | `ocean-acp` event bridge | `session-wire.json` | `event_to_update` names exactly the published event types, with no wildcard | `event_to_update_covers_the_published_session_wire` in `crates/ocean-acp/src/convert.rs` |
 | `ocean-acp` component markdown | `component-wire.json` | every kind `render_component_markdown` special-cases is published, and a fallback arm renders the rest | `component_kinds_are_inside_the_published_component_wire` in `crates/ocean-acp/src/convert.rs` |
@@ -121,13 +121,19 @@ accepted `detail` values, and the `ObservatorySnapshot` fields) and `GET
 /v1/observatory/events` (statuses, the `after` and `scope` query fields, the
 accepted `scope` values, the `last-event-id` resume header, the `error`,
 `message` and `reset` frame names, the envelope fields, `EventKind` names, the
-adjacently tagged `EventPayload` tag and variant names, and the `stream.gap`
-kind of the gap frame the tail synthesizes). That gap frame is not an
-`EventEnvelope`: its top-level `kind` is `stream.gap`, which is not an
-`EventKind`, so a typed decoder fails on it. The TUI rebaselines on any data
-frame it cannot decode, and its test holds it to that. The payload variant
-names are PascalCase on the wire because `EventPayload` has no `rename_all`;
-the contract publishes them as they are.
+adjacently tagged `EventPayload` tag and variant names, and `gap_kind` /
+`gap_payload_kind`, the kind and payload variant of the gap signal the tail
+sends when the durable log skips). That gap signal is an ordinary
+`EventEnvelope` on the `message` frame (manifest §2.1 Property 4 and §7.2):
+`kind` is `stream_gap`, the payload is `StreamGap { from_cursor, to_cursor,
+reason }`, `truth` is `derived`, the topology ids are empty, `cursor` is the
+first missing cursor, and there is no SSE `id:`. The daemon test builds it
+from the daemon's own `gap_envelope` and proves it decodes as an envelope. The
+TUI test proves the TUI decodes it and rebaselines on it by name. Daemons
+before this change sent an untyped `"kind":"stream.gap"` object instead; the
+TUI still rebaselines on any data frame it cannot decode, as a backstop. The
+payload variant names are PascalCase on the wire because `EventPayload` has
+no `rename_all`; the contract publishes them as they are.
 
 `component-wire.json` lists the component kinds the runtime's component tools
 accept, in `VALID_KINDS` order, and its test also requires a section per kind

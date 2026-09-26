@@ -72,7 +72,8 @@
       "message",
       "reset"
     ],
-    "gap_kind": "stream.gap",
+    "gap_kind": "stream_gap",
+    "gap_payload_kind": "StreamGap",
     "payload_kinds": [
       "DaemonStarted",
       "DaemonStopping",

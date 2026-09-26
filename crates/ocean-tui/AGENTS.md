@@ -176,7 +176,9 @@ This crate owns the full-screen terminal steering cockpit (`ocean` binary) for i
   operator explicitly closed the rail. The graph consumes the boot-bound summary
   token, baselines from `/v1/observatory/snapshot`, resumes
   `/v1/observatory/events` from that cursor, and rebaselines on
-  auth/reset/gap/instance or cursor discontinuity; it never derives execution
+  auth/reset, a typed `StreamGap` envelope (matched by name in
+  `observatory_event_continues`, never via a decode failure), an instance
+  change, or a cursor discontinuity; it never derives execution
   truth from chat cards or owns orchestration. Terminal nodes remain inspectable
   until the operator deliberately changes representation. Enter expands the same
   workflow projection into the center graph surface. The renderer keeps all

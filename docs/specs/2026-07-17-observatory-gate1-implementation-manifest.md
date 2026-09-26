@@ -1901,6 +1901,14 @@ If any of these conditions arise during implementation, the task blocks and a re
 
 - **D1 — Structural allow-list replaces `#[observer_safe]` for V1.** Closed, metadata-only Observatory payload types, explicit adapter construction, and exhaustive redaction/serialization regression fixtures form the V1 structural allow-list; no raw runtime `AgentEvent` type derives `Serialize` or maps implicitly. This supersedes the macro-specific acceptance and non-acceptance language in this manifest for V1 only. WildDragon approved D1 as coordination lead on 2026-07-17. A proc-macro may be added later as optional defense-in-depth hardening, but it is not a V1 landing gate.
 
+### Status notes
+
+- **Live-tail gap frame conformance (recorded 2026-09-26, branch `fix/observatory-gap-frame`).** Until this change the SSE tail synthesized its gap signal as a partial JSON object whose top-level `kind` was the literal `"stream.gap"`. That is not an `EventKind` (§1.3 serializes `StreamGap` as `stream_gap`), so the frame was not the `EventEnvelope` that §7.2 requires in the SSE `data` field. The TUI rebaselined on it only because decoding failed. Ocean Surface logged it as unparseable and waited for the next cursor jump. The tail now emits what §2.1 Property 4 ("the daemon sends an explicit `StreamGap` event with `from_cursor` and `to_cursor` fields") and §7.2 ("SSE `data` field: JSON EventEnvelope") specify: a full `EventEnvelope` with `kind: stream_gap`, payload `StreamGap { from_cursor, to_cursor, reason }`, on the ordinary `message` frame. It has no SSE `id:` (Task 9 F5). The code that builds it is `gap_envelope` in `crates/ocean-daemon/src/observatory.rs`. We read the dotted spellings in the §7.2 example (`stream.gap`, `execution.admitted`, `tool.started`) and in the `ocean-observatory` JSON fixtures as illustrations; the typed §1.3/§1.4 definitions are what the wire carries. Three field values are the implementer's reading, not the manifest's text:
+  - `truth: derived`, because §1.2 defines derived as "computed … not in durable log".
+  - Empty topology ids, because the gap belongs to no execution.
+  - `cursor` = the first missing cursor, as in the §7.2 example.
+- **Open operator question (gap client behavior).** §2.1 Property 4 says "the client must request a fresh snapshot after a gap". §7.2 client behavior item 3 says "data is still valid; cursor has jumped; future events continue". Both first-party clients follow §2.1 and rebaseline: the TUI through `observatory_event_continues` in `crates/ocean-tui/src/shell/client.rs`, and Surface's reducer through `IntegrityState::Gap`. Which text governs, and whether a client may keep its projection across a gap, is for the operator to rule on. No wire change depends on the answer.
+
 ---
 
 ## References

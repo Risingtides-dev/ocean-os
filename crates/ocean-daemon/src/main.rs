@@ -15884,8 +15884,27 @@ mod tests {
         let mut frames = next_quoted_after(events, ".event(");
         frames.extend(next_quoted_after(events, "sse_terminal("));
         let frames = sorted_strings(frames);
-        let gap = source_quoted_after(events, "\"kind\": \"");
-        assert_eq!(gap.len(), 1, "one synthesized gap frame");
+        // The gap signal is a typed StreamGap envelope (manifest §2.1
+        // Property 4, §7.2) built by one helper; no frame kind is spelled by
+        // hand in the tail.
+        assert!(
+            events.contains("gap_envelope("),
+            "the tail signals a gap through gap_envelope"
+        );
+        assert!(
+            source_quoted_after(events, "\"kind\": \"").is_empty(),
+            "no hand-built frame kind"
+        );
+        let gap = serde_json::to_value(observatory::gap_envelope(
+            ocean_observatory::Cursor::new(1),
+            ocean_observatory::Cursor::new(3),
+            "cursor_jump",
+            "observatory",
+            "daemon",
+        ))
+        .unwrap();
+        serde_json::from_value::<ocean_observatory::EventEnvelope>(gap.clone())
+            .expect("the gap frame is an EventEnvelope");
 
         // EventPayload is adjacently tagged; the tag is the key that carries
         // the variant name.
@@ -15900,6 +15919,7 @@ mod tests {
             .find(|(_, value)| *value == "StreamReset")
             .map(|(key, _)| key.clone())
             .expect("the payload names its variant");
+        let gap_payload_kind = gap["payload"][payload_tag.as_str()].clone();
         assert!(artifact["note"].is_string());
         let derived = json!({
             "note": artifact["note"],
@@ -15926,7 +15946,8 @@ mod tests {
                 "payload_kinds": serde_variant_names::<ocean_observatory::EventPayload>(
                     json!({ "kind": "contract-probe", "data": {} })
                 ),
-                "gap_kind": gap[0],
+                "gap_kind": gap["kind"],
+                "gap_payload_kind": gap_payload_kind,
             },
         });
         assert!(

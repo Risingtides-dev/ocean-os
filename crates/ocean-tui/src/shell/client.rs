@@ -24,8 +24,8 @@ use ocean_core::{
     SessionSyncResponse,
 };
 use ocean_observatory::{
-    observer_token_for_child, observer_token_from_file, EventEnvelope as ObservatoryEventEnvelope,
-    EventPayload, ObservatorySnapshot,
+    observer_token_for_child, observer_token_from_file, Cursor,
+    EventEnvelope as ObservatoryEventEnvelope, EventPayload, ObservatorySnapshot,
 };
 use tokio::sync::mpsc;
 
@@ -450,13 +450,7 @@ impl DaemonClient {
                             }
                             ObservatoryFrame::Event(event) => event,
                         };
-                        if event.daemon_instance_id != daemon_instance_id
-                            || !event.cursor.is_consecutive_after(cursor)
-                            || matches!(
-                                event.payload,
-                                EventPayload::StreamGap { .. } | EventPayload::StreamReset { .. }
-                            )
-                        {
+                        if !observatory_event_continues(&event, &daemon_instance_id, cursor) {
                             rebaseline = true;
                             break;
                         }
@@ -1116,6 +1110,27 @@ enum ObservatoryFrame {
     Rebaseline,
 }
 
+/// Whether a decoded Observatory envelope extends the current baseline.
+///
+/// The daemon signals a live-tail hole with a typed `StreamGap` envelope
+/// (Gate 1 manifest §2.1 Property 4, §7.2), and §2.1 says the client "must
+/// request a fresh snapshot after a gap"; a `StreamReset` means the same.
+/// Either one ends the baseline by name, as does a daemon restart or a cursor
+/// that does not follow the last one applied.
+fn observatory_event_continues(
+    event: &ObservatoryEventEnvelope,
+    daemon_instance_id: &str,
+    cursor: Cursor,
+) -> bool {
+    match event.payload {
+        EventPayload::StreamGap { .. } | EventPayload::StreamReset { .. } => false,
+        _ => {
+            event.daemon_instance_id == daemon_instance_id
+                && event.cursor.is_consecutive_after(cursor)
+        }
+    }
+}
+
 fn parse_observatory_frame(frame: &str) -> ObservatoryFrame {
     if matches!(
         parse_sse_event(frame),
@@ -1125,7 +1140,10 @@ fn parse_observatory_frame(frame: &str) -> ObservatoryFrame {
     }
     // Keepalive/comment frames carry no data. Any data frame on this typed
     // stream that fails schema decoding is a continuity break: rebaseline now
-    // rather than waiting for a later cursor gap to expose it.
+    // rather than waiting for a later cursor gap to expose it. (Gap signals
+    // are typed envelopes and never land here; this is the backstop for a
+    // frame the TUI's schema does not know, including the untyped
+    // `"kind":"stream.gap"` frame daemons before the typed gap sent.)
     if !frame.lines().any(|line| line.starts_with("data:")) {
         return ObservatoryFrame::KeepAlive;
     }
@@ -1785,8 +1803,9 @@ mod tests {
     /// Consumer half of the Observatory contract: the two routes, the query
     /// fields and values, the bearer scheme and the `401` the TUI answers by
     /// dropping its environment token, the frames it rebaselines on, the
-    /// synthesized gap frame (not an envelope, so it must rebaseline too),
-    /// the snapshot and envelope it decodes, and the payload kinds it names.
+    /// typed `StreamGap` envelope the tail sends for a hole (decoded and
+    /// rebaselined on by name, not by a decode failure), the snapshot and
+    /// envelope it decodes, and the payload kinds it names.
     #[test]
     fn observatory_client_is_inside_the_published_observatory_wire() {
         let wire = contract(include_str!(
@@ -1855,17 +1874,25 @@ mod tests {
                 "a published {frame} frame without an envelope must rebaseline"
             );
         }
-        let gap = format!(
-            "event: message\ndata: {}",
-            serde_json::json!({
-                "cursor": "2",
-                "kind": events["gap_kind"],
-                "payload": { "from_cursor": "1", "to_cursor": "3", "reason": "cursor_jump" },
-            })
+        let gap_kind = events["gap_kind"].as_str().unwrap();
+        let gap_payload_kind = events["gap_payload_kind"].as_str().unwrap();
+        inside(&events["event_kinds"], [gap_kind], "gap kind");
+        inside(
+            &events["payload_kinds"],
+            [gap_payload_kind],
+            "gap payload kind",
+        );
+        let gap = observatory_gap_frame(gap_kind, gap_payload_kind);
+        let ObservatoryFrame::Event(event) = parse_observatory_frame(&gap) else {
+            panic!("the published gap frame is an envelope the TUI decodes: {gap}");
+        };
+        assert!(
+            matches!(event.payload, EventPayload::StreamGap { .. }),
+            "the published gap frame decodes as StreamGap"
         );
         assert!(
-            matches!(parse_observatory_frame(&gap), ObservatoryFrame::Rebaseline),
-            "the published gap frame is not an envelope; the TUI must rebaseline on it"
+            !observatory_event_continues(&event, "d", Cursor::new(1)),
+            "a gap ends the baseline even when its cursor follows the last one"
         );
 
         assert_eq!(events["payload_tag"], "kind");
@@ -1913,6 +1940,70 @@ mod tests {
         let frame = "event: error\ndata: {\"error\":\"subscriber lagged\"}";
         assert_eq!(parse_sse_event(frame), Some("error"));
         assert!(parse_sse_frame(frame).is_none());
+    }
+
+    /// A live-tail gap frame shaped like the daemon's `gap_envelope`, with
+    /// the top-level kind and payload variant names given by the contract.
+    fn observatory_gap_frame(kind: &str, payload_kind: &str) -> String {
+        let data = serde_json::json!({
+            "schema_version": 1,
+            "cursor": "2",
+            "event_id": "gap",
+            "observatory_id": "o",
+            "daemon_instance_id": "d",
+            "occurred_at": "2026-09-26T00:00:00Z",
+            "recorded_at": "2026-09-26T00:00:00Z",
+            "kind": kind,
+            "truth": "derived",
+            "producer": { "kind": "daemon", "id": "ocean-daemon" },
+            "topology": {
+                "execution_id": "", "root_execution_id": "",
+                "parent_execution_id": null, "edge_id": null,
+                "session_id": "", "turn_id": "", "request_id": "",
+            },
+            "correlation": { "tool_call_id": null, "permission_id": null },
+            "visibility": "metadata",
+            "payload": {
+                "kind": payload_kind,
+                "data": { "from_cursor": "1", "to_cursor": "3", "reason": "cursor_jump" },
+            },
+        });
+        format!("event: message\ndata: {data}")
+    }
+
+    /// The baseline survives only a consecutive, same-instance, non-signal
+    /// envelope; a typed gap or reset ends it by name.
+    #[test]
+    fn observatory_continuity_rebaselines_on_gap_by_name() {
+        let ObservatoryFrame::Event(gap) =
+            parse_observatory_frame(&observatory_gap_frame("stream_gap", "StreamGap"))
+        else {
+            panic!("a typed gap decodes");
+        };
+        assert!(!observatory_event_continues(&gap, "d", Cursor::new(1)));
+
+        let mut ordinary = gap.clone();
+        ordinary.kind = ocean_observatory::EventKind::ExecutionHeartbeat;
+        ordinary.payload = EventPayload::ExecutionHeartbeat {};
+        assert!(observatory_event_continues(&ordinary, "d", Cursor::new(1)));
+        assert!(!observatory_event_continues(&ordinary, "d", Cursor::new(0)));
+        assert!(!observatory_event_continues(
+            &ordinary,
+            "other",
+            Cursor::new(1)
+        ));
+
+        let mut reset = ordinary.clone();
+        reset.payload = EventPayload::StreamReset { reason: "r".into() };
+        assert!(!observatory_event_continues(&reset, "d", Cursor::new(1)));
+
+        // The untyped frame older daemons sent still rebaselines, through
+        // the undecodable-data backstop.
+        let legacy = "event: message\ndata: {\"cursor\":\"2\",\"kind\":\"stream.gap\",\"payload\":{\"from_cursor\":\"1\",\"to_cursor\":\"3\",\"reason\":\"cursor_jump\"}}";
+        assert!(matches!(
+            parse_observatory_frame(legacy),
+            ObservatoryFrame::Rebaseline
+        ));
     }
 
     #[test]
