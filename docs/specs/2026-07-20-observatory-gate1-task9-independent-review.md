@@ -264,9 +264,12 @@ the in-memory watermark ahead of the durable log
 (`a_failed_append_does_not_advance_the_cursor`). Open, non-gating:
 
 - ~~The size loop reduces a page-measured excess by raw JSON length~~ —
-  fixed 2026-09-25: the size bound now prunes in batches of 64 and re-measures
-  live pages after each commit, stopping once under the bound. WAL size is
-  still not counted.
+  fixed 2026-09-25 (ocean-os PR #487): the size bound now prunes in batches
+  of 64 and re-measures live pages after each commit, stopping once under the
+  bound. WAL size is still not counted; the §4.3 checkpoint (below) bounds
+  the WAL separately. The PR #486 delta-review comment calls this item
+  "size-loop margin"; no further margin repair is defined, so the item is
+  closed (status reconciled 2026-09-26).
 - ocean-surface's Replay scrubber asks `snapshot?at=<earlier cursor>`, which
   now answers 409 (it previously got current state under the wrong label); it
   must move to `/replay` or be disabled before the renderer relies on it.
