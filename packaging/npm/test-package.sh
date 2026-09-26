@@ -141,12 +141,13 @@ package/THIRD-PARTY-LICENSES.txt
 package/TRADEMARKS.md
 package/bin/ocean
 package/bin/ocean-daemon
+package/bin/ocean-mcp
 package/ocean-update.sh
 package/package.json
 FILES
 )"
 if [[ "$actual_files" != "$expected_files" ]]; then
-  echo "error: packed file set differs from the twelve-file contract" >&2
+  echo "error: packed file set differs from the thirteen-file contract" >&2
   diff -u <(printf '%s\n' "$expected_files") <(printf '%s\n' "$actual_files") || true
   exit 1
 fi
@@ -160,7 +161,7 @@ cmp "$inventory" "$tmp_dir/unpacked/package/THIRD-PARTY-LICENSES.txt"
 
 prefix="$tmp_dir/prefix"
 npm install --global --ignore-scripts --no-audit --no-fund --prefix "$prefix" "$archive_path" >/dev/null
-for command_name in ocean ocean-daemon ocean-update; do
+for command_name in ocean ocean-daemon ocean-mcp ocean-update; do
   if [[ ! -x "$prefix/bin/$command_name" ]]; then
     echo "error: npm install did not expose executable $command_name" >&2
     exit 1
@@ -169,8 +170,10 @@ done
 
 ocean_target="$(readlink "$prefix/bin/ocean")"
 daemon_target="$(readlink "$prefix/bin/ocean-daemon")"
-if [[ "$(dirname "$ocean_target")" != "$(dirname "$daemon_target")" ]]; then
-  echo "error: ocean and ocean-daemon did not install as sibling binaries" >&2
+mcp_target="$(readlink "$prefix/bin/ocean-mcp")"
+if [[ "$(dirname "$ocean_target")" != "$(dirname "$daemon_target")" \
+  || "$(dirname "$ocean_target")" != "$(dirname "$mcp_target")" ]]; then
+  echo "error: ocean, ocean-daemon, and ocean-mcp did not install as sibling binaries" >&2
   exit 1
 fi
 
@@ -183,7 +186,7 @@ if [[ "${RUN_BUN_SMOKE:-0}" == "1" ]]; then
   mkdir -p "$tmp_dir/bun-home"
   HOME="$tmp_dir/bun-home" BUN_INSTALL="$bun_root" \
     bun add --global "$archive_path" --cache-dir "$tmp_dir/bun-cache" --no-progress >/dev/null
-  for command_name in ocean ocean-daemon ocean-update; do
+  for command_name in ocean ocean-daemon ocean-mcp ocean-update; do
     if [[ ! -x "$bun_root/bin/$command_name" ]]; then
       echo "error: bun install did not expose executable $command_name" >&2
       exit 1
