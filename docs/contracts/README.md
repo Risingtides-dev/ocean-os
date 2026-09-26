@@ -8,7 +8,8 @@ turns that test red.
 | Artifact | Consumer | Held equal by |
 |---|---|---|
 | `room-wire.json` | ocean-surface (Rooms), the `ocean-mcp` room tools | `room_wire_contract_matches_the_daemon` in `crates/ocean-daemon/src/main.rs` |
-| `session-wire.json` | every first-party surface (sessions, agent events) | `session_wire_contract_matches_the_daemon` in `crates/ocean-daemon/src/main.rs` |
+| `session-wire.json` | every first-party surface (sessions, agent events, turns, prompts, permissions, models and the other daemon-control routes) | `session_wire_contract_matches_the_daemon` and `session_wire_consumer_routes_match_the_daemon` in `crates/ocean-daemon/src/main.rs` |
+| `observatory-wire.json` | the TUI's live Observatory graph | `observatory_wire_contract_matches_the_daemon` in `crates/ocean-daemon/src/main.rs` |
 | `component-wire.json` | surfaces that render agent components | `component_wire_contract_matches_the_runtime` in `crates/ocean-runtime/src/tools/component.rs` |
 | `voice-wire.json` | ocean-surface (web and Tauri voice), Ocean Buddy (voice and event ingress), TUI dictation | `voice_wire_contract_matches_the_daemon` in `crates/ocean-daemon/src/main.rs` |
 
@@ -26,20 +27,25 @@ check is equality.
 | `ocean-tui` dictation | `voice-wire.json` | `POST /v1/voice/stt`, the `audio/wav` body type, the `text` response key and the `error` key | `stt_client_is_inside_the_published_voice_wire` in `crates/ocean-tui/src/shell/client.rs` |
 | `ocean-tui` session stream | `session-wire.json` | its decoder knows every published event type; every event variant it branches on is published; its session-create body and decoded response stay inside the published keys | `session_client_is_inside_the_published_session_wire` in `crates/ocean-tui/src/shell/client.rs` |
 | `ocean-tui` stream recovery, sync and config | `session-wire.json` | the `/v1/agent/events` route and its `error` reset frame, the `ocean.session_changed` extension, the `tui` client type, `/v1/sessions/{id}/sync` and the sync keys it decodes, the config routes, PATCH body, decoded keys, `error` key and busy answer | `session_stream_sync_and_config_are_inside_the_published_session_wire` in `crates/ocean-tui/src/shell/client.rs` |
+| `ocean-tui` daemon routes | `session-wire.json` | the session-create, health, turn, compact, cancel, permission-decision, permission-settings, models, memory, LSP and `/v1/events` routes; the turn body and acknowledgement, its busy answer, and a deliberate branch for every published turn status; the `session_id` and `replay` stream query fields; the compact keys and the pre-commit refusal statuses it trusts; the cancel keys; the decision body and decision values; the settings bodies and modes; the model, memory and LSP keys and the `cwd` query; and on `/v1/events`, a decoder that knows every published event type, a published type for every event it branches on, and the envelope fields it decodes | `daemon_routes_are_inside_the_published_session_wire` in `crates/ocean-tui/src/shell/client.rs` |
+| `ocean-tui` Observatory graph | `observatory-wire.json` | the snapshot and events routes, the `detail`, `after` and `scope` query fields and the `summary` value it asks for, the resume header, the Bearer scheme and the `401` it answers by dropping its environment token, the `reset` and `error` frames it rebaselines on, the synthesized gap frame (not an envelope, so it must rebaseline), the snapshot and envelope fields, and the payload kinds it branches on | `observatory_client_is_inside_the_published_observatory_wire` in `crates/ocean-tui/src/shell/client.rs` |
 | `ocean-tui` component projection | `component-wire.json` | every kind `component_lines` and the pinned-height table branch on is published, and both keep a fallback arm | `component_kinds_are_inside_the_published_component_wire` in `crates/ocean-tui/src/shell/components/chat.rs` |
 | `ocean-acp` event bridge | `session-wire.json` | `event_to_update` names exactly the published event types, with no wildcard | `event_to_update_covers_the_published_session_wire` in `crates/ocean-acp/src/convert.rs` |
 | `ocean-acp` component markdown | `component-wire.json` | every kind `render_component_markdown` special-cases is published, and a fallback arm renders the rest | `component_kinds_are_inside_the_published_component_wire` in `crates/ocean-acp/src/convert.rs` |
 | `ocean-acp` session create | `session-wire.json` | the create body it sends, its `acp-zed` client type, and the response it decodes (it relies on `cwd`) | `session_create_is_inside_the_published_session_wire` in `crates/ocean-acp/src/daemon.rs` |
-| `ocean-mcp` room tools | `room-wire.json` | the `/snapshot` keys `ocean_room_read` reads, the row fields and message kinds `render_row` reads, the participant kinds it sends and reads, and the list, post, inspect and resources keys the other room tools read | `room_literals_are_inside_the_published_room_wire` in `crates/ocean-mcp/src/bin/ocean_mcp.rs` |
+| `ocean-acp` daemon routes | `session-wire.json` | the models, model-set, session detail, session list, turn, `/v1/events`, permission-decision and cancel routes; the `all` stream query and the `cwd` and `cursor` list query; the model-set, turn and decision bodies; the model, session detail, session list and turn keys it decodes; and on `/v1/events`, every published event type decodes, every event `main.rs` branches on is published, and the envelope fields stay inside the published ones | `daemon_routes_are_inside_the_published_session_wire` in `crates/ocean-acp/src/daemon.rs` |
+| `ocean-mcp` room tools | `room-wire.json` | the room routes it calls, the `/snapshot` query it sends and the keys `ocean_room_read` reads, the row fields and message kinds `render_row` reads, the participant kinds it sends and reads, the post and join bodies it sends, and the list, post, inspect and resources keys the other room tools read | `room_literals_are_inside_the_published_room_wire` in `crates/ocean-mcp/src/bin/ocean_mcp.rs` |
+| `ocean-mcp` daemon tools and `doctor` | `session-wire.json` | the health, identity, session list, prompt and agents routes, the prompt body it sends, and the health, identity, session list and prompt keys it reads | `session_literals_are_inside_the_published_session_wire` in `crates/ocean-mcp/src/bin/ocean_mcp.rs` |
+| `ocean-cli` (outside `ocean extension`) | `session-wire.json` | the health, prompt, `/v1/events`, permission-decision and legacy session list and detail routes; the prompt and decision bodies; the `cwd` list query; the health, prompt and session keys it decodes; and on `/v1/events`, every event the permission bridge branches on and the envelope fields it decodes | `daemon_routes_are_inside_the_published_session_wire` in `crates/ocean-cli/src/main.rs` |
 | Ocean Buddy (Swift) | `voice-wire.json` | the client-secret route, body keys, `purpose` and error key; the response keys `BuddyRealtimeSecret` decodes; the tool names `fulfill` dispatches on (equal to the tools a conversation mint can hand it); the `note` argument `write_handoff` reads; the handoff route, body keys, role, kind and `ok` acknowledgement; the event ingress route, the event, state, attachment, response and card names it encodes and decodes, and its mock capture's mime type | the six `buddy_*` tests in `crates/ocean-daemon/tests/buddy_voice_contract.rs` |
 
 The Rust workspace cannot compile Swift, so the Buddy tests read the Swift
 source the way `voice_wire_contract_matches_the_daemon` reads the daemon's
-handlers, and a literal the scan cannot find fails the test. `ocean-cli` uses
-none of these contracts: its routes (`/v1/prompt`, `/v1/sessions`,
-`/v1/events`, `/v1/permissions`, `/v1/extensions`) are not published by any of
-them. ocean-surface still has to vendor the artifacts; #225 covers
-`room-wire.json` there.
+handlers, and a literal the scan cannot find fails the test. The TUI, ACP and
+CLI tests read their wire types' field names through the same serde name probe
+the daemon tests use, or from a written value where a `flatten` hides them.
+ocean-surface still has to vendor the artifacts; #225 covers `room-wire.json`
+there.
 
 ## What each artifact covers
 
@@ -52,7 +58,12 @@ access-projection fields from the serde derives; the keys of the room list,
 of a local post (`201`) and a queued federated post (`202`), of `/inspect`
 and its `execution` block, and of `/resources`, from real answers; and the
 keys of an inspect agent entry, its `execution` block, a credential slot and
-a resource, from the projections that build them (a fresh room has none). It is the daemon half of Rooms DoD 5.8; the surface
+a resource, from the projections that build them (a fresh room has none). It
+also covers the routes a room client calls for those facts (`routes`, each held
+to its registered handler), the `/snapshot` paging query, and the bodies a
+client sends to post a message and to join, from the types those handlers
+extract. The post body type refuses unknown fields, so a client that sends one
+more field is refused. It is the daemon half of Rooms DoD 5.8; the surface
 half vendors the file and checks its decoders against it. Both repositories
 are public, so a consumer's CI can fetch the current artifact directly without
 a cross-repo credential.
@@ -73,6 +84,50 @@ open set: the daemon accepts and echoes any string, and the published `known`
 values are the ones `HarnessProfile::from_client_type` maps (anything else
 runs with the CLI profile). The test proves both by source and by creating a
 session with an unlisted value.
+
+`session-wire.json` also covers every other daemon route an in-repo consumer
+calls: `POST /v1/agent/sessions` itself (`session_create_route`), `GET
+/health`, `GET /v1/identity` (and its `source` values), `POST /v1/agent/turns`
+(its statuses, request and acknowledgement fields, and the `409` busy text the
+TUI matches), the `/v1/agent/events` query fields, `GET /v1/agent/sessions`
+and `GET /v1/agent/sessions/{id}`, the legacy `GET /v1/sessions` and `GET
+/v1/sessions/{id}` that `ocean-cli` reads, `POST /v1/sessions/{id}/compact`
+(whose `sync` and `fence` are the published `session_sync` snapshot and fence
+shapes), `POST /v1/requests/{id}/cancel`, `POST /v1/permissions/{id}/decision`
+(its body and decision values), `GET`/`POST /v1/settings/permissions` (bodies
+and modes), `GET /v1/models` and `POST /v1/model`, `GET /v1/memory`, `GET
+/v1/lsp`, `GET /v1/agents`, the legacy `GET /v1/events` stream (its `type` tag,
+event types and envelope fields) and `POST /v1/prompt`. Each section publishes
+the route, the statuses its handler can answer, the request and query fields,
+and the full response shape, so a consumer's subset check has the whole shape
+to check against. `session_wire_consumer_routes_match_the_daemon` rebuilds
+every section from the code and compares it whole: routes and handlers from
+the router, statuses from the handler's `StatusCode::*` (a handler that answers
+a bare `Json` is `200`), fields from the serde derives through the name probe
+(or a fully populated value where a `flatten` or an input `alias` would hide
+or add names), variant names of tagged enums from the error their derive gives
+an unknown tag, literal-built answers from the handler's own `json!` keys, and
+the rest from real answers. It also checks that each handler extracts and
+answers the type the section is derived from.
+
+`observatory-wire.json` covers the Observatory read API. It is a contract of its
+own because the API is a surface of its own: it has its own auth (an observer token, sent by the TUI as
+`Bearer`), its own error body (`error`, `message`, `http_status`), its own SSE
+frames and cursor resume, and wire types from the `ocean-observatory` crate
+under the Gate 1 manifest, so folding it into `session-wire.json` would mix
+two authorities. It covers `GET /v1/observatory/snapshot` (statuses including
+the auth `401` and the store's `503`, the `at` and `detail` query fields, the
+accepted `detail` values, and the `ObservatorySnapshot` fields) and `GET
+/v1/observatory/events` (statuses, the `after` and `scope` query fields, the
+accepted `scope` values, the `last-event-id` resume header, the `error`,
+`message` and `reset` frame names, the envelope fields, `EventKind` names, the
+adjacently tagged `EventPayload` tag and variant names, and the `stream.gap`
+kind of the gap frame the tail synthesizes). That gap frame is not an
+`EventEnvelope`: its top-level `kind` is `stream.gap`, which is not an
+`EventKind`, so a typed decoder fails on it. The TUI rebaselines on any data
+frame it cannot decode, and its test holds it to that. The payload variant
+names are PascalCase on the wire because `EventPayload` has no `rename_all`;
+the contract publishes them as they are.
 
 `component-wire.json` lists the component kinds the runtime's component tools
 accept, in `VALID_KINDS` order, and its test also requires a section per kind
@@ -124,8 +179,28 @@ bump on an additive change, and every consumer reads by key.
 - The rows of a sync `snapshot.transcript`. The TUI decodes them with the
   shared `ocean_core` type, so in-repo drift is a compile error; publish them
   when a sibling repo decodes them.
+- The inner fields of the legacy `GET /v1/sessions/{id}` `session` object
+  (`SessionDetail`). `ocean-cli` decodes it with the shared `ocean_core` type
+  and prints it whole, for the same reason as the transcript rows.
+- The SSE frame names on the legacy `/v1/events` stream. They come from an
+  internal naming helper, not the serde tag, and no consumer reads them: all
+  three decode the `data:` envelope and ignore the frame name.
+- The Observatory error codes (`invalid_cursor`, `cursor_expired` and the
+  rest), and `GET /v1/observatory/replay`. The TUI keys on status and frame
+  name and never reads a code, and no in-repo client calls replay; publish
+  them when ocean-surface's Observatory reducer vendors this file.
+- The inner shapes of the Observatory snapshot's nodes, edges and attention
+  items, the envelope's topology, correlation and producer objects, and each
+  payload's data fields. The TUI decodes them with the shared
+  `ocean_observatory` types.
+- `ocean-cli`'s `ocean extension` routes (`/v1/extensions/*`). Their contract
+  is the Stage A implementation manifest's §15 surface: the pre-commit and
+  committed envelopes, the `202` and exit-code rules, and the operator
+  credential. The A3b route tests and the A5 end-to-end gate hold the CLI and
+  the routes to it. Stage A is not accepted and five operator rulings are
+  still open, one of them the mutation credential class. A copy here would be
+  a second authority over a surface that can still change under those
+  rulings. Publish them when Stage A is accepted.
 
-Other daemon routes the in-repo consumers still call are not published yet:
-the TUI's turn, compact, permission, model, memory, LSP and Observatory
-routes; `ocean-mcp`'s health, identity, session list and prompt routes and
-its post and join request bodies; and `ocean-cli`'s routes listed above.
+Every other daemon route an in-repo consumer calls is now published, and the
+consumer tests in the table above hold each call site inside its contract.

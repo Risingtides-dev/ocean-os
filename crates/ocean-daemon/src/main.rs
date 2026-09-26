@@ -15240,13 +15240,33 @@ mod tests {
                 "agent_event_tag",
                 "agent_event_types",
                 "agent_events_error",
+                "agent_events_query_fields",
                 "agent_events_route",
+                "agent_turn",
+                "agents",
+                "events",
+                "health",
+                "identity",
+                "legacy_session_detail",
+                "legacy_session_list",
+                "lsp",
+                "memory",
+                "model_set",
+                "models",
                 "note",
+                "permission_decision",
+                "permission_settings",
+                "prompt",
+                "request_cancel",
                 "session_changed_extension",
+                "session_compact",
                 "session_config",
                 "session_create_client_types",
                 "session_create_request_fields",
                 "session_create_response_keys",
+                "session_create_route",
+                "session_detail",
+                "session_list",
                 "session_sync",
                 "version",
             ])
@@ -15440,6 +15460,627 @@ mod tests {
         );
     }
 
+    /// ROADMAP drift checks, second half of `docs/contracts/session-wire.json`:
+    /// the daemon routes the in-repo consumers (TUI, ocean-acp, ocean-mcp)
+    /// call beyond session create, the agent stream, sync and config. Each
+    /// section is rebuilt here from the code and compared whole, so a fact the
+    /// artifact adds, drops or changes turns this red in either direction.
+    /// Routes come from the router registrations, statuses from the
+    /// `StatusCode::*` each registered handler names (a handler that answers a
+    /// bare `Json` is `200`), request and response fields from the serde
+    /// derives through the name probe (or a fully populated value where a
+    /// `flatten` hides the names from the probe), literal-built bodies from
+    /// the handler's own `json!` keys, and the rest from real answers.
+    #[tokio::test]
+    async fn session_wire_consumer_routes_match_the_daemon() {
+        let artifact: serde_json::Value =
+            serde_json::from_str(include_str!("../../../docs/contracts/session-wire.json"))
+                .expect("session-wire.json parses");
+        let state = capped_turn_state(1);
+        let derived = session_wire_consumer_routes(&state).await;
+
+        // A compact answer carries the published sync snapshot and fence.
+        let compacted = serde_json::to_value(CompactResponse {
+            ok: true,
+            session_id: uuid::Uuid::nil(),
+            wall_ms: 1,
+            elided_messages: 1,
+            stderr: String::new(),
+            sync: Some(ocean_core::SessionSyncSnapshot {
+                session_id: uuid::Uuid::nil(),
+                model: "m".into(),
+                provider: "p".into(),
+                config_revision: 1,
+                transcript: Vec::new(),
+                truncated_messages: 1,
+                truncated_text_bytes: 1,
+            }),
+            fence: Some(ocean_core::SessionEventFence {
+                event_id: Some(uuid::Uuid::nil()),
+            }),
+        })
+        .unwrap();
+        assert_eq!(
+            json!(value_keys(&compacted["sync"])),
+            artifact["session_sync"]["snapshot_fields"]
+        );
+        assert_eq!(
+            json!(value_keys(&compacted["fence"])),
+            artifact["session_sync"]["fence_fields"]
+        );
+        let drifted: serde_json::Map<String, serde_json::Value> = derived
+            .as_object()
+            .unwrap()
+            .iter()
+            .filter(|(section, expected)| &artifact[section.as_str()] != *expected)
+            .map(|(section, expected)| (section.clone(), expected.clone()))
+            .collect();
+        assert!(
+            drifted.is_empty(),
+            "session-wire.json sections differ from what the daemon serves; the daemon's are:\n{}",
+            serde_json::to_string_pretty(&drifted).unwrap()
+        );
+    }
+
+    /// The consumer-route sections of `session-wire.json`, rebuilt from code.
+    async fn session_wire_consumer_routes(state: &AppState) -> serde_json::Value {
+        let registered = source_registered_routes();
+        let route = |route: &str| -> serde_json::Value {
+            assert!(registered.contains(route), "{route} is registered");
+            json!(route)
+        };
+        let uses = |route: &str, types: &[&str]| {
+            let body = route_handler_body(route);
+            for ty in types {
+                assert!(body.contains(ty), "{route} handler uses {ty}");
+            }
+        };
+
+        // GET /health: the shared HealthResponse flattened with `rev`,
+        // `room_maintenance` and `rooms`.
+        uses("GET /health", &["Json<HealthEnvelope>"]);
+        let health_answer = serde_json::to_value(&health(State(state.clone())).await.0).unwrap();
+
+        // GET /v1/identity
+        let identity_answer = identity::Identity {
+            member_id: Some("m".into()),
+            display_name: Some("d".into()),
+            source: identity::IdentitySource::MemberToml,
+        }
+        .to_json();
+        let identity_source = |source: identity::IdentitySource| match source {
+            identity::IdentitySource::MemberToml
+            | identity::IdentitySource::Env
+            | identity::IdentitySource::Unset => json!(source).as_str().unwrap().to_string(),
+        };
+        assert!(route_handler_body("GET /v1/identity").contains(".to_json()"));
+
+        // POST /v1/agent/turns
+        uses(
+            "POST /v1/agent/turns",
+            &["Json<AgentTurnRequest>", "Json<AgentTurnResponse>"],
+        );
+        let turn = route_handler_body("POST /v1/agent/turns");
+        let turn_conflict = &turn[turn
+            .find("StatusCode::CONFLICT")
+            .expect("a busy session is refused")..];
+        let turn_busy = source_quoted_after(turn_conflict, "error: Some(\"")[0].clone();
+
+        // POST /v1/sessions/{id}/compact
+        uses("POST /v1/sessions/{id}/compact", &["Json<CompactResponse>"]);
+
+        // POST /v1/requests/{id}/cancel
+        uses(
+            "POST /v1/requests/{id}/cancel",
+            &["Json<RequestControlResponse>"],
+        );
+
+        // POST /v1/permissions/{id}/decision: the body flattens the decision,
+        // so its names come from a fully populated value.
+        uses(
+            "POST /v1/permissions/{id}/decision",
+            &[
+                "Json<PermissionDecisionRequest>",
+                "Json<PermissionControlResponse>",
+            ],
+        );
+        let decision_body = serde_json::to_value(PermissionDecisionRequest {
+            permission_id: uuid::Uuid::nil(),
+            decision: PermissionDecisionBody::Deny {
+                reason: Some("r".into()),
+            },
+            decision_token: Some("t".into()),
+        })
+        .unwrap();
+
+        // GET/POST /v1/settings/permissions
+        let settings_routes: Vec<String> = registered
+            .iter()
+            .filter(|route| route.ends_with(" /v1/settings/permissions"))
+            .cloned()
+            .collect();
+        for settings_route in &settings_routes {
+            uses(settings_route, &["Json<PermissionSettingsResponse>"]);
+        }
+        uses(
+            "POST /v1/settings/permissions",
+            &["Json<PermissionSettingsRequest>"],
+        );
+
+        // GET /v1/models: the answer is a literal, so its keys come from a real
+        // answer; an entry is the flattened ReadyModel, so its names come from
+        // a fully populated value.
+        uses("GET /v1/models", &["known_models_with_readiness"]);
+        let models_answer = model_catalog::models_list(State(state.clone())).await.0;
+        let model_entry = serde_json::to_value(ocean_agent::ReadyModel {
+            model: ocean_agent::KnownModel {
+                id: "i".into(),
+                provider: "p".into(),
+                label: "l".into(),
+            },
+            ready: true,
+            credential_source: Some(ocean_providers::CredentialSource::NotRequired),
+        })
+        .unwrap();
+
+        // POST /v1/model
+        uses("POST /v1/model", &["Json<ModelSetRequest>"]);
+
+        // GET /v1/memory, GET /v1/lsp and GET /v1/agents answer one top-level
+        // literal each.
+        uses("GET /v1/memory", &["ocean_agent::list_memories("]);
+        uses(
+            "GET /v1/lsp",
+            &["Query<LspQuery>", "ocean_agent::lsp_servers("],
+        );
+
+        // GET /v1/events: each data frame is a whole serialized envelope.
+        assert!(route_handler_body("GET /v1/events").contains("legacy_event_to_sse(&envelope)"));
+        assert!(
+            source_fn_body(production_main_source(), "legacy_event_to_sse")
+                .contains("serde_json::to_string(envelope)")
+        );
+        let mut envelope = serde_json::to_value(EventEnvelope {
+            id: uuid::Uuid::nil(),
+            at: Utc::now(),
+            session_id: Some(uuid::Uuid::nil()),
+            request_id: Some(uuid::Uuid::nil()),
+            permission_id: Some(uuid::Uuid::nil()),
+            origin: Some("o".into()),
+            event: OceanEvent::SessionCreated,
+        })
+        .unwrap();
+        assert_eq!(
+            envelope["type"], "session_created",
+            "events are tagged by type"
+        );
+        envelope.as_object_mut().unwrap().remove("type");
+
+        // POST /v1/prompt
+        uses(
+            "POST /v1/prompt",
+            &["Json<PromptRequest>", "Json<ocean_core::PromptResponse>"],
+        );
+
+        // GET /v1/agent/sessions and GET /v1/agent/sessions/{id}
+        uses(
+            "GET /v1/agent/sessions",
+            &["Query<SessionListQuery>", "Json<AgentSessionsResponse>"],
+        );
+        uses(
+            "GET /v1/agent/sessions/{id}",
+            &["Json<AgentSessionResponse>"],
+        );
+
+        // The legacy GET /v1/sessions and GET /v1/sessions/{id} ocean-cli
+        // reads. The list rows are SessionSummary; its `id` also accepts a
+        // `session_id` alias on input, so the names come from a written row.
+        uses(
+            "GET /v1/sessions",
+            &["Query<SessionListQuery>", "\"sessions\": page.items"],
+        );
+        uses("GET /v1/sessions/{id}", &["Json<SessionResponse>"]);
+        let legacy_summary = serde_json::to_value(ocean_core::SessionSummary {
+            id: uuid::Uuid::nil(),
+            model: "m".into(),
+            turns: 1,
+            title: "t".into(),
+            workspace_root: Some("/w".into()),
+            git_branch: Some("b".into()),
+            updated_ms: Some(1),
+        })
+        .unwrap();
+
+        // POST /v1/agent/sessions: its bodies are pinned by
+        // session_wire_contract_matches_the_daemon; this is the route.
+        uses(
+            "POST /v1/agent/sessions",
+            &["Json<AgentSessionCreateRequest>"],
+        );
+
+        json!({
+            "session_create_route": route("POST /v1/agent/sessions"),
+            "agent_events_query_fields": serde_wire_names::<AgentEventsQuery>(),
+            "health": {
+                "route": route("GET /health"),
+                "statuses": route_statuses("GET /health"),
+                "response_fields": value_keys(&health_answer),
+            },
+            "identity": {
+                "route": route("GET /v1/identity"),
+                "statuses": route_statuses("GET /v1/identity"),
+                "response_fields": value_keys(&identity_answer),
+                "sources": sorted_strings([
+                    identity::IdentitySource::MemberToml,
+                    identity::IdentitySource::Env,
+                    identity::IdentitySource::Unset,
+                ]
+                .map(identity_source)),
+            },
+            "agent_turn": {
+                "route": route("POST /v1/agent/turns"),
+                "statuses": route_statuses("POST /v1/agent/turns"),
+                "request_fields": serde_wire_names::<AgentTurnRequest>(),
+                "response_fields": serde_wire_names::<AgentTurnResponse>(),
+                "busy": { "status": 409, "error": turn_busy },
+            },
+            "session_list": {
+                "route": route("GET /v1/agent/sessions"),
+                "statuses": route_statuses("GET /v1/agent/sessions"),
+                "query_fields": serde_wire_names::<SessionListQuery>(),
+                "response_fields": serde_wire_names::<AgentSessionsResponse>(),
+                "summary_fields": serde_wire_names::<AgentSessionSummary>(),
+            },
+            "session_detail": {
+                "route": route("GET /v1/agent/sessions/{id}"),
+                "statuses": route_statuses("GET /v1/agent/sessions/{id}"),
+                "response_fields": serde_wire_names::<AgentSessionResponse>(),
+                "session_fields": serde_wire_names::<ocean_agent_sdk::AgentSession>(),
+            },
+            "legacy_session_list": {
+                "route": route("GET /v1/sessions"),
+                "statuses": route_statuses("GET /v1/sessions"),
+                "query_fields": serde_wire_names::<SessionListQuery>(),
+                "response_fields": json_literal_keys(route_handler_body("GET /v1/sessions")),
+                "summary_fields": value_keys(&legacy_summary),
+            },
+            "legacy_session_detail": {
+                "route": route("GET /v1/sessions/{id}"),
+                "statuses": route_statuses("GET /v1/sessions/{id}"),
+                "response_fields": serde_wire_names::<SessionResponse>(),
+            },
+            "session_compact": {
+                "route": route("POST /v1/sessions/{id}/compact"),
+                "statuses": route_statuses("POST /v1/sessions/{id}/compact"),
+                "response_fields": serde_wire_names::<CompactResponse>(),
+            },
+            "request_cancel": {
+                "route": route("POST /v1/requests/{id}/cancel"),
+                "statuses": route_statuses("POST /v1/requests/{id}/cancel"),
+                "response_fields": serde_wire_names::<RequestControlResponse>(),
+            },
+            "permission_decision": {
+                "route": route("POST /v1/permissions/{id}/decision"),
+                "statuses": route_statuses("POST /v1/permissions/{id}/decision"),
+                "request_fields": value_keys(&decision_body),
+                "decisions": serde_variant_names::<PermissionDecisionBody>(
+                    json!({ "decision": "contract-probe" })
+                ),
+                "response_fields": serde_wire_names::<PermissionControlResponse>(),
+            },
+            "permission_settings": {
+                "routes": settings_routes,
+                "statuses": settings_routes
+                    .iter()
+                    .map(|settings_route| (settings_route.clone(), json!(route_statuses(settings_route))))
+                    .collect::<serde_json::Map<_, _>>(),
+                "request_fields": serde_wire_names::<ocean_core::PermissionSettingsRequest>(),
+                "modes": serde_wire_names::<PermissionMode>(),
+                "response_fields": serde_wire_names::<ocean_core::PermissionSettingsResponse>(),
+            },
+            "models": {
+                "route": route("GET /v1/models"),
+                "statuses": route_statuses("GET /v1/models"),
+                "response_fields": value_keys(&models_answer),
+                "current_fields": value_keys(&models_answer["current"]),
+                "model_fields": value_keys(&model_entry),
+            },
+            "model_set": {
+                "route": route("POST /v1/model"),
+                "statuses": route_statuses("POST /v1/model"),
+                "request_fields": serde_wire_names::<model_catalog::ModelSetRequest>(),
+                "response_fields": json_literal_keys(route_handler_body("POST /v1/model")),
+            },
+            "memory": {
+                "route": route("GET /v1/memory"),
+                "statuses": route_statuses("GET /v1/memory"),
+                "response_fields": answer_literal_keys(route_handler_body("GET /v1/memory")),
+                "memory_fields": serde_wire_names::<ocean_agent::MemoryView>(),
+            },
+            "lsp": {
+                "route": route("GET /v1/lsp"),
+                "statuses": route_statuses("GET /v1/lsp"),
+                "query_fields": serde_wire_names::<LspQuery>(),
+                "response_fields": answer_literal_keys(route_handler_body("GET /v1/lsp")),
+                "server_fields": serde_wire_names::<ocean_agent::LspServerView>(),
+            },
+            "agents": {
+                "route": route("GET /v1/agents"),
+                "statuses": route_statuses("GET /v1/agents"),
+                "response_fields": answer_literal_keys(route_handler_body("GET /v1/agents")),
+            },
+            "events": {
+                "route": route("GET /v1/events"),
+                "event_tag": "type",
+                "envelope_fields": value_keys(&envelope),
+                "event_types": serde_variant_names::<OceanEvent>(json!({ "type": "contract-probe" })),
+            },
+            "prompt": {
+                "route": route("POST /v1/prompt"),
+                "statuses": route_statuses("POST /v1/prompt"),
+                "request_fields": serde_wire_names::<PromptRequest>(),
+                "response_fields": serde_wire_names::<ocean_core::PromptResponse>(),
+            },
+        })
+    }
+
+    /// ROADMAP drift checks: `docs/contracts/observatory-wire.json` is the
+    /// Observatory read wire the TUI's live graph decodes. Routes come from the
+    /// router, statuses from each handler's `StatusCode::*` plus the `503` its
+    /// `store_unavailable` helper answers and the `401` the `ObservatoryAuth`
+    /// extractor answers, query fields and wire types from the serde derives,
+    /// the accepted `detail` and `scope` values and the SSE frame names from
+    /// the handler source, and the error keys from the one error builder.
+    #[test]
+    fn observatory_wire_contract_matches_the_daemon() {
+        let artifact: serde_json::Value = serde_json::from_str(include_str!(
+            "../../../docs/contracts/observatory-wire.json"
+        ))
+        .expect("observatory-wire.json parses");
+        let source = include_str!("observatory.rs");
+        let source = source.split("\n#[cfg(test)]\n").next().unwrap();
+        let auth = include_str!("observatory_auth.rs");
+        let registered = source_registered_routes();
+
+        let rejection = source_status_codes(source_section(
+            auth,
+            "impl IntoResponse for ObservatoryUnauthorized",
+            "\n}\n",
+        ));
+        assert_eq!(rejection.len(), 1, "the auth rejection answers one status");
+        let unauthorized = rejection[0];
+        let token = source_fn_body(auth, "request_token");
+        let scheme = source_quoted_after(token, ".strip_prefix(\"")[0]
+            .trim()
+            .to_string();
+        let unavailable = source_status_codes(source_fn_body(source, "store_unavailable"));
+        let statuses = |route: &str| -> Vec<u64> {
+            assert!(registered.contains(route), "{route} is registered");
+            let path = registered_handler_path(route);
+            assert!(
+                path.starts_with("observatory::"),
+                "{route} is an Observatory route"
+            );
+            let body = source_fn_body(source, &registered_handler(route));
+            assert!(
+                body.contains("ObservatoryAuth("),
+                "{route} requires a token"
+            );
+            let mut codes = source_status_codes(body);
+            if body.contains("store_unavailable(") {
+                codes.extend(&unavailable);
+            }
+            codes.push(unauthorized);
+            codes.sort_unstable();
+            codes.dedup();
+            codes
+        };
+        let snapshot = source_fn_body(source, "snapshot");
+        let events = source_fn_body(source, "events");
+        assert!(snapshot.contains("Query<SnapshotQuery>"));
+        assert!(snapshot.contains("Json(snapshot)"));
+        assert!(events.contains("Query<EventsQuery>"));
+        assert!(events.contains("serde_json::to_string(&envelope)"));
+        let mut frames = next_quoted_after(events, ".event(");
+        frames.extend(next_quoted_after(events, "sse_terminal("));
+        let frames = sorted_strings(frames);
+        let gap = source_quoted_after(events, "\"kind\": \"");
+        assert_eq!(gap.len(), 1, "one synthesized gap frame");
+
+        // EventPayload is adjacently tagged; the tag is the key that carries
+        // the variant name.
+        let payload = serde_json::to_value(ocean_observatory::EventPayload::StreamReset {
+            reason: "r".into(),
+        })
+        .unwrap();
+        let payload_tag = payload
+            .as_object()
+            .unwrap()
+            .iter()
+            .find(|(_, value)| *value == "StreamReset")
+            .map(|(key, _)| key.clone())
+            .expect("the payload names its variant");
+        assert!(artifact["note"].is_string());
+        let derived = json!({
+            "note": artifact["note"],
+            "version": 1,
+            "auth_scheme": scheme,
+            "error_fields": json_literal_keys(source_fn_body(source, "error_response")),
+            "snapshot": {
+                "route": "GET /v1/observatory/snapshot",
+                "statuses": statuses("GET /v1/observatory/snapshot"),
+                "query_fields": serde_wire_names::<observatory::SnapshotQuery>(),
+                "detail_values": sorted_strings(source_quoted_after(snapshot, "detail != \"")),
+                "response_fields": serde_wire_names::<ocean_observatory::ObservatorySnapshot>(),
+            },
+            "events": {
+                "route": "GET /v1/observatory/events",
+                "statuses": statuses("GET /v1/observatory/events"),
+                "query_fields": serde_wire_names::<observatory::EventsQuery>(),
+                "scope_values": sorted_strings(source_quoted_after(events, "scope != \"")),
+                "resume_header": "last-event-id",
+                "frames": frames,
+                "envelope_fields": serde_wire_names::<ocean_observatory::EventEnvelope>(),
+                "event_kinds": serde_wire_names::<ocean_observatory::EventKind>(),
+                "payload_tag": payload_tag,
+                "payload_kinds": serde_variant_names::<ocean_observatory::EventPayload>(
+                    json!({ "kind": "contract-probe", "data": {} })
+                ),
+                "gap_kind": gap[0],
+            },
+        });
+        assert!(
+            source.contains("HeaderName::from_static(\"last-event-id\")"),
+            "the resume header is the one the handler reads"
+        );
+        assert_eq!(
+            artifact,
+            derived,
+            "observatory-wire.json must equal what the daemon serves:\n{}",
+            serde_json::to_string_pretty(&derived).unwrap()
+        );
+    }
+
+    /// Sorted, deduplicated strings as a JSON array.
+    fn sorted_strings<S: Into<String>>(items: impl IntoIterator<Item = S>) -> serde_json::Value {
+        let mut list: Vec<String> = items.into_iter().map(Into::into).collect();
+        list.sort();
+        list.dedup();
+        json!(list)
+    }
+
+    /// The sorted keys of a JSON object.
+    fn value_keys(value: &serde_json::Value) -> Vec<String> {
+        let mut keys: Vec<String> = value
+            .as_object()
+            .unwrap_or_else(|| panic!("{value} is an object"))
+            .keys()
+            .cloned()
+            .collect();
+        keys.sort();
+        keys
+    }
+
+    /// The variant names a tagged enum knows, read off the error its derive
+    /// gives an unknown tag. The probe the name recorder uses cannot see an
+    /// internally or adjacently tagged enum: those derives buffer the input
+    /// and never name their variants to the deserializer.
+    fn serde_variant_names<T: serde::de::DeserializeOwned>(
+        probe: serde_json::Value,
+    ) -> Vec<String> {
+        let error = serde_json::from_value::<T>(probe)
+            .err()
+            .unwrap_or_else(|| panic!("{} accepted the probe tag", std::any::type_name::<T>()))
+            .to_string();
+        let listed = error
+            .split_once("expected one of ")
+            .unwrap_or_else(|| panic!("unexpected probe error: {error}"))
+            .1;
+        let mut names: Vec<String> = listed
+            .split('`')
+            .skip(1)
+            .step_by(2)
+            .map(str::to_string)
+            .collect();
+        names.sort();
+        names
+    }
+
+    /// Every key of every `json!({...})` literal in `body`, sorted and
+    /// deduplicated. Right for a body whose literals are flat.
+    fn json_literal_keys(body: &str) -> Vec<String> {
+        let mut keys: Vec<String> = body
+            .match_indices("json!({")
+            .flat_map(|(at, _)| {
+                source_json_literal_keys(&body[at..at + body[at..].find("})").unwrap()])
+            })
+            .collect();
+        keys.sort();
+        keys.dedup();
+        keys
+    }
+
+    /// The keys of the one literal a handler answers with, `Json(json!({...}))`.
+    fn answer_literal_keys(body: &str) -> Vec<String> {
+        let at = body
+            .find("Json(json!({")
+            .expect("the handler answers a literal");
+        assert_eq!(
+            body.matches("Json(json!({").count(),
+            1,
+            "one answer literal"
+        );
+        let literal = &body[at..at + body[at..].find("}))").unwrap()];
+        assert!(
+            !literal["Json(json!({".len()..].contains('{'),
+            "the answer literal is flat: {literal}"
+        );
+        source_json_literal_keys(literal)
+    }
+
+    /// The first string literal after each `needle`, skipping whitespace; a
+    /// needle followed by anything but a literal is ignored.
+    fn next_quoted_after(haystack: &str, needle: &str) -> Vec<String> {
+        haystack
+            .match_indices(needle)
+            .filter_map(|(at, lit)| {
+                let rest = haystack[at + lit.len()..].trim_start().strip_prefix('"')?;
+                Some(rest[..rest.find('"').unwrap()].to_string())
+            })
+            .collect()
+    }
+
+    /// The body of the handler a registered route dispatches to: a handler
+    /// named through a module path is read from that module, an unqualified
+    /// one from `main.rs` or the modules whose handlers it imports.
+    fn route_handler_body(route: &str) -> &'static str {
+        let path = registered_handler_path(route);
+        let name = registered_handler(route);
+        let module = |module: &str| -> &'static str {
+            match module {
+                "identity" => include_str!("identity.rs"),
+                "model_catalog" => include_str!("model_catalog.rs"),
+                "observatory" => include_str!("observatory.rs"),
+                "persistent_rooms" => include_str!("persistent_rooms.rs"),
+                "yolo_settings" => include_str!("yolo_settings.rs"),
+                other => panic!("add {other}.rs to route_handler_body"),
+            }
+        };
+        let defines = |source: &str| {
+            source.contains(&format!("async fn {name}("))
+                || source.contains(&format!(" fn {name}("))
+        };
+        let source = match path.rsplit_once("::") {
+            Some((prefix, _)) => module(prefix),
+            None => [
+                production_main_source(),
+                module("model_catalog"),
+                module("yolo_settings"),
+                module("persistent_rooms"),
+            ]
+            .into_iter()
+            .find(|source| defines(source))
+            .unwrap_or_else(|| panic!("{route}: fn {name} is defined")),
+        };
+        source_fn_body(source, &name)
+    }
+
+    /// The statuses a route's handler can answer: every `StatusCode::*` it
+    /// names, or `200` for a handler that returns a bare `Json`.
+    fn route_statuses(route: &str) -> Vec<u64> {
+        let body = route_handler_body(route);
+        let codes = source_status_codes(body);
+        if !codes.is_empty() {
+            return codes;
+        }
+        let signature = &body[..body.find('{').unwrap()];
+        assert!(
+            signature.contains("-> Json<"),
+            "{route} names no status and does not answer a bare Json"
+        );
+        vec![200]
+    }
+
     /// Records the field (struct) or variant (enum) names a `Deserialize`
     /// derive hands its deserializer, with every `rename`/`rename_all` already
     /// applied, so a wire vocabulary can be read from the type itself instead
@@ -15530,9 +16171,13 @@ mod tests {
                     "CREATED" => 201,
                     "ACCEPTED" => 202,
                     "BAD_REQUEST" => 400,
+                    "UNAUTHORIZED" => 401,
+                    "FORBIDDEN" => 403,
                     "NOT_FOUND" => 404,
                     "CONFLICT" => 409,
+                    "GONE" => 410,
                     "UNPROCESSABLE_ENTITY" => 422,
+                    "TOO_MANY_REQUESTS" => 429,
                     "INTERNAL_SERVER_ERROR" => 500,
                     "BAD_GATEWAY" => 502,
                     "SERVICE_UNAVAILABLE" => 503,
@@ -15563,9 +16208,10 @@ mod tests {
         keys
     }
 
-    /// The handler a registered `METHOD /path` dispatches to, read from the
-    /// same router sections `source_registered_routes` parses.
-    fn registered_handler(route: &str) -> String {
+    /// The handler path (`name` or `module::name`) a registered
+    /// `METHOD /path` dispatches to, read from the same router sections
+    /// `source_registered_routes` parses.
+    fn registered_handler_path(route: &str) -> String {
         let (method, path) = route.split_once(' ').expect("METHOD /path");
         let method = method.to_ascii_lowercase();
         let source = include_str!("main.rs");
@@ -15599,8 +16245,17 @@ mod tests {
             })
             .collect();
         assert_eq!(found.len(), 1, "{route} has one registered handler");
-        let handler = found.into_iter().next().unwrap();
-        handler.rsplit("::").next().unwrap().to_string()
+        found.into_iter().next().unwrap()
+    }
+
+    /// The bare fn name of the handler a registered `METHOD /path`
+    /// dispatches to.
+    fn registered_handler(route: &str) -> String {
+        registered_handler_path(route)
+            .rsplit("::")
+            .next()
+            .unwrap()
+            .to_string()
     }
 
     fn serde_wire_names<T: serde::de::DeserializeOwned>() -> Vec<String> {
@@ -23324,13 +23979,17 @@ mod tests {
                     "message_kinds",
                     "message_post_keys",
                     "message_post_queued_keys",
+                    "message_post_request_fields",
                     "not_open",
                     "note",
                     "participant_fields",
+                    "participant_join_request_fields",
                     "participant_kinds",
                     "resources_keys",
                     "room_fields",
+                    "routes",
                     "snapshot_keys",
+                    "snapshot_query_fields",
                     "sse_events",
                     "transcript_keys",
                     "version",
@@ -23340,6 +23999,74 @@ mod tests {
             )
         );
         assert_eq!(artifact["version"], 1);
+
+        // The routes a room client calls for the facts above, each held to
+        // the handler that serves the fact.
+        let room_routes = artifact["routes"].as_object().expect("routes is a map");
+        let registered = source_registered_routes();
+        let mut route_names: Vec<String> = room_routes.keys().cloned().collect();
+        route_names.sort();
+        for (name, handler) in [
+            ("events", "room_events"),
+            ("inspect", "room_inspect"),
+            ("list", "rooms_list_persistent"),
+            ("message_post", "room_post_message"),
+            ("participant_join", "room_join"),
+            ("resources", "room_resources_list"),
+            ("snapshot", "room_snapshot"),
+            ("transcript", "room_transcript"),
+        ] {
+            let route = room_routes[name].as_str().unwrap();
+            assert!(registered.contains(route), "{route} is registered");
+            assert_eq!(registered_handler(route), handler, "{name}: {route}");
+        }
+        assert_eq!(
+            route_names,
+            sorted(
+                [
+                    "events",
+                    "inspect",
+                    "list",
+                    "message_post",
+                    "participant_join",
+                    "resources",
+                    "snapshot",
+                    "transcript",
+                ]
+                .map(str::to_string)
+                .to_vec()
+            )
+        );
+
+        // The request bodies a room client sends to post and to join, and the
+        // paging query of `/snapshot`, from the types the handlers extract.
+        let rooms_source = include_str!("persistent_rooms.rs");
+        for (field, handler, extractor, fields) in [
+            (
+                "message_post_request_fields",
+                "room_post_message",
+                "Json<RoomMessageRequest>",
+                serde_wire_names::<persistent_rooms::RoomMessageRequest>(),
+            ),
+            (
+                "participant_join_request_fields",
+                "room_join",
+                "Json<RoomJoinRequest>",
+                serde_wire_names::<persistent_rooms::RoomJoinRequest>(),
+            ),
+            (
+                "snapshot_query_fields",
+                "room_snapshot",
+                "Query<SnapshotQuery>",
+                serde_wire_names::<persistent_rooms::SnapshotQuery>(),
+            ),
+        ] {
+            assert!(
+                source_fn_body(rooms_source, handler).contains(extractor),
+                "{handler} extracts {extractor}"
+            );
+            assert_eq!(names(field), fields, "{field}");
+        }
         let object_keys = |value: &serde_json::Value| -> Vec<String> {
             sorted(value.as_object().unwrap().keys().cloned().collect())
         };

@@ -65,9 +65,23 @@ This crate owns the long-running Ocean HTTP service on `:4780`, including API ro
   values `HarnessProfile` maps, `/v1/sessions/{id}/sync`, and the session
   config routes, bodies, statuses and busy answer.
   `room_wire_contract_matches_the_daemon` also pins the transcript row,
-  participant, room and access fields, and the list, post, inspect (with its
+  participant, room and access fields, the list, post, inspect (with its
   agent, execution, credential-slot and resource entries) and resources
-  response keys. Each checks every key of its artifact.
+  response keys, the room client routes and their handlers, the `/snapshot`
+  paging query, and the post and join bodies. Each checks every key of its
+  artifact.
+- `session_wire_consumer_routes_match_the_daemon` holds the rest of
+  `session-wire.json` equal to the code: every other route an in-repo consumer
+  calls (session create, health, identity, turns, the agent-stream query,
+  agent session list and detail, legacy `/v1/sessions`, compact, cancel,
+  permission decision and settings, models, model set, memory, LSP, agents,
+  legacy `/v1/events`, prompt). It rebuilds each section from the router, the
+  handler's `StatusCode::*` and extracted types, the serde derives and the
+  literal answers, and compares it whole.
+  `observatory_wire_contract_matches_the_daemon` does the same for
+  `docs/contracts/observatory-wire.json` (snapshot and live tail, auth,
+  frames, wire types). A change to such a handler's route, statuses, body or
+  answer updates the artifact in the same commit.
 - `tests/buddy_voice_contract.rs` is the consumer half for Ocean Buddy: it
   reads Buddy's Swift source and holds its client-secret route, body keys,
   `purpose`, decoded response keys, tool names, the `write_handoff` argument

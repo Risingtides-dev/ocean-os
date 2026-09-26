@@ -27,11 +27,14 @@ This crate owns the full-screen terminal steering cockpit (`ocean` binary) for i
   The TUI is pinned inside the published `docs/contracts/` artifacts on its own
   side: dictation's STT literals, the session stream/create shapes, and the
   agent-stream route and `error` frame, the `ocean.session_changed`
-  extension, the `tui` client type, and the sync and config routes, bodies
-  and busy answer (named constants in `shell/client.rs`) by tests in
+  extension, the `tui` client type, the sync and config routes, bodies and
+  busy answer, every other daemon route it calls (health, turns, compact,
+  cancel, permissions, models, memory, LSP, `/v1/events`) and the Observatory
+  snapshot and tail (named constants in `shell/client.rs`) by tests in
   `shell/client.rs`, and the component kinds `component_lines` and the
   pinned-height table branch on by a test in `shell/components/chat.rs`. A new
-  component arm or voice literal must be a published one.
+  route, query field, decoded key, component arm or voice literal must be a
+  published one.
 - `/web` and `/desk` hand the bound session to sibling surfaces owned by the
   `ocean-surface` repo: the web PWA consumes `?session=<id>` at boot (proxy
   default `http://127.0.0.1:8790`, override via `OCEAN_SURFACE_URL`) and the

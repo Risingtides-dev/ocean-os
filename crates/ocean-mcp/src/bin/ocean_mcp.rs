@@ -283,7 +283,7 @@ fn tool_definitions() -> Vec<Value> {
         ),
         tool(
             "ocean_sessions",
-            "Recent Ocean sessions on this daemon (id, title, model, turns, workspace).",
+            "Recent Ocean sessions on this daemon (id, title, turns, workspace).",
             json!({ "limit": { "type": "integer", "minimum": 1, "maximum": 100 } }),
             &[],
         ),
@@ -334,6 +334,9 @@ mod room_wire {
     pub const SNAPSHOT_TRANSCRIPT: &str = "transcript";
     pub const SNAPSHOT_HAS_MORE: &str = "has_more";
     pub const SNAPSHOT_PREV_SEQ: &str = "prev_seq";
+    /// `/snapshot` query fields `ocean_room_read` sends.
+    pub const SNAPSHOT_BEFORE_SEQ: &str = "before_seq";
+    pub const SNAPSHOT_LIMIT: &str = "limit";
     /// Message kinds `render_row` branches on.
     pub const MESSAGE_KIND_MESSAGE: &str = "message";
     pub const MESSAGE_KIND_SYSTEM: &str = "system";
@@ -381,6 +384,104 @@ mod room_wire {
     pub const RESOURCE_AGENTS: &str = "authorized_agent_member_ids";
     /// `GET .../resources`: the key `ocean_room_resources` reads.
     pub const RESOURCES_LIST: &str = "resources";
+    /// The room routes the tools call; `{key}` is the room id.
+    pub const ROOMS_PATH: &str = "/v1/rooms/persistent";
+    pub const SNAPSHOT_PATH: &str = "/v1/rooms/persistent/{key}/snapshot";
+    pub const MESSAGES_PATH: &str = "/v1/rooms/persistent/{key}/messages";
+    pub const PARTICIPANTS_PATH: &str = "/v1/rooms/persistent/{key}/participants";
+    pub const INSPECT_PATH: &str = "/v1/rooms/persistent/{key}/inspect";
+    pub const RESOURCES_PATH: &str = "/v1/rooms/persistent/{key}/resources";
+}
+
+/// A room route with its `{key}` filled.
+fn room_path(route: &str, room: &str) -> String {
+    route.replace("{key}", room)
+}
+
+/// The session-wire literals this bridge reads or sends. Each one is held
+/// inside `docs/contracts/session-wire.json` by
+/// `session_literals_are_inside_the_published_session_wire`.
+mod session_wire {
+    /// `GET /health` and the keys `ocean_health` and `doctor` read.
+    pub const HEALTH_PATH: &str = "/health";
+    pub const HEALTH_OK: &str = "ok";
+    pub const HEALTH_BACKEND: &str = "backend";
+    pub const HEALTH_REV: &str = "rev";
+    /// `GET /v1/identity` and the keys `doctor` reads.
+    pub const IDENTITY_PATH: &str = "/v1/identity";
+    pub const IDENTITY_MEMBER_ID: &str = "member_id";
+    pub const IDENTITY_SOURCE: &str = "source";
+    /// `GET /v1/agent/sessions`, the list key and the summary fields
+    /// `ocean_sessions` reads.
+    pub const SESSIONS_PATH: &str = "/v1/agent/sessions";
+    pub const SESSIONS_LIST: &str = "sessions";
+    pub const SESSION_ID: &str = "id";
+    pub const SESSION_TITLE: &str = "title";
+    pub const SESSION_TURN_COUNT: &str = "turn_count";
+    pub const SESSION_WORKSPACE_ROOT: &str = "workspace_root";
+    /// `POST /v1/prompt` and the response keys `ocean_prompt` reads.
+    pub const PROMPT_PATH: &str = "/v1/prompt";
+    pub const PROMPT_SESSION_ID: &str = "session_id";
+    pub const PROMPT_STDOUT: &str = "stdout";
+    pub const PROMPT_STDERR: &str = "stderr";
+    pub const PROMPT_OK: &str = "ok";
+    /// `GET /v1/agents`, which `ocean_agents` hands back whole.
+    pub const AGENTS_PATH: &str = "/v1/agents";
+}
+
+/// The `POST /v1/rooms/persistent/{room}/messages` body `ocean_room_post` sends.
+fn room_post_body(member: &str, body: &str, thread_parent_seq: Option<u64>) -> Value {
+    let mut req = json!({
+        "author_id": member,
+        "author_kind": room_wire::PARTICIPANT_HUMAN,
+        "body": body,
+    });
+    if let Some(parent) = thread_parent_seq {
+        req["thread_parent_seq"] = json!(parent);
+    }
+    req
+}
+
+/// The `POST /v1/rooms/persistent/{room}/participants` body `ocean_room_join`
+/// sends.
+fn room_join_body(member: &str) -> Value {
+    json!({
+        "id": member,
+        "kind": room_wire::PARTICIPANT_HUMAN,
+        "display_name": member,
+    })
+}
+
+/// The `/snapshot` query `ocean_room_read` sends.
+fn room_snapshot_query(before_seq: u64, limit: u64) -> String {
+    format!(
+        "{}={before_seq}&{}={limit}",
+        room_wire::SNAPSHOT_BEFORE_SEQ,
+        room_wire::SNAPSHOT_LIMIT
+    )
+}
+
+/// The `POST /v1/prompt` body `ocean_prompt` sends.
+fn prompt_body(
+    prompt: &str,
+    cwd: &str,
+    session_id: Option<&str>,
+    yolo: bool,
+    max_turns: Option<u64>,
+) -> Value {
+    json!({
+        "prompt": prompt,
+        "images": null,
+        "request_id": null,
+        "session_id": session_id,
+        "create_if_missing": true,
+        "max_turns": max_turns,
+        "yolo": yolo,
+        "cwd": cwd,
+        "project_id": null,
+        "client_type": "mcp",
+        "decision_token": null,
+    })
 }
 
 fn render_row(row: &Value) -> String {
@@ -426,16 +527,16 @@ fn render_row(row: &Value) -> String {
 async fn call_tool(daemon: &Daemon, name: &str, args: &Value) -> Result<String> {
     match name {
         "ocean_health" => {
-            let v = daemon.get("/health").await?;
+            let v = daemon.get(session_wire::HEALTH_PATH).await?;
             Ok(format!(
                 "ok={} backend={} rev={}",
-                v["ok"],
-                v["backend"].as_str().unwrap_or("?"),
-                v["rev"].as_str().unwrap_or("?")
+                v[session_wire::HEALTH_OK],
+                v[session_wire::HEALTH_BACKEND].as_str().unwrap_or("?"),
+                v[session_wire::HEALTH_REV].as_str().unwrap_or("?")
             ))
         }
         "ocean_rooms" => {
-            let v = daemon.get("/v1/rooms/persistent").await?;
+            let v = daemon.get(room_wire::ROOMS_PATH).await?;
             let rooms = v
                 .get(room_wire::LIST_ROOMS)
                 .and_then(Value::as_array)
@@ -485,7 +586,9 @@ async fn call_tool(daemon: &Daemon, name: &str, args: &Value) -> Result<String> 
             let before = arg_u64(args, "before_seq").unwrap_or(u64::MAX);
             let v = daemon
                 .get(&format!(
-                    "/v1/rooms/persistent/{room}/snapshot?before_seq={before}&limit={limit}"
+                    "{}?{}",
+                    room_path(room_wire::SNAPSHOT_PATH, room),
+                    room_snapshot_query(before, limit)
                 ))
                 .await?;
             let rows = v
@@ -516,17 +619,10 @@ async fn call_tool(daemon: &Daemon, name: &str, args: &Value) -> Result<String> 
             let room = arg_str(args, "room")?;
             let body = arg_str(args, "body")?;
             let member = daemon.member()?;
-            let mut req = json!({
-                "author_id": member,
-                "author_kind": room_wire::PARTICIPANT_HUMAN,
-                "body": body,
-            });
-            if let Some(parent) = arg_u64(args, "thread_parent_seq") {
-                req["thread_parent_seq"] = json!(parent);
-            }
+            let req = room_post_body(member, body, arg_u64(args, "thread_parent_seq"));
             let v = daemon
                 .post(
-                    &format!("/v1/rooms/persistent/{room}/messages"),
+                    &room_path(room_wire::MESSAGES_PATH, room),
                     req,
                     Duration::from_secs(30),
                 )
@@ -553,12 +649,8 @@ async fn call_tool(daemon: &Daemon, name: &str, args: &Value) -> Result<String> 
             let member = daemon.member()?;
             daemon
                 .post(
-                    &format!("/v1/rooms/persistent/{room}/participants"),
-                    json!({
-                        "id": member,
-                        "kind": room_wire::PARTICIPANT_HUMAN,
-                        "display_name": member,
-                    }),
+                    &room_path(room_wire::PARTICIPANTS_PATH, room),
+                    room_join_body(member),
                     Duration::from_secs(30),
                 )
                 .await?;
@@ -567,7 +659,7 @@ async fn call_tool(daemon: &Daemon, name: &str, args: &Value) -> Result<String> 
         "ocean_room_inspect" => {
             let room = arg_str(args, "room")?;
             let v = daemon
-                .get(&format!("/v1/rooms/persistent/{room}/inspect"))
+                .get(&room_path(room_wire::INSPECT_PATH, room))
                 .await?;
             let mut out = format!(
                 "room {} — access {} — federated {}\n",
@@ -631,12 +723,12 @@ async fn call_tool(daemon: &Daemon, name: &str, args: &Value) -> Result<String> 
         "ocean_room_resources" => {
             let room = arg_str(args, "room")?;
             let v = daemon
-                .get(&format!("/v1/rooms/persistent/{room}/resources"))
+                .get(&room_path(room_wire::RESOURCES_PATH, room))
                 .await?;
             Ok(serde_json::to_string_pretty(&v[room_wire::RESOURCES_LIST]).unwrap_or_default())
         }
         "ocean_agents" => {
-            let v = daemon.get("/v1/agents").await?;
+            let v = daemon.get(session_wire::AGENTS_PATH).await?;
             Ok(truncate(
                 &serde_json::to_string_pretty(&v).unwrap_or_default(),
                 MAX_TOOL_TEXT_CHARS,
@@ -644,9 +736,9 @@ async fn call_tool(daemon: &Daemon, name: &str, args: &Value) -> Result<String> 
         }
         "ocean_sessions" => {
             let limit = arg_u64(args, "limit").unwrap_or(20).clamp(1, 100) as usize;
-            let v = daemon.get("/v1/agent/sessions").await?;
+            let v = daemon.get(session_wire::SESSIONS_PATH).await?;
             let sessions = v
-                .get("sessions")
+                .get(session_wire::SESSIONS_LIST)
                 .and_then(Value::as_array)
                 .cloned()
                 .or_else(|| v.as_array().cloned())
@@ -654,12 +746,13 @@ async fn call_tool(daemon: &Daemon, name: &str, args: &Value) -> Result<String> 
             let mut out = String::new();
             for s in sessions.iter().take(limit) {
                 out.push_str(&format!(
-                    "- {} — {} — model={} turns={} workspace={}\n",
-                    s["id"].as_str().unwrap_or("?"),
-                    s["title"].as_str().unwrap_or(""),
-                    s["model"].as_str().unwrap_or("?"),
-                    s["turns"],
-                    s["workspace_root"].as_str().unwrap_or("-")
+                    "- {} — {} — turns={} workspace={}\n",
+                    s[session_wire::SESSION_ID].as_str().unwrap_or("?"),
+                    s[session_wire::SESSION_TITLE].as_str().unwrap_or(""),
+                    s[session_wire::SESSION_TURN_COUNT],
+                    s[session_wire::SESSION_WORKSPACE_ROOT]
+                        .as_str()
+                        .unwrap_or("-")
                 ));
             }
             if out.is_empty() {
@@ -681,33 +774,21 @@ async fn call_tool(daemon: &Daemon, name: &str, args: &Value) -> Result<String> 
             let session_id = args.get("session_id").and_then(Value::as_str);
             let yolo = args.get("yolo").and_then(Value::as_bool).unwrap_or(false);
             let max_turns = arg_u64(args, "max_turns");
-            let body = json!({
-                "prompt": prompt,
-                "images": null,
-                "request_id": null,
-                "session_id": session_id,
-                "create_if_missing": true,
-                "max_turns": max_turns,
-                "yolo": yolo,
-                "cwd": cwd,
-                "project_id": null,
-                "client_type": "mcp",
-                "decision_token": null,
-            });
+            let body = prompt_body(prompt, &cwd, session_id, yolo, max_turns);
             let v = daemon
-                .post("/v1/prompt", body, Duration::from_secs(600))
+                .post(session_wire::PROMPT_PATH, body, Duration::from_secs(600))
                 .await?;
             let mut out = String::new();
-            if let Some(sid) = v["session_id"].as_str() {
+            if let Some(sid) = v[session_wire::PROMPT_SESSION_ID].as_str() {
                 out.push_str(&format!("session_id: {sid}\n"));
             }
-            out.push_str(v["stdout"].as_str().unwrap_or(""));
-            let stderr = v["stderr"].as_str().unwrap_or("");
+            out.push_str(v[session_wire::PROMPT_STDOUT].as_str().unwrap_or(""));
+            let stderr = v[session_wire::PROMPT_STDERR].as_str().unwrap_or("");
             if !stderr.trim().is_empty() {
                 out.push_str("\n[stderr]\n");
                 out.push_str(stderr);
             }
-            if v["ok"] != true {
+            if v[session_wire::PROMPT_OK] != true {
                 out.push_str("\n[turn did not complete cleanly]");
             }
             Ok(truncate(&out, MAX_TOOL_TEXT_CHARS))
@@ -922,13 +1003,13 @@ fn setup(dry_run: bool) -> Result<()> {
 
 async fn doctor(daemon: &Daemon) -> Result<()> {
     let mut out = std::io::stdout();
-    match daemon.get("/health").await {
+    match daemon.get(session_wire::HEALTH_PATH).await {
         Ok(v) => writeln!(
             out,
             "daemon: ok at {} (backend {}, rev {})",
             daemon.base,
-            v["backend"].as_str().unwrap_or("?"),
-            v["rev"].as_str().unwrap_or("?")
+            v[session_wire::HEALTH_BACKEND].as_str().unwrap_or("?"),
+            v[session_wire::HEALTH_REV].as_str().unwrap_or("?")
         )?,
         Err(err) => {
             writeln!(out, "daemon: NOT reachable at {} — {err:#}", daemon.base)?;
@@ -946,13 +1027,13 @@ async fn doctor(daemon: &Daemon) -> Result<()> {
         )?,
         None => writeln!(out, "member id: NOT SET — {MEMBER_HINT}")?,
     }
-    let identity = daemon.get("/v1/identity").await;
+    let identity = daemon.get(session_wire::IDENTITY_PATH).await;
     writeln!(
         out,
         "{}",
         identity_line(daemon.member.as_deref(), &identity)
     )?;
-    match daemon.get("/v1/rooms/persistent").await {
+    match daemon.get(room_wire::ROOMS_PATH).await {
         Ok(v) => {
             let n = v[room_wire::LIST_ROOMS]
                 .as_array()
@@ -991,8 +1072,8 @@ fn identity_line(member: Option<&str>, daemon_identity: &Result<Value>) -> Strin
         }
         Err(err) => format!("daemon identity: could not read — {err:#}"),
         Ok(value) => {
-            let source = value["source"].as_str().unwrap_or("?");
-            match (value["member_id"].as_str(), member) {
+            let source = value[session_wire::IDENTITY_SOURCE].as_str().unwrap_or("?");
+            match (value[session_wire::IDENTITY_MEMBER_ID].as_str(), member) {
                 (None, _) => format!(
                     "daemon identity: NOT SET on the daemon host (source {source}) — write member.toml in that daemon's config dir"
                 ),
@@ -1096,6 +1177,103 @@ mod tests {
             published("inspect_resource_keys", key);
         }
         published("resources_keys", room_wire::RESOURCES_LIST);
+
+        // The routes the room tools call.
+        for (name, method, path) in [
+            ("list", "GET", room_wire::ROOMS_PATH),
+            ("snapshot", "GET", room_wire::SNAPSHOT_PATH),
+            ("message_post", "POST", room_wire::MESSAGES_PATH),
+            ("participant_join", "POST", room_wire::PARTICIPANTS_PATH),
+            ("inspect", "GET", room_wire::INSPECT_PATH),
+            ("resources", "GET", room_wire::RESOURCES_PATH),
+        ] {
+            assert_eq!(wire["routes"][name], format!("{method} {path}"), "{name}");
+        }
+
+        // The bodies the bridge sends to post and to join, and the paging
+        // query it reads a room with. The daemon refuses unknown post fields.
+        let keys =
+            |value: Value| -> Vec<String> { value.as_object().unwrap().keys().cloned().collect() };
+        for key in keys(room_post_body("m", "b", Some(1))) {
+            published("message_post_request_fields", &key);
+        }
+        for key in keys(room_join_body("m")) {
+            published("participant_join_request_fields", &key);
+        }
+        for pair in room_snapshot_query(1, 1).split('&') {
+            published("snapshot_query_fields", pair.split_once('=').unwrap().0);
+        }
+    }
+
+    /// Consumer half of the session contract: the health, identity, session
+    /// list, prompt and agents routes the bridge calls, the prompt body it
+    /// sends, and every key it reads off their answers are published.
+    #[test]
+    fn session_literals_are_inside_the_published_session_wire() {
+        let wire: Value =
+            serde_json::from_str(include_str!("../../../../docs/contracts/session-wire.json"))
+                .expect("session-wire.json parses");
+        let published = |section: &str, field: &str, literal: &str| {
+            assert!(
+                wire[section][field]
+                    .as_array()
+                    .unwrap_or_else(|| panic!("{section}.{field} is a list"))
+                    .iter()
+                    .any(|v| v.as_str() == Some(literal)),
+                "{literal} is not a published {section}.{field} entry"
+            );
+        };
+        let route = |section: &str, method: &str, path: &str| {
+            assert_eq!(
+                wire[section]["route"],
+                format!("{method} {path}"),
+                "{section}"
+            );
+        };
+
+        route("health", "GET", session_wire::HEALTH_PATH);
+        for key in [
+            session_wire::HEALTH_OK,
+            session_wire::HEALTH_BACKEND,
+            session_wire::HEALTH_REV,
+        ] {
+            published("health", "response_fields", key);
+        }
+        route("identity", "GET", session_wire::IDENTITY_PATH);
+        for key in [
+            session_wire::IDENTITY_MEMBER_ID,
+            session_wire::IDENTITY_SOURCE,
+        ] {
+            published("identity", "response_fields", key);
+        }
+        route("session_list", "GET", session_wire::SESSIONS_PATH);
+        published(
+            "session_list",
+            "response_fields",
+            session_wire::SESSIONS_LIST,
+        );
+        for key in [
+            session_wire::SESSION_ID,
+            session_wire::SESSION_TITLE,
+            session_wire::SESSION_TURN_COUNT,
+            session_wire::SESSION_WORKSPACE_ROOT,
+        ] {
+            published("session_list", "summary_fields", key);
+        }
+        route("prompt", "POST", session_wire::PROMPT_PATH);
+        let body = prompt_body("p", "/w", Some("s"), true, Some(1));
+        for key in body.as_object().unwrap().keys() {
+            published("prompt", "request_fields", key);
+        }
+        for key in [
+            session_wire::PROMPT_SESSION_ID,
+            session_wire::PROMPT_STDOUT,
+            session_wire::PROMPT_STDERR,
+            session_wire::PROMPT_OK,
+        ] {
+            published("prompt", "response_fields", key);
+        }
+        route("agents", "GET", session_wire::AGENTS_PATH);
     }
     use axum::{routing::get, routing::post, Json, Router};
 
