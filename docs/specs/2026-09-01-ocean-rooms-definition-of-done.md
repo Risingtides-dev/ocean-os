@@ -70,11 +70,17 @@ ocean-os 616293e, ocean-surface d58a145.
   answers 200, not 501. Check: coworker:login-smoke plus one production login
   recorded in HANDOFF. [bedrock, user config]
 - 1.2 Enroll as an operator, register a device by key proof, declare a directory
-  allocation, from the surface. Check: PR #117 gates plus a surface acceptance
-  test. [bedrock #117, surface]
+  allocation, from the surface. Check: Bedrock operator-identity gates plus a
+  surface acceptance test. [user config, surface] (2026-09-26: the Bedrock half
+  is live. #117 shipped inside integration PR #137, a21e186, with migrations
+  013–015 applied, and device pairing followed in #138/#139; #117 itself was
+  closed as superseded. What remains is production Access config, the same hand
+  as 1.1, plus the surface enroll/device/directory UI and its acceptance test.)
 - 1.3 Discover, create (public or invite-only), join, invite by operator id,
   accept, from the rooms rail; legacy admin-only registration is no longer the
-  only path. Check: rooms:pg-smoke operator section plus surface acceptance. [bedrock #117, surface]
+  only path. Check: rooms:pg-smoke operator section plus surface acceptance.
+  [user config, surface] (2026-09-26: the Bedrock operator room routes shipped
+  in #137; the remaining work is the same as for 1.2.)
 - 1.4 Create a room that agents can work in: the surface sends workspace_root
   on create and offers a bind control for existing rooms, and a room without one
   says so. Today every agent @mention in a surface-created room fails closed

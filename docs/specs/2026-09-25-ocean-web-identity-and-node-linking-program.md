@@ -397,6 +397,25 @@ were written by hand (ocean-surface `ops/README.md` says so out loud).
    relay, cross-person daemon access (a link only ever attaches a node to its
    own person).
 
+**Overlap to settle before accepting §10 (recorded 2026-09-26).** Bedrock
+already runs a live identity and pairing path that this proposal does not
+reference:
+
+- One opaque `ocean_*` operator id per Cloudflare Access human. It shipped in
+  Bedrock #137 (a21e186), which carried the #117 work.
+- Code-based device pairing by Ed25519 key proof (#138/#139): a node proves
+  its key and gets a ten-minute human code, and the signed-in operator claims
+  it. That device key is in effect the "Gate 0 device key" listed above as
+  deferred.
+
+Accepting §10 as written gives two pairing flows, two device registries and
+two identity roots: GitHub on the hub versus an Access email in Bedrock. The
+operator should decide whether M2 linking reuses Bedrock's operator id and
+device pairing, or deliberately stays separate with a stated mapping between
+the two. The Rooms member-lane auth proposal
+(`2026-09-26-rooms-member-lane-authentication-proposal.md`) does not depend on
+this choice.
+
 ### What the operator is deciding
 
 Yes/no on this shape — in particular on (2), which changes the daemon's
