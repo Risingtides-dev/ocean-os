@@ -2515,43 +2515,29 @@ impl AgentRuntime {
                 }
                 _ => {}
             }
-            match ev {
-                AgentEvent::TurnCheckpoint { messages, .. } => {
-                    // A checkpoint is emitted only after the runtime has paired
-                    // assistant tool calls with all results in provider-valid
-                    // order. Persist that valid prefix immediately, matching
-                    // stock Pi's message-end durability without ever saving an
-                    // orphan tool call.
-                    checkpoint_messages.extend(messages);
-                    let persisted = cap_session_history(checkpoint_messages.clone());
-                    let checkpoint_span =
-                        tracing::info_span!("checkpoint", messages = persisted.len());
-                    let _checkpoint = checkpoint_span.enter();
-                    session.replace_messages(persisted);
-                    session::save(&self.config_dir, &session)?;
+            // Relay classification has one source of truth,
+            // `AgentEvent::is_wire_relayed` (exhaustive, in `ocean-runtime`).
+            // Relayed events are MOVED onto the sink, never cloned. The rest are
+            // never forwarded: the daemon bridge, the only production sink,
+            // discards every one of them (OCEAN-373), and `AgentEnd` carries the
+            // whole history while `TurnCheckpoint` carries every durability
+            // delta (bounded turn event channel proposal, slice 2).
+            if ev.is_wire_relayed() {
+                if let Some(sink) = event_sink.as_ref() {
+                    let _ = sink.send(ev);
                 }
-                // Not forwarded to the event sink: the daemon bridge, its only
-                // consumer, discards every one of these (OCEAN-373, the named
-                // no-relay arm in `ocean-daemon`'s turn bridge). `AgentEnd`
-                // carries the whole message history and `TurnCheckpoint` (above)
-                // every durability delta, so forwarding them only copied
-                // history-sized payloads into a queue that dropped them
-                // (bounded turn event channel proposal, slice 2). Relaying one
-                // later means adding it to the bridge AND removing it here.
-                AgentEvent::AgentStart { .. }
-                | AgentEvent::AgentEnd { .. }
-                | AgentEvent::TurnStart { .. }
-                | AgentEvent::TurnEnd { .. }
-                | AgentEvent::AssistantMessage { .. }
-                | AgentEvent::UserMessage { .. } => {}
-                // Everything else is relayed, moved rather than cloned. A new
-                // runtime variant is forwarded by default, so the bridge's
-                // exhaustive match still forces a relay-or-document decision.
-                ev => {
-                    if let Some(sink) = event_sink.as_ref() {
-                        let _ = sink.send(ev);
-                    }
-                }
+            } else if let AgentEvent::TurnCheckpoint { messages, .. } = ev {
+                // A checkpoint is emitted only after the runtime has paired
+                // assistant tool calls with all results in provider-valid
+                // order. Persist that valid prefix immediately, matching stock
+                // Pi's message-end durability without ever saving an orphan
+                // tool call.
+                checkpoint_messages.extend(messages);
+                let persisted = cap_session_history(checkpoint_messages.clone());
+                let checkpoint_span = tracing::info_span!("checkpoint", messages = persisted.len());
+                let _checkpoint = checkpoint_span.enter();
+                session.replace_messages(persisted);
+                session::save(&self.config_dir, &session)?;
             }
         }
 
@@ -7449,20 +7435,64 @@ done
         }
     }
 
+    /// Serializes the tests that point the `fake-tool` provider's scripted
+    /// `write` at a per-test path through the process-global
+    /// `OCEAN_FAKE_TOOL_TARGET_ENV`. A tokio mutex, so the guard may be held
+    /// across `.await`.
+    static FAKE_TOOL_TARGET_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+    /// Sets `OCEAN_FAKE_TOOL_TARGET_ENV` for one test and restores the prior
+    /// value on drop, panics included. Hold `FAKE_TOOL_TARGET_LOCK` first.
+    struct FakeToolTargetEnv(Option<std::ffi::OsString>);
+
+    impl FakeToolTargetEnv {
+        fn set(target: &Path) -> Self {
+            let prior = std::env::var_os(ocean_runtime::FAKE_TOOL_TARGET_ENV);
+            std::env::set_var(ocean_runtime::FAKE_TOOL_TARGET_ENV, target);
+            Self(prior)
+        }
+    }
+
+    impl Drop for FakeToolTargetEnv {
+        fn drop(&mut self) {
+            match self.0.take() {
+                Some(prior) => std::env::set_var(ocean_runtime::FAKE_TOOL_TARGET_ENV, prior),
+                None => std::env::remove_var(ocean_runtime::FAKE_TOOL_TARGET_ENV),
+            }
+        }
+    }
+
+    fn fake_tool_request(cwd: &Path) -> PromptRequest {
+        PromptRequest {
+            prompt: "write the file".into(),
+            images: None,
+            request_id: None,
+            session_id: None,
+            create_if_missing: true,
+            max_turns: None,
+            yolo: true,
+            cwd: cwd.to_string_lossy().into_owned(),
+            project_id: None,
+            client_type: None,
+            decision_token: None,
+        }
+    }
+
     /// Bounded turn event channel proposal, slice 2: the H1 forwarder in
-    /// `run_prompt` no longer puts on the event sink (H2) the variants the
-    /// daemon bridge discards — `AgentEnd` (the whole history),
-    /// `TurnCheckpoint` (durability deltas), `AssistantMessage`,
-    /// `UserMessage`, `AgentStart/End`, `TurnStart/End`. A scripted
-    /// `fake-tool` turn through the real loop puts exactly the relayed kinds
-    /// on the sink, in order, while `stdout`/`stderr` and the persisted
-    /// transcript (the checkpoints' consumer) are unchanged.
+    /// `run_prompt` puts on the event sink (H2) exactly the events
+    /// `AgentEvent::is_wire_relayed` classifies as relayed, and none of the
+    /// seven the daemon bridge discards (`AgentEnd` with the whole history,
+    /// every `TurnCheckpoint` delta, `AssistantMessage`, `UserMessage`,
+    /// `AgentStart/End`, `TurnStart/End`). A scripted `fake-tool` turn through
+    /// the real loop keeps `stdout`, `stderr`, and the final transcript
+    /// unchanged.
     #[tokio::test]
     async fn event_sink_carries_only_bridge_relayed_events_for_a_scripted_turn() {
+        let _lock = FAKE_TOOL_TARGET_LOCK.lock().await;
         let config_dir = temp_config_dir("sink-relayed");
         std::fs::create_dir_all(&config_dir).unwrap();
         let target = config_dir.join("fake-tool-target.txt");
-        std::env::set_var(ocean_runtime::FAKE_TOOL_TARGET_ENV, &target);
+        let _env = FakeToolTargetEnv::set(&target);
         let runtime = runtime(
             config_dir.clone(),
             provider_config(ProviderId::Fake, ocean_runtime::FAKE_TOOL_MODEL, false),
@@ -7471,19 +7501,7 @@ done
         let (tx, mut rx) = mpsc::unbounded_channel::<AgentEvent>();
         let res = runtime
             .prompt(
-                PromptRequest {
-                    prompt: "write the file".into(),
-                    images: None,
-                    request_id: None,
-                    session_id: None,
-                    create_if_missing: true,
-                    max_turns: None,
-                    yolo: true,
-                    cwd: config_dir.to_string_lossy().into_owned(),
-                    project_id: None,
-                    client_type: None,
-                    decision_token: None,
-                },
+                fake_tool_request(&config_dir),
                 PromptControl::yolo(true).with_event_sink(tx),
             )
             .await;
@@ -7502,7 +7520,9 @@ done
                 serde_json::json!({ "path": path, "content": ocean_runtime::FAKE_TOOL_CONTENT })
             )
         );
-        // Checkpoints are still persisted: user, tool call, tool result, reply.
+        // The final transcript (the turn-end `persist` save): user, tool call,
+        // tool result, reply. Mid-turn checkpoint saves are pinned separately by
+        // `turn_checkpoint_is_persisted_mid_turn_without_a_final_save`.
         let detail = runtime.session_detail(res.session_id.unwrap()).unwrap();
         assert_eq!(detail.messages.len(), 4);
 
@@ -7511,21 +7531,12 @@ done
             events.push(ev);
         }
         let kinds: Vec<&str> = events.iter().map(agent_event_kind).collect();
-        const BRIDGE_DISCARDED: [&str; 7] = [
-            "AgentStart",
-            "AgentEnd",
-            "TurnStart",
-            "TurnEnd",
-            "TurnCheckpoint",
-            "AssistantMessage",
-            "UserMessage",
-        ];
-        // Golden: the kinds the bridge relays, in emission order. This holds
-        // with and without slice 2.
-        let relayed: Vec<&str> = kinds
+        // Golden: the relayed kinds, in emission order. This held before slice
+        // 2 too, as the relayed subsequence of everything forwarded.
+        let relayed: Vec<&str> = events
             .iter()
-            .copied()
-            .filter(|kind| !BRIDGE_DISCARDED.contains(kind))
+            .filter(|ev| ev.is_wire_relayed())
+            .map(agent_event_kind)
             .collect();
         assert_eq!(
             relayed,
@@ -7533,18 +7544,79 @@ done
             "relayed event sequence changed"
         );
         // Slice 2: nothing the bridge discards reaches the sink at all.
-        for discarded in BRIDGE_DISCARDED {
-            assert!(
-                !kinds.contains(&discarded),
-                "{discarded} reached the event sink: {kinds:?}"
-            );
-        }
-        assert_eq!(kinds, relayed);
+        assert_eq!(kinds, relayed, "a non-relayed event reached the event sink");
         let session_id = res.session_id.unwrap().to_string();
         assert!(events
             .iter()
             .all(|ev| ev.session_id() == Some(session_id.as_str())));
 
+        let _ = std::fs::remove_dir_all(config_dir);
+    }
+
+    /// Cancels the turn from inside the permission check, before the scripted
+    /// `write` runs. The runtime then closes the tool call with a cancelled
+    /// result, emits the round's `TurnCheckpoint`, and fails with `Cancelled`.
+    struct CancelOnCheck(CancellationToken);
+
+    #[async_trait]
+    impl PermissionPolicy for CancelOnCheck {
+        async fn check(&self, _tool_name: &str, _args: &Value) -> PermissionDecision {
+            self.0.cancel();
+            PermissionDecision::Allow
+        }
+    }
+
+    /// A `TurnCheckpoint` is persisted when the H1 loop receives it, not only
+    /// by the turn-end save. A cancelled turn does no turn-end save, so the
+    /// only way the tool round reaches disk is the checkpoint arm: the stored
+    /// transcript must hold the accepted user message AND the round-1 tool
+    /// call and its (cancelled) result. Without the checkpoint save it holds
+    /// only the user message.
+    #[tokio::test]
+    async fn turn_checkpoint_is_persisted_mid_turn_without_a_final_save() {
+        let _lock = FAKE_TOOL_TARGET_LOCK.lock().await;
+        let config_dir = temp_config_dir("checkpoint-mid-turn");
+        std::fs::create_dir_all(&config_dir).unwrap();
+        let target = config_dir.join("fake-tool-target.txt");
+        let _env = FakeToolTargetEnv::set(&target);
+        let runtime = runtime(
+            config_dir.clone(),
+            provider_config(ProviderId::Fake, ocean_runtime::FAKE_TOOL_MODEL, false),
+        );
+
+        let cancel = CancellationToken::new();
+        let (tx, mut rx) = mpsc::unbounded_channel::<AgentEvent>();
+        let control = PromptControl::new(Arc::new(CancelOnCheck(cancel.clone())))
+            .with_cancel(cancel)
+            .with_event_sink(tx);
+        let res = runtime
+            .prompt(fake_tool_request(&config_dir), control)
+            .await;
+        assert!(!res.ok, "a cancelled turn must fail");
+        assert!(!target.exists(), "the cancelled write must not run");
+
+        let sessions = runtime.list_sessions(None).unwrap();
+        assert_eq!(sessions.len(), 1);
+        let detail = runtime.session_detail(sessions[0].id).unwrap();
+        let roles: Vec<&str> = detail
+            .messages
+            .iter()
+            .map(|message| message["role"].as_str().unwrap_or_default())
+            .collect();
+        assert_eq!(
+            roles,
+            ["user", "assistant", "toolResult"],
+            "the round-1 checkpoint was not persisted mid-turn"
+        );
+
+        // The cancelled round still pairs Start with End on the sink, and no
+        // non-relayed event reaches it.
+        let mut kinds = Vec::new();
+        while let Ok(ev) = rx.try_recv() {
+            assert!(ev.is_wire_relayed(), "{ev:?} reached the event sink");
+            kinds.push(agent_event_kind(&ev));
+        }
+        assert_eq!(kinds, ["ToolExecutionStart", "ToolExecutionEnd"]);
         let _ = std::fs::remove_dir_all(config_dir);
     }
 

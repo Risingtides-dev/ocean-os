@@ -6504,6 +6504,381 @@ fn session_workspace_binding(
     }
 }
 
+/// The runtime → bus streaming bridge for one turn. Every relayed runtime
+/// event (`TextDelta`, `ThinkingDelta`, `ToolExecution*`, …) is mapped onto the
+/// `AgentEventBus` in real time so SSE clients render as it streams. Runs until
+/// the turn drops its sender; `agent_turn` awaits it before `TurnFinished`.
+async fn run_turn_bridge(
+    mut event_rx: tokio::sync::mpsc::UnboundedReceiver<AgentEvent>,
+    bridge_bus: AgentEventBus,
+    bridge_lifecycle: Arc<LifecycleDispatcher>,
+    bridge_project_id: Option<Uuid>,
+    request_id: RequestId,
+    bridge_turn_id: AgentTurnId,
+    bridge_session_id: AgentSessionId,
+) {
+    let mut tool_call_ids: HashMap<String, ToolCallId> = HashMap::new();
+    while let Some(ev) = event_rx.recv().await {
+        // Every runtime AgentEvent now carries its own `session_id`
+        // (OCEAN-54), stamped by the agent loop from AgentConfig. The bridge
+        // still re-attaches `bridge_session_id` below, which is now
+        // redundant — the native id equals the bridge id for this turn — but
+        // kept so the SSE payload type (`SessionId` Uuid) is unchanged. The
+        // debug_assert documents the invariant without affecting release.
+        debug_assert!(
+            ev.session_id().is_none()
+                || ev.session_id() == Some(bridge_session_id.to_string()).as_deref(),
+            "runtime event session_id must match the bridge session id"
+        );
+        match ev {
+            AgentEvent::TextDelta { delta, .. } => {
+                if delta.is_empty() {
+                    continue;
+                }
+                bridge_bus.emit(AgentTurnEvent::AssistantTextDelta {
+                    session_id: bridge_session_id,
+                    turn_id: bridge_turn_id,
+                    delta,
+                });
+            }
+            // OCEAN-275 honesty: the failover that keeps a turn alive must
+            // also be visible — relay the reroute so surfaces can tell the
+            // operator "you asked for X, this turn ran on Y".
+            AgentEvent::ModelRerouted {
+                requested,
+                effective,
+                reason,
+                ..
+            } => {
+                bridge_bus.emit(AgentTurnEvent::ModelRerouted {
+                    session_id: bridge_session_id,
+                    turn_id: bridge_turn_id,
+                    requested,
+                    effective,
+                    reason,
+                });
+            }
+            // Same honesty rule as the reroute above: a turn that is quietly
+            // reconnecting must say so, or every surface shows a bare
+            // "working" that is indistinguishable from a hang.
+            AgentEvent::ProviderRetrying {
+                attempt,
+                max_attempts,
+                delay_ms,
+                reason,
+                scope,
+                ..
+            } => {
+                bridge_bus.emit(AgentTurnEvent::ProviderRetrying {
+                    session_id: bridge_session_id,
+                    turn_id: bridge_turn_id,
+                    attempt,
+                    max_attempts,
+                    delay_ms,
+                    reason,
+                    scope: scope.as_str().to_string(),
+                });
+            }
+            AgentEvent::ThinkingDelta { delta, .. } => {
+                if delta.is_empty() {
+                    continue;
+                }
+                bridge_bus.emit(AgentTurnEvent::ThinkingDelta {
+                    session_id: bridge_session_id,
+                    turn_id: bridge_turn_id,
+                    delta,
+                });
+            }
+            AgentEvent::ToolExecutionStart {
+                tool_call_id,
+                tool_name,
+                args,
+                ..
+            } => {
+                let call_id = ToolCallId(Uuid::new_v4());
+                tool_call_ids.insert(tool_call_id.clone(), call_id.clone());
+                if let Ok(lifecycle_tool_name) =
+                    ocean_agent_sdk::extension_lifecycle::ToolName::new(tool_name.clone())
+                {
+                    let scope = bridge_lifecycle.source_scope(
+                        bridge_project_id,
+                        Some(bridge_session_id.inner()),
+                        Some(bridge_turn_id.inner()),
+                        Some(request_id),
+                        None,
+                    );
+                    bridge_lifecycle.publish(LifecycleSource::ToolExecutionStart {
+                        scope,
+                        runtime_tool_call_id: tool_call_id,
+                        host_tool_call_id: call_id.0,
+                        tool_name: lifecycle_tool_name,
+                        started_at_ms: u64::try_from(Utc::now().timestamp_millis())
+                            .unwrap_or_default(),
+                        stamp: lifecycle_stamp(),
+                        arguments: args.clone(),
+                    });
+                }
+                bridge_bus.emit(AgentTurnEvent::ToolCallStarted {
+                    session_id: bridge_session_id,
+                    turn_id: bridge_turn_id,
+                    call: ToolCall {
+                        id: call_id,
+                        name: tool_name,
+                        args_json: args,
+                    },
+                });
+            }
+            AgentEvent::ToolExecutionEnd {
+                tool_call_id,
+                tool_name: _,
+                is_error,
+                content,
+                details,
+                ..
+            } => {
+                let call_id = tool_call_ids.remove(&tool_call_id);
+                let output = render_tool_output(&content);
+                let scope = bridge_lifecycle.source_scope(
+                    bridge_project_id,
+                    Some(bridge_session_id.inner()),
+                    Some(bridge_turn_id.inner()),
+                    Some(request_id),
+                    None,
+                );
+                bridge_lifecycle.publish(LifecycleSource::ToolExecutionEnd {
+                    scope,
+                    runtime_tool_call_id: tool_call_id,
+                    is_error,
+                    rendered_output: output.as_bytes().to_vec(),
+                    details: LifecycleToolEndDetails {
+                        cancelled: details
+                            .get("cancelled")
+                            .and_then(Value::as_bool)
+                            .unwrap_or(false),
+                        private: details.clone(),
+                    },
+                    ended_at_ms: u64::try_from(Utc::now().timestamp_millis()).unwrap_or_default(),
+                    stamp: lifecycle_stamp(),
+                });
+                let call_id = call_id.unwrap_or_else(|| ToolCallId(Uuid::new_v4()));
+                bridge_bus.emit(AgentTurnEvent::ToolCallFinished {
+                    session_id: bridge_session_id,
+                    turn_id: bridge_turn_id,
+                    call_id,
+                    result: ToolResult {
+                        ok: !is_error,
+                        output,
+                        // Forward the runtime's structured tool-result
+                        // details (exit codes, counts, perf, …) to clients.
+                        // The runtime uses `Value::Null` to mean "no
+                        // metadata"; collapse that to `None` so the SDK
+                        // field stays absent rather than carrying a null.
+                        metadata_json: metadata_from_details(details),
+                    },
+                });
+            }
+            AgentEvent::PermissionDenied {
+                tool_name, reason, ..
+            } => {
+                bridge_lifecycle.publish(LifecycleSource::CompatibilityPermissionDenied {
+                    tool_name: tool_name.clone(),
+                    reason: reason.clone(),
+                });
+                // OCEAN-317: emit a paired Started→Finished so clients can
+                // correlate the denial with the tool call that triggered it.
+                // A lone Finished (no Started) leaves TUI blocks in a
+                // permanent "running" state. Both events share one call_id
+                // minted here; ToolExecutionStart was never emitted by the
+                // runtime for a denied call, so no existing entry exists in
+                // `tool_call_ids` to reuse.
+                let call_id = ToolCallId(Uuid::new_v4());
+                bridge_bus.emit(AgentTurnEvent::ToolCallStarted {
+                    session_id: bridge_session_id,
+                    turn_id: bridge_turn_id,
+                    call: ToolCall {
+                        id: call_id.clone(),
+                        name: tool_name.clone(),
+                        args_json: serde_json::Value::Null,
+                    },
+                });
+                bridge_bus.emit(AgentTurnEvent::ToolCallFinished {
+                    session_id: bridge_session_id,
+                    turn_id: bridge_turn_id,
+                    call_id,
+                    result: ToolResult {
+                        ok: false,
+                        output: format!("permission denied for {tool_name}: {reason}"),
+                        metadata_json: None,
+                    },
+                });
+            }
+            AgentEvent::Render {
+                id,
+                kind,
+                props,
+                replace,
+                ..
+            } => {
+                bridge_bus.emit(AgentTurnEvent::ComponentRender {
+                    session_id: bridge_session_id,
+                    component_id: id,
+                    kind,
+                    props,
+                    replace,
+                });
+            }
+            AgentEvent::Unmount { id, .. } => {
+                bridge_bus.emit(AgentTurnEvent::ComponentUnmount {
+                    session_id: bridge_session_id,
+                    component_id: id,
+                });
+            }
+            AgentEvent::BrowserActivity { active, .. } => {
+                bridge_bus.emit(AgentTurnEvent::BrowserActivity {
+                    session_id: bridge_session_id,
+                    active,
+                });
+            }
+            AgentEvent::SurfacePatch {
+                canvas_id, patches, ..
+            } => {
+                // Slice 3: stamp each validated patch into a
+                // `SurfacePatchEnvelope` carrying the routing/persistence
+                // context (session/surface/canvas/actor/timestamp), then
+                // relay onto `/v1/agent/events`. The event carries this
+                // turn's `bridge_session_id`, so the SSE filter scopes it to
+                // the originating session — a second session never sees it.
+                use ocean_agent_sdk::surface::{
+                    ActorRef, CanvasId, PatchId, SurfaceId, SurfacePatchEnvelope,
+                };
+                let canvas = CanvasId::new(canvas_id);
+                let created_at_ms = ocean_protocol::now_ms();
+                let envelopes: Vec<SurfacePatchEnvelope> = patches
+                    .into_iter()
+                    .map(|patch| SurfacePatchEnvelope {
+                        patch_id: PatchId::new(Uuid::new_v4().to_string()),
+                        session_id: bridge_session_id,
+                        surface_id: SurfaceId::new("surface:local"),
+                        canvas_id: canvas.clone(),
+                        actor: ActorRef::agent(None),
+                        created_at_ms,
+                        patch,
+                        // OCEAN-258: the daemon is a transport, not the merge
+                        // authority — the surface ledger stamps the convergent-
+                        // merge `version` when it applies this patch. Stamping an
+                        // authoritative revision here would split-brain the clock.
+                        version: None,
+                    })
+                    .collect();
+                bridge_bus.emit(AgentTurnEvent::SurfacePatch {
+                    session_id: bridge_session_id,
+                    turn_id: bridge_turn_id,
+                    canvas_id: canvas,
+                    patches: envelopes,
+                });
+            }
+            AgentEvent::SlackCanvas { op, .. } => {
+                // OCEAN-235: relay the validated slack_canvas op onto
+                // `/v1/agent/events` scoped to this session, so the Slack
+                // canvas bridge (`ocean-agents`) can consume it and round-trip
+                // to the Slack Canvas API. Before this, the event hit the
+                // `_ => {}` catch-all below and was silently dropped — the
+                // bridge could never see a `read` request to fulfill.
+                //
+                // We attach the runtime's contracted result for the op (the
+                // honest *pending* shape for `read`/`list`) so a bridge has
+                // both the op to fulfill and the result shape to stamp live
+                // content into via
+                // `SlackCanvasResult::fulfilled_read`/`fulfilled_list`.
+                use ocean_agent_sdk::slack_canvas::{SlackCanvasOp, SlackCanvasResult};
+                let result = match &op {
+                    SlackCanvasOp::Read { canvas_id } => {
+                        SlackCanvasResult::pending_read(canvas_id.clone())
+                    }
+                    SlackCanvasOp::List { .. } => SlackCanvasResult::pending_list(),
+                    SlackCanvasOp::Create { .. } => SlackCanvasResult {
+                        ok: true,
+                        op: "create".to_string(),
+                        canvas_id: None,
+                        contents: None,
+                        canvases: None,
+                        fetch_status: Default::default(),
+                        bridged: false,
+                        metadata: serde_json::Value::Null,
+                    },
+                    SlackCanvasOp::Update { canvas_id, .. }
+                    | SlackCanvasOp::Append { canvas_id, .. } => SlackCanvasResult {
+                        ok: true,
+                        op: op.op_name().to_string(),
+                        canvas_id: Some(canvas_id.clone()),
+                        contents: None,
+                        canvases: None,
+                        fetch_status: Default::default(),
+                        bridged: false,
+                        metadata: serde_json::Value::Null,
+                    },
+                };
+                bridge_bus.emit(AgentTurnEvent::SlackCanvas {
+                    session_id: bridge_session_id,
+                    turn_id: bridge_turn_id,
+                    op,
+                    result,
+                });
+            }
+            // OCEAN-373: the remaining runtime `AgentEvent` variants are
+            // *intentionally not relayed* onto `/v1/agent/events`. They are
+            // named explicitly (no `_ => {}` wildcard) so this filter is a
+            // deliberate, greppable decision rather than a silent drop, and
+            // so any NEW `AgentEvent` variant added upstream fails to compile
+            // here until someone consciously decides to relay-or-document it.
+            //
+            // Each of these is a structural turn-lifecycle marker that the
+            // daemon already covers from its own vantage point, or whose
+            // payload is already delivered through the streaming deltas
+            // above. There is no `AgentTurnEvent` wire variant for any of
+            // them, and no SSE consumer needs one today, so adding wire
+            // variants here would be speculative protocol surface. If a
+            // consumer ever genuinely needs one, add the matching
+            // `AgentTurnEvent` variant and move that arm up.
+            //
+            //   - AgentStart / AgentEnd: the run's outer boundary. The daemon
+            //     does not surface a run boundary on the wire; turn-level
+            //     `TurnStarted` / `TurnFinished` (emitted by the daemon itself,
+            //     bracketing this bridge) are the unit clients track.
+            //   - TurnStart / TurnEnd: the runtime's bare turn markers (carry
+            //     only a `session_id`). The daemon emits its own richer
+            //     `AgentTurnEvent::TurnStarted` (with `model`) and
+            //     `TurnFinished` (with status / tokens / wall time) around the
+            //     loop, so relaying these bare runtime markers would duplicate
+            //     the boundary with strictly less information.
+            //   - AssistantMessage: the finalized assistant message. Its text
+            //     already streamed to clients delta-by-delta via
+            //     `AssistantTextDelta` (see the `TextDelta` arm and the NOTE at
+            //     turn close), so re-emitting the whole message would double it.
+            //   - UserMessage: the prompt the client just submitted on this
+            //     turn — echoing it back over SSE tells the client nothing new.
+            //   - TurnCheckpoint: internal session-durability deltas. They are
+            //     consumed and persisted by ocean-agent, never exposed on SSE.
+            //
+            // These are exactly the variants for which
+            // `AgentEvent::is_wire_relayed()` is false, and ocean-agent's H1
+            // forwarder (`run_prompt`) never sends them here (bounded turn
+            // event channel proposal, slice 2), so this arm is unreachable
+            // today. It stays named so the match remains exhaustive.
+            // `turn_bridge_relays_exactly_the_wire_relayed_variants` holds this
+            // match equal to `is_wire_relayed()`: to relay one, add its wire
+            // arm here AND flip it there.
+            AgentEvent::AgentStart { .. }
+            | AgentEvent::AgentEnd { .. }
+            | AgentEvent::TurnStart { .. }
+            | AgentEvent::TurnEnd { .. }
+            | AgentEvent::TurnCheckpoint { .. }
+            | AgentEvent::AssistantMessage { .. }
+            | AgentEvent::UserMessage { .. } => {}
+        }
+    }
+}
+
 async fn agent_turn(
     State(state): State<AppState>,
     Json(req): Json<AgentTurnRequest>,
@@ -6981,373 +7356,16 @@ async fn agent_turn(
     // Wire up the runtime → bus streaming bridge. Every TextDelta /
     // ThinkingDelta / ToolExecution* event the agent emits gets forwarded
     // onto the AgentEventBus in real time so SSE clients render as it streams.
-    let (event_tx, mut event_rx) = tokio::sync::mpsc::unbounded_channel::<AgentEvent>();
-    let bridge_bus = state.agent_events.clone();
-    let bridge_lifecycle = Arc::clone(&state.extension_lifecycle);
-    let bridge_project_id = lifecycle_project_id;
-    let bridge_turn_id = turn_id;
-    let bridge_session_id = session_id;
-
-    let bridge = tokio::spawn(async move {
-        let mut tool_call_ids: HashMap<String, ToolCallId> = HashMap::new();
-        while let Some(ev) = event_rx.recv().await {
-            // Every runtime AgentEvent now carries its own `session_id`
-            // (OCEAN-54), stamped by the agent loop from AgentConfig. The bridge
-            // still re-attaches `bridge_session_id` below, which is now
-            // redundant — the native id equals the bridge id for this turn — but
-            // kept so the SSE payload type (`SessionId` Uuid) is unchanged. The
-            // debug_assert documents the invariant without affecting release.
-            debug_assert!(
-                ev.session_id().is_none()
-                    || ev.session_id() == Some(bridge_session_id.to_string()).as_deref(),
-                "runtime event session_id must match the bridge session id"
-            );
-            match ev {
-                AgentEvent::TextDelta { delta, .. } => {
-                    if delta.is_empty() {
-                        continue;
-                    }
-                    bridge_bus.emit(AgentTurnEvent::AssistantTextDelta {
-                        session_id: bridge_session_id,
-                        turn_id: bridge_turn_id,
-                        delta,
-                    });
-                }
-                // OCEAN-275 honesty: the failover that keeps a turn alive must
-                // also be visible — relay the reroute so surfaces can tell the
-                // operator "you asked for X, this turn ran on Y".
-                AgentEvent::ModelRerouted {
-                    requested,
-                    effective,
-                    reason,
-                    ..
-                } => {
-                    bridge_bus.emit(AgentTurnEvent::ModelRerouted {
-                        session_id: bridge_session_id,
-                        turn_id: bridge_turn_id,
-                        requested,
-                        effective,
-                        reason,
-                    });
-                }
-                // Same honesty rule as the reroute above: a turn that is quietly
-                // reconnecting must say so, or every surface shows a bare
-                // "working" that is indistinguishable from a hang.
-                AgentEvent::ProviderRetrying {
-                    attempt,
-                    max_attempts,
-                    delay_ms,
-                    reason,
-                    scope,
-                    ..
-                } => {
-                    bridge_bus.emit(AgentTurnEvent::ProviderRetrying {
-                        session_id: bridge_session_id,
-                        turn_id: bridge_turn_id,
-                        attempt,
-                        max_attempts,
-                        delay_ms,
-                        reason,
-                        scope: scope.as_str().to_string(),
-                    });
-                }
-                AgentEvent::ThinkingDelta { delta, .. } => {
-                    if delta.is_empty() {
-                        continue;
-                    }
-                    bridge_bus.emit(AgentTurnEvent::ThinkingDelta {
-                        session_id: bridge_session_id,
-                        turn_id: bridge_turn_id,
-                        delta,
-                    });
-                }
-                AgentEvent::ToolExecutionStart {
-                    tool_call_id,
-                    tool_name,
-                    args,
-                    ..
-                } => {
-                    let call_id = ToolCallId(Uuid::new_v4());
-                    tool_call_ids.insert(tool_call_id.clone(), call_id.clone());
-                    if let Ok(lifecycle_tool_name) =
-                        ocean_agent_sdk::extension_lifecycle::ToolName::new(tool_name.clone())
-                    {
-                        let scope = bridge_lifecycle.source_scope(
-                            bridge_project_id,
-                            Some(bridge_session_id.inner()),
-                            Some(bridge_turn_id.inner()),
-                            Some(request_id),
-                            None,
-                        );
-                        bridge_lifecycle.publish(LifecycleSource::ToolExecutionStart {
-                            scope,
-                            runtime_tool_call_id: tool_call_id,
-                            host_tool_call_id: call_id.0,
-                            tool_name: lifecycle_tool_name,
-                            started_at_ms: u64::try_from(Utc::now().timestamp_millis())
-                                .unwrap_or_default(),
-                            stamp: lifecycle_stamp(),
-                            arguments: args.clone(),
-                        });
-                    }
-                    bridge_bus.emit(AgentTurnEvent::ToolCallStarted {
-                        session_id: bridge_session_id,
-                        turn_id: bridge_turn_id,
-                        call: ToolCall {
-                            id: call_id,
-                            name: tool_name,
-                            args_json: args,
-                        },
-                    });
-                }
-                AgentEvent::ToolExecutionEnd {
-                    tool_call_id,
-                    tool_name: _,
-                    is_error,
-                    content,
-                    details,
-                    ..
-                } => {
-                    let call_id = tool_call_ids.remove(&tool_call_id);
-                    let output = render_tool_output(&content);
-                    let scope = bridge_lifecycle.source_scope(
-                        bridge_project_id,
-                        Some(bridge_session_id.inner()),
-                        Some(bridge_turn_id.inner()),
-                        Some(request_id),
-                        None,
-                    );
-                    bridge_lifecycle.publish(LifecycleSource::ToolExecutionEnd {
-                        scope,
-                        runtime_tool_call_id: tool_call_id,
-                        is_error,
-                        rendered_output: output.as_bytes().to_vec(),
-                        details: LifecycleToolEndDetails {
-                            cancelled: details
-                                .get("cancelled")
-                                .and_then(Value::as_bool)
-                                .unwrap_or(false),
-                            private: details.clone(),
-                        },
-                        ended_at_ms: u64::try_from(Utc::now().timestamp_millis())
-                            .unwrap_or_default(),
-                        stamp: lifecycle_stamp(),
-                    });
-                    let call_id = call_id.unwrap_or_else(|| ToolCallId(Uuid::new_v4()));
-                    bridge_bus.emit(AgentTurnEvent::ToolCallFinished {
-                        session_id: bridge_session_id,
-                        turn_id: bridge_turn_id,
-                        call_id,
-                        result: ToolResult {
-                            ok: !is_error,
-                            output,
-                            // Forward the runtime's structured tool-result
-                            // details (exit codes, counts, perf, …) to clients.
-                            // The runtime uses `Value::Null` to mean "no
-                            // metadata"; collapse that to `None` so the SDK
-                            // field stays absent rather than carrying a null.
-                            metadata_json: metadata_from_details(details),
-                        },
-                    });
-                }
-                AgentEvent::PermissionDenied {
-                    tool_name, reason, ..
-                } => {
-                    bridge_lifecycle.publish(LifecycleSource::CompatibilityPermissionDenied {
-                        tool_name: tool_name.clone(),
-                        reason: reason.clone(),
-                    });
-                    // OCEAN-317: emit a paired Started→Finished so clients can
-                    // correlate the denial with the tool call that triggered it.
-                    // A lone Finished (no Started) leaves TUI blocks in a
-                    // permanent "running" state. Both events share one call_id
-                    // minted here; ToolExecutionStart was never emitted by the
-                    // runtime for a denied call, so no existing entry exists in
-                    // `tool_call_ids` to reuse.
-                    let call_id = ToolCallId(Uuid::new_v4());
-                    bridge_bus.emit(AgentTurnEvent::ToolCallStarted {
-                        session_id: bridge_session_id,
-                        turn_id: bridge_turn_id,
-                        call: ToolCall {
-                            id: call_id.clone(),
-                            name: tool_name.clone(),
-                            args_json: serde_json::Value::Null,
-                        },
-                    });
-                    bridge_bus.emit(AgentTurnEvent::ToolCallFinished {
-                        session_id: bridge_session_id,
-                        turn_id: bridge_turn_id,
-                        call_id,
-                        result: ToolResult {
-                            ok: false,
-                            output: format!("permission denied for {tool_name}: {reason}"),
-                            metadata_json: None,
-                        },
-                    });
-                }
-                AgentEvent::Render {
-                    id,
-                    kind,
-                    props,
-                    replace,
-                    ..
-                } => {
-                    bridge_bus.emit(AgentTurnEvent::ComponentRender {
-                        session_id: bridge_session_id,
-                        component_id: id,
-                        kind,
-                        props,
-                        replace,
-                    });
-                }
-                AgentEvent::Unmount { id, .. } => {
-                    bridge_bus.emit(AgentTurnEvent::ComponentUnmount {
-                        session_id: bridge_session_id,
-                        component_id: id,
-                    });
-                }
-                AgentEvent::BrowserActivity { active, .. } => {
-                    bridge_bus.emit(AgentTurnEvent::BrowserActivity {
-                        session_id: bridge_session_id,
-                        active,
-                    });
-                }
-                AgentEvent::SurfacePatch {
-                    canvas_id, patches, ..
-                } => {
-                    // Slice 3: stamp each validated patch into a
-                    // `SurfacePatchEnvelope` carrying the routing/persistence
-                    // context (session/surface/canvas/actor/timestamp), then
-                    // relay onto `/v1/agent/events`. The event carries this
-                    // turn's `bridge_session_id`, so the SSE filter scopes it to
-                    // the originating session — a second session never sees it.
-                    use ocean_agent_sdk::surface::{
-                        ActorRef, CanvasId, PatchId, SurfaceId, SurfacePatchEnvelope,
-                    };
-                    let canvas = CanvasId::new(canvas_id);
-                    let created_at_ms = ocean_protocol::now_ms();
-                    let envelopes: Vec<SurfacePatchEnvelope> = patches
-                        .into_iter()
-                        .map(|patch| SurfacePatchEnvelope {
-                            patch_id: PatchId::new(Uuid::new_v4().to_string()),
-                            session_id: bridge_session_id,
-                            surface_id: SurfaceId::new("surface:local"),
-                            canvas_id: canvas.clone(),
-                            actor: ActorRef::agent(None),
-                            created_at_ms,
-                            patch,
-                            // OCEAN-258: the daemon is a transport, not the merge
-                            // authority — the surface ledger stamps the convergent-
-                            // merge `version` when it applies this patch. Stamping an
-                            // authoritative revision here would split-brain the clock.
-                            version: None,
-                        })
-                        .collect();
-                    bridge_bus.emit(AgentTurnEvent::SurfacePatch {
-                        session_id: bridge_session_id,
-                        turn_id: bridge_turn_id,
-                        canvas_id: canvas,
-                        patches: envelopes,
-                    });
-                }
-                AgentEvent::SlackCanvas { op, .. } => {
-                    // OCEAN-235: relay the validated slack_canvas op onto
-                    // `/v1/agent/events` scoped to this session, so the Slack
-                    // canvas bridge (`ocean-agents`) can consume it and round-trip
-                    // to the Slack Canvas API. Before this, the event hit the
-                    // `_ => {}` catch-all below and was silently dropped — the
-                    // bridge could never see a `read` request to fulfill.
-                    //
-                    // We attach the runtime's contracted result for the op (the
-                    // honest *pending* shape for `read`/`list`) so a bridge has
-                    // both the op to fulfill and the result shape to stamp live
-                    // content into via
-                    // `SlackCanvasResult::fulfilled_read`/`fulfilled_list`.
-                    use ocean_agent_sdk::slack_canvas::{SlackCanvasOp, SlackCanvasResult};
-                    let result = match &op {
-                        SlackCanvasOp::Read { canvas_id } => {
-                            SlackCanvasResult::pending_read(canvas_id.clone())
-                        }
-                        SlackCanvasOp::List { .. } => SlackCanvasResult::pending_list(),
-                        SlackCanvasOp::Create { .. } => SlackCanvasResult {
-                            ok: true,
-                            op: "create".to_string(),
-                            canvas_id: None,
-                            contents: None,
-                            canvases: None,
-                            fetch_status: Default::default(),
-                            bridged: false,
-                            metadata: serde_json::Value::Null,
-                        },
-                        SlackCanvasOp::Update { canvas_id, .. }
-                        | SlackCanvasOp::Append { canvas_id, .. } => SlackCanvasResult {
-                            ok: true,
-                            op: op.op_name().to_string(),
-                            canvas_id: Some(canvas_id.clone()),
-                            contents: None,
-                            canvases: None,
-                            fetch_status: Default::default(),
-                            bridged: false,
-                            metadata: serde_json::Value::Null,
-                        },
-                    };
-                    bridge_bus.emit(AgentTurnEvent::SlackCanvas {
-                        session_id: bridge_session_id,
-                        turn_id: bridge_turn_id,
-                        op,
-                        result,
-                    });
-                }
-                // OCEAN-373: the remaining runtime `AgentEvent` variants are
-                // *intentionally not relayed* onto `/v1/agent/events`. They are
-                // named explicitly (no `_ => {}` wildcard) so this filter is a
-                // deliberate, greppable decision rather than a silent drop, and
-                // so any NEW `AgentEvent` variant added upstream fails to compile
-                // here until someone consciously decides to relay-or-document it.
-                //
-                // Each of these is a structural turn-lifecycle marker that the
-                // daemon already covers from its own vantage point, or whose
-                // payload is already delivered through the streaming deltas
-                // above. There is no `AgentTurnEvent` wire variant for any of
-                // them, and no SSE consumer needs one today, so adding wire
-                // variants here would be speculative protocol surface. If a
-                // consumer ever genuinely needs one, add the matching
-                // `AgentTurnEvent` variant and move that arm up.
-                //
-                //   - AgentStart / AgentEnd: the run's outer boundary. The daemon
-                //     does not surface a run boundary on the wire; turn-level
-                //     `TurnStarted` / `TurnFinished` (emitted by the daemon itself,
-                //     bracketing this bridge) are the unit clients track.
-                //   - TurnStart / TurnEnd: the runtime's bare turn markers (carry
-                //     only a `session_id`). The daemon emits its own richer
-                //     `AgentTurnEvent::TurnStarted` (with `model`) and
-                //     `TurnFinished` (with status / tokens / wall time) around the
-                //     loop, so relaying these bare runtime markers would duplicate
-                //     the boundary with strictly less information.
-                //   - AssistantMessage: the finalized assistant message. Its text
-                //     already streamed to clients delta-by-delta via
-                //     `AssistantTextDelta` (see the `TextDelta` arm and the NOTE at
-                //     turn close), so re-emitting the whole message would double it.
-                //   - UserMessage: the prompt the client just submitted on this
-                //     turn — echoing it back over SSE tells the client nothing new.
-                //   - TurnCheckpoint: internal session-durability deltas. They are
-                //     consumed and persisted by ocean-agent, never exposed on SSE.
-                //
-                // ocean-agent's H1 forwarder (`run_prompt`) no longer sends any
-                // of these to this bridge (bounded turn event channel proposal,
-                // slice 2), so this arm is unreachable today. It stays named so
-                // the match remains exhaustive and the decision greppable. To
-                // relay one, add its wire arm here AND stop filtering it there.
-                AgentEvent::AgentStart { .. }
-                | AgentEvent::AgentEnd { .. }
-                | AgentEvent::TurnStart { .. }
-                | AgentEvent::TurnEnd { .. }
-                | AgentEvent::TurnCheckpoint { .. }
-                | AgentEvent::AssistantMessage { .. }
-                | AgentEvent::UserMessage { .. } => {}
-            }
-        }
-    });
+    let (event_tx, event_rx) = tokio::sync::mpsc::unbounded_channel::<AgentEvent>();
+    let bridge = tokio::spawn(run_turn_bridge(
+        event_rx,
+        state.agent_events.clone(),
+        Arc::clone(&state.extension_lifecycle),
+        lifecycle_project_id,
+        request_id,
+        turn_id,
+        session_id,
+    ));
 
     let control = build_prompt_control_with_lifecycle(
         &state,
@@ -9813,110 +9831,149 @@ mod tests {
         Arc::new(Mutex::new(HashMap::new()))
     }
 
-    /// OCEAN-373: the runtime → SSE bridge classifies every `AgentEvent` variant
-    /// as either RELAYED (forwarded onto `/v1/agent/events` as an
-    /// `AgentTurnEvent`) or FILTERED (intentionally dropped — see the documented
-    /// match arm in the bridge). This classifier MIRRORS that bridge match arm
-    /// for arm, with NO `_` wildcard, so the contract has a single greppable
-    /// home in the tests as well as the bridge.
-    ///
-    /// The real guard is the compiler: adding a new `AgentEvent` variant upstream
-    /// breaks BOTH this match and the bridge's match (neither has a wildcard),
-    /// forcing whoever adds it to consciously choose relay-or-document rather
-    /// than letting it fall silently into a catch-all. The assertions below then
-    /// pin the *current* classification so a behavior change (moving a variant
-    /// between buckets) is caught too.
-    #[cfg(test)]
-    #[derive(Debug, PartialEq, Eq)]
-    enum RelayClass {
-        Relayed,
-        Filtered,
-    }
-
-    #[cfg(test)]
-    fn classify_agent_event(ev: &AgentEvent) -> RelayClass {
-        match ev {
-            // Relayed onto the SSE wire (see the bridge match arms).
-            AgentEvent::TextDelta { .. }
-            | AgentEvent::ModelRerouted { .. }
-            | AgentEvent::ProviderRetrying { .. }
-            | AgentEvent::ThinkingDelta { .. }
-            | AgentEvent::ToolExecutionStart { .. }
-            | AgentEvent::ToolExecutionEnd { .. }
-            | AgentEvent::PermissionDenied { .. }
-            | AgentEvent::Render { .. }
-            | AgentEvent::Unmount { .. }
-            | AgentEvent::BrowserActivity { .. }
-            | AgentEvent::SurfacePatch { .. }
-            | AgentEvent::SlackCanvas { .. } => RelayClass::Relayed,
-            // Intentionally NOT relayed (OCEAN-373) — structural turn/run markers
-            // the daemon covers itself, or message payloads already streamed.
-            AgentEvent::AgentStart { .. }
-            | AgentEvent::AgentEnd { .. }
-            | AgentEvent::TurnStart { .. }
-            | AgentEvent::TurnEnd { .. }
-            | AgentEvent::TurnCheckpoint { .. }
-            | AgentEvent::AssistantMessage { .. }
-            | AgentEvent::UserMessage { .. } => RelayClass::Filtered,
-        }
-    }
-
-    #[test]
-    fn ocean_373_agentevent_relay_classification_is_exhaustive_and_documented() {
+    /// OCEAN-373 + bounded turn event channel proposal, slice 2: the real
+    /// turn bridge (`run_turn_bridge`) puts something on the agent bus for
+    /// exactly the runtime variants `AgentEvent::is_wire_relayed()` classifies
+    /// as relayed, and nothing for the rest. This replaces the hand-kept
+    /// mirror of the bridge match: `is_wire_relayed` (exhaustive, in
+    /// `ocean-runtime`) is the single source of truth, `ocean-agent` filters
+    /// with it, and this test holds the bridge's own exhaustive match to it.
+    /// Every variant appears once in `samples`; the distinct-kind count guards
+    /// that.
+    #[tokio::test]
+    async fn turn_bridge_relays_exactly_the_wire_relayed_variants() {
         use ocean_protocol::Message;
+        use ocean_runtime::types::RetryScope;
 
-        // Every currently-filtered variant must classify as Filtered. These are
-        // the structural/message/durability variants the bridge documents-and-drops.
-        let filtered = [
-            AgentEvent::AgentStart { session_id: None },
+        let session_id = AgentSessionId::new_v4();
+        let s = || Some(session_id.to_string());
+        let samples = vec![
+            AgentEvent::AgentStart { session_id: s() },
             AgentEvent::AgentEnd {
-                session_id: None,
-                messages: vec![],
+                session_id: s(),
+                messages: vec![Message::user_text("x")],
             },
-            AgentEvent::TurnStart { session_id: None },
-            AgentEvent::TurnEnd { session_id: None },
+            AgentEvent::TurnStart { session_id: s() },
+            AgentEvent::TurnEnd { session_id: s() },
             AgentEvent::TurnCheckpoint {
-                session_id: None,
-                messages: vec![],
+                session_id: s(),
+                messages: vec![Message::user_text("x")],
             },
             AgentEvent::AssistantMessage {
-                session_id: None,
+                session_id: s(),
                 message: Message::user_text("x"),
             },
             AgentEvent::UserMessage {
-                session_id: None,
+                session_id: s(),
                 message: Message::user_text("x"),
             },
-        ];
-        for ev in &filtered {
-            assert_eq!(
-                classify_agent_event(ev),
-                RelayClass::Filtered,
-                "{ev:?} must be intentionally filtered (OCEAN-373)"
-            );
-        }
-
-        // Spot-check that representative relayed variants classify as Relayed, so
-        // a regression that lumped everything into one bucket is caught.
-        let relayed = [
             AgentEvent::TextDelta {
-                session_id: None,
+                session_id: s(),
                 delta: "hi".into(),
             },
-            AgentEvent::BrowserActivity {
-                session_id: None,
-                active: true,
+            AgentEvent::ThinkingDelta {
+                session_id: s(),
+                delta: "hmm".into(),
+            },
+            AgentEvent::ToolExecutionStart {
+                session_id: s(),
+                tool_call_id: "c1".into(),
+                tool_name: "bash".into(),
+                args: json!({}),
+            },
+            AgentEvent::ToolExecutionEnd {
+                session_id: s(),
+                tool_call_id: "c1".into(),
+                tool_name: "bash".into(),
+                is_error: false,
+                content: vec![],
+                details: Value::Null,
+            },
+            AgentEvent::PermissionDenied {
+                session_id: s(),
+                tool_name: "write".into(),
+                reason: "no".into(),
+            },
+            AgentEvent::ModelRerouted {
+                session_id: s(),
+                requested: "a".into(),
+                effective: "b".into(),
+                reason: "r".into(),
+            },
+            AgentEvent::ProviderRetrying {
+                session_id: s(),
+                attempt: 1,
+                max_attempts: 3,
+                delay_ms: 10,
+                reason: "connection failed".into(),
+                scope: RetryScope::Request,
+            },
+            AgentEvent::Render {
+                session_id: s(),
+                id: "c".into(),
+                kind: "card".into(),
+                props: json!({}),
+                replace: false,
             },
             AgentEvent::Unmount {
-                session_id: None,
-                id: "c1".into(),
+                session_id: s(),
+                id: "c".into(),
+            },
+            AgentEvent::BrowserActivity {
+                session_id: s(),
+                active: true,
+            },
+            AgentEvent::SurfacePatch {
+                session_id: s(),
+                canvas_id: "canvas:main".into(),
+                patches: vec![],
+            },
+            AgentEvent::SlackCanvas {
+                session_id: s(),
+                op: ocean_agent_sdk::slack_canvas::SlackCanvasOp::List {
+                    channel_id: ocean_agent_sdk::slack_canvas::SlackChannelId::new("C1"),
+                },
             },
         ];
-        for ev in &relayed {
+        let kinds: HashSet<String> = samples
+            .iter()
+            .map(|ev| {
+                format!("{ev:?}")
+                    .split([' ', '{', '('])
+                    .next()
+                    .unwrap()
+                    .to_owned()
+            })
+            .collect();
+        assert_eq!(kinds.len(), samples.len(), "one sample per variant");
+        assert_eq!(
+            samples.len(),
+            19,
+            "add a sample for every new AgentEvent variant"
+        );
+
+        for ev in samples {
+            let bus = AgentEventBus::new(64);
+            let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+            let relayed = ev.is_wire_relayed();
+            let label = format!("{ev:?}");
+            tx.send(ev).unwrap();
+            drop(tx);
+            run_turn_bridge(
+                rx,
+                bus.clone(),
+                test_lifecycle_dispatcher(),
+                None,
+                RequestId::new_v4(),
+                AgentTurnId::new_v4(),
+                session_id,
+            )
+            .await;
+            let (emitted, _) = bus.subscribe_with_full_replay();
             assert_eq!(
-                classify_agent_event(ev),
-                RelayClass::Relayed,
-                "{ev:?} must be relayed onto SSE"
+                !emitted.is_empty(),
+                relayed,
+                "bridge and is_wire_relayed disagree on {label}"
             );
         }
     }
@@ -17340,6 +17397,116 @@ mod tests {
         assert!(state.permissions.read().await.is_empty());
     }
 
+    /// A daemon on the keyless `fake-tool` model whose scripted `write`
+    /// targets a per-test path. `yolo` false keeps the real gating policy, so
+    /// the turn suspends on a permission waiter. Caller holds
+    /// `AUTO_CONVENE_ENV_LOCK` and a `TestEnvRestore` over `OCEAN_CONFIG_DIR`,
+    /// `OCEAN_MODEL`, `OCEAN_YOLO`, and `FAKE_TOOL_TARGET_ENV`.
+    fn scripted_fake_tool_state(
+        tmp: &tempfile::TempDir,
+        yolo: bool,
+    ) -> (AppState, std::path::PathBuf) {
+        let mut state = fake_convene_state(tmp);
+        if !yolo {
+            std::env::remove_var("OCEAN_YOLO");
+        }
+        std::env::set_var("OCEAN_MODEL", ocean_runtime::FAKE_TOOL_MODEL);
+        let target = tmp.path().join("fake-tool-target.txt");
+        std::env::set_var(ocean_runtime::FAKE_TOOL_TARGET_ENV, &target);
+        state.runtime = Arc::new(
+            AgentRuntime::with_config_dir(tmp.path().to_path_buf()).expect("fake-tool runtime"),
+        );
+        (state, target)
+    }
+
+    /// Start one scripted turn through the real handler; returns its session.
+    async fn start_scripted_turn(state: &AppState, tmp: &tempfile::TempDir) -> serde_json::Value {
+        let mut turn = sample_agent_turn();
+        turn.prompt = "write the file".into();
+        turn.cwd = tmp.path().to_string_lossy().into_owned();
+        let (status, Json(ack)) = agent_turn(State(state.clone()), Json(turn)).await;
+        assert_eq!(status, StatusCode::ACCEPTED, "{ack:?}");
+        serde_json::to_value(ack.session_id).unwrap()
+    }
+
+    /// The session's agent-bus events, once its `turn_finished` is on the bus.
+    async fn scripted_turn_events(
+        state: &AppState,
+        session: &serde_json::Value,
+    ) -> Vec<serde_json::Value> {
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            let (history, _live) = state.agent_events.subscribe_with_full_replay();
+            let events: Vec<serde_json::Value> = history
+                .iter()
+                .map(|envelope| serde_json::to_value(&envelope.event).unwrap())
+                .filter(|event| event["session_id"] == *session)
+                .collect();
+            if events.iter().any(|event| event["type"] == "turn_finished") {
+                return events;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "scripted turn never finished: {events:?}"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    }
+
+    /// The session's retained extension-lifecycle fact kinds, in order, once
+    /// the terminal `turn_finished` fact has been retained.
+    async fn scripted_turn_lifecycle(state: &AppState, session: &serde_json::Value) -> Vec<String> {
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            let kinds: Vec<String> = state
+                .extension_lifecycle
+                .attach()
+                .retained
+                .iter()
+                .map(|event| serde_json::to_value(event).unwrap())
+                .filter(|event| event["scope"]["session_id"] == *session)
+                .map(|event| event["kind"].as_str().unwrap_or_default().to_owned())
+                .collect();
+            if kinds.iter().any(|kind| kind == "turn_finished") {
+                return kinds;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "no terminal lifecycle fact: {kinds:?}"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    }
+
+    /// Wait for the turn's permission waiter and answer it.
+    async fn answer_scripted_waiter(state: &AppState, decision: AgentPermissionDecision) {
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            let sender = {
+                let mut permissions = state.permissions.write().await;
+                permissions
+                    .values_mut()
+                    .find_map(|waiter| waiter.sender.take())
+            };
+            if let Some(sender) = sender {
+                sender.send(decision).expect("decision");
+                return;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "no permission waiter"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    }
+
+    fn event_types(events: &[serde_json::Value]) -> Vec<&str> {
+        events
+            .iter()
+            .map(|event| event["type"].as_str().unwrap_or_default())
+            .collect()
+    }
+
     /// Bounded turn event channel proposal
     /// (`docs/specs/2026-09-26-bounded-turn-event-channel-proposal.md`),
     /// slice 2 golden: a scripted `fake-tool` turn through the real handler,
@@ -17357,50 +17524,14 @@ mod tests {
             ocean_runtime::FAKE_TOOL_TARGET_ENV,
         ]);
         let tmp = tempfile::tempdir().unwrap();
-        // YOLO (set by the fixture), so the scripted `write` runs ungated.
-        let mut state = fake_convene_state(&tmp);
-        std::env::set_var("OCEAN_MODEL", ocean_runtime::FAKE_TOOL_MODEL);
-        let target = tmp.path().join("fake-tool-target.txt");
-        std::env::set_var(ocean_runtime::FAKE_TOOL_TARGET_ENV, &target);
-        state.runtime = Arc::new(
-            AgentRuntime::with_config_dir(tmp.path().to_path_buf()).expect("fake-tool runtime"),
-        );
-
-        let mut turn = sample_agent_turn();
-        turn.prompt = "write the file".into();
-        turn.cwd = tmp.path().to_string_lossy().into_owned();
-        let (status, Json(ack)) = agent_turn(State(state.clone()), Json(turn)).await;
-        assert_eq!(status, StatusCode::ACCEPTED, "{ack:?}");
-        let session = serde_json::to_value(ack.session_id).unwrap();
-
-        let session_events = || -> Vec<serde_json::Value> {
-            let (history, _live) = state.agent_events.subscribe_with_full_replay();
-            history
-                .iter()
-                .map(|envelope| serde_json::to_value(&envelope.event).unwrap())
-                .filter(|event| event["session_id"] == session)
-                .collect()
-        };
-        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
-        let events = loop {
-            let events = session_events();
-            if events.iter().any(|event| event["type"] == "turn_finished") {
-                break events;
-            }
-            assert!(
-                tokio::time::Instant::now() < deadline,
-                "scripted turn never finished: {events:?}"
-            );
-            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-        };
+        // YOLO, so the scripted `write` runs ungated.
+        let (state, target) = scripted_fake_tool_state(&tmp, true);
+        let session = start_scripted_turn(&state, &tmp).await;
+        let events = scripted_turn_events(&state, &session).await;
         assert!(target.exists(), "the scripted write did not run");
 
-        let kinds: Vec<&str> = events
-            .iter()
-            .map(|event| event["type"].as_str().unwrap_or_default())
-            .collect();
         assert_eq!(
-            kinds,
+            event_types(&events),
             [
                 "session_created",
                 "turn_started",
@@ -17412,8 +17543,132 @@ mod tests {
             "bridge-visible event stream changed: {events:#?}"
         );
         assert_eq!(events[2]["call"]["name"], "write");
+        assert_eq!(events[3]["call_id"], events[2]["call"]["id"]);
+        assert_eq!(events[3]["result"]["ok"], true);
         assert_eq!(events[4]["delta"], "done");
         assert_eq!(events[5]["status"], "completed");
+    }
+
+    /// Slice 2 golden, denied permission: the gated `write` is denied, so the
+    /// runtime's `PermissionDenied` becomes a paired started/finished
+    /// (OCEAN-317) with `ok: false`, the scripted second round still replies,
+    /// and the turn completes. Nothing ran.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn scripted_denied_turn_bridge_visible_event_stream_matches_golden() {
+        let _guard = AUTO_CONVENE_ENV_LOCK.lock().await;
+        let _env = TestEnvRestore::capture(&[
+            "OCEAN_CONFIG_DIR",
+            "OCEAN_MODEL",
+            "OCEAN_YOLO",
+            ocean_runtime::FAKE_TOOL_TARGET_ENV,
+        ]);
+        let tmp = tempfile::tempdir().unwrap();
+        let (state, target) = scripted_fake_tool_state(&tmp, false);
+        let session = start_scripted_turn(&state, &tmp).await;
+        answer_scripted_waiter(
+            &state,
+            AgentPermissionDecision::Deny {
+                reason: "denied by test".into(),
+            },
+        )
+        .await;
+        let events = scripted_turn_events(&state, &session).await;
+        assert!(!target.exists(), "a denied write must not run");
+
+        assert_eq!(
+            event_types(&events),
+            [
+                "session_created",
+                "turn_started",
+                "tool_call_started",
+                "tool_call_finished",
+                "assistant_text_delta",
+                "turn_finished",
+            ],
+            "denied-turn event stream changed: {events:#?}"
+        );
+        assert_eq!(events[2]["call"]["name"], "write");
+        assert_eq!(events[3]["call_id"], events[2]["call"]["id"]);
+        assert_eq!(events[3]["result"]["ok"], false);
+        assert_eq!(events[4]["delta"], "done");
+        assert_eq!(events[5]["status"], "completed");
+        let lifecycle = scripted_turn_lifecycle(&state, &session).await;
+        assert_eq!(
+            lifecycle,
+            [
+                "session_started",
+                "turn_started",
+                "permission_requested",
+                "permission_resolved",
+                "turn_finished",
+            ],
+            "a lifecycle frame was left open or added"
+        );
+    }
+
+    /// Slice 2 golden, cancelled turn: the turn is cancelled through the real
+    /// cancel route while it waits on its permission. The pending call closes
+    /// as a denied started/finished pair, the turn ends `cancelled`, and no
+    /// lifecycle frame is left open: the requested permission is resolved and
+    /// the terminal fact is last.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn scripted_cancelled_turn_bridge_visible_event_stream_matches_golden() {
+        let _guard = AUTO_CONVENE_ENV_LOCK.lock().await;
+        let _env = TestEnvRestore::capture(&[
+            "OCEAN_CONFIG_DIR",
+            "OCEAN_MODEL",
+            "OCEAN_YOLO",
+            ocean_runtime::FAKE_TOOL_TARGET_ENV,
+        ]);
+        let tmp = tempfile::tempdir().unwrap();
+        let (state, target) = scripted_fake_tool_state(&tmp, false);
+        let session = start_scripted_turn(&state, &tmp).await;
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+        while state.permissions.read().await.is_empty() {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "no permission waiter"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        let request_ids: Vec<RequestId> = state.requests.read().await.keys().copied().collect();
+        assert_eq!(request_ids.len(), 1);
+        let Json(cancelled) = cancel_request(State(state.clone()), Path(request_ids[0])).await;
+        assert!(cancelled.ok, "{}", cancelled.message);
+
+        let events = scripted_turn_events(&state, &session).await;
+        assert!(!target.exists(), "a cancelled write must not run");
+        assert_eq!(
+            event_types(&events),
+            [
+                "session_created",
+                "turn_started",
+                "tool_call_started",
+                "tool_call_finished",
+                "turn_finished",
+            ],
+            "cancelled-turn event stream changed: {events:#?}"
+        );
+        assert_eq!(events[2]["call"]["name"], "write");
+        assert_eq!(events[3]["call_id"], events[2]["call"]["id"]);
+        assert_eq!(events[3]["result"]["ok"], false);
+        assert_eq!(
+            events[3]["result"]["output"],
+            "permission denied for write: request cancelled while waiting for permission"
+        );
+        assert_eq!(events[4]["status"], "cancelled");
+        let lifecycle = scripted_turn_lifecycle(&state, &session).await;
+        assert_eq!(
+            lifecycle,
+            [
+                "session_started",
+                "turn_started",
+                "permission_requested",
+                "permission_resolved",
+                "turn_finished",
+            ],
+            "a lifecycle frame was left open or added"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

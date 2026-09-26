@@ -531,6 +531,45 @@ pub enum AgentEvent {
 }
 
 impl AgentEvent {
+    /// Whether the daemon relays this variant onto the client wire
+    /// (`/v1/agent/events`). This is the single source of truth for that
+    /// decision: `ocean-agent` forwards to its event sink exactly the events
+    /// for which this is `true`, and the daemon turn bridge's exhaustive match
+    /// is tested against it (`turn_bridge_relays_exactly_the_wire_relayed_variants`).
+    ///
+    /// The `false` variants (OCEAN-373) are run/turn markers the daemon covers
+    /// itself, message payloads already streamed as deltas, or `TurnCheckpoint`
+    /// durability deltas that `ocean-agent` persists. `AgentEnd` carries the
+    /// whole history, so never forwarding it matters (bounded turn event
+    /// channel proposal, slice 2).
+    ///
+    /// No wildcard: a new variant must be classified here, and the bridge's
+    /// match forces the matching wire decision in `ocean-daemon`. When in doubt,
+    /// `true` is the safe answer — the bridge then decides.
+    pub fn is_wire_relayed(&self) -> bool {
+        match self {
+            AgentEvent::TextDelta { .. }
+            | AgentEvent::ThinkingDelta { .. }
+            | AgentEvent::ToolExecutionStart { .. }
+            | AgentEvent::ToolExecutionEnd { .. }
+            | AgentEvent::PermissionDenied { .. }
+            | AgentEvent::ModelRerouted { .. }
+            | AgentEvent::ProviderRetrying { .. }
+            | AgentEvent::Render { .. }
+            | AgentEvent::Unmount { .. }
+            | AgentEvent::BrowserActivity { .. }
+            | AgentEvent::SurfacePatch { .. }
+            | AgentEvent::SlackCanvas { .. } => true,
+            AgentEvent::AgentStart { .. }
+            | AgentEvent::AgentEnd { .. }
+            | AgentEvent::TurnStart { .. }
+            | AgentEvent::TurnEnd { .. }
+            | AgentEvent::TurnCheckpoint { .. }
+            | AgentEvent::AssistantMessage { .. }
+            | AgentEvent::UserMessage { .. } => false,
+        }
+    }
+
     /// The session this event belongs to, if the run had one.
     pub fn session_id(&self) -> Option<&str> {
         match self {
@@ -561,6 +600,60 @@ impl AgentEvent {
 mod tests {
     use super::*;
     use ocean_protocol::Model;
+
+    /// The seven OCEAN-373 variants are not wire-relayed; everything that
+    /// carries client-visible output is. Full parity with the daemon bridge is
+    /// pinned in `ocean-daemon` against the real bridge.
+    #[test]
+    fn wire_relay_classification_pins_the_ocean_373_filter() {
+        let message = ocean_protocol::Message::user_text("x");
+        let not_relayed = [
+            AgentEvent::AgentStart { session_id: None },
+            AgentEvent::AgentEnd {
+                session_id: None,
+                messages: vec![message.clone()],
+            },
+            AgentEvent::TurnStart { session_id: None },
+            AgentEvent::TurnEnd { session_id: None },
+            AgentEvent::TurnCheckpoint {
+                session_id: None,
+                messages: vec![message.clone()],
+            },
+            AgentEvent::AssistantMessage {
+                session_id: None,
+                message: message.clone(),
+            },
+            AgentEvent::UserMessage {
+                session_id: None,
+                message,
+            },
+        ];
+        for ev in &not_relayed {
+            assert!(!ev.is_wire_relayed(), "{ev:?}");
+        }
+        let relayed = [
+            AgentEvent::TextDelta {
+                session_id: None,
+                delta: "d".into(),
+            },
+            AgentEvent::ToolExecutionEnd {
+                session_id: None,
+                tool_call_id: "c".into(),
+                tool_name: "bash".into(),
+                is_error: false,
+                content: vec![],
+                details: Value::Null,
+            },
+            AgentEvent::PermissionDenied {
+                session_id: None,
+                tool_name: "write".into(),
+                reason: "no".into(),
+            },
+        ];
+        for ev in &relayed {
+            assert!(ev.is_wire_relayed(), "{ev:?}");
+        }
+    }
 
     fn cfg() -> AgentConfig {
         AgentConfig::new(Model::anthropic_claude_sonnet_4_6(), "test")

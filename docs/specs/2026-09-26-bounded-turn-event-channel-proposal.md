@@ -218,36 +218,71 @@ These agree with the scratch figures in §2. The H1 consumer stalls for about 10
 
 ### Slice 2: stop forwarding what the bridge discards
 
-**Change.** `run_prompt`'s H1 receive loop (`crates/ocean-agent/src/lib.rs`) now:
+**Change.**
 
-- updates `stdout`, `stderr`, and `streamed_output` by reference;
-- persists `TurnCheckpoint` locally by moving its delta, as before;
-- drops `AgentStart`, `AgentEnd`, `TurnStart`, `TurnEnd`, `AssistantMessage`, and `UserMessage` without forwarding them;
-- **moves** every other event into the event sink (H2). The old `sink.send(ev.clone())` is gone.
+- **One source of truth.** `AgentEvent::is_wire_relayed()` (`crates/ocean-runtime/src/types.rs`) is an exhaustive match with no wildcard. It classifies the seven OCEAN-373 variants as not relayed and everything else as relayed. It replaces the hand-kept copies that used to exist: the daemon's test-only `classify_agent_event`/`RelayClass`, and the filter lists in `ocean-agent` and its test.
+- **The H1 forwarder** in `run_prompt` (`crates/ocean-agent/src/lib.rs`):
+  - updates `stdout`, `stderr`, and `streamed_output` by reference;
+  - **moves** every event where `ev.is_wire_relayed()` is true into the event sink (H2). The old `sink.send(ev.clone())` is gone;
+  - for the rest, persists `TurnCheckpoint` locally (a move of its delta, as before) and drops everything else.
 
-A future runtime variant is forwarded by default, so the bridge's exhaustive `match` still forces a relay-or-document decision. The bridge (`crates/ocean-daemon/src/main.rs`) is unchanged except for a comment: its named no-relay arm is now unreachable and kept for exhaustiveness. The direct `ModelRerouted` and fake-provider `TextDelta` sends are unchanged.
+  It has no catch-all of its own. A new runtime variant forces a decision in `is_wire_relayed` in `ocean-runtime` and in the bridge's exhaustive match in `ocean-daemon`.
+- **The bridge.** Its body moved verbatim out of `agent_turn` into `run_turn_bridge` (`crates/ocean-daemon/src/main.rs`) so a test can drive it. Its named no-relay arm is now unreachable and is kept for exhaustiveness.
+- The direct `ModelRerouted` and fake-provider `TextDelta` sends are unchanged.
 
 **Consumer audit.** Every holder of H2, and every other reader of runtime `AgentEvent`s, at `c8fad6ce`:
 
 | Consumer | Reads H2? | What it reads | Relies on a dropped variant? |
 |---|---|---|---|
-| Daemon turn bridge (`ocean-daemon/src/main.rs`, `with_event_sink(event_tx)`) | yes, the only production sink | `TextDelta`, `ThinkingDelta`, `ModelRerouted`, `ProviderRetrying`, `ToolExecutionStart/End` (also to the lifecycle dispatcher), `PermissionDenied`, `Render`, `Unmount`, `BrowserActivity`, `SurfacePatch`, `SlackCanvas`, plus a debug-only `session_id` assert on every event | no. All seven are in its `=> {}` arm. |
+| Daemon turn bridge (`run_turn_bridge`, fed by `with_event_sink(event_tx)`) | yes, the only production sink | `TextDelta`, `ThinkingDelta`, `ModelRerouted`, `ProviderRetrying`, `ToolExecutionStart/End` (also sent to the lifecycle dispatcher), `PermissionDenied`, `Render`, `Unmount`, `BrowserActivity`, `SurfacePatch`, `SlackCanvas`, plus a debug-only `session_id` assert on every event | no. All seven are in its `=> {}` arm, and a parity test proves it. |
 | `ocean-agent` unit test `fake_provider_streams_assistant_text_delta_on_event_sink` | yes (test) | `TextDelta` from the `fake-ok` path, which does not use H1 | no |
 | `ocean-cli` | no | depends on `ocean-agent` only for `agentdir` and `config_dir_from_env`. Its output comes from the daemon or `stdout`. | no |
-| `ocean-tui`, `ocean-acp`, `ocean-surface`, MCP, Observatory, extension services | no | wire `AgentTurnEvent`s over SSE or the bus, produced by the bridge. None depends on `ocean-agent`, and none sets an event sink. | no. Their input is pinned by the golden test below. |
+| `ocean-tui`, `ocean-acp`, `ocean-surface`, MCP, Observatory, extension services | no | wire `AgentTurnEvent`s over SSE or the bus, produced by the bridge. None depends on `ocean-agent`, and none sets an event sink. | no. Their input is pinned by the golden tests below. |
 | `ocean-runtime` tests, daemon `run_agent_with_history` tests | no | their own runtime channels (H1-shaped), not `ocean-agent`'s sink | no |
-| Transcript and checkpoints | no | `ocean-agent` persists `TurnCheckpoint` and the final `run.messages` itself, before and after this change | no |
+| Transcript and checkpoints | no | `ocean-agent` persists each `TurnCheckpoint` as it arrives and the final `run.messages` at turn end, as before | no |
 
 **Tests.**
 
-- `ocean-daemon` `scripted_turn_bridge_visible_event_stream_matches_golden`: a `fake-tool` turn through `agent_turn`, the real runtime, H1, and the bridge. The session's agent-bus events must be exactly `session_created, turn_started, tool_call_started, tool_call_finished, assistant_text_delta, turn_finished`, with the tool name `write`, the delta text `done`, and status `completed`.
-- `ocean-agent` `event_sink_carries_only_bridge_relayed_events_for_a_scripted_turn`: the same scripted turn at the `ocean-agent` layer. It first checks that `stdout` (`"\ndone\n"`), `stderr`, and the persisted transcript (4 messages) are unchanged, and that the bridge-relayed subsequence is `ToolExecutionStart, ToolExecutionEnd, TextDelta`. Then it checks that none of the seven dropped kinds reaches the sink.
+- **`ocean-runtime` `wire_relay_classification_pins_the_ocean_373_filter`:** the seven variants are not relayed, and representative content variants are.
+- **`ocean-daemon` `turn_bridge_relays_exactly_the_wire_relayed_variants`:** sends one sample of each of the 19 variants through the real `run_turn_bridge`. It asserts the bridge put something on the agent bus exactly when `is_wire_relayed()` is true. It also asserts one sample per variant.
+- **`ocean-daemon` `scripted_turn_bridge_visible_event_stream_matches_golden`:** runs a YOLO `fake-tool` turn through `agent_turn`, the real runtime, H1, and the bridge. It asserts:
+  - the sequence is exactly `session_created, turn_started, tool_call_started, tool_call_finished, assistant_text_delta, turn_finished`;
+  - the finished `call_id` equals the started `call.id`;
+  - `result.ok` is true, the delta is `done`, and the status is `completed`.
 
-**Mutation checks** (sources restored and `touch`ed after each; both tests green after restore):
+  It passes before and after slice 2.
+- **`ocean-daemon` `scripted_denied_turn_bridge_visible_event_stream_matches_golden`:** the gated `write` is denied through the real waiter. It asserts:
+  - the same six-event sequence, with a paired `call_id` and `result.ok: false`;
+  - the scripted reply `done`, and status `completed`;
+  - the lifecycle facts are exactly `session_started, turn_started, permission_requested, permission_resolved, turn_finished`.
+- **`ocean-daemon` `scripted_cancelled_turn_bridge_visible_event_stream_matches_golden`:** the turn is cancelled through `cancel_request` while it waits on its permission. It asserts:
+  - the events `session_created, turn_started, tool_call_started, tool_call_finished` (`ok: false`, "request cancelled while waiting for permission"), then `turn_finished` with status `cancelled`;
+  - the same five lifecycle facts, with nothing left open.
+- **Not done: a failing scripted-provider turn.** No keyless fake model fails, and pointing `OCEAN_MODEL` at a real provider could make a live call with this machine's credentials. The cancelled turn covers the non-`completed` terminal and the no-leaked-lifecycle-frames check.
+- **`ocean-agent` `event_sink_carries_only_bridge_relayed_events_for_a_scripted_turn`:** the same scripted turn at the `ocean-agent` layer. It checks:
+  - `stdout` (`"\ndone\n"`), `stderr`, and the final transcript (4 messages) are unchanged;
+  - the relayed subsequence is `ToolExecutionStart, ToolExecutionEnd, TextDelta`;
+  - the sink holds nothing else.
+- **`ocean-agent` `turn_checkpoint_is_persisted_mid_turn_without_a_final_save`:** pins the mid-turn checkpoint save. A permission policy cancels the turn from inside its check, before the `write` runs. The runtime closes the call with a cancelled result, emits the round's `TurnCheckpoint`, and fails. A failed turn does no turn-end save, so only the checkpoint arm can put the round on disk. The stored transcript must be `user, assistant, toolResult`. The test is deterministic and needs no timing.
+- **Env handling.** Both `ocean-agent` scripted tests hold `FAKE_TOOL_TARGET_LOCK` and set `OCEAN_FAKE_TOOL_TARGET_PATH` through a restore-on-drop guard. The daemon tests use the existing `AUTO_CONVENE_ENV_LOCK` and `TestEnvRestore`.
+
+**Mutation checks.** Sources were restored and `touch`ed after each mutation, and every test is green after restore. The first round ran against the first revision of this slice:
 
 | Mutation | `ocean-agent` sink test | daemon golden test |
 |---|---|---|
 | M1: restore the pre-slice-2 loop (clone and forward everything) | **fails** (`AgentStart reached the event sink`), after its `stdout`/`stderr`/transcript and relayed-golden asserts pass | passes. The bridge-visible stream is identical before and after. |
-| M2: also stop forwarding `TextDelta` | **fails** (relayed sequence changed) | **fails** (`assistant_text_delta` missing) |
-| M3: forward `AgentEnd` again | **fails** (`AgentEnd reached the event sink`) | passes (the bridge discards it) |
-| M4: forward a cloned `TurnCheckpoint` again | **fails** (`TurnCheckpoint reached the event sink`) | passes (the bridge discards it) |
+| M2: also stop forwarding `TextDelta` | **fails** | **fails** (`assistant_text_delta` missing) |
+| M3: forward `AgentEnd` again | **fails** | passes (the bridge discards it) |
+| M4: forward a cloned `TurnCheckpoint` again | **fails** | passes (the bridge discards it) |
+
+The second round ran against the review revision. The runtime column is the unit test, the agent columns are the sink test and the checkpoint test, the parity column is the bridge-parity test, and the goldens are allowed / denied / cancelled:
+
+| Mutation | runtime | agent sink | agent checkpoint | bridge parity | goldens (allowed / denied / cancelled) |
+|---|---|---|---|---|---|
+| K1: delete the checkpoint arm's `replace_messages` + `save` | pass | pass | **fails** | pass | pass / pass / pass |
+| K2: forward every event (cloned) regardless of class | pass | **fails** | **fails** | pass | pass / pass / pass |
+| K3: classify `AgentEnd` as relayed | **fails** | **fails** | pass | **fails** (disagree on `AgentEnd`) | pass / pass / pass |
+| K4: the bridge drops non-empty `TextDelta` | pass | pass | pass | **fails** | **fails** / **fails** / pass |
+| K5: classify `TextDelta` as not relayed | **fails** | **fails** | pass | **fails** | **fails** / **fails** / pass |
+
+The cancelled golden has no text delta, so K4 and K5 do not reach it.
