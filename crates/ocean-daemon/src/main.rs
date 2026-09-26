@@ -776,6 +776,18 @@ fn app_router(cors: CorsLayer) -> Router<AppState> {
         .route("/v1/observatory/snapshot", get(observatory::snapshot))
         .route("/v1/observatory/events", get(observatory::events))
         .route("/v1/observatory/replay", get(observatory::replay))
+        // Stage A3b (§15): reads are credential-free and execute nothing;
+        // every mutation (and the trust preview sharing its route) is
+        // operator-authenticated and reconciles the supervisor before 200.
+        .route("/v1/extensions", get(extension_registry::list))
+        .route(
+            "/v1/extensions/install",
+            post(extension_registry::mutation::install),
+        )
+        .route(
+            "/v1/extensions/{id}",
+            axum::routing::delete(extension_registry::mutation::remove),
+        )
         .route(
             "/v1/extensions/{id}/inspect",
             get(extension_registry::inspect),
@@ -783,6 +795,26 @@ fn app_router(cors: CorsLayer) -> Router<AppState> {
         .route(
             "/v1/extensions/{id}/doctor",
             get(extension_registry::doctor),
+        )
+        .route(
+            "/v1/extensions/{id}/status",
+            get(extension_registry::status),
+        )
+        .route(
+            "/v1/extensions/{id}/trust",
+            post(extension_registry::mutation::trust),
+        )
+        .route(
+            "/v1/extensions/{id}/enable",
+            post(extension_registry::mutation::enable),
+        )
+        .route(
+            "/v1/extensions/{id}/disable",
+            post(extension_registry::mutation::disable),
+        )
+        .route(
+            "/v1/extensions/{id}/update",
+            post(extension_registry::mutation::update),
         )
         // OCEAN-262: the Slack canvas bridge (`ocean-agents`) POSTs a fulfilled
         // awareness result here after round-tripping a `read`/`list`/`create` to
@@ -1095,6 +1127,12 @@ async fn main() -> anyhow::Result<()> {
     let room_operator = Arc::new(room_operator::OperatorIdentity::load(&config_dir));
     let roles = load_model_roles(&config_dir);
 
+    // Stage A3b §12.3: journal-proven registry recovery runs to completion
+    // before any registry reader (the HTTP routes are not served yet) or any
+    // service reconciliation starts. Fail-soft for the daemon; a failure keeps
+    // extension activation fail-closed.
+    extension_registry::recover_at_startup(config_dir.clone()).await;
+
     // The lifecycle dispatcher exists before reconciliation so daemon_started is
     // sequence 1 and a late/restarted service can receive the retained boot fact.
     // Reconciliation is fail-soft and asynchronous: no optional extension can
@@ -1122,11 +1160,6 @@ async fn main() -> anyhow::Result<()> {
     extension_supervisor
         .start(config_dir.clone(), registered_extension_projects)
         .await;
-    // Cache inspection is truthful and non-probing; A2b adds no public status
-    // route or registry mutation surface.
-    let extension_status_cache = extension_supervisor.status_cache();
-    let _ = extension_status_cache.snapshot();
-
     // Hoist the event bus so the Observatory durability pump subscribes before
     // any turn can emit a fact. One boot id scopes auth and all read models.
     let agent_event_bus = AgentEventBus::new(1024);
@@ -1667,8 +1700,16 @@ fn banner_routes() -> &'static [&'static str] {
         "GET /v1/observatory/snapshot",
         "GET /v1/observatory/events",
         "GET /v1/observatory/replay",
+        "GET /v1/extensions",
+        "POST /v1/extensions/install",
+        "DELETE /v1/extensions/{id}",
         "GET /v1/extensions/{id}/inspect",
         "GET /v1/extensions/{id}/doctor",
+        "GET /v1/extensions/{id}/status",
+        "POST /v1/extensions/{id}/trust",
+        "POST /v1/extensions/{id}/enable",
+        "POST /v1/extensions/{id}/disable",
+        "POST /v1/extensions/{id}/update",
         "POST /v1/agent/canvas/fulfill",
         "GET /v1/agent/canvas/fulfill",
         "POST /v1/agent/sessions",
@@ -27506,9 +27547,12 @@ mod tests {
         // 139 -> 144: web identity M3 coding plans — operator-only status,
         // login start/poll/cancel, and logout for the Claude and Codex OAuth
         // blocks, so a surface can manage a node's plans without the TUI.
+        // 144 -> 152: extension Stage A3b (§15) — credential-free list and
+        // cached runtime status reads plus the operator-authenticated
+        // install/trust/enable/disable/update/remove mutations.
         assert_eq!(
             banner.len(),
-            144,
+            152,
             "route baseline changed; review the manifest"
         );
 

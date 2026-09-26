@@ -22,7 +22,7 @@ use uuid::Uuid;
 #[cfg(not(feature = "registry-portability-check"))]
 use super::extension_lifecycle::LifecycleDispatcher;
 use super::extension_registry::{
-    read_unsupported_service_activations, UnsupportedServiceActivation,
+    read_unsupported_service_activations, SupervisorReconcile, UnsupportedServiceActivation,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -61,6 +61,23 @@ pub(crate) struct RuntimeStatus {
     last_acknowledged_sequence: Option<Sequence>,
     lag_count: u64,
     reason: Option<RuntimeReason>,
+}
+
+impl RuntimeStatus {
+    pub(crate) fn package_id(&self) -> &str {
+        &self.package_id
+    }
+}
+
+/// No process or temp root is ever created on an unsupported platform, so
+/// every package is always stopped for the registry writer's guard.
+#[derive(Clone, Default)]
+pub(crate) struct ServiceActivityLedger;
+
+impl ServiceActivityLedger {
+    pub(crate) fn package_stopped(&self, _package_id: &str) -> bool {
+        true
+    }
 }
 
 #[derive(Clone, Default)]
@@ -118,6 +135,7 @@ pub(crate) struct ExtensionSupervisor {
     status: RuntimeStatusCache,
     root_task: Mutex<Option<tokio::task::JoinHandle<()>>>,
     config_dir: RwLock<Option<PathBuf>>,
+    projects: RwLock<HashSet<Uuid>>,
     reconciliation: Mutex<()>,
 }
 
@@ -127,8 +145,39 @@ impl ExtensionSupervisor {
             status: RuntimeStatusCache::default(),
             root_task: Mutex::new(None),
             config_dir: RwLock::new(None),
+            projects: RwLock::new(HashSet::new()),
             reconciliation: Mutex::new(()),
         })
+    }
+
+    pub(crate) fn activity(&self) -> ServiceActivityLedger {
+        ServiceActivityLedger
+    }
+
+    /// Reproject the committed registry generation as `unsupported_platform`
+    /// status. Nothing can have been started, so nothing is ever reaped.
+    pub(crate) async fn reconcile_registry(
+        &self,
+        _committed_revision: u64,
+        _package_id: &str,
+    ) -> SupervisorReconcile {
+        let config_dir = self
+            .config_dir
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone();
+        let projects = self
+            .projects
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone();
+        match config_dir {
+            Some(config_dir) => match self.reconcile(config_dir, projects).await {
+                Ok(()) => SupervisorReconcile::Complete { reaped: false },
+                Err(()) => SupervisorReconcile::Blocked,
+            },
+            None => SupervisorReconcile::Blocked,
+        }
     }
 
     #[cfg(not(feature = "registry-portability-check"))]
@@ -156,6 +205,12 @@ impl ExtensionSupervisor {
         registered_projects: HashSet<Uuid>,
     ) -> Result<(), ()> {
         let _serial = self.reconciliation.lock().await;
+        registered_projects.clone_into(
+            &mut self
+                .projects
+                .write()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()),
+        );
         let result = tokio::task::spawn_blocking(move || {
             read_unsupported_service_activations(&config_dir, &registered_projects)
         })

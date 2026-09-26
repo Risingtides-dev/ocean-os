@@ -6,6 +6,9 @@ use ocean_core::{
 };
 use std::io::{IsTerminal, Write};
 
+mod extension;
+use extension::ExtensionCmd;
+
 /// How the CLI answers a daemon `PermissionRequest` when it is NOT attached to
 /// an interactive terminal (piped / CI). In a TTY the operator is prompted
 /// directly and this mode is ignored.
@@ -101,23 +104,6 @@ enum AgentsCmd {
     },
 }
 
-/// Read-only extension state commands. Package mutation remains a later phase.
-#[derive(Debug, Subcommand)]
-enum ExtensionCmd {
-    /// Inspect installed/trusted/enabled state without executing package code.
-    Inspect {
-        id: String,
-        #[arg(long)]
-        project_id: Option<uuid::Uuid>,
-    },
-    /// Run static state, digest, manifest, trust, and enablement diagnostics.
-    Doctor {
-        id: String,
-        #[arg(long)]
-        project_id: Option<uuid::Uuid>,
-    },
-}
-
 #[derive(Debug, Parser)]
 #[command(name = "ocean-rs", about = "Ocean OS agent runtime client")]
 struct Cli {
@@ -160,7 +146,8 @@ enum Cmd {
     Session {
         id: SessionId,
     },
-    /// Inspect daemon-owned extension state without mutating it.
+    /// Inspect and manage daemon-owned extension state through the daemon's
+    /// §15 HTTP contract (the CLI never writes registry files).
     Extension {
         #[command(subcommand)]
         subcmd: ExtensionCmd,
@@ -310,31 +297,6 @@ fn usage_footer(res: &PromptResponse) -> String {
 fn check_response(res: &PromptResponse) -> anyhow::Result<()> {
     anyhow::ensure!(res.ok, "daemon reported error: {}", res.stderr.trim());
     Ok(())
-}
-
-fn check_extension_response(
-    status: reqwest::StatusCode,
-    body: &serde_json::Value,
-) -> anyhow::Result<()> {
-    anyhow::ensure!(
-        status.is_success(),
-        "extension request failed with {status}"
-    );
-    anyhow::ensure!(
-        body.get("ok").and_then(serde_json::Value::as_bool) == Some(true),
-        "extension diagnostics reported a failure"
-    );
-    Ok(())
-}
-
-async fn print_extension_response(client: &reqwest::Client, url: String) -> anyhow::Result<()> {
-    let response = client.get(url).send().await?;
-    let status = response.status();
-    let text = response.text().await.context("read extension response")?;
-    let body: serde_json::Value =
-        serde_json::from_str(&text).context("decode extension response")?;
-    println!("{}", serde_json::to_string_pretty(&body)?);
-    check_extension_response(status, &body)
 }
 
 fn urlencoding(s: &str) -> String {
@@ -662,21 +624,13 @@ async fn main() -> anyhow::Result<()> {
             println!("{}", serde_json::to_string_pretty(&body)?);
         }
         Cmd::Extension { subcmd } => {
-            let (id, project_id, action) = match subcmd {
-                ExtensionCmd::Inspect { id, project_id } => (id, project_id, "inspect"),
-                ExtensionCmd::Doctor { id, project_id } => (id, project_id, "doctor"),
-            };
-            let mut url = format!(
-                "{}/v1/extensions/{}/{}",
-                cli.url.trim_end_matches('/'),
-                urlencoding(&id),
-                action
-            );
-            if let Some(project_id) = project_id {
-                url.push_str("?project_id=");
-                url.push_str(&project_id.to_string());
+            // §15 exit contract: 3 = committed 202, 4 = committed recovery
+            // required. Neither is an error to retry, so they bypass anyhow.
+            let code = extension::run(&client, &cli.url, subcmd).await?;
+            if code != 0 {
+                std::io::stdout().flush().ok();
+                std::process::exit(code);
             }
-            print_extension_response(&client, url).await?;
         }
         Cmd::Onboard { bedrock_url, token } => {
             let bedrock_url = resolve_or_prompt(
@@ -976,22 +930,94 @@ mod tests {
     }
 
     #[test]
-    fn extension_response_exit_semantics_fail_on_http_or_doctor_error() {
-        assert!(check_extension_response(
-            reqwest::StatusCode::OK,
-            &serde_json::json!({"ok": true})
-        )
-        .is_ok());
-        assert!(check_extension_response(
-            reqwest::StatusCode::NOT_FOUND,
-            &serde_json::json!({"ok": false, "error": "extension_not_found"})
-        )
-        .is_err());
-        assert!(check_extension_response(
-            reqwest::StatusCode::OK,
-            &serde_json::json!({"ok": false, "diagnostics": []})
-        )
-        .is_err());
+    fn extension_mutation_commands_parse_the_exact_section_15_grammar() {
+        let parse = |args: &[&str]| {
+            let mut argv = vec!["ocean-rs", "extension"];
+            argv.extend_from_slice(args);
+            Cli::try_parse_from(argv)
+        };
+        let install = parse(&["install", "--path", "./pkg"]).expect("local install");
+        assert!(matches!(
+            install.cmd,
+            Cmd::Extension {
+                subcmd: ExtensionCmd::Install {
+                    path: Some(_),
+                    git: None,
+                    rev: None
+                }
+            }
+        ));
+        let git = parse(&[
+            "install",
+            "--git",
+            "https://example.com/r.git",
+            "--rev",
+            "ab",
+        ])
+        .expect("git install parses; the daemon owns acceptance");
+        assert!(matches!(
+            git.cmd,
+            Cmd::Extension {
+                subcmd: ExtensionCmd::Install {
+                    path: None,
+                    git: Some(_),
+                    rev: Some(_)
+                }
+            }
+        ));
+        // --path and --git are mutually exclusive; --rev requires --git; one
+        // source is required; there is no --subdir.
+        assert!(parse(&["install", "--path", "p", "--git", "u", "--rev", "r"]).is_err());
+        assert!(parse(&["install", "--path", "p", "--rev", "r"]).is_err());
+        assert!(parse(&["install", "--git", "u"]).is_err());
+        assert!(parse(&["install"]).is_err());
+        assert!(parse(&["install", "--path", "p", "--subdir", "x"]).is_err());
+        assert!(parse(&["update", "example.noop", "--path", "p"]).is_ok());
+        assert!(parse(&["update", "example.noop"]).is_err());
+
+        let trust = parse(&[
+            "trust",
+            "example.noop",
+            "--digest",
+            "sha256:00",
+            "--grant-env",
+            "TOKEN",
+            "--grant-secret",
+            "env:SOURCE",
+            "--ack-native-process",
+            "lifecycle",
+            "--bind-secret",
+            "lifecycle:TOKEN=env:SOURCE",
+            "--confirm-grant-diff",
+            "sha256:11",
+        ])
+        .expect("trust parses");
+        assert!(matches!(
+            trust.cmd,
+            Cmd::Extension {
+                subcmd: ExtensionCmd::Trust { ref confirm_grant_diff, .. }
+            } if confirm_grant_diff.as_deref() == Some("sha256:11")
+        ));
+        // No --yes, wildcard, or all.
+        assert!(parse(&["trust", "example.noop", "--digest", "d", "--yes"]).is_err());
+        assert!(parse(&["trust", "example.noop"]).is_err());
+
+        let project = uuid::Uuid::new_v4().to_string();
+        assert!(parse(&["enable", "example.noop"]).is_ok());
+        assert!(parse(&["enable", "example.noop", "--project-id", &project]).is_ok());
+        assert!(parse(&["disable", "example.noop", "--project-id", &project]).is_ok());
+        let remove = parse(&["remove", "example.noop", "--purge-state"]).expect("remove");
+        assert!(matches!(
+            remove.cmd,
+            Cmd::Extension {
+                subcmd: ExtensionCmd::Remove {
+                    purge_state: true,
+                    ..
+                }
+            }
+        ));
+        assert!(parse(&["list"]).is_ok());
+        assert!(parse(&["status", "example.noop"]).is_ok());
     }
 
     #[test]

@@ -5,9 +5,15 @@
 //! deterministic restart policy, sanitized stderr diagnostics, and
 //! generation-safe Unix process-group cleanup. It has no registry mutation,
 //! route, package acquisition, or extension-originated command authority.
+//! Registry routes (A3b) consume its cached status, activity ledger, and
+//! revision-serialized reconciliation; route composition stays in `main.rs`.
+
+// The source-inclusion portability mode stubs the A3b route adapters, which
+// are the only consumers of the status/activity/reconcile accessors.
+#![cfg_attr(feature = "registry-portability-check", allow(dead_code))]
 
 use std::{
-    collections::{BTreeMap, HashSet, VecDeque},
+    collections::{BTreeMap, BTreeSet, HashSet, VecDeque},
     ffi::{CStr, CString, OsStr, OsString},
     fs::{self, File},
     io,
@@ -46,8 +52,8 @@ use uuid::Uuid;
 use super::{
     extension_lifecycle::{ActivationScope, LifecycleAttach, LifecycleDispatcher},
     extension_registry::{
-        env_secret_source, read_service_activations, reserved_child_environment_name,
-        valid_child_environment_name, SecretBinding, ServiceActivation,
+        env_secret_source, read_service_activation_generation, reserved_child_environment_name,
+        valid_child_environment_name, SecretBinding, ServiceActivation, SupervisorReconcile,
     },
 };
 
@@ -158,6 +164,12 @@ pub(crate) struct RuntimeStatus {
     reason: Option<RuntimeReason>,
 }
 
+impl RuntimeStatus {
+    pub(crate) fn package_id(&self) -> &str {
+        &self.package_id
+    }
+}
+
 #[derive(Clone, Default)]
 pub(crate) struct RuntimeStatusCache {
     inner: Arc<RwLock<BTreeMap<ServiceKey, RuntimeStatus>>>,
@@ -232,8 +244,24 @@ impl RuntimeStatusCache {
             status.stderr_truncated_lines = previous.stderr_truncated_lines;
             status.stderr_redactions = previous.stderr_redactions;
             status.temp_cleanup_failures = previous.temp_cleanup_failures;
+            // A same-epoch process restart keeps the newest reconciled
+            // registry revision rather than the one captured at spawn.
+            status.activation_revision =
+                status.activation_revision.max(previous.activation_revision);
         }
         statuses.insert(key, status);
+    }
+
+    /// Record that a later committed registry revision was reconciled for a
+    /// service whose activation identity did not change. Keyed by the live
+    /// epoch so a stale generation can never publish a newer status.
+    fn advance_revision(&self, key: &ServiceKey, epoch: Uuid, revision: u64) {
+        if let Some(status) = self.write().get_mut(key) {
+            if status.activation_epoch == epoch && status.activation_revision < revision {
+                status.activation_revision = revision;
+                status.observed_at = now_string();
+            }
+        }
     }
 
     fn key(activation: &ServiceActivation) -> ServiceKey {
@@ -321,10 +349,14 @@ fn now_string() -> String {
     Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true)
 }
 
+/// Activation identity. The registry `state_revision` is deliberately absent:
+/// an unrelated committed mutation (another package's install, a trust row for
+/// a different digest) must not restart this service (§10.1). Digest, args,
+/// grants/bindings, subscriptions, restart policy, and effective scope are the
+/// fields whose change restarts it.
 #[derive(Clone, PartialEq, Eq)]
 struct ServiceDescriptor {
     package_digest: String,
-    activation_revision: u64,
     args: Vec<String>,
     events: Vec<LifecycleEventKind>,
     environment: Vec<String>,
@@ -338,7 +370,6 @@ impl ServiceDescriptor {
     fn from_activation(activation: &ServiceActivation) -> Self {
         Self {
             package_digest: activation.package_digest.clone(),
-            activation_revision: activation.activation_revision,
             args: activation.args.clone(),
             events: activation.events.clone(),
             environment: activation.environment.clone(),
@@ -361,6 +392,7 @@ struct RestartHistory {
 
 struct ManagedService {
     descriptor: ServiceDescriptor,
+    epoch: Uuid,
     cancel: CancellationToken,
     stop_reason: Arc<std::sync::Mutex<ShutdownReason>>,
     history: Arc<std::sync::Mutex<RestartHistory>>,
@@ -386,6 +418,96 @@ struct ProjectSnapshotCommand {
     completed: oneshot::Sender<Result<(), ProjectSnapshotError>>,
 }
 
+/// A3b: reconcile the supervisor to the registry generation that a committed
+/// mutation published. Commands share the project-snapshot queue, so every
+/// reconciliation — project or registry — is applied by one task in order.
+struct RegistryReconcileCommand {
+    committed_revision: u64,
+    completed: oneshot::Sender<Result<ReconcileReport, ProjectSnapshotError>>,
+}
+
+enum SupervisorCommand {
+    Projects(ProjectSnapshotCommand),
+    Registry(RegistryReconcileCommand),
+}
+
+/// What one reconciliation pass did: the registry revision it read and every
+/// package whose service generation it stopped and reaped.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct ReconcileReport {
+    revision: u64,
+    stopped_packages: BTreeSet<String>,
+}
+
+/// Process and temp-root authority each package still owns: every managed
+/// service task plus every retained exceptional cleanup authority. The
+/// registry writer's update/remove guard reads it synchronously (from a
+/// blocking thread, under the exclusive `.state.lock`), so a package is
+/// "stopped" only when nothing it spawned can still be alive or hold a
+/// connection temp root.
+///
+/// A reconciliation pass that has read a registry generation but not yet
+/// spawned from it is also counted: while any pass is in flight, no package is
+/// reported stopped. The pass registers BEFORE its shared-lock read, so a
+/// writer that sees no pass under its exclusive lock knows every later pass
+/// will read the generation that writer commits; one that sees a pass refuses
+/// with the retryable `extension_active` instead of racing a spawn from an
+/// older generation.
+#[derive(Clone, Default)]
+pub(crate) struct ServiceActivityLedger {
+    owners: Arc<std::sync::Mutex<BTreeMap<String, usize>>>,
+    passes: Arc<AtomicUsize>,
+}
+
+/// One in-flight reconciliation pass; released on drop, including on error.
+struct ReconcilePass(ServiceActivityLedger);
+
+impl Drop for ReconcilePass {
+    fn drop(&mut self) {
+        self.0.passes.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
+impl ServiceActivityLedger {
+    pub(crate) fn package_stopped(&self, package_id: &str) -> bool {
+        let owners = self.lock();
+        self.passes.load(Ordering::SeqCst) == 0 && !owners.contains_key(package_id)
+    }
+
+    fn begin_pass(&self) -> ReconcilePass {
+        let _owners = self.lock();
+        self.passes.fetch_add(1, Ordering::SeqCst);
+        ReconcilePass(self.clone())
+    }
+
+    fn lock(&self) -> std::sync::MutexGuard<'_, BTreeMap<String, usize>> {
+        self.owners
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    fn acquire(&self, package_id: &str) {
+        *self.lock().entry(package_id.to_owned()).or_default() += 1;
+    }
+
+    fn release(&self, package_id: &str) {
+        let mut owners = self.lock();
+        if let Some(count) = owners.get_mut(package_id) {
+            *count = count.saturating_sub(1);
+            if *count == 0 {
+                owners.remove(package_id);
+            }
+        }
+    }
+}
+
+/// Exceptional cleanup authority retained after a managed task could not prove
+/// its group gone; it keeps its package's activity ownership until it succeeds.
+struct RetainedCleanup {
+    package_id: String,
+    authority: CleanupAuthority,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ProjectSnapshotError {
     SupervisorUnavailable,
@@ -401,9 +523,10 @@ pub(crate) struct ExtensionSupervisor {
     cancel: CancellationToken,
     status: RuntimeStatusCache,
     root_task: Mutex<Option<JoinHandle<()>>>,
-    project_tx: mpsc::Sender<ProjectSnapshotCommand>,
-    project_rx: Mutex<Option<mpsc::Receiver<ProjectSnapshotCommand>>>,
-    retained_cleanup: Arc<Mutex<Vec<CleanupAuthority>>>,
+    project_tx: mpsc::Sender<SupervisorCommand>,
+    project_rx: Mutex<Option<mpsc::Receiver<SupervisorCommand>>>,
+    retained_cleanup: Arc<Mutex<Vec<RetainedCleanup>>>,
+    activity: ServiceActivityLedger,
 }
 
 impl ExtensionSupervisor {
@@ -417,11 +540,60 @@ impl ExtensionSupervisor {
             project_tx,
             project_rx: Mutex::new(Some(project_rx)),
             retained_cleanup: Arc::new(Mutex::new(Vec::new())),
+            activity: ServiceActivityLedger::default(),
         })
     }
 
     pub(crate) fn status_cache(&self) -> RuntimeStatusCache {
         self.status.clone()
+    }
+
+    /// The synchronous stopped-package projection bound to the registry
+    /// writer's update/remove `ServiceActivity` guard.
+    pub(crate) fn activity(&self) -> ServiceActivityLedger {
+        self.activity.clone()
+    }
+
+    /// Reconcile to the registry generation a committed mutation published and
+    /// report, for `package_id`, whether that reconciliation (including any
+    /// generation-safe reap) is complete. Never mutates the registry. A
+    /// timeout leaves the queued pass to finish in order; the caller reports
+    /// it as pending, never as a pre-commit failure.
+    pub(crate) async fn reconcile_registry(
+        &self,
+        committed_revision: u64,
+        package_id: &str,
+    ) -> SupervisorReconcile {
+        let update = async {
+            let (completed, wait) = oneshot::channel();
+            self.project_tx
+                .send(SupervisorCommand::Registry(RegistryReconcileCommand {
+                    committed_revision,
+                    completed,
+                }))
+                .await
+                .map_err(|_| ProjectSnapshotError::SupervisorUnavailable)?;
+            wait.await
+                .map_err(|_| ProjectSnapshotError::SupervisorUnavailable)?
+        };
+        match tokio::time::timeout(PROJECT_RECONCILE_TIMEOUT, update).await {
+            Ok(Ok(report)) if report.revision >= committed_revision => {
+                SupervisorReconcile::Complete {
+                    reaped: report.stopped_packages.contains(package_id),
+                }
+            }
+            // The pass read an older generation than the one committed: it
+            // cannot vouch for the committed revision.
+            Ok(Ok(_)) | Ok(Err(ProjectSnapshotError::RegistryUnavailable)) => {
+                SupervisorReconcile::Blocked
+            }
+            Ok(Err(ProjectSnapshotError::CleanupIncomplete)) => {
+                SupervisorReconcile::CleanupIncomplete
+            }
+            Ok(Err(ProjectSnapshotError::SupervisorUnavailable)) | Err(_) => {
+                SupervisorReconcile::Pending
+            }
+        }
     }
 
     pub(crate) async fn update_project_snapshot(
@@ -431,10 +603,10 @@ impl ExtensionSupervisor {
         let update = async {
             let (completed, wait) = oneshot::channel();
             self.project_tx
-                .send(ProjectSnapshotCommand {
+                .send(SupervisorCommand::Projects(ProjectSnapshotCommand {
                     projects,
                     completed,
-                })
+                }))
                 .await
                 .map_err(|_| ProjectSnapshotError::SupervisorUnavailable)?;
             wait.await
@@ -467,9 +639,10 @@ impl ExtensionSupervisor {
     async fn load_activations(
         config_dir: PathBuf,
         projects: HashSet<Uuid>,
-    ) -> Result<Vec<ServiceActivation>, ProjectSnapshotError> {
-        let load =
-            tokio::task::spawn_blocking(move || read_service_activations(&config_dir, &projects));
+    ) -> Result<(u64, Vec<ServiceActivation>), ProjectSnapshotError> {
+        let load = tokio::task::spawn_blocking(move || {
+            read_service_activation_generation(&config_dir, &projects)
+        });
         match tokio::time::timeout(REGISTRY_LOAD_TIMEOUT, load).await {
             Ok(Ok(Ok(activations))) => Ok(activations),
             Ok(Ok(Err(error))) => {
@@ -518,9 +691,11 @@ impl ExtensionSupervisor {
             return Ok(());
         }
         let mut failed = Vec::new();
-        for mut authority in retained {
-            if !authority.cleanup().await {
-                failed.push(authority);
+        for mut retained in retained {
+            if retained.authority.cleanup().await {
+                self.activity.release(&retained.package_id);
+            } else {
+                failed.push(retained);
             }
         }
         if failed.is_empty() {
@@ -537,6 +712,9 @@ impl ExtensionSupervisor {
         history: Arc<std::sync::Mutex<RestartHistory>>,
     ) -> ManagedService {
         let descriptor = ServiceDescriptor::from_activation(&activation);
+        let package_id = activation.package_id.clone();
+        let activity = self.activity.clone();
+        activity.acquire(&package_id);
         let cancel = CancellationToken::new();
         let task_cancel = cancel.clone();
         let stop_reason = Arc::new(std::sync::Mutex::new(ShutdownReason::DaemonStopping));
@@ -562,6 +740,7 @@ impl ExtensionSupervisor {
             )
             .await
             else {
+                activity.release(&package_id);
                 return true;
             };
 
@@ -569,15 +748,22 @@ impl ExtensionSupervisor {
             // the one promised exceptional retry. A still-failed authority is
             // transferred into supervisor-owned retention before this task can
             // complete, so no JoinHandle can hide a surviving process group.
+            // Its activity ownership moves with it: the package stays active
+            // until that retained cleanup succeeds.
             if authority.cleanup().await {
+                activity.release(&package_id);
                 true
             } else {
-                retained_cleanup.lock().await.push(authority);
+                retained_cleanup.lock().await.push(RetainedCleanup {
+                    package_id,
+                    authority,
+                });
                 false
             }
         });
         ManagedService {
             descriptor,
+            epoch,
             cancel,
             stop_reason,
             history,
@@ -590,12 +776,18 @@ impl ExtensionSupervisor {
         config_dir: &Path,
         projects: &HashSet<Uuid>,
         services: &mut BTreeMap<ServiceKey, ManagedService>,
-    ) -> Result<(), ProjectSnapshotError> {
+    ) -> Result<ReconcileReport, ProjectSnapshotError> {
+        // Registered before the registry read; see `ServiceActivityLedger`.
+        let _pass = self.activity.begin_pass();
         // Never activate a replacement generation while an obsolete process
         // group still has retained cleanup authority.
         self.retry_retained_cleanup().await?;
-        let activations =
+        let (revision, activations) =
             Self::load_activations(config_dir.to_path_buf(), projects.clone()).await?;
+        let mut report = ReconcileReport {
+            revision,
+            stopped_packages: BTreeSet::new(),
+        };
         let mut desired = BTreeMap::new();
         for activation in activations {
             let key = ServiceKey {
@@ -624,8 +816,15 @@ impl ExtensionSupervisor {
                 }) {
                     preserved_histories.insert(key.clone(), Arc::clone(&managed.history));
                 }
-                self.stop_managed(managed, ShutdownReason::Reconfigure)
-                    .await?;
+                // A service no longer effective anywhere is being disabled;
+                // one whose activation identity changed is being reconfigured.
+                let reason = if desired.contains_key(&key) {
+                    ShutdownReason::Reconfigure
+                } else {
+                    ShutdownReason::Disabled
+                };
+                report.stopped_packages.insert(key.package_id.clone());
+                self.stop_managed(managed, reason).await?;
             }
         }
 
@@ -633,7 +832,8 @@ impl ExtensionSupervisor {
         self.status.retain_only(&desired_keys);
 
         for (key, activation) in desired {
-            if services.contains_key(&key) {
+            if let Some(managed) = services.get(&key) {
+                self.status.advance_revision(&key, managed.epoch, revision);
                 continue;
             }
             let history = preserved_histories.remove(&key).unwrap_or_default();
@@ -642,14 +842,14 @@ impl ExtensionSupervisor {
             // project-snapshot change.
             services.insert(key, self.spawn_managed(activation, history));
         }
-        Ok(())
+        Ok(report)
     }
 
     async fn run_reconciliation(
         self: Arc<Self>,
         config_dir: PathBuf,
         mut projects: HashSet<Uuid>,
-        mut project_rx: mpsc::Receiver<ProjectSnapshotCommand>,
+        mut project_rx: mpsc::Receiver<SupervisorCommand>,
     ) {
         let mut services = BTreeMap::new();
         let _ = self.reconcile(&config_dir, &projects, &mut services).await;
@@ -658,9 +858,33 @@ impl ExtensionSupervisor {
                 _ = self.cancel.cancelled() => break,
                 command = project_rx.recv() => {
                     let Some(command) = command else { break };
-                    projects = command.projects;
-                    let result = self.reconcile(&config_dir, &projects, &mut services).await;
-                    let _ = command.completed.send(result);
+                    match command {
+                        SupervisorCommand::Projects(command) => {
+                            projects = command.projects;
+                            let result = self
+                                .reconcile(&config_dir, &projects, &mut services)
+                                .await
+                                .map(|_| ());
+                            let _ = command.completed.send(result);
+                        }
+                        SupervisorCommand::Registry(command) => {
+                            // Serialized with every other pass on this one
+                            // task; each reads the newest coherent generation,
+                            // which is at least the committed revision.
+                            let result = self
+                                .reconcile(&config_dir, &projects, &mut services)
+                                .await;
+                            if let Ok(report) = &result {
+                                if report.revision < command.committed_revision {
+                                    tracing::warn!(
+                                        reason = "registry_revision_regressed",
+                                        "extension reconciliation read an older registry generation"
+                                    );
+                                }
+                            }
+                            let _ = command.completed.send(result);
+                        }
+                    }
                 }
             }
         }
@@ -696,8 +920,13 @@ impl ExtensionSupervisor {
 
         let retained = std::mem::take(&mut *self.retained_cleanup.lock().await);
         let mut retries = JoinSet::new();
-        for mut authority in retained {
-            retries.spawn(async move { authority.cleanup().await });
+        for mut retained in retained {
+            let activity = self.activity.clone();
+            retries.spawn(async move {
+                if retained.authority.cleanup().await {
+                    activity.release(&retained.package_id);
+                }
+            });
         }
         while retries.join_next().await.is_some() {}
         // Each authority performs one independently bounded group retry. Never
@@ -4236,6 +4465,60 @@ done
         let circuit = wait_for_runtime_state(&status, RuntimeState::CircuitOpen).await;
         assert_eq!(circuit.restart_count, 4);
         assert_eq!(circuit.reason, Some(RuntimeReason::UnexpectedExit));
+    }
+
+    #[test]
+    fn activity_ledger_counts_owners_and_in_flight_reconciliation_passes() {
+        let ledger = ServiceActivityLedger::default();
+        assert!(ledger.package_stopped("example.a"));
+        ledger.acquire("example.a");
+        ledger.acquire("example.a");
+        assert!(!ledger.package_stopped("example.a"));
+        assert!(ledger.package_stopped("example.b"));
+        // A pass that may spawn from a generation it already read keeps every
+        // package "active" for the writer's update/remove guard.
+        let pass = ledger.begin_pass();
+        assert!(!ledger.package_stopped("example.b"));
+        drop(pass);
+        assert!(ledger.package_stopped("example.b"));
+        ledger.release("example.a");
+        assert!(!ledger.package_stopped("example.a"));
+        ledger.release("example.a");
+        assert!(ledger.package_stopped("example.a"));
+        ledger.release("example.a");
+        assert!(ledger.package_stopped("example.a"));
+    }
+
+    #[test]
+    fn activation_descriptor_ignores_the_registry_revision_only() {
+        let (_temp, mut activation) = executable_fixture("#!/bin/sh\nexit 0\n");
+        let before = ServiceDescriptor::from_activation(&activation);
+        activation.activation_revision += 5;
+        assert!(before == ServiceDescriptor::from_activation(&activation));
+        activation.args.push("--changed".into());
+        assert!(before != ServiceDescriptor::from_activation(&activation));
+        activation.args.pop();
+        activation.effective_projects.insert(Uuid::new_v4());
+        assert!(before != ServiceDescriptor::from_activation(&activation));
+    }
+
+    #[test]
+    fn advance_revision_is_keyed_by_the_live_epoch() {
+        let (_temp, activation) = executable_fixture("#!/bin/sh\nexit 0\n");
+        let cache = RuntimeStatusCache::default();
+        let epoch = Uuid::new_v4();
+        cache.insert_starting(&activation, epoch, Sequence(0), 0);
+        let key = RuntimeStatusCache::key(&activation);
+        let base = activation.activation_revision;
+        cache.advance_revision(&key, Uuid::new_v4(), base + 3);
+        assert_eq!(cache.snapshot()[0].activation_revision, base);
+        cache.advance_revision(&key, epoch, base + 3);
+        assert_eq!(cache.snapshot()[0].activation_revision, base + 3);
+        cache.advance_revision(&key, epoch, base + 1);
+        assert_eq!(cache.snapshot()[0].activation_revision, base + 3);
+        // A same-epoch process restart keeps the newest reconciled revision.
+        cache.insert_starting(&activation, epoch, Sequence(0), 1);
+        assert_eq!(cache.snapshot()[0].activation_revision, base + 3);
     }
 
     #[tokio::test]
