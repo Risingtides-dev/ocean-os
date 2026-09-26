@@ -101,12 +101,13 @@ A1, A2a, and A2b are accepted.
 - [x] A3a — internal transactional registry writer, journal/recovery, retention,
       grant diff, and the first-publication marker: independently reviewed and
       merged in PR #501.
-- [ ] A3b — §15 HTTP/CLI mutation surfaces (operator-authenticated), startup
+- [x] A3b — §15 HTTP/CLI mutation surfaces (operator-authenticated), startup
       recovery wiring, and revision-serialized supervisor reconciliation/reap:
-      implemented on `feat/extension-stage-a3b`, pending fresh independent
-      review and the credential-class ruling recorded in the manifest.
-- [ ] A4 — pinned public Git acquisition (next after the A3b review); A5 —
-      integrated Stage A gate.
+      merged in PR #502; the credential-class ruling recorded in the manifest
+      remains open.
+- [ ] A4 — pinned public Git acquisition: implemented on
+      `feat/extension-stage-a4`, pending fresh independent review.
+- [ ] A5 — integrated Stage A gate (next after the A4 review).
 
 ## Ocean Observatory
 

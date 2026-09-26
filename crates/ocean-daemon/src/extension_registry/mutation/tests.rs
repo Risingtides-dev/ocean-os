@@ -416,6 +416,18 @@ fn every_writer_code_has_a_closed_status_and_fixed_message() {
             "git_connection_pinning_unavailable",
             StatusCode::NOT_IMPLEMENTED,
         ),
+        ("invalid_git_source", StatusCode::BAD_REQUEST),
+        ("git_host_not_public", StatusCode::BAD_REQUEST),
+        ("git_revision_mismatch", StatusCode::BAD_REQUEST),
+        ("git_tree_unsupported", StatusCode::BAD_REQUEST),
+        ("git_acquisition_limit", StatusCode::BAD_REQUEST),
+        ("git_resolution_failed", StatusCode::BAD_GATEWAY),
+        ("git_fetch_failed", StatusCode::BAD_GATEWAY),
+        ("git_acquisition_timeout", StatusCode::GATEWAY_TIMEOUT),
+        (
+            "git_process_cleanup_failed",
+            StatusCode::INTERNAL_SERVER_ERROR,
+        ),
         (
             "extension_state_malformed",
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -443,6 +455,126 @@ fn every_writer_code_has_a_closed_status_and_fixed_message() {
 // ---------------------------------------------------------------------------
 // Authentication and strict bodies.
 // ---------------------------------------------------------------------------
+
+/// A4: Git install and update run through the same detached, blocking,
+/// operator-authenticated route as a local source. Offline, the fixture
+/// remote is a local bare repository behind the full resolution and
+/// public-address check; the default test acquirer refuses DNS.
+#[tokio::test]
+async fn git_sources_install_and_update_through_the_pinned_acquirer() {
+    use super::super::transaction::git::{test_support, GitAcquirer};
+
+    let _guard = AUTO_CONVENE_ENV_LOCK.lock().await;
+    let _restore = TestEnvRestore::capture(&["OCEAN_CONFIG_DIR", "OCEAN_MODEL", "OCEAN_YOLO"]);
+    let fixture = Fixture::new();
+    let app = router(fake_convene_state(&fixture.config));
+    let url = "https://git.ocean-fixture.com/ocean/noop.git";
+
+    // A package committed to a local bare repository.
+    let tree = fixture.package("noop", ID, "1.0.0");
+    let repo = fixture.sources.path().join("remote.git");
+    let git = |args: &[&str]| {
+        let output = std::process::Command::new("git")
+            .arg(format!("--git-dir={}", repo.display()))
+            .arg(format!("--work-tree={tree}"))
+            .args([
+                "-c",
+                "user.name=Ocean Test",
+                "-c",
+                "user.email=t@ocean.invalid",
+            ])
+            .args(["-c", "commit.gpgsign=false"])
+            .args(args)
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "{args:?}");
+        String::from_utf8(output.stdout).unwrap().trim().to_string()
+    };
+    assert!(std::process::Command::new("git")
+        .args(["init", "--bare", "--quiet"])
+        .arg(&repo)
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .status()
+        .unwrap()
+        .success());
+    git(&["add", "-A"]);
+    git(&["commit", "--quiet", "-m", "one"]);
+    let first = git(&["rev-parse", "HEAD"]);
+    fs::write(FsPath::new(&tree).join("CHANGELOG"), "two\n").unwrap();
+    git(&["add", "-A"]);
+    git(&["commit", "--quiet", "-m", "two"]);
+    let second = git(&["rev-parse", "HEAD"]);
+    let body = |expected: u64, revision: &str| json!({"expected_state_revision": expected, "source": {"kind": "git", "url": url, "revision": revision}});
+
+    // Unregistered: the offline default resolver refuses, nothing is created.
+    let (status, response) = post_op(&app, "/v1/extensions/install", body(0, &first)).await;
+    assert_eq!(status, StatusCode::BAD_GATEWAY, "{response}");
+    assert_precommit(&response, "git_resolution_failed", 0);
+    assert!(!fixture.root().exists());
+
+    // A non-public answer refuses the whole acquisition.
+    let private = test_support::register(
+        fixture.config.path(),
+        GitAcquirer::system()
+            .with_resolver(Arc::new(test_support::Fixed(vec!["10.0.0.7"
+                .parse()
+                .unwrap()])))
+            .with_file_remote(repo.clone()),
+    );
+    let (status, response) = post_op(&app, "/v1/extensions/install", body(0, &first)).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{response}");
+    assert_precommit(&response, "git_host_not_public", 0);
+    assert!(!fixture.root().exists());
+    drop(private);
+
+    let _registration = test_support::register(
+        fixture.config.path(),
+        GitAcquirer::system()
+            .with_resolver(Arc::new(test_support::Fixed(vec!["93.184.216.34"
+                .parse()
+                .unwrap()])))
+            .with_file_remote(repo.clone()),
+    );
+    // No supervisor is attached here, so a commit is the authoritative 202.
+    let (status, installed) = post_op(&app, "/v1/extensions/install", body(0, &first)).await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{installed}");
+    assert_committed(&installed, 1);
+    assert_eq!(installed["mutation"]["effective"], false);
+    let (_, inspected) = get_json(&app, &format!("/v1/extensions/{ID}/inspect")).await;
+    let source = &inspected["extension"]["source"];
+    assert_eq!(source["kind"], "git", "{inspected}");
+    assert_eq!(source["locator"], url);
+    assert_eq!(source["revision"], first.as_str());
+
+    let (status, updated) = post_op(
+        &app,
+        &format!("/v1/extensions/{ID}/update"),
+        body(1, &second),
+    )
+    .await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{updated}");
+    assert_committed(&updated, 2);
+    assert_ne!(
+        updated["mutation"]["digest"],
+        installed["mutation"]["digest"]
+    );
+
+    // A missing commit is a pre-commit failure at the unchanged revision.
+    let (status, response) = post_op(
+        &app,
+        &format!("/v1/extensions/{ID}/update"),
+        body(2, "0123456789abcdef0123456789abcdef01234567"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_GATEWAY, "{response}");
+    assert_precommit(&response, "git_fetch_failed", 0);
+    assert_eq!(fixture.revision(), 2);
+    assert!(fixture.entries("quarantine").is_empty());
+    fixture.assert_no_canary_ran();
+}
 
 #[tokio::test]
 async fn every_mutation_is_operator_authenticated_and_reads_stay_credential_free() {
@@ -570,16 +702,16 @@ async fn strict_bodies_and_git_sources_fail_before_any_acquisition() {
     .await;
     assert_eq!(status, StatusCode::BAD_REQUEST, "{response}");
 
-    // Git is A4: refused with the §13.2 fail-closed code before any permit,
-    // quarantine, DNS, or process.
+    // A Git source outside the §13.2 grammar (here a floating branch name) is
+    // refused before any permit, quarantine, DNS, or process.
     let (status, response) = post_op(
         &app,
         "/v1/extensions/install",
-        json!({"expected_state_revision": 0, "source": {"kind": "git", "url": "https://example.com/repo.git", "revision": "0123456789abcdef0123456789abcdef01234567"}}),
+        json!({"expected_state_revision": 0, "source": {"kind": "git", "url": "https://example.com/repo.git", "revision": "main"}}),
     )
     .await;
-    assert_eq!(status, StatusCode::NOT_IMPLEMENTED);
-    assert_precommit(&response, "git_connection_pinning_unavailable", 0);
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_precommit(&response, "invalid_git_source", 0);
     assert!(!fixture.root().exists());
     let bootstrap_residue = fs::read_dir(fixture.config.path())
         .unwrap()
