@@ -505,6 +505,47 @@ impl AdmissionRefusal {
     }
 }
 
+/// Which federated member-lane route substituted the room's node human for a
+/// caller-supplied identity (member-lane authentication proposal, threat T4).
+///
+/// A closed local enum for the same reason [`RedemptionFailure`] is one: the
+/// label set of `ocean_room_federated_actor_substituted_total` must be provably
+/// fixed. The room key and every member id stay off it; the room key rides the
+/// warn line instead.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum FederatedActorRoute {
+    /// `POST .../messages` on a federated room: `author_id` is read and then
+    /// ignored; the outbox row is authored as `local_human_member_id`.
+    Post,
+    /// A workspace read under `?actor_id=`: gated on the roster, then sent
+    /// with the node human's room bearer.
+    WorkspaceRead,
+    /// An attributed or owner-gated workspace command under `?actor_id=`: a
+    /// non-Agent actor resolves to `local_human_member_id` in the forwarded
+    /// `actor_member_id`.
+    WorkspaceCommand,
+}
+
+impl FederatedActorRoute {
+    const ALL: [Self; 3] = [Self::Post, Self::WorkspaceRead, Self::WorkspaceCommand];
+
+    const fn index(self) -> usize {
+        match self {
+            Self::Post => 0,
+            Self::WorkspaceRead => 1,
+            Self::WorkspaceCommand => 2,
+        }
+    }
+
+    pub(super) const fn label(self) -> &'static str {
+        match self {
+            Self::Post => "post",
+            Self::WorkspaceRead => "workspace_read",
+            Self::WorkspaceCommand => "workspace_command",
+        }
+    }
+}
+
 /// One room's line on the `/health` rooms card.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub(super) struct RoomCardEntry {
@@ -555,6 +596,13 @@ pub(super) struct RoomMetricsCard {
     pub(super) admission_refusals: std::collections::BTreeMap<String, u64>,
     pub(super) store_lock_waits_total: u64,
     pub(super) store_lock_wait_seconds_total: f64,
+    /// Federated member-lane writes whose caller-supplied identity was not the
+    /// node human and was replaced by it. Observability only: nothing is
+    /// refused on this count (proposal §7 question 4 decides enforcement).
+    #[serde(default)]
+    pub(super) federated_actor_substituted_total: u64,
+    #[serde(default)]
+    pub(super) federated_actor_substituted: std::collections::BTreeMap<String, u64>,
     /// Per-room detail. This is the surface the fixed-cardinality rule pushes
     /// room identity onto: a room id is unbounded, so it lives here and never in
     /// a Prometheus label.
@@ -587,14 +635,15 @@ struct RoomMetricsDetail {
 /// shipped surfaces: Prometheus lines on `GET /metrics`, and the JSON `rooms`
 /// card on `GET /health`.
 ///
-/// Exactly six families live here and nothing else:
+/// Exactly seven families live here and nothing else:
 ///
 /// 1. rooms by access state (one gauge per [`RoomAccessState`] variant),
 /// 2. outbox depth by state (pending, failed) plus oldest-item age,
 /// 3. federation SSE reconnects (counter) and lag (gauge),
 /// 4. redemption failures by [`RedemptionFailure`],
 /// 5. admission refusals by [`AdmissionRefusal`],
-/// 6. store lock wait (count and summed wait).
+/// 6. store lock wait (count and summed wait),
+/// 7. federated actor substitutions by [`FederatedActorRoute`].
 ///
 /// Families 1 and 2 are SAMPLED from the store in the background; the rest are
 /// PUSHED from their sites. The atomics are relaxed for the same reason
@@ -614,6 +663,7 @@ pub(super) struct RoomMetrics {
     admission_refusals: [std::sync::atomic::AtomicU64; AdmissionRefusal::ALL.len()],
     store_lock_waits: std::sync::atomic::AtomicU64,
     store_lock_wait_nanos: std::sync::atomic::AtomicU64,
+    federated_actor_substituted: [std::sync::atomic::AtomicU64; FederatedActorRoute::ALL.len()],
     detail: std::sync::Mutex<RoomMetricsDetail>,
 }
 
@@ -774,6 +824,14 @@ impl RoomMetrics {
         self.admission_refusals[refusal.index()].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     }
 
+    /// One federated member-lane write that replaced a caller-supplied
+    /// identity with the node human. Pushed from the route, through
+    /// `&AppState`, so a route test can assert the count.
+    pub(super) fn record_federated_actor_substituted(&self, route: FederatedActorRoute) {
+        self.federated_actor_substituted[route.index()]
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+
     /// One completed acquisition of the daemon-wide room-store mutex, with how
     /// long the caller waited for it.
     pub(super) fn record_store_lock_wait(&self, waited: Duration) {
@@ -843,6 +901,16 @@ impl RoomMetrics {
                 )
             })
             .collect();
+        let federated_actor_substituted: std::collections::BTreeMap<String, u64> =
+            FederatedActorRoute::ALL
+                .iter()
+                .map(|route| {
+                    (
+                        route.label().to_string(),
+                        self.federated_actor_substituted[route.index()].load(Relaxed),
+                    )
+                })
+                .collect();
         let outbox_pending = self.outbox_pending.load(Relaxed);
         let outbox_failed = self.outbox_failed.load(Relaxed);
 
@@ -863,11 +931,13 @@ impl RoomMetrics {
             store_lock_waits_total: self.store_lock_waits.load(Relaxed),
             store_lock_wait_seconds_total: (self.store_lock_wait_nanos.load(Relaxed) as f64)
                 / 1_000_000_000.0,
+            federated_actor_substituted_total: federated_actor_substituted.values().sum(),
+            federated_actor_substituted,
             rooms,
         }
     }
 
-    /// Render the six families as Prometheus text, appended to the `/metrics`
+    /// Render the seven families as Prometheus text, appended to the `/metrics`
     /// body. Every label here comes from a closed enum; no room id, member id,
     /// package id, or invite code may become one.
     pub(super) fn render_prometheus(&self) -> String {
@@ -976,6 +1046,19 @@ impl RoomMetrics {
             out,
             "ocean_room_store_lock_wait_seconds_total {wait_seconds}"
         );
+
+        out.push_str(
+            "# HELP ocean_room_federated_actor_substituted_total Federated member-lane writes whose caller-supplied identity was replaced by the node human, by route.\n",
+        );
+        out.push_str("# TYPE ocean_room_federated_actor_substituted_total counter\n");
+        for route in FederatedActorRoute::ALL {
+            let count = self.federated_actor_substituted[route.index()].load(Relaxed);
+            let _ = writeln!(
+                out,
+                "ocean_room_federated_actor_substituted_total{{route=\"{}\"}} {count}",
+                route.label()
+            );
+        }
 
         out
     }
@@ -1599,6 +1682,49 @@ mod tests {
             metric_value(&body, "ocean_room_federation_lag_events"),
             Some(5)
         );
+    }
+
+    /// The federated actor-substitution family renders every route label with
+    /// an explicit zero, counts per route, and mirrors onto the `/health` card
+    /// with a total, so a scrape can read "zero" rather than "absent".
+    ///
+    /// Mutation: drop the fetch_add in `record_federated_actor_substituted`
+    /// -> RED; collapse two routes onto one index -> RED.
+    #[test]
+    fn room_metrics_federated_actor_substitution_counts_by_closed_route_label() {
+        let m = RoomMetrics::default();
+        let body = m.render_prometheus();
+        assert!(body.contains("# TYPE ocean_room_federated_actor_substituted_total counter"));
+        for label in ["post", "workspace_read", "workspace_command"] {
+            assert_eq!(
+                labelled_value(
+                    &body,
+                    &format!("ocean_room_federated_actor_substituted_total{{route=\"{label}\"}}")
+                ),
+                Some(0),
+                "{label} must render an explicit zero\n{body}"
+            );
+        }
+
+        m.record_federated_actor_substituted(FederatedActorRoute::Post);
+        m.record_federated_actor_substituted(FederatedActorRoute::Post);
+        m.record_federated_actor_substituted(FederatedActorRoute::WorkspaceCommand);
+        let body = m.render_prometheus();
+        for (label, want) in [("post", 2), ("workspace_read", 0), ("workspace_command", 1)] {
+            assert_eq!(
+                labelled_value(
+                    &body,
+                    &format!("ocean_room_federated_actor_substituted_total{{route=\"{label}\"}}")
+                ),
+                Some(want),
+                "{label}\n{body}"
+            );
+        }
+        let card = m.card();
+        assert_eq!(card.federated_actor_substituted_total, 3);
+        assert_eq!(card.federated_actor_substituted["post"], 2);
+        assert_eq!(card.federated_actor_substituted["workspace_read"], 0);
+        assert_eq!(card.federated_actor_substituted["workspace_command"], 1);
     }
 
     /// A room that stops being tracked while behind must not leave its lag in

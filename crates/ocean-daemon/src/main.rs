@@ -458,10 +458,10 @@ struct AppState {
     /// there is a single source of truth for that count. See [`TurnMetrics`].
     metrics: Arc<TurnMetrics>,
     /// Room and federation observability counters (Ocean Rooms definition-of-done
-    /// §4.1): the six families an operator needs to tell a healthy Rooms daemon
+    /// §4.1): the seven families an operator needs to tell a healthy Rooms daemon
     /// from a stuck one — rooms by access state, outbox depth and oldest-item
     /// age, federation SSE reconnects and lag, redemption failures, admission
-    /// refusals, and store lock wait. Held here beside [`AppState::metrics`] for
+    /// refusals, store lock wait, and federated actor substitutions. Held here beside [`AppState::metrics`] for
     /// the same reason and with the same relaxed-atomic discipline. Rendered onto
     /// BOTH shipped surfaces: Prometheus lines appended to `GET /metrics`, and
     /// the JSON `rooms` card on `GET /health` which additionally carries the
@@ -25991,7 +25991,7 @@ mod tests {
         let bytes = resp.into_body().collect().await.unwrap().to_bytes();
         let body = String::from_utf8(bytes.to_vec()).unwrap();
 
-        // One stem per family; the six families, named.
+        // One stem per family; the seven families, named.
         for stem in [
             // 1. rooms by access state
             "ocean_room_access_state",
@@ -26008,6 +26008,8 @@ mod tests {
             // 6. store lock wait
             "ocean_room_store_lock_waits_total",
             "ocean_room_store_lock_wait_seconds_total",
+            // 7. federated actor substitutions (threat T4 evidence)
+            "ocean_room_federated_actor_substituted_total",
         ] {
             assert!(
                 body.contains(&format!("# HELP {stem} ")),
@@ -26078,6 +26080,8 @@ mod tests {
             "admission_refusals",
             "store_lock_waits_total",
             "store_lock_wait_seconds_total",
+            "federated_actor_substituted_total",
+            "federated_actor_substituted",
         ] {
             assert!(
                 rooms.get(family_key).is_some(),

@@ -730,6 +730,9 @@ struct GatedCall {
     /// actor it could not derive one for. Reads carry `None` on purpose — an
     /// unregistered agent may still look, it just cannot be spoken for.
     actor_member_id: Option<String>,
+    /// The asserted actor's roster kind. Read only by the T4 observation in
+    /// [`forward`]; the gate's decisions above are already made.
+    actor_kind: RoomParticipantKind,
 }
 
 /// Roster-check the asserted actor, read the room's credential, and derive the
@@ -810,6 +813,7 @@ fn gate_workspace_call(
         Ok(GatedCall {
             credential,
             actor_member_id,
+            actor_kind: kind,
         })
     })
 }
@@ -856,6 +860,25 @@ async fn forward(
         UpstreamMethod::Delete => None,
         _ => body,
     };
+    // Every local refusal has had its say, so this call WILL go out on the
+    // node human's bearer. A non-Agent actor is spoken for by that human (an
+    // Agent resolves to its own registered member), so an actor who is not the
+    // node human is counted and logged here. Observability only (threat T4).
+    if gated.actor_kind != RoomParticipantKind::Agent {
+        let route = if call.attributed || call.owner {
+            crate::metrics::FederatedActorRoute::WorkspaceCommand
+        } else {
+            crate::metrics::FederatedActorRoute::WorkspaceRead
+        };
+        crate::persistent_rooms::observe_federated_actor(
+            &state,
+            &key,
+            route,
+            Some(actor_id),
+            &credential.local_human_member_id,
+            true,
+        );
+    }
     let query: Vec<(&str, String)> = call
         .query
         .iter()
@@ -2843,6 +2866,149 @@ mod tests {
         assert_eq!(status, StatusCode::FORBIDDEN);
         assert_eq!(body["code"], json!("room_access_revoked"));
         assert!(fixture.seen.calls().is_empty());
+
+        fixture.close();
+    }
+
+    // ── Threat T4 observation (member-lane authentication proposal) ──────
+    //
+    // The lane speaks for every non-Agent actor with the node human's bearer.
+    // These pin the pre-enforcement counter: it moves exactly when an actor
+    // who is not the node human is spoken for, and the call itself is
+    // forwarded exactly as before.
+
+    /// The node human's `/v1/identity` id, written into the fixture's config
+    /// dir so no developer `member.toml` or `OCEAN_MEMBER_ID` can leak in.
+    const NODE_OWNER: &str = "node-owner";
+
+    fn pin_node_identity(tmp: &tempfile::TempDir, fixture: &Fixture) {
+        std::fs::write(
+            tmp.path().join(crate::identity::MEMBER_FILE),
+            format!("member_id = \"{NODE_OWNER}\"\n"),
+        )
+        .unwrap();
+        with_rooms(&fixture.state, |store| {
+            store
+                .add_participant(
+                    &fixture.key,
+                    ocean_core::RoomParticipant {
+                        id: NODE_OWNER.into(),
+                        kind: RoomParticipantKind::Human,
+                        display_name: "Node Owner".into(),
+                    },
+                    Utc::now(),
+                )
+                .expect("roster fixture");
+        });
+    }
+
+    fn substituted(state: &AppState) -> (u64, u64, u64) {
+        let card = state.room_metrics.card();
+        let by = |label: &str| card.federated_actor_substituted[label];
+        (by("post"), by("workspace_read"), by("workspace_command"))
+    }
+
+    /// A read asserted by a roster Human who is not the node human goes out
+    /// on the node human's bearer: counted under `workspace_read`, and the
+    /// response and upstream call are what they always were.
+    ///
+    /// Mutation: drop the `observe_federated_actor` call in `forward` -> RED;
+    /// invert its comparison -> RED.
+    #[tokio::test]
+    async fn a_foreign_human_read_counts_a_substitution_and_still_forwards() {
+        let tmp = tempfile::tempdir().unwrap();
+        let fixture = federated_room(&tmp).await;
+        pin_node_identity(&tmp, &fixture);
+
+        let response = room_workspace_status(
+            State(fixture.state.clone()),
+            Path(fixture.key.as_str().to_string()),
+            query(&[("actor_id", "alice")]),
+        )
+        .await;
+        let (status, body) = body_of(response).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body, json!({"ok": true}));
+        let calls = fixture.seen.calls();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(
+            calls[0].authorization.as_deref(),
+            Some(format!("Bearer {BEARER}").as_str())
+        );
+        assert_eq!(substituted(&fixture.state), (0, 1, 0));
+
+        fixture.close();
+    }
+
+    /// An attributed command asserted by a foreign Human is counted under
+    /// `workspace_command`, and still forwards with the node human's id in
+    /// `actor_member_id`, exactly as before.
+    ///
+    /// Mutation: drop the call -> RED; invert the comparison -> RED; swap the
+    /// read/command route choice -> RED.
+    #[tokio::test]
+    async fn a_foreign_human_command_counts_a_substitution_and_still_forwards() {
+        let tmp = tempfile::tempdir().unwrap();
+        let fixture = federated_room(&tmp).await;
+        pin_node_identity(&tmp, &fixture);
+
+        let response = room_workspace_command(
+            State(fixture.state.clone()),
+            Path((fixture.key.as_str().to_string(), "exec".to_string())),
+            query(&[("actor_id", "alice")]),
+            Json(json!({"command": "npm test"})),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let calls = fixture.seen.calls();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].body[ACTOR_MEMBER_ID], json!(LOCAL_MEMBER));
+        assert_eq!(substituted(&fixture.state), (0, 0, 1));
+
+        fixture.close();
+    }
+
+    /// The node human, a registered Agent, and a refused caller are not
+    /// substitutions: the first IS the principal, the second resolves to its
+    /// own member, and the third never reached the network.
+    ///
+    /// Mutation: invert the comparison -> RED; count Agents -> RED; count
+    /// before the gate -> RED.
+    #[tokio::test]
+    async fn the_node_human_an_agent_and_a_refused_caller_count_nothing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let fixture = federated_room(&tmp).await;
+        pin_node_identity(&tmp, &fixture);
+
+        for actor in [NODE_OWNER, "researcher"] {
+            let response = room_workspace_status(
+                State(fixture.state.clone()),
+                Path(fixture.key.as_str().to_string()),
+                query(&[("actor_id", actor)]),
+            )
+            .await;
+            assert_eq!(response.status(), StatusCode::OK, "{actor}");
+        }
+        let response = room_workspace_command(
+            State(fixture.state.clone()),
+            Path((fixture.key.as_str().to_string(), "exec".to_string())),
+            query(&[("actor_id", NODE_OWNER)]),
+            Json(json!({"command": "npm test"})),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(fixture.seen.calls().len(), 3);
+
+        let response = room_workspace_status(
+            State(fixture.state.clone()),
+            Path(fixture.key.as_str().to_string()),
+            query(&[("actor_id", "mallory")]),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        assert_eq!(fixture.seen.calls().len(), 3);
+
+        assert_eq!(substituted(&fixture.state), (0, 0, 0));
 
         fixture.close();
     }

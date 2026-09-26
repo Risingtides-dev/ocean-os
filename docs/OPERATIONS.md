@@ -240,8 +240,9 @@ tests): `ocean_room_access_state{state}`, `ocean_room_outbox_depth{state}`,
 `ocean_room_federation_sse_reconnects_total`,
 `ocean_room_federation_lag_events`,
 `ocean_room_redemption_failures_total{reason}`,
-`ocean_room_admission_refusals_total{code}`, and the store lock-wait pair
-`ocean_room_store_lock_waits_total` / `ocean_room_store_lock_wait_seconds_total`.
+`ocean_room_admission_refusals_total{code}`, the store lock-wait pair
+`ocean_room_store_lock_waits_total` / `ocean_room_store_lock_wait_seconds_total`,
+and `ocean_room_federated_actor_substituted_total{route}`.
 `/health` carries a sampled `rooms` block, the JSON twin of those families
 (`sampled: false` means the numbers are the previous sample), plus the `room_maintenance` card (retention window, orphan GC, last
 sweep counts; the window is `OCEAN_ROOM_RETENTION_DAYS` in
@@ -258,6 +259,17 @@ sweep counts; the window is `OCEAN_ROOM_RETENTION_DAYS` in
   reconnects cap at 60 s.
 - Presence follows the SSE lease: a disconnect downgrades every projected
   member to Unavailable in the same access commit.
+- `ocean_room_federated_actor_substituted_total{route}` (`post`,
+  `workspace_read`, `workspace_command`; `/health`
+  `rooms.federated_actor_substituted`) counts federated writes where the
+  caller named someone other than this node's human and the daemon spoke as
+  the node human anyway. The node human matches under either the credential's
+  Bedrock id or the `/v1/identity` id (`member.toml`, then `OCEAN_MEMBER_ID`),
+  so on a node with no identity set every UI post under `surface-operator`
+  counts. Nothing is refused. A nonzero count is threat T4 of the member-lane
+  proposal happening. Each increment logs one `warn` from the
+  `persistent_rooms` module naming the room key, the route,
+  `supplied_on_local_roster` and `node_identity_set`, never the ids.
 
 ### Rollback
 

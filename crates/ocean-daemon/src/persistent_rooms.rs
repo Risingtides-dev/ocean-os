@@ -2625,6 +2625,71 @@ pub(super) fn classify_local_author<'a>(
         .ok_or(PostRejection::AuthorNotInRoster)
 }
 
+/// Whether a caller-supplied member-lane identity names someone other than
+/// this node's human, and so is REPLACED by the node human when a federated
+/// room acts on it (member-lane authentication proposal, threat T4).
+///
+/// The node human answers to two spellings, and both count as a match: the
+/// room credential's `local_human_member_id` (the opaque Bedrock id every
+/// federated write is authored as) and the node's `/v1/identity` member id
+/// (`member.toml`, then `OCEAN_MEMBER_ID`), which is what `ocean-mcp` and an
+/// adopted surface identity send. Comparing against the Bedrock id alone would
+/// flag every ordinary post, because no local client ever holds that id.
+///
+/// An absent or blank supplied value is not a mismatch: the daemon derives
+/// the actor there, so there is nothing to substitute.
+pub(super) fn federated_actor_is_substituted(
+    supplied: Option<&str>,
+    local_human_member_id: &str,
+    node_member_id: impl FnOnce() -> Option<String>,
+) -> bool {
+    let Some(supplied) = supplied.map(str::trim).filter(|id| !id.is_empty()) else {
+        return false;
+    };
+    if supplied == local_human_member_id {
+        return false;
+    }
+    node_member_id().as_deref() != Some(supplied)
+}
+
+/// Count and log one federated member-lane write that acted as the node human
+/// on behalf of a caller who named someone else. Observability only: the
+/// caller's response and the write are exactly what they were before.
+///
+/// The warn line carries the room key, the route label, whether the supplied
+/// id is on the room's local roster, and whether the node has an identity at
+/// all. It never carries the supplied id or the node human's id — member ids
+/// are identity data, and this metric exists to be read before anyone rules
+/// on enforcement, not to build a who-did-what trail.
+pub(super) fn observe_federated_actor(
+    state: &AppState,
+    key: &RoomKey,
+    route: crate::metrics::FederatedActorRoute,
+    supplied: Option<&str>,
+    local_human_member_id: &str,
+    supplied_on_local_roster: bool,
+) {
+    let mut node_identity_set = false;
+    let substituted = federated_actor_is_substituted(supplied, local_human_member_id, || {
+        let env_member = std::env::var("OCEAN_MEMBER_ID").ok();
+        let member_id =
+            crate::identity::resolve(state.runtime.config_dir(), env_member.as_deref()).member_id;
+        node_identity_set = member_id.is_some();
+        member_id
+    });
+    if !substituted {
+        return;
+    }
+    state.room_metrics.record_federated_actor_substituted(route);
+    tracing::warn!(
+        room = %key.as_str(),
+        route = route.label(),
+        supplied_on_local_roster,
+        node_identity_set,
+        "federated room acted as the node human for a caller who named another member"
+    );
+}
+
 /// Read just the author of one thread root, as a bounded single-row query.
 ///
 /// Uses the `LIMIT`ed [`RoomStore::transcript_page`] with `after_seq =
@@ -2694,8 +2759,17 @@ pub(super) async fn room_post_message(
         if reg.get(&key)?.is_none() {
             return Err(ocean_store::RoomStoreError::UnknownRoom(key.clone()).into());
         }
-        if reg.room_credential(&key)?.is_some() {
-            return Ok(None);
+        if let Some(credential) = reg.room_credential(&key)? {
+            // Observation input only (threat T4): the federated enqueue below
+            // ignores `author_id`, so read what it would have been checked
+            // against under this same guard, and nothing else.
+            let on_roster = reg.get(&key)?.is_some_and(|rec| {
+                rec.room
+                    .participants
+                    .iter()
+                    .any(|participant| participant.id == req.author_id.trim())
+            });
+            return Ok(Err((credential.local_human_member_id, on_roster)));
         }
         if reg.room_access(&key)?.state != RoomAccessState::Local {
             return Err(ocean_store::RoomStoreError::FederationCorruption(
@@ -2741,21 +2815,33 @@ pub(super) async fn room_post_message(
             Err(ThreadAppendError::Store(e)) => return Err(LocalPostError::Store(e)),
         };
         let policy = reg.trigger_policy(&key)?;
-        Ok::<_, LocalPostError>(Some((msg, policy, roster, root_author)))
+        Ok::<_, LocalPostError>(Ok((msg, policy, roster, root_author)))
     });
 
     let (msg, policy, roster, root_author) = match append {
-        Ok(Some(local)) => local,
-        Ok(None) => {
+        Ok(Ok(local)) => local,
+        Ok(Err((local_human_member_id, supplied_on_local_roster))) => {
             return match state
                 .room_federation
                 .enqueue_federated_message(&key, None, &req.body)
                 .await
             {
-                Ok(access) => (
-                    StatusCode::ACCEPTED,
-                    Json(json!({ "ok": true, "access": access })),
-                ),
+                Ok(access) => {
+                    // Counted only once the row is enqueued: a refused post
+                    // never spoke as the node human, so it substituted nobody.
+                    observe_federated_actor(
+                        &state,
+                        &key,
+                        crate::metrics::FederatedActorRoute::Post,
+                        Some(&req.author_id),
+                        &local_human_member_id,
+                        supplied_on_local_roster,
+                    );
+                    (
+                        StatusCode::ACCEPTED,
+                        Json(json!({ "ok": true, "access": access })),
+                    )
+                }
                 Err(error) => intent_error_response(error),
             };
         }
@@ -8224,6 +8310,219 @@ mod tests {
         .await;
         assert_eq!(status, StatusCode::NOT_FOUND);
         assert_eq!(body["error"], "room_not_found");
+    }
+
+    // ── Threat T4 observation (member-lane authentication proposal) ──────
+
+    /// A federated room whose credential names `human` (the Bedrock id), with
+    /// the node's `/v1/identity` pinned to `node-owner` in the test's own
+    /// config dir, and `coworker` and `node-owner` on the local roster.
+    fn t4_federated_room(state: &AppState, tmp: &tempfile::TempDir, key: &RoomKey, human: &str) {
+        std::fs::write(
+            tmp.path().join(crate::identity::MEMBER_FILE),
+            "member_id = \"node-owner\"\n",
+        )
+        .unwrap();
+        with_rooms(state, |store| {
+            store.create(key.clone(), key.as_str(), None, Utc::now())?;
+            for id in ["coworker", "node-owner"] {
+                store.add_participant(
+                    key,
+                    RoomParticipant {
+                        id: id.into(),
+                        kind: RoomParticipantKind::Human,
+                        display_name: id.into(),
+                    },
+                    Utc::now(),
+                )?;
+            }
+            store.install_room_credential(key, "private-bearer", human)?;
+            store.update_room_access_safe(key, Some(RoomAccessState::Live), None, None)?;
+            Ok::<_, ocean_store::RoomStoreError>(())
+        })
+        .unwrap();
+    }
+
+    fn t4_post_count(state: &AppState) -> (u64, u64) {
+        let card = state.room_metrics.card();
+        (
+            card.federated_actor_substituted["post"],
+            card.federated_actor_substituted_total,
+        )
+    }
+
+    async fn t4_post(
+        state: &AppState,
+        key: &RoomKey,
+        author_id: &str,
+    ) -> (StatusCode, serde_json::Value) {
+        let (status, Json(body)) = room_post_message(
+            State(state.clone()),
+            Path(key.as_str().into()),
+            Json(RoomMessageRequest {
+                author_id: author_id.into(),
+                author_kind: RoomParticipantKind::Human,
+                body: "federated intent".into(),
+                thread_parent_seq: None,
+            }),
+        )
+        .await;
+        (status, body)
+    }
+
+    /// A federated post naming a member who is not the node human is counted
+    /// once under `route="post"`, and the post itself is unchanged: 202, one
+    /// outbox row authored as the credential's human, nothing on the local
+    /// transcript.
+    ///
+    /// Mutation: drop the `observe_federated_actor` call in
+    /// `room_post_message` -> RED; invert the comparison in
+    /// `federated_actor_is_substituted` -> RED.
+    #[tokio::test]
+    async fn t4_federated_post_with_a_foreign_author_counts_and_still_posts_as_the_node_human() {
+        let _env = AUTO_CONVENE_ENV_LOCK.lock().await;
+        let tmp = tempfile::tempdir().unwrap();
+        let _restore = TestEnvRestore::capture(&[
+            "OCEAN_CONFIG_DIR",
+            "OCEAN_MODEL",
+            "OCEAN_YOLO",
+            "OCEAN_AGENTS_DIR",
+        ]);
+        let state = fake_convene_state(&tmp);
+        let key = RoomKey::new("t4-post-foreign");
+        let human = "11111111-1111-4111-8111-111111111111";
+        t4_federated_room(&state, &tmp, &key, human);
+
+        // The roster fixture wrote join markers; the post must add nothing.
+        let transcript_before = with_rooms(&state, |store| store.transcript(&key, None))
+            .unwrap()
+            .len();
+        let (status, body) = t4_post(&state, &key, "coworker").await;
+        assert_eq!(status, StatusCode::ACCEPTED);
+        assert_eq!(body["ok"], true);
+        let projection = with_rooms(&state, |store| store.room_access(&key)).unwrap();
+        assert_eq!(projection.outbox.len(), 1);
+        assert_eq!(projection.outbox[0].author_member_id, human);
+        assert_eq!(
+            with_rooms(&state, |store| store.transcript(&key, None))
+                .unwrap()
+                .len(),
+            transcript_before,
+            "a federated post never touches the local transcript"
+        );
+        assert_eq!(t4_post_count(&state), (1, 1));
+
+        // An id nobody has heard of is a substitution too; the roster flag
+        // only goes to the log line.
+        let (status, _) = t4_post(&state, &key, "stranger").await;
+        assert_eq!(status, StatusCode::ACCEPTED);
+        assert_eq!(t4_post_count(&state), (2, 2));
+    }
+
+    /// The node human under either spelling (the credential's Bedrock id, or
+    /// the `/v1/identity` id, trimmed) and an absent (blank) author are not
+    /// substitutions. Every one of them still posts.
+    ///
+    /// Mutation: invert the comparison -> RED; drop the trim -> RED; drop the
+    /// `/v1/identity` arm -> RED.
+    #[tokio::test]
+    async fn t4_federated_post_as_the_node_human_or_blank_counts_nothing() {
+        let _env = AUTO_CONVENE_ENV_LOCK.lock().await;
+        let tmp = tempfile::tempdir().unwrap();
+        let _restore = TestEnvRestore::capture(&[
+            "OCEAN_CONFIG_DIR",
+            "OCEAN_MODEL",
+            "OCEAN_YOLO",
+            "OCEAN_AGENTS_DIR",
+        ]);
+        let state = fake_convene_state(&tmp);
+        let key = RoomKey::new("t4-post-matching");
+        let human = "22222222-2222-4222-8222-222222222222";
+        t4_federated_room(&state, &tmp, &key, human);
+
+        for author in [human, "node-owner", "  node-owner  ", "", "   "] {
+            let (status, body) = t4_post(&state, &key, author).await;
+            assert_eq!(status, StatusCode::ACCEPTED, "{author:?}");
+            assert_eq!(body["ok"], true, "{author:?}");
+        }
+        let projection = with_rooms(&state, |store| store.room_access(&key)).unwrap();
+        assert_eq!(projection.outbox.len(), 5);
+        assert_eq!(t4_post_count(&state), (0, 0));
+    }
+
+    /// A refused federated post substituted nobody (nothing was enqueued), and
+    /// a Local room post never substitutes: both leave the counter at zero.
+    ///
+    /// Mutation: count before the enqueue result -> RED.
+    #[tokio::test]
+    async fn t4_refused_federated_post_and_local_post_count_nothing() {
+        let _env = AUTO_CONVENE_ENV_LOCK.lock().await;
+        let tmp = tempfile::tempdir().unwrap();
+        let _restore = TestEnvRestore::capture(&[
+            "OCEAN_CONFIG_DIR",
+            "OCEAN_MODEL",
+            "OCEAN_YOLO",
+            "OCEAN_AGENTS_DIR",
+        ]);
+        let state = fake_convene_state(&tmp);
+        let key = RoomKey::new("t4-post-revoked");
+        t4_federated_room(&state, &tmp, &key, "33333333-3333-4333-8333-333333333333");
+        with_rooms(&state, |store| {
+            store.update_room_access_safe(&key, Some(RoomAccessState::Revoked), None, None)
+        })
+        .unwrap();
+        let (status, _) = t4_post(&state, &key, "coworker").await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+
+        let local = RoomKey::new("t4-post-local");
+        with_rooms(&state, |store| {
+            store.create(local.clone(), local.as_str(), None, Utc::now())?;
+            store.add_participant(
+                &local,
+                RoomParticipant {
+                    id: "coworker".into(),
+                    kind: RoomParticipantKind::Human,
+                    display_name: "coworker".into(),
+                },
+                Utc::now(),
+            )
+        })
+        .unwrap();
+        let (status, _) = t4_post(&state, &local, "coworker").await;
+        assert_eq!(status, StatusCode::CREATED);
+
+        assert_eq!(t4_post_count(&state), (0, 0));
+    }
+
+    /// The pure classifier, including the case a route test cannot pin
+    /// without racing the process environment: a node with no identity at all
+    /// matches only the Bedrock id, and the identity is read lazily, only
+    /// when the Bedrock id did not already match.
+    #[test]
+    fn t4_federated_actor_classifier_edges() {
+        let never = || -> Option<String> { panic!("identity must not be read") };
+        assert!(!federated_actor_is_substituted(None, "uuid", never));
+        assert!(!federated_actor_is_substituted(Some(""), "uuid", never));
+        assert!(!federated_actor_is_substituted(Some("  "), "uuid", never));
+        assert!(!federated_actor_is_substituted(Some("uuid"), "uuid", never));
+        assert!(!federated_actor_is_substituted(
+            Some(" uuid "),
+            "uuid",
+            never
+        ));
+        assert!(!federated_actor_is_substituted(
+            Some("john"),
+            "uuid",
+            || Some("john".into())
+        ));
+        assert!(federated_actor_is_substituted(
+            Some("mallory"),
+            "uuid",
+            || Some("john".into())
+        ));
+        assert!(federated_actor_is_substituted(Some("john"), "uuid", || {
+            None
+        }));
     }
 
     #[tokio::test]
