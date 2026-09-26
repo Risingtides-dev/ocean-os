@@ -15206,6 +15206,448 @@ mod tests {
         assert_eq!(names("session_create_response_keys"), response_keys);
     }
 
+    /// Records the field (struct) or variant (enum) names a `Deserialize`
+    /// derive hands its deserializer, with every `rename`/`rename_all` already
+    /// applied, so a wire vocabulary can be read from the type itself instead
+    /// of a copy. A type the probe cannot see (a `flatten`ed struct, a manual
+    /// impl) records nothing, and the caller panics rather than pass vacuously.
+    struct SerdeNameProbe<'a>(&'a mut Option<&'static [&'static str]>);
+
+    impl<'de> serde::Deserializer<'de> for SerdeNameProbe<'_> {
+        type Error = serde::de::value::Error;
+
+        fn deserialize_any<V: serde::de::Visitor<'de>>(
+            self,
+            _visitor: V,
+        ) -> Result<V::Value, Self::Error> {
+            Err(serde::de::Error::custom("serde name probe"))
+        }
+
+        fn deserialize_struct<V: serde::de::Visitor<'de>>(
+            self,
+            _name: &'static str,
+            fields: &'static [&'static str],
+            _visitor: V,
+        ) -> Result<V::Value, Self::Error> {
+            *self.0 = Some(fields);
+            Err(serde::de::Error::custom("serde name probe"))
+        }
+
+        fn deserialize_enum<V: serde::de::Visitor<'de>>(
+            self,
+            _name: &'static str,
+            variants: &'static [&'static str],
+            _visitor: V,
+        ) -> Result<V::Value, Self::Error> {
+            *self.0 = Some(variants);
+            Err(serde::de::Error::custom("serde name probe"))
+        }
+
+        serde::forward_to_deserialize_any! {
+            bool i8 i16 i32 i64 i128 u8 u16 u32 u64 u128 f32 f64 char str string
+            bytes byte_buf option unit unit_struct newtype_struct seq tuple
+            tuple_struct map identifier ignored_any
+        }
+    }
+
+    fn serde_wire_names<T: serde::de::DeserializeOwned>() -> Vec<String> {
+        let mut captured = None;
+        let _ = T::deserialize(SerdeNameProbe(&mut captured));
+        let mut names: Vec<String> = captured
+            .unwrap_or_else(|| panic!("{} exposes no derived names", std::any::type_name::<T>()))
+            .iter()
+            .map(|name| (*name).to_string())
+            .collect();
+        names.sort();
+        names
+    }
+
+    /// ROADMAP drift checks: `docs/contracts/voice-wire.json` is the voice wire
+    /// first-party surfaces decode, held equal to the code in both directions.
+    /// Routes come from the `app_router` registrations (the same parser the
+    /// route-parity test uses), each route's status codes from the
+    /// `StatusCode::*` its registered handler can answer, request fields and
+    /// the realtime purposes from the serde derives themselves, response keys
+    /// and realtime tool names from the pure builders the handlers call, and
+    /// the remaining literals from the handler source. Every key of the
+    /// artifact is checked, so it cannot carry an unpinned fact.
+    #[test]
+    fn voice_wire_contract_matches_the_daemon() {
+        use std::collections::BTreeMap;
+
+        let artifact: serde_json::Value =
+            serde_json::from_str(include_str!("../../../docs/contracts/voice-wire.json"))
+                .expect("voice-wire.json parses");
+        let list = |value: &serde_json::Value| -> Vec<String> {
+            let mut list: Vec<String> = value
+                .as_array()
+                .unwrap_or_else(|| panic!("{value} is a list"))
+                .iter()
+                .map(|v| v.as_str().unwrap().to_string())
+                .collect();
+            list.sort();
+            list
+        };
+        let keys = |value: &serde_json::Value| -> Vec<String> {
+            let mut keys: Vec<String> = value.as_object().unwrap().keys().cloned().collect();
+            keys.sort();
+            keys
+        };
+        let sorted = |mut list: Vec<String>| {
+            list.sort();
+            list
+        };
+        let strings = |items: &[&str]| -> Vec<String> {
+            sorted(items.iter().map(|s| (*s).to_string()).collect())
+        };
+
+        // Every fact in the artifact is one this test checks.
+        assert_eq!(
+            keys(&artifact),
+            strings(&[
+                "agent_voice",
+                "error_key",
+                "handler_statuses",
+                "handoff",
+                "handoff_route",
+                "note",
+                "realtime",
+                "routes",
+                "stt",
+                "tts",
+                "version",
+            ])
+        );
+        assert_eq!(artifact["version"], 1);
+
+        // Production source only: this test's own text must not satisfy a scan.
+        let full = include_str!("main.rs");
+        let source = full.split("\n#[cfg(test)]\nmod tests {").next().unwrap();
+        let handler_body = |name: &str| -> &str {
+            let marker = format!("async fn {name}(");
+            let start = source
+                .find(&marker)
+                .unwrap_or_else(|| panic!("handler {name} is defined"));
+            let tail = &source[start..];
+            &tail[..tail.find("\n}\n").expect("handler body closes")]
+        };
+        let quoted_after = |haystack: &str, needle: &str| -> Vec<String> {
+            haystack
+                .match_indices(needle)
+                .map(|(at, lit)| {
+                    let rest = &haystack[at + lit.len()..];
+                    rest[..rest.find('"').unwrap()].to_string()
+                })
+                .collect()
+        };
+
+        // Routes: every registered route naming voice, plus the handoff append,
+        // with the handler each one dispatches to.
+        let router = source_section(source, "fn app_router(", "#[tokio::main]");
+        let mut handlers: BTreeMap<String, String> = BTreeMap::new();
+        for call in route_calls(router) {
+            let path_start = call.find('"').unwrap() + 1;
+            let path = &call[path_start..path_start + call[path_start..].find('"').unwrap()];
+            if let Some(at) = call.find("post(") {
+                let rest = &call[at + "post(".len()..];
+                let handler: String = rest
+                    .chars()
+                    .take_while(|c| c.is_ascii_alphanumeric() || *c == '_' || *c == ':')
+                    .collect();
+                handlers.insert(format!("POST {path}"), handler);
+            }
+        }
+        let registered = source_registered_routes();
+        let voice_routes: Vec<String> = registered
+            .iter()
+            .filter(|route| route.contains("voice"))
+            .cloned()
+            .collect();
+        assert_eq!(list(&artifact["routes"]), voice_routes);
+        let handoff_route = artifact["handoff_route"].as_str().unwrap();
+        assert!(
+            registered.contains(handoff_route),
+            "{handoff_route} is registered"
+        );
+
+        // Status codes each route's own handler can answer.
+        let status_code = |name: &str| -> u64 {
+            match name {
+                "OK" => 200,
+                "BAD_REQUEST" => 400,
+                "NOT_FOUND" => 404,
+                "CONFLICT" => 409,
+                "INTERNAL_SERVER_ERROR" => 500,
+                "BAD_GATEWAY" => 502,
+                "SERVICE_UNAVAILABLE" => 503,
+                other => panic!("add StatusCode::{other} to the voice contract mapping"),
+            }
+        };
+        let statuses = artifact["handler_statuses"].as_object().unwrap();
+        let mut routes_with_statuses: Vec<String> = voice_routes.clone();
+        routes_with_statuses.push(handoff_route.to_string());
+        assert_eq!(
+            keys(&artifact["handler_statuses"]),
+            sorted(routes_with_statuses.clone())
+        );
+        for route in &routes_with_statuses {
+            let handler = handlers
+                .get(route)
+                .unwrap_or_else(|| panic!("{route} has a POST handler"));
+            let body = handler_body(handler);
+            let mut found: Vec<u64> = body
+                .match_indices("StatusCode::")
+                .map(|(at, lit)| {
+                    let name: String = body[at + lit.len()..]
+                        .chars()
+                        .take_while(|c| c.is_ascii_uppercase() || *c == '_')
+                        .collect();
+                    status_code(&name)
+                })
+                .collect();
+            found.sort_unstable();
+            found.dedup();
+            let pinned: Vec<u64> = statuses[route]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|v| v.as_u64().unwrap())
+                .collect();
+            assert_eq!(pinned, found, "{route} ({handler}) statuses");
+        }
+
+        // Every JSON error body the voice handlers build carries `error`.
+        let error_key = artifact["error_key"].as_str().unwrap();
+        for route in &routes_with_statuses {
+            let body = handler_body(&handlers[route]);
+            for (at, _) in body.match_indices("json!({") {
+                let literal = &body[at..at + body[at..].find("})").unwrap()];
+                let is_success = body[..at].trim_end().ends_with("(StatusCode::OK, Json(");
+                if !is_success {
+                    assert!(
+                        literal.contains(&format!("\"{error_key}\"")),
+                        "{route}: error body {literal} lacks {error_key:?}"
+                    );
+                }
+            }
+        }
+        let ok_body_keys = |body: &str| -> Vec<String> {
+            let at = body
+                .find("(StatusCode::OK, Json(json!({")
+                .expect("a literal success body");
+            let literal = &body[at..at + body[at..].find("})").unwrap()];
+            sorted(
+                literal
+                    .match_indices('"')
+                    .step_by(2)
+                    .map(|(q, _)| {
+                        let rest = &literal[q + 1..];
+                        rest[..rest.find('"').unwrap()].to_string()
+                    })
+                    .collect(),
+            )
+        };
+
+        // POST /v1/agent/voice
+        let voice = &artifact["agent_voice"];
+        assert_eq!(
+            keys(voice),
+            strings(&[
+                "client_type",
+                "delegates_to",
+                "request_fields",
+                "response_fields"
+            ])
+        );
+        assert_eq!(
+            list(&voice["request_fields"]),
+            serde_wire_names::<AgentVoiceRequest>()
+        );
+        assert_eq!(
+            list(&voice["response_fields"]),
+            serde_wire_names::<AgentTurnResponse>()
+        );
+        let agent_voice_body = handler_body("agent_voice");
+        assert_eq!(
+            quoted_after(agent_voice_body, "client_type: Some(\""),
+            vec![voice["client_type"].as_str().unwrap().to_string()]
+        );
+        let delegate = voice["delegates_to"].as_str().unwrap();
+        assert_eq!(handlers[delegate], "agent_turn");
+        assert!(agent_voice_body.contains("agent_turn(State(state), Json(turn)).await"));
+
+        // POST /v1/voice/realtime/client-secret
+        let realtime = &artifact["realtime"];
+        assert_eq!(
+            keys(realtime),
+            strings(&[
+                "conversation_workspace_key",
+                "default_model",
+                "default_purpose",
+                "planner_context_fields",
+                "purposes",
+                "request_fields",
+                "response_keys",
+                "tools",
+            ])
+        );
+        assert_eq!(
+            list(&realtime["request_fields"]),
+            serde_wire_names::<voice_realtime::RealtimeSecretRequest>()
+        );
+        assert_eq!(
+            list(&realtime["purposes"]),
+            serde_wire_names::<voice_realtime::RealtimePurpose>()
+        );
+        assert_eq!(
+            serde_json::from_value::<voice_realtime::RealtimePurpose>(
+                realtime["default_purpose"].clone()
+            )
+            .unwrap(),
+            voice_realtime::RealtimePurpose::default()
+        );
+        assert_eq!(
+            list(&realtime["planner_context_fields"]),
+            serde_wire_names::<voice_realtime::VoicePlannerContext>()
+        );
+        assert_eq!(
+            realtime["default_model"],
+            voice_realtime::DEFAULT_REALTIME_MODEL
+        );
+        let minted = voice_realtime::normalize_upstream(
+            &json!({ "value": "secret", "expires_at": 1 }),
+            "model",
+        )
+        .unwrap();
+        assert_eq!(list(&realtime["response_keys"]), keys(&minted));
+        assert_eq!(
+            quoted_after(
+                handler_body("voice_realtime_client_secret"),
+                "normalized[\""
+            ),
+            vec![realtime["conversation_workspace_key"]
+                .as_str()
+                .unwrap()
+                .to_string()]
+        );
+        let tool_names = |body: serde_json::Value| -> Vec<String> {
+            sorted(
+                body["session"]["tools"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .map(|tool| tool["name"].as_str().unwrap().to_string())
+                    .collect(),
+            )
+        };
+        let tools = &realtime["tools"];
+        assert_eq!(
+            keys(tools),
+            strings(&["conversation", "conversation_with_workspace", "planner"])
+        );
+        assert_eq!(
+            list(&tools["conversation"]),
+            tool_names(voice_realtime::upstream_body("m", "i", false))
+        );
+        assert_eq!(
+            list(&tools["conversation_with_workspace"]),
+            tool_names(voice_realtime::upstream_body("m", "i", true))
+        );
+        assert_eq!(
+            list(&tools["planner"]),
+            tool_names(voice_realtime::planner_upstream_body("m", "i"))
+        );
+
+        // POST /v1/voice/stt
+        let stt = &artifact["stt"];
+        assert_eq!(
+            keys(stt),
+            strings(&["request_body", "response_keys", "wav_content_types"])
+        );
+        let stt_body = handler_body("voice_stt");
+        assert!(
+            stt_body.contains("body: axum::body::Bytes"),
+            "stt takes the raw audio body"
+        );
+        assert_eq!(stt["request_body"], "raw audio bytes");
+        let speech = include_str!("voice_speech.rs");
+        let from_content_type = &speech[speech
+            .find("fn from_content_type(")
+            .expect("from_content_type is defined")..];
+        let wav_arm = from_content_type
+            .lines()
+            .find(|line| line.contains("=> Self::Wav"))
+            .expect("one arm selects WAV");
+        let wav_types: Vec<String> = sorted(
+            wav_arm
+                .split('"')
+                .skip(1)
+                .step_by(2)
+                .map(str::to_string)
+                .collect(),
+        );
+        assert_eq!(list(&stt["wav_content_types"]), wav_types);
+        for content_type in &wav_types {
+            assert_eq!(
+                voice_speech::SttAudioFormat::from_content_type(Some(content_type)),
+                voice_speech::SttAudioFormat::Wav
+            );
+        }
+        assert_eq!(list(&stt["response_keys"]), ok_body_keys(stt_body));
+
+        // POST /v1/voice/tts
+        let tts = &artifact["tts"];
+        assert_eq!(
+            keys(tts),
+            strings(&["default_voice", "request_fields", "response_body"])
+        );
+        assert_eq!(
+            list(&tts["request_fields"]),
+            serde_wire_names::<voice_speech::TtsRequest>()
+        );
+        assert_eq!(tts["default_voice"], voice_speech::DEFAULT_VOICE);
+        assert!(
+            handler_body("voice_tts")
+                .contains("[(axum::http::header::CONTENT_TYPE, content_type.as_str())]"),
+            "tts answers audio bytes with the upstream Content-Type"
+        );
+        assert_eq!(
+            tts["response_body"],
+            "audio bytes, Content-Type relayed from upstream"
+        );
+
+        // POST /v1/agent/sessions/{id}/messages (the voice handoff append)
+        let handoff = &artifact["handoff"];
+        assert_eq!(
+            keys(handoff),
+            strings(&["kinds", "request_fields", "response_keys", "roles"])
+        );
+        assert_eq!(
+            list(&handoff["request_fields"]),
+            serde_wire_names::<SessionMessageAppendRequest>()
+        );
+        let append_body = handler_body("agent_session_message_append");
+        assert_eq!(
+            list(&handoff["roles"]),
+            sorted(quoted_after(append_body, "req.role != \""))
+        );
+        let formatter = source_section(
+            source,
+            "fn format_session_append(",
+            "/// Append an out-of-turn message",
+        );
+        let kinds = sorted(quoted_after(formatter, "Some(\""));
+        assert_eq!(list(&handoff["kinds"]), kinds);
+        for kind in &kinds {
+            assert_ne!(
+                format_session_append(Some(kind), "x"),
+                "x",
+                "{kind} is tagged"
+            );
+        }
+        assert_eq!(list(&handoff["response_keys"]), ok_body_keys(append_body));
+    }
+
     #[tokio::test]
     async fn explicit_session_create_publishes_only_the_successful_authoritative_fact() {
         use ocean_agent_sdk::extension_lifecycle::LifecycleEventKind;

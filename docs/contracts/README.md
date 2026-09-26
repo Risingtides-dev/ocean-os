@@ -10,6 +10,7 @@ turns that test red.
 | `room-wire.json` | ocean-surface (Rooms) | `room_wire_contract_matches_the_daemon` in `crates/ocean-daemon/src/main.rs` |
 | `session-wire.json` | every first-party surface (sessions, agent events) | `session_wire_contract_matches_the_daemon` in `crates/ocean-daemon/src/main.rs` |
 | `component-wire.json` | surfaces that render agent components | `component_wire_contract_matches_the_runtime` in `crates/ocean-runtime/src/tools/component.rs` |
+| `voice-wire.json` | ocean-surface (web and Tauri voice), Ocean Buddy, TUI dictation | `voice_wire_contract_matches_the_daemon` in `crates/ocean-daemon/src/main.rs` |
 
 `room-wire.json` covers what a Rooms client branches on: the `/events` SSE
 event names, the access-state, message-kind and participant-kind vocabularies,
@@ -29,3 +30,25 @@ derivation stays valid.
 accept, in `VALID_KINDS` order, and its test also requires a section per kind
 in `docs/AGENT_RENDER_PROTOCOL.md`, so the protocol doc cannot fall behind the
 code again. It was one kind short (`dashboard`) when this landed.
+
+`voice-wire.json` covers the voice routes: `POST /v1/agent/voice`, the
+realtime client-secret mint, `/v1/voice/stt` and `/v1/voice/tts`, and the
+`POST /v1/agent/sessions/{id}/messages` handoff append that the realtime
+agent's `write_handoff` tool uses. For each route it pins the request fields,
+the response keys, and the status codes that route's own handler can answer.
+Error bodies carry `error`. It also pins the realtime `purpose` values, the
+default model, the tool names a surface dispatches on in each mint mode, the
+WAV content types STT accepts, the default TTS voice, the `leo-voice`
+client type, and the handoff `kind` values. Every value is derived from the
+code. Routes come from the `app_router` registrations. Field and variant names
+come from the serde derives, through a probe deserializer, so a `rename`
+changes them. Response keys and tool names come from the pure builders the
+handlers call, and the rest comes from the handler source. The test also
+checks every key of the artifact, so the file cannot hold a fact that nothing
+checks. Voice routes answer a prose `error` string rather than a machine
+`code`, so no error codes are pinned. `POST /v1/agent/voice` shares its
+response with `POST /v1/agent/turns` and hands every non-rejection outcome to
+it. The LiveKit call tap has no route of its own. It runs inside the daemon
+under the `livekit-tap` feature. `POST /v1/rooms/{room_id}/livekit-token` and
+`/v1/calls/*` are room and call media routes, so this artifact does not cover
+them.

@@ -1,0 +1,121 @@
+{
+  "note": "The voice wire facts first-party surfaces (ocean-surface web and Tauri, Ocean Buddy, the TUI dictation client) depend on, published by ocean-daemon and held equal to the code by voice_wire_contract_matches_the_daemon (crates/ocean-daemon). See docs/contracts/README.md.",
+  "version": 1,
+  "routes": [
+    "POST /v1/agent/voice",
+    "POST /v1/voice/realtime/client-secret",
+    "POST /v1/voice/stt",
+    "POST /v1/voice/tts"
+  ],
+  "handoff_route": "POST /v1/agent/sessions/{id}/messages",
+  "handler_statuses": {
+    "POST /v1/agent/sessions/{id}/messages": [200, 400, 404, 409, 500],
+    "POST /v1/agent/voice": [400],
+    "POST /v1/voice/realtime/client-secret": [200, 400, 502],
+    "POST /v1/voice/stt": [200, 400, 502, 503],
+    "POST /v1/voice/tts": [200, 400, 502, 503]
+  },
+  "error_key": "error",
+  "agent_voice": {
+    "request_fields": [
+      "cwd",
+      "decision_token",
+      "project_id",
+      "session_id",
+      "transcript"
+    ],
+    "client_type": "leo-voice",
+    "delegates_to": "POST /v1/agent/turns",
+    "response_fields": [
+      "cache_read_tokens",
+      "context_usage",
+      "error",
+      "event_id_prefix",
+      "input_tokens",
+      "ok",
+      "output_tokens",
+      "session_id",
+      "status",
+      "tokens_per_second",
+      "turn_id",
+      "wall_ms"
+    ]
+  },
+  "realtime": {
+    "request_fields": [
+      "model",
+      "planner_context",
+      "purpose",
+      "session_id"
+    ],
+    "purposes": [
+      "conversation",
+      "planner"
+    ],
+    "default_purpose": "conversation",
+    "planner_context_fields": [
+      "project_id",
+      "workspace_root"
+    ],
+    "default_model": "gpt-realtime-2.1",
+    "response_keys": [
+      "client_secret",
+      "expires_at",
+      "model"
+    ],
+    "conversation_workspace_key": "workspace_root",
+    "tools": {
+      "conversation": [
+        "render_component",
+        "write_handoff"
+      ],
+      "conversation_with_workspace": [
+        "list_workspace",
+        "read_workspace_file",
+        "render_component",
+        "write_handoff"
+      ],
+      "planner": [
+        "list_workspace",
+        "propose_handoff",
+        "read_workspace_file"
+      ]
+    }
+  },
+  "stt": {
+    "request_body": "raw audio bytes",
+    "wav_content_types": [
+      "audio/wav",
+      "audio/wave",
+      "audio/x-wav"
+    ],
+    "response_keys": [
+      "text"
+    ]
+  },
+  "tts": {
+    "request_fields": [
+      "text",
+      "voice"
+    ],
+    "default_voice": "leo",
+    "response_body": "audio bytes, Content-Type relayed from upstream"
+  },
+  "handoff": {
+    "request_fields": [
+      "content",
+      "kind",
+      "role"
+    ],
+    "roles": [
+      "user"
+    ],
+    "kinds": [
+      "handoff",
+      "planner_handoff"
+    ],
+    "response_keys": [
+      "ok"
+    ]
+  }
+}

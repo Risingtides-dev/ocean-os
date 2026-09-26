@@ -15,8 +15,9 @@ approved design or permission to alter public contracts.
       retains CLI-compatible hashline/artifact gates pending cross-repo policy.
 - [ ] Keep cross-repository session, voice, component, and room contracts under
       executable drift checks rather than prose-only synchronization. Room,
-      session and component contracts are published in `docs/contracts/` and
-      pinned to the code; voice remains, as does each consumer vendoring them.
+      session, component and voice contracts are published in
+      `docs/contracts/` and pinned to the code. What remains is each consumer
+      vendoring them.
 
 ## Ocean Rooms distributed workspace
 

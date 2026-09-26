@@ -49,6 +49,13 @@ This crate owns the long-running Ocean HTTP service on `:4780`, including API ro
   or live linked worktree. Return that canonical root with the secret for frozen
   Surface fulfillment; never accept a browser/model-nominated conversation root,
   and keep project-less/session-less conversations on render + handoff only.
+- The voice routes above, `POST /v1/agent/voice`, and the handoff append are
+  published as `docs/contracts/voice-wire.json`. The test
+  `voice_wire_contract_matches_the_daemon` holds that file equal to the code.
+  It covers the route set, each handler's status codes, the serde request
+  fields and purposes, the response keys, the realtime tool names, the STT WAV
+  types, the TTS default voice, and the handoff kinds. A change to any of
+  these updates the artifact in the same commit.
 
 - `POST /v1/ocean-buddy/events` is the deliberately narrow first Buddy ingress: it accepts only a typed mocked `attached` lifecycle event, carries attachment metadata but no image bytes, performs no camera/session/tool work, and returns a typed Watch result card. Watch approval remains in the Watch-to-iPhone adapter flow.
 - Session behavior lives in `ocean-agent`; route changes must not create a separate session model.
