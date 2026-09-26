@@ -101,7 +101,11 @@ The implementation lives in:
   the same merge-gated scene during replay.
 
 This keeps the rendered state and the next-turn canvas context on the same
-authoritative client-side ledger path.
+authoritative client-side ledger path. The daemon does not consume that
+next-turn context yet: Surface sends it as the turn's `canvas` field and
+`AgentTurnRequest` drops it, so the model never sees it. Whether to accept it
+is an open operator decision, recorded in
+[`contracts/README.md`](contracts/README.md).
 
 ## Scope — foundation, not full multiplayer
 

@@ -1178,6 +1178,7 @@ fn session_create_request(workspace_root: &str, model: Option<&str>) -> AgentSes
         project_id: None,
         model: model.map(str::to_string),
         client_type: Some(TUI_CLIENT_TYPE.into()),
+        title: None,
     }
 }
 

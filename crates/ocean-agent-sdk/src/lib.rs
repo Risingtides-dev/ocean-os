@@ -450,6 +450,13 @@ pub struct AgentSessionCreateRequest {
     /// "surface-tauri", "surface-extension", "cli", and "leo-voice".
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub client_type: Option<String>,
+    /// Optional display-title hint (Ocean Surface sends the start of the
+    /// operator's first prompt). The daemon adopts it as the session's display
+    /// title with the same rules the first turn uses: whitespace is squashed,
+    /// it is truncated to the switcher length, a blank hint is ignored, and the
+    /// first title written wins, so a later turn never relabels the session.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
 }
 
 /// Response payload for `POST /v1/agent/sessions`.
