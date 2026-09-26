@@ -678,7 +678,10 @@ pub(crate) async fn events(
 ///
 /// It is synthesized, never appended to the durable log, so its truth is
 /// `derived` (manifest §1.2: "computed … not in durable log") and it carries
-/// no execution topology. Its cursor is `from + 1`, the first missing cursor,
+/// no execution topology. For the same reason `recorded_at` is the time the
+/// tail built the frame, not the §1.2 durable-write time; the contract README
+/// tells consumers never to treat a gap envelope as a durable record. Its
+/// cursor is `from + 1`, the first missing cursor,
 /// as in the §7.2 example; the SSE frame carries no `id:` (Task 9 F5), so the
 /// cursor never becomes a client's `Last-Event-ID`.
 pub(crate) fn gap_envelope(
@@ -1777,6 +1780,78 @@ mod tests {
             other => panic!("gap payload is StreamGap, got {other:?}"),
         }
         assert_eq!(text.matches("id: 3").count(), 1, "{text}");
+    }
+
+    /// A hole the tail meets because retention pruned past the client's
+    /// position is named `retention_boundary`, not `cursor_jump`. Retention
+    /// has to prune while the tail is attached (at attach time the same state
+    /// is a `reset`), so the prune and the arrival of the next event land in
+    /// one raw transaction the tail sees atomically.
+    #[tokio::test]
+    async fn live_tail_names_a_retention_pruned_gap() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("obs.db");
+        let store =
+            Arc::new(ObservatoryStore::open(&path, RetentionPolicy::default()).expect("open"));
+        for id in ["e-1", "e-2", "e-3", "e-4", "e-5", "e-6"] {
+            store
+                .append_event(envelope(id, EventKind::ExecutionPhaseChanged))
+                .expect("append");
+        }
+        // Hold back 4..=6 so a tail attached at 3 has nothing to read yet.
+        let raw = rusqlite::Connection::open(&path).expect("open raw");
+        raw.execute_batch(
+            "CREATE TABLE held AS SELECT * FROM observatory_events WHERE cursor >= 4;
+             DELETE FROM observatory_events WHERE cursor >= 4;",
+        )
+        .expect("hold back");
+        let response = app(store)
+            .oneshot(authed("/v1/observatory/events?after=3"))
+            .await
+            .expect("response");
+        // Attached with 1..=3 retained. Now, atomically: cursor 6 arrives and
+        // retention prunes everything through 5, including 4 and 5 the client
+        // never received.
+        raw.execute_batch(
+            "BEGIN IMMEDIATE;
+             INSERT INTO observatory_events SELECT * FROM held WHERE cursor = 6;
+             DELETE FROM observatory_events WHERE cursor <= 5;
+             COMMIT;",
+        )
+        .expect("prune");
+        use futures::StreamExt;
+        let mut body = http_body_util::BodyExt::into_data_stream(response.into_body());
+        let mut text = String::new();
+        while !text.contains("id: 6") {
+            let chunk = tokio::time::timeout(Duration::from_secs(5), body.next())
+                .await
+                .expect("frame within 5s")
+                .expect("stream open")
+                .expect("chunk");
+            text.push_str(&String::from_utf8_lossy(&chunk));
+        }
+        let gap = text
+            .split("\n\n")
+            .find(|f| f.contains("StreamGap"))
+            .unwrap_or_else(|| panic!("no gap frame: {text}"));
+        let data = gap
+            .lines()
+            .find_map(|line| line.strip_prefix("data: "))
+            .unwrap_or_else(|| panic!("gap frame has data: {gap}"));
+        let decoded: EventEnvelope = serde_json::from_str(data).expect("gap is an envelope");
+        assert_eq!(decoded.cursor, Cursor::new(4), "first missing cursor");
+        match decoded.payload {
+            EventPayload::StreamGap {
+                from_cursor,
+                to_cursor,
+                reason,
+            } => {
+                assert_eq!(from_cursor, Cursor::new(3));
+                assert_eq!(to_cursor, Cursor::new(6));
+                assert_eq!(reason, "retention_boundary");
+            }
+            other => panic!("gap payload is StreamGap, got {other:?}"),
+        }
     }
 
     /// F6: the filter value is percent-encoded into continuation_url, so a

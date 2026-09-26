@@ -15948,6 +15948,7 @@ mod tests {
                 ),
                 "gap_kind": gap["kind"],
                 "gap_payload_kind": gap_payload_kind,
+                "gap_truth": gap["truth"],
             },
         });
         assert!(

@@ -1,5 +1,5 @@
 {
-  "note": "The Observatory read wire the TUI's live graph decodes: the snapshot and the live event tail, their bearer auth, statuses, query fields, frame names and wire types. Published by ocean-daemon and held equal to the code by observatory_wire_contract_matches_the_daemon (crates/ocean-daemon). See docs/contracts/README.md.",
+  "note": "The Observatory read wire the TUI's live graph decodes: the snapshot and the live event tail, their bearer auth, statuses, query fields, frame names and wire types. Published by ocean-daemon and held equal to the code by observatory_wire_contract_matches_the_daemon (crates/ocean-daemon). The gap signal (gap_kind / gap_payload_kind) is synthesized by the tail and never written to the durable log: its truth is gap_truth, and its recorded_at is the time the tail built the frame, not a durable-write time, so no consumer may treat a gap envelope as a durable record. See docs/contracts/README.md.",
   "version": 1,
   "auth_scheme": "Bearer",
   "error_fields": [
@@ -74,6 +74,7 @@
     ],
     "gap_kind": "stream_gap",
     "gap_payload_kind": "StreamGap",
+    "gap_truth": "derived",
     "payload_kinds": [
       "DaemonStarted",
       "DaemonStopping",

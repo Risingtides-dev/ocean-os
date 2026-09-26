@@ -126,8 +126,13 @@ adjacently tagged `EventPayload` tag and variant names, and `gap_kind` /
 sends when the durable log skips). That gap signal is an ordinary
 `EventEnvelope` on the `message` frame (manifest §2.1 Property 4 and §7.2):
 `kind` is `stream_gap`, the payload is `StreamGap { from_cursor, to_cursor,
-reason }`, `truth` is `derived`, the topology ids are empty, `cursor` is the
-first missing cursor, and there is no SSE `id:`. The daemon test builds it
+reason }`, `truth` is `derived` (published as `gap_truth`), the topology ids
+are empty, `cursor` is the first missing cursor, and there is no SSE `id:`.
+The gap is never written to the durable log, so its `recorded_at` (like
+`occurred_at`) is the time the tail built the frame, not the manifest §1.2
+durable-write time. A consumer must not treat a gap envelope as a durable
+record: it does not appear in `/replay`, and its cursor and `event_id` are
+not stored. The daemon test builds it
 from the daemon's own `gap_envelope` and proves it decodes as an envelope. The
 TUI test proves the TUI decodes it and rebaselines on it by name. Daemons
 before this change sent an untyped `"kind":"stream.gap"` object instead; the
