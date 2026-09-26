@@ -634,3 +634,302 @@ done
         .unwrap()
         .is_none());
 }
+
+// ---------------------------------------------------------------------------
+// Stage A open items (evidence record §6), closed after A5 merged.
+// ---------------------------------------------------------------------------
+
+/// O-4: the child's cwd is the anchored package directory, even while its
+/// pathname is being replaced. A thread keeps moving the verified package
+/// directory aside, putting a decoy directory (or nothing) at its path, and
+/// moving it back. Every spawned child records the inode of its cwd; each must
+/// be the verified directory's, never a decoy's, and no spawn may fail on a
+/// missing path. The executable-path race has its own test
+/// (`verified_executable_generation_survives_concurrent_path_replacement`).
+#[tokio::test]
+async fn a5_open_cwd_is_the_anchored_package_directory_under_path_replacement() {
+    use std::os::unix::fs::MetadataExt;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    let (temp, activation) =
+        executable_fixture("#!/bin/sh\nls -id . | awk '{print $1}' >> \"$OUTPUT\"\n");
+    let config = temp.path().join("config");
+    fs::create_dir_all(config.join("extensions")).unwrap();
+    let roots = assigned_roots(
+        &config,
+        &activation.package_id,
+        &activation.service_id,
+        Uuid::new_v4(),
+    )
+    .unwrap();
+    let output = temp.path().join("cwd-inodes");
+    let environment = vec![(
+        "OUTPUT".to_owned(),
+        SensitiveValue(output.as_os_str().as_bytes().to_vec()),
+    )];
+    let verified = fs::metadata(&activation.package_path).unwrap().ino();
+    // One unraced spawn first. On macOS the kernel can SIGKILL a child
+    // exec'd by its `/.vol/<dev>/<ino>` file-id path while a rename moves its
+    // directory. Here that happened only while the executable had never been
+    // exec'd: without this spawn, 4 of 10 runs saw up to 9 kills; with it,
+    // 0 kills in 10 runs.
+    let mut warm = spawn_service(&activation, &roots, &environment).unwrap();
+    assert!(warm.wait().await.unwrap().success());
+    fs::remove_file(&output).unwrap();
+    let package = activation.package_path.clone();
+    let aside = temp.path().join("package-aside");
+    let stop = Arc::new(AtomicBool::new(false));
+    let replacer_stop = Arc::clone(&stop);
+    let replacer = std::thread::spawn(move || {
+        let mut swaps = 0_u64;
+        while !replacer_stop.load(Ordering::Acquire) {
+            fs::rename(&package, &aside).unwrap();
+            fs::create_dir(&package).unwrap();
+            std::thread::yield_now();
+            fs::remove_dir(&package).unwrap();
+            std::thread::yield_now();
+            fs::rename(&aside, &package).unwrap();
+            swaps += 1;
+        }
+        swaps
+    });
+
+    // Any remaining such kill fails closed and proves nothing about the cwd,
+    // so it is retried: a signal death, exit 137, or a run that appended no
+    // line (a killed `ls` still lets `awk` exit 0 with no output). Each spawn
+    // gets at most four retries and the whole run at most eight. A spawn error
+    // or any other nonzero exit is a failure: a path-following child fails
+    // exactly that way, and one that ran in a decoy writes the wrong inode.
+    const SPAWNS: usize = 32;
+    const RETRIES_PER_SPAWN: usize = 4;
+    const RETRIES_TOTAL: usize = 8;
+    let lines = || {
+        fs::read_to_string(&output)
+            .map(|text| text.lines().count())
+            .unwrap_or(0)
+    };
+    let mut failures = Vec::new();
+    let mut retries = 0;
+    for spawn in 0..SPAWNS {
+        let mut attempts = 0;
+        loop {
+            let before = lines();
+            let killed = match spawn_service(&activation, &roots, &environment) {
+                Ok(mut child) => {
+                    use std::os::unix::process::ExitStatusExt;
+                    let status = child.wait().await.unwrap();
+                    let appended = lines() - before;
+                    if status.signal().is_some() || status.code() == Some(128 + libc::SIGKILL) {
+                        true
+                    } else if !status.success() {
+                        failures.push(format!("child could not read its cwd: {status}"));
+                        false
+                    } else if appended == 0 {
+                        true
+                    } else {
+                        assert_eq!(appended, 1, "spawn {spawn} wrote {appended} lines");
+                        false
+                    }
+                }
+                Err(error) => {
+                    failures.push(error.to_string());
+                    false
+                }
+            };
+            if !killed {
+                break;
+            }
+            attempts += 1;
+            retries += 1;
+            assert!(
+                attempts <= RETRIES_PER_SPAWN && retries <= RETRIES_TOTAL,
+                "spawn {spawn}: {attempts} kills here, {retries} in the run"
+            );
+        }
+    }
+    stop.store(true, Ordering::Release);
+    let swaps = replacer.join().unwrap();
+    assert!(swaps > 0, "the replacer never ran");
+    assert!(
+        failures.is_empty(),
+        "the child followed the replaced path: {failures:?}"
+    );
+    let recorded = fs::read_to_string(&output).unwrap();
+    let inodes: Vec<u64> = recorded
+        .lines()
+        .map(|line| line.trim().parse().unwrap())
+        .collect();
+    assert_eq!(inodes.len(), SPAWNS);
+    assert!(
+        inodes.iter().all(|inode| *inode == verified),
+        "a child ran in a replacement directory: {inodes:?} (verified {verified})"
+    );
+}
+
+/// O-6: a health (ping) failure reaps the whole process group, grandchild
+/// included. The service answers the handshake, forks one grandchild into its
+/// group, and never answers a ping; three missed pongs fail it with
+/// `ping_timeout`, and afterwards neither the leader nor the grandchild is
+/// alive and the group has no live member.
+#[tokio::test]
+async fn a5_open_ping_timeout_reaps_the_grandchild_with_the_group() {
+    let script = "#!/bin/sh\nprintf '%s' $$ > \"$HOME/leader.pid\"\nsleep 600 </dev/null >/dev/null 2>&1 &\nprintf '%s' $! > \"$HOME/grandchild.pid\"\nIFS= read -r hello\nprintf '%s\\n' '{\"protocol\":\"ocean.extension.service\",\"version\":1,\"frame\":\"service_hello\",\"subscriptions\":[],\"resume\":null}'\nIFS= read -r ready\nwhile IFS= read -r frame; do\n case \"$frame\" in\n  *'\"frame\":\"shutdown\"'*) exit 0 ;;\n esac\ndone\n";
+    let (temp, mut activation) = executable_fixture(script);
+    install_fixture_store(&temp, &mut activation);
+    activation.events.clear();
+    let data = activation
+        .config_dir
+        .join("extensions/state/example.noop/data");
+    let lifecycle = LifecycleDispatcher::new(Uuid::new_v4(), HashSet::new());
+    let status = RuntimeStatusCache::default();
+    let task = tokio::spawn(run_service_a2b(
+        activation,
+        lifecycle,
+        CancellationToken::new(),
+        status.clone(),
+    ));
+    let healthy = wait_for_runtime_state(&status, RuntimeState::Healthy).await;
+    assert_eq!(healthy.state, RuntimeState::Healthy);
+    wait_for_fixture_marker(&data.join("grandchild.pid")).await;
+    let leader: libc::pid_t = fs::read_to_string(data.join("leader.pid"))
+        .unwrap()
+        .parse()
+        .unwrap();
+    let grandchild: libc::pid_t = fs::read_to_string(data.join("grandchild.pid"))
+        .unwrap()
+        .parse()
+        .unwrap();
+    // If an assertion fails first, never leave the `sleep 600` behind. The
+    // guard signals the grandchild only while it is still in the service's
+    // group, so a recycled pid is never touched.
+    struct GrandchildGuard(libc::pid_t, libc::pid_t);
+    impl Drop for GrandchildGuard {
+        fn drop(&mut self) {
+            // SAFETY: getpgid reads process-table state; the kill is limited to
+            // a pid still in the fixture's own process group.
+            unsafe {
+                if libc::getpgid(self.0) == self.1 {
+                    libc::kill(self.0, libc::SIGKILL);
+                }
+            }
+        }
+    }
+    let _guard = GrandchildGuard(grandchild, leader);
+    // SAFETY: signal 0 performs an existence check only.
+    assert_eq!(unsafe { libc::kill(grandchild, 0) }, 0);
+    // SAFETY: getpgid only reads process-table state.
+    assert_eq!(unsafe { libc::getpgid(grandchild) }, leader);
+
+    // As in `three_missed_pongs_trigger_ping_timeout_and_full_cleanup`: pause
+    // only after the real child is healthy, then advance through three missed
+    // pongs and the bounded cleanup while yielding real time to the child.
+    tokio::time::pause();
+    for delta in [10_u64, 5, 5, 5, 5, 5] {
+        tokio::time::advance(Duration::from_secs(delta)).await;
+        tokio::task::yield_now().await;
+    }
+    for _ in 0..500 {
+        if task.is_finished() {
+            break;
+        }
+        tokio::time::advance(Duration::from_millis(100)).await;
+        std::thread::sleep(Duration::from_millis(1));
+        tokio::task::yield_now().await;
+    }
+    assert!(task.is_finished(), "health cleanup did not finish");
+    // The grandchild itself is gone. It was re-parented when the leader
+    // died, so it is polled (in real time) until init has reaped it.
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    // SAFETY: signal 0 performs an existence check only.
+    while unsafe { libc::kill(grandchild, 0) } == 0 {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the health failure left the grandchild {grandchild} alive"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    assert!(task.await.expect("service task").is_none());
+    let row = status.snapshot().pop().expect("status");
+    assert_eq!(row.reason, Some(RuntimeReason::PingTimeout));
+    assert_eq!(row.pid, None);
+    assert!(
+        !group_has_live_members(leader).unwrap(),
+        "the health failure left a live member in the service group"
+    );
+}
+
+/// A writer whose every `poll_write` accepts the whole buffer only after
+/// `delay`: a child that drains exactly one frame per `delay`, or a kernel that
+/// grows a blocked pipe's buffer once per `delay`.
+struct TrickleWriter {
+    delay: Duration,
+    pending: Option<std::pin::Pin<Box<tokio::time::Sleep>>>,
+    frames: usize,
+}
+
+impl tokio::io::AsyncWrite for TrickleWriter {
+    fn poll_write(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &[u8],
+    ) -> std::task::Poll<io::Result<usize>> {
+        use std::future::Future;
+        let delay = self.delay;
+        let sleep = self
+            .pending
+            .get_or_insert_with(|| Box::pin(tokio::time::sleep(delay)));
+        if sleep.as_mut().poll(cx).is_pending() {
+            return std::task::Poll::Pending;
+        }
+        self.pending = None;
+        self.frames += 1;
+        std::task::Poll::Ready(Ok(buf.len()))
+    }
+
+    fn poll_flush(
+        self: std::pin::Pin<&mut Self>,
+        _: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<io::Result<()>> {
+        std::task::Poll::Ready(Ok(()))
+    }
+
+    fn poll_shutdown(
+        self: std::pin::Pin<&mut Self>,
+        _: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<io::Result<()>> {
+        std::task::Poll::Ready(Ok(()))
+    }
+}
+
+/// O-11 (characterization, pending an operator ruling): the 2 s stdin write
+/// deadline is enforced per frame. Every frame that completes inside 2 s
+/// restarts the clock, so a peer that accepts one frame every 1.5 s keeps the
+/// connection alive indefinitely (here 8 frames over 12 s), while a single
+/// frame blocked for 2 s fails. This pins today's behavior only; §7.1 and
+/// §9.2 do not say whether the 2 s is per write or per connection (see the
+/// evidence record, O-11). If the ruling makes it cumulative, this test flips.
+#[tokio::test(start_paused = true)]
+async fn a5_open_o11_the_stdin_write_deadline_restarts_with_every_frame() {
+    let frame = serde_json::json!({"payload": "x"});
+    let mut trickle = TrickleWriter {
+        delay: Duration::from_millis(1_500),
+        pending: None,
+        frames: 0,
+    };
+    let started = tokio::time::Instant::now();
+    for _ in 0..8 {
+        assert!(write_frame(&mut trickle, &frame).await.is_ok());
+    }
+    assert_eq!(trickle.frames, 8);
+    assert_eq!(started.elapsed(), Duration::from_secs(12));
+
+    let mut blocked = TrickleWriter {
+        delay: Duration::from_millis(2_001),
+        pending: None,
+        frames: 0,
+    };
+    let started = tokio::time::Instant::now();
+    assert!(write_frame(&mut blocked, &frame).await.is_err());
+    assert_eq!(started.elapsed(), WRITE_TIMEOUT);
+    assert_eq!(blocked.frames, 0);
+}

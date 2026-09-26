@@ -46,6 +46,27 @@ pub const FAKE_SURFACE_CALL_ID: &str = "fake-surface-call-1";
 /// and side-effect-minimal — a single small file under the OS temp dir.
 pub const FAKE_TOOL_TARGET_PATH: &str = "/tmp/ocean-fake-tool-test.txt";
 
+/// Test-only override of [`FAKE_TOOL_TARGET_PATH`], read only when the
+/// `test-support` feature is enabled (it is enabled solely from dev-dependencies,
+/// so no production build reads it). Lets concurrent test processes give each
+/// scripted `write` its own path instead of sharing the fixed `/tmp` file.
+#[cfg(feature = "test-support")]
+pub const FAKE_TOOL_TARGET_ENV: &str = "OCEAN_FAKE_TOOL_TARGET_PATH";
+
+/// The path the scripted `write` tool call targets: [`FAKE_TOOL_TARGET_PATH`],
+/// unless a `test-support` build sets a non-empty [`FAKE_TOOL_TARGET_ENV`].
+/// Read once per scripted tool-call round.
+pub fn fake_tool_target_path() -> String {
+    #[cfg(feature = "test-support")]
+    if let Some(path) = std::env::var(FAKE_TOOL_TARGET_ENV)
+        .ok()
+        .filter(|path| !path.is_empty())
+    {
+        return path;
+    }
+    FAKE_TOOL_TARGET_PATH.to_owned()
+}
+
 /// Fixed contents written by the scripted tool call.
 pub const FAKE_TOOL_CONTENT: &str = "ok";
 
@@ -137,7 +158,7 @@ impl Provider for FakeToolProvider {
                     id: FAKE_TOOL_CALL_ID.into(),
                     name: "write".into(),
                     arguments: json!({
-                        "path": FAKE_TOOL_TARGET_PATH,
+                        "path": fake_tool_target_path(),
                         "content": FAKE_TOOL_CONTENT,
                     }),
                 },
@@ -181,5 +202,55 @@ impl Provider for FakeToolProvider {
 
         let events: Vec<Result<AssistantMessageEvent>> = events.into_iter().map(Ok).collect();
         Ok(Box::pin(stream::iter(events)))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use futures::StreamExt;
+
+    async fn scripted_write_path() -> String {
+        let provider = FakeToolProvider::new();
+        let model = Model::openai_compat("fake", FAKE_TOOL_MODEL, "fake://local", 1000, 1000);
+        let mut stream = provider
+            .stream(&model, &Context::default(), &StreamOptions::default())
+            .await
+            .unwrap();
+        let Some(Ok(AssistantMessageEvent::Done { message, .. })) = stream.next().await else {
+            panic!("the first round is one completed tool call");
+        };
+        let [Content::ToolCall {
+            name, arguments, ..
+        }] = message.content.as_slice()
+        else {
+            panic!("the first round is one completed tool call");
+        };
+        assert_eq!(name, "write");
+        assert_eq!(arguments["content"], FAKE_TOOL_CONTENT);
+        arguments["path"].as_str().unwrap().to_owned()
+    }
+
+    /// Without `test-support` the override variable is never read: the
+    /// scripted `write` targets the fixed path even when it is set. This is the
+    /// release-build proof, run as
+    /// `OCEAN_FAKE_TOOL_TARGET_PATH=/tmp/x cargo test -p ocean-runtime --lib fake_tool`
+    /// (the feature is off unless a dev-dependency enables it).
+    #[cfg(not(feature = "test-support"))]
+    #[tokio::test]
+    async fn without_test_support_the_scripted_write_always_targets_the_fixed_path() {
+        assert_eq!(fake_tool_target_path(), FAKE_TOOL_TARGET_PATH);
+        assert_eq!(scripted_write_path().await, FAKE_TOOL_TARGET_PATH);
+    }
+
+    /// With `test-support`, the scripted `write` follows the override when it
+    /// is set, and the fixed path otherwise.
+    #[cfg(feature = "test-support")]
+    #[tokio::test]
+    async fn with_test_support_the_override_selects_the_scripted_write_path() {
+        match std::env::var(FAKE_TOOL_TARGET_ENV) {
+            Ok(path) if !path.is_empty() => assert_eq!(scripted_write_path().await, path),
+            _ => assert_eq!(scripted_write_path().await, FAKE_TOOL_TARGET_PATH),
+        }
     }
 }

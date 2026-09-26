@@ -17230,15 +17230,17 @@ mod tests {
             "OCEAN_MODEL",
             "OCEAN_YOLO",
             "OCEAN_CALL_CWD",
+            ocean_runtime::FAKE_TOOL_TARGET_ENV,
         ]);
         let tmp = tempfile::tempdir().unwrap();
         let mut state = fake_convene_state(&tmp);
         std::env::set_var("OCEAN_MODEL", ocean_runtime::FAKE_TOOL_MODEL);
         std::env::set_var("OCEAN_CALL_CWD", tmp.path());
+        // A per-test target (O-10): never the shared fixed `/tmp` file.
+        let target = tmp.path().join("fake-tool-target.txt");
+        std::env::set_var(ocean_runtime::FAKE_TOOL_TARGET_ENV, &target);
         state.runtime = Arc::new(AgentRuntime::from_env().expect("fake-tool runtime"));
-
-        let target = std::path::Path::new(ocean_runtime::FAKE_TOOL_TARGET_PATH);
-        let _ = std::fs::remove_file(target);
+        let target = target.as_path();
         let mut runner = DaemonTurnRunner::new(state.clone(), "safe-call".into());
 
         let first = ocean_call::TurnRunner::run(&mut runner, "try the write").await;

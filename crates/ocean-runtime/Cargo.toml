@@ -45,6 +45,11 @@ default = []
 # exact schemas registered but return a structured `browser_host_unavailable`
 # error instead of launching Chrome, and no chromiumoxide enters the graph.
 legacy-chromium = ["dep:ocean-browser", "ocean-browser/legacy-chromium"]
+# Test-only fixture seams. Enabled solely from other crates' dev-dependencies
+# (resolver 2 keeps it out of every non-test build). Today it lets a test point
+# the keyless `fake-tool` provider's scripted `write` at a per-test path through
+# `OCEAN_FAKE_TOOL_TARGET_PATH`; without the feature that variable is never read.
+test-support = []
 
 [dev-dependencies]
 proptest = "1"

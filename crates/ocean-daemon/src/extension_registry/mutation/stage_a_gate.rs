@@ -1020,6 +1020,15 @@ async fn stage_a_gate_local_noop_package_end_to_end() {
 /// blocked, 160 concurrent ordinary turns are all acknowledged and finish
 /// within their bound. The overflow is recorded as lag, and the group is
 /// reaped.
+///
+/// O-9: the service subscribes to every produced kind. Before the flood a
+/// `fake-tool` turn suspends on the real permission waiter, so the waiter is
+/// open while the pipe fills. Right after the flood the operator allows it:
+/// `permission_resolved` is published after the pinned fill and before the
+/// connection fails, so the resolution met the full queue. The tool then runs
+/// and the turn finishes. The only timing assumption is that one waiter
+/// decision lands inside the 2 s write deadline after the fill; it is taken
+/// with no await on anything but the waiter map.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn stage_a_gate_stalled_service_never_delays_ordinary_turns() {
     const FLOOD: usize = 600;
@@ -1030,15 +1039,30 @@ async fn stage_a_gate_stalled_service_never_delays_ordinary_turns() {
     // fill).
     const SLACK: Duration = Duration::from_secs(28);
     let _guard = AUTO_CONVENE_ENV_LOCK.lock().await;
-    let _restore = TestEnvRestore::capture(&["OCEAN_CONFIG_DIR", "OCEAN_MODEL", "OCEAN_YOLO"]);
+    let _restore = TestEnvRestore::capture(&[
+        "OCEAN_CONFIG_DIR",
+        "OCEAN_MODEL",
+        "OCEAN_YOLO",
+        ocean_runtime::FAKE_TOOL_TARGET_ENV,
+    ]);
     let fixture = Fixture::new();
     let mut state = fake_convene_state(&fixture.config);
+    // The gating policy, so the `fake-tool` turn below waits on a real
+    // permission waiter; the `fake-ok` burst calls no tool either way.
+    std::env::remove_var("OCEAN_YOLO");
+    let target = fake_tool_target(&fixture, "stalled-tool-target.txt");
     let supervisor = with_supervisor(&mut state, fixture.config.path()).await;
     let app = router(state.clone());
     let stalled = format!(
-        "#!/bin/sh\nIFS= read -r hello\nprintf '%s\\n' \"$hello\" > \"$HOME/host-hello\"\nprintf '%s\\n' '{{\"protocol\":\"ocean.extension.service\",\"version\":1,\"frame\":\"service_hello\",\"subscriptions\":{SUBSCRIPTIONS},\"resume\":null}}'\nIFS= read -r ready\nprintf '%s\\n' \"$ready\" >> \"$HOME/host-hello\"\nprintf stalled > \"$HOME/stalled\"\nexec sleep 600\n"
+        "#!/bin/sh\nIFS= read -r hello\nprintf '%s\\n' \"$hello\" > \"$HOME/host-hello\"\nprintf '%s\\n' '{{\"protocol\":\"ocean.extension.service\",\"version\":1,\"frame\":\"service_hello\",\"subscriptions\":{ALL_PRODUCED},\"resume\":null}}'\nIFS= read -r ready\nprintf '%s\\n' \"$ready\" >> \"$HOME/host-hello\"\nprintf stalled > \"$HOME/stalled\"\nexec sleep 600\n"
     );
     let package = gate_package_with(&fixture, "stalled", "1.0.0", "", &stalled);
+    let manifest = FsPath::new(&package).join("ocean-extension.toml");
+    let rewritten = fs::read_to_string(&manifest).unwrap().replace(
+        &format!("events = {SUBSCRIPTIONS}"),
+        &format!("events = {ALL_PRODUCED}"),
+    );
+    fs::write(&manifest, rewritten).unwrap();
     let (_, installed) = install_local(&app, 0, &package).await;
     let digest = installed["mutation"]["digest"].as_str().unwrap().to_owned();
     let (status, _, _) = trust(&app, 1, &digest, json!({}), json!([])).await;
@@ -1057,6 +1081,21 @@ async fn stage_a_gate_stalled_service_never_delays_ordinary_turns() {
     {
         assert_strict_host_frame(line);
     }
+
+    // O-9: a permission waiter is open across the fill. The turn selects the
+    // keyless `fake-tool` model for itself only.
+    let cwd = fixture.sources.path().to_str().unwrap().to_owned();
+    let mut request = turn_request(None, "write the file", &cwd);
+    request.model_id = Some(ocean_runtime::FAKE_TOOL_MODEL.to_owned());
+    let (status, Json(ack)) = crate::agent_turn(State(state.clone()), Json(request)).await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{ack:?}");
+    let permission_session = serde_json::to_value(ack.session_id).unwrap();
+    wait_for("the permission waiter is open", || {
+        retained_for(&state, &permission_session)
+            .iter()
+            .any(|event| event["kind"] == "permission_requested")
+    })
+    .await;
 
     // Pin the moment the pipe fills.
     let before = state.extension_lifecycle.current_sequence().0;
@@ -1083,8 +1122,46 @@ async fn stage_a_gate_stalled_service_never_delays_ordinary_turns() {
         "the flood was too slow to pin the blocked write"
     );
 
+    // O-9: resolve the waiter now that the pipe is full.
+    decide_first_waiter(&state, crate::AgentPermissionDecision::Allow).await;
+    wait_for("the permission turn finished", || {
+        retained_for(&state, &permission_session)
+            .iter()
+            .any(|event| event["kind"] == "turn_finished")
+    })
+    .await;
+    assert!(target.exists(), "the allowed tool did not run");
+    let permission_facts = retained_for(&state, &permission_session);
+    let kinds: Vec<&str> = permission_facts
+        .iter()
+        .map(|event| event["kind"].as_str().unwrap())
+        .collect();
+    assert_eq!(
+        kinds,
+        [
+            "session_started",
+            "turn_started",
+            "permission_requested",
+            "permission_resolved",
+            "tool_started",
+            "tool_finished",
+            "turn_finished"
+        ]
+    );
+    assert_eq!(permission_facts[3]["metadata"]["outcome"], "allowed");
+    assert_eq!(permission_facts[5]["metadata"]["outcome"], "success");
+    // The waiter opened before the fill; everything from its resolution on
+    // was published after it.
+    for (index, event) in permission_facts.iter().enumerate() {
+        let after_fill = sequence(event) > before + FLOOD as u64;
+        assert_eq!(after_fill, index >= 3, "fact {index} vs the fill: {event}");
+    }
+    let resolved_at =
+        chrono::DateTime::parse_from_rfc3339(permission_facts[3]["occurred_at"].as_str().unwrap())
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+
     // Ordinary turns run while the write is blocked.
-    let cwd = fixture.sources.path().to_str().unwrap().to_owned();
     let mut turns = tokio::task::JoinSet::new();
     for _ in 0..BURST {
         let state = state.clone();
@@ -1153,6 +1230,12 @@ async fn stage_a_gate_stalled_service_never_delays_ordinary_turns() {
         after_end < Duration::from_secs(2) + SLACK,
         "the blocked write failed {after_end:?} after the pipe filled, past its bounded deadline"
     );
+    // The resolution met the full queue of a live connection: it was
+    // published before the blocked write failed it.
+    assert!(
+        resolved_at <= stopping_at,
+        "the waiter resolved at {resolved_at}, after the connection failed at {stopping_at}"
+    );
     let stopping_at = tokio::time::Instant::now();
 
     let mut slowest = Duration::ZERO;
@@ -1192,6 +1275,53 @@ async fn stage_a_gate_stalled_service_never_delays_ordinary_turns() {
 // §20 step 5 with a permission and a tool, through the real turn path.
 // ---------------------------------------------------------------------------
 
+/// Point the keyless `fake-tool` provider's scripted `write` at a path inside
+/// this test's fixture (O-10). The caller captures
+/// `ocean_runtime::FAKE_TOOL_TARGET_ENV` in its `TestEnvRestore`.
+fn fake_tool_target(fixture: &Fixture, name: &str) -> PathBuf {
+    let target = fixture.sources.path().join(name);
+    std::env::set_var(ocean_runtime::FAKE_TOOL_TARGET_ENV, &target);
+    assert_eq!(
+        ocean_runtime::fake_tool_target_path(),
+        target.to_str().unwrap()
+    );
+    target
+}
+
+/// Allow (or deny) the first pending permission waiter, within a bound.
+async fn decide_first_waiter(state: &AppState, decision: crate::AgentPermissionDecision) {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        let sender = {
+            let mut permissions = state.permissions.write().await;
+            permissions
+                .values_mut()
+                .find_map(|waiter| waiter.sender.take())
+        };
+        if let Some(sender) = sender {
+            sender.send(decision).expect("decision");
+            return;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "no permission waiter"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+}
+
+/// The dispatcher's retained facts for one session, in sequence order.
+fn retained_for(state: &AppState, session: &Value) -> Vec<Value> {
+    state
+        .extension_lifecycle
+        .attach()
+        .retained
+        .iter()
+        .map(|event| serde_json::to_value(event).unwrap())
+        .filter(|event| event["scope"]["session_id"] == *session)
+        .collect()
+}
+
 const ALL_PRODUCED: &str = r#"["daemon_started","session_started","turn_started","permission_requested","permission_resolved","tool_started","tool_finished","turn_finished","daemon_stopping"]"#;
 
 /// An ordinary turn on the keyless `fake-tool` model asks for `write`, the
@@ -1202,7 +1332,12 @@ const ALL_PRODUCED: &str = r#"["daemon_started","session_started","turn_started"
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn stage_a_gate_live_permission_and_tool_facts_are_metadata_only() {
     let _guard = AUTO_CONVENE_ENV_LOCK.lock().await;
-    let _restore = TestEnvRestore::capture(&["OCEAN_CONFIG_DIR", "OCEAN_MODEL", "OCEAN_YOLO"]);
+    let _restore = TestEnvRestore::capture(&[
+        "OCEAN_CONFIG_DIR",
+        "OCEAN_MODEL",
+        "OCEAN_YOLO",
+        ocean_runtime::FAKE_TOOL_TARGET_ENV,
+    ]);
     let fixture = Fixture::new();
     let mut state = fake_convene_state(&fixture.config);
     // The gating (non-yolo) policy and the tool-calling fake model.
@@ -1212,8 +1347,9 @@ async fn stage_a_gate_live_permission_and_tool_facts_are_metadata_only() {
         crate::AgentRuntime::with_config_dir(fixture.config.path().to_path_buf())
             .expect("fake-tool runtime"),
     );
-    let target = FsPath::new(ocean_runtime::FAKE_TOOL_TARGET_PATH);
-    let _ = fs::remove_file(target);
+    // A per-test target (O-10), so no other test process shares the file.
+    let target = fake_tool_target(&fixture, "fake-tool-target.txt");
+    let target = target.as_path();
     let supervisor = with_supervisor(&mut state, fixture.config.path()).await;
     let app = router(state.clone());
 
@@ -1331,6 +1467,7 @@ async fn stage_a_gate_live_permission_and_tool_facts_are_metadata_only() {
     assert_eq!(by_kind("turn_finished")["metadata"]["outcome"], "completed");
     let raw = fs::read_to_string(data_dir(&fixture).join("frames")).unwrap();
     for forbidden in [
+        target.to_str().unwrap(),
         ocean_runtime::FAKE_TOOL_TARGET_PATH,
         ocean_runtime::FAKE_TOOL_CALL_ID,
         "write the file",
@@ -1406,6 +1543,149 @@ async fn stage_a_gate_live_permission_and_tool_facts_are_metadata_only() {
     let _ = frames(&fixture);
     let _ = fs::remove_file(target);
     fixture.assert_no_canary_ran();
+}
+
+/// O-1: a tool the runtime is still running when its turn is cancelled is
+/// reported `cancelled` through the real runtime bridge. The scripted `write`
+/// targets a FIFO with no reader, so the real tool blocks inside `open` after
+/// `tool_started` is published. Cancelling the turn through the real request
+/// route makes the runtime close the call with `details.cancelled = true`,
+/// and the bridge's extraction of that bit is what makes the published
+/// `tool_finished` say `cancelled` (the same call is `is_error`, so a bridge
+/// that dropped the bit would publish `error`). Metadata only, as ever.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn stage_a_gate_cancelled_running_tool_is_published_cancelled_through_the_bridge() {
+    let _guard = AUTO_CONVENE_ENV_LOCK.lock().await;
+    let _restore = TestEnvRestore::capture(&[
+        "OCEAN_CONFIG_DIR",
+        "OCEAN_MODEL",
+        "OCEAN_YOLO",
+        ocean_runtime::FAKE_TOOL_TARGET_ENV,
+    ]);
+    let fixture = Fixture::new();
+    let mut state = fake_convene_state(&fixture.config);
+    std::env::remove_var("OCEAN_YOLO");
+    std::env::set_var("OCEAN_MODEL", ocean_runtime::FAKE_TOOL_MODEL);
+    state.runtime = Arc::new(
+        crate::AgentRuntime::with_config_dir(fixture.config.path().to_path_buf())
+            .expect("fake-tool runtime"),
+    );
+    let fifo = fake_tool_target(&fixture, "blocking-target");
+    let c_fifo = std::ffi::CString::new(fifo.to_str().unwrap()).unwrap();
+    // SAFETY: `c_fifo` is a NUL-terminated path inside this test's tempdir.
+    assert_eq!(unsafe { libc::mkfifo(c_fifo.as_ptr(), 0o600) }, 0);
+    // If an assertion fails before the explicit release below, a detached
+    // reader still pairs with the abandoned blocking `open`, so the runtime's
+    // blocking pool can shut down and the failure is reported, not hung.
+    struct FifoRelease(Option<PathBuf>);
+    impl Drop for FifoRelease {
+        fn drop(&mut self) {
+            if let Some(fifo) = self.0.take() {
+                std::thread::spawn(move || {
+                    use std::io::Read;
+                    if let Ok(mut reader) = fs::File::open(fifo) {
+                        let _ = reader.read_to_end(&mut Vec::new());
+                    }
+                });
+            }
+        }
+    }
+    let mut release = FifoRelease(Some(fifo.clone()));
+
+    let cwd = fixture.sources.path().to_str().unwrap().to_owned();
+    let (status, Json(ack)) = crate::agent_turn(
+        State(state.clone()),
+        Json(turn_request(None, "write the file", &cwd)),
+    )
+    .await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{ack:?}");
+    decide_first_waiter(&state, crate::AgentPermissionDecision::Allow).await;
+    let session = serde_json::to_value(ack.session_id).unwrap();
+    wait_for("the tool is running", || {
+        retained_for(&state, &session)
+            .iter()
+            .any(|event| event["kind"] == "tool_started")
+    })
+    .await;
+    // The tool is blocked opening the FIFO: nothing has finished it.
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert!(
+        !retained_for(&state, &session)
+            .iter()
+            .any(|event| event["kind"] == "tool_finished"),
+        "the blocking tool finished before it was cancelled"
+    );
+
+    let turn = serde_json::to_value(ack.turn_id).unwrap();
+    let request = Uuid::parse_str(turn.as_str().unwrap()).unwrap();
+    let Json(cancelled) =
+        crate::cancel_request(State(state.clone()), axum::extract::Path(request)).await;
+    assert!(cancelled.ok, "{cancelled:?}");
+    wait_for("cancelled turn finished", || {
+        retained_for(&state, &session)
+            .iter()
+            .any(|event| event["kind"] == "turn_finished")
+    })
+    .await;
+
+    let delivered = retained_for(&state, &session);
+    let kinds: Vec<&str> = delivered
+        .iter()
+        .map(|event| event["kind"].as_str().unwrap())
+        .collect();
+    assert_eq!(
+        kinds,
+        [
+            "session_started",
+            "turn_started",
+            "permission_requested",
+            "permission_resolved",
+            "tool_started",
+            "tool_finished",
+            "turn_finished"
+        ]
+    );
+    let by_kind = |kind: &str| delivered.iter().find(|e| e["kind"] == kind).unwrap();
+    let finished = &by_kind("tool_finished")["metadata"];
+    assert_eq!(finished["tool_name"], "write");
+    assert_eq!(
+        finished["outcome"], "cancelled",
+        "the bridge lost details.cancelled: {finished}"
+    );
+    assert_eq!(
+        by_kind("tool_finished")["scope"]["tool_call_id"],
+        by_kind("tool_started")["scope"]["tool_call_id"]
+    );
+    assert_eq!(by_kind("turn_finished")["metadata"]["outcome"], "cancelled");
+    let encoded = serde_json::to_string(&delivered).unwrap();
+    for forbidden in [
+        fifo.to_str().unwrap(),
+        ocean_runtime::FAKE_TOOL_CALL_ID,
+        "write the file",
+        "cancelled before completion",
+    ] {
+        assert!(!encoded.contains(forbidden), "{forbidden} was published");
+    }
+
+    // Release the abandoned blocking `open` so no runtime thread stays parked:
+    // a reader lets the dropped write complete into the pipe. The reader is a
+    // detached thread and the wait is bounded, so a write that never comes
+    // fails this test instead of hanging CI.
+    release.0 = None;
+    let (sender, received) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        use std::io::Read;
+        let mut contents = String::new();
+        let read = fs::File::open(&fifo).and_then(|mut file| file.read_to_string(&mut contents));
+        let _ = sender.send(read.map(|_| contents));
+    });
+    let contents =
+        tokio::task::spawn_blocking(move || received.recv_timeout(Duration::from_secs(10)))
+            .await
+            .unwrap()
+            .expect("the abandoned write never released the FIFO")
+            .unwrap();
+    assert_eq!(contents, ocean_runtime::FAKE_TOOL_CONTENT);
 }
 
 // ---------------------------------------------------------------------------
@@ -1550,12 +1830,103 @@ async fn stage_a_gate_project_scope_widening_never_replays_interval_facts() {
 // §19.3 secret sentinel through the integrated HTTP path.
 // ---------------------------------------------------------------------------
 
+/// Every `tracing` event any thread of a runtime emits, rendered as text.
+#[derive(Clone, Default)]
+struct LogCapture(Arc<std::sync::Mutex<Vec<u8>>>);
+
+impl std::io::Write for LogCapture {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        self.0.lock().unwrap().extend_from_slice(bytes);
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+impl LogCapture {
+    /// A TRACE-level dispatcher for every target, writing here. Span
+    /// open/enter/exit/close events are rendered too, with their fields.
+    fn dispatch(&self) -> tracing::Dispatch {
+        let writer = self.clone();
+        tracing::Dispatch::new(
+            tracing_subscriber::fmt()
+                .with_max_level(tracing::Level::TRACE)
+                .with_span_events(tracing_subscriber::fmt::format::FmtSpan::FULL)
+                .with_ansi(false)
+                .with_writer(move || writer.clone())
+                .finish(),
+        )
+    }
+
+    fn text(&self) -> String {
+        String::from_utf8_lossy(&self.0.lock().unwrap()).into_owned()
+    }
+}
+
+const CAPTURE_PROBE: &str = "a5-capture-probe";
+
 /// A secret bound through the HTTP trust route reaches exactly the confirmed
 /// child variable, and its value appears in no registry file, journal, HTTP
 /// response, runtime status, lifecycle event, or the child's argv; the one
 /// stderr line that echoes it is counted as a redaction.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn stage_a_gate_bound_secret_never_leaves_the_spawn_environment() {
+///
+/// O-5: the whole run is under a TRACE-level `tracing` capture installed on
+/// every runtime thread (workers and the blocking pool, via `on_thread_start`)
+/// and on the test thread. Probes from a worker task and a blocking task prove
+/// the capture sees those threads; the secret appears nowhere in it.
+#[test]
+fn stage_a_gate_bound_secret_never_leaves_the_spawn_environment() {
+    let capture = LogCapture::default();
+    let dispatch = capture.dispatch();
+    let per_thread = dispatch.clone();
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(4)
+        .enable_all()
+        .on_thread_start(move || {
+            // The guard lives as long as the runtime thread.
+            std::mem::forget(tracing::dispatcher::set_default(&per_thread));
+        })
+        .build()
+        .unwrap();
+    let main_thread = tracing::dispatcher::set_default(&dispatch);
+    // `tracing-core` keeps a fast path while at most one dispatcher is live:
+    // interest is then computed from whichever thread's default happens to
+    // trigger the rebuild, and other tests in this binary run on threads with
+    // no subscriber, which would cache daemon callsites as `never`. A second
+    // live dispatcher disables that path, so interest is combined across both;
+    // then every cached interest is recomputed with this capture registered.
+    let _combined_interest = tracing::Dispatch::new(tracing_subscriber::registry());
+    tracing::callsite::rebuild_interest_cache();
+    let sentinel = runtime.block_on(async {
+        tokio::spawn(async { tracing::trace!(probe = CAPTURE_PROBE, "worker") })
+            .await
+            .unwrap();
+        tokio::task::spawn_blocking(|| tracing::trace!(probe = CAPTURE_PROBE, "blocking"))
+            .await
+            .unwrap();
+        bound_secret_gate().await
+    });
+    runtime.shutdown_timeout(Duration::from_secs(10));
+    drop(main_thread);
+    let log = capture.text();
+    assert!(
+        log.matches(CAPTURE_PROBE).count() >= 2,
+        "the capture missed a runtime thread"
+    );
+    // And it saw the daemon's own events from the run (the turn's INFO line).
+    assert!(
+        log.contains("agent turn finished"),
+        "the capture saw no daemon event"
+    );
+    assert!(
+        !log.contains(&sentinel),
+        "the secret reached a tracing event"
+    );
+}
+
+async fn bound_secret_gate() -> String {
     let _guard = AUTO_CONVENE_ENV_LOCK.lock().await;
     let source = format!("OCEAN_A5_GATE_SECRET_{}", Uuid::new_v4().simple()).to_uppercase();
     let _restore = TestEnvRestore::capture(&["OCEAN_CONFIG_DIR", "OCEAN_MODEL", "OCEAN_YOLO"]);
@@ -1675,6 +2046,7 @@ async fn stage_a_gate_bound_secret_never_leaves_the_spawn_environment() {
     // strict canonical v1 frame.
     let _ = frames(&fixture);
     fixture.assert_no_canary_ran();
+    sentinel
 }
 
 // ---------------------------------------------------------------------------
@@ -1893,6 +2265,137 @@ async fn stage_a_gate_crash_resume_backoff_circuit_and_explicit_retry() {
     supervisor.shutdown().await;
     // Every host frame this service ever received, shutdown included, is a
     // strict canonical v1 frame.
+    let _ = frames(&fixture);
+    wait_for("the retried service was reaped at shutdown", || {
+        !process_alive(retried)
+    })
+    .await;
+    fixture.assert_no_canary_ran();
+}
+
+/// Kill the healthy leader with `$HOME/crash` present, so every restart
+/// exits 17, and wait for the circuit to open. Returns every service pid
+/// started so far.
+async fn open_the_circuit(app: &Router, fixture: &Fixture) -> Vec<i64> {
+    let (leader, _) = healthy(app).await;
+    fs::write(data_dir(fixture).join("crash"), "").unwrap();
+    // SAFETY: signals only the observed leader of this test's service.
+    assert_eq!(
+        unsafe { libc::kill(leader as libc::pid_t, libc::SIGKILL) },
+        0
+    );
+    let body = wait_for_status(app, ID, |body| {
+        body["services"][0]["state"] == "circuit_open"
+    })
+    .await;
+    assert_eq!(body["services"][0]["pid"], Value::Null, "{body}");
+    let pids: Vec<i64> = fs::read_to_string(data_dir(fixture).join("starts"))
+        .unwrap()
+        .lines()
+        .map(|pid| pid.parse().unwrap())
+        .collect();
+    for pid in &pids {
+        assert!(!process_alive(*pid), "service {pid} survived the circuit");
+    }
+    // Never closed by a timer: past the 4 s step an open circuit skips.
+    tokio::time::sleep(Duration::from_secs(5)).await;
+    assert_eq!(starts(fixture), pids.len(), "the open circuit restarted");
+    pids
+}
+
+/// O-3: the two explicit circuit retries other than disable → enable, end to
+/// end (§10.4). A daemon restart (graceful stop, then a new dispatcher and the
+/// production `start_extension_host` over the same config) starts the service
+/// again with no restart history. A new trusted digest does too; because
+/// `update` refuses an enabled package (`extension_active`), that retry is only
+/// reachable as disable → update → trust → enable, and it is driven that way.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn stage_a_gate_open_circuit_retries_on_daemon_restart_and_new_trusted_digest() {
+    let _guard = AUTO_CONVENE_ENV_LOCK.lock().await;
+    let _restore = TestEnvRestore::capture(&["OCEAN_CONFIG_DIR", "OCEAN_MODEL", "OCEAN_YOLO"]);
+    let fixture = Fixture::new();
+    let mut state = fake_convene_state(&fixture.config);
+    publish_daemon_started(&state.extension_lifecycle);
+    let supervisor = with_supervisor(&mut state, fixture.config.path()).await;
+    let app = router(state.clone());
+    let restart = "restart = \"on-failure\"\n";
+    let package = gate_package_with(
+        &fixture,
+        "crashy",
+        "1.0.0",
+        restart,
+        &crashing_gate_service(),
+    );
+    let (_, installed) = install_local(&app, 0, &package).await;
+    let digest = installed["mutation"]["digest"].as_str().unwrap().to_owned();
+    let (status, _, _) = trust(&app, 1, &digest, json!({}), json!([])).await;
+    assert_eq!(status, StatusCode::OK);
+    let (status, _) = scope(&app, ID, "enable", 2).await;
+    assert_eq!(status, StatusCode::OK);
+
+    // Daemon restart.
+    let before_restart = open_the_circuit(&app, &fixture).await;
+    fs::remove_file(data_dir(&fixture).join("crash")).unwrap();
+    state.extension_lifecycle.stop_publication();
+    supervisor.shutdown().await;
+    assert_eq!(
+        starts(&fixture),
+        before_restart.len(),
+        "shutdown started one"
+    );
+    let lifecycle = LifecycleDispatcher::new(Uuid::new_v4(), HashSet::new());
+    publish_daemon_started(&lifecycle);
+    let supervisor = crate::start_extension_host(
+        fixture.config.path(),
+        Arc::clone(&lifecycle),
+        HashSet::new(),
+    )
+    .await;
+    state.extension_lifecycle = Arc::clone(&lifecycle);
+    state.extension_supervisor = Some(Arc::clone(&supervisor));
+    let app = router(state.clone());
+    let (restarted, body) = healthy(&app).await;
+    assert!(!before_restart.contains(&restarted));
+    assert_eq!(body["services"][0]["restart_count"], 0, "{body}");
+    assert_eq!(starts(&fixture), before_restart.len() + 1);
+
+    // A new trusted digest.
+    let before_update = open_the_circuit(&app, &fixture).await;
+    fs::remove_file(data_dir(&fixture).join("crash")).unwrap();
+    let revision = fixture.revision();
+    let (status, disabled) = scope(&app, ID, "disable", revision).await;
+    assert_eq!(status, StatusCode::OK, "{disabled}");
+    let package_v2 = gate_package_with(
+        &fixture,
+        "crashy-v2",
+        "2.0.0",
+        restart,
+        &crashing_gate_service(),
+    );
+    let (status, updated) = post_op(
+        &app,
+        &format!("/v1/extensions/{ID}/update"),
+        json!({"expected_state_revision": revision + 1, "source": {"kind": "local-path", "path": package_v2}}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{updated}");
+    let digest_v2 = updated["mutation"]["digest"].as_str().unwrap().to_owned();
+    assert_ne!(digest_v2, digest);
+    let (status, _, _) = trust(&app, revision + 2, &digest_v2, json!({}), json!([])).await;
+    assert_eq!(status, StatusCode::OK);
+    let (status, _) = scope(&app, ID, "enable", revision + 3).await;
+    assert_eq!(status, StatusCode::OK);
+    let (retried, body) = healthy(&app).await;
+    assert!(!before_update.contains(&retried));
+    assert_eq!(body["services"][0]["restart_count"], 0, "{body}");
+    assert_eq!(
+        body["services"][0]["package_digest"],
+        json!(digest_v2),
+        "{body}"
+    );
+
+    state.extension_lifecycle.stop_publication();
+    supervisor.shutdown().await;
     let _ = frames(&fixture);
     wait_for("the retried service was reaped at shutdown", || {
         !process_alive(retried)

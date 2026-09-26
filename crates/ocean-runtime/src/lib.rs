@@ -22,9 +22,12 @@ pub use capability::{
     SharedTool,
 };
 pub use error::{AgentError, Result};
+#[cfg(feature = "test-support")]
+pub use fake_tool_provider::FAKE_TOOL_TARGET_ENV;
 pub use fake_tool_provider::{
-    FakeToolProvider, FAKE_SURFACE_CALL_ID, FAKE_SURFACE_CANVAS_ID, FAKE_SURFACE_MODEL,
-    FAKE_TOOL_CALL_ID, FAKE_TOOL_CONTENT, FAKE_TOOL_MODEL, FAKE_TOOL_TARGET_PATH,
+    fake_tool_target_path, FakeToolProvider, FAKE_SURFACE_CALL_ID, FAKE_SURFACE_CANVAS_ID,
+    FAKE_SURFACE_MODEL, FAKE_TOOL_CALL_ID, FAKE_TOOL_CONTENT, FAKE_TOOL_MODEL,
+    FAKE_TOOL_TARGET_PATH,
 };
 pub use types::{
     tool_def, AgentConfig, AgentEvent, AgentTool, AgentToolResult, AllowAllPolicy, Concurrency,
