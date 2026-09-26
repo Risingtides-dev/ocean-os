@@ -11298,3 +11298,12 @@ area:      [backend]
 
 Wrote docs/specs/2026-09-26-rooms-member-lane-authentication-proposal.md, status PROPOSED, for the member-lane half of Rooms DoD 3.1. It maps every caller's trust hop with file:line. It lists the threats: spoofed leave/remove as an owner_present denial of service, claimed actors, close by any member, a coworker on someone else's node posting as that node's human in a federated room (a new finding: federated writes ignore author_id and always use the node bearer), the federated owner-mapping gap, and unauthenticated invite mint and redeem. It recommends one design. A room_principal extractor derives the actor from the operator key, or from M2 X-Ocean-Link plus a credential-pinned X-Ocean-Acting-Member, with the loopback caller treated as the node human; legacy actor fields become must-match. Leave, close and remove become self, owner or operator. Federated rooms are pinned to the node human through a new room_federation.local_principal_id column. room-wire.json goes to v2. There is a compat-then-enforce window, and rollout runs S1 to S5 across ocean-os and ocean-surface, with no Bedrock slice. The proposal ends with five yes/no questions. DoD 3.1, docs/README and docs/AGENTS point to it. No code changed.
 _________________________________________________________________________________ 09:40 docs/rooms-member-lane-auth
+
+time:      [10:24] [26-09-26]
+agent:     [claude]
+worktree:  docs/dod-12-13-and-m2-bedrock-overlap
+type:      [review]
+area:      [docs]
+
+A triage of stale ocean-bedrock PRs found that #117, #118, #121, #122 and #127 were all carried onto master by integration PR #137 (a21e186) on 2026-09-02. Each branch tip is an ancestor of #137's head, and master's tree equals that head. All five were closed as superseded with a pointer to #137. Rooms DoD 1.2 and 1.3 still named "bedrock #117" as their blocker, so they now say the Bedrock half is live and that production Access config plus the surface enroll/device/directory UI remain. The web identity program §10 (M2 node linking) now records an overlap to settle before it is accepted. Bedrock already has a live Access-based operator id and Ed25519 code pairing (#137/#138/#139), so §10 as written would create a second pairing flow, device registry and identity root. The operator should decide whether M2 reuses them or stays separate with a mapping.
+_________________________________________________________________________________ 10:24 docs/dod-12-13-and-m2-bedrock-overlap
