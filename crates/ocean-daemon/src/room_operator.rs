@@ -238,12 +238,17 @@ impl OperatorIdentity {
 
 /// Scheme + authority of a URL-ish header value, lowercased. A `Referer`
 /// carries a full path; only its origin is meaningful here.
-fn origin_of(raw: &str) -> String {
+pub(crate) fn origin_of(raw: &str) -> String {
     let raw = raw.trim();
     let Some((scheme, rest)) = raw.split_once("://") else {
         return raw.to_ascii_lowercase();
     };
     let authority = rest.split(['/', '?', '#']).next().unwrap_or("");
+    // Userinfo is never part of an origin: `http://localhost@evil.example`
+    // names the host `evil.example`.
+    let authority = authority
+        .rsplit_once('@')
+        .map_or(authority, |(_, host)| host);
     format!(
         "{}://{}",
         scheme.to_ascii_lowercase(),
@@ -259,7 +264,7 @@ fn default_allowed_origins() -> Vec<String> {
         let list: Vec<String> = raw
             .split(',')
             .map(|s| origin_of(s.trim()))
-            .filter(|s| !s.is_empty())
+            .filter(|s| !s.is_empty() && s != "null")
             .collect();
         if !list.is_empty() {
             return list;
@@ -611,5 +616,14 @@ mod tests {
     fn origin_of_extracts_scheme_and_authority() {
         assert_eq!(origin_of("http://Host:80/a/b?c"), "http://host:80");
         assert_eq!(origin_of("https://X.example"), "https://x.example");
+        assert_eq!(
+            origin_of("http://localhost:8790@evil.example/x"),
+            "http://evil.example",
+            "userinfo is stripped, never read as the host"
+        );
+        assert_eq!(
+            origin_of("http://a@b@localhost:8790/"),
+            "http://localhost:8790"
+        );
     }
 }

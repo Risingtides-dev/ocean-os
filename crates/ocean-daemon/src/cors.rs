@@ -1,7 +1,37 @@
 //! Browser-origin trust policy for the daemon's global CORS middleware.
 
+use std::sync::Arc;
+
 use axum::http::{header, HeaderValue, Method};
 use tower_http::cors::{AllowOrigin, CorsLayer};
+
+/// The one browser-origin trust set the daemon enforces, shared by the CORS
+/// layer and the cross-site write guard (`cross_site_write.rs`) so the two can
+/// never disagree about which pages are "local".
+///
+/// Built once at startup from the normalized `OCEAN_ALLOWED_ORIGINS` extras;
+/// cheap to clone (the extras sit behind an `Arc`).
+#[derive(Clone, Debug, Default)]
+pub(crate) struct BrowserOrigins {
+    extra: Arc<[String]>,
+}
+
+impl BrowserOrigins {
+    /// Wrap an already-normalized operator allowlist (see
+    /// [`parse_allowed_origins`]).
+    pub(crate) fn new(extra: Vec<String>) -> Self {
+        Self {
+            extra: extra.into(),
+        }
+    }
+
+    /// Whether a scheme+authority origin string is trusted. The cross-site
+    /// write guard passes the lowercased origin of an `Origin`/`Referer`
+    /// header; extras are compared ASCII-case-insensitively for that reason.
+    pub(crate) fn trusts(&self, origin: &str) -> bool {
+        is_trusted_origin_str(origin, &self.extra)
+    }
+}
 
 /// HTTP methods advertised in the CORS preflight (`Access-Control-Allow-Methods`).
 /// Must cover EVERY method the router actually serves, or the browser's OPTIONS
@@ -26,7 +56,9 @@ fn cors_allowed_methods() -> [Method; 5] {
 pub(super) fn parse_allowed_origins(raw: &str) -> Vec<String> {
     raw.split(',')
         .map(|s| s.trim().trim_end_matches('/'))
-        .filter(|s| !s.is_empty())
+        // `null` is the opaque origin of sandboxed frames, `file:` pages, and
+        // redirects: trusting it would trust every such page at once.
+        .filter(|s| !s.is_empty() && !s.eq_ignore_ascii_case("null"))
         .map(|s| s.to_string())
         .collect()
 }
@@ -53,11 +85,18 @@ fn is_trusted_origin(origin: &HeaderValue, extra: &[String]) -> bool {
     let Ok(origin) = origin.to_str() else {
         return false;
     };
+    is_trusted_origin_str(origin, extra)
+}
+
+/// String form of [`is_trusted_origin`], shared with [`BrowserOrigins::trusts`].
+fn is_trusted_origin_str(origin: &str, extra: &[String]) -> bool {
     is_loopback_origin(origin)
         || origin.starts_with("chrome-extension://")
         || origin == "tauri://localhost"
         || origin == "https://tauri.localhost"
-        || extra.iter().any(|allowed| allowed == origin)
+        || extra
+            .iter()
+            .any(|allowed| allowed.eq_ignore_ascii_case(origin))
 }
 
 /// True for `http(s)://localhost|127.0.0.1|[::1]` with any (or no) port. Matches
@@ -85,10 +124,10 @@ fn is_loopback_origin(origin: &str) -> bool {
 ///
 /// Keeping layer construction outside `main` lets the production router and the
 /// route-contract tests exercise the same origin, method, and header policy.
-pub(super) fn cors_layer(extra_origins: Vec<String>) -> CorsLayer {
+pub(super) fn cors_layer(origins: BrowserOrigins) -> CorsLayer {
     CorsLayer::new()
         .allow_origin(AllowOrigin::predicate(move |origin, _req| {
-            is_trusted_origin(origin, &extra_origins)
+            is_trusted_origin(origin, &origins.extra)
         }))
         .allow_methods(cors_allowed_methods())
         .allow_headers([
@@ -179,6 +218,11 @@ mod tests {
         assert_eq!(parsed, vec!["https://a.com", "https://b.com"]);
         assert!(parse_allowed_origins("").is_empty());
         assert!(parse_allowed_origins("   ,  , ").is_empty());
+        assert_eq!(
+            parse_allowed_origins("null, NULL ,https://a.com"),
+            vec!["https://a.com"],
+            "the opaque null origin is never an allowed origin"
+        );
     }
 
     /// The router serves PATCH (`/v1/projects/{id}`) and DELETE

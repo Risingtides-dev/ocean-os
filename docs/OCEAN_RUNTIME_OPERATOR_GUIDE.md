@@ -128,6 +128,50 @@ It now only accepts:
 
 The surface proxy and other native HTTP callers do not send a browser `Origin`. Direct browser, extension, and Tauri webview requests are origin-checked against the policy above.
 
+#### Cross-site write guard
+
+CORS alone cannot stop a browser "simple" request (no custom header; no body, `text/plain`, form, or multipart), because the browser sends it without a preflight and the handler runs before CORS has a say. So every daemon request whose method is not `GET`, `HEAD`, or `OPTIONS` also passes a guard that answers a fixed 403 with the operator lane's codes:
+
+- a `Cookie` header → `{"ok":false,"code":"ambient_credential_rejected",…}`;
+- an `Origin` or `Referer` that is present and not in the trusted set above (the same set, including `OCEAN_ALLOWED_ORIGINS`; the opaque `null` origin is refused) → `{"ok":false,"code":"foreign_origin_rejected",…}`.
+
+A request with neither `Origin` nor `Referer` passes, exactly as on the operator lane, so `ocean`, `ocean-mcp`, the TUI, ACP, and `curl` are unaffected. Reads are not guarded. If a phone or tunnel page talks to the daemon directly rather than through the proxy, its origin must be in `OCEAN_ALLOWED_ORIGINS` for writes as well as for CORS.
+
+**What this guard does not cover: the surface proxy.** The proxy rebuilds every upstream request without the browser's `Origin`, `Referer`, or `Cookie`. That is why the proxy keeps working — a compatibility fact — and it is also why this guard cannot see a cross-site write that is laundered THROUGH the proxy: it arrives here with no `Origin` and passes. With `OCEAN_SURFACE_AUTH=off` the proxy also upgrades `text/plain` bodies to JSON, which makes even the JSON routes reachable that way. The auth-off proxy path is covered only once ocean-surface #230 lands (it gates every non-GET under `/v1` and `/api` on `Origin`/`Referer` in auth-off mode). Until then, a web page can still drive daemon writes through an auth-off proxy on `:8790`; with proxy auth on, the page has no session to ride.
+
+**Cookies.** No first-party client sends a cookie to the daemon. The proxy's own `ocean_session` and `ocean_device` cookies are `HttpOnly; SameSite=Strict` for the proxy's host, and every direct browser call to the daemon (loopback dev pages, the Tauri webview, the Chrome side panel) is a cross-origin `fetch`/`EventSource` in the default `same-origin` credentials mode, which never attaches cookies to a cross-origin request regardless of `SameSite`. The Surface UI never opts into `credentials: "include"`. A future client that does will be refused, on purpose.
+
+**Open follow-up (not changed here).** Any loopback port and any `chrome-extension://` origin are trusted for writes, because that is what CORS already trusted. Narrowing it to known ports and a pinned extension id is a compatibility decision that is still owed (Rooms DoD 3.1).
+
+#### Host allowlist (DNS rebinding) — `OCEAN_ALLOWED_HOSTS`
+
+Origin checks cannot stop DNS rebinding: a page on `evil.example:4780` that re-resolves its name to `127.0.0.1` is same-origin with its own requests, so it can read responses — `GET /v1/fs/file` would return any file under `$HOME`. Every request, on every method, is therefore refused with a fixed-shape 421 that names the refused host and says what to do:
+
+```json
+{"ok":false,"code":"host_not_allowed","host":"mini.tailnet.ts.net:4780","hint":"add it to OCEAN_ALLOWED_HOSTS","error":"request Host `mini.tailnet.ts.net:4780` is not an address this daemon answers to"}
+```
+
+A request is answered only when its `Host` is one of:
+
+- `localhost`, or any loopback IP literal (`127.0.0.1`, `[::1]` — the IPv6 companion listener), on any port;
+- the IP literal of `OCEAN_BIND`, or ANY IP literal when `OCEAN_BIND` is unspecified (`0.0.0.0:4780`), since an IP literal cannot be rebound;
+- the host of each `OCEAN_ALLOWED_ORIGINS` entry;
+- an entry of `OCEAN_ALLOWED_HOSTS` (comma-separated). An entry may be a host name, `host:port`, `[ipv6]:port`, an IP literal, or a pasted daemon URL such as `http://mini.tailnet.ts.net:4780/`: the scheme and any path are stripped. An entry that still does not parse (a non-numeric port, userinfo, an empty host) fails daemon startup naming the entry, rather than being dropped and turning every request by that name into a 421.
+
+At startup the daemon logs the effective allowlist once (`Host allowlist (DNS-rebinding guard)`): the bind address, the loopback set, the `OCEAN_ALLOWED_HOSTS` entries, the hosts derived from `OCEAN_ALLOWED_ORIGINS`, and `any_ip` (true only when bound unspecified).
+
+The supervised daemon leaves `OCEAN_BIND` unset (loopback), so its clients — the CLI, MCP, TUI, the surface proxy's default `http://127.0.0.1:4780` upstream, the Tauri webview, and the side panel — are unaffected. A daemon reached by NAME from another machine needs that name here, for example the MagicDNS name of an approved tailnet bind (bind the tailnet IP, never `0.0.0.0` — see [Security concern](#security-concern) below):
+
+```bash
+(cd "$HOME" && OCEAN_BIND=100.64.0.7:4780 OCEAN_ALLOWED_HOSTS="mini.tailnet.ts.net" "$OCEAN_DAEMON_BIN")
+```
+
+The tailnet IP itself needs no entry, since it is the bind address. The same applies to the Buddy development build, which dials `risings-mac-mini.local`: that name must be listed.
+
+A loopback-bound daemon that is exposed through `tailscale serve`, socat, or any other forwarder, and reached by a non-loopback IP or name, gets 421 until that host is in `OCEAN_ALLOWED_HOSTS` whenever the forwarder keeps the client's `Host` (a TCP forwarder such as socat always does).
+
+A literal `null` entry in `OCEAN_ALLOWED_ORIGINS` or `OCEAN_OPERATOR_ALLOWED_ORIGINS` is dropped at parse time; the opaque origin is never trusted.
+
 ### Daemon URL for clients
 
 Clients default to `http://127.0.0.1:4780`.

@@ -1959,9 +1959,12 @@ mod tests {
     }
 
     fn github_router(state: AppState, service: GitHubService) -> Router {
-        crate::app_router(crate::cors_layer(Vec::new()))
-            .with_state(state)
-            .layer(Extension(service))
+        crate::app_router(
+            crate::cors::BrowserOrigins::default(),
+            crate::host_guard::AllowedHosts::default(),
+        )
+        .with_state(state)
+        .layer(Extension(service))
     }
 
     async fn request_json(app: &Router, uri: &str) -> (StatusCode, HeaderMap, Value) {

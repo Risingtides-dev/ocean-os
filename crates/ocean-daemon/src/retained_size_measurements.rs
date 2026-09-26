@@ -749,7 +749,11 @@ async fn serve(state: AppState) -> SocketAddr {
     let listener = socket.listen(64).expect("listen");
     let addr = listener.local_addr().expect("local addr");
     let shutdown = state.shutdown.clone();
-    let app = crate::app_router(crate::cors::cors_layer(Vec::new())).with_state(state);
+    let app = crate::app_router(
+        crate::cors::BrowserOrigins::default(),
+        crate::host_guard::AllowedHosts::default(),
+    )
+    .with_state(state);
     tokio::spawn(async move {
         axum::serve(listener, app)
             .with_graceful_shutdown(shutdown.cancelled_owned())

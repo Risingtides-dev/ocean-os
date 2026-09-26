@@ -161,6 +161,7 @@ ocean-os 616293e, ocean-surface d58a145.
 - 3.1 The daemon's room routes authenticate the caller; identity is not a
   caller-asserted author_id; invite mint and redeem require an operator; CORS
   does not trust every chrome-extension origin. [os, M to L, design ruling]
+  **Progress** (2026-09-26): direct no-preflight cross-site writes to the daemon are refused daemon-wide. `cross_site_write.rs` refuses every non-GET/HEAD/OPTIONS request that carries `Cookie` or a present `Origin`/`Referer` outside the CORS trust set (403 `ambient_credential_rejected` / `foreign_origin_rejected`; absent `Origin` passes, matching the operator lane), and `host_guard.rs` refuses a foreign `Host` on every method (421 `host_not_allowed`, the DNS-rebinding stop). Not closed: a write laundered through an `OCEAN_SURFACE_AUTH=off` surface proxy arrives with no `Origin` and passes; that path is covered only once ocean-surface #230 lands. Also open: the member lane is still roster-asserted rather than authenticated, and any loopback port and any chrome-extension origin are still trusted (narrowing to known ports and a pinned extension id is an owed compatibility decision).
 - 3.2 Token ids are never projected (gate green; every new auth_tokens
   reference claimed the day it is written). [bedrock, green]
 - 3.3 Preview URL tokens are salted and rotatable, or a written ruling names who
