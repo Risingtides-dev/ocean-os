@@ -1095,8 +1095,8 @@ Status exposure is read-only/non-probing cached runtime projection, never a
 package probe. Its committed-202, CLI exit, active-service, and retry/reinspect
 tests land here. No Git network acquisition.
 
-**A3b status (2026-09-25): merged to `main` by PR #502. A4 followed on
-`feat/extension-stage-a4`.**
+**A3b status (2026-09-25): merged to `main` by PR #502. A4 followed and merged in
+PR #503.**
 The HTTP adapters are `crates/ocean-daemon/src/extension_registry/mutation.rs`
 (a child of the registry module, beside the A3a writer); route composition stays
 in `main.rs`; the CLI verbs are `crates/ocean-cli/src/extension.rs`. Realization
@@ -1242,8 +1242,9 @@ pinning, Git capability/version fail-closed behavior, credential/proxy isolation
 generation-safe process groups, timeout/byte/revision/root-tree/no-submodule/LFS/
 filter/script constraints, and rollback tests.
 
-**A4 status (2026-09-25): implemented on `feat/extension-stage-a4` (draft PR),
-pending fresh independent review; not accepted. A5 is next after that review.**
+**A4 status (2026-09-26): independently reviewed (review, delta review, and
+follow-up review) and merged to `main` in PR #503, with the delta-review
+follow-ups in PR #504. A5 is next.**
 A3b merged to `main` in PR #502 before A4 began.
 The acquisition is `crates/ocean-daemon/src/extension_registry/transaction/git.rs`,
 a child of the A3a writer so it fills the same `AcquisitionLease` with the same

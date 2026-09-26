@@ -105,9 +105,10 @@ A1, A2a, and A2b are accepted.
       recovery wiring, and revision-serialized supervisor reconciliation/reap:
       merged in PR #502; the credential-class ruling recorded in the manifest
       remains open.
-- [ ] A4 — pinned public Git acquisition: implemented on
-      `feat/extension-stage-a4`, pending fresh independent review.
-- [ ] A5 — integrated Stage A gate (next after the A4 review).
+- [x] A4 — pinned public Git acquisition: independently reviewed and merged
+      in PR #503; delta-review follow-ups (full case folding, stranded-permit
+      waiter, shim-gate seam) in PR #504.
+- [ ] A5 — integrated Stage A gate (next).
 
 ## Ocean Observatory
 
