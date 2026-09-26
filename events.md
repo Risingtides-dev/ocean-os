@@ -11179,3 +11179,12 @@ area:      [testing]
 
 Hosted macOS CI failed the stalled-service gate at 03882310. The blocked write failed 4.26 s after the pinned pipe fill, past the 2.6 s live upper bound, because the per-frame write deadline restarts whenever the kernel accepts more bytes. So the live upper bound is not deterministic either. It is widened to 8 s after the fill and labeled a liveness bound, with the exact 2 s credited only to the unit test blocked_stdin_fails_at_the_two_second_connection_deadline. The evidence doc (step 6, the blocked-stdin row, and M25b) and the manifest A5 note now say so, and M25b is no longer counted as a live-gate kill. Not merged.
 _________________________________________________________________________________ 02:43 feat/extension-stage-a5
+
+time:      [03:02] [26-09-26]
+agent:     [claude]
+worktree:  fix/hooks-etxtbsy-flake
+type:      [bug-report]
+area:      [testing]
+
+Fixed a Linux CI flake in ocean-hooks. On PR #505, hook_chain_characterizes_process_context_and_control_flow saw two warnings instead of one: the test writes its fixture script and then execs it directly, so a sibling test thread that forks while the write handle is open makes the exec fail with ETXTBSY. The fixture now runs through /bin/sh with the script as its first argument, so the file is read and never exec'd. The unused make_executable helper is removed. Test-only; no production change.
+_________________________________________________________________________________ 03:02 fix/hooks-etxtbsy-flake

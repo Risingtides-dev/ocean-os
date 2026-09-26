@@ -351,11 +351,13 @@ esac
 "#,
         )
         .unwrap();
-        make_executable(&fixture);
-
+        // Run the fixture through `/bin/sh` rather than exec'ing the file just
+        // written: a sibling test thread that forks while the write handle is
+        // open makes a direct exec fail with ETXTBSY on Linux.
         let command = |mode: &str, extra: Vec<String>, enabled: bool| HookCommand {
-            command: fixture.to_string_lossy().into_owned(),
-            args: std::iter::once(mode.to_string())
+            command: "/bin/sh".to_string(),
+            args: std::iter::once(fixture.to_string_lossy().into_owned())
+                .chain(std::iter::once(mode.to_string()))
                 .chain(std::iter::once(order.to_string_lossy().into_owned()))
                 .chain(extra)
                 .collect(),
@@ -457,17 +459,6 @@ esac
         assert_eq!(result.outcome, HookOutcome::Continue);
         assert_eq!(result.warnings.len(), 1);
     }
-
-    #[cfg(unix)]
-    fn make_executable(path: &Path) {
-        use std::os::unix::fs::PermissionsExt;
-        let mut perms = std::fs::metadata(path).unwrap().permissions();
-        perms.set_mode(0o755);
-        std::fs::set_permissions(path, perms).unwrap();
-    }
-
-    #[cfg(not(unix))]
-    fn make_executable(_path: &Path) {}
 
     fn toml_like_parse<T: serde::de::DeserializeOwned>(text: &str) -> T {
         toml::from_str(text).unwrap()
