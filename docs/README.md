@@ -89,6 +89,7 @@ Active implementation reference:
 Retained measurements:
 
 - [`specs/2026-09-25-retained-size-and-slow-client-measurements.md`](specs/2026-09-25-retained-size-and-slow-client-measurements.md) — measurement-only evidence for the ROADMAP "Reliability and scale" item. It covers serialized bytes retained by the agent replay ring, the legacy history, broadcast slots, and persisted transcripts across turn and tool-output sizes; exact lag thresholds for the agent, legacy, and room buses; and real-socket slow-client behavior through `app_router`. It changes no bound, and it states what the numbers do and do not justify.
+- [`specs/2026-09-26-bounded-turn-event-channel-proposal.md`](specs/2026-09-26-bounded-turn-event-channel-proposal.md) — PROPOSED, not accepted. This is the per-turn runtime → daemon channel policy. Both unbounded `mpsc` hops become one backpressured channel with a budget of 8 MiB and 1,024 items per hop. It never drops, it coalesces adjacent deltas up to 64 KiB, and it makes no wire change. The document includes a slice plan with mutation-checked guards.
 
 Completed extraction manifests are retained evidence, not independent work orders. The broader behavior-neutral daemon refactor remains active under `DAEMON_REFACTOR_MISSION.md`; consult its progress section and the current code-health plan before selecting the next checkpoint.
 
