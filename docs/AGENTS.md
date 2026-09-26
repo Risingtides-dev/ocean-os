@@ -51,6 +51,10 @@ This child contract governs current architecture, operations, cross-repository r
   route/contract manifest first. Its invariants — no model credentials in the
   proxy or coordinator, no identity by address, no daemon URLs in the device
   picker — bind every milestone.
+- `specs/2026-09-26-rooms-member-lane-authentication-proposal.md` is a
+  PROPOSED (not accepted) design for the member-lane half of Rooms DoD 3.1. It
+  reuses the M2 §10 `X-Ocean-Link` credential rather than competing with it.
+  Do not build from it until the operator answers its §7 questions.
 
 ## Work Guidance
 
