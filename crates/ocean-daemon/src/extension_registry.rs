@@ -2884,6 +2884,9 @@ pub(crate) async fn recover_at_startup(_config_dir: PathBuf) {}
 mod tests {
     use super::*;
     use serde_json::json;
+
+    /// Stage A5 §19.4 gap closures (see the manifest's A5 evidence table).
+    mod a5_gaps;
     use std::path::PathBuf;
 
     const ID: &str = "example.phase-one";

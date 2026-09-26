@@ -108,7 +108,14 @@ A1, A2a, and A2b are accepted.
 - [x] A4 — pinned public Git acquisition: independently reviewed and merged
       in PR #503; delta-review follow-ups (full case folding, stranded-permit
       waiter, shim-gate seam) in PR #504.
-- [ ] A5 — integrated Stage A gate (next).
+- [ ] A5 — integrated Stage A gate: the §20 end-to-end gate and §19 gap
+      closures (tests only; evidence in
+      [`docs/specs/2026-09-26-ocean-extension-stage-a5-acceptance-evidence.md`](docs/specs/2026-09-26-ocean-extension-stage-a5-acceptance-evidence.md))
+      are implemented and pending independent review.
+- [ ] Stage A acceptance — blocked on four operator rulings: the mutation
+      credential class, §17 project-scope disable of a shared service,
+      Windows R5 package management, and local-source path collisions. The
+      operator's separate acceptance follows.
 
 ## Ocean Observatory
 

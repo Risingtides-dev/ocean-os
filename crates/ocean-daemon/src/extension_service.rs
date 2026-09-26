@@ -3816,6 +3816,9 @@ pub(crate) fn group_has_live_members(pgid: libc::pid_t) -> io::Result<bool> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Stage A5 §19 gap closures (see the manifest's A5 evidence table).
+    mod a5_gaps;
     use crate::extension_lifecycle::LifecycleSource;
     use ocean_agent_sdk::extension_lifecycle::LifecycleEventKind;
     use std::os::unix::fs::PermissionsExt;

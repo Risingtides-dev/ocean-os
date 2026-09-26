@@ -691,4 +691,110 @@ mod tests {
         assert_eq!(unsafe { libc::mkfifo(fifo_path.as_ptr(), 0o600) }, 0);
         assert!(operator_key(fifo.path()).is_err(), "fifo accepted");
     }
+
+    /// Stage A5 (§15, §19.4): whatever the daemon answers — committed, committed
+    /// but pending, a retryable refusal, a committed recovery error, or an
+    /// unknown outcome — the CLI sends the mutation exactly once and maps the
+    /// answer to its fixed exit code. It never retries on the operator's behalf.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a5_mutations_are_sent_exactly_once_whatever_the_answer() {
+        use std::os::unix::fs::PermissionsExt;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let config = tempfile::tempdir().unwrap();
+        let key = config.path().join("operator.key");
+        std::fs::write(&key, "a5-operator-key\n").unwrap();
+        std::fs::set_permissions(&key, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let previous = std::env::var_os("OCEAN_CONFIG_DIR");
+        std::env::set_var("OCEAN_CONFIG_DIR", config.path());
+
+        let committed = |reconciliation: &str| json!({"ok": true, "mutation": {"operation_id": "op", "committed": true, "state_revision": 9, "id": "example.noop", "digest": null, "effective": false, "reconciliation": reconciliation, "reap": "not_required"}});
+        let cases = [
+            (200, committed("complete"), 0),
+            (202, committed("pending"), EXIT_COMMITTED_PENDING),
+            (
+                503,
+                json!({"ok": false, "mutation": {"operation_id": "op", "committed": false, "state_revision": 8}, "error": {"code": "extension_state_busy", "message": "m", "retryable": true}}),
+                1,
+            ),
+            (
+                409,
+                json!({"ok": false, "mutation": {"operation_id": "op", "committed": false, "state_revision": 8}, "error": {"code": "reconciliation_in_progress", "message": "m", "retryable": true}}),
+                1,
+            ),
+            (
+                500,
+                json!({"ok": false, "mutation": {"operation_id": "op", "committed": true, "state_revision": 9}, "error": {"code": "registry_recovery_required", "message": "m"}}),
+                EXIT_RECOVERY_REQUIRED,
+            ),
+            (
+                500,
+                json!({"ok": false, "mutation": {"operation_id": null, "committed": null, "state_revision": null}, "error": {"code": "outcome_unknown", "message": "m"}}),
+                EXIT_OUTCOME_UNKNOWN,
+            ),
+        ];
+        for (status, body, exit) in cases {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let address = listener.local_addr().unwrap();
+            let requests = Arc::new(AtomicUsize::new(0));
+            let counted = Arc::clone(&requests);
+            let payload = body.to_string();
+            let server = tokio::spawn(async move {
+                loop {
+                    let (mut stream, _) = listener.accept().await.unwrap();
+                    counted.fetch_add(1, Ordering::SeqCst);
+                    let mut request = Vec::new();
+                    let mut buffer = [0u8; 4096];
+                    // Read the head, then exactly Content-Length body bytes.
+                    let body_start = loop {
+                        let read = stream.read(&mut buffer).await.unwrap();
+                        request.extend_from_slice(&buffer[..read]);
+                        if let Some(at) = request.windows(4).position(|w| w == b"\r\n\r\n") {
+                            break at + 4;
+                        }
+                        assert!(read > 0, "request head never completed");
+                    };
+                    let head = String::from_utf8_lossy(&request[..body_start]).to_lowercase();
+                    assert!(head.contains("x-ocean-operator: a5-operator-key"), "{head}");
+                    let length: usize = head
+                        .lines()
+                        .find_map(|line| line.strip_prefix("content-length: "))
+                        .map(|value| value.trim().parse().unwrap())
+                        .unwrap_or(0);
+                    while request.len() < body_start + length {
+                        let read = stream.read(&mut buffer).await.unwrap();
+                        assert!(read > 0);
+                        request.extend_from_slice(&buffer[..read]);
+                    }
+                    let response = format!(
+                        "HTTP/1.1 {status} A5\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{payload}",
+                        payload.len()
+                    );
+                    stream.write_all(response.as_bytes()).await.unwrap();
+                    stream.shutdown().await.ok();
+                }
+            });
+            let client = reqwest::Client::new();
+            let code = mutate(
+                &client,
+                reqwest::Method::POST,
+                format!("http://{address}/v1/extensions/install"),
+                json!({"expected_state_revision": 8, "source": {"kind": "local-path", "path": "/a5/noop"}}),
+            )
+            .await
+            .unwrap();
+            assert_eq!(code, exit, "{status} {body}");
+            // Give any (forbidden) retry time to arrive before counting.
+            tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+            assert_eq!(requests.load(Ordering::SeqCst), 1, "{status} {body}");
+            server.abort();
+        }
+        match previous {
+            Some(value) => std::env::set_var("OCEAN_CONFIG_DIR", value),
+            None => std::env::remove_var("OCEAN_CONFIG_DIR"),
+        }
+    }
 }
