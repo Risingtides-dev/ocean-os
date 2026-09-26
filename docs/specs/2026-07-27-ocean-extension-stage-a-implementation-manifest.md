@@ -1487,10 +1487,10 @@ complete independent security/correctness/architecture review, full CI/MSRV/
 compatibility, operator acceptance record, and docs/devlog closeout. No Stage B
 code, reference integration, deployment, or extension repository creation.
 
-**A5 status (2026-09-26): implemented on `feat/extension-stage-a5` and pending
-independent review. A4 merged in PRs #503 and #504 before A5 began. Stage A is
-not accepted. Acceptance still needs the five operator rulings below and the
-operator's separate acceptance (§20 step 15).**
+**A5 status (2026-09-26): merged to `main` in PR #505, with the live
+stalled-write bound widened in PR #506. A4 merged in PRs #503 and #504 before
+A5 began. Stage A is not accepted. Acceptance still needs the five operator
+rulings below and the operator's separate acceptance (§20 step 15).**
 The row-by-row §19 map and the §20 step map are in
 [`2026-09-26-ocean-extension-stage-a5-acceptance-evidence.md`](2026-09-26-ocean-extension-stage-a5-acceptance-evidence.md),
 which this note names as the A5 evidence record. A5 adds tests only: no route,
@@ -1565,9 +1565,33 @@ Blocked on operator rulings, not decided by A5:
 5. Whether the shell §20 fixture is accepted in place of the specified minimal
    Rust service, or a fixture crate is authorized by amendment.
 
-Open engineering items, none of which blocks a ruling, are listed in the
-evidence record's §6. Two examples: `details.cancelled` extraction at the
-runtime bridge, and secret absence from `tracing` logs.
+The evidence record's §6 lists the open engineering items (O-1 to O-10) that
+need no ruling. A follow-up on `test/extension-stage-a-open-items` closes eight
+with mutation-checked tests. It closes O-2 by a bound: every admissible event
+encodes far below the frame limit, so the oversized branch is unreachable. It
+closes O-3 for the daemon-restart retry only. The new-digest retry is subsumed
+by disable → enable, because `update` refuses an enabled package, so it is not
+separately guarded. Panic payloads stay structural. The follow-up adds tests
+plus three small non-test edits, none of which changes behavior:
+
+- a named `frame_error_diagnostic`, extracted from `prepare_one` unchanged;
+- a default-off `test-support` feature in `ocean-runtime`, which lets a test
+  build move the `fake-tool` target through `OCEAN_FAKE_TOOL_TARGET_PATH`;
+- the daemon dev-dependency that enables it.
+
+It found no production bug. It records two things:
+
+- *A macOS platform behavior.* A service exec'd by its `/.vol` file-id path
+  can be SIGKILLed if its package directory is renamed during the spawn. This
+  fails closed and counts toward the circuit. Only a local writer to the
+  sealed store can cause it.
+- *O-11, an engineering interpretation.* The 2 s blocked-stdin deadline (§7.1,
+  §9.2) is read as per frame. That is the only reading consistent with §19.2
+  (a slow reader gets a coalesced `lag`) and §9.2 (never backpressure). A peer
+  that never reads is still bounded by the 256-frame ACK window with its 5 s
+  drain, and by the 3 × 10 s heartbeat. The §7.1 text is unchanged; the
+  operator may optionally clarify its wording. A tighter bound, if ever wanted,
+  would reset on child progress (an ACK or a pong).
 
 The strict order is A0 evidence → A1 → A2a → A2b → A3a → A3b → A4 → A5.
 Each named sub-slice is a separate commit/PR and receives fresh independent

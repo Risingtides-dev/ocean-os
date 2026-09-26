@@ -121,6 +121,10 @@ http-body-util = "0.1"
 # through `ocean-store`'s API. Already in the workspace lock (transitive via
 # ocean-store), so this pulls no new download.
 rusqlite = { workspace = true }
+# Stage A open items (O-10): the fake-tool permission tests write to a per-test
+# target instead of the provider's fixed `/tmp` path. Dev-only, so the feature
+# never reaches a production daemon build.
+ocean-runtime = { workspace = true, features = ["test-support"] }
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { workspace = true, features = [

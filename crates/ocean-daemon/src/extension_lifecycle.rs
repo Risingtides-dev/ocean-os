@@ -263,6 +263,17 @@ struct PermissionCorrelationKey {
     permission_id: Uuid,
 }
 
+/// The fixed diagnostic for an event the encoder refuses. `OversizedEvent` is
+/// defensive: every admissible metadata field is bounded far below
+/// `MAX_FRAME_BYTES` (see
+/// `tests::every_admissible_event_encodes_far_below_the_frame_limit`).
+fn frame_error_diagnostic(error: FrameError) -> DiagnosticCode {
+    match error {
+        FrameError::TooLarge { .. } => DiagnosticCode::OversizedEvent,
+        FrameError::InvalidFraming | FrameError::InvalidFrame => DiagnosticCode::InvalidEvent,
+    }
+}
+
 #[derive(Debug, Clone)]
 struct PreparedEvent {
     event: LifecycleEvent,
@@ -845,10 +856,7 @@ impl LifecycleAdapter {
             scope,
             metadata,
         };
-        let encoded = encode_frame(&event).map_err(|error| match error {
-            FrameError::TooLarge { .. } => DiagnosticCode::OversizedEvent,
-            FrameError::InvalidFraming | FrameError::InvalidFrame => DiagnosticCode::InvalidEvent,
-        })?;
+        let encoded = encode_frame(&event).map_err(frame_error_diagnostic)?;
         Ok(PreparedEvent {
             event,
             encoded_bytes: encoded.len(),
@@ -1714,6 +1722,132 @@ mod tests {
         assert_eq!(adapter.next_sequence, Some(1));
         assert_eq!(adapter.retained().count(), 0);
         assert_eq!(adapter.diagnostic_count(DiagnosticCode::InvalidEvent), 2);
+    }
+
+    /// O-2: the encoder's size refusal maps to its own fixed diagnostic, and
+    /// no other refusal is reported as oversized.
+    #[test]
+    fn oversized_encoder_refusal_maps_to_the_oversized_diagnostic() {
+        use ocean_agent_sdk::extension_lifecycle::MAX_FRAME_BYTES;
+        assert_eq!(
+            frame_error_diagnostic(FrameError::TooLarge {
+                encoded_bytes: MAX_FRAME_BYTES + 1
+            }),
+            DiagnosticCode::OversizedEvent
+        );
+        assert_eq!(
+            frame_error_diagnostic(FrameError::InvalidFrame),
+            DiagnosticCode::InvalidEvent
+        );
+        assert_eq!(
+            frame_error_diagnostic(FrameError::InvalidFraming),
+            DiagnosticCode::InvalidEvent
+        );
+        assert_eq!(DiagnosticCode::OversizedEvent.as_str(), "oversized_event");
+    }
+
+    /// O-2: the oversized branch is unreachable from admissible input. Each of
+    /// the ten metadata variants is built at its largest: every scope identity
+    /// set, every counter at `u64::MAX`, a tool name at `MAX_TOOL_NAME_BYTES`
+    /// of control bytes (each JSON-escaped to six bytes), and a daemon version
+    /// at `MAX_DAEMON_VERSION_BYTES`. Every one encodes, with room to spare,
+    /// below `MAX_FRAME_BYTES`, so no current source can reach the refusal.
+    #[test]
+    fn every_admissible_event_encodes_far_below_the_frame_limit() {
+        use ocean_agent_sdk::extension_lifecycle::{
+            SessionStopReason, SessionStoppedMetadata, MAX_DAEMON_VERSION_BYTES, MAX_FRAME_BYTES,
+            MAX_TOOL_NAME_BYTES,
+        };
+
+        let adapter = LifecycleAdapter::new(id(1));
+        let tool_name = || ToolName::new("\u{1}".repeat(MAX_TOOL_NAME_BYTES)).unwrap();
+        let version = format!("1.0.0-{}", "a".repeat(MAX_DAEMON_VERSION_BYTES - 6));
+        let daemon_version = DaemonVersion::new(version.clone()).unwrap();
+        assert_eq!(daemon_version.as_str().len(), MAX_DAEMON_VERSION_BYTES);
+        let scope = LifecycleScope {
+            project_id: Some(id(2)),
+            session_id: Some(id(3)),
+            turn_id: Some(id(4)),
+            request_id: Some(id(5)),
+            tool_call_id: Some(id(6)),
+            permission_id: Some(id(7)),
+        };
+        let cases = [
+            (
+                LifecycleEventKind::DaemonStarted,
+                LifecycleMetadata::DaemonStarted(DaemonStartedMetadata { daemon_version }),
+            ),
+            (
+                LifecycleEventKind::PermissionRequested,
+                LifecycleMetadata::PermissionRequested(PermissionRequestedMetadata {
+                    tool_name: tool_name(),
+                }),
+            ),
+            (
+                LifecycleEventKind::PermissionResolved,
+                LifecycleMetadata::PermissionResolved(PermissionResolvedMetadata {
+                    outcome: PermissionOutcome::Cancelled,
+                }),
+            ),
+            (
+                LifecycleEventKind::ToolStarted,
+                LifecycleMetadata::ToolStarted(ToolStartedMetadata {
+                    tool_name: tool_name(),
+                }),
+            ),
+            (
+                LifecycleEventKind::ToolFinished,
+                LifecycleMetadata::ToolFinished(ToolFinishedMetadata {
+                    tool_name: tool_name(),
+                    outcome: ToolOutcome::Cancelled,
+                    duration_ms: u64::MAX,
+                    output_bytes: u64::MAX,
+                }),
+            ),
+            (
+                LifecycleEventKind::TurnFinished,
+                LifecycleMetadata::TurnFinished(TurnFinishedMetadata {
+                    outcome: TurnOutcome::Abandoned,
+                    duration_ms: u64::MAX,
+                    input_tokens: Some(u64::MAX),
+                    output_tokens: Some(u64::MAX),
+                    cache_read_tokens: Some(u64::MAX),
+                }),
+            ),
+            (
+                LifecycleEventKind::SessionStopped,
+                LifecycleMetadata::SessionStopped(SessionStoppedMetadata {
+                    reason: SessionStopReason::ExplicitStop,
+                }),
+            ),
+            (
+                LifecycleEventKind::DaemonStopping,
+                LifecycleMetadata::DaemonStopping(DaemonStoppingMetadata {
+                    reason: DaemonStopReason::GracefulShutdown,
+                }),
+            ),
+            (
+                LifecycleEventKind::SessionStarted,
+                LifecycleMetadata::Empty(EmptyMetadata {}),
+            ),
+            (
+                LifecycleEventKind::TurnStarted,
+                LifecycleMetadata::Empty(EmptyMetadata {}),
+            ),
+        ];
+        let mut largest = 0;
+        for (index, (kind, metadata)) in cases.into_iter().enumerate() {
+            let prepared = adapter
+                .prepare_one(kind, scope.clone(), metadata, stamp(900 + index as u128, 0))
+                .unwrap_or_else(|code| panic!("{kind:?} was refused: {code:?}"));
+            largest = largest.max(prepared.encoded_bytes);
+        }
+        // The worst case is a few KiB: an order of magnitude under the limit.
+        assert!(
+            largest * 16 < MAX_FRAME_BYTES,
+            "the largest admissible event is {largest} bytes"
+        );
+        assert_eq!(adapter.diagnostics.len(), 0);
     }
 
     #[test]
