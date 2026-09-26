@@ -233,12 +233,19 @@ mod tests {
 
     /// Without `test-support` the override variable is never read: the
     /// scripted `write` targets the fixed path even when it is set. This is the
-    /// release-build proof, run as
-    /// `OCEAN_FAKE_TOOL_TARGET_PATH=/tmp/x cargo test -p ocean-runtime --lib fake_tool`
-    /// (the feature is off unless a dev-dependency enables it).
+    /// release-build proof; `cargo xtask ci` runs it as
+    /// `cargo test -p ocean-runtime --lib fake_tool`, which builds ocean-runtime
+    /// alone so the dev-only feature stays off. The test sets the override
+    /// itself so the proof never depends on the caller's environment; no other
+    /// test in a build without the feature reads the variable.
     #[cfg(not(feature = "test-support"))]
     #[tokio::test]
     async fn without_test_support_the_scripted_write_always_targets_the_fixed_path() {
+        // The constant is compiled only with the feature, so spell the name.
+        std::env::set_var(
+            "OCEAN_FAKE_TOOL_TARGET_PATH",
+            "/nonexistent/ocean-override-must-be-ignored",
+        );
         assert_eq!(fake_tool_target_path(), FAKE_TOOL_TARGET_PATH);
         assert_eq!(scripted_write_path().await, FAKE_TOOL_TARGET_PATH);
     }

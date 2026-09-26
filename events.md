@@ -11206,3 +11206,12 @@ area:      [testing]
 
 Addressed Knox's review of PR #507. O-4 flaked because macOS SIGKILLs a service exec'd by its /.vol file-id path when its directory is renamed during the spawn, and only on the executable's first exec. The test now runs one unraced spawn first, counts a spawn only when it appends exactly one line, and retries kills within a tight cap (4 per spawn, 8 per run). It passed 20 of 20 alone. The production behavior is recorded as fail-closed. O-9 now holds the permission waiter open across the pinned fill and asserts only that its resolution precedes the connection failure; that one implicit bound is documented. O-3 is recorded as closed for daemon restart only: the new-digest retry is subsumed by disable→enable, so the digest condition is unguarded. O-11 is no longer a ruling. It is a recorded per-frame interpretation, bounded by the ACK window and heartbeat, with an optional §7.1 wording clarification, and the unsound cumulative-clock sketch is withdrawn. The low-severity items are also done: span events in the tracing capture (M36b), a bounded FIFO reader, an O-6 grandchild guard with a direct check that now catches M38, truly permuted O-8 twins with a narrowed-binding assertion, and a feature-split runtime test with the release proof (M43). All gates are green. The new tests passed 3 of 3. Draft PR, not merged.
 _________________________________________________________________________________ 05:23 test/extension-stage-a-open-items
+
+time:      [05:38] [26-09-26]
+agent:     [claude]
+worktree:  ci/runtime-release-feature-proof
+type:      [gh-actions]
+area:      [testing]
+
+Closed the N1 finding from the #507 delta review. CI only ran cargo test --workspace, and the daemon's dev-dependency unifies ocean-runtime's test-support feature on in that build, so the release-shape proof that the fake-tool override is ignored was never compiled in CI. It also depended on the caller exporting OCEAN_FAKE_TOOL_TARGET_PATH. The proof test now sets the variable itself, and cargo xtask ci gains a gate, cargo test -p ocean-runtime --lib fake_tool, which builds ocean-runtime alone so the feature stays off. The xtask manifest test, the root and runtime AGENTS files, and the O-10 evidence row are updated. Mutation M43 (reading the variable without the feature) now fails the new gate with no environment set, and passes again once reverted.
+_________________________________________________________________________________ 05:38 ci/runtime-release-feature-proof

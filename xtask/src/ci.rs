@@ -25,6 +25,16 @@ const REPOSITORY_GATES: &[Gate] = &[
         args: &["test", "--workspace"],
         deny: false,
     },
+    // `cargo test --workspace` unifies ocean-runtime's dev-only `test-support`
+    // feature on through the daemon's dev-dependency, so the release-shape
+    // proof that the fake-tool override is ignored needs ocean-runtime built
+    // alone, where the feature stays off.
+    Gate {
+        label: "runtime release-feature proof",
+        program: "cargo",
+        args: &["test", "-p", "ocean-runtime", "--lib", "fake_tool"],
+        deny: false,
+    },
     Gate {
         label: "Clippy",
         program: "cargo",
@@ -363,6 +373,7 @@ mod tests {
             [
                 "cargo build --workspace",
                 "cargo test --workspace",
+                "cargo test -p ocean-runtime --lib fake_tool",
                 "cargo clippy --workspace --all-targets -- -D warnings",
                 "cargo fmt --all -- --check",
                 "cargo deny check",
