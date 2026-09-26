@@ -98,12 +98,15 @@ M1; M3's route contract is §9 of the spec; M2 still needs its manifest.
 Governed by [`docs/specs/2026-07-27-ocean-extension-stage-a-implementation-manifest.md`](docs/specs/2026-07-27-ocean-extension-stage-a-implementation-manifest.md);
 A1, A2a, and A2b are accepted.
 
-- [ ] A3a — internal transactional registry writer, journal/recovery, retention,
-      grant diff, and the first-publication marker: implemented on
-      `feat/extension-stage-a3a`, awaiting fresh independent review.
-- [ ] A3b — HTTP/CLI mutation surfaces, startup recovery wiring, and
-      revision-serialized supervisor reconciliation (after A3a review).
-- [ ] A4 — pinned public Git acquisition; A5 — integrated Stage A gate.
+- [x] A3a — internal transactional registry writer, journal/recovery, retention,
+      grant diff, and the first-publication marker: independently reviewed and
+      merged in PR #501.
+- [ ] A3b — §15 HTTP/CLI mutation surfaces (operator-authenticated), startup
+      recovery wiring, and revision-serialized supervisor reconciliation/reap:
+      implemented on `feat/extension-stage-a3b`, pending fresh independent
+      review and the credential-class ruling recorded in the manifest.
+- [ ] A4 — pinned public Git acquisition (next after the A3b review); A5 —
+      integrated Stage A gate.
 
 ## Ocean Observatory
 

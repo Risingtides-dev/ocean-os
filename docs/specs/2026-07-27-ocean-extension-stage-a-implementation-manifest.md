@@ -1033,8 +1033,8 @@ crash fixtures. No HTTP/CLI mutation routes, live supervisor reconciliation, or
 Git network acquisition. Tests invoke the internal authority and include
 acquisition outside the state lock.
 
-**A3a status (2026-09-25): implemented on `feat/extension-stage-a3a`, pending
-fresh independent review; not accepted.** The writer is
+**A3a status (2026-09-25): passed its independent review (delta approved) and
+merged to `main` by PR #501.** The writer is
 `crates/ocean-daemon/src/extension_registry/transaction.rs`, a child of the
 registry module. The first independent review (PR #501) requested changes and
 **ratified** the marker name/format, the rename order, and the bootstrap
@@ -1094,6 +1094,146 @@ and revision-serialized supervisor reconciliation/reap behavior over A3a.
 Status exposure is read-only/non-probing cached runtime projection, never a
 package probe. Its committed-202, CLI exit, active-service, and retry/reinspect
 tests land here. No Git network acquisition.
+
+**A3b status (2026-09-25): implemented on `feat/extension-stage-a3b` (draft PR),
+pending fresh independent review; not accepted. A4 is next after that review.**
+The HTTP adapters are `crates/ocean-daemon/src/extension_registry/mutation.rs`
+(a child of the registry module, beside the A3a writer); route composition stays
+in `main.rs`; the CLI verbs are `crates/ocean-cli/src/extension.rs`. Realization
+choices:
+
+- *Routes.* Eight method/path pairs join the two A0 reads: `GET
+  /v1/extensions`, `GET /v1/extensions/{id}/status`, `POST
+  /v1/extensions/install`, `POST /v1/extensions/{id}/trust|enable|disable|update`,
+  and `DELETE /v1/extensions/{id}`, exactly as the §15 table spells them. List
+  and status are §15 reads that no other slice could add; inspect, doctor, and
+  list carry the cached runtime summary as an additive `runtime` array (§10.2),
+  and status reads only that cache, so an id with no cached service answers an
+  empty list rather than probing the registry.
+- *Authentication (builder's reading; ruling requested).* §15 names no
+  credential class. Reads stay credential-free like the accepted A0 reads. Every
+  mutation route — including the trust preview, which shares its route — requires
+  the existing local operator principal (`room_operator.rs`): header-only
+  `X-Ocean-Operator`, cookie and foreign-origin refusal before comparison, 503
+  when the key or header is absent and 403 for invalid/ambient/foreign authority.
+  Handlers extract only headers, the raw path result, and the unread body, so
+  the order is exactly: credential, then `Content-Type: application/json`
+  (else 415 `unsupported_media_type`), then path, and only then is the body
+  (capped at 1 MiB) read and parsed. The reasons are the parent's "trust is
+  operator-owned" invariant, that trust+enable grants daemon-user-equivalent
+  native execution, and that every other authority-granting daemon mutation uses
+  this principal. Refusals use the §15 pre-commit envelope with
+  `state_revision: 0` (the writer's convention for "no registry read yet"). The
+  CLI reads `<config_dir>/operator.key` only through an `O_NOFOLLOW|O_NONBLOCK`
+  open of a single-link regular file owned by the caller that no other user can
+  read (bounded read), and refuses to send it to a non-loopback daemon URL.
+- *Envelopes.* Pre-commit and committed shapes are exactly §15's; a retryable
+  pre-commit code (`extension_state_busy`, `acquisition_capacity`) adds
+  `error.retryable: true`. Codes map to closed statuses: malformed/invalid 400,
+  absent 404, state preconditions (`state_revision_conflict`, `already_installed`,
+  `extension_active`, `trust_required`, `grant_confirmation_mismatch`, …) 409,
+  capacity 429, busy 503, operator 503/403, anything else 500. A committed
+  `registry_recovery_required` is the §15 500 with `committed: true`. The trust
+  preview is 200 `{applied:false, committed:false, state_revision, preview}`.
+- *Reconciliation.* The whole authorized operation — acquisition, commit, and
+  the reconcile request — runs in one detached task the handler only awaits, so
+  a client disconnect can never leave a committed revision unreconciled. The
+  route sends a registry command on the supervisor's existing project-snapshot
+  queue, so every reconciliation (project or registry) runs on the one
+  supervisor task in order; each pass reads the newest coherent generation
+  together with its `state_revision`. The envelope reports what THAT pass did
+  for the package: HTTP 200 means the pass read at least the committed revision
+  and completed, including any generation-safe reap of this package; a cleanup of
+  this package that cannot be proven is `reconciliation: pending, reap: pending`
+  (202); a 15 s timeout is `pending` (202, the queued pass still runs); an
+  unreadable registry is `blocked` (202). Only when no pass answered is the
+  ledger consulted: `reap` is then `pending` exactly when the package is no
+  longer registry-effective but still owns a process or temp root. A committed
+  retention cleanup the writer deferred to the next recovery is also reported as
+  `reap: pending`. If the task running a mutation dies (a panic that may be
+  after the commit point), the answer is HTTP 500 with `committed: null` and the
+  fixed code `outcome_unknown` ("reinspect by revision before retrying"), never
+  a `committed: false` guess; the CLI exits 5 for it and never retries. Any pass
+  that was blocked or left cleanup unproven — the
+  startup pass included — is re-run by the supervisor itself with exponential
+  backoff (0.5 s doubling to 30 s) until one completes.
+- *Failure isolation.* Stops always run. A retained cleanup authority that still
+  cannot be proven, or a stale service whose reap fails, withholds only a
+  replacement spawn of that same service key; every other stale service is still
+  stopped and every other package still reconciles, and the failure is reported
+  only for its own package. Temp-root cleanup makes each opened (no-follow)
+  directory owner-writable before removing its entries, so read-only trees a
+  service leaves behind (Go module caches are `0555`) are removable.
+- *Activation identity.* The global registry revision is not part of it, so an
+  unrelated commit (another package's install) never restarts a running
+  service. Instead it carries a boot-local per-package activation generation:
+  the committed revision of the package's last disable, trust, update, or
+  remove, recorded in a shared map by `reconcile_registry` BEFORE its command is
+  queued (so a send timeout can never lose it) and read by every pass when it
+  starts. A disable→enable pair committed before any pass ran therefore still
+  mints a new epoch and process (§7.2, §10.4) instead of collapsing to
+  "unchanged", and such a reset also discards restart/backoff/circuit history
+  (history survives only same-digest reconfiguration with no reset since the
+  service spawned), so the circuit closes as §10.4 requires; the replacement is
+  stopped with reason `disabled` after a disable/remove and `reconfigure` after
+  a trust/update. The cached `activation_revision`
+  is exactly the one the child received in `host_hello`. A service that is no
+  longer effective anywhere is stopped with `shutdown` reason `disabled`; one
+  whose activation identity changed, `reconfigure`.
+- *`ServiceActivity`.* The real supervisor keeps a per-package owner count —
+  every managed service task plus every retained exceptional cleanup authority —
+  and the writer's update/remove guard reads it synchronously. A package is
+  stopped only when nothing it spawned can still be alive or hold a connection
+  temp root, so a bounded reap failure keeps update/remove refused with
+  `extension_active`. A reconciliation pass registers itself BEFORE its
+  shared-lock registry read and until it finishes the writer refuses update and
+  remove with the distinct, retryable `reconciliation_in_progress`. The guard
+  takes ONE single-lock snapshot of both facts (pass registration, completion,
+  and every owner acquire/release share that lock, and a pass acquires its
+  spawns before it completes), never two separately locked reads a pass could
+  spawn between
+  (`error.retryable: true`; the CLI says to retry), so a remove or update can
+  never commit between a pass reading an older (still-enabled) generation and
+  spawning from it.
+- *Startup recovery* runs `RegistryWriter::recover` on the blocking pool inside
+  `start_extension_host`, which awaits it before creating and starting the
+  supervisor; `main` awaits that seam before any route is served. It is fail-soft for the daemon; a failure is logged by fixed
+  code and leaves readers and activation fail-closed.
+- *Blocking discipline.* The writer is constructed and every call, including
+  `acquire_exclusive_lock` and the acquisition permit, runs inside
+  `spawn_blocking`; the registered-project read is off the executor too.
+- *Busy readers.* A reader that exceeds its 250 ms shared-lock bound during a
+  large mutation answers 503 `{"ok":false,"error":"extension_state_busy","retryable":true}`
+  instead of the former 500; the CLI retries reads (never mutations) up to five
+  times.
+- *Git.* The §15 `{"kind":"git","url","revision"}` body and the CLI's `--git URL
+  --rev HEX` grammar parse strictly (no `subdir`), but acquisition is A4: the
+  route refuses with 501 `git_connection_pinning_unavailable` before any permit,
+  quarantine, DNS, or process.
+
+Recorded boundaries, not decided here:
+
+1. The mutation credential class above needs an operator ruling.
+2. §17 says a project disable that leaves another effective scope must not stop
+   the shared service. The accepted A2b supervisor treats every scope change as
+   an activation-identity change and restarts the service under a new epoch
+   (restart history preserved). A3b does not change the transport; narrowing a
+   live filter without a stop needs a supervisor change and review of its own.
+3. The first independent review (Knox) requested changes (retained-cleanup
+   isolation, detached commit+reconcile with supervisor retry, per-package
+   activation generation, behavioral guard tests, auth-before-parse, retryable
+   in-flight refusal, pass-derived envelopes, `host_hello`-consistent status,
+   loopback-only CLI key); all are repaired on the same branch and await delta
+   review. Mutation checks (`package_stopped` forced true, `begin_pass`
+   removed, startup recovery spawned or commented out, activation generation
+   zeroed) each now fail a test. The delta review judged it merge-ready and
+   asked for five more fixes, all folded in: the single-lock guard snapshot,
+   history reset on generation change, `outcome_unknown`, the generation bump
+   recorded before sending, and the JSON content-type check. The new tests were
+   mutation-checked the same way: separate reads in the guard, a snapshot that
+   ignores in-flight passes, and history kept across a reset each fail a test.
+4. Windows package management (R5 "may manage") remains open: the writer is
+   Unix-only, so non-Unix mutation routes answer 409 `unsupported_platform`.
 
 ### A4 — pinned public Git acquisition
 

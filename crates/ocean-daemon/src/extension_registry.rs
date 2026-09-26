@@ -67,6 +67,47 @@ use super::AppState;
 #[cfg(all(unix, any(test, not(feature = "registry-portability-check"))))]
 pub(crate) mod transaction;
 
+/// Stage A3b §15 HTTP mutation surfaces over the A3a writer: operator
+/// authentication, strict bodies, the common pre-commit/committed envelopes,
+/// and post-commit supervisor reconciliation. Route composition stays in
+/// `main.rs`.
+#[cfg(any(test, not(feature = "registry-portability-check")))]
+pub(crate) mod mutation;
+
+/// Inert stand-ins for the source-inclusion portability mode, which removes
+/// only AppState/Axum coupling; the harness never mounts a router.
+#[cfg(all(feature = "registry-portability-check", not(test)))]
+pub(crate) mod mutation {
+    pub(crate) async fn install() {}
+    pub(crate) async fn update() {}
+    pub(crate) async fn trust() {}
+    pub(crate) async fn enable() {}
+    pub(crate) async fn disable() {}
+    pub(crate) async fn remove() {}
+}
+
+/// A3b: the supervisor's answer to "is the committed revision reconciled for
+/// this package?". Both the native and the unsupported-platform supervisor
+/// return it, so the mutation routes map one vocabulary onto §15's envelope.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SupervisorReconcile {
+    /// Reconciled at (or past) the committed revision. `reaped` is true when
+    /// that pass stopped and generation-safely reaped a service of the
+    /// package.
+    Complete { reaped: bool },
+    /// The pass ran, but a stopped generation's group/temp-root cleanup could
+    /// not be proven; the supervisor retains that authority.
+    CleanupIncomplete,
+    /// Queued behind other passes or timed out; it still runs in order (and
+    /// is retried with backoff if it fails). `owned` is whether the package
+    /// still owns a process or temp root per the supervisor's ledger.
+    Pending { owned: bool },
+    /// No coherent registry generation could be read (for example after a
+    /// committed `registry_recovery_required`) or no supervisor exists, so
+    /// nothing was reconciled; the supervisor retries with backoff.
+    Blocked { owned: bool },
+}
+
 const STATE_SCHEMA_VERSION: u32 = 1;
 const STATE_FILE_LIMIT: u64 = 1024 * 1024;
 const MANIFEST_FILE_LIMIT: u64 = 1024 * 1024;
@@ -2001,21 +2042,34 @@ pub(crate) fn read_unsupported_service_activations(
 
 /// Read one coherent generation and derive only exact-grant, currently effective
 /// native service activations. No package code or secret value is touched.
+#[cfg(test)]
 pub(crate) fn read_service_activations(
     config_dir: &FsPath,
     registered_projects: &HashSet<Uuid>,
 ) -> Result<Vec<ServiceActivation>, StateError> {
+    read_service_activation_generation(config_dir, registered_projects)
+        .map(|(_, activations)| activations)
+}
+
+/// Every effective native service activation together with the one coherent
+/// `state_revision` it was derived from, so supervisor reconciliation can be
+/// serialized by the registry generation it actually read (§10.1).
+pub(crate) fn read_service_activation_generation(
+    config_dir: &FsPath,
+    registered_projects: &HashSet<Uuid>,
+) -> Result<(u64, Vec<ServiceActivation>), StateError> {
     #[cfg(not(any(target_os = "macos", target_os = "linux")))]
     {
         let _ = (config_dir, registered_projects);
-        return Ok(Vec::new());
+        return Ok((0, Vec::new()));
     }
 
     #[cfg(any(target_os = "macos", target_os = "linux"))]
     {
         let state = read_locked_state(config_dir)?;
+        let revision = state.snapshot.revision;
         let Some(root) = state.root.as_ref() else {
-            return Ok(Vec::new());
+            return Ok((revision, Vec::new()));
         };
         let canonical_config =
             fs::canonicalize(config_dir).map_err(|_| StateError::Read("config directory"))?;
@@ -2162,7 +2216,7 @@ pub(crate) fn read_service_activations(
                 });
             }
         }
-        Ok(activations)
+        Ok((revision, activations))
     }
 }
 
@@ -2491,13 +2545,12 @@ enum LoadError {
     Join,
 }
 
+/// Validate an optional `project_id` query against the registered projects.
 #[cfg(any(test, not(feature = "registry-portability-check")))]
-async fn load_inspection(
-    state: AppState,
-    id: String,
-    query: ExtensionStateQuery,
-) -> Result<Option<ExtensionInspection>, LoadError> {
-    validate_extension_id(&id).map_err(|_| LoadError::BadExtensionId)?;
+fn resolve_project_query(
+    state: &AppState,
+    query: &ExtensionStateQuery,
+) -> Result<(Option<Uuid>, HashSet<Uuid>), LoadError> {
     let project_id = query
         .project_id
         .as_deref()
@@ -2512,6 +2565,35 @@ async fn load_inspection(
     if project_id.is_some_and(|id| !registered.contains(&id)) {
         return Err(LoadError::ProjectNotFound);
     }
+    Ok((project_id, registered))
+}
+
+/// The supervisor's cached runtime projection for one package (§10.2). Reads
+/// the in-memory cache only: it starts, probes, and opens nothing.
+#[cfg(any(test, not(feature = "registry-portability-check")))]
+fn runtime_summary(state: &AppState, id: &str) -> Value {
+    let statuses = state
+        .extension_supervisor
+        .as_ref()
+        .map(|supervisor| supervisor.status_cache().snapshot())
+        .unwrap_or_default();
+    Value::Array(
+        statuses
+            .into_iter()
+            .filter(|status| status.package_id() == id)
+            .filter_map(|status| serde_json::to_value(status).ok())
+            .collect(),
+    )
+}
+
+#[cfg(any(test, not(feature = "registry-portability-check")))]
+async fn load_inspection(
+    state: AppState,
+    id: String,
+    query: ExtensionStateQuery,
+) -> Result<Option<ExtensionInspection>, LoadError> {
+    validate_extension_id(&id).map_err(|_| LoadError::BadExtensionId)?;
+    let (project_id, registered) = resolve_project_query(&state, &query)?;
     let permit = inspection_limiter()
         .try_acquire_owned()
         .map_err(|_| LoadError::Capacity)?;
@@ -2533,9 +2615,51 @@ async fn load_inspection(
     .map_err(|_| LoadError::Join)?
 }
 
+/// Every extension id with any registry state, inspected from ONE coherent
+/// shared-lock generation.
+#[cfg(any(test, not(feature = "registry-portability-check")))]
+async fn load_listing(
+    state: AppState,
+    query: ExtensionStateQuery,
+) -> Result<(u64, Vec<ExtensionInspection>), LoadError> {
+    let (project_id, registered) = resolve_project_query(&state, &query)?;
+    let permit = inspection_limiter()
+        .try_acquire_owned()
+        .map_err(|_| LoadError::Capacity)?;
+    let config_dir = state.runtime.config_dir().to_path_buf();
+    tokio::task::spawn_blocking(move || {
+        let _permit = permit;
+        let locked = read_locked_state(&config_dir).map_err(LoadError::State)?;
+        let host_version = Version::parse(env!("CARGO_PKG_VERSION"))
+            .expect("daemon package version is valid SemVer");
+        let snapshot = &locked.snapshot;
+        let ids: BTreeSet<&str> = snapshot
+            .installs
+            .iter()
+            .map(|install| install.id.as_str())
+            .chain(snapshot.grants.iter().map(|grant| grant.id.as_str()))
+            .chain(snapshot.enablement.iter().map(|entry| entry.id.as_str()))
+            .collect();
+        let listed = ids
+            .into_iter()
+            .filter_map(|id| inspect_extension(&locked, id, project_id, &registered, &host_version))
+            .collect();
+        Ok((snapshot.revision, listed))
+    })
+    .await
+    .map_err(|_| LoadError::Join)?
+}
+
 #[cfg(any(test, not(feature = "registry-portability-check")))]
 fn load_error_response(error: LoadError, doctor: bool) -> (StatusCode, Json<Value>) {
     match error {
+        // A mutation holds `.state.lock` exclusively while it rehashes and
+        // publishes; a reader that exceeds its 250 ms bound saw nothing
+        // incoherent and may simply retry (A3a obligation).
+        LoadError::State(StateError::LockBusy) => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({"ok": false, "error": "extension_state_busy", "retryable": true})),
+        ),
         LoadError::BadExtensionId => (
             StatusCode::BAD_REQUEST,
             Json(json!({"ok": false, "error": "invalid_extension_id"})),
@@ -2590,11 +2714,14 @@ pub(super) async fn inspect(
     Path(id): Path<String>,
     Query(query): Query<ExtensionStateQuery>,
 ) -> (StatusCode, Json<Value>) {
-    match load_inspection(state, id, query).await {
-        Ok(Some(inspection)) => (
-            StatusCode::OK,
-            Json(json!({"ok": true, "extension": inspection})),
-        ),
+    match load_inspection(state.clone(), id, query).await {
+        Ok(Some(inspection)) => {
+            let runtime = runtime_summary(&state, &inspection.id);
+            (
+                StatusCode::OK,
+                Json(json!({"ok": true, "extension": inspection, "runtime": runtime})),
+            )
+        }
         Ok(None) => (
             StatusCode::NOT_FOUND,
             Json(json!({"ok": false, "error": "extension_not_found"})),
@@ -2611,8 +2738,9 @@ pub(super) async fn doctor(
     Path(id): Path<String>,
     Query(query): Query<ExtensionStateQuery>,
 ) -> (StatusCode, Json<Value>) {
-    match load_inspection(state, id, query).await {
+    match load_inspection(state.clone(), id, query).await {
         Ok(Some(inspection)) => {
+            let runtime = runtime_summary(&state, &inspection.id);
             let healthy = !inspection
                 .diagnostics
                 .iter()
@@ -2632,7 +2760,8 @@ pub(super) async fn doctor(
                     "ok": healthy,
                     "extension": inspection,
                     "checks": checks,
-                    "diagnostics": diagnostics
+                    "diagnostics": diagnostics,
+                    "runtime": runtime
                 })),
             )
         }
@@ -2641,6 +2770,94 @@ pub(super) async fn doctor(
             Json(json!({"ok": false, "error": "extension_not_found"})),
         ),
         Err(error) => load_error_response(error, true),
+    }
+}
+
+/// `GET /v1/extensions`: every extension with registry state, each with the
+/// same inspection projection and cached runtime summary as inspect. Executes
+/// and probes nothing.
+#[cfg(any(test, not(feature = "registry-portability-check")))]
+pub(super) async fn list(
+    State(state): State<AppState>,
+    Query(query): Query<ExtensionStateQuery>,
+) -> (StatusCode, Json<Value>) {
+    match load_listing(state.clone(), query).await {
+        Ok((state_revision, inspections)) => {
+            let extensions: Vec<Value> = inspections
+                .into_iter()
+                .map(|inspection| {
+                    let runtime = runtime_summary(&state, &inspection.id);
+                    json!({"extension": inspection, "runtime": runtime})
+                })
+                .collect();
+            (
+                StatusCode::OK,
+                Json(json!({
+                    "ok": true,
+                    "state_revision": state_revision,
+                    "extensions": extensions
+                })),
+            )
+        }
+        Err(error) => load_error_response(error, false),
+    }
+}
+
+/// `GET /v1/extensions/{id}/status`: the supervisor's cached runtime
+/// projection only (§10.2). It reads no package, starts nothing, and probes
+/// nothing; an id with no live or cached service answers an empty list.
+#[cfg(any(test, not(feature = "registry-portability-check")))]
+pub(super) async fn status(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> (StatusCode, Json<Value>) {
+    if validate_extension_id(&id).is_err() {
+        return load_error_response(LoadError::BadExtensionId, false);
+    }
+    let services = runtime_summary(&state, &id);
+    (
+        StatusCode::OK,
+        Json(json!({"ok": true, "id": id, "probe_run": false, "services": services})),
+    )
+}
+
+/// §12.3: journal-proven recovery at daemon startup, before any registry
+/// reader or service reconciliation. It is fail-soft for the daemon — an
+/// optional extension never blocks startup — but a failure leaves the
+/// registry fail-closed for readers and activation, logged by fixed code only.
+#[cfg(any(test, not(feature = "registry-portability-check")))]
+pub(crate) async fn recover_at_startup(config_dir: PathBuf) {
+    #[cfg(unix)]
+    {
+        let recovery = tokio::task::spawn_blocking(move || {
+            transaction::RegistryWriter::new(config_dir).recover()
+        })
+        .await;
+        match recovery {
+            Ok(Ok(report)) => {
+                if report != transaction::RecoveryReport::default() {
+                    tracing::info!(
+                        rolled_back = report.rolled_back,
+                        rolled_forward = report.rolled_forward,
+                        cleanup_pending = report.cleanup_pending,
+                        orphans_removed = report.orphans_removed,
+                        "extension registry startup recovery completed"
+                    );
+                }
+            }
+            Ok(Err(error)) => tracing::warn!(
+                reason = error.code,
+                "extension registry startup recovery failed; extension activation stays fail-closed"
+            ),
+            Err(_) => tracing::warn!(
+                reason = "registry_recovery_join_failed",
+                "extension registry startup recovery failed; extension activation stays fail-closed"
+            ),
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = config_dir;
     }
 }
 
@@ -2653,6 +2870,15 @@ pub(super) async fn inspect() {}
 
 #[cfg(all(feature = "registry-portability-check", not(test)))]
 pub(super) async fn doctor() {}
+
+#[cfg(all(feature = "registry-portability-check", not(test)))]
+pub(super) async fn list() {}
+
+#[cfg(all(feature = "registry-portability-check", not(test)))]
+pub(super) async fn status() {}
+
+#[cfg(all(feature = "registry-portability-check", not(test)))]
+pub(crate) async fn recover_at_startup(_config_dir: PathBuf) {}
 
 #[cfg(test)]
 mod tests {

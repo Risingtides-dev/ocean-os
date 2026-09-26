@@ -18,13 +18,13 @@
 //!   missing or corrupt after the commit point;
 //! - the exact §12.4 retention transitions and §14 grant preview/apply.
 //!
-//! It exposes no HTTP/CLI route, performs no supervisor reconciliation, and
-//! acquires no Git source; those belong to A3b and A4. Nothing here executes
-//! package code: acquisition copies and hashes bytes only.
-
-// A3a lands the internal authority only. A3b composes it into routes, so
-// outside tests nothing calls it yet.
-#![cfg_attr(not(test), allow(dead_code))]
+//! It exposes no HTTP/CLI route itself, performs no supervisor
+//! reconciliation, and acquires no Git source: A3b's sibling `mutation`
+//! module composes it into the §15 routes (always through `spawn_blocking`)
+//! and reconciles the supervisor after each commit, and daemon startup calls
+//! [`RegistryWriter::recover`] before any reader or service starts; Git is A4.
+//! Nothing here executes package code: acquisition copies and hashes bytes
+//! only.
 
 use std::collections::BTreeMap;
 use std::ffi::{CStr, CString};
@@ -89,6 +89,7 @@ enum Fail {
     Reject(&'static str),
     /// Test-only simulated process death: skip every in-process cleanup,
     /// rollback, and roll-forward, exactly as a crash would.
+    #[cfg_attr(not(test), allow(dead_code))]
     Crash,
 }
 
@@ -136,6 +137,9 @@ impl MutationError {
             "extension_not_installed" => "extension is not installed",
             "extension_not_found" => "extension has no registry state",
             "extension_active" => "extension must be fully disabled and stopped",
+            "reconciliation_in_progress" => {
+                "extension service reconciliation is in progress; retry shortly"
+            }
             "digest_mismatch" => "digest does not match the installed artifact",
             "artifact_unavailable" => "installed artifact is missing or does not verify",
             "artifact_store_conflict" => "stored payload for this digest does not verify",
@@ -202,6 +206,38 @@ pub(crate) enum EnablementScope {
 /// supervisor; a package is stopped when no process/temp root it owns remains.
 pub(crate) trait ServiceActivity {
     fn package_stopped(&self, package_id: &str) -> bool;
+
+    /// A reconciliation pass is in flight and may still spawn from a
+    /// generation it read before this writer's commit. Update/remove refuse
+    /// with the retryable `reconciliation_in_progress` rather than race it.
+    fn reconciliation_in_progress(&self) -> bool {
+        false
+    }
+
+    /// Both facts as ONE consistent reading, which is what the guard uses.
+    /// Two independent reads leave a gap: a pass in flight during the
+    /// `package_stopped` read could spawn the package and finish before the
+    /// `reconciliation_in_progress` read, and both would then say "go". A
+    /// ledger overrides this with a single-lock snapshot. The default reads
+    /// in-progress FIRST: a pass that registers after that read necessarily
+    /// reads the registry after this writer's exclusive-lock commit, so it can
+    /// only spawn from the committed generation.
+    fn snapshot(&self, package_id: &str) -> ActivitySnapshot {
+        let reconciling = self.reconciliation_in_progress();
+        ActivitySnapshot {
+            stopped: self.package_stopped(package_id),
+            reconciling,
+        }
+    }
+}
+
+/// One consistent reading of a package's supervisor activity.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ActivitySnapshot {
+    /// No managed task or retained cleanup authority of the package remains.
+    pub(crate) stopped: bool,
+    /// Some reconciliation pass is registered and not yet finished.
+    pub(crate) reconciling: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
@@ -425,6 +461,7 @@ pub(crate) struct AcquisitionLease {
 }
 
 impl AcquisitionLease {
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn operation_id(&self) -> Uuid {
         self.operation_id
     }
@@ -455,6 +492,7 @@ pub(crate) struct VerifiedQuarantine {
 }
 
 impl VerifiedQuarantine {
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn digest(&self) -> &str {
         &self.digest
     }
@@ -489,7 +527,7 @@ impl RegistryWriter {
     }
 
     #[cfg(test)]
-    fn crash_at(&self, point: Option<CrashPoint>) {
+    pub(crate) fn crash_at(&self, point: Option<CrashPoint>) {
         *self.crash_at.lock().unwrap() = point;
     }
 
@@ -1391,8 +1429,14 @@ fn require_disabled_and_stopped(
     id: &str,
     activity: &dyn ServiceActivity,
 ) -> Step<()> {
-    if !fully_disabled(snapshot, id) || !activity.package_stopped(id) {
+    // One reading of both facts (see `ServiceActivity::snapshot`): never two
+    // separately locked reads a pass could spawn between.
+    let now = activity.snapshot(id);
+    if !fully_disabled(snapshot, id) || !now.stopped {
         return Err(Fail::Reject("extension_active"));
+    }
+    if now.reconciling {
+        return Err(Fail::Reject("reconciliation_in_progress"));
     }
     Ok(())
 }
