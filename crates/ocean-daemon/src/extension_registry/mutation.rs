@@ -11,17 +11,24 @@
 //! - Every mutation (and trust preview, which shares its route) requires the
 //!   local operator principal from [`crate::room_operator`]: header-only
 //!   `X-Ocean-Operator`, cookie/foreign-origin refusal before comparison,
-//!   fail-closed 503 when no key is configured. Authentication runs before the
-//!   body is parsed, so an unauthenticated caller learns nothing about
-//!   validation.
+//!   fail-closed 503 when no key is configured. Handlers extract only
+//!   infallible parts (headers, the raw path result, raw body bytes), so
+//!   authentication really runs before the path or body is parsed and an
+//!   unauthenticated caller learns nothing about validation.
+//! - Once authorized, the operation — acquisition, commit, and the
+//!   post-commit reconciliation request — runs in one detached task the
+//!   handler merely awaits. A client disconnect therefore can never commit a
+//!   revision without also asking the supervisor to reconcile it.
 //! - The writer is blocking filesystem code that may sleep on `.state.lock`
-//!   (250 ms) or the acquisition gate: it runs only inside `spawn_blocking`,
-//!   never on an async worker.
+//!   (250 ms) or the acquisition gate: it is constructed and run only inside
+//!   `spawn_blocking`, never on an async worker. The project registry read is
+//!   off the executor too.
 //! - A pre-commit failure always says `committed:false` with the previously
 //!   effective revision. A commit is never reported as an error: when the
 //!   supervisor cannot confirm reconciliation or reap, the response is the
 //!   committed envelope at HTTP 202, and the committed revision is
-//!   authoritative immediately.
+//!   authoritative immediately. The supervisor itself re-runs a blocked or
+//!   incomplete pass with backoff.
 //! - No response carries a path, secret value, package byte, or stderr: codes
 //!   are closed and messages are fixed text.
 //! - Git sources are part of the §15 body grammar but belong to slice A4. Until
@@ -32,17 +39,20 @@
 use std::collections::HashSet;
 
 use axum::{
-    extract::{rejection::JsonRejection, Path, State},
+    body::Bytes,
+    extract::{
+        rejection::{BytesRejection, PathRejection},
+        Path, State,
+    },
     http::{HeaderMap, StatusCode},
     response::{IntoResponse, Response},
     Json,
 };
-use serde::{Deserialize, Serialize};
+use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use serde_json::{json, Value};
 use uuid::Uuid;
 
 use super::SupervisorReconcile;
-use crate::room_operator::OperatorAuthError;
 use crate::AppState;
 
 #[cfg(unix)]
@@ -52,7 +62,11 @@ use super::transaction::{
 };
 
 /// Codes a caller may simply retry after a short wait: nothing was written.
-const RETRYABLE: [&str; 2] = ["extension_state_busy", "acquisition_capacity"];
+const RETRYABLE: [&str; 3] = [
+    "extension_state_busy",
+    "acquisition_capacity",
+    "reconciliation_in_progress",
+];
 
 // ---------------------------------------------------------------------------
 // Request bodies. Every object denies unknown fields (§15).
@@ -110,6 +124,12 @@ pub(crate) struct RemoveRequest {
     purge_state: bool,
 }
 
+/// The trust body is the writer's own strict `TrustRequest` on Unix.
+#[cfg(unix)]
+type TrustBody = TrustRequest;
+#[cfg(not(unix))]
+type TrustBody = Value;
+
 // ---------------------------------------------------------------------------
 // Envelopes.
 // ---------------------------------------------------------------------------
@@ -132,13 +152,13 @@ pub(crate) enum Reap {
     Pending,
 }
 
-/// Map the supervisor's answer onto the two envelope fields.
+/// Map the supervisor's answer for THIS package onto the two envelope fields.
 ///
-/// - `effective` is the registry-derived post-commit effectiveness of the
-///   package; `stopped` is the supervisor's synchronous activity projection.
-///   When the supervisor could not answer, a package that is no longer
-///   effective but still owns a process or temp root has a reap outstanding;
-///   anything else has nothing to reap.
+/// - `Complete`/`CleanupIncomplete` are what the pass itself did for the
+///   package (stopped and reaped, or could not prove cleanup).
+/// - When no pass answered (`Pending`/`Blocked`), a package that is no longer
+///   registry-`effective` but still `owned` a process or temp root has a reap
+///   outstanding; anything else has nothing to reap.
 /// - A committed retention cleanup (payload/state-root deletion) that the
 ///   writer deferred to the next recovery is reported as a pending reap: the
 ///   registry generation is coherent, but the package's bytes are not yet
@@ -146,13 +166,14 @@ pub(crate) enum Reap {
 pub(crate) fn envelope_states(
     reconcile: SupervisorReconcile,
     effective: bool,
-    stopped: bool,
     retention_cleanup_pending: bool,
 ) -> (Reconciliation, Reap) {
-    let outstanding = if !effective && !stopped {
-        Reap::Pending
-    } else {
-        Reap::NotRequired
+    let outstanding = |owned: bool| {
+        if !effective && owned {
+            Reap::Pending
+        } else {
+            Reap::NotRequired
+        }
     };
     let (reconciliation, reap) = match reconcile {
         SupervisorReconcile::Complete { reaped: true } => {
@@ -162,8 +183,8 @@ pub(crate) fn envelope_states(
             (Reconciliation::Complete, Reap::NotRequired)
         }
         SupervisorReconcile::CleanupIncomplete => (Reconciliation::Pending, Reap::Pending),
-        SupervisorReconcile::Pending => (Reconciliation::Pending, outstanding),
-        SupervisorReconcile::Blocked => (Reconciliation::Blocked, outstanding),
+        SupervisorReconcile::Pending { owned } => (Reconciliation::Pending, outstanding(owned)),
+        SupervisorReconcile::Blocked { owned } => (Reconciliation::Blocked, outstanding(owned)),
     };
     let reap = if retention_cleanup_pending {
         Reap::Pending
@@ -244,6 +265,7 @@ pub(crate) fn precommit_status(code: &str) -> StatusCode {
         "already_installed"
         | "state_revision_conflict"
         | "extension_active"
+        | "reconciliation_in_progress"
         | "grant_confirmation_mismatch"
         | "trust_required"
         | "service_grant_required"
@@ -320,10 +342,6 @@ fn mutation_error(error: MutationError) -> Response {
     }
 }
 
-fn operator_code(error: OperatorAuthError) -> &'static str {
-    error.code()
-}
-
 /// A refusal decided before any registry read: a closed code that becomes the
 /// pre-commit envelope with a fresh operation id and `state_revision: 0`.
 type Refusal = &'static str;
@@ -332,26 +350,56 @@ fn refuse(code: Refusal) -> Response {
     precommit(Uuid::new_v4(), 0, code)
 }
 
-/// Operator principal check shared by every route here. Runs before the body
-/// is examined.
+// ---------------------------------------------------------------------------
+// Request intake: authenticate first, then parse.
+// ---------------------------------------------------------------------------
+
+/// Operator principal check. Runs before the path or body is examined.
 fn authorize(state: &AppState, headers: &HeaderMap) -> Result<(), Refusal> {
     state
         .room_operator
         .authorize(headers)
         .map(|_| ())
-        .map_err(operator_code)
+        .map_err(|error| error.code())
 }
 
-fn body<T>(body: Result<Json<T>, JsonRejection>) -> Result<T, Refusal> {
-    body.map(|Json(value)| value).map_err(|_| "invalid_request")
+fn parse_body<T: DeserializeOwned>(body: Result<Bytes, BytesRejection>) -> Result<T, Refusal> {
+    let bytes = body.map_err(|_| "invalid_request")?;
+    serde_json::from_slice(&bytes).map_err(|_| "invalid_request")
 }
 
-fn registered_projects(state: &AppState) -> Result<HashSet<Uuid>, Refusal> {
-    state
-        .runtime
-        .list_projects()
-        .map(|projects| projects.into_iter().map(|project| project.id).collect())
-        .map_err(|_| "project_registry_unavailable")
+fn parse_path(path: Result<Path<String>, PathRejection>) -> Result<String, Refusal> {
+    path.map(|Path(id)| id).map_err(|_| "invalid_extension_id")
+}
+
+/// Authenticate, then parse. The returned values are only ever produced for an
+/// authorized caller.
+fn intake<T: DeserializeOwned>(
+    state: &AppState,
+    headers: &HeaderMap,
+    path: Option<Result<Path<String>, PathRejection>>,
+    body: Result<Bytes, BytesRejection>,
+) -> Result<(Option<String>, T), Refusal> {
+    authorize(state, headers)?;
+    let id = path.map(parse_path).transpose()?;
+    let body = parse_body(body)?;
+    Ok((id, body))
+}
+
+/// Run the authorized operation in a detached task and await it. Dropping the
+/// handler future (client disconnect) cannot cancel the commit or the
+/// post-commit reconciliation request that follows it.
+async fn detached(work: impl std::future::Future<Output = Response> + Send + 'static) -> Response {
+    tokio::spawn(work).await.unwrap_or_else(|_| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({
+                "ok": false,
+                "error": {"code": "extension_state_unavailable", "message": message_for("extension_state_unavailable")}
+            })),
+        )
+            .into_response()
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -361,7 +409,7 @@ fn registered_projects(state: &AppState) -> Result<HashSet<Uuid>, Refusal> {
 
 /// The real supervisor's synchronous activity projection, bound to the
 /// writer's update/remove guard. With no supervisor there is no process a
-/// package could own.
+/// package could own and no pass in flight.
 #[cfg(unix)]
 struct SupervisorActivity(Option<crate::extension_service::ServiceActivityLedger>);
 
@@ -371,6 +419,12 @@ impl ServiceActivity for SupervisorActivity {
         self.0
             .as_ref()
             .is_none_or(|ledger| ledger.package_stopped(package_id))
+    }
+
+    fn reconciliation_in_progress(&self) -> bool {
+        self.0
+            .as_ref()
+            .is_some_and(|ledger| ledger.reconciliation_in_progress())
     }
 }
 
@@ -384,37 +438,52 @@ fn activity(state: &AppState) -> SupervisorActivity {
     )
 }
 
-/// Run one blocking writer operation off the async workers.
+/// Construct the writer and run one blocking operation on the blocking pool.
 #[cfg(unix)]
 async fn blocking<T: Send + 'static>(
     state: &AppState,
     operation: impl FnOnce(RegistryWriter) -> Result<T, MutationError> + Send + 'static,
 ) -> Result<T, Response> {
-    let writer = RegistryWriter::new(state.runtime.config_dir().to_path_buf());
-    match tokio::task::spawn_blocking(move || operation(writer)).await {
+    let config_dir = state.runtime.config_dir().to_path_buf();
+    match tokio::task::spawn_blocking(move || operation(RegistryWriter::new(config_dir))).await {
         Ok(result) => result.map_err(mutation_error),
-        Err(_) => Err(precommit(Uuid::new_v4(), 0, "extension_state_unavailable")),
+        Err(_) => Err(refuse("extension_state_unavailable")),
+    }
+}
+
+/// Registered project ids, read off the async executor.
+#[cfg(unix)]
+async fn registered_projects(state: &AppState) -> Result<HashSet<Uuid>, Response> {
+    let runtime = std::sync::Arc::clone(&state.runtime);
+    match tokio::task::spawn_blocking(move || runtime.list_projects()).await {
+        Ok(Ok(projects)) => Ok(projects.into_iter().map(|project| project.id).collect()),
+        _ => Err(refuse("project_registry_unavailable")),
     }
 }
 
 /// Reconcile the supervisor to the committed revision and answer with the
 /// common committed envelope. Never retried here and never turned into an
-/// error: the commit already happened.
+/// error: the commit already happened. `resets_activation` marks commits that
+/// changed the package's trust or may have ended its effectiveness, so the
+/// supervisor mints a new activation epoch even if a later commit restored an
+/// identical descriptor before any pass ran.
 #[cfg(unix)]
-async fn committed(state: &AppState, outcome: MutationOutcome) -> Response {
+async fn committed(
+    state: &AppState,
+    outcome: MutationOutcome,
+    resets_activation: bool,
+) -> Response {
     let reconcile = match &state.extension_supervisor {
         Some(supervisor) => {
             supervisor
-                .reconcile_registry(outcome.state_revision, &outcome.id)
+                .reconcile_registry(outcome.state_revision, &outcome.id, resets_activation)
                 .await
         }
-        None => SupervisorReconcile::Blocked,
+        None => SupervisorReconcile::Blocked { owned: false },
     };
-    let stopped = activity(state).package_stopped(&outcome.id);
     let (reconciliation, reap) = envelope_states(
         reconcile,
         outcome.effective,
-        stopped,
         outcome.retention_cleanup_pending,
     );
     (
@@ -454,8 +523,27 @@ fn enablement_scope(scope: ScopeRequest) -> EnablementScope {
     }
 }
 
+/// Commit one writer operation, then reconcile, inside the caller's detached
+/// task.
+#[cfg(unix)]
+async fn commit_and_reconcile(
+    state: AppState,
+    resets_activation: bool,
+    operation: impl FnOnce(RegistryWriter) -> Result<MutationOutcome, MutationError> + Send + 'static,
+) -> Response {
+    match blocking(&state, operation).await {
+        Ok(outcome) => committed(&state, outcome, resets_activation).await,
+        Err(refusal) => refusal,
+    }
+}
+
+#[cfg(not(unix))]
+fn unsupported() -> Response {
+    refuse("unsupported_platform")
+}
+
 // ---------------------------------------------------------------------------
-// Handlers.
+// Handlers. Each extracts only infallible parts, authenticates, then parses.
 // ---------------------------------------------------------------------------
 
 /// `POST /v1/extensions/install`: acquire into quarantine WITHOUT the state
@@ -463,13 +551,10 @@ fn enablement_scope(scope: ScopeRequest) -> EnablementScope {
 pub(crate) async fn install(
     State(state): State<AppState>,
     headers: HeaderMap,
-    request: Result<Json<InstallRequest>, JsonRejection>,
+    body: Result<Bytes, BytesRejection>,
 ) -> Response {
-    if let Err(code) = authorize(&state, &headers) {
-        return refuse(code);
-    }
-    let request = match body(request) {
-        Ok(request) => request,
+    let request: InstallRequest = match intake(&state, &headers, None, body) {
+        Ok((_, request)) => request,
         Err(code) => return refuse(code),
     };
     #[cfg(unix)]
@@ -479,20 +564,16 @@ pub(crate) async fn install(
             Err(code) => return refuse(code),
         };
         let expected = request.expected_state_revision;
-        match blocking(&state, move |writer| {
+        detached(commit_and_reconcile(state, false, move |writer| {
             let quarantine = writer.acquire_local(&path)?;
             writer.install(expected, quarantine)
-        })
+        }))
         .await
-        {
-            Ok(outcome) => committed(&state, outcome).await,
-            Err(refusal) => refusal,
-        }
     }
     #[cfg(not(unix))]
     {
-        let _ = request;
-        precommit(Uuid::new_v4(), 0, "unsupported_platform")
+        let _ = (state, request);
+        unsupported()
     }
 }
 
@@ -500,21 +581,20 @@ pub(crate) async fn install(
 /// stopped; the replacement digest is untrusted until a separate trust.
 pub(crate) async fn update(
     State(state): State<AppState>,
-    Path(id): Path<String>,
     headers: HeaderMap,
-    request: Result<Json<UpdateRequest>, JsonRejection>,
+    path: Result<Path<String>, PathRejection>,
+    body: Result<Bytes, BytesRejection>,
 ) -> Response {
-    if let Err(code) = authorize(&state, &headers) {
-        return refuse(code);
-    }
-    let request = match body(request) {
-        Ok(request) => request,
-        Err(code) => return refuse(code),
-    };
+    let (id, request): (Option<String>, UpdateRequest) =
+        match intake(&state, &headers, Some(path), body) {
+            Ok(parsed) => parsed,
+            Err(code) => return refuse(code),
+        };
+    let id = id.unwrap_or_default();
     #[cfg(unix)]
     {
         if ocean_extension::validate_extension_id(&id).is_err() {
-            return precommit(Uuid::new_v4(), 0, "invalid_extension_id");
+            return refuse("invalid_extension_id");
         }
         let path = match local_path(request.source) {
             Ok(path) => path,
@@ -522,20 +602,16 @@ pub(crate) async fn update(
         };
         let expected = request.expected_state_revision;
         let activity = activity(&state);
-        match blocking(&state, move |writer| {
+        detached(commit_and_reconcile(state, true, move |writer| {
             let quarantine = writer.acquire_local(&path)?;
             writer.update(&id, expected, quarantine, &activity)
-        })
+        }))
         .await
-        {
-            Ok(outcome) => committed(&state, outcome).await,
-            Err(refusal) => refusal,
-        }
     }
     #[cfg(not(unix))]
     {
-        let _ = (id, request);
-        precommit(Uuid::new_v4(), 0, "unsupported_platform")
+        let _ = (state, id, request);
+        unsupported()
     }
 }
 
@@ -544,63 +620,59 @@ pub(crate) async fn update(
 /// confirmation (common committed envelope).
 pub(crate) async fn trust(
     State(state): State<AppState>,
-    Path(id): Path<String>,
     headers: HeaderMap,
-    request: Result<Json<TrustBody>, JsonRejection>,
+    path: Result<Path<String>, PathRejection>,
+    body: Result<Bytes, BytesRejection>,
 ) -> Response {
-    if let Err(code) = authorize(&state, &headers) {
-        return refuse(code);
-    }
-    let request = match body(request) {
-        Ok(request) => request,
-        Err(code) => return refuse(code),
-    };
+    let (id, request): (Option<String>, TrustBody) =
+        match intake(&state, &headers, Some(path), body) {
+            Ok(parsed) => parsed,
+            Err(code) => return refuse(code),
+        };
+    let id = id.unwrap_or_default();
     #[cfg(unix)]
     {
-        let digest = request.digest.clone();
-        let target = id.clone();
-        match blocking(&state, move |writer| writer.trust(&target, request)).await {
-            Ok(TrustResult::Preview {
-                state_revision,
-                preview,
-            }) => (
-                StatusCode::OK,
-                Json(json!({
-                    "ok": true,
-                    "applied": false,
-                    "committed": false,
-                    "state_revision": state_revision,
-                    "id": id,
-                    "digest": digest,
-                    "preview": preview,
-                })),
-            )
-                .into_response(),
-            Ok(TrustResult::Applied(outcome)) => committed(&state, outcome).await,
-            Err(refusal) => refusal,
-        }
+        detached(async move {
+            let digest = request.digest.clone();
+            let target = id.clone();
+            match blocking(&state, move |writer| writer.trust(&target, request)).await {
+                Ok(TrustResult::Preview {
+                    state_revision,
+                    preview,
+                }) => (
+                    StatusCode::OK,
+                    Json(json!({
+                        "ok": true,
+                        "applied": false,
+                        "committed": false,
+                        "state_revision": state_revision,
+                        "id": id,
+                        "digest": digest,
+                        "preview": preview,
+                    })),
+                )
+                    .into_response(),
+                Ok(TrustResult::Applied(outcome)) => committed(&state, outcome, true).await,
+                Err(refusal) => refusal,
+            }
+        })
+        .await
     }
     #[cfg(not(unix))]
     {
-        let _ = (id, request);
-        precommit(Uuid::new_v4(), 0, "unsupported_platform")
+        let _ = (state, id, request);
+        unsupported()
     }
 }
-
-/// The trust body is the writer's own strict `TrustRequest` on Unix.
-#[cfg(unix)]
-pub(crate) type TrustBody = TrustRequest;
-#[cfg(not(unix))]
-pub(crate) type TrustBody = Value;
 
 /// `POST /v1/extensions/{id}/enable`.
 pub(crate) async fn enable(
     State(state): State<AppState>,
-    Path(id): Path<String>,
     headers: HeaderMap,
-    request: Result<Json<ScopeMutationRequest>, JsonRejection>,
+    path: Result<Path<String>, PathRejection>,
+    body: Result<Bytes, BytesRejection>,
 ) -> Response {
-    scope_mutation(state, id, headers, request, true).await
+    scope_mutation(state, headers, path, body, true).await
 }
 
 /// `POST /v1/extensions/{id}/disable`: commits the filter removal, then
@@ -608,52 +680,52 @@ pub(crate) async fn enable(
 /// that is no longer effective; a bounded reap failure is the committed 202.
 pub(crate) async fn disable(
     State(state): State<AppState>,
-    Path(id): Path<String>,
     headers: HeaderMap,
-    request: Result<Json<ScopeMutationRequest>, JsonRejection>,
+    path: Result<Path<String>, PathRejection>,
+    body: Result<Bytes, BytesRejection>,
 ) -> Response {
-    scope_mutation(state, id, headers, request, false).await
+    scope_mutation(state, headers, path, body, false).await
 }
 
 async fn scope_mutation(
     state: AppState,
-    id: String,
     headers: HeaderMap,
-    request: Result<Json<ScopeMutationRequest>, JsonRejection>,
+    path: Result<Path<String>, PathRejection>,
+    body: Result<Bytes, BytesRejection>,
     enable: bool,
 ) -> Response {
-    if let Err(code) = authorize(&state, &headers) {
-        return refuse(code);
-    }
-    let request = match body(request) {
-        Ok(request) => request,
-        Err(code) => return refuse(code),
-    };
-    #[cfg(unix)]
-    {
-        let projects = match registered_projects(&state) {
-            Ok(projects) => projects,
+    let (id, request): (Option<String>, ScopeMutationRequest) =
+        match intake(&state, &headers, Some(path), body) {
+            Ok(parsed) => parsed,
             Err(code) => return refuse(code),
         };
-        let expected = request.expected_state_revision;
-        let scope = enablement_scope(request.scope);
-        match blocking(&state, move |writer| {
-            if enable {
-                writer.enable(&id, expected, scope, &projects)
-            } else {
-                writer.disable(&id, expected, scope, &projects)
-            }
+    let id = id.unwrap_or_default();
+    #[cfg(unix)]
+    {
+        detached(async move {
+            let projects = match registered_projects(&state).await {
+                Ok(projects) => projects,
+                Err(refusal) => return refusal,
+            };
+            let expected = request.expected_state_revision;
+            let scope = enablement_scope(request.scope);
+            // Disable may end effectiveness; enable never needs a reset (a
+            // restart it requires shows up as a changed descriptor).
+            commit_and_reconcile(state, !enable, move |writer| {
+                if enable {
+                    writer.enable(&id, expected, scope, &projects)
+                } else {
+                    writer.disable(&id, expected, scope, &projects)
+                }
+            })
+            .await
         })
         .await
-        {
-            Ok(outcome) => committed(&state, outcome).await,
-            Err(refusal) => refusal,
-        }
     }
     #[cfg(not(unix))]
     {
-        let _ = (id, request, enable, registered_projects(&state));
-        precommit(Uuid::new_v4(), 0, "unsupported_platform")
+        let _ = (state, id, request, enable);
+        unsupported()
     }
 }
 
@@ -662,35 +734,30 @@ async fn scope_mutation(
 /// bindings, and enablement.
 pub(crate) async fn remove(
     State(state): State<AppState>,
-    Path(id): Path<String>,
     headers: HeaderMap,
-    request: Result<Json<RemoveRequest>, JsonRejection>,
+    path: Result<Path<String>, PathRejection>,
+    body: Result<Bytes, BytesRejection>,
 ) -> Response {
-    if let Err(code) = authorize(&state, &headers) {
-        return refuse(code);
-    }
-    let request = match body(request) {
-        Ok(request) => request,
-        Err(code) => return refuse(code),
-    };
+    let (id, request): (Option<String>, RemoveRequest) =
+        match intake(&state, &headers, Some(path), body) {
+            Ok(parsed) => parsed,
+            Err(code) => return refuse(code),
+        };
+    let id = id.unwrap_or_default();
     #[cfg(unix)]
     {
         let expected = request.expected_state_revision;
         let purge = request.purge_state;
         let activity = activity(&state);
-        match blocking(&state, move |writer| {
+        detached(commit_and_reconcile(state, true, move |writer| {
             writer.remove(&id, expected, purge, &activity)
-        })
+        }))
         .await
-        {
-            Ok(outcome) => committed(&state, outcome).await,
-            Err(refusal) => refusal,
-        }
     }
     #[cfg(not(unix))]
     {
-        let _ = (id, request);
-        precommit(Uuid::new_v4(), 0, "unsupported_platform")
+        let _ = (state, id, request);
+        unsupported()
     }
 }
 

@@ -137,6 +137,9 @@ impl MutationError {
             "extension_not_installed" => "extension is not installed",
             "extension_not_found" => "extension has no registry state",
             "extension_active" => "extension must be fully disabled and stopped",
+            "reconciliation_in_progress" => {
+                "extension service reconciliation is in progress; retry shortly"
+            }
             "digest_mismatch" => "digest does not match the installed artifact",
             "artifact_unavailable" => "installed artifact is missing or does not verify",
             "artifact_store_conflict" => "stored payload for this digest does not verify",
@@ -203,6 +206,13 @@ pub(crate) enum EnablementScope {
 /// supervisor; a package is stopped when no process/temp root it owns remains.
 pub(crate) trait ServiceActivity {
     fn package_stopped(&self, package_id: &str) -> bool;
+
+    /// A reconciliation pass is in flight and may still spawn from a
+    /// generation it read before this writer's commit. Update/remove refuse
+    /// with the retryable `reconciliation_in_progress` rather than race it.
+    fn reconciliation_in_progress(&self) -> bool {
+        false
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
@@ -1396,6 +1406,9 @@ fn require_disabled_and_stopped(
 ) -> Step<()> {
     if !fully_disabled(snapshot, id) || !activity.package_stopped(id) {
         return Err(Fail::Reject("extension_active"));
+    }
+    if activity.reconciliation_in_progress() {
+        return Err(Fail::Reject("reconciliation_in_progress"));
     }
     Ok(())
 }

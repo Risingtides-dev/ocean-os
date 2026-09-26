@@ -98,12 +98,14 @@ pub(crate) enum SupervisorReconcile {
     /// The pass ran, but a stopped generation's group/temp-root cleanup could
     /// not be proven; the supervisor retains that authority.
     CleanupIncomplete,
-    /// Queued behind other passes or timed out; it still runs in order.
-    Pending,
+    /// Queued behind other passes or timed out; it still runs in order (and
+    /// is retried with backoff if it fails). `owned` is whether the package
+    /// still owns a process or temp root per the supervisor's ledger.
+    Pending { owned: bool },
     /// No coherent registry generation could be read (for example after a
     /// committed `registry_recovery_required`) or no supervisor exists, so
-    /// nothing was reconciled.
-    Blocked,
+    /// nothing was reconciled; the supervisor retries with backoff.
+    Blocked { owned: bool },
 }
 
 const STATE_SCHEMA_VERSION: u32 = 1;

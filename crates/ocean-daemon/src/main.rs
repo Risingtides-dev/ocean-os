@@ -1127,12 +1127,6 @@ async fn main() -> anyhow::Result<()> {
     let room_operator = Arc::new(room_operator::OperatorIdentity::load(&config_dir));
     let roles = load_model_roles(&config_dir);
 
-    // Stage A3b §12.3: journal-proven registry recovery runs to completion
-    // before any registry reader (the HTTP routes are not served yet) or any
-    // service reconciliation starts. Fail-soft for the daemon; a failure keeps
-    // extension activation fail-closed.
-    extension_registry::recover_at_startup(config_dir.clone()).await;
-
     // The lifecycle dispatcher exists before reconciliation so daemon_started is
     // sequence 1 and a late/restarted service can receive the retained boot fact.
     // Reconciliation is fail-soft and asynchronous: no optional extension can
@@ -1154,12 +1148,13 @@ async fn main() -> anyhow::Result<()> {
         daemon_version: env!("CARGO_PKG_VERSION").to_owned(),
         stamp: lifecycle_stamp(),
     });
-    let extension_supervisor = extension_service::ExtensionSupervisor::new_with_lifecycle(
+    // The HTTP routes are not served until well after this returns.
+    let extension_supervisor = start_extension_host(
+        &config_dir,
         Arc::clone(&extension_lifecycle),
-    );
-    extension_supervisor
-        .start(config_dir.clone(), registered_extension_projects)
-        .await;
+        registered_extension_projects,
+    )
+    .await;
     // Hoist the event bus so the Observatory durability pump subscribes before
     // any turn can emit a fact. One boot id scopes auth and all read models.
     let agent_event_bus = AgentEventBus::new(1024);
@@ -1681,6 +1676,24 @@ async fn wait_for_signal() {
 /// `Router::route()` calls in `main()` and the operator guide
 /// (`docs/OCEAN_RUNTIME_OPERATOR_GUIDE.md`) whenever a route is added or
 /// removed.
+/// Stage A3b §12.3 startup: journal-proven registry recovery runs to
+/// completion (awaited, never spawned) before the supervisor is created or its
+/// first reconciliation pass starts, and before `main` serves any registry
+/// reader. Recovery is fail-soft for the daemon; a failure keeps extension
+/// activation fail-closed and the supervisor retries its blocked pass.
+async fn start_extension_host(
+    config_dir: &std::path::Path,
+    lifecycle: Arc<LifecycleDispatcher>,
+    registered_projects: HashSet<Uuid>,
+) -> Arc<extension_service::ExtensionSupervisor> {
+    extension_registry::recover_at_startup(config_dir.to_path_buf()).await;
+    let supervisor = extension_service::ExtensionSupervisor::new_with_lifecycle(lifecycle);
+    supervisor
+        .start(config_dir.to_path_buf(), registered_projects)
+        .await;
+    supervisor
+}
+
 fn banner_routes() -> &'static [&'static str] {
     &[
         "GET /",

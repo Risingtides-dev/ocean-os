@@ -123,6 +123,7 @@ enum Auth {
     None,
     Wrong,
     Cookie,
+    ForeignOrigin,
 }
 
 async fn send(
@@ -144,6 +145,11 @@ async fn send(
             request = request
                 .header("x-ocean-operator", OPERATOR)
                 .header("cookie", "session=1")
+        }
+        Auth::ForeignOrigin => {
+            request = request
+                .header("x-ocean-operator", OPERATOR)
+                .header("origin", "https://evil.example")
         }
     }
     let request = match body {
@@ -269,9 +275,9 @@ async fn with_supervisor(
 fn envelope_states_cover_every_reconciliation_outcome() {
     use SupervisorReconcile::*;
     let cases = [
+        // What the pass itself did for this package.
         (
             Complete { reaped: true },
-            true,
             true,
             false,
             Reconciliation::Complete,
@@ -279,7 +285,6 @@ fn envelope_states_cover_every_reconciliation_outcome() {
         ),
         (
             Complete { reaped: false },
-            true,
             false,
             false,
             Reconciliation::Complete,
@@ -289,23 +294,20 @@ fn envelope_states_cover_every_reconciliation_outcome() {
             CleanupIncomplete,
             false,
             false,
-            false,
             Reconciliation::Pending,
             Reap::Pending,
         ),
-        // Queued/blocked with a still-owned process for a no-longer-effective
-        // package: the reap is outstanding.
+        // No pass answered: a no-longer-effective package that still owns a
+        // process or temp root has a reap outstanding.
         (
-            Pending,
-            false,
+            Pending { owned: true },
             false,
             false,
             Reconciliation::Pending,
             Reap::Pending,
         ),
         (
-            Blocked,
-            false,
+            Blocked { owned: true },
             false,
             false,
             Reconciliation::Blocked,
@@ -313,17 +315,15 @@ fn envelope_states_cover_every_reconciliation_outcome() {
         ),
         // Nothing owned, or the package is meant to run: nothing to reap.
         (
-            Pending,
+            Pending { owned: false },
             false,
-            true,
             false,
             Reconciliation::Pending,
             Reap::NotRequired,
         ),
         (
-            Blocked,
+            Blocked { owned: true },
             true,
-            false,
             false,
             Reconciliation::Blocked,
             Reap::NotRequired,
@@ -334,16 +334,15 @@ fn envelope_states_cover_every_reconciliation_outcome() {
             Complete { reaped: false },
             false,
             true,
-            true,
             Reconciliation::Complete,
             Reap::Pending,
         ),
     ];
-    for (reconcile, effective, stopped, retention, reconciliation, reap) in cases {
+    for (reconcile, effective, retention, reconciliation, reap) in cases {
         assert_eq!(
-            envelope_states(reconcile, effective, stopped, retention),
+            envelope_states(reconcile, effective, retention),
             (reconciliation, reap),
-            "{reconcile:?} effective={effective} stopped={stopped} retention={retention}"
+            "{reconcile:?} effective={effective} retention={retention}"
         );
     }
     assert_eq!(
@@ -403,6 +402,7 @@ fn every_writer_code_has_a_closed_status_and_fixed_message() {
         ("already_installed", StatusCode::CONFLICT),
         ("state_revision_conflict", StatusCode::CONFLICT),
         ("extension_active", StatusCode::CONFLICT),
+        ("reconciliation_in_progress", StatusCode::CONFLICT),
         ("grant_confirmation_mismatch", StatusCode::CONFLICT),
         ("trust_required", StatusCode::CONFLICT),
         ("acquisition_capacity", StatusCode::TOO_MANY_REQUESTS),
@@ -429,6 +429,10 @@ fn every_writer_code_has_a_closed_status_and_fixed_message() {
     }
     assert_eq!(
         error_object("extension_state_busy")["retryable"],
+        Value::Bool(true)
+    );
+    assert_eq!(
+        error_object("reconciliation_in_progress")["retryable"],
         Value::Bool(true)
     );
     assert!(error_object("state_revision_conflict")
@@ -495,6 +499,11 @@ async fn every_mutation_is_operator_authenticated_and_reads_stay_credential_free
                 Auth::Cookie,
                 StatusCode::FORBIDDEN,
                 "ambient_credential_rejected",
+            ),
+            (
+                Auth::ForeignOrigin,
+                StatusCode::FORBIDDEN,
+                "foreign_origin_rejected",
             ),
         ] {
             let (got, response) = send(&app, method.clone(), uri, Some(body.clone()), auth).await;
@@ -764,7 +773,8 @@ async fn http_lifecycle_reconciles_supervisor_and_disable_reaps_before_200() {
     let (_, after) = get_json(&app, &format!("/v1/extensions/{ID}/status")).await;
     assert_eq!(after["services"][0]["pid"], pid);
     assert_eq!(after["services"][0]["activation_epoch"], epoch);
-    assert_eq!(after["services"][0]["activation_revision"], 4);
+    // The status revision is the one the child saw in host_hello (L4).
+    assert_eq!(after["services"][0]["activation_revision"], 3);
 
     // 5. Active update/remove refuse before any write and never detach it.
     let (status, active) = post_op(
@@ -892,21 +902,347 @@ async fn startup_recovery_rolls_journals_forward_and_back_before_readers() {
     fixture.assert_no_canary_ran();
 }
 
-/// The daemon's startup sequence recovers the registry before it creates the
-/// supervisor or serves a route.
+/// Behavioral startup seam: `start_extension_host` must have finished
+/// journal-proven recovery before it returns, with no await point in between
+/// that could let a spawned recovery run later. On this current-thread runtime
+/// a recovery that was spawned (or skipped) would still leave the mixed
+/// generation in place when the host returns.
+#[tokio::test]
+async fn start_extension_host_recovers_before_returning_a_supervisor() {
+    let fixture = Fixture::new();
+    let writer = RegistryWriter::new(fixture.config.path().to_path_buf());
+    let path = fixture.package("noop", ID, "1.0.0");
+    writer
+        .install(0, writer.acquire_local(&path).unwrap())
+        .unwrap();
+    writer.crash_at(Some(CrashPoint::AfterStateRename(0)));
+    assert!(writer
+        .disable(
+            ID,
+            1,
+            super::super::transaction::EnablementScope::Global,
+            &HashSet::new()
+        )
+        .is_err());
+    writer.crash_at(None);
+    assert!(read_locked_state(fixture.config.path()).is_err());
+
+    let lifecycle =
+        crate::extension_lifecycle::LifecycleDispatcher::new(Uuid::new_v4(), HashSet::new());
+    let supervisor =
+        crate::start_extension_host(fixture.config.path(), lifecycle, HashSet::new()).await;
+    // No yield since the host returned: only an awaited recovery could have
+    // produced a coherent generation by now.
+    assert_eq!(fixture.revision(), 2);
+    assert!(fixture.entries("transactions").is_empty());
+    supervisor.shutdown().await;
+}
+
+/// `main` must reach the extension host through the awaited seam above, on a
+/// live (uncommented, unspawned) line, before the router is served.
 #[test]
-fn daemon_startup_recovers_before_supervisor_and_router() {
+fn daemon_main_awaits_the_extension_host_before_serving() {
     let source = include_str!("../../main.rs");
     let body = &source[source.find("#[tokio::main]").expect("daemon main")..];
-    let recover = body
-        .find("extension_registry::recover_at_startup(")
-        .expect("startup recovery is wired");
-    let supervisor = body
-        .find("extension_service::ExtensionSupervisor::new_with_lifecycle(")
-        .expect("supervisor is created at startup");
-    let start = body
-        .find(".start(config_dir.clone(), registered_extension_projects)")
-        .expect("supervisor start");
-    let serve = body.find("axum::serve(").expect("router is served");
-    assert!(recover < supervisor && supervisor < start && start < serve);
+    let lines: Vec<&str> = body
+        .lines()
+        .filter(|line| {
+            line.contains("start_extension_host(") && !line.contains("fn start_extension_host(")
+        })
+        .collect();
+    assert_eq!(lines.len(), 1, "exactly one startup call: {lines:?}");
+    let line = lines[0].trim_start();
+    assert!(!line.starts_with("//"), "startup call is commented out");
+    assert!(
+        !line.contains("spawn"),
+        "startup call must be awaited, not spawned"
+    );
+    let call = body.find(lines[0]).unwrap();
+    let statement = &body[call..call + body[call..].find(';').unwrap()];
+    assert!(statement.contains(".await"), "startup call must be awaited");
+    assert!(!body[..call].contains("ExtensionSupervisor::new_with_lifecycle("));
+    assert!(call < body.find("axum::serve(").expect("router is served"));
+    // The seam itself awaits recovery before constructing the supervisor.
+    let seam = &source[source.find("async fn start_extension_host(").unwrap()..];
+    let seam = &seam[..seam.find("\n}\n").unwrap()];
+    let recover = seam.find("recover_at_startup(").expect("seam recovers");
+    let recover_line = seam[..recover].rsplit('\n').next().unwrap();
+    assert!(!recover_line.trim_start().starts_with("//") && !recover_line.contains("spawn"));
+    assert!(recover < seam.find("new_with_lifecycle(").unwrap());
+}
+
+// ---------------------------------------------------------------------------
+// Review fixes: isolation of cleanup failures, retries, activation
+// generations, the in-flight-pass guard, and fail-closed auth.
+// ---------------------------------------------------------------------------
+
+/// Install, trust, and globally enable `id` over HTTP starting at `expected`;
+/// returns the revision after enable.
+async fn activate(app: &Router, fixture: &Fixture, name: &str, id: &str, expected: u64) -> u64 {
+    let (status, installed) =
+        install_local(app, expected, &fixture.package(name, id, "1.0.0")).await;
+    assert!(status.is_success(), "{installed}");
+    let digest = installed["mutation"]["digest"].as_str().unwrap().to_owned();
+    let (status, trusted) = trust_noop(app, id, expected + 1, &digest).await;
+    assert!(status.is_success(), "{trusted}");
+    let (status, enabled) = scope(app, id, "enable", expected + 2).await;
+    assert!(status.is_success(), "{enabled}");
+    expected + 3
+}
+
+async fn healthy_pid(app: &Router, id: &str) -> (i64, Value) {
+    let body = wait_for_status(app, id, |body| {
+        body["services"][0]["state"] == "healthy" && body["services"][0]["pid"].is_u64()
+    })
+    .await;
+    (
+        body["services"][0]["pid"].as_i64().unwrap(),
+        body["services"][0]["activation_epoch"].clone(),
+    )
+}
+
+/// Poll `done` for up to 10 s; a guard that never engages fails, never hangs.
+async fn wait_until(done: impl Fn() -> bool) {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    while !done() {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "condition never held"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+}
+
+/// The live connection temp root of `id`'s service.
+fn connection_root(fixture: &Fixture, id: &str) -> PathBuf {
+    let parent = fixture.root().join("state").join(id).join("tmp/lifecycle");
+    fs::read_dir(&parent)
+        .unwrap()
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .find(|path| path.is_dir())
+        .expect("a live connection temp root")
+}
+
+/// H1 + M3: a retained cleanup failure for package X is isolated. Disabling X
+/// reports the unproven reap (202), X stays guarded as `extension_active`
+/// (its ledger entry, not the registry, is what refuses the update), disabling
+/// an unrelated package Y still returns 200 with Y's process gone, and once
+/// the obstruction clears the supervisor's own retry finishes X's cleanup.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn one_retained_cleanup_failure_does_not_block_other_packages() {
+    let _guard = AUTO_CONVENE_ENV_LOCK.lock().await;
+    let _restore = TestEnvRestore::capture(&["OCEAN_CONFIG_DIR", "OCEAN_MODEL", "OCEAN_YOLO"]);
+    let fixture = Fixture::new();
+    let mut state = fake_convene_state(&fixture.config);
+    let supervisor = with_supervisor(&mut state, fixture.config.path()).await;
+    let app = router(state);
+
+    let revision = activate(&app, &fixture, "x", ID, 0).await;
+    let revision = activate(&app, &fixture, "y", OTHER, revision).await;
+    let (x_pid, _) = healthy_pid(&app, ID).await;
+    let (y_pid, _) = healthy_pid(&app, OTHER).await;
+
+    // Swap X's connection temp root for an impostor: the descriptor-bound
+    // cleanup refuses to remove a generation it does not own.
+    let named = connection_root(&fixture, ID);
+    let retained = named.with_extension("retained");
+    fs::rename(&named, &retained).unwrap();
+    fs::create_dir(&named).unwrap();
+
+    let (status, disabled_x) = scope(&app, ID, "disable", revision).await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{disabled_x}");
+    assert_committed(&disabled_x, revision + 1);
+    assert_eq!(disabled_x["mutation"]["reconciliation"], "pending");
+    assert_eq!(disabled_x["mutation"]["reap"], "pending");
+    assert!(!process_alive(x_pid), "the group itself was terminated");
+    assert!(!supervisor.activity().package_stopped(ID));
+
+    // Disabled in the registry but still owning retained authority: update
+    // is refused by the ledger alone.
+    let (status, active) = post_op(
+        &app,
+        &format!("/v1/extensions/{ID}/update"),
+        json!({"expected_state_revision": revision + 1, "source": {"kind": "local-path", "path": fixture.package("x2", ID, "2.0.0")}}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT, "{active}");
+    assert_precommit(&active, "extension_active", revision + 1);
+
+    // An unrelated package still disables to a clean 200 with its pid gone.
+    let (status, disabled_y) = scope(&app, OTHER, "disable", revision + 1).await;
+    assert_eq!(status, StatusCode::OK, "{disabled_y}");
+    assert_eq!(disabled_y["mutation"]["reconciliation"], "complete");
+    assert_eq!(disabled_y["mutation"]["reap"], "complete");
+    assert!(
+        !process_alive(y_pid),
+        "disable returned 200 before Y was reaped"
+    );
+
+    // Clear the obstruction; the supervisor's backoff retry proves X's
+    // cleanup without any further command.
+    fs::remove_dir(&named).unwrap();
+    fs::rename(&retained, &named).unwrap();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+    while !supervisor.activity().package_stopped(ID) {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "retained cleanup never retried"
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert!(!named.exists(), "retained temp root was not removed");
+    let (status, removed) = send(
+        &app,
+        Method::DELETE,
+        &format!("/v1/extensions/{ID}"),
+        Some(json!({"expected_state_revision": revision + 2, "purge_state": false})),
+        Auth::Operator,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{removed}");
+    supervisor.shutdown().await;
+    fixture.assert_no_canary_ran();
+}
+
+/// M1: a pass blocked by an unreadable registry (here: the startup pass,
+/// while `.state.lock` is held) is retried with backoff until it succeeds,
+/// with no further command.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn blocked_startup_pass_is_retried_without_a_new_command() {
+    let _guard = AUTO_CONVENE_ENV_LOCK.lock().await;
+    let _restore = TestEnvRestore::capture(&["OCEAN_CONFIG_DIR", "OCEAN_MODEL", "OCEAN_YOLO"]);
+    let fixture = Fixture::new();
+    // Commit a trusted, enabled package with no supervisor running.
+    let app = router(fake_convene_state(&fixture.config));
+    activate(&app, &fixture, "noop", ID, 0).await;
+
+    let lock = fs::File::open(fixture.root().join(".state.lock")).unwrap();
+    fs2::FileExt::try_lock_exclusive(&lock).unwrap();
+    let mut state = fake_convene_state(&fixture.config);
+    let supervisor = with_supervisor(&mut state, fixture.config.path()).await;
+    let app = router(state);
+    tokio::time::sleep(Duration::from_millis(1200)).await;
+    let (_, idle) = get_json(&app, &format!("/v1/extensions/{ID}/status")).await;
+    assert_eq!(idle["services"], json!([]), "the startup pass was blocked");
+    drop(lock);
+    let (pid, _) = healthy_pid(&app, ID).await;
+    assert!(process_alive(pid));
+    supervisor.shutdown().await;
+    fixture.assert_no_canary_ran();
+}
+
+/// M2: disable and enable committed back to back before any pass runs must
+/// still mint a new activation epoch and process, never silently keep the
+/// pre-disable generation.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn disable_then_enable_before_a_pass_mints_a_new_epoch() {
+    let _guard = AUTO_CONVENE_ENV_LOCK.lock().await;
+    let _restore = TestEnvRestore::capture(&["OCEAN_CONFIG_DIR", "OCEAN_MODEL", "OCEAN_YOLO"]);
+    let fixture = Fixture::new();
+    let mut state = fake_convene_state(&fixture.config);
+    let supervisor = with_supervisor(&mut state, fixture.config.path()).await;
+    let app = router(state);
+    let revision = activate(&app, &fixture, "noop", ID, 0).await;
+    let (pid, epoch) = healthy_pid(&app, ID).await;
+
+    let gate = Arc::new(tokio::sync::Semaphore::new(0));
+    supervisor.gate_passes_for_test(Arc::clone(&gate));
+    let disable = tokio::spawn({
+        let app = app.clone();
+        async move { scope(&app, ID, "disable", revision).await }
+    });
+    wait_until(|| !(fixture.revision() != revision + 1)).await;
+    let enable = tokio::spawn({
+        let app = app.clone();
+        async move { scope(&app, ID, "enable", revision + 1).await }
+    });
+    wait_until(|| !(fixture.revision() != revision + 2)).await;
+    gate.add_permits(64);
+    let (status, disabled) = disable.await.unwrap();
+    assert_eq!(status, StatusCode::OK, "{disabled}");
+    assert_eq!(disabled["mutation"]["reap"], "complete");
+    let (status, enabled) = enable.await.unwrap();
+    assert_eq!(status, StatusCode::OK, "{enabled}");
+
+    let (new_pid, new_epoch) = healthy_pid(&app, ID).await;
+    assert_ne!(new_pid, pid, "the pre-disable process survived");
+    assert_ne!(new_epoch, epoch, "the pre-disable epoch survived");
+    assert!(!process_alive(pid));
+    supervisor.shutdown().await;
+}
+
+/// M3 + L2: while a real reconciliation pass is in flight (held open at the
+/// test gate right after it registers), update and remove refuse with the
+/// retryable `reconciliation_in_progress`, and succeed once it finishes.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn update_and_remove_refuse_while_a_pass_is_in_flight() {
+    let _guard = AUTO_CONVENE_ENV_LOCK.lock().await;
+    let _restore = TestEnvRestore::capture(&["OCEAN_CONFIG_DIR", "OCEAN_MODEL", "OCEAN_YOLO"]);
+    let fixture = Fixture::new();
+    let mut state = fake_convene_state(&fixture.config);
+    let supervisor = with_supervisor(&mut state, fixture.config.path()).await;
+    let app = router(state);
+    let (status, installed) = install_local(&app, 0, &fixture.package("noop", ID, "1.0.0")).await;
+    assert_eq!(status, StatusCode::OK, "{installed}");
+
+    let gate = Arc::new(tokio::sync::Semaphore::new(0));
+    supervisor.gate_passes_for_test(Arc::clone(&gate));
+    let pass = tokio::spawn({
+        let supervisor = Arc::clone(&supervisor);
+        async move { supervisor.update_project_snapshot(HashSet::new()).await }
+    });
+    wait_until(|| !(!supervisor.activity().reconciliation_in_progress())).await;
+    let (status, refused) = send(
+        &app,
+        Method::DELETE,
+        &format!("/v1/extensions/{ID}"),
+        Some(json!({"expected_state_revision": 1, "purge_state": false})),
+        Auth::Operator,
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT, "{refused}");
+    assert_precommit(&refused, "reconciliation_in_progress", 1);
+    assert_eq!(refused["error"]["retryable"], true);
+    let (status, refused) = post_op(
+        &app,
+        &format!("/v1/extensions/{ID}/update"),
+        json!({"expected_state_revision": 1, "source": {"kind": "local-path", "path": fixture.package("noop2", ID, "2.0.0")}}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT, "{refused}");
+    assert_precommit(&refused, "reconciliation_in_progress", 1);
+    assert_eq!(fixture.revision(), 1);
+
+    gate.add_permits(64);
+    pass.await.unwrap().unwrap();
+    let (status, removed) = send(
+        &app,
+        Method::DELETE,
+        &format!("/v1/extensions/{ID}"),
+        Some(json!({"expected_state_revision": 1, "purge_state": false})),
+        Auth::Operator,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{removed}");
+    supervisor.shutdown().await;
+}
+
+/// An unconfigured operator key fails every mutation closed with 503, even
+/// when a credential is presented.
+#[tokio::test]
+async fn unconfigured_operator_key_fails_closed() {
+    let _guard = AUTO_CONVENE_ENV_LOCK.lock().await;
+    let _restore = TestEnvRestore::capture(&["OCEAN_CONFIG_DIR", "OCEAN_MODEL", "OCEAN_YOLO"]);
+    let fixture = Fixture::new();
+    let mut state = fake_convene_state(&fixture.config);
+    state.room_operator = Arc::new(crate::room_operator::OperatorIdentity::for_test(
+        None,
+        vec!["http://127.0.0.1:8790".into()],
+    ));
+    let app = router(state);
+    let (status, body) = install_local(&app, 0, &fixture.package("noop", ID, "1.0.0")).await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{body}");
+    assert_precommit(&body, "operator_identity_unavailable", 0);
+    assert!(!fixture.root().exists());
 }

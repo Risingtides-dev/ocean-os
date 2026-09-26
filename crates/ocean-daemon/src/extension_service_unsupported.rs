@@ -78,6 +78,10 @@ impl ServiceActivityLedger {
     pub(crate) fn package_stopped(&self, _package_id: &str) -> bool {
         true
     }
+
+    pub(crate) fn reconciliation_in_progress(&self) -> bool {
+        false
+    }
 }
 
 #[derive(Clone, Default)]
@@ -160,6 +164,7 @@ impl ExtensionSupervisor {
         &self,
         _committed_revision: u64,
         _package_id: &str,
+        _resets_activation: bool,
     ) -> SupervisorReconcile {
         let config_dir = self
             .config_dir
@@ -174,9 +179,9 @@ impl ExtensionSupervisor {
         match config_dir {
             Some(config_dir) => match self.reconcile(config_dir, projects).await {
                 Ok(()) => SupervisorReconcile::Complete { reaped: false },
-                Err(()) => SupervisorReconcile::Blocked,
+                Err(()) => SupervisorReconcile::Blocked { owned: false },
             },
-            None => SupervisorReconcile::Blocked,
+            None => SupervisorReconcile::Blocked { owned: false },
         }
     }
 

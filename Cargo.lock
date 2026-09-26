@@ -3449,6 +3449,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "clap",
+ "libc",
  "ocean-agent",
  "ocean-core",
  "reqwest 0.12.28",

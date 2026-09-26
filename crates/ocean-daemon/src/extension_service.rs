@@ -244,24 +244,8 @@ impl RuntimeStatusCache {
             status.stderr_truncated_lines = previous.stderr_truncated_lines;
             status.stderr_redactions = previous.stderr_redactions;
             status.temp_cleanup_failures = previous.temp_cleanup_failures;
-            // A same-epoch process restart keeps the newest reconciled
-            // registry revision rather than the one captured at spawn.
-            status.activation_revision =
-                status.activation_revision.max(previous.activation_revision);
         }
         statuses.insert(key, status);
-    }
-
-    /// Record that a later committed registry revision was reconciled for a
-    /// service whose activation identity did not change. Keyed by the live
-    /// epoch so a stale generation can never publish a newer status.
-    fn advance_revision(&self, key: &ServiceKey, epoch: Uuid, revision: u64) {
-        if let Some(status) = self.write().get_mut(key) {
-            if status.activation_epoch == epoch && status.activation_revision < revision {
-                status.activation_revision = revision;
-                status.observed_at = now_string();
-            }
-        }
     }
 
     fn key(activation: &ServiceActivation) -> ServiceKey {
@@ -349,14 +333,23 @@ fn now_string() -> String {
     Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true)
 }
 
-/// Activation identity. The registry `state_revision` is deliberately absent:
-/// an unrelated committed mutation (another package's install, a trust row for
-/// a different digest) must not restart this service (§10.1). Digest, args,
-/// grants/bindings, subscriptions, restart policy, and effective scope are the
-/// fields whose change restarts it.
+/// Activation identity. The global registry `state_revision` is deliberately
+/// absent: an unrelated committed mutation (another package's install) must
+/// not restart this service (§10.1). Digest, args, grants/bindings,
+/// subscriptions, restart policy, effective scope, and the package's own
+/// activation `generation` are the fields whose change restarts it.
+///
+/// `generation` is the committed revision at which this package's trust or
+/// effectiveness last changed (disable, trust, update, remove), as reported by
+/// the committing route. It is what keeps a disable→enable pair committed
+/// before any pass ran from collapsing into "unchanged": the pass that reads
+/// the re-enabled generation still sees a newer package generation and mints
+/// a new epoch (§7.2, §10.4). It is boot-local; a daemon restart re-mints every
+/// epoch anyway.
 #[derive(Clone, PartialEq, Eq)]
 struct ServiceDescriptor {
     package_digest: String,
+    generation: u64,
     args: Vec<String>,
     events: Vec<LifecycleEventKind>,
     environment: Vec<String>,
@@ -367,9 +360,10 @@ struct ServiceDescriptor {
 }
 
 impl ServiceDescriptor {
-    fn from_activation(activation: &ServiceActivation) -> Self {
+    fn from_activation(activation: &ServiceActivation, generation: u64) -> Self {
         Self {
             package_digest: activation.package_digest.clone(),
+            generation,
             args: activation.args.clone(),
             events: activation.events.clone(),
             environment: activation.environment.clone(),
@@ -392,7 +386,6 @@ struct RestartHistory {
 
 struct ManagedService {
     descriptor: ServiceDescriptor,
-    epoch: Uuid,
     cancel: CancellationToken,
     stop_reason: Arc<std::sync::Mutex<ShutdownReason>>,
     history: Arc<std::sync::Mutex<RestartHistory>>,
@@ -423,6 +416,10 @@ struct ProjectSnapshotCommand {
 /// reconciliation — project or registry — is applied by one task in order.
 struct RegistryReconcileCommand {
     committed_revision: u64,
+    package_id: String,
+    /// The commit changed this package's trust or could have ended its
+    /// effectiveness: bump its activation generation before the pass.
+    resets_activation: bool,
     completed: oneshot::Sender<Result<ReconcileReport, ProjectSnapshotError>>,
 }
 
@@ -431,13 +428,25 @@ enum SupervisorCommand {
     Registry(RegistryReconcileCommand),
 }
 
-/// What one reconciliation pass did: the registry revision it read and every
-/// package whose service generation it stopped and reaped.
+/// What one reconciliation pass did: the registry revision it read, every
+/// package whose service generation it stopped and reaped, and every package
+/// with a stop or retained cleanup it could not prove.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 struct ReconcileReport {
     revision: u64,
     stopped_packages: BTreeSet<String>,
+    incomplete_packages: BTreeSet<String>,
 }
+
+impl ReconcileReport {
+    fn complete(&self) -> bool {
+        self.incomplete_packages.is_empty()
+    }
+}
+
+/// Backoff for re-running a pass that was blocked or left cleanup unproven.
+const RECONCILE_RETRY_INITIAL: Duration = Duration::from_millis(500);
+const RECONCILE_RETRY_MAX: Duration = Duration::from_secs(30);
 
 /// Process and temp-root authority each package still owns: every managed
 /// service task plus every retained exceptional cleanup authority. The
@@ -469,9 +478,16 @@ impl Drop for ReconcilePass {
 }
 
 impl ServiceActivityLedger {
+    /// No managed task or retained cleanup authority of this package remains.
     pub(crate) fn package_stopped(&self, package_id: &str) -> bool {
-        let owners = self.lock();
-        self.passes.load(Ordering::SeqCst) == 0 && !owners.contains_key(package_id)
+        !self.lock().contains_key(package_id)
+    }
+
+    /// Some reconciliation pass has registered and not yet finished; it may
+    /// still spawn from a generation it read before the caller's commit.
+    pub(crate) fn reconciliation_in_progress(&self) -> bool {
+        let _owners = self.lock();
+        self.passes.load(Ordering::SeqCst) > 0
     }
 
     fn begin_pass(&self) -> ReconcilePass {
@@ -502,9 +518,10 @@ impl ServiceActivityLedger {
 }
 
 /// Exceptional cleanup authority retained after a managed task could not prove
-/// its group gone; it keeps its package's activity ownership until it succeeds.
+/// its group gone; it keeps its package's activity ownership until it succeeds
+/// and blocks only a replacement spawn of the same service key.
 struct RetainedCleanup {
-    package_id: String,
+    key: ServiceKey,
     authority: CleanupAuthority,
 }
 
@@ -527,6 +544,10 @@ pub(crate) struct ExtensionSupervisor {
     project_rx: Mutex<Option<mpsc::Receiver<SupervisorCommand>>>,
     retained_cleanup: Arc<Mutex<Vec<RetainedCleanup>>>,
     activity: ServiceActivityLedger,
+    /// Test-only seam: when set, every pass waits for one permit right after
+    /// registering in the activity ledger, so tests can hold a real pass open.
+    #[cfg(test)]
+    pass_gate: std::sync::Mutex<Option<Arc<tokio::sync::Semaphore>>>,
 }
 
 impl ExtensionSupervisor {
@@ -541,7 +562,15 @@ impl ExtensionSupervisor {
             project_rx: Mutex::new(Some(project_rx)),
             retained_cleanup: Arc::new(Mutex::new(Vec::new())),
             activity: ServiceActivityLedger::default(),
+            #[cfg(test)]
+            pass_gate: std::sync::Mutex::new(None),
         })
+    }
+
+    /// Test seam: gate every later pass on `gate` (see `pass_gate`).
+    #[cfg(test)]
+    pub(crate) fn gate_passes_for_test(&self, gate: Arc<tokio::sync::Semaphore>) {
+        *self.pass_gate.lock().unwrap() = Some(gate);
     }
 
     pub(crate) fn status_cache(&self) -> RuntimeStatusCache {
@@ -563,12 +592,15 @@ impl ExtensionSupervisor {
         &self,
         committed_revision: u64,
         package_id: &str,
+        resets_activation: bool,
     ) -> SupervisorReconcile {
         let update = async {
             let (completed, wait) = oneshot::channel();
             self.project_tx
                 .send(SupervisorCommand::Registry(RegistryReconcileCommand {
                     committed_revision,
+                    package_id: package_id.to_owned(),
+                    resets_activation,
                     completed,
                 }))
                 .await
@@ -576,22 +608,30 @@ impl ExtensionSupervisor {
             wait.await
                 .map_err(|_| ProjectSnapshotError::SupervisorUnavailable)?
         };
+        // Everything below comes from what THE PASS did for this package; the
+        // live ledger is consulted only when no pass answered, and then only
+        // for owned processes/temp roots (never for other in-flight passes).
+        let owned = || !self.activity.package_stopped(package_id);
         match tokio::time::timeout(PROJECT_RECONCILE_TIMEOUT, update).await {
             Ok(Ok(report)) if report.revision >= committed_revision => {
-                SupervisorReconcile::Complete {
-                    reaped: report.stopped_packages.contains(package_id),
+                if report.incomplete_packages.contains(package_id) {
+                    SupervisorReconcile::CleanupIncomplete
+                } else {
+                    SupervisorReconcile::Complete {
+                        reaped: report.stopped_packages.contains(package_id),
+                    }
                 }
             }
             // The pass read an older generation than the one committed: it
             // cannot vouch for the committed revision.
             Ok(Ok(_)) | Ok(Err(ProjectSnapshotError::RegistryUnavailable)) => {
-                SupervisorReconcile::Blocked
+                SupervisorReconcile::Blocked { owned: owned() }
             }
             Ok(Err(ProjectSnapshotError::CleanupIncomplete)) => {
                 SupervisorReconcile::CleanupIncomplete
             }
             Ok(Err(ProjectSnapshotError::SupervisorUnavailable)) | Err(_) => {
-                SupervisorReconcile::Pending
+                SupervisorReconcile::Pending { owned: owned() }
             }
         }
     }
@@ -685,34 +725,51 @@ impl ExtensionSupervisor {
         }
     }
 
+    #[cfg(test)]
     async fn retry_retained_cleanup(&self) -> Result<(), ProjectSnapshotError> {
-        let retained = std::mem::take(&mut *self.retained_cleanup.lock().await);
-        if retained.is_empty() {
-            return Ok(());
-        }
-        let mut failed = Vec::new();
-        for mut retained in retained {
-            if retained.authority.cleanup().await {
-                self.activity.release(&retained.package_id);
-            } else {
-                failed.push(retained);
-            }
-        }
-        if failed.is_empty() {
+        if self.retry_retained_cleanup_keys().await.is_empty() {
             Ok(())
         } else {
-            self.retained_cleanup.lock().await.extend(failed);
             Err(ProjectSnapshotError::CleanupIncomplete)
         }
     }
 
+    /// One bounded retry of every retained authority. Returns the service keys
+    /// whose cleanup is still unproven; only a replacement of those exact keys
+    /// is withheld, never a stop or an unrelated spawn.
+    async fn retry_retained_cleanup_keys(&self) -> BTreeSet<ServiceKey> {
+        let retained = std::mem::take(&mut *self.retained_cleanup.lock().await);
+        let mut failed = Vec::new();
+        for mut retained in retained {
+            if retained.authority.cleanup().await {
+                self.activity.release(&retained.key.package_id);
+            } else {
+                failed.push(retained);
+            }
+        }
+        let keys = failed.iter().map(|retained| retained.key.clone()).collect();
+        self.retained_cleanup.lock().await.extend(failed);
+        keys
+    }
+
+    #[cfg(test)]
     fn spawn_managed(
         &self,
         activation: ServiceActivation,
         history: Arc<std::sync::Mutex<RestartHistory>>,
     ) -> ManagedService {
-        let descriptor = ServiceDescriptor::from_activation(&activation);
+        self.spawn_managed_generation(activation, history, 0)
+    }
+
+    fn spawn_managed_generation(
+        &self,
+        activation: ServiceActivation,
+        history: Arc<std::sync::Mutex<RestartHistory>>,
+        generation: u64,
+    ) -> ManagedService {
+        let descriptor = ServiceDescriptor::from_activation(&activation, generation);
         let package_id = activation.package_id.clone();
+        let service_key = RuntimeStatusCache::key(&activation);
         let activity = self.activity.clone();
         activity.acquire(&package_id);
         let cancel = CancellationToken::new();
@@ -755,7 +812,7 @@ impl ExtensionSupervisor {
                 true
             } else {
                 retained_cleanup.lock().await.push(RetainedCleanup {
-                    package_id,
+                    key: service_key,
                     authority,
                 });
                 false
@@ -763,7 +820,6 @@ impl ExtensionSupervisor {
         });
         ManagedService {
             descriptor,
-            epoch,
             cancel,
             stop_reason,
             history,
@@ -771,23 +827,38 @@ impl ExtensionSupervisor {
         }
     }
 
+    /// One reconciliation pass.
+    ///
+    /// Stops always run: a retained cleanup that cannot be proven, or one stale
+    /// service whose reap fails, never prevents stopping every other stale
+    /// service. Unproven cleanup withholds only a replacement spawn of the same
+    /// service key, and is reported per package in `incomplete_packages`.
     async fn reconcile(
         &self,
         config_dir: &Path,
         projects: &HashSet<Uuid>,
+        generations: &BTreeMap<String, u64>,
         services: &mut BTreeMap<ServiceKey, ManagedService>,
     ) -> Result<ReconcileReport, ProjectSnapshotError> {
         // Registered before the registry read; see `ServiceActivityLedger`.
         let _pass = self.activity.begin_pass();
-        // Never activate a replacement generation while an obsolete process
-        // group still has retained cleanup authority.
-        self.retry_retained_cleanup().await?;
+        #[cfg(test)]
+        {
+            let gate = self.pass_gate.lock().unwrap().clone();
+            if let Some(gate) = gate {
+                if let Ok(permit) = gate.acquire().await {
+                    permit.forget();
+                }
+            }
+        }
+        let mut unproven = self.retry_retained_cleanup_keys().await;
         let (revision, activations) =
             Self::load_activations(config_dir.to_path_buf(), projects.clone()).await?;
         let mut report = ReconcileReport {
             revision,
-            stopped_packages: BTreeSet::new(),
+            ..ReconcileReport::default()
         };
+        let generation = |package_id: &str| generations.get(package_id).copied().unwrap_or(0);
         let mut desired = BTreeMap::new();
         for activation in activations {
             let key = ServiceKey {
@@ -803,7 +874,11 @@ impl ExtensionSupervisor {
                 desired
                     .get(key)
                     .is_none_or(|activation| {
-                        managed.descriptor != ServiceDescriptor::from_activation(activation)
+                        managed.descriptor
+                            != ServiceDescriptor::from_activation(
+                                activation,
+                                generation(&activation.package_id),
+                            )
                     })
                     .then_some(key.clone())
             })
@@ -823,8 +898,16 @@ impl ExtensionSupervisor {
                 } else {
                     ShutdownReason::Disabled
                 };
-                report.stopped_packages.insert(key.package_id.clone());
-                self.stop_managed(managed, reason).await?;
+                match self.stop_managed(managed, reason).await {
+                    Ok(()) => {
+                        report.stopped_packages.insert(key.package_id.clone());
+                    }
+                    // Keep going: the failed group is retained authority now,
+                    // and every other stale service still has to stop.
+                    Err(_) => {
+                        unproven.insert(key.clone());
+                    }
+                }
             }
         }
 
@@ -832,16 +915,25 @@ impl ExtensionSupervisor {
         self.status.retain_only(&desired_keys);
 
         for (key, activation) in desired {
-            if let Some(managed) = services.get(&key) {
-                self.status.advance_revision(&key, managed.epoch, revision);
+            if services.contains_key(&key) {
+                continue;
+            }
+            // Never activate a replacement of a service whose obsolete group
+            // still has unproven cleanup authority. Other keys proceed.
+            if unproven.contains(&key) {
                 continue;
             }
             let history = preserved_histories.remove(&key).unwrap_or_default();
+            let package_generation = generation(&key.package_id);
             // Minting the immutable epoch and floor happens in this exact
             // production spawn path before reconciliation acknowledges a
             // project-snapshot change.
-            services.insert(key, self.spawn_managed(activation, history));
+            services.insert(
+                key,
+                self.spawn_managed_generation(activation, history, package_generation),
+            );
         }
+        report.incomplete_packages = unproven.into_iter().map(|key| key.package_id).collect();
         Ok(report)
     }
 
@@ -852,36 +944,86 @@ impl ExtensionSupervisor {
         mut project_rx: mpsc::Receiver<SupervisorCommand>,
     ) {
         let mut services = BTreeMap::new();
-        let _ = self.reconcile(&config_dir, &projects, &mut services).await;
+        let mut generations: BTreeMap<String, u64> = BTreeMap::new();
+        // A pass that was blocked (registry unreadable) or left cleanup
+        // unproven is re-run with bounded exponential backoff until one
+        // completes, including the startup pass, so a stale generation never
+        // simply persists until the next unrelated command.
+        let mut retry_delay = RECONCILE_RETRY_INITIAL;
+        let mut retry_at: Option<tokio::time::Instant> = None;
+        let mut schedule = |complete: bool, retry_at: &mut Option<tokio::time::Instant>| {
+            if complete {
+                retry_delay = RECONCILE_RETRY_INITIAL;
+                *retry_at = None;
+            } else {
+                *retry_at = Some(tokio::time::Instant::now() + retry_delay);
+                retry_delay = (retry_delay * 2).min(RECONCILE_RETRY_MAX);
+            }
+        };
+        let passed = |result: &Result<ReconcileReport, ProjectSnapshotError>| {
+            result.as_ref().is_ok_and(ReconcileReport::complete)
+        };
+        let result = self
+            .reconcile(&config_dir, &projects, &generations, &mut services)
+            .await;
+        schedule(passed(&result), &mut retry_at);
         loop {
+            let scheduled = retry_at;
+            let retry = async move {
+                match scheduled {
+                    Some(at) => tokio::time::sleep_until(at).await,
+                    None => std::future::pending().await,
+                }
+            };
             tokio::select! {
                 _ = self.cancel.cancelled() => break,
+                () = retry => {
+                    let result = self
+                        .reconcile(&config_dir, &projects, &generations, &mut services)
+                        .await;
+                    schedule(passed(&result), &mut retry_at);
+                }
                 command = project_rx.recv() => {
                     let Some(command) = command else { break };
                     match command {
                         SupervisorCommand::Projects(command) => {
                             projects = command.projects;
                             let result = self
-                                .reconcile(&config_dir, &projects, &mut services)
-                                .await
-                                .map(|_| ());
+                                .reconcile(&config_dir, &projects, &generations, &mut services)
+                                .await;
+                            schedule(passed(&result), &mut retry_at);
+                            let result = result.and_then(|report| {
+                                if report.complete() {
+                                    Ok(())
+                                } else {
+                                    Err(ProjectSnapshotError::CleanupIncomplete)
+                                }
+                            });
                             let _ = command.completed.send(result);
                         }
                         SupervisorCommand::Registry(command) => {
+                            if command.resets_activation {
+                                let generation = generations
+                                    .entry(command.package_id.clone())
+                                    .or_default();
+                                *generation = (*generation).max(command.committed_revision);
+                            }
                             // Serialized with every other pass on this one
                             // task; each reads the newest coherent generation,
                             // which is at least the committed revision.
                             let result = self
-                                .reconcile(&config_dir, &projects, &mut services)
+                                .reconcile(&config_dir, &projects, &generations, &mut services)
                                 .await;
-                            if let Ok(report) = &result {
-                                if report.revision < command.committed_revision {
-                                    tracing::warn!(
-                                        reason = "registry_revision_regressed",
-                                        "extension reconciliation read an older registry generation"
-                                    );
-                                }
+                            let reached = result
+                                .as_ref()
+                                .is_ok_and(|report| report.revision >= command.committed_revision);
+                            if result.is_ok() && !reached {
+                                tracing::warn!(
+                                    reason = "registry_revision_regressed",
+                                    "extension reconciliation read an older registry generation"
+                                );
                             }
+                            schedule(passed(&result) && reached, &mut retry_at);
                             let _ = command.completed.send(result);
                         }
                     }
@@ -924,7 +1066,7 @@ impl ExtensionSupervisor {
             let activity = self.activity.clone();
             retries.spawn(async move {
                 if retained.authority.cleanup().await {
-                    activity.release(&retained.package_id);
+                    activity.release(&retained.key.package_id);
                 }
             });
         }
@@ -1181,7 +1323,25 @@ impl Drop for DirectoryStream {
     }
 }
 
+/// Make an already-opened directory owner-writable/searchable so its entries
+/// can be unlinked. A package may legitimately leave read-only trees behind
+/// (Go module caches are `0555`); the descriptor was opened no-follow, so this
+/// can only ever change the directory that is being removed. Best effort: a
+/// failure surfaces as the unlink failure it would otherwise have been.
+fn make_owner_writable(directory: &File) {
+    if let Ok(metadata) = directory.metadata() {
+        let mode = metadata.mode() & 0o7777;
+        if mode & 0o700 != 0o700 {
+            // SAFETY: fchmod on a live descriptor this function borrows.
+            unsafe {
+                libc::fchmod(directory.as_raw_fd(), (mode | 0o700) as libc::mode_t);
+            }
+        }
+    }
+}
+
 fn remove_directory_contents(directory: &File) -> io::Result<()> {
+    make_owner_writable(directory);
     let duplicate = unsafe { libc::fcntl(directory.as_raw_fd(), libc::F_DUPFD_CLOEXEC, 0) };
     if duplicate < 0 {
         return Err(io::Error::last_os_error());
@@ -4475,12 +4635,14 @@ done
         ledger.acquire("example.a");
         assert!(!ledger.package_stopped("example.a"));
         assert!(ledger.package_stopped("example.b"));
-        // A pass that may spawn from a generation it already read keeps every
-        // package "active" for the writer's update/remove guard.
+        // A pass that may spawn from a generation it already read is reported
+        // separately, so the writer refuses with the retryable code.
+        assert!(!ledger.reconciliation_in_progress());
         let pass = ledger.begin_pass();
-        assert!(!ledger.package_stopped("example.b"));
-        drop(pass);
+        assert!(ledger.reconciliation_in_progress());
         assert!(ledger.package_stopped("example.b"));
+        drop(pass);
+        assert!(!ledger.reconciliation_in_progress());
         ledger.release("example.a");
         assert!(!ledger.package_stopped("example.a"));
         ledger.release("example.a");
@@ -4490,35 +4652,38 @@ done
     }
 
     #[test]
-    fn activation_descriptor_ignores_the_registry_revision_only() {
+    fn activation_descriptor_ignores_the_global_revision_but_not_the_package_generation() {
         let (_temp, mut activation) = executable_fixture("#!/bin/sh\nexit 0\n");
-        let before = ServiceDescriptor::from_activation(&activation);
+        let before = ServiceDescriptor::from_activation(&activation, 3);
         activation.activation_revision += 5;
-        assert!(before == ServiceDescriptor::from_activation(&activation));
+        assert!(before == ServiceDescriptor::from_activation(&activation, 3));
+        assert!(before != ServiceDescriptor::from_activation(&activation, 8));
         activation.args.push("--changed".into());
-        assert!(before != ServiceDescriptor::from_activation(&activation));
+        assert!(before != ServiceDescriptor::from_activation(&activation, 3));
         activation.args.pop();
         activation.effective_projects.insert(Uuid::new_v4());
-        assert!(before != ServiceDescriptor::from_activation(&activation));
+        assert!(before != ServiceDescriptor::from_activation(&activation, 3));
     }
 
     #[test]
-    fn advance_revision_is_keyed_by_the_live_epoch() {
-        let (_temp, activation) = executable_fixture("#!/bin/sh\nexit 0\n");
-        let cache = RuntimeStatusCache::default();
-        let epoch = Uuid::new_v4();
-        cache.insert_starting(&activation, epoch, Sequence(0), 0);
-        let key = RuntimeStatusCache::key(&activation);
-        let base = activation.activation_revision;
-        cache.advance_revision(&key, Uuid::new_v4(), base + 3);
-        assert_eq!(cache.snapshot()[0].activation_revision, base);
-        cache.advance_revision(&key, epoch, base + 3);
-        assert_eq!(cache.snapshot()[0].activation_revision, base + 3);
-        cache.advance_revision(&key, epoch, base + 1);
-        assert_eq!(cache.snapshot()[0].activation_revision, base + 3);
-        // A same-epoch process restart keeps the newest reconciled revision.
-        cache.insert_starting(&activation, epoch, Sequence(0), 1);
-        assert_eq!(cache.snapshot()[0].activation_revision, base + 3);
+    fn temp_cleanup_removes_read_only_subtrees() {
+        use std::os::unix::fs::PermissionsExt;
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("connection");
+        let module = root.join("go/pkg/mod/example.com/m@v1.0.0");
+        fs::create_dir_all(&module).unwrap();
+        fs::write(module.join("go.mod"), "module m\n").unwrap();
+        fs::set_permissions(module.join("go.mod"), fs::Permissions::from_mode(0o444)).unwrap();
+        for dir in [
+            module.clone(),
+            root.join("go/pkg/mod/example.com"),
+            root.join("go/pkg/mod"),
+        ] {
+            fs::set_permissions(&dir, fs::Permissions::from_mode(0o555)).unwrap();
+        }
+        let handle = File::open(&root).unwrap();
+        remove_directory_contents(&handle).unwrap();
+        assert_eq!(fs::read_dir(&root).unwrap().count(), 0);
     }
 
     #[tokio::test]

@@ -407,28 +407,58 @@ pub(crate) fn operator_key(config_dir: &Path) -> anyhow::Result<String> {
             path.display()
         )
     };
-    let before = std::fs::symlink_metadata(&path).with_context(unavailable)?;
-    anyhow::ensure!(before.file_type().is_file(), "{}", unavailable());
-    let mut file = std::fs::File::open(&path).with_context(unavailable)?;
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        // Never follow a symlink, and never block opening a FIFO planted at
+        // the key path.
+        options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC);
+    }
+    let file = options.open(&path).with_context(unavailable)?;
     let opened = file.metadata().with_context(unavailable)?;
+    anyhow::ensure!(opened.is_file(), "{}", unavailable());
     #[cfg(unix)]
     {
         use std::os::unix::fs::MetadataExt;
+        // SAFETY: geteuid has no preconditions.
+        let euid = unsafe { libc::geteuid() };
         anyhow::ensure!(
-            opened.dev() == before.dev()
-                && opened.ino() == before.ino()
-                && opened.nlink() == 1
-                && opened.mode() & 0o077 == 0,
+            opened.uid() == euid && opened.nlink() == 1 && opened.mode() & 0o077 == 0,
             "{}",
             unavailable()
         );
     }
-    anyhow::ensure!(opened.is_file(), "{}", unavailable());
+    // The daemon's key is 43 base64url characters plus a newline; read a
+    // bounded prefix so a replaced huge file cannot exhaust memory.
     let mut key = String::new();
-    std::io::Read::read_to_string(&mut file, &mut key).with_context(unavailable)?;
+    std::io::Read::read_to_string(&mut std::io::Read::take(file, MAX_KEY_BYTES), &mut key)
+        .with_context(unavailable)?;
     let key = key.trim().to_owned();
     anyhow::ensure!(!key.is_empty(), "{}", unavailable());
     Ok(key)
+}
+
+const MAX_KEY_BYTES: u64 = 1024;
+
+/// The operator credential is sent only to a loopback daemon. A remote
+/// `--url` (for example a tailnet or proxy address) would carry the local
+/// operator key off the box, so it is refused before the key is read.
+pub(crate) fn require_loopback(url: &str) -> anyhow::Result<()> {
+    let parsed = reqwest::Url::parse(url).with_context(|| format!("invalid daemon URL {url:?}"))?;
+    let loopback = parsed.host_str().is_some_and(|host| {
+        let host = host.trim_start_matches('[').trim_end_matches(']');
+        host.eq_ignore_ascii_case("localhost")
+            || host
+                .parse::<std::net::IpAddr>()
+                .is_ok_and(|address| address.is_loopback())
+    });
+    anyhow::ensure!(
+        loopback,
+        "refusing to send the operator key to a non-loopback daemon URL; extension mutations must target a local daemon"
+    );
+    Ok(())
 }
 
 async fn mutate(
@@ -437,6 +467,7 @@ async fn mutate(
     url: String,
     body: Value,
 ) -> anyhow::Result<ExitCode> {
+    require_loopback(&url)?;
     let key = operator_key(&ocean_agent::config_dir_from_env())?;
     let response = client
         .request(method, &url)
@@ -461,6 +492,10 @@ async fn mutate(
         EXIT_RECOVERY_REQUIRED => eprintln!(
             "committed at revision {} but the registry needs recovery — do not retry; restart the daemon to run journal recovery",
             body["mutation"]["state_revision"]
+        ),
+        _ if body["error"]["retryable"] == true => eprintln!(
+            "nothing was committed and the refusal is transient ({}); inspect again and retry the command shortly",
+            body["error"]["code"]
         ),
         _ => {}
     }
@@ -560,6 +595,27 @@ mod tests {
     }
 
     #[test]
+    fn operator_key_is_only_sent_to_loopback_daemons() {
+        for url in [
+            "http://127.0.0.1:4780/v1/extensions/install",
+            "http://localhost:4780/v1/extensions/x",
+            "http://[::1]:4780/v1/extensions/x",
+            "http://127.9.9.9/v1/extensions/x",
+        ] {
+            assert!(require_loopback(url).is_ok(), "{url}");
+        }
+        for url in [
+            "http://100.65.142.80:4780/v1/extensions/install",
+            "https://daemon.example.com/v1/extensions/x",
+            "http://localhost.example.com/v1/extensions/x",
+            "http://0.0.0.0:4780/v1/extensions/x",
+            "not a url",
+        ] {
+            assert!(require_loopback(url).is_err(), "{url}");
+        }
+    }
+
+    #[test]
     fn relative_paths_are_made_absolute_lexically() {
         let cwd = Path::new("/work/tree");
         assert_eq!(
@@ -612,5 +668,17 @@ mod tests {
         let linked = tempfile::tempdir().unwrap();
         std::os::unix::fs::symlink(&path, linked.path().join("operator.key")).unwrap();
         assert!(operator_key(linked.path()).is_err(), "symlink followed");
+        // A FIFO at the key path is refused without blocking the CLI.
+        let fifo = tempfile::tempdir().unwrap();
+        let fifo_path = std::ffi::CString::new(
+            fifo.path()
+                .join("operator.key")
+                .to_str()
+                .unwrap()
+                .as_bytes(),
+        )
+        .unwrap();
+        assert_eq!(unsafe { libc::mkfifo(fifo_path.as_ptr(), 0o600) }, 0);
+        assert!(operator_key(fifo.path()).is_err(), "fifo accepted");
     }
 }

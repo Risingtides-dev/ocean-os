@@ -1115,14 +1115,16 @@ choices:
   mutation route — including the trust preview, which shares its route — requires
   the existing local operator principal (`room_operator.rs`): header-only
   `X-Ocean-Operator`, cookie and foreign-origin refusal before comparison, 503
-  when the key or header is absent and 403 for invalid/ambient/foreign authority,
-  checked before the body is parsed. The reasons are the parent's "trust is
+  when the key or header is absent and 403 for invalid/ambient/foreign authority.
+  Handlers extract only headers, the raw path result, and raw body bytes, so the
+  credential really is checked before the path or body is parsed. The reasons are the parent's "trust is
   operator-owned" invariant, that trust+enable grants daemon-user-equivalent
   native execution, and that every other authority-granting daemon mutation uses
   this principal. Refusals use the §15 pre-commit envelope with
   `state_revision: 0` (the writer's convention for "no registry read yet"). The
-  CLI reads `<config_dir>/operator.key` only from a single-link, non-symlink file
-  no other user can read.
+  CLI reads `<config_dir>/operator.key` only through an `O_NOFOLLOW|O_NONBLOCK`
+  open of a single-link regular file owned by the caller that no other user can
+  read (bounded read), and refuses to send it to a non-loopback daemon URL.
 - *Envelopes.* Pre-commit and committed shapes are exactly §15's; a retryable
   pre-commit code (`extension_state_busy`, `acquisition_capacity`) adds
   `error.retryable: true`. Codes map to closed statuses: malformed/invalid 400,
@@ -1131,40 +1133,59 @@ choices:
   capacity 429, busy 503, operator 503/403, anything else 500. A committed
   `registry_recovery_required` is the §15 500 with `committed: true`. The trust
   preview is 200 `{applied:false, committed:false, state_revision, preview}`.
-- *Reconciliation.* After a commit the route sends a registry command on the
-  supervisor's existing project-snapshot queue, so every reconciliation (project
-  or registry) runs on the one supervisor task in order; each pass reads the
-  newest coherent generation together with its `state_revision`. HTTP 200 means
-  that pass read at least the committed revision and completed, including any
-  generation-safe reap; a cleanup that cannot be proven is `reconciliation:
-  pending, reap: pending` (202); a 15 s timeout is `pending` (202, the queued
-  pass still runs); an unreadable registry is `blocked` (202). When the
-  supervisor could not answer, `reap` is `pending` exactly when the package is no
+- *Reconciliation.* The whole authorized operation — acquisition, commit, and
+  the reconcile request — runs in one detached task the handler only awaits, so
+  a client disconnect can never leave a committed revision unreconciled. The
+  route sends a registry command on the supervisor's existing project-snapshot
+  queue, so every reconciliation (project or registry) runs on the one
+  supervisor task in order; each pass reads the newest coherent generation
+  together with its `state_revision`. The envelope reports what THAT pass did
+  for the package: HTTP 200 means the pass read at least the committed revision
+  and completed, including any generation-safe reap of this package; a cleanup of
+  this package that cannot be proven is `reconciliation: pending, reap: pending`
+  (202); a 15 s timeout is `pending` (202, the queued pass still runs); an
+  unreadable registry is `blocked` (202). Only when no pass answered is the
+  ledger consulted: `reap` is then `pending` exactly when the package is no
   longer registry-effective but still owns a process or temp root. A committed
   retention cleanup the writer deferred to the next recovery is also reported as
-  `reap: pending`. The activation descriptor no longer includes the registry
-  revision, so an unrelated commit (another package's install) never restarts a
-  running service; the cached `activation_revision` advances only under that
-  service's live epoch, so stale work cannot publish a newer status. A service
-  that is no longer effective anywhere is stopped with `shutdown` reason
-  `disabled`; one whose activation identity changed, `reconfigure`.
+  `reap: pending`. Any pass that was blocked or left cleanup unproven — the
+  startup pass included — is re-run by the supervisor itself with exponential
+  backoff (0.5 s doubling to 30 s) until one completes.
+- *Failure isolation.* Stops always run. A retained cleanup authority that still
+  cannot be proven, or a stale service whose reap fails, withholds only a
+  replacement spawn of that same service key; every other stale service is still
+  stopped and every other package still reconciles, and the failure is reported
+  only for its own package. Temp-root cleanup makes each opened (no-follow)
+  directory owner-writable before removing its entries, so read-only trees a
+  service leaves behind (Go module caches are `0555`) are removable.
+- *Activation identity.* The global registry revision is not part of it, so an
+  unrelated commit (another package's install) never restarts a running
+  service. Instead it carries a boot-local per-package activation generation:
+  the committed revision of the package's last disable, trust, update, or
+  remove, reported by the committing route. A disable→enable pair committed
+  before any pass ran therefore still mints a new epoch and process (§7.2,
+  §10.4) instead of collapsing to "unchanged". The cached `activation_revision`
+  is exactly the one the child received in `host_hello`. A service that is no
+  longer effective anywhere is stopped with `shutdown` reason `disabled`; one
+  whose activation identity changed, `reconfigure`.
 - *`ServiceActivity`.* The real supervisor keeps a per-package owner count —
   every managed service task plus every retained exceptional cleanup authority —
   and the writer's update/remove guard reads it synchronously. A package is
   stopped only when nothing it spawned can still be alive or hold a connection
   temp root, so a bounded reap failure keeps update/remove refused with
   `extension_active`. A reconciliation pass registers itself BEFORE its
-  shared-lock registry read and counts as activity for every package until it
-  finishes, so a writer holding the exclusive lock can never commit a remove or
-  update in the window between a pass reading an older (still-enabled)
-  generation and spawning from it; that rare overlap is the retryable
-  `extension_active`, never a service started for a removed package.
-- *Startup recovery* runs `RegistryWriter::recover` on the blocking pool after
-  the config directory is resolved and before the supervisor is created or any
-  route is served. It is fail-soft for the daemon; a failure is logged by fixed
+  shared-lock registry read and until it finishes the writer refuses update and
+  remove with the distinct, retryable `reconciliation_in_progress`
+  (`error.retryable: true`; the CLI says to retry), so a remove or update can
+  never commit between a pass reading an older (still-enabled) generation and
+  spawning from it.
+- *Startup recovery* runs `RegistryWriter::recover` on the blocking pool inside
+  `start_extension_host`, which awaits it before creating and starting the
+  supervisor; `main` awaits that seam before any route is served. It is fail-soft for the daemon; a failure is logged by fixed
   code and leaves readers and activation fail-closed.
-- *Blocking discipline.* Every writer call, including `acquire_exclusive_lock`
-  and the acquisition permit, runs inside `spawn_blocking`.
+- *Blocking discipline.* The writer is constructed and every call, including
+  `acquire_exclusive_lock` and the acquisition permit, runs inside
+  `spawn_blocking`; the registered-project read is off the executor too.
 - *Busy readers.* A reader that exceeds its 250 ms shared-lock bound during a
   large mutation answers 503 `{"ok":false,"error":"extension_state_busy","retryable":true}`
   instead of the former 500; the CLI retries reads (never mutations) up to five
@@ -1182,7 +1203,15 @@ Recorded boundaries, not decided here:
    an activation-identity change and restarts the service under a new epoch
    (restart history preserved). A3b does not change the transport; narrowing a
    live filter without a stop needs a supervisor change and review of its own.
-3. Windows package management (R5 "may manage") remains open: the writer is
+3. The first independent review (Knox) requested changes (retained-cleanup
+   isolation, detached commit+reconcile with supervisor retry, per-package
+   activation generation, behavioral guard tests, auth-before-parse, retryable
+   in-flight refusal, pass-derived envelopes, `host_hello`-consistent status,
+   loopback-only CLI key); all are repaired on the same branch and await delta
+   review. Mutation checks (`package_stopped` forced true, `begin_pass`
+   removed, startup recovery spawned or commented out, activation generation
+   zeroed) each now fail a test.
+4. Windows package management (R5 "may manage") remains open: the writer is
    Unix-only, so non-Unix mutation routes answer 409 `unsupported_platform`.
 
 ### A4 — pinned public Git acquisition
