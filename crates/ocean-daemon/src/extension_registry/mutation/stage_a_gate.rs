@@ -47,8 +47,13 @@ me=$$
 printf '%s\n' "$me" >> "$HOME/starts"
 if [ -e "$HOME/frames" ]; then printf '%s\n' "$me" >> "$HOME/saw-retained-data"; fi
 env | LC_ALL=C sort > "$HOME/env-$me"
-pwd -P > "$HOME/cwd-$me"
 printf '%s|' "$0" "$@" > "$HOME/argv-$me"
+for name in HOME XDG_STATE_HOME XDG_CACHE_HOME TMPDIR PWD; do
+  eval "path=\$$name"
+  printf '%s %s\n' "$name" "$(ls -idL "$path" | awk '{{print $1}}')" >> "$HOME/ids-$me"
+done
+printf 'CWD %s\n' "$(ls -idL . | awk '{{print $1}}')" >> "$HOME/ids-$me"
+printf 'ARGV0 %s\n' "$(ls -iL "$0" | awk '{{print $1}}')" >> "$HOME/ids-$me"
 printf cache > "$XDG_CACHE_HOME/cache-proof"
 printf tmp > "$TMPDIR/tmp-proof"
 sleep 600 </dev/null >/dev/null 2>&1 &
@@ -125,14 +130,47 @@ fn data_dir(fixture: &Fixture) -> PathBuf {
     fixture.root().join("state").join(ID).join("data")
 }
 
+/// Decode one recorded host→child frame with the strict SDK decoder for its
+/// declared type and re-encode it: the host must have written exactly the
+/// canonical v1 bytes (§7.1, §8.1). The shell fixture only records lines; this
+/// is what proves host-frame conformance.
+fn assert_strict_host_frame(line: &str) -> Value {
+    use ocean_agent_sdk::extension_lifecycle::{
+        decode_frame, encode_frame, HostHello, Lag, LifecycleEvent, Ping, Ready, Reset, Shutdown,
+    };
+    let bytes = format!("{line}\n").into_bytes();
+    let value: Value = serde_json::from_str(line).unwrap();
+    fn exact<T: serde::de::DeserializeOwned + serde::Serialize>(bytes: &[u8]) {
+        let decoded: T = decode_frame(bytes)
+            .unwrap_or_else(|error| panic!("{error:?}: {}", String::from_utf8_lossy(bytes)));
+        assert_eq!(
+            encode_frame(&decoded).unwrap(),
+            bytes,
+            "host frame is not canonical"
+        );
+    }
+    match value["frame"].as_str().unwrap_or_default() {
+        "host_hello" => exact::<HostHello>(&bytes),
+        "ready" => exact::<Ready>(&bytes),
+        "event" => exact::<LifecycleEvent>(&bytes),
+        "lag" => exact::<Lag>(&bytes),
+        "reset" => exact::<Reset>(&bytes),
+        "ping" => exact::<Ping>(&bytes),
+        "shutdown" => exact::<Shutdown>(&bytes),
+        other => panic!("the host wrote a non-v1 frame kind {other:?}: {line}"),
+    }
+    value
+}
+
 /// Every frame the service received, in order, as `(service pid, frame)`.
+/// Each one is first proven to be a strict, canonical v1 host frame.
 fn frames(fixture: &Fixture) -> Vec<(String, Value)> {
     fs::read_to_string(data_dir(fixture).join("frames"))
         .unwrap_or_default()
         .lines()
         .map(|line| {
             let (pid, frame) = line.split_once(' ').unwrap();
-            (pid.to_owned(), serde_json::from_str(frame).unwrap())
+            (pid.to_owned(), assert_strict_host_frame(frame))
         })
         .collect()
 }
@@ -339,19 +377,6 @@ fn canonical(path: &FsPath) -> String {
     fs::canonicalize(path).unwrap().to_str().unwrap().to_owned()
 }
 
-/// `seen` (as the child reported it) names the same file as `expected`.
-fn assert_same_file(seen: &str, expected: &FsPath) {
-    use std::os::unix::fs::MetadataExt;
-    let seen_meta = fs::metadata(seen).unwrap_or_else(|error| panic!("{seen}: {error}"));
-    let expected_meta = fs::metadata(expected).unwrap();
-    assert_eq!(
-        (seen_meta.dev(), seen_meta.ino()),
-        (expected_meta.dev(), expected_meta.ino()),
-        "{seen} is not {}",
-        expected.display()
-    );
-}
-
 /// Assert no file under `root` contains `needle`, naming the first that does.
 fn assert_tree_lacks(root: &FsPath, needle: &str, skip: Option<&FsPath>) {
     let mut stack = vec![root.to_path_buf()];
@@ -524,7 +549,6 @@ async fn stage_a_gate_local_noop_package_end_to_end() {
             "replay_floor": status_a["services"][0]["replay_floor"],
         })
     );
-    let config = canonical(fixture.config.path());
     let env = fs::read_to_string(data_dir(&fixture).join(format!("env-{first}"))).unwrap();
     assert!(
         !env.contains(&ambient),
@@ -548,19 +572,28 @@ async fn stage_a_gate_local_noop_package_end_to_end() {
         ])
     );
     let value = |name: &str| env.iter().find(|(n, _)| *n == name).unwrap().1.to_owned();
-    // The host hands the child descriptor-derived paths (on macOS a volfs
-    // `/.vol/<dev>/<ino>` spelling), so each assigned root is compared by
-    // file identity with the directory it must name.
+    // The host hands the child descriptor-derived paths — a volfs
+    // `/.vol/<dev>/<ino>` spelling on macOS and `/proc/self/fd/<n>` on Linux,
+    // which only the child can resolve — so the child records the inode each
+    // path names from its own context, and the gate compares it with the
+    // directory or file the root must be.
     let state_root = fixture.root().join("state").join(ID);
     let hex = digest.strip_prefix("sha256:").unwrap();
     let package_root = fixture.root().join("store").join(ID).join(hex);
     assert_eq!(value("PATH"), "/usr/bin:/bin");
-    assert_same_file(&value("HOME"), &state_root.join("data"));
-    assert_same_file(&value("XDG_STATE_HOME"), &state_root.join("data"));
-    assert_same_file(&value("XDG_CACHE_HOME"), &state_root.join("cache"));
-    assert_same_file(&value("PWD"), &package_root);
-    let cwd_seen = fs::read_to_string(data_dir(&fixture).join(format!("cwd-{first}"))).unwrap();
-    assert_same_file(cwd_seen.trim(), &package_root);
+    let ids: std::collections::HashMap<String, u64> =
+        fs::read_to_string(data_dir(&fixture).join(format!("ids-{first}")))
+            .unwrap()
+            .lines()
+            .map(|line| {
+                let (name, inode) = line.split_once(' ').unwrap();
+                (name.to_owned(), inode.trim().parse().unwrap_or(0))
+            })
+            .collect();
+    let inode = |path: &FsPath| {
+        use std::os::unix::fs::MetadataExt;
+        fs::metadata(path).unwrap().ino()
+    };
     let connection_dirs: Vec<PathBuf> = fs::read_dir(state_root.join("tmp/lifecycle"))
         .unwrap()
         .map(|entry| entry.unwrap().path())
@@ -570,13 +603,26 @@ async fn stage_a_gate_local_noop_package_end_to_end() {
         1,
         "one connection temp root per launch"
     );
-    assert_same_file(&value("TMPDIR"), &connection_dirs[0]);
     assert!(connection_dirs[0].join("tmp-proof").exists());
+    for (name, expected) in [
+        ("HOME", state_root.join("data")),
+        ("XDG_STATE_HOME", state_root.join("data")),
+        ("XDG_CACHE_HOME", state_root.join("cache")),
+        ("TMPDIR", connection_dirs[0].clone()),
+        ("PWD", package_root.clone()),
+        ("CWD", package_root.clone()),
+        ("ARGV0", package_root.join("services/lifecycle")),
+    ] {
+        assert_eq!(
+            ids[name],
+            inode(&expected),
+            "{name} is not {}",
+            expected.display()
+        );
+    }
     let argv = fs::read_to_string(data_dir(&fixture).join(format!("argv-{first}"))).unwrap();
-    let (entry, rest) = argv.split_once('|').unwrap();
+    let (_entry, rest) = argv.split_once('|').unwrap();
     assert_eq!(rest, "", "the manifest declares no arguments");
-    assert_same_file(entry, &package_root.join("services/lifecycle"));
-    let _ = config;
     let child_of_first = grandchild(&fixture, first);
     assert_eq!(pgid(first), first, "the service leads its own group");
     assert_eq!(pgid(child_of_first), first, "the grandchild shares it");
@@ -928,10 +974,16 @@ async fn stage_a_gate_local_noop_package_end_to_end() {
 // ---------------------------------------------------------------------------
 
 /// A service that completes its handshake and then never reads stdin again
-/// cannot delay ordinary turns: each turn is acknowledged and finishes while
-/// the stalled service's pipe is full.
+/// cannot delay ordinary turns. A burst of concurrent turns publishes far more
+/// than the 256-frame data queue and the 64 KiB pipe hold, so the host both
+/// coalesces lost frames into `lag` and blocks on a full stdin. Every turn
+/// is still acknowledged and finishes within its bound. The blocked write
+/// fails the connection at the 2 s deadline (as a protocol failure), no
+/// earlier than 2 s after the burst began and within a bounded slack of its
+/// end, and the process group is reaped.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn stage_a_gate_stalled_service_never_delays_ordinary_turns() {
+    const BURST: usize = 160;
     let _guard = AUTO_CONVENE_ENV_LOCK.lock().await;
     let _restore = TestEnvRestore::capture(&["OCEAN_CONFIG_DIR", "OCEAN_MODEL", "OCEAN_YOLO"]);
     let fixture = Fixture::new();
@@ -949,27 +1001,458 @@ async fn stage_a_gate_stalled_service_never_delays_ordinary_turns() {
     let (status, _) = scope(&app, ID, "enable", 2).await;
     assert_eq!(status, StatusCode::OK);
     let (pid, _) = healthy(&app).await;
-    wait_for("stalled marker", || {
-        data_dir(&fixture).join("stalled").exists()
+    let child = {
+        wait_for("stalled marker", || {
+            data_dir(&fixture).join("stalled").exists()
+        })
+        .await;
+        pid
+    };
+
+    let cwd = fixture.sources.path().to_str().unwrap().to_owned();
+    let before = state.extension_lifecycle.current_sequence().0;
+    let burst_started = tokio::time::Instant::now();
+    let mut turns = tokio::task::JoinSet::new();
+    for _ in 0..BURST {
+        let state = state.clone();
+        let cwd = cwd.clone();
+        turns.spawn(async move {
+            let started = tokio::time::Instant::now();
+            let (status, Json(ack)) =
+                crate::agent_turn(State(state.clone()), Json(turn_request(None, "ping", &cwd)))
+                    .await;
+            assert_eq!(status, StatusCode::ACCEPTED, "{ack:?}");
+            let session = serde_json::to_value(ack.session_id).unwrap();
+            wait_for("burst turn finished", || {
+                state
+                    .extension_lifecycle
+                    .attach()
+                    .retained
+                    .iter()
+                    .any(|event| {
+                        let event = serde_json::to_value(event).unwrap();
+                        event["kind"] == "turn_finished" && event["scope"]["session_id"] == session
+                    })
+            })
+            .await;
+            started.elapsed()
+        });
+    }
+    let mut slowest = Duration::ZERO;
+    while let Some(elapsed) = tokio::time::timeout(Duration::from_secs(30), turns.join_next())
+        .await
+        .expect("a stalled service delayed an ordinary turn")
+    {
+        slowest = slowest.max(elapsed.unwrap());
+    }
+    let burst_ended = tokio::time::Instant::now();
+    assert!(
+        slowest < Duration::from_secs(20),
+        "slowest turn took {slowest:?}"
+    );
+    let published = state.extension_lifecycle.current_sequence().0 - before;
+    assert!(
+        published as usize >= 3 * BURST,
+        "the burst published {published} facts"
+    );
+
+    // The stalled connection lagged and then failed at the write deadline:
+    // `stopping` (with its fixed reason) is published the moment the
+    // connection fails, and the terminal `unhealthy` follows the §10.5
+    // bounded cleanup (shutdown write deadline, TERM, KILL, reap).
+    let stopping_at = loop {
+        let (_, body) = get_json(&app, &format!("/v1/extensions/{ID}/status")).await;
+        let state = body["services"][0]["state"].clone();
+        if state == "stopping" || state == "unhealthy" {
+            assert_eq!(
+                body["services"][0]["reason"], "protocol_violation",
+                "{body}"
+            );
+            break tokio::time::Instant::now();
+        }
+        assert_eq!(state, "healthy", "{body}");
+        assert!(
+            burst_ended.elapsed() < Duration::from_secs(10),
+            "the blocked write never failed: {body}"
+        );
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    };
+    assert!(
+        stopping_at.duration_since(burst_started) >= Duration::from_secs(2),
+        "the connection failed before its 2 s write deadline"
+    );
+    assert!(
+        stopping_at.duration_since(burst_ended) < Duration::from_millis(3500),
+        "the blocked write outlived its 2 s deadline: {:?} after the burst",
+        stopping_at.duration_since(burst_ended)
+    );
+    let failed =
+        wait_for_status(&app, ID, |body| body["services"][0]["state"] == "unhealthy").await;
+    assert!(
+        stopping_at.elapsed() < Duration::from_secs(8),
+        "cleanup exceeded the §10.5 bounds"
+    );
+    let row = &failed["services"][0];
+    assert!(
+        row["lag_count"].as_u64() > Some(0),
+        "no lag recorded: {failed}"
+    );
+    assert_eq!(row["reason"], "protocol_violation", "{failed}");
+    assert_eq!(row["pid"], Value::Null);
+    assert!(!process_alive(child), "the stalled group was not reaped");
+    supervisor.shutdown().await;
+    fixture.assert_no_canary_ran();
+}
+
+// ---------------------------------------------------------------------------
+// §20 step 5 with a permission and a tool, through the real turn path.
+// ---------------------------------------------------------------------------
+
+const ALL_PRODUCED: &str = r#"["daemon_started","session_started","turn_started","permission_requested","permission_resolved","tool_started","tool_finished","turn_finished","daemon_stopping"]"#;
+
+/// An ordinary turn on the keyless `fake-tool` model asks for `write`, the
+/// real daemon permission policy suspends it, the operator allows it through
+/// the existing waiter, and the real tool runs. The subscribed service
+/// receives exactly the ratified metadata sequence with host UUIDs, and no
+/// argument, path, content, or runtime tool-call id reaches it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn stage_a_gate_live_permission_and_tool_facts_are_metadata_only() {
+    let _guard = AUTO_CONVENE_ENV_LOCK.lock().await;
+    let _restore = TestEnvRestore::capture(&["OCEAN_CONFIG_DIR", "OCEAN_MODEL", "OCEAN_YOLO"]);
+    let fixture = Fixture::new();
+    let mut state = fake_convene_state(&fixture.config);
+    // The gating (non-yolo) policy and the tool-calling fake model.
+    std::env::remove_var("OCEAN_YOLO");
+    std::env::set_var("OCEAN_MODEL", ocean_runtime::FAKE_TOOL_MODEL);
+    state.runtime = Arc::new(
+        crate::AgentRuntime::with_config_dir(fixture.config.path().to_path_buf())
+            .expect("fake-tool runtime"),
+    );
+    let target = FsPath::new(ocean_runtime::FAKE_TOOL_TARGET_PATH);
+    let _ = fs::remove_file(target);
+    let supervisor = with_supervisor(&mut state, fixture.config.path()).await;
+    let app = router(state.clone());
+
+    let service = gate_service().replace(SUBSCRIPTIONS, ALL_PRODUCED);
+    let package = gate_package_with(&fixture, "tools", "1.0.0", "", &service);
+    let manifest = FsPath::new(&package).join("ocean-extension.toml");
+    let rewritten = fs::read_to_string(&manifest).unwrap().replace(
+        &format!("events = {SUBSCRIPTIONS}"),
+        &format!("events = {ALL_PRODUCED}"),
+    );
+    fs::write(&manifest, rewritten).unwrap();
+    let (_, installed) = install_local(&app, 0, &package).await;
+    let digest = installed["mutation"]["digest"].as_str().unwrap().to_owned();
+    let (status, _, _) = trust(&app, 1, &digest, json!({}), json!([])).await;
+    assert_eq!(status, StatusCode::OK);
+    let (status, _) = scope(&app, ID, "enable", 2).await;
+    assert_eq!(status, StatusCode::OK);
+    let (pid, _) = healthy(&app).await;
+    wait_for("ready", || {
+        frames_of(&fixture, pid)
+            .iter()
+            .any(|f| f["frame"] == "ready")
     })
     .await;
 
     let cwd = fixture.sources.path().to_str().unwrap().to_owned();
-    for _ in 0..20 {
-        let started = tokio::time::Instant::now();
-        tokio::time::timeout(
-            Duration::from_secs(10),
-            ordinary_turn(&state, None, "ping", &cwd),
-        )
-        .await
-        .expect("a stalled service delayed an ordinary turn");
-        assert!(started.elapsed() < Duration::from_secs(10));
+    let (status, Json(ack)) = crate::agent_turn(
+        State(state.clone()),
+        Json(turn_request(None, "write the file", &cwd)),
+    )
+    .await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{ack:?}");
+    // The real policy suspends the turn on a waiter; allow it once.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        let sender = {
+            let mut permissions = state.permissions.write().await;
+            permissions
+                .values_mut()
+                .find_map(|waiter| waiter.sender.take())
+        };
+        if let Some(sender) = sender {
+            sender
+                .send(crate::AgentPermissionDecision::Allow)
+                .expect("decision");
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "no permission waiter"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
     }
-    // The service is still the one supervised process (or has been failed
-    // closed by the transport); either way the daemon never waited on it.
-    let _ = pid;
+    let session = serde_json::to_value(ack.session_id).unwrap();
+    wait_for("tool turn delivered", || {
+        events_of(&fixture, pid)
+            .iter()
+            .any(|e| e["kind"] == "turn_finished" && e["scope"]["session_id"] == session)
+    })
+    .await;
+    assert!(target.exists(), "the allowed tool did not run");
+
+    let delivered: Vec<Value> = events_of(&fixture, pid)
+        .into_iter()
+        .filter(|event| event["scope"]["session_id"] == session)
+        .collect();
+    let kinds: Vec<&str> = delivered
+        .iter()
+        .map(|event| event["kind"].as_str().unwrap())
+        .collect();
+    assert_eq!(
+        kinds,
+        [
+            "session_started",
+            "turn_started",
+            "permission_requested",
+            "permission_resolved",
+            "tool_started",
+            "tool_finished",
+            "turn_finished"
+        ]
+    );
+    let by_kind = |kind: &str| delivered.iter().find(|e| e["kind"] == kind).unwrap();
+    assert_eq!(
+        by_kind("permission_requested")["metadata"],
+        json!({"tool_name": "write"})
+    );
+    assert_eq!(
+        by_kind("permission_resolved")["metadata"],
+        json!({"outcome": "allowed"})
+    );
+    assert_eq!(
+        by_kind("permission_requested")["scope"]["permission_id"],
+        by_kind("permission_resolved")["scope"]["permission_id"]
+    );
+    assert!(Uuid::parse_str(
+        by_kind("permission_requested")["scope"]["permission_id"]
+            .as_str()
+            .unwrap()
+    )
+    .is_ok());
+    assert_eq!(
+        by_kind("tool_started")["metadata"],
+        json!({"tool_name": "write"})
+    );
+    let finished = &by_kind("tool_finished")["metadata"];
+    assert_eq!(finished["tool_name"], "write");
+    assert_eq!(finished["outcome"], "success");
+    let tool_call = by_kind("tool_started")["scope"]["tool_call_id"].clone();
+    assert_eq!(by_kind("tool_finished")["scope"]["tool_call_id"], tool_call);
+    assert!(
+        Uuid::parse_str(tool_call.as_str().unwrap()).is_ok(),
+        "host UUID"
+    );
+    assert_eq!(by_kind("turn_finished")["metadata"]["outcome"], "completed");
+    let raw = fs::read_to_string(data_dir(&fixture).join("frames")).unwrap();
+    for forbidden in [
+        ocean_runtime::FAKE_TOOL_TARGET_PATH,
+        ocean_runtime::FAKE_TOOL_CALL_ID,
+        "write the file",
+    ] {
+        assert!(!raw.contains(forbidden), "{forbidden} reached the service");
+    }
+
+    // Deny: the runtime's compatibility PermissionDenied pair is never
+    // translated into execution facts, because no tool ran.
+    let _ = fs::remove_file(target);
+    let (status, Json(ack)) = crate::agent_turn(
+        State(state.clone()),
+        Json(turn_request(None, "write the file", &cwd)),
+    )
+    .await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{ack:?}");
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        let sender = {
+            let mut permissions = state.permissions.write().await;
+            permissions
+                .values_mut()
+                .find_map(|waiter| waiter.sender.take())
+        };
+        if let Some(sender) = sender {
+            sender
+                .send(crate::AgentPermissionDecision::Deny {
+                    reason: "a5-deny-reason-sentinel".to_owned(),
+                })
+                .expect("decision");
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "no permission waiter"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    let denied_session = serde_json::to_value(ack.session_id).unwrap();
+    wait_for("denied turn delivered", || {
+        events_of(&fixture, pid)
+            .iter()
+            .any(|e| e["kind"] == "turn_finished" && e["scope"]["session_id"] == denied_session)
+    })
+    .await;
+    assert!(!target.exists(), "a denied tool ran");
+    let denied: Vec<Value> = events_of(&fixture, pid)
+        .into_iter()
+        .filter(|event| event["scope"]["session_id"] == denied_session)
+        .collect();
+    let kinds: Vec<&str> = denied
+        .iter()
+        .map(|event| event["kind"].as_str().unwrap())
+        .collect();
+    assert_eq!(
+        kinds,
+        [
+            "session_started",
+            "turn_started",
+            "permission_requested",
+            "permission_resolved",
+            "turn_finished"
+        ],
+        "a denial fabricated tool execution"
+    );
+    assert_eq!(denied[3]["metadata"], json!({"outcome": "denied"}));
+    let raw = fs::read_to_string(data_dir(&fixture).join("frames")).unwrap();
+    assert!(!raw.contains("a5-deny-reason-sentinel"));
+
     supervisor.shutdown().await;
-    assert!(!process_alive(pid));
+    let _ = fs::remove_file(target);
+    fixture.assert_no_canary_ran();
+}
+
+// ---------------------------------------------------------------------------
+// §19.2 / §20 step 7: live project-scope widening.
+// ---------------------------------------------------------------------------
+
+async fn create_project(state: &AppState, name: &str, root: &FsPath) -> Uuid {
+    let (status, Json(created)) = crate::project_create(
+        State(state.clone()),
+        Json(
+            serde_json::from_value(json!({"name": name, "workspace_root": root.to_str().unwrap()}))
+                .unwrap(),
+        ),
+    )
+    .await;
+    assert!(status.is_success(), "{:?}", created.error);
+    created.project.unwrap().id
+}
+
+/// A service enabled for project A receives A's facts and never B's. Widening
+/// to A+B mints a new epoch whose floor is at or above every fact B produced
+/// while it was out of scope, the stale cursor is reset, and none of B's
+/// interval facts is ever delivered; B's facts after the widening are.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn stage_a_gate_project_scope_widening_never_replays_interval_facts() {
+    let _guard = AUTO_CONVENE_ENV_LOCK.lock().await;
+    let _restore = TestEnvRestore::capture(&["OCEAN_CONFIG_DIR", "OCEAN_MODEL", "OCEAN_YOLO"]);
+    let fixture = Fixture::new();
+    let mut state = fake_convene_state(&fixture.config);
+    let supervisor = with_supervisor(&mut state, fixture.config.path()).await;
+    let app = router(state.clone());
+    let root_a = fixture.sources.path().join("project-a");
+    let root_b = fixture.sources.path().join("project-b");
+    let project_a = create_project(&state, "a", &root_a).await;
+    let project_b = create_project(&state, "b", &root_b).await;
+    let (cwd_a, cwd_b) = (canonical(&root_a), canonical(&root_b));
+
+    let package = gate_package(&fixture, "scoped", "1.0.0", "");
+    let (_, installed) = install_local(&app, 0, &package).await;
+    let digest = installed["mutation"]["digest"].as_str().unwrap().to_owned();
+    let (status, _, _) = trust(&app, 1, &digest, json!({}), json!([])).await;
+    assert_eq!(status, StatusCode::OK);
+    let enable_project = |expected: u64, project: Uuid| {
+        let app = app.clone();
+        async move {
+            post_op(
+                &app,
+                &format!("/v1/extensions/{ID}/enable"),
+                json!({"expected_state_revision": expected, "scope": {"kind": "project", "project_id": project}}),
+            )
+            .await
+        }
+    };
+    let (status, enabled) = enable_project(2, project_a).await;
+    assert_eq!(status, StatusCode::OK, "{enabled}");
+    let (first, status_a) = healthy(&app).await;
+    let epoch_a = status_a["services"][0]["activation_epoch"].clone();
+
+    let (in_a, _) = ordinary_turn(&state, None, "ping", &cwd_a).await;
+    let in_a = serde_json::to_value(in_a.session_id).unwrap();
+    wait_for("A delivered", || {
+        events_of(&fixture, first)
+            .iter()
+            .any(|e| e["kind"] == "turn_finished" && e["scope"]["session_id"] == in_a)
+    })
+    .await;
+    let (in_b, _) = ordinary_turn(&state, None, "ping", &cwd_b).await;
+    let in_b = serde_json::to_value(in_b.session_id).unwrap();
+    let b_high = state.extension_lifecycle.current_sequence().0;
+    for event in events_of(&fixture, first) {
+        assert_ne!(
+            event["scope"]["session_id"], in_b,
+            "out-of-scope B fact delivered"
+        );
+        if event["kind"] != "daemon_started" {
+            assert_eq!(event["scope"]["project_id"], json!(project_a), "{event}");
+        }
+    }
+
+    // Widen to A+B.
+    let (status, widened) = enable_project(3, project_b).await;
+    assert_eq!(status, StatusCode::OK, "{widened}");
+    let body = wait_for_status(&app, ID, |body| {
+        body["services"][0]["state"] == "healthy"
+            && body["services"][0]["activation_epoch"] != epoch_a
+            && body["services"][0]["pid"].is_u64()
+    })
+    .await;
+    let second = body["services"][0]["pid"].as_i64().unwrap();
+    let floor: u64 = body["services"][0]["replay_floor"]
+        .as_str()
+        .unwrap()
+        .parse()
+        .unwrap();
+    assert!(
+        floor >= b_high,
+        "the widened floor {floor} admits B's interval facts"
+    );
+    wait_for("stale cursor reset", || {
+        frames_of(&fixture, second)
+            .iter()
+            .any(|f| f["frame"] == "reset")
+    })
+    .await;
+    let reset = frames_of(&fixture, second)
+        .into_iter()
+        .find(|f| f["frame"] == "reset")
+        .unwrap();
+    assert_eq!(reset["reason"], "activation_changed", "{reset}");
+
+    let (after_b, _) = ordinary_turn(&state, None, "ping", &cwd_b).await;
+    let after_b = serde_json::to_value(after_b.session_id).unwrap();
+    wait_for("B delivered after widening", || {
+        events_of(&fixture, second)
+            .iter()
+            .any(|e| e["kind"] == "turn_finished" && e["scope"]["session_id"] == after_b)
+    })
+    .await;
+    for event in events_of(&fixture, second) {
+        assert_ne!(
+            event["scope"]["session_id"], in_b,
+            "B's interval fact replayed"
+        );
+        assert!(sequence(&event) > b_high || event["kind"] == "daemon_started");
+    }
+    assert_eq!(
+        events_of(&fixture, second)
+            .iter()
+            .find(|e| e["scope"]["session_id"] == after_b)
+            .unwrap()["scope"]["project_id"],
+        json!(project_b)
+    );
+
+    supervisor.shutdown().await;
     fixture.assert_no_canary_ran();
 }
 
@@ -1040,8 +1523,10 @@ async fn stage_a_gate_bound_secret_never_leaves_the_spawn_environment() {
         "exact"
     );
     assert!(!data_dir(&fixture).join("source-leaked").exists());
-    // The child echoed the secret on stderr; stderr counters reach status
-    // only at connection end, so the unit suite owns the redaction count.
+    // The child echoed the secret on stderr. Stderr counters reach status at
+    // connection end, and disable prunes the status row, so the connection is
+    // ended first by killing the leader (no restart policy): the row stays,
+    // unhealthy, with the redaction counted and no secret text.
     ordinary_turn(
         &state,
         None,
@@ -1062,6 +1547,14 @@ async fn stage_a_gate_bound_secret_never_leaves_the_spawn_environment() {
         .output()
         .unwrap();
     assert!(!String::from_utf8_lossy(&argv.stdout).contains(&sentinel));
+    // SAFETY: signals only the observed leader of this test's service.
+    assert_eq!(unsafe { libc::kill(pid as libc::pid_t, libc::SIGKILL) }, 0);
+    let ended = wait_for_status(&app, ID, |body| body["services"][0]["state"] == "unhealthy").await;
+    assert!(
+        ended["services"][0]["stderr_redactions"].as_u64() >= Some(1),
+        "the echoed secret was not counted as a redaction: {ended}"
+    );
+    responses.push(ended);
     let (status, disabled) = scope(&app, ID, "disable", 3).await;
     assert_eq!(status, StatusCode::OK);
     responses.push(disabled);
@@ -1272,7 +1765,7 @@ async fn stage_a_gate_crash_resume_backoff_circuit_and_explicit_retry() {
     for (gap, delay) in stamps.windows(2).zip([1000u64, 2000]) {
         let gap = gap[1].duration_since(gap[0]).as_millis() as u64;
         assert!(
-            gap + 60 >= delay && gap < delay + 1500,
+            gap + 60 >= delay && gap < delay + 500,
             "backoff gap {gap} ms is not the ratified {delay} ms"
         );
     }
@@ -1289,8 +1782,9 @@ async fn stage_a_gate_crash_resume_backoff_circuit_and_explicit_retry() {
             "a grandchild of {pid} survived"
         );
     }
-    // The open circuit never closes on a timer.
-    tokio::time::sleep(Duration::from_secs(3)).await;
+    // The open circuit never closes on a timer: wait past the next (4 s)
+    // backoff step that an un-opened circuit would have taken.
+    tokio::time::sleep(Duration::from_secs(5)).await;
     assert_eq!(starts(&fixture), pids.len());
 
     // Explicit retry: disable → enable mints a new epoch with fresh history.
@@ -1467,6 +1961,33 @@ async fn stage_a_gate_pinned_git_noop_installs_untrusted_and_activates_only_afte
     let (status, disabled) = scope(&app, ID, "disable", 3).await;
     assert_eq!(status, StatusCode::OK, "{disabled}");
     assert!(!process_alive(pid) && !process_alive(child));
+
+    // A pinned Git update to an exact second commit installs a new, untrusted
+    // digest, keeps the Git provenance, and starts nothing.
+    fs::write(FsPath::new(&tree).join("CHANGELOG"), "two\n").unwrap();
+    git(&["add", "-A"]);
+    git(&["commit", "--quiet", "-m", "two"]);
+    let second = git(&["rev-parse", "HEAD"]);
+    let starts_before = starts(&fixture);
+    let (status, updated) = post_op(
+        &app,
+        &format!("/v1/extensions/{ID}/update"),
+        json!({"expected_state_revision": 4, "source": {"kind": "git", "url": url, "revision": second}}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{updated}");
+    assert_committed(&updated, 5);
+    assert_ne!(updated["mutation"]["digest"], local_digest.as_str());
+    let (_, inspected) = get_json(&app, &format!("/v1/extensions/{ID}/inspect")).await;
+    assert_eq!(inspected["extension"]["trusted"], false, "{inspected}");
+    assert_eq!(
+        inspected["extension"]["source"]["revision"],
+        second.as_str()
+    );
+    let (status, refused) = scope(&app, ID, "enable", 5).await;
+    assert_eq!(status, StatusCode::CONFLICT, "{refused}");
+    assert_precommit(&refused, "trust_required", 5);
+    assert_eq!(starts(&fixture), starts_before);
 
     supervisor.shutdown().await;
     fixture.assert_no_canary_ran();

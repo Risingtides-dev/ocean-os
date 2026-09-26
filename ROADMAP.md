@@ -112,9 +112,10 @@ A1, A2a, and A2b are accepted.
       closures (tests only; evidence in
       [`docs/specs/2026-09-26-ocean-extension-stage-a5-acceptance-evidence.md`](docs/specs/2026-09-26-ocean-extension-stage-a5-acceptance-evidence.md))
       are implemented and pending independent review.
-- [ ] Stage A acceptance — blocked on four operator rulings: the mutation
+- [ ] Stage A acceptance — blocked on five operator rulings: the mutation
       credential class, §17 project-scope disable of a shared service,
-      Windows R5 package management, and local-source path collisions. The
+      Windows R5 package management, local-source path collisions, and the
+      shell §20 fixture in place of the specified Rust service. The
       operator's separate acceptance follows.
 
 ## Ocean Observatory

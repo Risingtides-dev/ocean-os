@@ -539,7 +539,7 @@ ordered A1 → A2a → A2b sequence and binding review/stop gates.
 
 **Gate:** untrusted project package tests, offline path install, Git revision pinning, rollback/uninstall tests, no-code-execution-on-inspect proof.
 
-**Stage A status (2026-09-26):** Phases 2–3 are implemented through Stage A slices A1–A4, which are merged. The A5 integrated gate is pending review, with its evidence in [`2026-09-26-ocean-extension-stage-a5-acceptance-evidence.md`](2026-09-26-ocean-extension-stage-a5-acceptance-evidence.md). Phases 2–3 are not accepted. Acceptance needs the four operator rulings that the Stage A manifest's A5 note names, and then the operator's acceptance.
+**Stage A status (2026-09-26):** Phases 2–3 are implemented through Stage A slices A1–A4, which are merged. The A5 integrated gate is pending review, with its evidence in [`2026-09-26-ocean-extension-stage-a5-acceptance-evidence.md`](2026-09-26-ocean-extension-stage-a5-acceptance-evidence.md). Phases 2–3 are not accepted. Acceptance needs the five operator rulings that the Stage A manifest's A5 note names, and then the operator's acceptance.
 
 ### Phase 4 — `ocean-herdr` reference package
 

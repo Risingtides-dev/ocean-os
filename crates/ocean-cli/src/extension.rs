@@ -708,7 +708,17 @@ mod tests {
         let key = config.path().join("operator.key");
         std::fs::write(&key, "a5-operator-key\n").unwrap();
         std::fs::set_permissions(&key, std::fs::Permissions::from_mode(0o600)).unwrap();
-        let previous = std::env::var_os("OCEAN_CONFIG_DIR");
+        // Restore the process-global config dir even if an assertion panics.
+        struct RestoreConfigDir(Option<std::ffi::OsString>);
+        impl Drop for RestoreConfigDir {
+            fn drop(&mut self) {
+                match self.0.take() {
+                    Some(value) => std::env::set_var("OCEAN_CONFIG_DIR", value),
+                    None => std::env::remove_var("OCEAN_CONFIG_DIR"),
+                }
+            }
+        }
+        let _restore = RestoreConfigDir(std::env::var_os("OCEAN_CONFIG_DIR"));
         std::env::set_var("OCEAN_CONFIG_DIR", config.path());
 
         let committed = |reconciliation: &str| json!({"ok": true, "mutation": {"operation_id": "op", "committed": true, "state_revision": 9, "id": "example.noop", "digest": null, "effective": false, "reconciliation": reconciliation, "reap": "not_required"}});
@@ -791,10 +801,6 @@ mod tests {
             tokio::time::sleep(std::time::Duration::from_millis(300)).await;
             assert_eq!(requests.load(Ordering::SeqCst), 1, "{status} {body}");
             server.abort();
-        }
-        match previous {
-            Some(value) => std::env::set_var("OCEAN_CONFIG_DIR", value),
-            None => std::env::remove_var("OCEAN_CONFIG_DIR"),
         }
     }
 }

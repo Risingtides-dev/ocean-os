@@ -500,6 +500,15 @@ async fn a5_live_queue_bounds_count_and_bytes_with_computed_replay_availability(
         _ => panic!("the over-budget frame must lag"),
     }
 
+    // The byte bound is inclusive: a reservation that lands exactly on 1 MiB
+    // is accepted, one byte more is refused, and a refusal reserves nothing.
+    let at_limit = AtomicUsize::new(OUTBOUND_MAX_BYTES - 512);
+    assert!(try_reserve_bytes(&at_limit, 512));
+    assert_eq!(at_limit.load(Ordering::Acquire), OUTBOUND_MAX_BYTES);
+    let over = AtomicUsize::new(OUTBOUND_MAX_BYTES - 512);
+    assert!(!try_reserve_bytes(&over, 513));
+    assert_eq!(over.load(Ordering::Acquire), OUTBOUND_MAX_BYTES - 512);
+
     // replay_available is computed: evicted and out-of-scope ranges are false.
     for _ in 0..crate::extension_lifecycle::BOOT_RING_MAX_EVENTS {
         dispatcher.publish(session_source(&dispatcher));
