@@ -49,8 +49,12 @@ legacy-chromium = [
 
 [dependencies]
 libc = "0.2"
-# A4: NFC normalization for Git tree case/normalization collision keys. Already
-# in the lock through `idna`; no new package.
+# A4: Git tree collision keys, NFC(full case fold(NFD)). `icu_normalizer` is
+# already in the lock through `idna`. `icu_casemap` (same ICU4X 2.2 release
+# and license, sharing its provider/zerovec stack) supplies full Unicode case
+# folding; `unicase`, the only folding crate already locked, exposes equality
+# but no folded string to normalize afterwards.
+icu_casemap = { version = "~2.2", default-features = false, features = ["compiled_data"] }
 icu_normalizer = { version = "2.2", default-features = false, features = ["compiled_data"] }
 anyhow.workspace = true
 async-trait.workspace = true
