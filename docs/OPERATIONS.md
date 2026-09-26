@@ -231,9 +231,21 @@ only for the actor that resolves to the credential's own principal. CI pulls
 need a `GH_TOKEN` room secret set through `secrets/set`; Bedrock returns no
 secret value on any route.
 
-### Reading the bridge without metrics
+### Reading the bridge
 
-There are no room or federation counters on `/metrics` yet. Until there are:
+`/metrics` carries the room and federation families (Rooms DoD 4.1, owned by
+`crates/ocean-daemon/src/metrics.rs` and checked by its `room_metrics_*`
+tests): `ocean_room_access_state{state}`, `ocean_room_outbox_depth{state}`,
+`ocean_room_outbox_oldest_age_seconds`,
+`ocean_room_federation_sse_reconnects_total`,
+`ocean_room_federation_lag_events`,
+`ocean_room_redemption_failures_total{reason}`,
+`ocean_room_admission_refusals_total{code}`, and the store lock-wait pair
+`ocean_room_store_lock_waits_total` / `ocean_room_store_lock_wait_seconds_total`.
+`/health` carries a sampled `rooms` block, the JSON twin of those families
+(`sampled: false` means the numbers are the previous sample), plus the `room_maintenance` card (retention window, orphan GC, last
+sweep counts; the window is `OCEAN_ROOM_RETENTION_DAYS` in
+`OCEAN_RUNTIME_OPERATOR_GUIDE.md`, off by default). Per room:
 
 - `access.state` on the snapshot is the primary signal: `live` is caught up,
   `recovering` is replaying from the durable cursor or misconfigured, `revoked`
