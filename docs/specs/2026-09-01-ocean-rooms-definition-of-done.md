@@ -34,6 +34,9 @@ ocean-os 616293e, ocean-surface d58a145.
   2026-09-01 paging fixes (#436 to #439), installed by the documented single
   command, with the revision on /health recorded in events.md. Today: 7bf80cdc
   from 08-31. [os]
+  Met as written (verified 2026-09-26): the operated daemon's `/health` reports
+  `f458f2ea`, which contains #436 to #439 and is recorded in events.md (the S0
+  #462 deploy entry). It is 17 days behind main; redeploying is the user's.
 - 0.6 Federation is ON in the operated daemon: a supported, untracked,
   owner-only, daemon-specific launcher (or an equivalent per-job secret
   channel) restores `OCEAN_FEDERATION_URL` and
@@ -49,6 +52,14 @@ ocean-os 616293e, ocean-surface d58a145.
   launchd environment. After a fresh login or reboot, a real credentialed room
   must still reach `live` against production Bedrock. Today: off, with no
   supported daemon-specific secret loader shipped. [os, user]
+  Engineering half shipped (verified 2026-09-26): `deploy/ocean-daemon.sh` is
+  the plist's program, so launchd runs it on every start; it reads an
+  owner-only `0600` `federation.env` (or a Keychain item it names) just before
+  exec, refuses a file failing any custody check, and never calls `launchctl
+  setenv`; `ops/set-ocean-federation.sh` writes that file and lints both
+  plists. Check: `node --test scripts/federation-loader.test.mjs`. Still off on
+  the operated daemon (`/health` rooms: 0 live, 5 local); turning it on and
+  recording a room reaching `live` after a reboot is the user's.
 - 0.7 The surface web bundle, Tauri build and extension are published from
   origin/main through the promotion guard with the build identity visible in
   the surface. [surface]
@@ -185,6 +196,17 @@ ocean-os 616293e, ocean-surface d58a145.
 - 4.3 Room lifecycle: a route closes a room, transcript retention and attachment
   orphan GC exist, idle workspaces are reaped; rooms.db and the blob tree stop
   growing without bound. [os M, bedrock S]
+  **Done as written** (verified against code 2026-09-26): `POST
+  /v1/rooms/persistent/{key}/close` (`closing_a_room_freezes_it_and_says_who_did_it`);
+  `room_maintenance.rs` retention and orphan GC
+  (`retention_cuts_only_a_room_closed_longer_than_the_window`,
+  `orphan_gc_takes_the_unreferenced_blob_and_only_that_one`,
+  `health_carries_the_room_maintenance_card`); bedrock idle reaper
+  (`test/workspace-reaper.test.mjs`, the `idle reaping:` section of
+  `rooms:compute-smoke`). Two limits a member will meet: retention is opt-in
+  (`OCEAN_ROOM_RETENTION_DAYS`, default 0 = never), so only an operator's
+  setting bounds rooms.db, and the surface has no control that calls the close
+  route.
 - 4.4 The store is durable under load: WAL, busy_timeout, synchronous set in
   production; store work off the tokio workers; per-room wake buses. [os, M to L]
   Partial (2026-09-25): WAL, busy_timeout and synchronous are set
@@ -195,6 +217,10 @@ ocean-os 616293e, ocean-surface d58a145.
   `slow_store_work_does_not_park_the_async_worker` fails without it.
 - 4.5 docs/OPERATIONS.md has a rooms and federation runbook; a migration
   rehearsal of a real rooms.db with rollback is recorded (manifest gate 4). [os, M]
+  Runbook half present: OPERATIONS.md "Rooms and federation" (member node,
+  enable, workspace proxy, reading the bridge with the §4.1 metrics, rollback)
+  and the "rooms.db migration rehearsal" procedure. The recorded rehearsal is
+  still owed and is the user's.
 - 4.6 ledger:check is green in all three repos and the manifest-only question
   has a ruling written into the checker. [all, user ruling]
 - 4.7 HANDOFF and DEV-LOG describe production within one working day of any
@@ -221,6 +247,16 @@ ocean-os 616293e, ocean-surface d58a145.
   and ARCHITECTURE.md's totals against the router.
 - 5.3 The Bedrock event vocabulary pin is refreshed by CI, not by hand; a new
   action reds the daemon build. [os, S]
+  Partial (2026-09-26): ocean-os cannot read private ocean-bedrock without a
+  cross-repo token, so this repo cannot refresh the copy itself. The reverse
+  read needs none: ocean-bedrock #163 (draft) adds `npm run
+  rooms:event-pin:check` to its CI, which fetches this repo's public vendored
+  copy and exits 1 when Bedrock publishes an action the copy lacks. So a new
+  action reds Bedrock's build until it is vendored here, and vendoring it reds
+  this build until it is ruled (`workspace_marker_allowlist_classifies_every_bedrock_event`).
+  The refresh itself stays `scripts/vendor-bedrock-room-events.mjs`. Closing
+  the line as worded needs either a cross-repo token (the user's call) or
+  accepting this in its place.
 - 5.4 OCEAN_ROOMS_PRODUCT.md is corrected to the real wire shapes (access
   states, message body, agent turn path, pagination, timestamps, invites) and
   AGENTS.md stops binding dead .rooms-panel CSS. [surface, S]
