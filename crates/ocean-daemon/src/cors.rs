@@ -56,7 +56,9 @@ fn cors_allowed_methods() -> [Method; 5] {
 pub(super) fn parse_allowed_origins(raw: &str) -> Vec<String> {
     raw.split(',')
         .map(|s| s.trim().trim_end_matches('/'))
-        .filter(|s| !s.is_empty())
+        // `null` is the opaque origin of sandboxed frames, `file:` pages, and
+        // redirects: trusting it would trust every such page at once.
+        .filter(|s| !s.is_empty() && !s.eq_ignore_ascii_case("null"))
         .map(|s| s.to_string())
         .collect()
 }
@@ -216,6 +218,11 @@ mod tests {
         assert_eq!(parsed, vec!["https://a.com", "https://b.com"]);
         assert!(parse_allowed_origins("").is_empty());
         assert!(parse_allowed_origins("   ,  , ").is_empty());
+        assert_eq!(
+            parse_allowed_origins("null, NULL ,https://a.com"),
+            vec!["https://a.com"],
+            "the opaque null origin is never an allowed origin"
+        );
     }
 
     /// The router serves PATCH (`/v1/projects/{id}`) and DELETE

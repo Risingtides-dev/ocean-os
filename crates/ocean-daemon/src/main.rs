@@ -120,6 +120,8 @@ mod filesystem;
 mod github;
 /// Bounded fuzzy search over ocean-agent's persisted display transcripts.
 mod history_search;
+/// Daemon-wide refusal of requests addressed to a foreign Host (DNS rebinding).
+mod host_guard;
 mod identity;
 /// Persisted-title and read-projection mutation HTTP adapters.
 mod longhouse_governance_control;
@@ -214,6 +216,7 @@ use extension_lifecycle::{
 };
 use filesystem::{fs_dirs, fs_file};
 use history_search::history_search;
+use host_guard::AllowedHosts;
 #[cfg(test)]
 use longhouse_governance_control::with_titles;
 use longhouse_governance_control::{
@@ -745,12 +748,14 @@ fn parse_agent_replay_anchor(headers: &HeaderMap) -> (Option<String>, Option<Res
 ///
 /// This is the behavior-neutral Phase 2C seam: route registration, grouped
 /// merges, Axum's default fallback, and middleware order now have one reusable
-/// construction path. Layers, inner to outer: the cross-site write guard, then
-/// CORS, then HTTP tracing, so requests enter tracing, then CORS (which answers
-/// preflights), then the guard (which refuses cookie-bearing or foreign-origin
-/// state-changing requests), then route dispatch. The guard and CORS are built
-/// from the same [`BrowserOrigins`] so they cannot disagree about trust.
-fn app_router(origins: BrowserOrigins) -> Router<AppState> {
+/// construction path. Layers, inner to outer: the cross-site write guard, CORS,
+/// the Host allowlist, then HTTP tracing. A request enters tracing, then the
+/// Host allowlist (which refuses a foreign `Host` on every method, preflights
+/// included: DNS rebinding), then CORS (which answers preflights), then the
+/// write guard (which refuses cookie-bearing or foreign-origin state-changing
+/// requests), then route dispatch. The write guard and CORS are built from the
+/// same [`BrowserOrigins`] so they cannot disagree about trust.
+fn app_router(origins: BrowserOrigins, hosts: AllowedHosts) -> Router<AppState> {
     Router::new()
         .route("/", get(root))
         .route("/health", get(health))
@@ -925,6 +930,10 @@ fn app_router(origins: BrowserOrigins) -> Router<AppState> {
             cross_site_write::refuse_cross_site_writes,
         ))
         .layer(cors_layer(origins))
+        .layer(axum::middleware::from_fn_with_state(
+            hosts,
+            host_guard::refuse_foreign_hosts,
+        ))
         .layer(TraceLayer::new_for_http())
 }
 
@@ -1387,8 +1396,20 @@ async fn main() -> anyhow::Result<()> {
     if !extra_origins.is_empty() {
         tracing::info!(origins = ?extra_origins, "OCEAN_ALLOWED_ORIGINS: extra CORS origins");
     }
+    // DNS-rebinding stop: the hosts this daemon answers to are loopback, the
+    // bind IP (any IP literal when bound unspecified), the hosts of the extra
+    // origins above, and `OCEAN_ALLOWED_HOSTS`. See `host_guard.rs`.
+    let addr: SocketAddr = bind.parse().context("invalid OCEAN_BIND")?;
+    let extra_hosts: Vec<String> = env::var("OCEAN_ALLOWED_HOSTS")
+        .unwrap_or_default()
+        .split(',')
+        .map(str::trim)
+        .filter(|h| !h.is_empty())
+        .map(str::to_string)
+        .collect();
+    let allowed_hosts = AllowedHosts::new(addr, &extra_origins, extra_hosts);
     let github_service = github::GitHubService::new()?;
-    let app = app_router(BrowserOrigins::new(extra_origins));
+    let app = app_router(BrowserOrigins::new(extra_origins), allowed_hosts);
 
     // Drain the registry of in-flight turn tasks AFTER axum finishes draining
     // open connections (OCEAN-184). `with_graceful_shutdown` only waits for live
@@ -1410,7 +1431,6 @@ async fn main() -> anyhow::Result<()> {
         .layer(axum::Extension(observatory_services))
         .layer(axum::Extension(github_service));
 
-    let addr: SocketAddr = bind.parse().context("invalid OCEAN_BIND")?;
     tracing::info!(%addr, "ocean-daemon listening");
     let listener = tokio::net::TcpListener::bind(addr).await?;
 
@@ -16785,7 +16805,8 @@ mod tests {
             .unwrap();
         let sdk_session_id = sdk_sid(session_id);
         let uri = format!("/v1/agent/sessions/{sdk_session_id}/config");
-        let app = app_router(BrowserOrigins::default()).with_state(state.clone());
+        let app = app_router(BrowserOrigins::default(), AllowedHosts::default())
+            .with_state(state.clone());
 
         let (status, raw) =
             session_config_http_request(app.clone(), Method::GET, uri.clone(), None).await;
@@ -16894,7 +16915,8 @@ mod tests {
             .unwrap();
         let sdk_session_id = sdk_sid(session_id);
         let uri = format!("/v1/agent/sessions/{sdk_session_id}/config");
-        let app = app_router(BrowserOrigins::default()).with_state(state.clone());
+        let app = app_router(BrowserOrigins::default(), AllowedHosts::default())
+            .with_state(state.clone());
 
         let (status, raw) =
             session_config_http_request(app.clone(), Method::GET, uri.clone(), None).await;
@@ -16933,7 +16955,8 @@ mod tests {
             .create_session(tmp.path().to_str().unwrap(), None)
             .unwrap();
         let uri = format!("/v1/agent/sessions/{}/config", sdk_sid(session_id));
-        let app = app_router(BrowserOrigins::default()).with_state(state.clone());
+        let app = app_router(BrowserOrigins::default(), AllowedHosts::default())
+            .with_state(state.clone());
         let known = ocean_agent::known_models()
             .into_iter()
             .next()
@@ -16988,7 +17011,7 @@ mod tests {
         ]);
         let tmp = tempfile::tempdir().unwrap();
         let state = fake_convene_state(&tmp);
-        let app = app_router(BrowserOrigins::default()).with_state(state);
+        let app = app_router(BrowserOrigins::default(), AllowedHosts::default()).with_state(state);
         let known = ocean_agent::known_models()
             .into_iter()
             .next()
@@ -26770,7 +26793,7 @@ mod tests {
             .await
             .unwrap();
 
-        let app = app_router(BrowserOrigins::default()).with_state(state);
+        let app = app_router(BrowserOrigins::default(), AllowedHosts::default()).with_state(state);
         let found = app
             .clone()
             .oneshot(
@@ -27794,6 +27817,9 @@ mod tests {
         let cors = builder
             .find(".layer(cors_layer(origins))")
             .expect("CORS layer is mounted");
+        let host = builder
+            .find("host_guard::refuse_foreign_hosts")
+            .expect("Host allowlist is mounted");
         let trace = builder
             .find(".layer(TraceLayer::new_for_http())")
             .expect("HTTP trace layer is mounted");
@@ -27802,8 +27828,8 @@ mod tests {
             "the cross-site write guard must sit inside CORS so preflights are answered first"
         );
         assert!(
-            cors < trace,
-            "Axum layers are applied inner-to-outer: CORS must remain inside HTTP tracing"
+            cors < host && host < trace,
+            "Axum layers are applied inner-to-outer: CORS inside the Host allowlist inside HTTP tracing"
         );
         assert!(
             !builder.contains(".fallback("),
@@ -27908,7 +27934,7 @@ mod tests {
 
         let tmp = tempfile::tempdir().unwrap();
         let state = route_contract_state(&tmp).await;
-        let app = app_router(BrowserOrigins::default())
+        let app = app_router(BrowserOrigins::default(), AllowedHosts::default())
             .route_layer(axum::middleware::from_fn(route_probe_sentinel))
             .fallback(|| async { (StatusCode::IM_A_TEAPOT, "route-contract fallback") })
             .with_state(state.clone());
@@ -27930,7 +27956,8 @@ mod tests {
             );
         }
 
-        let production = app_router(BrowserOrigins::default()).with_state(state);
+        let production =
+            app_router(BrowserOrigins::default(), AllowedHosts::default()).with_state(state);
         let unknown = production
             .clone()
             .oneshot(
@@ -28038,8 +28065,8 @@ mod tests {
         use tower::ServiceExt;
 
         let tmp = tempfile::tempdir().unwrap();
-        let app =
-            app_router(BrowserOrigins::default()).with_state(route_contract_state(&tmp).await);
+        let app = app_router(BrowserOrigins::default(), AllowedHosts::default())
+            .with_state(route_contract_state(&tmp).await);
         let trusted_origin = "http://localhost:8080";
 
         for (method, path, status, allow) in [
@@ -28147,8 +28174,8 @@ mod tests {
         use tower::ServiceExt;
 
         let tmp = tempfile::tempdir().unwrap();
-        let app =
-            app_router(BrowserOrigins::default()).with_state(route_contract_state(&tmp).await);
+        let app = app_router(BrowserOrigins::default(), AllowedHosts::default())
+            .with_state(route_contract_state(&tmp).await);
 
         let detail = app
             .clone()

@@ -135,7 +135,30 @@ CORS alone cannot stop a browser "simple" request (no custom header; no body, `t
 - a `Cookie` header → `{"ok":false,"code":"ambient_credential_rejected",…}`;
 - an `Origin` or `Referer` that is present and not in the trusted set above (the same set, including `OCEAN_ALLOWED_ORIGINS`; the opaque `null` origin is refused) → `{"ok":false,"code":"foreign_origin_rejected",…}`.
 
-A request with neither `Origin` nor `Referer` passes, so `ocean`, `ocean-mcp`, the TUI, `curl`, and the surface proxy (which rebuilds each upstream request and never forwards browser `Origin`, `Referer`, or `Cookie`) are unaffected. Reads are not guarded. If a phone or tunnel page talks to the daemon directly rather than through the proxy, its origin must be in `OCEAN_ALLOWED_ORIGINS` for writes as well as for CORS.
+A request with neither `Origin` nor `Referer` passes, exactly as on the operator lane, so `ocean`, `ocean-mcp`, the TUI, ACP, and `curl` are unaffected. Reads are not guarded. If a phone or tunnel page talks to the daemon directly rather than through the proxy, its origin must be in `OCEAN_ALLOWED_ORIGINS` for writes as well as for CORS.
+
+**What this guard does not cover: the surface proxy.** The proxy rebuilds every upstream request without the browser's `Origin`, `Referer`, or `Cookie`. That is why the proxy keeps working — a compatibility fact — and it is also why this guard cannot see a cross-site write that is laundered THROUGH the proxy: it arrives here with no `Origin` and passes. With `OCEAN_SURFACE_AUTH=off` the proxy also upgrades `text/plain` bodies to JSON, which makes even the JSON routes reachable that way. The auth-off proxy path is covered only once ocean-surface #230 lands (it gates every non-GET under `/v1` and `/api` on `Origin`/`Referer` in auth-off mode). Until then, a web page can still drive daemon writes through an auth-off proxy on `:8790`; with proxy auth on, the page has no session to ride.
+
+**Cookies.** No first-party client sends a cookie to the daemon. The proxy's own `ocean_session` and `ocean_device` cookies are `HttpOnly; SameSite=Strict` for the proxy's host, and every direct browser call to the daemon (loopback dev pages, the Tauri webview, the Chrome side panel) is a cross-origin `fetch`/`EventSource` in the default `same-origin` credentials mode, which never attaches cookies to a cross-origin request regardless of `SameSite`. The Surface UI never opts into `credentials: "include"`. A future client that does will be refused, on purpose.
+
+**Open follow-up (not changed here).** Any loopback port and any `chrome-extension://` origin are trusted for writes, because that is what CORS already trusted. Narrowing it to known ports and a pinned extension id is a compatibility decision that is still owed (Rooms DoD 3.1).
+
+#### Host allowlist (DNS rebinding) — `OCEAN_ALLOWED_HOSTS`
+
+Origin checks cannot stop DNS rebinding: a page on `evil.example:4780` that re-resolves its name to `127.0.0.1` is same-origin with its own requests, so it can read responses — `GET /v1/fs/file` would return any file under `$HOME`. Every request, on every method, is therefore refused with `421 {"ok":false,"code":"host_not_allowed",…}` unless its `Host` is one of:
+
+- `localhost`, or any loopback IP literal (`127.0.0.1`, `[::1]` — the IPv6 companion listener), on any port;
+- the IP literal of `OCEAN_BIND`, or ANY IP literal when `OCEAN_BIND` is unspecified (`0.0.0.0:4780`), since an IP literal cannot be rebound;
+- the host of each `OCEAN_ALLOWED_ORIGINS` entry;
+- an entry of `OCEAN_ALLOWED_HOSTS` (comma-separated host names, port optional).
+
+The supervised daemon leaves `OCEAN_BIND` unset (loopback), so its clients — the CLI, MCP, TUI, the surface proxy's default `http://127.0.0.1:4780` upstream, the Tauri webview, and the side panel — are unaffected. A daemon reached by NAME from another machine needs that name here, for example a MagicDNS name for a tailnet bind, or the Buddy development build's `risings-mac-mini.local`:
+
+```bash
+(cd "$HOME" && OCEAN_BIND=0.0.0.0:4780 OCEAN_ALLOWED_HOSTS="mini.tailnet.ts.net,risings-mac-mini.local" "$OCEAN_DAEMON_BIN")
+```
+
+A literal `null` entry in `OCEAN_ALLOWED_ORIGINS` or `OCEAN_OPERATOR_ALLOWED_ORIGINS` is dropped at parse time; the opaque origin is never trusted.
 
 ### Daemon URL for clients
 

@@ -32,7 +32,10 @@
 //!    ocean-mcp, the TUI, the surface proxy, which builds its upstream request
 //!    without them, Tauri's Rust side) send neither, and a browser always
 //!    attaches `Origin` to a cross-origin `POST`/`PUT`/`PATCH`/`DELETE`, so a
-//!    missing one is not a browser-driven cross-site write.
+//!    missing one is not a browser-driven DIRECT cross-site write. The proxy
+//!    stripping `Origin` is a compatibility fact, not a protection: a write a
+//!    page launders through an auth-off surface proxy arrives here Origin-less
+//!    and passes, and only the proxy's own gate (ocean-surface #230) stops it.
 //!
 //! Safe methods are left alone: the observatory's compatibility cookie rides
 //! `GET`, and a cross-site `GET` cannot read the response under CORS.
@@ -212,6 +215,20 @@ mod tests {
     }
 
     #[test]
+    fn userinfo_cannot_disguise_a_foreign_host_as_loopback() {
+        for (name, value) in [
+            (header::REFERER, "http://localhost:8080@evil.example/page"),
+            (header::ORIGIN, "http://127.0.0.1:8790@evil.example"),
+        ] {
+            assert_eq!(
+                check(&local(), &headers(&[(name.clone(), value)])),
+                Err(CrossSiteRefusal::ForeignOrigin),
+                "{name}: {value}"
+            );
+        }
+    }
+
+    #[test]
     fn a_foreign_referer_is_refused_even_beside_a_trusted_origin() {
         let h = headers(&[
             (header::ORIGIN, "http://localhost:8080"),
@@ -372,7 +389,11 @@ mod tests {
                 .unwrap()
                 .transcript
                 .len();
-            let app = crate::app_router(BrowserOrigins::default()).with_state(state.clone());
+            let app = crate::app_router(
+                BrowserOrigins::default(),
+                crate::host_guard::AllowedHosts::default(),
+            )
+            .with_state(state.clone());
 
             for (pairs, code) in [
                 (
@@ -409,13 +430,114 @@ mod tests {
             assert_eq!(rows_after, rows_before, "a refused close writes no marker");
         }
 
+        /// N1: the guard is not limited to room routes. `POST /v1/calls/demo`
+        /// takes no body and no header, and `POST /v1/voice/stt` takes a raw
+        /// body: both are simple requests a page can send without preflight.
+        #[tokio::test]
+        async fn non_room_simple_request_writes_from_a_foreign_page_are_refused() {
+            let _env = AUTO_CONVENE_ENV_LOCK.lock().await;
+            let tmp = tempfile::tempdir().unwrap();
+            let state = fake_convene_state(&tmp);
+            let app = crate::app_router(
+                BrowserOrigins::default(),
+                crate::host_guard::AllowedHosts::default(),
+            )
+            .with_state(state);
+            for (uri, content_type, body) in [
+                ("/v1/calls/demo", None, ""),
+                ("/v1/voice/stt", Some("text/plain"), "not audio"),
+            ] {
+                let mut pairs = vec![(header::ORIGIN, "https://evil.example")];
+                if let Some(ct) = content_type {
+                    pairs.push((header::CONTENT_TYPE, ct));
+                }
+                let (status, json) = send(&app, Method::POST, uri, &pairs, Body::from(body)).await;
+                assert_eq!(status, StatusCode::FORBIDDEN, "{uri}: {json}");
+                assert_eq!(json["code"], json!("foreign_origin_rejected"), "{uri}");
+            }
+        }
+
+        /// N2: DELETE is guarded, not only POST.
+        #[tokio::test]
+        async fn a_foreign_delete_of_a_participant_is_refused_and_the_roster_is_intact() {
+            let _env = AUTO_CONVENE_ENV_LOCK.lock().await;
+            let tmp = tempfile::tempdir().unwrap();
+            let state = fake_convene_state(&tmp);
+            let key = room_with_alice(&state);
+            let app = crate::app_router(
+                BrowserOrigins::default(),
+                crate::host_guard::AllowedHosts::default(),
+            )
+            .with_state(state.clone());
+            let uri = "/v1/rooms/persistent/csrf-room/participants/alice";
+            let (status, json) = send(
+                &app,
+                Method::DELETE,
+                uri,
+                &[(header::ORIGIN, "https://evil.example")],
+                Body::empty(),
+            )
+            .await;
+            assert_eq!(status, StatusCode::FORBIDDEN, "{json}");
+            assert_eq!(json["code"], json!("foreign_origin_rejected"));
+            let roster = with_rooms(&state, |store| store.get(&key))
+                .unwrap()
+                .unwrap()
+                .room
+                .participants;
+            assert!(
+                roster.iter().any(|p| p.id == "alice"),
+                "a refused DELETE must leave the participant on the roster"
+            );
+        }
+
+        /// S4, behaviourally: the guard sits INSIDE CORS, so a refusal to a
+        /// trusted origin still carries CORS headers and the local page can
+        /// read why it was refused. Outside CORS the 403 would carry none.
+        #[tokio::test]
+        async fn a_refusal_to_a_trusted_origin_still_carries_cors_headers() {
+            let _env = AUTO_CONVENE_ENV_LOCK.lock().await;
+            let tmp = tempfile::tempdir().unwrap();
+            let state = fake_convene_state(&tmp);
+            room_with_alice(&state);
+            let app = crate::app_router(
+                BrowserOrigins::default(),
+                crate::host_guard::AllowedHosts::default(),
+            )
+            .with_state(state);
+            let response = app
+                .oneshot(
+                    axum::http::Request::builder()
+                        .method(Method::POST)
+                        .uri(CLOSE)
+                        .header(header::ORIGIN, "http://localhost:8080")
+                        .header(header::COOKIE, "sid=1")
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::FORBIDDEN);
+            assert_eq!(
+                response
+                    .headers()
+                    .get(header::ACCESS_CONTROL_ALLOW_ORIGIN)
+                    .map(|v| v.to_str().unwrap()),
+                Some("http://localhost:8080")
+            );
+        }
+
         #[tokio::test]
         async fn a_member_close_with_no_origin_still_works_for_native_callers() {
             let _env = AUTO_CONVENE_ENV_LOCK.lock().await;
             let tmp = tempfile::tempdir().unwrap();
             let state = fake_convene_state(&tmp);
             let key = room_with_alice(&state);
-            let app = crate::app_router(BrowserOrigins::default()).with_state(state.clone());
+            let app = crate::app_router(
+                BrowserOrigins::default(),
+                crate::host_guard::AllowedHosts::default(),
+            )
+            .with_state(state.clone());
             let (status, body) = send(&app, Method::POST, CLOSE, &[], Body::empty()).await;
             assert_eq!(status, StatusCode::OK, "{body}");
             assert!(!still_open(&state, &key));
@@ -428,7 +550,11 @@ mod tests {
                 let tmp = tempfile::tempdir().unwrap();
                 let state = fake_convene_state(&tmp);
                 let key = room_with_alice(&state);
-                let app = crate::app_router(BrowserOrigins::default()).with_state(state.clone());
+                let app = crate::app_router(
+                    BrowserOrigins::default(),
+                    crate::host_guard::AllowedHosts::default(),
+                )
+                .with_state(state.clone());
                 let (status, body) = send(
                     &app,
                     Method::POST,
@@ -450,7 +576,11 @@ mod tests {
             let _env = AUTO_CONVENE_ENV_LOCK.lock().await;
             let tmp = tempfile::tempdir().unwrap();
             let state = fake_convene_state(&tmp);
-            let app = crate::app_router(BrowserOrigins::default()).with_state(state.clone());
+            let app = crate::app_router(
+                BrowserOrigins::default(),
+                crate::host_guard::AllowedHosts::default(),
+            )
+            .with_state(state.clone());
             // Exactly what reqwest sends for `.json(&body)`: a content type,
             // no Origin, no Referer, no Cookie.
             let (status, body) = send(
@@ -486,7 +616,11 @@ mod tests {
             let tmp = tempfile::tempdir().unwrap();
             let state = fake_convene_state(&tmp);
             let key = room_with_alice(&state);
-            let app = crate::app_router(BrowserOrigins::default()).with_state(state.clone());
+            let app = crate::app_router(
+                BrowserOrigins::default(),
+                crate::host_guard::AllowedHosts::default(),
+            )
+            .with_state(state.clone());
             let (status, body) = send(
                 &app,
                 Method::POST,
@@ -512,7 +646,11 @@ mod tests {
             let _env = AUTO_CONVENE_ENV_LOCK.lock().await;
             let tmp = tempfile::tempdir().unwrap();
             let state = fake_convene_state(&tmp);
-            let app = crate::app_router(BrowserOrigins::default()).with_state(state);
+            let app = crate::app_router(
+                BrowserOrigins::default(),
+                crate::host_guard::AllowedHosts::default(),
+            )
+            .with_state(state);
             let (status, _) = send(
                 &app,
                 Method::GET,
