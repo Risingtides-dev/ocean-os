@@ -21,23 +21,23 @@ use super::super::{read_locked_state, SupervisorReconcile};
 use super::*;
 use crate::tests::{fake_convene_state, TestEnvRestore, AUTO_CONVENE_ENV_LOCK};
 
-const ID: &str = "example.noop";
+pub(super) const ID: &str = "example.noop";
 const OTHER: &str = "example.other";
-const OPERATOR: &str = "test-room-operator";
+pub(super) const OPERATOR: &str = "test-room-operator";
 
 /// A no-op native service speaking the strict stdio protocol: hello, ready,
 /// pong, and a clean shutdown. Every other resource path is an executable
 /// canary; nothing but the enabled service may ever run.
 const SERVICE: &str = "#!/bin/sh\nIFS= read -r hello\nprintf '%s\\n' '{\"protocol\":\"ocean.extension.service\",\"version\":1,\"frame\":\"service_hello\",\"subscriptions\":[],\"resume\":null}'\nIFS= read -r ready\nwhile IFS= read -r frame; do\n case \"$frame\" in\n  *'\"frame\":\"ping\"'*) nonce=$(printf '%s' \"$frame\" | sed -n 's/.*\"nonce\":\"\\([^\"]*\\)\".*/\\1/p'); printf '{\"protocol\":\"ocean.extension.service\",\"version\":1,\"frame\":\"pong\",\"nonce\":\"%s\"}\\n' \"$nonce\" ;;\n  *'\"frame\":\"shutdown\"'*) printf '%s\\n' '{\"protocol\":\"ocean.extension.service\",\"version\":1,\"frame\":\"shutdown_complete\"}'; exit 0 ;;\n esac\ndone\n";
 
-struct Fixture {
-    config: tempfile::TempDir,
-    sources: tempfile::TempDir,
-    canary: PathBuf,
+pub(super) struct Fixture {
+    pub(super) config: tempfile::TempDir,
+    pub(super) sources: tempfile::TempDir,
+    pub(super) canary: PathBuf,
 }
 
 impl Fixture {
-    fn new() -> Self {
+    pub(super) fn new() -> Self {
         let sources = tempfile::tempdir().unwrap();
         let canary = sources.path().join("PACKAGE_CANARY_RAN");
         Self {
@@ -47,7 +47,7 @@ impl Fixture {
         }
     }
 
-    fn root(&self) -> PathBuf {
+    pub(super) fn root(&self) -> PathBuf {
         self.config.path().join("extensions")
     }
 
@@ -78,21 +78,21 @@ impl Fixture {
         dir.to_str().unwrap().to_string()
     }
 
-    fn revision(&self) -> u64 {
+    pub(super) fn revision(&self) -> u64 {
         read_locked_state(self.config.path())
             .unwrap()
             .snapshot
             .revision
     }
 
-    fn assert_no_canary_ran(&self) {
+    pub(super) fn assert_no_canary_ran(&self) {
         assert!(
             !self.canary.exists(),
             "package code executed outside activation"
         );
     }
 
-    fn entries(&self, relative: &str) -> Vec<String> {
+    pub(super) fn entries(&self, relative: &str) -> Vec<String> {
         fs::read_dir(self.root().join(relative))
             .map(|entries| {
                 entries
@@ -103,13 +103,14 @@ impl Fixture {
     }
 }
 
-fn router(state: AppState) -> Router {
+pub(super) fn router(state: AppState) -> Router {
     Router::new()
         .route("/v1/extensions", get(super::super::list))
         .route("/v1/extensions/install", post(install))
         .route("/v1/extensions/{id}", delete(remove))
         .route("/v1/extensions/{id}/inspect", get(super::super::inspect))
         .route("/v1/extensions/{id}/status", get(super::super::status))
+        .route("/v1/extensions/{id}/doctor", get(super::super::doctor))
         .route("/v1/extensions/{id}/trust", post(trust))
         .route("/v1/extensions/{id}/enable", post(enable))
         .route("/v1/extensions/{id}/disable", post(disable))
@@ -118,7 +119,7 @@ fn router(state: AppState) -> Router {
 }
 
 #[derive(Clone, Copy)]
-enum Auth {
+pub(super) enum Auth {
     Operator,
     None,
     Wrong,
@@ -126,7 +127,7 @@ enum Auth {
     ForeignOrigin,
 }
 
-async fn send(
+pub(super) async fn send(
     app: &Router,
     method: Method,
     uri: &str,
@@ -168,15 +169,15 @@ async fn send(
     )
 }
 
-async fn get_json(app: &Router, uri: &str) -> (StatusCode, Value) {
+pub(super) async fn get_json(app: &Router, uri: &str) -> (StatusCode, Value) {
     send(app, Method::GET, uri, None, Auth::None).await
 }
 
-async fn post_op(app: &Router, uri: &str, body: Value) -> (StatusCode, Value) {
+pub(super) async fn post_op(app: &Router, uri: &str, body: Value) -> (StatusCode, Value) {
     send(app, Method::POST, uri, Some(body), Auth::Operator).await
 }
 
-fn assert_precommit(body: &Value, code: &str, revision: u64) {
+pub(super) fn assert_precommit(body: &Value, code: &str, revision: u64) {
     assert_eq!(body["ok"], false, "{body}");
     assert_eq!(body["mutation"]["committed"], false, "{body}");
     assert_eq!(body["mutation"]["state_revision"], revision, "{body}");
@@ -185,14 +186,14 @@ fn assert_precommit(body: &Value, code: &str, revision: u64) {
     assert!(body["error"]["message"].as_str().is_some());
 }
 
-fn assert_committed(body: &Value, revision: u64) {
+pub(super) fn assert_committed(body: &Value, revision: u64) {
     assert_eq!(body["ok"], true, "{body}");
     assert_eq!(body["mutation"]["committed"], true, "{body}");
     assert_eq!(body["mutation"]["state_revision"], revision, "{body}");
     assert!(Uuid::parse_str(body["mutation"]["operation_id"].as_str().unwrap()).is_ok());
 }
 
-async fn install_local(app: &Router, expected: u64, path: &str) -> (StatusCode, Value) {
+pub(super) async fn install_local(app: &Router, expected: u64, path: &str) -> (StatusCode, Value) {
     post_op(
         app,
         "/v1/extensions/install",
@@ -225,7 +226,12 @@ async fn trust_noop(app: &Router, id: &str, expected: u64, digest: &str) -> (Sta
     post_op(app, &format!("/v1/extensions/{id}/trust"), apply).await
 }
 
-async fn scope(app: &Router, id: &str, verb: &str, expected: u64) -> (StatusCode, Value) {
+pub(super) async fn scope(
+    app: &Router,
+    id: &str,
+    verb: &str,
+    expected: u64,
+) -> (StatusCode, Value) {
     post_op(
         app,
         &format!("/v1/extensions/{id}/{verb}"),
@@ -234,7 +240,11 @@ async fn scope(app: &Router, id: &str, verb: &str, expected: u64) -> (StatusCode
     .await
 }
 
-async fn wait_for_status(app: &Router, id: &str, want: impl Fn(&Value) -> bool) -> Value {
+pub(super) async fn wait_for_status(
+    app: &Router,
+    id: &str,
+    want: impl Fn(&Value) -> bool,
+) -> Value {
     let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
     loop {
         let (status, body) = get_json(app, &format!("/v1/extensions/{id}/status")).await;
@@ -250,12 +260,12 @@ async fn wait_for_status(app: &Router, id: &str, want: impl Fn(&Value) -> bool) 
     }
 }
 
-fn process_alive(pid: i64) -> bool {
+pub(super) fn process_alive(pid: i64) -> bool {
     // Signal 0 probes existence without delivering anything.
     unsafe { libc::kill(pid as libc::pid_t, 0) == 0 }
 }
 
-async fn with_supervisor(
+pub(super) async fn with_supervisor(
     state: &mut AppState,
     config: &FsPath,
 ) -> Arc<crate::extension_service::ExtensionSupervisor> {

@@ -1244,7 +1244,8 @@ filter/script constraints, and rollback tests.
 
 **A4 status (2026-09-26): independently reviewed (review, delta review, and
 follow-up review) and merged to `main` in PR #503, with the delta-review
-follow-ups in PR #504. A5 is next.**
+follow-ups in PR #504. A5 followed on `feat/extension-stage-a5` and is pending
+review.**
 A3b merged to `main` in PR #502 before A4 began.
 The acquisition is `crates/ocean-daemon/src/extension_registry/transaction/git.rs`,
 a child of the A3a writer so it fills the same `AcquisitionLease` with the same
@@ -1485,6 +1486,88 @@ Add/run the E2E matrix in §19 against local and pinned Git no-op packages,
 complete independent security/correctness/architecture review, full CI/MSRV/
 compatibility, operator acceptance record, and docs/devlog closeout. No Stage B
 code, reference integration, deployment, or extension repository creation.
+
+**A5 status (2026-09-26): implemented on `feat/extension-stage-a5` and pending
+independent review. A4 merged in PRs #503 and #504 before A5 began. Stage A is
+not accepted. Acceptance still needs the five operator rulings below and the
+operator's separate acceptance (§20 step 15).**
+The row-by-row §19 map and the §20 step map are in
+[`2026-09-26-ocean-extension-stage-a5-acceptance-evidence.md`](2026-09-26-ocean-extension-stage-a5-acceptance-evidence.md),
+which this note names as the A5 evidence record. A5 adds tests only: no route,
+schema, persisted field, frame, lifecycle kind, or runtime behavior. The non-test
+edits are `#[cfg(test)]` module declarations, `pub(super)` on the A3b route-test
+helpers, and a `doctor` route on the test-only router. Realization choices:
+
+- *The integrated gate* is `extension_registry/mutation/stage_a_gate.rs`. It
+  drives the real §15 routes, the A3a writer, the supervisor, the lifecycle
+  dispatcher, and ordinary fake-provider turns through `agent_turn`, over one
+  real no-op native service. That service speaks the strict stdio protocol,
+  persists its cursor under `data/`, records every frame it receives, and forks
+  one cooperative grandchild. The gate covers §20 steps 1–9 and 11–14, with
+  step 10 for the global scope. The daemon restart in step 9 goes through the
+  production `start_extension_host` on a new dispatcher.
+- *The fixture is a shell script*, as in every earlier slice, not the "minimal
+  Rust service" §20 specifies. A fixture binary would need a new workspace
+  member, and §6 requires an amendment for a new crate, so this deviation is
+  listed below as ruling 5. The gate proves host conformance itself: every
+  recorded host→child frame is decoded with the strict SDK decoder into its
+  declared v1 type and must re-encode to the identical bytes.
+- *Assigned paths are compared by inode.* The host passes descriptor-derived
+  paths to the child (`/.vol/<dev>/<ino>` on macOS, `/proc/self/fd/<n>` on
+  Linux) that only the child can resolve, so the child records the inode each
+  of `HOME`, `XDG_*`, `TMPDIR`, `PWD`, cwd, and argv[0] names, and the gate
+  compares them with the assigned roots.
+- *Live paths the review asked for.*
+  - The permission and tool path runs through `agent_turn` on the keyless
+    `fake-tool` model and the real policy waiter, for both allow and deny.
+  - Project-scope widening runs live, with projects created through the real
+    route.
+  - Backpressure is real. A synchronous 600-fact flood overflows the 256-frame
+    queue and the pipe of a service that never reads, which pins when the pipe
+    fills. The gate proves `lag`, and that the blocked write fails within a
+    bounded deadline of [2 s, 8 s] after the fill (a hosted macOS runner
+    observed 4.26 s, so the live upper bound is a liveness bound). Meanwhile 160 concurrent turns stay bounded. The exact 2 s value
+    is unit-proven by `blocked_stdin_fails_at_the_two_second_connection_deadline`,
+    because a per-frame deadline can restart when macOS grows a blocked pipe's
+    buffer.
+- *Gap closures.* Rows the earlier suites proved only in part now have tests:
+  - every reset reason by name;
+  - the full control-lane order;
+  - the per-service count and byte queue bounds with computed
+    `replay_available`;
+  - the rolling window;
+  - a stable reset (an ignored real-time test, run once and recorded);
+  - duplicate, expanded, versioned, and late hellos on the production runner;
+  - a missing secret at run level;
+  - observer frames that try to publish or command;
+  - allow-session and deny on the real permission policy;
+  - service-grant order, trust, service, and binding authority through the
+    reader;
+  - state and manifest size caps;
+  - a hardlinked payload file;
+  - stale revisions on enable, update, and remove;
+  - filesystem declarations;
+  - the CLI sending each mutation exactly once;
+  - Observatory isolation;
+  - the single ordered producers of `daemon_started` and `daemon_stopping`.
+
+  Each guard was mutation-checked; the evidence record lists every mutation and
+  its result.
+
+Blocked on operator rulings, not decided by A5:
+
+1. The mutation credential class (A3b boundary 1).
+2. §17 project-scope disable of a shared service (A3b boundary 2). This blocks
+   §20 step 10 for a project scope. Project-scope widening is proven live and
+   is not blocked.
+3. Windows R5 package management and a Windows runtime lane (A3b boundary 4).
+4. Local-source path collisions (A4 boundary 7).
+5. Whether the shell §20 fixture is accepted in place of the specified minimal
+   Rust service, or a fixture crate is authorized by amendment.
+
+Open engineering items, none of which blocks a ruling, are listed in the
+evidence record's §6. Two examples: `details.cancelled` extraction at the
+runtime bridge, and secret absence from `tracing` logs.
 
 The strict order is A0 evidence → A1 → A2a → A2b → A3a → A3b → A4 → A5.
 Each named sub-slice is a separate commit/PR and receives fresh independent

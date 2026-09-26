@@ -2864,6 +2864,9 @@ fn remove_tree_at(parent: &File, name: &CStr, depth: usize) -> io::Result<()> {
 mod tests {
     use super::*;
     use serde_json::{json, Value};
+
+    /// Stage A5 §19.4 gap closures (see the manifest's A5 evidence table).
+    mod a5_gaps;
     use std::path::Path;
     use std::sync::atomic::Ordering;
 

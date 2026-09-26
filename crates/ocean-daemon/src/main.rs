@@ -14464,6 +14464,80 @@ mod tests {
             .any(|window| { window == "must-not-serialize".as_bytes() }));
     }
 
+    /// Stage A5 (§19.1): the real policy resolves allow-session and deny
+    /// exactly once each, with the fixed outcome and no reason or argument
+    /// text on the lifecycle wire.
+    #[tokio::test]
+    async fn a5_permission_policy_allow_session_and_deny_resolve_once_without_reasons() {
+        use ocean_agent_sdk::extension_lifecycle::LifecycleEventKind;
+        use std::time::Duration;
+
+        const REASON: &str = "a5-denial-reason-sentinel";
+        const ARGUMENT: &str = "a5-argument-sentinel";
+        for (decision, outcome) in [
+            (AgentPermissionDecision::AllowSession, "allowed"),
+            (
+                AgentPermissionDecision::Deny {
+                    reason: REASON.to_owned(),
+                },
+                "denied",
+            ),
+        ] {
+            let dispatcher = LifecycleDispatcher::new(Uuid::new_v4(), HashSet::new());
+            let mut policy = gating_policy(false);
+            let permissions = policy.permissions.clone();
+            policy.lifecycle = Some(LifecyclePermissionContext {
+                dispatcher: Arc::clone(&dispatcher),
+                project_id: None,
+                session_id: Some(Uuid::new_v4()),
+                turn_id: Some(Uuid::new_v4()),
+                request_id: policy.request_id,
+            });
+            let check =
+                tokio::spawn(async move { policy.check("write", &json!({"arg": ARGUMENT})).await });
+            let permission_id = tokio::time::timeout(Duration::from_secs(1), async {
+                loop {
+                    if let Some(id) = permissions.read().await.keys().next().copied() {
+                        break id;
+                    }
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("permission waiter");
+            permissions
+                .write()
+                .await
+                .get_mut(&permission_id)
+                .and_then(|waiter| waiter.sender.take())
+                .expect("waiter sender")
+                .send(decision)
+                .expect("decision");
+            check.await.expect("check task");
+
+            let retained = dispatcher.attach().retained;
+            assert_eq!(
+                retained.iter().map(|event| event.kind).collect::<Vec<_>>(),
+                vec![
+                    LifecycleEventKind::PermissionRequested,
+                    LifecycleEventKind::PermissionResolved,
+                ]
+            );
+            let wire = retained
+                .iter()
+                .map(ocean_agent_sdk::extension_lifecycle::encode_frame)
+                .collect::<Result<Vec<_>, _>>()
+                .expect("encode")
+                .concat();
+            let wire = String::from_utf8(wire).unwrap();
+            assert!(
+                wire.contains(&format!("\"outcome\":\"{outcome}\"")),
+                "{wire}"
+            );
+            assert!(!wire.contains(REASON) && !wire.contains(ARGUMENT), "{wire}");
+        }
+    }
+
     #[tokio::test]
     async fn permission_waiter_cancel_race_is_deterministically_lifecycle_cancelled() {
         use std::time::Duration;
