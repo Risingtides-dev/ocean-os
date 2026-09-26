@@ -84,7 +84,7 @@ Use `crates/AGENTS.md` for all current workspace packages, ownership exclusions,
 
 ### Merge / PR gate (mirrors CI)
 
-- `cargo xtask ci` is the canonical local gate: docs/index integrity, workspace build/test, all-target Clippy with denied warnings, format, and `cargo deny check`.
+- `cargo xtask ci` is the canonical local gate: docs/index integrity, workspace build/test, the ocean-runtime release-feature proof (`cargo test -p ocean-runtime --lib fake_tool`, built alone so dev-only `test-support` stays off), all-target Clippy with denied warnings, format, and `cargo deny check`.
 - `cargo xtask ci --dry-run` prints the portable command manifest plus omitted CI-only matrix/setup lanes without executing them.
 - Fresh reviewer acknowledgement is required for feature, logic, security, protocol, or architecture changes.
 
