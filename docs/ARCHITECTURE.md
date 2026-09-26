@@ -160,9 +160,10 @@ tool and permission enforcement remains in Ocean OS regardless of profile
 source.
 
 Ocean Surface's Tauri host emits `surface-tauri`. `ocean-agent::surface_flag`
-maps that identity to `TAURI` and supplies the native-shell component guidance;
-the daemon's narrower effective harness seam still preserves CLI-compatible
-hashline/artifact gates until a separate cross-repository policy decision.
+maps that identity to `TAURI` and supplies the native-shell component guidance,
+and the daemon's effective harness seam gives it the same Web profile as
+`surface-web` and `surface-extension`, since all three host the one shared
+Leptos/WASM Surface.
 
 ## Other daemon domains
 
@@ -202,5 +203,5 @@ Ocean OS does not currently claim:
 - sandbox-grade isolation beyond its documented permission/cwd/process controls;
 - bounded live per-turn MPSC memory;
 - runtime composition of Ocean Agents `_shared`/`_base` profile sources;
-- a distinct `surface-tauri` effective harness profile beyond its current CLI-compatible gates;
+- a distinct `surface-tauri` effective harness profile beyond the shared Web profile;
 - shared cloud storage authority (Ocean Bedrock owns that plane).
