@@ -49,6 +49,9 @@ legacy-chromium = [
 
 [dependencies]
 libc = "0.2"
+# A4: NFC normalization for Git tree case/normalization collision keys. Already
+# in the lock through `idna`; no new package.
+icu_normalizer = { version = "2.2", default-features = false, features = ["compiled_data"] }
 anyhow.workspace = true
 async-trait.workspace = true
 axum.workspace = true

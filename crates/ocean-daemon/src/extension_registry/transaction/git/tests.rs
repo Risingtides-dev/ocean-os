@@ -217,6 +217,12 @@ impl FakeGit {
     /// capability probe with `version`, creates the repository on `init`, and
     /// runs `fetch_body` for `fetch`.
     fn new(version: &str, fetch_body: &str) -> Self {
+        Self::scripted(version, fetch_body, "")
+    }
+
+    /// As [`Self::new`], with extra raw `case` arms (matched against
+    /// `" $* "`) for the post-fetch verbs; `$GD` is the `--git-dir` value.
+    fn scripted(version: &str, fetch_body: &str, arms: &str) -> Self {
         let temp = tempfile::tempdir().unwrap();
         let log = temp.path().join("log");
         let exec = temp.path().join("libexec");
@@ -224,10 +230,11 @@ impl FakeGit {
         fs::create_dir(&exec).unwrap();
         fs::write(exec.join("git-remote-https"), b"").unwrap();
         let script = format!(
-            "#!/bin/sh\nLOG='{log}'\nfor a in \"$@\"; do printf '%s\\n' \"$a\"; done > \"$LOG/$$.argv\"\nenv > \"$LOG/$$.env\"\ncase \" $* \" in\n  *' --version '*) printf '%s\\n' '{version}'; exit 0 ;;\n  *' --exec-path '*) printf '%s\\n' '{exec}'; exit 0 ;;\n  *' init '*) for last in \"$@\"; do :; done; mkdir -p \"$last\"; exit 0 ;;\n  *' fetch '*) {fetch_body} ;;\nesac\nexit 1\n",
+            "#!/bin/sh\nLOG='{log}'\nfor a in \"$@\"; do printf '%s\\n' \"$a\"; done > \"$LOG/$$.argv\"\nenv > \"$LOG/$$.env\"\nGD=; for a in \"$@\"; do case \"$a\" in --git-dir=*) GD=\"${{a#--git-dir=}}\";; esac; done\ncase \" $* \" in\n  *' --version '*) printf '%s\\n' '{version}'; exit 0 ;;\n  *' --exec-path '*) printf '%s\\n' '{exec}'; exit 0 ;;\n  *' init '*) for last in \"$@\"; do :; done; mkdir -p \"$last\"; exit 0 ;;\n  *' fetch '*) {fetch_body} ;;\n{arms}\nesac\nexit 1\n",
             log = log.display(),
             exec = exec.display(),
-        );
+        )
+        .replace("{FAKE}", &temp.path().display().to_string());
         let program = temp.path().join("git");
         fs::write(&program, script).unwrap();
         fs::set_permissions(&program, fs::Permissions::from_mode(0o755)).unwrap();
@@ -596,6 +603,8 @@ fn a4_every_git_process_gets_a_stripped_environment_and_one_checked_pin() {
             "core.hooksPath=/dev/null",
             "fetch.recurseSubmodules=false",
             "fetch.fsckObjects=true",
+            "transfer.bundleURI=false",
+            "fetch.uriProtocols=",
             "filter.lfs.smudge=",
             "--no-tags",
             "--no-recurse-submodules",
@@ -621,6 +630,19 @@ fn a4_every_git_process_gets_a_stripped_environment_and_one_checked_pin() {
                 .to_string(),
         ])
     );
+
+    // Local-only commands (probe, init) may use no transport at all.
+    for (argv, _) in [fake.invocations("--version"), fake.invocations("init")].concat() {
+        assert!(
+            argv.iter()
+                .filter(|arg| arg.starts_with("protocol."))
+                .all(|arg| arg == "protocol.allow=never"),
+            "{argv:?}"
+        );
+        assert!(!argv
+            .iter()
+            .any(|arg| arg.starts_with("http.curloptResolve")));
+    }
 
     // Every process, probe included, saw exactly the fixed environment.
     let every = [
@@ -682,8 +704,15 @@ struct Listener {
 
 impl Listener {
     fn start(respond: impl Fn(u16, &[u8]) -> Vec<u8> + Send + 'static) -> Self {
+        Self::start_on("127.0.0.1:0", respond).unwrap()
+    }
+
+    fn start_on(
+        address: &str,
+        respond: impl Fn(u16, &[u8]) -> Vec<u8> + Send + 'static,
+    ) -> io::Result<Self> {
         use std::sync::atomic::{AtomicBool, Ordering};
-        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let listener = TcpListener::bind(address)?;
         listener.set_nonblocking(true).unwrap();
         let port = listener.local_addr().unwrap().port();
         let requests = Arc::new(Mutex::new(Vec::new()));
@@ -720,11 +749,11 @@ impl Listener {
                 let _ = stream.write_all(&response);
             }
         });
-        Self {
+        Ok(Self {
             port,
             requests,
             stop,
-        }
+        })
     }
 
     fn requests(&self) -> Vec<Vec<u8>> {
@@ -742,6 +771,17 @@ const PINNED_HOST: &str = "pinned.ocean-a4.invalid";
 
 /// Run one real pinned fetch attempt through the production process path.
 fn pinned_attempt(scheme: &str, port: u16, pin: Option<IpAddr>) -> Step<()> {
+    let pin = pin.map(|address| pin_entry(PINNED_HOST, port, address));
+    fetch_once(
+        &format!("{scheme}://{PINNED_HOST}:{port}/ocean/noop.git"),
+        scheme,
+        pin.as_deref(),
+        "0123456789abcdef0123456789abcdef01234567",
+    )
+}
+
+/// One real `fetch_attempt` through the production process path.
+fn fetch_once(target: &str, scheme: &str, pin: Option<&str>, revision: &str) -> Step<()> {
     let config = tempfile::tempdir().unwrap();
     let writer = RegistryWriter::new(config.path().to_path_buf());
     let lease = writer.begin_acquisition().unwrap();
@@ -749,16 +789,7 @@ fn pinned_attempt(scheme: &str, port: u16, pin: Option<IpAddr>) -> Step<()> {
     let acquirer = GitAcquirer::system().with_program(host_git());
     let deadline = Instant::now() + Duration::from_secs(30);
     let program = acquirer.probe(&work, deadline).unwrap();
-    let pin = pin.map(|address| pin_entry(PINNED_HOST, port, address));
-    acquirer.fetch_attempt(
-        &program,
-        &work,
-        &format!("{scheme}://{PINNED_HOST}:{port}/ocean/noop.git"),
-        scheme,
-        pin.as_deref(),
-        "0123456789abcdef0123456789abcdef01234567",
-        deadline,
-    )
+    acquirer.fetch_attempt(&program, &work, target, scheme, pin, revision, deadline)
 }
 
 fn head_has(request: &[u8], needle: &str) -> bool {
@@ -1289,4 +1320,498 @@ fn a4_public_commit_smoke() {
         .unwrap_or_else(|fail| panic!("public smoke failed: {fail:?}"));
     let readme = open_regular_file_at(&lease.artifact, OsStr::new("README"), "README").unwrap();
     assert!(readme.metadata().unwrap().len() > 0);
+}
+
+// ---------------------------------------------------------------------------
+// Knox review follow-ups.
+// ---------------------------------------------------------------------------
+
+/// Build a tree object from `ls-tree`-format lines in `remote`.
+fn mktree(remote: &Remote, listing: &str) -> String {
+    let mut child = Command::new(host_git())
+        .arg(format!("--git-dir={}", remote.repo().display()))
+        .args(["mktree", "--missing"])
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(listing.as_bytes())
+        .unwrap();
+    let output = child.wait_with_output().unwrap();
+    assert!(output.status.success(), "mktree refused {listing:?}");
+    String::from_utf8(output.stdout).unwrap().trim().to_string()
+}
+
+#[test]
+fn a4_case_and_normalization_aliases_are_refused_on_every_host() {
+    let config = tempfile::tempdir().unwrap();
+    let writer = RegistryWriter::new(config.path().to_path_buf());
+    let aliased = |extra: &dyn Fn(&Remote, &str) -> String| {
+        let remote = Remote::new();
+        remote.package();
+        let rev = remote.commit();
+        let root = remote.tree_git(&["rev-parse", &format!("{rev}^{{tree}}")]);
+        let blob = remote.tree_git(&["rev-parse", &format!("{rev}:run-me")]);
+        let listing = remote.tree_git(&["ls-tree", &root]);
+        let tree = mktree(&remote, &format!("{listing}\n{}", extra(&remote, &blob)));
+        let commit = remote.git(&[
+            &format!("--git-dir={}", remote.repo().display()),
+            "commit-tree",
+            &tree,
+            "-m",
+            "aliased",
+        ]);
+        let result = code(writer.acquire_git_with(&acquirer(&remote), URL, &commit));
+        remote.assert_no_canary_ran();
+        result
+    };
+    // README + readme.
+    assert_eq!(
+        aliased(&|_, blob| format!("100644 blob {blob}\tREADME\n100644 blob {blob}\treadme\n")),
+        TREE_UNSUPPORTED
+    );
+    // café in NFC and in NFD.
+    assert_eq!(
+        aliased(&|_, blob| format!(
+            "100644 blob {blob}\tcaf\u{e9}\n100644 blob {blob}\tcafe\u{301}\n"
+        )),
+        TREE_UNSUPPORTED
+    );
+    // DIR/ + dir/ holding different subtrees.
+    assert_eq!(
+        aliased(&|remote, blob| {
+            let upper = mktree(remote, &format!("100644 blob {blob}\tone\n"));
+            let lower = mktree(remote, &format!("100755 blob {blob}\ttwo\n"));
+            format!("040000 tree {upper}\tDIR\n040000 tree {lower}\tdir\n")
+        }),
+        TREE_UNSUPPORTED
+    );
+    // A file and a directory that fold together.
+    assert_eq!(
+        aliased(&|remote, blob| {
+            let sub = mktree(remote, &format!("100644 blob {blob}\tinner\n"));
+            format!("100644 blob {blob}\tDocs\n040000 tree {sub}\tdocs\n")
+        }),
+        TREE_UNSUPPORTED
+    );
+    assert_no_acquisition_residue(config.path());
+    assert_eq!(fold_path("DIR/Caf\u{c9}"), fold_path("dir/cafe\u{301}"));
+    assert_ne!(fold_path("dir/a"), fold_path("dir/b"));
+}
+
+/// The filesystem-level guard beneath the fold check: a directory the writer
+/// did not create itself is never merged into, which is what a case-folding
+/// or normalizing filesystem presents for `DIR/` + `dir/`.
+#[test]
+fn a4_tree_writer_never_merges_into_a_directory_it_did_not_create() {
+    let root = tempfile::tempdir().unwrap();
+    let artifact = File::open(root.path()).unwrap();
+
+    // Deterministic on every filesystem: a pre-existing directory.
+    fs::create_dir(root.path().join("planted")).unwrap();
+    let mut writer = TreeWriter::new(&artifact);
+    assert!(matches!(
+        writer.create("planted/x", 0o644),
+        Err(Fail::Reject(TREE_UNSUPPORTED))
+    ));
+
+    // The same directory it created is re-entered freely.
+    let mut writer = TreeWriter::new(&artifact);
+    writer.create("DIR/one", 0o644).unwrap();
+    writer.create("other/x", 0o644).unwrap();
+    writer.create("DIR/three", 0o644).unwrap();
+
+    // DIR/ then dir/: on a case-insensitive filesystem `dir` already exists
+    // but was never created under that spelling, so it is refused.
+    let probe = root.path().join("CaseProbe");
+    fs::write(&probe, b"").unwrap();
+    let case_insensitive = root.path().join("caseprobe").exists();
+    let result = writer.create("dir/two", 0o644);
+    if case_insensitive {
+        assert!(matches!(result, Err(Fail::Reject(TREE_UNSUPPORTED))));
+    } else {
+        assert!(result.is_ok());
+    }
+}
+
+#[test]
+fn a4_safe_component_refuses_git_metadata_names_in_any_case() {
+    for refused in [
+        ".git",
+        ".GIT",
+        ".Git",
+        ".gitmodules",
+        ".GITMODULES",
+        ".lfsconfig",
+        ".LFSCONFIG",
+        "",
+        ".",
+        "..",
+        "a\u{1}b",
+        "tab\there",
+    ] {
+        assert!(!safe_component(refused), "{refused:?}");
+    }
+    assert!(!safe_component(&"x".repeat(256)));
+    for allowed in [
+        ".github",
+        "gitmodules",
+        ".gitignore",
+        "a",
+        "café",
+        &"x".repeat(255),
+    ] {
+        assert!(safe_component(allowed), "{allowed:?}");
+    }
+}
+
+/// A fake git that completes the whole flow for one manifest-only package:
+/// `fetch_head` is the shell that writes `$GD/FETCH_HEAD` (`$last` is the
+/// requested id) and `header_size` overrides the `cat-file --batch` size.
+fn complete_fake(fetch_head: &str, header_size: Option<usize>) -> FakeGit {
+    let manifest = "schema_version = 1\nid = \"example.noop\"\nname = \"Noop\"\nversion = \"1.0.0\"\nmin_ocean_version = \"0.1.0\"\n";
+    let oid = "ab".repeat(20);
+    let size = manifest.len();
+    let arms = format!(
+        "  *' cat-file -t '*) printf 'commit\\n'; exit 0 ;;\n  *' ls-tree '*) printf '100644 blob %s %s\\tocean-extension.toml\\000' '{oid}' '{size}'; exit 0 ;;\n  *' --batch '*) printf '%s blob %s\\n' '{oid}' '{header}'; cat '{{FAKE}}/manifest.toml'; printf '\\n'; exit 0 ;;",
+        header = header_size.unwrap_or(size),
+    );
+    let fake = FakeGit::scripted(
+        "git version 2.40.1",
+        &format!("for last in \"$@\"; do :; done; {fetch_head}; exit 0"),
+        &arms,
+    );
+    fs::write(fake.temp.path().join("manifest.toml"), manifest).unwrap();
+    fake
+}
+
+fn fake_acquirer(fake: &FakeGit) -> GitAcquirer {
+    GitAcquirer::system()
+        .with_program(fake.program())
+        .with_resolver(Arc::new(Fixed(vec![PUBLIC_V4])))
+}
+
+const FAKE_REV: &str = "0123456789abcdef0123456789abcdef01234567";
+
+#[test]
+fn a4_fetch_head_must_name_exactly_one_line() {
+    let config = tempfile::tempdir().unwrap();
+    let writer = RegistryWriter::new(config.path().to_path_buf());
+    // Control: one exact line lets the scripted flow install.
+    let exact = complete_fake(r#"printf '%s\t\tx\n' "$last" > "$GD/FETCH_HEAD""#, None);
+    assert_eq!(
+        code(writer.acquire_git_with(&fake_acquirer(&exact), URL, FAKE_REV)),
+        "ok"
+    );
+    for fetch_head in [
+        r#"printf '%s\t\tx\n%s\t\ty\n' "$last" "$last" > "$GD/FETCH_HEAD""#,
+        r#"printf '%s\t\tx\n' 1111111111111111111111111111111111111111 > "$GD/FETCH_HEAD""#,
+        r#"printf '%sX\n' "$last" > "$GD/FETCH_HEAD""#,
+        ":",
+    ] {
+        let fake = complete_fake(fetch_head, None);
+        assert_eq!(
+            code(writer.acquire_git_with(&fake_acquirer(&fake), URL, FAKE_REV)),
+            REVISION_MISMATCH,
+            "{fetch_head}"
+        );
+    }
+    assert_no_acquisition_residue(config.path());
+}
+
+#[test]
+fn a4_blob_headers_must_match_the_listing() {
+    let config = tempfile::tempdir().unwrap();
+    let writer = RegistryWriter::new(config.path().to_path_buf());
+    let fetch_head = r#"printf '%s\t\tx\n' "$last" > "$GD/FETCH_HEAD""#;
+    let manifest_len = complete_fake(fetch_head, None);
+    let size = fs::metadata(manifest_len.temp.path().join("manifest.toml"))
+        .unwrap()
+        .len() as usize;
+    // A header one byte long, whose stream is otherwise self-consistent with
+    // the listing, must still be refused.
+    for wrong in [size + 1, size - 1] {
+        let fake = complete_fake(fetch_head, Some(wrong));
+        assert_eq!(
+            code(writer.acquire_git_with(&fake_acquirer(&fake), URL, FAKE_REV)),
+            PACKAGE_INVALID,
+            "header size {wrong}"
+        );
+    }
+    assert_no_acquisition_residue(config.path());
+}
+
+#[test]
+fn a4_a_failing_type_probe_is_a_revision_mismatch() {
+    let fake = FakeGit::scripted(
+        "git version 2.40.1",
+        r#"for last in "$@"; do :; done; printf '%s\t\tx\n' "$last" > "$GD/FETCH_HEAD"; exit 0"#,
+        "  *' cat-file -t '*) exit 128 ;;",
+    );
+    let config = tempfile::tempdir().unwrap();
+    let writer = RegistryWriter::new(config.path().to_path_buf());
+    assert_eq!(
+        code(writer.acquire_git_with(&fake_acquirer(&fake), URL, FAKE_REV)),
+        REVISION_MISMATCH
+    );
+}
+
+#[test]
+fn a4_tree_bombs_are_killed_while_ls_tree_streams() {
+    let fetch =
+        r#"for last in "$@"; do :; done; printf '%s\t\tx\n' "$last" > "$GD/FETCH_HEAD"; exit 0"#;
+    let config = tempfile::tempdir().unwrap();
+    let writer = RegistryWriter::new(config.path().to_path_buf());
+    let oid = "ab".repeat(20);
+    // Endless records: stopped at the record cap.
+    let records = FakeGit::scripted(
+        "git version 2.40.1",
+        fetch,
+        &format!(
+            "  *' cat-file -t '*) printf 'commit\\n'; exit 0 ;;\n  *' ls-tree '*) i=0; while :; do i=$((i+1)); printf '100644 blob {oid} 1\\tf%s\\000' \"$i\"; done ;;"
+        ),
+    );
+    let started = Instant::now();
+    assert_eq!(
+        code(
+            writer.acquire_git_with(
+                &fake_acquirer(&records)
+                    .with_limits(50, MAX_PACKAGE_DEPTH, MAX_PACKAGE_BYTES)
+                    .with_deadline(Duration::from_secs(20)),
+                URL,
+                FAKE_REV
+            )
+        ),
+        PACKAGE_INVALID
+    );
+    assert!(started.elapsed() < Duration::from_secs(10));
+    // Endless bytes and no record separator: stopped at the byte cap.
+    let bytes = FakeGit::scripted(
+        "git version 2.40.1",
+        fetch,
+        "  *' cat-file -t '*) printf 'commit\\n'; exit 0 ;;\n  *' ls-tree '*) yes | tr -d '\\n' ;;",
+    );
+    let started = Instant::now();
+    assert_eq!(
+        code(writer.acquire_git_with(
+            &fake_acquirer(&bytes).with_deadline(Duration::from_secs(30)),
+            URL,
+            FAKE_REV
+        )),
+        PACKAGE_INVALID
+    );
+    assert!(started.elapsed() < Duration::from_secs(25));
+    assert_no_acquisition_residue(config.path());
+}
+
+#[test]
+fn a4_a_file_remote_is_refused_under_the_https_protocol_allowance() {
+    let remote = Remote::new();
+    remote.package();
+    let rev = remote.commit();
+    let target = format!("file://{}", remote.repo().display());
+    assert!(matches!(
+        fetch_once(&target, "https", None, &rev),
+        Err(Fail::Reject(FETCH_FAILED))
+    ));
+    // Control: the same fetch succeeds only when `file` is the allowed one.
+    assert!(fetch_once(&target, "file", None, &rev).is_ok());
+}
+
+#[test]
+fn a4_pinned_ipv6_connection_reaches_only_the_checked_address() {
+    let not_found = |_: u16, _: &[u8]| {
+        b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".to_vec()
+    };
+    let Ok(listener) = Listener::start_on("[::1]:0", not_found) else {
+        eprintln!("skipping: IPv6 loopback is unavailable on this host");
+        return;
+    };
+    assert!(matches!(
+        pinned_attempt("http", listener.port, Some(IpAddr::V6(Ipv6Addr::LOCALHOST))),
+        Err(Fail::Reject(FETCH_FAILED))
+    ));
+    let requests = listener.requests();
+    assert!(
+        !requests.is_empty(),
+        "the pinned [::1] address was never contacted"
+    );
+    for request in &requests {
+        assert!(head_has(
+            request,
+            &format!("host: {PINNED_HOST}:{}", listener.port)
+        ));
+    }
+    let unpinned = Listener::start_on("[::1]:0", not_found).unwrap();
+    assert!(pinned_attempt("http", unpinned.port, None).is_err());
+    assert!(unpinned.requests().is_empty());
+}
+
+#[test]
+fn a4_at_most_eight_checked_addresses_are_attempted() {
+    let fake = FakeGit::new("git version 2.40.1", "exit 1");
+    let config = tempfile::tempdir().unwrap();
+    let writer = RegistryWriter::new(config.path().to_path_buf());
+    let answers = (1..=12)
+        .map(|last| IpAddr::V4(Ipv4Addr::new(93, 184, 216, last)))
+        .collect();
+    let acquirer = GitAcquirer::system()
+        .with_program(fake.program())
+        .with_resolver(Arc::new(Fixed(answers)));
+    assert_eq!(
+        code(writer.acquire_git_with(&acquirer, URL, FAKE_REV)),
+        FETCH_FAILED
+    );
+    assert_eq!(fake.invocations("fetch").len(), MAX_ADDRESSES);
+}
+
+#[test]
+fn a4_resolver_threads_are_capped_daemon_wide() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    let (release, gate) = std::sync::mpsc::channel::<()>();
+    let gate = Arc::new(Mutex::new(gate));
+    for _ in 0..MAX_RESOLVER_THREADS {
+        let gate = Arc::clone(&gate);
+        let answer = bounded_lookup(
+            move || {
+                let _ = gate.lock().unwrap().recv();
+                Some(Vec::new())
+            },
+            Duration::from_millis(20),
+        );
+        assert!(
+            answer.is_none(),
+            "a stuck lookup times out but keeps its slot"
+        );
+    }
+    // Every slot is held: refused without running the lookup at all, and the
+    // production resolver reports it as a resolution failure.
+    let ran = Arc::new(AtomicBool::new(false));
+    let flag = Arc::clone(&ran);
+    assert!(bounded_lookup(
+        move || {
+            flag.store(true, Ordering::SeqCst);
+            Some(vec![PUBLIC_V4])
+        },
+        Duration::from_secs(1)
+    )
+    .is_none());
+    assert!(!ran.load(Ordering::SeqCst));
+    assert!(matches!(
+        checked_addresses(
+            &SystemResolver,
+            "git.ocean-fixture.com",
+            Instant::now() + Duration::from_secs(5)
+        ),
+        Err(Fail::Reject(RESOLUTION_FAILED))
+    ));
+    for _ in 0..MAX_RESOLVER_THREADS {
+        release.send(()).unwrap();
+    }
+    let until = Instant::now() + Duration::from_secs(5);
+    while RESOLVER_THREADS.load(Ordering::SeqCst) != 0 && Instant::now() < until {
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert_eq!(
+        bounded_lookup(|| Some(vec![PUBLIC_V4]), Duration::from_secs(1)),
+        Some(vec![PUBLIC_V4])
+    );
+}
+
+#[test]
+fn a4_transient_spawn_failures_are_not_reported_as_unpinnable() {
+    for errno in [libc::EAGAIN, libc::ENOMEM, libc::EMFILE, libc::ENFILE] {
+        assert!(matches!(
+            spawn_failure(&io::Error::from_raw_os_error(errno)),
+            Fail::Reject(FETCH_FAILED)
+        ));
+    }
+    for errno in [libc::ENOENT, libc::EACCES, libc::ENOEXEC] {
+        assert!(matches!(
+            spawn_failure(&io::Error::from_raw_os_error(errno)),
+            Fail::Reject(GIT_UNAVAILABLE)
+        ));
+    }
+}
+
+#[test]
+fn a4_macos_git_shim_is_used_only_when_developer_tools_back_it() {
+    let tools = tempfile::tempdir().unwrap();
+    let xcode = tools.path().join("Xcode");
+    let clt = tools.path().join("CommandLineTools");
+    fs::create_dir_all(clt.join("usr/bin")).unwrap();
+    fs::write(clt.join("usr/bin/git"), b"").unwrap();
+    // No selection: either default location backs the shim.
+    assert!(macos_shim_backed(None, &[&xcode, &clt]));
+    assert!(!macos_shim_backed(None, &[&xcode]));
+    // A recorded selection is authoritative even when a default exists.
+    assert!(!macos_shim_backed(Some(&xcode), &[&xcode, &clt]));
+    assert!(macos_shim_backed(Some(&clt), &[&xcode]));
+}
+
+#[test]
+fn a4_cleanup_failure_keeps_its_acquisition_permit() {
+    let config = tempfile::tempdir().unwrap();
+    let writer = RegistryWriter::new(config.path().to_path_buf());
+    let key = writer.gate_key();
+    let active = || registry_gates().get(&key).map_or(0, |gate| gate.active);
+    for (fail, retained) in [
+        (Fail::Reject(TIMEOUT), 0),
+        (Fail::Reject(FETCH_FAILED), 0),
+        (Fail::Reject(CLEANUP_FAILED), 1),
+    ] {
+        let mut lease = writer.begin_acquisition().unwrap();
+        let quarantine = lease.path.clone();
+        assert_eq!(active(), 1);
+        retain_permit_after(&mut lease, &fail);
+        drop(lease);
+        assert!(!quarantine.exists(), "the quarantine is always deleted");
+        assert_eq!(active(), retained, "{fail:?}");
+        // Undo the deliberate retention for the shared per-process gate.
+        if retained == 1 {
+            registry_gates().get_mut(&key).unwrap().active -= 1;
+        }
+    }
+}
+
+#[test]
+fn a4_listing_fold_collisions_are_refused_before_any_filesystem_write() {
+    let acquirer = GitAcquirer::system();
+    let oid = "ab".repeat(20);
+    let listing = |paths: &[&str]| {
+        paths
+            .iter()
+            .map(|path| format!("100644 blob {oid} 1\t{path}\0"))
+            .collect::<String>()
+    };
+    for paths in [
+        &["README", "readme"][..],
+        &["caf\u{e9}", "cafe\u{301}"],
+        &["DIR/one", "dir/two"],
+        &["Docs", "docs/inner"],
+        &["a/B/x", "a/b/y"],
+    ] {
+        assert!(
+            matches!(
+                acquirer.parse_tree(listing(paths).as_bytes(), 40),
+                Err(Fail::Reject(TREE_UNSUPPORTED))
+            ),
+            "{paths:?}"
+        );
+    }
+    // Siblings under one directory are fine.
+    assert_eq!(
+        acquirer
+            .parse_tree(listing(&["dir/one", "dir/two", "other"]).as_bytes(), 40)
+            .unwrap()
+            .len(),
+        3
+    );
 }

@@ -1350,6 +1350,58 @@ fail a test. The separately recorded exact public-commit smoke
 `7fd1a60b01f91b314f59955a4e4d4e80d8edf11d` through a pinned connection with the
 system resolver and host Git 2.50.1 on 2026-09-25 and extracted its tree.
 
+*Independent review follow-up (Knox on PR #503: no blockers; one medium, seven
+lows, six nits), repaired on the same branch:*
+
+- *Aliasing paths (medium).* The tree listing is refused as
+  `git_tree_unsupported` when two distinct paths, or a file and a directory,
+  share one collision key (Unicode lowercase, then NFC via the `icu_normalizer`
+  crate already in the lock through `idna`), so `README`+`readme`, NFC+NFD
+  `café`, and `DIR/`+`dir/` fail on every host, not only on a case-insensitive
+  or normalizing filesystem. The filesystem-level `TreeWriter` guard (never
+  merge into a directory this writer did not create) stays as the second layer
+  and has its own deterministic test.
+- *Local commands carry no transport.* `init`, `ls-tree`, `cat-file`, and the
+  version/exec-path probe get `protocol.allow=never` and no per-protocol
+  allowance; only `fetch` gets exactly one. `transfer.bundleURI=false` and an
+  empty `fetch.uriProtocols` join the fixed hardening (no bundle-URI or
+  packfile-URI side channel).
+- *Tree bomb.* `ls-tree` output is read as it grows and the group is killed
+  (§10.5) once it passes the A0 entry cap in records or 64 MiB, as
+  `package_invalid`.
+- *Resolver threads.* At most four `getaddrinfo` helper threads may be in
+  flight daemon-wide; each holds its slot until the lookup itself returns, and a
+  full cap refuses without spawning as `git_resolution_failed`.
+- *Address walk.* At most eight members of the checked answer set are tried.
+- *Codes.* A failing `cat-file -t` is `git_revision_mismatch`, not 501; a
+  resource-exhaustion spawn failure (`EAGAIN`, `ENOMEM`, `EMFILE`, `ENFILE`) is
+  the transient `git_fetch_failed`, not 501.
+- *macOS shim.* `/usr/bin/git` is chosen only when the `xcode-select` choice
+  (read from `/var/db/xcode_select_link`, never by invoking the shim) or, with
+  no choice recorded, the Xcode or Command Line Tools default holds a real
+  `usr/bin/git`; otherwise the next fixed candidate (Homebrew) is used, so an
+  acquisition can never open the CLT install dialog.
+- *Permit after unproven cleanup.* On `git_process_cleanup_failed` the lease
+  keeps its acquisition permit until daemon restart (its quarantine is still
+  deleted), so stuck tools can never exceed the four-acquisition cap; while it
+  is held the orphan sweep is skipped, never raced.
+- *Tests added:* the three aliasing trees end to end plus a synthetic-listing
+  fold test and a `TreeWriter` test; direct `safe_component` assertions; a
+  scripted two-line/foreign/malformed `FETCH_HEAD` and a wrong-size blob header
+  (each with a passing control); a `file://` target refused under the `https`
+  allowance (with a `file` control); a `::1` twin of the pinning test (skipped
+  only when IPv6 loopback is unavailable); the address and resolver caps; the
+  spawn-code and shim decisions; and permit retention. Each new guard was
+  mutation-checked: removing the fold check, the writer guard, the `.git`
+  refusal, the one-line `FETCH_HEAD` rule, the header check, the streaming
+  listing watch, the local no-transport rule, `transfer.bundleURI`, the address
+  cap, the resolver cap, either code mapping, the `xcode-select` precedence,
+  permit retention, or the IPv6 pin fails a test; the protocol policy is two
+  layers (`protocol.allow=never` and `GIT_PROTOCOL_FROM_USER=0`) and removing
+  both fails the `file://` test. On APFS the end-to-end aliasing test fails
+  only when both collision layers are removed, which is the intended defense
+  in depth; each layer's own test fails when that layer alone is removed.
+
 Recorded boundaries, not decided here:
 
 1. §13.2's "any indication that the pin was not honored" has no production
@@ -1358,13 +1410,20 @@ Recorded boundaries, not decided here:
    on the host that runs it; a runtime self-check would need a loopback probe
    per acquisition and is not built.
 2. `getaddrinfo` cannot be cancelled. A lookup that outlives the deadline fails
-   the acquisition and finishes on its helper thread afterwards.
+   the acquisition and finishes on its helper thread afterwards, holding one of
+   the four resolver slots until it does.
 3. The deadline bounds every process; the in-process copy of already-fetched,
    already-listed bytes (at most 256 MiB) after `cat-file` exits is bounded
    work, not deadline-interrupted.
 4. `/usr/local/bin/git` and `/opt/homebrew/bin/git` are typically writable by
    the operator account. They are fixed, package-independent paths, but an
-   operator-controlled binary there is trusted like any daemon-user tool.
+   operator-controlled binary there is trusted like any daemon-user tool. The
+   macOS shim check reads developer-tool locations, not `DEVELOPER_DIR`
+   (the environment is cleared for every `git`, so the shim ignores it too).
+7. The aliasing rule refuses paths that are distinct on a case-sensitive
+   filesystem. Local acquisition does not apply it (a local tree already
+   exists on one filesystem); whether local sources should share it is left to
+   review.
 5. The `.gitattributes` `filter=` refusal, and refusing `.gitmodules`/
    `.lfsconfig` anywhere in the tree, are this builder's reading of "no
    submodules, Git LFS, … smudge/clean filter": content is never filtered, so

@@ -482,7 +482,9 @@ pub(crate) struct AcquisitionLease {
     artifact: File,
     source: Option<InstallSource>,
     consumed: bool,
-    _permit: AcquisitionPermit,
+    /// `None` only after A4 deliberately retains the permit for a git process
+    /// group whose cleanup could not be proven.
+    permit: Option<AcquisitionPermit>,
 }
 
 impl AcquisitionLease {
@@ -693,7 +695,7 @@ impl RegistryWriter {
             artifact,
             source: None,
             consumed: false,
-            _permit: permit,
+            permit: Some(permit),
         })
     }
 

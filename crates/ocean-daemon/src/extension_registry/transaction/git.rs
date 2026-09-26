@@ -51,7 +51,7 @@
 //! Nothing here runs package content, and no response or log carries a URL
 //! credential (none is accepted), a resolved address, or Git output.
 
-use std::collections::{BTreeSet, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::ffi::OsString;
 use std::io::{BufRead, BufReader, Read};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, ToSocketAddrs};
@@ -89,6 +89,12 @@ const MAX_ATTRIBUTES_BYTES: usize = 1024 * 1024;
 const MAX_SMALL_OUTPUT: u64 = 64 * 1024;
 const POLL_INTERVAL: Duration = Duration::from_millis(20);
 const MEASURE_INTERVAL: Duration = Duration::from_millis(200);
+/// At most this many members of the checked answer set are attempted.
+const MAX_ADDRESSES: usize = 8;
+/// Daemon-wide cap on in-flight `getaddrinfo` helper threads. A lookup that
+/// outlives its deadline keeps its slot until it returns, so a stuck resolver
+/// cannot accumulate threads; a full cap refuses as `git_resolution_failed`.
+const MAX_RESOLVER_THREADS: usize = 4;
 /// §10.5 group grace after SIGTERM and again after SIGKILL.
 const GROUP_GRACE: Duration = Duration::from_secs(2);
 
@@ -119,7 +125,7 @@ const RESERVED_TLDS: [&str; 10] = [
 
 /// Fixed hardening applied to every `git` invocation (`-c key=value`). The
 /// one allowed protocol is appended per call.
-const HARDENED_CONFIG: [&str; 28] = [
+const HARDENED_CONFIG: [&str; 30] = [
     "protocol.allow=never",
     "http.followRedirects=false",
     "http.proxy=",
@@ -142,6 +148,9 @@ const HARDENED_CONFIG: [&str; 28] = [
     "fetch.fsckObjects=true",
     "transfer.fsckObjects=true",
     "fetch.writeCommitGraph=false",
+    // No bundle-URI or packfile-URI side channels to another host.
+    "transfer.bundleURI=false",
+    "fetch.uriProtocols=",
     "gc.auto=0",
     "maintenance.auto=false",
     "filter.lfs.required=false",
@@ -307,22 +316,53 @@ struct SystemResolver;
 
 impl HostResolver for SystemResolver {
     fn resolve(&self, host: &str, timeout: Duration) -> Option<Vec<IpAddr>> {
-        let (sender, receiver) = mpsc::channel();
         let host = host.to_owned();
-        // getaddrinfo has no deadline of its own; a stuck lookup finishes on
-        // its helper thread after this acquisition has already failed.
-        std::thread::Builder::new()
-            .name("ocean-git-resolve".into())
-            .spawn(move || {
-                let answers = (host.as_str(), HTTPS_PORT)
+        bounded_lookup(
+            move || {
+                (host.as_str(), HTTPS_PORT)
                     .to_socket_addrs()
                     .ok()
-                    .map(|addresses| addresses.map(|address| address.ip()).collect());
-                let _ = sender.send(answers);
-            })
-            .ok()?;
-        receiver.recv_timeout(timeout).ok().flatten()
+                    .map(|addresses| addresses.map(|address| address.ip()).collect())
+            },
+            timeout,
+        )
     }
+}
+
+static RESOLVER_THREADS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// Run one blocking lookup on a helper thread bounded by `timeout`, holding
+/// one of [`MAX_RESOLVER_THREADS`] slots until the thread itself finishes.
+/// `getaddrinfo` has no deadline of its own, so a stuck lookup keeps its slot
+/// after this acquisition has already failed; when every slot is held the
+/// lookup is refused without spawning anything.
+fn bounded_lookup(
+    lookup: impl FnOnce() -> Option<Vec<IpAddr>> + Send + 'static,
+    timeout: Duration,
+) -> Option<Vec<IpAddr>> {
+    use std::sync::atomic::Ordering;
+    struct Slot;
+    impl Drop for Slot {
+        fn drop(&mut self) {
+            RESOLVER_THREADS.fetch_sub(1, Ordering::SeqCst);
+        }
+    }
+    RESOLVER_THREADS
+        .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |held| {
+            (held < MAX_RESOLVER_THREADS).then_some(held + 1)
+        })
+        .ok()?;
+    let slot = Slot;
+    let (sender, receiver) = mpsc::channel();
+    // A failed spawn drops the closure, and with it the slot.
+    std::thread::Builder::new()
+        .name("ocean-git-resolve".into())
+        .spawn(move || {
+            let _slot = slot;
+            let _ = sender.send(lookup());
+        })
+        .ok()?;
+    receiver.recv_timeout(timeout).ok().flatten()
 }
 
 /// Resolve once, canonicalize, deduplicate, and reject the whole set if any
@@ -349,7 +389,7 @@ fn checked_addresses(
     if !set.iter().all(|address| is_public_address(*address)) {
         return Err(Fail::Reject(HOST_NOT_PUBLIC));
     }
-    Ok(set.into_iter().collect())
+    Ok(set.into_iter().take(MAX_ADDRESSES).collect())
 }
 
 /// Git's `CURLOPT_RESOLVE` entry. No leading `+`: the pin never expires for
@@ -507,7 +547,9 @@ impl GitAcquirer {
             None => locate_git().ok_or(Fail::Reject(GIT_UNAVAILABLE))?,
         };
         let unavailable_unless_bounded = |fail: Fail| match fail {
-            Fail::Reject(TIMEOUT) | Fail::Reject(CLEANUP_FAILED) => fail,
+            Fail::Reject(TIMEOUT) | Fail::Reject(CLEANUP_FAILED) | Fail::Reject(FETCH_FAILED) => {
+                fail
+            }
             _ => Fail::Reject(GIT_UNAVAILABLE),
         };
         let version = self
@@ -569,7 +611,7 @@ impl GitAcquirer {
             init.push("--object-format=sha256".into());
         }
         init.push(repo.clone().into_os_string());
-        let status = self.run(program, work, scheme, None, &init, None, None, deadline)?;
+        let status = self.run(program, work, None, None, &init, None, None, deadline)?;
         if !status.success() {
             return Err(Fail::Reject(GIT_UNAVAILABLE));
         }
@@ -585,7 +627,16 @@ impl GitAcquirer {
             target.into(),
             revision.into(),
         ];
-        let status = self.run(program, work, scheme, pin, &fetch, None, None, deadline)?;
+        let status = self.run(
+            program,
+            work,
+            Some(scheme),
+            pin,
+            &fetch,
+            None,
+            None,
+            deadline,
+        )?;
         if status.success() {
             Ok(())
         } else {
@@ -618,19 +669,26 @@ impl GitAcquirer {
         {
             return Err(Fail::Reject(REVISION_MISMATCH));
         }
-        let kind = self.capture(
-            program,
-            work,
-            &[
-                git_dir(&work.path.join("repo.git")),
-                "cat-file".into(),
-                "-t".into(),
-                "--end-of-options".into(),
-                revision.into(),
-            ],
-            c"type.out",
-            deadline,
-        )?;
+        let kind = self
+            .capture(
+                program,
+                work,
+                &[
+                    git_dir(&work.path.join("repo.git")),
+                    "cat-file".into(),
+                    "-t".into(),
+                    "--end-of-options".into(),
+                    revision.into(),
+                ],
+                c"type.out",
+                deadline,
+            )
+            .map_err(|fail| match fail {
+                // `cat-file -t` exiting nonzero means the object is absent or
+                // unreadable here, not that pinned Git is unavailable.
+                Fail::Reject(GIT_UNAVAILABLE) => Fail::Reject(REVISION_MISMATCH),
+                other => other,
+            })?;
         if kind != b"commit\n" {
             return Err(Fail::Reject(REVISION_MISMATCH));
         }
@@ -658,15 +716,23 @@ impl GitAcquirer {
             revision.into(),
         ];
         let output = work.output(c"tree.out")?;
-        let status = self.run(
+        // A tree bomb is stopped while `ls-tree` streams, not after: the
+        // listing is read as it grows and the group is killed once it passes
+        // the record (A0 entry) or byte cap.
+        let mut listing = ListingWatch {
+            file: work.input(c"tree.out")?,
+            bytes: 0,
+            records: 0,
+            max_records: self.max_entries,
+        };
+        let status = self.run_watched(
             program,
             work,
-            "https",
-            None,
+            (None, None),
             &args,
-            None,
-            Some(output),
+            (None, Some(output)),
             deadline,
+            &mut || listing.check(),
         )?;
         if !status.success() {
             return Err(Fail::Reject(REVISION_MISMATCH));
@@ -683,6 +749,11 @@ impl GitAcquirer {
     fn parse_tree(&self, reader: impl BufRead, oid_len: usize) -> Step<Vec<TreeEntry>> {
         let mut entries = Vec::new();
         let mut directories: BTreeSet<String> = BTreeSet::new();
+        // Case-folded, NFC-normalized path → the exact path that claimed it.
+        // Two distinct paths with one fold would collide on a case-insensitive
+        // or normalizing filesystem (APFS, NTFS) and are refused everywhere,
+        // so a package means the same bytes on every host.
+        let mut folded: HashMap<String, (String, bool)> = HashMap::new();
         let mut bytes = 0u64;
         for record in reader.split(0) {
             let record = record.map_err(unavailable)?;
@@ -725,8 +796,26 @@ impl GitAcquirer {
             if components.len() - 1 > self.max_depth {
                 return Err(Fail::Reject(PACKAGE_INVALID));
             }
-            for depth in 1..components.len() {
-                directories.insert(components[..depth].join("/"));
+            for depth in 1..=components.len() {
+                let prefix = components[..depth].join("/");
+                let directory = depth < components.len();
+                match folded.entry(fold_path(&prefix)) {
+                    std::collections::hash_map::Entry::Vacant(slot) => {
+                        slot.insert((prefix.clone(), directory));
+                    }
+                    // Only the same directory may claim a fold twice; any
+                    // other second claimant (another spelling, or a file and
+                    // a directory) is a collision.
+                    std::collections::hash_map::Entry::Occupied(slot) => {
+                        let (claimant, claimed_as_directory) = slot.get();
+                        if !(directory && *claimed_as_directory && *claimant == prefix) {
+                            return Err(Fail::Reject(TREE_UNSUPPORTED));
+                        }
+                    }
+                }
+                if directory {
+                    directories.insert(prefix);
+                }
             }
             bytes = bytes
                 .checked_add(size)
@@ -775,7 +864,7 @@ impl GitAcquirer {
         let status = self.run(
             program,
             work,
-            "https",
+            None,
             None,
             &args,
             Some(input),
@@ -850,7 +939,7 @@ impl GitAcquirer {
         let status = self.run(
             program,
             work,
-            "https",
+            None,
             None,
             args,
             None,
@@ -873,17 +962,51 @@ impl GitAcquirer {
         &self,
         program: &Path,
         work: &Workspace,
-        scheme: &str,
+        scheme: Option<&str>,
         pin: Option<&str>,
         args: &[OsString],
         stdin: Option<File>,
         stdout: Option<File>,
         deadline: Instant,
     ) -> Step<ExitStatus> {
+        self.run_watched(
+            program,
+            work,
+            (scheme, pin),
+            args,
+            (stdin, stdout),
+            deadline,
+            &mut || None,
+        )
+    }
+
+    /// [`Self::run`] plus a caller watch polled while the process runs and
+    /// once after it exits; a `Some(code)` kills the group (§10.5) and fails
+    /// with that code.
+    #[allow(clippy::too_many_arguments)]
+    fn run_watched(
+        &self,
+        program: &Path,
+        work: &Workspace,
+        (scheme, pin): (Option<&str>, Option<&str>),
+        args: &[OsString],
+        (stdin, stdout): (Option<File>, Option<File>),
+        deadline: Instant,
+        watch: &mut dyn FnMut() -> Option<&'static str>,
+    ) -> Step<ExitStatus> {
         let command = command(program, work, scheme, pin, args, stdin, stdout);
-        let status = run_group(command, deadline, || work.bytes() > self.temp_ceiling)?;
-        if work.bytes() > self.temp_ceiling {
+        let ceiling = self.temp_ceiling;
+        let status = run_group(command, deadline, || {
+            if work.bytes() > ceiling {
+                return Some(LIMIT);
+            }
+            watch()
+        })?;
+        if work.bytes() > ceiling {
             return Err(Fail::Reject(LIMIT));
+        }
+        if let Some(code) = watch() {
+            return Err(Fail::Reject(code));
         }
         Ok(status)
     }
@@ -908,7 +1031,29 @@ fn locate_git() -> Option<PathBuf> {
     GIT_CANDIDATES.iter().map(PathBuf::from).find(|candidate| {
         fs::metadata(candidate)
             .is_ok_and(|metadata| metadata.is_file() && metadata.permissions().mode() & 0o111 != 0)
+            && (!cfg!(target_os = "macos")
+                || candidate != Path::new("/usr/bin/git")
+                || macos_shim_backed(
+                    fs::read_link("/var/db/xcode_select_link").ok().as_deref(),
+                    &[
+                        Path::new("/Applications/Xcode.app/Contents/Developer"),
+                        Path::new("/Library/Developer/CommandLineTools"),
+                    ],
+                ))
     })
+}
+
+/// macOS `/usr/bin/git` is an `xcrun` shim; without developer tools, running
+/// it can open the Command Line Tools install dialog. Decide from the
+/// filesystem alone, never by invoking the shim: the `xcode-select` choice
+/// (a symlink) when one is recorded, otherwise either default location, must
+/// hold a real `usr/bin/git`. Otherwise the next candidate (Homebrew) wins.
+fn macos_shim_backed(selected: Option<&Path>, defaults: &[&Path]) -> bool {
+    let backed = |developer: &Path| developer.join("usr/bin/git").is_file();
+    match selected {
+        Some(developer) => backed(developer),
+        None => defaults.iter().any(|developer| backed(developer)),
+    }
 }
 
 /// `git version X.Y[.Z…]` → `(X, Y, Z)`. Vendor suffixes such as
@@ -946,6 +1091,52 @@ fn safe_component(component: &str) -> bool {
         && !component.chars().any(char::is_control)
 }
 
+/// The collision key for one tree path: Unicode lowercase, then NFC. Distinct
+/// paths sharing a key would alias on a case-insensitive or
+/// normalization-insensitive filesystem.
+fn fold_path(path: &str) -> String {
+    icu_normalizer::ComposingNormalizerBorrowed::new_nfc()
+        .normalize(&path.to_lowercase())
+        .into_owned()
+}
+
+/// A resource-exhaustion spawn failure is transient (`git_fetch_failed`);
+/// anything else means the tool cannot be run here.
+fn spawn_failure(error: &io::Error) -> Fail {
+    match error.raw_os_error() {
+        Some(libc::EAGAIN | libc::ENOMEM | libc::EMFILE | libc::ENFILE) => {
+            Fail::Reject(FETCH_FAILED)
+        }
+        _ => Fail::Reject(GIT_UNAVAILABLE),
+    }
+}
+
+/// Reads the growing `ls-tree -z` listing while the process runs.
+struct ListingWatch {
+    file: File,
+    bytes: u64,
+    records: usize,
+    max_records: usize,
+}
+
+impl ListingWatch {
+    fn check(&mut self) -> Option<&'static str> {
+        let mut buffer = [0u8; 64 * 1024];
+        loop {
+            let count = match self.file.read(&mut buffer) {
+                Ok(0) => return None,
+                Ok(count) => count,
+                Err(_) => return Some(STATE_UNAVAILABLE),
+            };
+            self.bytes += count as u64;
+            self.records += buffer[..count].iter().filter(|byte| **byte == 0).count();
+            if self.bytes > MAX_TREE_LISTING || self.records > self.max_records {
+                return Some(PACKAGE_INVALID);
+            }
+        }
+    }
+}
+
 /// True when any `.gitattributes` line assigns a `filter` driver (Git LFS or
 /// any smudge/clean filter), including through an `[attr]` macro.
 fn declares_filter(attributes: &[u8]) -> bool {
@@ -977,15 +1168,18 @@ fn fixed_environment(home: &Path) -> [(&'static str, OsString); 10] {
     ]
 }
 
-/// `-c` hardening, the single allowed protocol, and at most one pin.
-fn config_arguments(scheme: &str, pin: Option<&str>) -> Vec<OsString> {
+/// `-c` hardening, at most one allowed protocol (none for local-only
+/// commands), and at most one pin.
+fn config_arguments(scheme: Option<&str>, pin: Option<&str>) -> Vec<OsString> {
     let mut arguments = Vec::with_capacity(HARDENED_CONFIG.len() * 2 + 4);
     for pair in HARDENED_CONFIG {
         arguments.push("-c".into());
         arguments.push(pair.into());
     }
-    arguments.push("-c".into());
-    arguments.push(format!("protocol.{scheme}.allow=always").into());
+    if let Some(scheme) = scheme {
+        arguments.push("-c".into());
+        arguments.push(format!("protocol.{scheme}.allow=always").into());
+    }
     if let Some(pin) = pin {
         arguments.push("-c".into());
         arguments.push(format!("http.curloptResolve={pin}").into());
@@ -996,7 +1190,7 @@ fn config_arguments(scheme: &str, pin: Option<&str>) -> Vec<OsString> {
 fn command(
     program: &Path,
     work: &Workspace,
-    scheme: &str,
+    scheme: Option<&str>,
     pin: Option<&str>,
     args: &[OsString],
     stdin: Option<File>,
@@ -1184,9 +1378,9 @@ impl<'a> TreeWriter<'a> {
 fn run_group(
     mut command: Command,
     deadline: Instant,
-    over_limit: impl Fn() -> bool,
+    mut over_limit: impl FnMut() -> Option<&'static str>,
 ) -> Step<ExitStatus> {
-    let child = command.spawn().map_err(|_| Fail::Reject(GIT_UNAVAILABLE))?;
+    let child = command.spawn().map_err(|error| spawn_failure(&error))?;
     let group = ToolGroup::new(child)?;
     let mut next_measure = Instant::now() + MEASURE_INTERVAL;
     loop {
@@ -1201,8 +1395,8 @@ fn run_group(
             return Err(group.terminate(TIMEOUT));
         }
         if now >= next_measure {
-            if over_limit() {
-                return Err(group.terminate(LIMIT));
+            if let Some(code) = over_limit() {
+                return Err(group.terminate(code));
             }
             next_measure = now + MEASURE_INTERVAL;
         }
@@ -1212,7 +1406,7 @@ fn run_group(
 }
 
 #[cfg(not(any(target_os = "macos", target_os = "linux")))]
-fn run_group(_: Command, _: Instant, _: impl Fn() -> bool) -> Step<ExitStatus> {
+fn run_group(_: Command, _: Instant, _: impl FnMut() -> Option<&'static str>) -> Step<ExitStatus> {
     Err(Fail::Reject(GIT_UNAVAILABLE))
 }
 
@@ -1314,6 +1508,17 @@ impl ToolGroup {
     }
 }
 
+/// A git process group whose exit could not be proven may still be running.
+/// Its lease keeps one of the four acquisition permits until the daemon
+/// restarts, so stuck tools can never exceed the daemon-wide acquisition cap;
+/// the quarantine itself is still deleted. While such a permit is held the
+/// orphan sweep is skipped (never raced), exactly as for a live acquisition.
+fn retain_permit_after(lease: &mut AcquisitionLease, fail: &Fail) {
+    if matches!(fail, Fail::Reject(CLEANUP_FAILED)) {
+        std::mem::forget(lease.permit.take());
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Writer entry points.
 // ---------------------------------------------------------------------------
@@ -1349,9 +1554,10 @@ impl RegistryWriter {
         }
         let mut lease = self.begin_acquisition()?;
         let operation_id = lease.operation_id;
-        acquirer
-            .fill(&mut lease, &source, started + acquirer.deadline)
-            .map_err(|fail| self.error(operation_id, Failure::pre(0)(fail)))?;
+        if let Err(fail) = acquirer.fill(&mut lease, &source, started + acquirer.deadline) {
+            retain_permit_after(&mut lease, &fail);
+            return Err(self.error(operation_id, Failure::pre(0)(fail)));
+        }
         self.seal(lease)
     }
 }
