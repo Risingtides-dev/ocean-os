@@ -410,6 +410,17 @@ pub struct AgentRuntime {
     /// the error shape a refused credential actually produces, with no network.
     #[cfg(test)]
     test_dispatch_status: HashMap<&'static str, u16>,
+    /// Test-only scripted provider for a real-loop `run_prompt` turn, applied
+    /// after the `fake-tool` injection through the same `with_provider` seam.
+    /// Used only by the `#[ignore]`d turn-channel queue measurement; production
+    /// never builds this field.
+    #[cfg(test)]
+    test_turn_provider: Option<TestCompactProvider>,
+    /// Test-only H1 dequeue probe for the turn-channel queue measurement. When
+    /// set, the `run_prompt` receive loop records the queue length left behind
+    /// at every dequeue plus a clone of the event. Production never builds it.
+    #[cfg(test)]
+    test_h1_probe: Option<turn_channel_queue_measurements::H1Probe>,
 }
 
 /// Debug-opaque wrapper so the `dyn Provider` test seam doesn't break
@@ -471,6 +482,10 @@ impl AgentRuntime {
             test_compact_provider: None,
             #[cfg(test)]
             test_dispatch_status: HashMap::new(),
+            #[cfg(test)]
+            test_turn_provider: None,
+            #[cfg(test)]
+            test_h1_probe: None,
         };
         runtime.migrate_legacy_sessions();
         // Bound on-disk session growth: prune session files past the TTL once
@@ -2437,6 +2452,12 @@ impl AgentRuntime {
             ));
         }
 
+        // Turn-channel queue measurement only: a scripted, paced provider.
+        #[cfg(test)]
+        if let Some(provider) = &self.test_turn_provider {
+            cfg = cfg.with_provider(provider.0.clone());
+        }
+
         let (tx, mut rx) = mpsc::unbounded_channel();
         // Parent-side durable transcript. The runtime sends only completed-round
         // deltas; keeping the valid prefix here avoids cloning the full history
@@ -2471,6 +2492,12 @@ impl AgentRuntime {
         // control events, so this stays `false` and failover is allowed.
         let mut streamed_output = false;
         while let Some(ev) = rx.recv().await {
+            // Turn-channel queue measurement only: what H1 still holds after
+            // this dequeue. Never compiled outside this crate's tests.
+            #[cfg(test)]
+            if let Some(probe) = &self.test_h1_probe {
+                probe.record(rx.len(), &ev);
+            }
             // This turn's own outputs, read by reference so the event can be
             // moved (not cloned) onto the event sink below.
             match &ev {
@@ -4055,6 +4082,11 @@ mod session;
 /// `docs/specs/2026-09-25-retained-size-and-slow-client-measurements.md`.
 #[cfg(test)]
 mod session_retained_size_measurements;
+/// Test-only, `#[ignore]`d stalled-consumer queue measurement for the two
+/// per-turn hops (H1, H2); see
+/// `docs/specs/2026-09-26-bounded-turn-event-channel-proposal.md` §8.
+#[cfg(test)]
+mod turn_channel_queue_measurements;
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -5564,6 +5596,8 @@ done
             test_env,
             test_compact_provider: None,
             test_dispatch_status: HashMap::new(),
+            test_turn_provider: None,
+            test_h1_probe: None,
         }
     }
 
