@@ -11170,3 +11170,12 @@ area:      [testing]
 
 Repaired the Knox delta review of PR #505 (one medium, three lows, three nits). The stalled gate now pins the pipe-fill moment with a synchronous 600-fact flood, and times the connection failure from the status row's observed_at instead of from a possibly starved poll. It asserts the failure lands within 2 to 2.6 s of the fill. A 3 s deadline fails the test in 3 of 3 runs, but a 1 s deadline fails it in only 2 of 6. The per-frame deadline restarts whenever macOS grows a blocked pipe's buffer, so the doc and the manifest now say "bounded deadline" and credit the unit test for the exact 2 s. Every recording service test now strictly decodes all of its host frames after shutdown, and the doc says lag and ping frames are unit-proven. Grandchild checks now wait, within a bound, for the process to be gone or a zombie, because kill(pid, 0) succeeds on a zombie. The fixed fake-tool target path is open item O-10, since fixing it is a runtime change. The doc explains the missing M29, records that the Ubuntu CI run at be979464 ran all nine gate tests, and notes that comparing inodes alone is sound because everything is on one filesystem. M25, M27, and M10 were re-run against the rewritten tests and all three fail. Mutations now restore sources with a fresh mtime. Not merged.
 _________________________________________________________________________________ 02:29 feat/extension-stage-a5
+
+time:      [02:43] [26-09-26]
+agent:     [claude]
+worktree:  feat/extension-stage-a5
+type:      [gh-actions]
+area:      [testing]
+
+Hosted macOS CI failed the stalled-service gate at 03882310. The blocked write failed 4.26 s after the pinned pipe fill, past the 2.6 s live upper bound, because the per-frame write deadline restarts whenever the kernel accepts more bytes. So the live upper bound is not deterministic either. It is widened to 8 s after the fill and labeled a liveness bound, with the exact 2 s credited only to the unit test blocked_stdin_fails_at_the_two_second_connection_deadline. The evidence doc (step 6, the blocked-stdin row, and M25b) and the manifest A5 note now say so, and M25b is no longer counted as a live-gate kill. Not merged.
+_________________________________________________________________________________ 02:43 feat/extension-stage-a5
