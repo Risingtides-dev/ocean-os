@@ -103,6 +103,149 @@ impl Fixture {
     }
 }
 
+/// A test that panics after a service started never reaches the supervisor's
+/// own reap, so its leader and any grandchild (the gate's `sleep 600`) would
+/// outlive the run. Dropping the fixture reaps them. This runs before the
+/// tempdirs are removed, because their paths are how the processes are found.
+impl Drop for Fixture {
+    fn drop(&mut self) {
+        reap_fixture_groups(&[self.config.path(), self.sources.path()]);
+    }
+}
+
+/// SIGKILL every process a fixture's services left running, and nothing else.
+///
+/// A process is the fixture's when its cwd lies inside one of `roots` (every
+/// supervised service is started in its package directory under the config
+/// tempdir, and a forked grandchild inherits it) and it sits in a process
+/// group other than the test binary's own. That is the fixture's own group:
+/// the supervisor starts each service leader with `setpgid(0, 0)`. The pid is
+/// signalled only while `getpgid` still names that group, so a pid that exited
+/// and was recycled after the scan is never touched, and a process whose cwd
+/// cannot be read (a zombie, or gone) is never a candidate. A scan that finds
+/// nothing returns at once, so a passing test pays only the process listing.
+pub(super) fn reap_fixture_groups(roots: &[&FsPath]) {
+    let roots: Vec<PathBuf> = roots
+        .iter()
+        .filter_map(|root| fs::canonicalize(root).ok())
+        .collect();
+    if roots.is_empty() {
+        return;
+    }
+    // SAFETY: getpgrp and getpid have no preconditions.
+    let (own_group, own_pid) = unsafe { (libc::getpgrp(), libc::getpid()) };
+    // A second pass catches a child forked while the first was signalling.
+    for _ in 0..3 {
+        let members: Vec<(libc::pid_t, libc::pid_t)> = fixture_process::all_pids()
+            .into_iter()
+            .filter(|pid| *pid > 1 && *pid != own_pid)
+            .filter(|pid| {
+                fixture_process::cwd(*pid)
+                    .is_some_and(|cwd| roots.iter().any(|root| cwd.starts_with(root)))
+            })
+            .filter_map(|pid| {
+                // SAFETY: getpgid only reads process-table state.
+                let group = unsafe { libc::getpgid(pid) };
+                (group > 1 && group != own_group).then_some((pid, group))
+            })
+            .collect();
+        if members.is_empty() {
+            return;
+        }
+        for (pid, group) in members {
+            // SAFETY: getpgid reads process-table state; the kill is limited to
+            // a pid still in the fixture group it was found in.
+            unsafe {
+                if libc::getpgid(pid) == group {
+                    libc::kill(pid, libc::SIGKILL);
+                }
+            }
+        }
+    }
+}
+
+mod fixture_process {
+    use std::path::PathBuf;
+
+    #[cfg(target_os = "macos")]
+    pub(super) fn all_pids() -> Vec<libc::pid_t> {
+        const PROC_ALL_PIDS: u32 = 1;
+        let mut pids = vec![0 as libc::pid_t; 4096];
+        loop {
+            let bytes = i32::try_from(std::mem::size_of_val(pids.as_slice())).unwrap_or(i32::MAX);
+            // SAFETY: pids is writable for exactly `bytes` bytes.
+            let used =
+                unsafe { libc::proc_listpids(PROC_ALL_PIDS, 0, pids.as_mut_ptr().cast(), bytes) };
+            let Ok(used) = usize::try_from(used) else {
+                return Vec::new();
+            };
+            let count = used / std::mem::size_of::<libc::pid_t>();
+            if count < pids.len() || pids.len() >= 1 << 20 {
+                pids.truncate(count);
+                return pids;
+            }
+            pids.resize(pids.len() * 2, 0);
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    pub(super) fn cwd(pid: libc::pid_t) -> Option<PathBuf> {
+        use std::os::unix::ffi::OsStrExt;
+        let mut info = std::mem::MaybeUninit::<libc::proc_vnodepathinfo>::zeroed();
+        let size = std::mem::size_of::<libc::proc_vnodepathinfo>();
+        // SAFETY: info is writable for the declared proc_vnodepathinfo size.
+        let used = unsafe {
+            libc::proc_pidinfo(
+                pid,
+                libc::PROC_PIDVNODEPATHINFO,
+                0,
+                info.as_mut_ptr().cast(),
+                i32::try_from(size).ok()?,
+            )
+        };
+        if usize::try_from(used).ok()? != size {
+            return None;
+        }
+        // SAFETY: proc_pidinfo filled the whole structure.
+        let info = unsafe { info.assume_init() };
+        // SAFETY: vip_path is MAXPATHLEN contiguous c_chars; read it as bytes.
+        let raw: &[u8] = unsafe {
+            std::slice::from_raw_parts(
+                info.pvi_cdir.vip_path.as_ptr().cast(),
+                std::mem::size_of_val(&info.pvi_cdir.vip_path),
+            )
+        };
+        let path = &raw[..raw.iter().position(|byte| *byte == 0)?];
+        (!path.is_empty()).then(|| PathBuf::from(std::ffi::OsStr::from_bytes(path)))
+    }
+
+    #[cfg(target_os = "linux")]
+    pub(super) fn all_pids() -> Vec<libc::pid_t> {
+        std::fs::read_dir("/proc")
+            .map(|entries| {
+                entries
+                    .filter_map(|entry| entry.ok()?.file_name().to_str()?.parse().ok())
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    #[cfg(target_os = "linux")]
+    pub(super) fn cwd(pid: libc::pid_t) -> Option<PathBuf> {
+        std::fs::read_link(format!("/proc/{pid}/cwd")).ok()
+    }
+
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    pub(super) fn all_pids() -> Vec<libc::pid_t> {
+        Vec::new()
+    }
+
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    pub(super) fn cwd(_: libc::pid_t) -> Option<PathBuf> {
+        None
+    }
+}
+
 pub(super) fn router(state: AppState) -> Router {
     Router::new()
         .route("/v1/extensions", get(super::super::list))
