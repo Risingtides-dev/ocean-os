@@ -213,6 +213,31 @@ pub(crate) trait ServiceActivity {
     fn reconciliation_in_progress(&self) -> bool {
         false
     }
+
+    /// Both facts as ONE consistent reading, which is what the guard uses.
+    /// Two independent reads leave a gap: a pass in flight during the
+    /// `package_stopped` read could spawn the package and finish before the
+    /// `reconciliation_in_progress` read, and both would then say "go". A
+    /// ledger overrides this with a single-lock snapshot. The default reads
+    /// in-progress FIRST: a pass that registers after that read necessarily
+    /// reads the registry after this writer's exclusive-lock commit, so it can
+    /// only spawn from the committed generation.
+    fn snapshot(&self, package_id: &str) -> ActivitySnapshot {
+        let reconciling = self.reconciliation_in_progress();
+        ActivitySnapshot {
+            stopped: self.package_stopped(package_id),
+            reconciling,
+        }
+    }
+}
+
+/// One consistent reading of a package's supervisor activity.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ActivitySnapshot {
+    /// No managed task or retained cleanup authority of the package remains.
+    pub(crate) stopped: bool,
+    /// Some reconciliation pass is registered and not yet finished.
+    pub(crate) reconciling: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
@@ -1404,10 +1429,13 @@ fn require_disabled_and_stopped(
     id: &str,
     activity: &dyn ServiceActivity,
 ) -> Step<()> {
-    if !fully_disabled(snapshot, id) || !activity.package_stopped(id) {
+    // One reading of both facts (see `ServiceActivity::snapshot`): never two
+    // separately locked reads a pass could spawn between.
+    let now = activity.snapshot(id);
+    if !fully_disabled(snapshot, id) || !now.stopped {
         return Err(Fail::Reject("extension_active"));
     }
-    if activity.reconciliation_in_progress() {
+    if now.reconciling {
         return Err(Fail::Reject("reconciliation_in_progress"));
     }
     Ok(())

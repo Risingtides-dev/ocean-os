@@ -69,6 +69,14 @@ impl RuntimeStatus {
     }
 }
 
+/// Why a commit reset a package's activation generation. Nothing activates on
+/// an unsupported platform, so it is accepted and ignored.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ActivationReset {
+    Disabled,
+    Reconfigured,
+}
+
 /// No process or temp root is ever created on an unsupported platform, so
 /// every package is always stopped for the registry writer's guard.
 #[derive(Clone, Default)]
@@ -81,6 +89,10 @@ impl ServiceActivityLedger {
 
     pub(crate) fn reconciliation_in_progress(&self) -> bool {
         false
+    }
+
+    pub(crate) fn snapshot(&self, _package_id: &str) -> (bool, bool) {
+        (true, false)
     }
 }
 
@@ -164,7 +176,7 @@ impl ExtensionSupervisor {
         &self,
         _committed_revision: u64,
         _package_id: &str,
-        _resets_activation: bool,
+        _reset: Option<ActivationReset>,
     ) -> SupervisorReconcile {
         let config_dir = self
             .config_dir

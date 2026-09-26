@@ -6,8 +6,10 @@
 //!
 //! Exit codes (§15): 0 for HTTP 200, 3 for a committed 202 (reconciliation or
 //! reap still pending/blocked), 4 for a committed `registry_recovery_required`,
-//! and 1 for any pre-commit refusal or transport failure. A committed response
-//! is never retried; a conflict is never silently retried.
+//! 5 for `outcome_unknown` (the daemon's mutation task died where it may
+//! already have committed: reinspect by revision, never retry blindly), and 1
+//! for any pre-commit refusal or transport failure. A committed response is
+//! never retried; a conflict is never silently retried.
 
 use std::path::{Component, Path, PathBuf};
 
@@ -23,6 +25,7 @@ const BUSY_READ_DELAY: std::time::Duration = std::time::Duration::from_millis(30
 
 pub(crate) const EXIT_COMMITTED_PENDING: i32 = 3;
 pub(crate) const EXIT_RECOVERY_REQUIRED: i32 = 4;
+pub(crate) const EXIT_OUTCOME_UNKNOWN: i32 = 5;
 
 /// Daemon-owned extension state commands.
 #[derive(Debug, Subcommand)]
@@ -489,6 +492,9 @@ async fn mutate(
             "committed at revision {}; reconciliation/reap is still pending — do not retry, check `ocean-rs extension status` or `inspect`",
             body["mutation"]["state_revision"]
         ),
+        EXIT_OUTCOME_UNKNOWN => eprintln!(
+            "the daemon cannot say whether this mutation committed — do not retry; run `ocean-rs extension inspect` (or `list`) and compare the state revision before deciding"
+        ),
         EXIT_RECOVERY_REQUIRED => eprintln!(
             "committed at revision {} but the registry needs recovery — do not retry; restart the daemon to run journal recovery",
             body["mutation"]["state_revision"]
@@ -539,6 +545,7 @@ pub(crate) fn mutation_exit_code(status: u16, body: &Value) -> ExitCode {
         500 if committed && body["error"]["code"] == "registry_recovery_required" => {
             EXIT_RECOVERY_REQUIRED
         }
+        _ if body["error"]["code"] == "outcome_unknown" => EXIT_OUTCOME_UNKNOWN,
         _ => 1,
     }
 }
@@ -566,6 +573,8 @@ mod tests {
         // A 500 that did not commit is an ordinary failure, never code 4.
         let uncommitted_500 = json!({"ok": false, "mutation": {"committed": false, "state_revision": 8}, "error": {"code": "registry_recovery_required"}});
         assert_eq!(mutation_exit_code(500, &uncommitted_500), 1);
+        let unknown = json!({"ok": false, "mutation": {"operation_id": null, "committed": null, "state_revision": null}, "error": {"code": "outcome_unknown", "message": "m"}});
+        assert_eq!(mutation_exit_code(500, &unknown), EXIT_OUTCOME_UNKNOWN);
         let preview = json!({"ok": true, "applied": false, "committed": false, "state_revision": 3, "preview": {"confirmation": "sha256:x"}});
         assert_eq!(mutation_exit_code(200, &preview), 0);
     }

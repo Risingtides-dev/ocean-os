@@ -1246,3 +1246,172 @@ async fn unconfigured_operator_key_fails_closed() {
     assert_precommit(&body, "operator_identity_unavailable", 0);
     assert!(!fixture.root().exists());
 }
+
+// ---------------------------------------------------------------------------
+// Delta-review fixes.
+// ---------------------------------------------------------------------------
+
+/// LOW-2: the update/remove guard uses ONE consistent reading. An activity
+/// whose two independent reads would both say "go" but whose snapshot shows a
+/// pass in flight must be refused — the guard may not recombine separate reads.
+#[test]
+fn update_remove_guard_uses_the_single_snapshot() {
+    use super::super::transaction::{ActivitySnapshot, ServiceActivity};
+    struct Torn;
+    impl ServiceActivity for Torn {
+        fn package_stopped(&self, _: &str) -> bool {
+            true
+        }
+        fn reconciliation_in_progress(&self) -> bool {
+            false
+        }
+        fn snapshot(&self, _: &str) -> ActivitySnapshot {
+            ActivitySnapshot {
+                stopped: true,
+                reconciling: true,
+            }
+        }
+    }
+    let fixture = Fixture::new();
+    let writer = RegistryWriter::new(fixture.config.path().to_path_buf());
+    let path = fixture.package("noop", ID, "1.0.0");
+    writer
+        .install(0, writer.acquire_local(&path).unwrap())
+        .unwrap();
+    let refused = writer.remove(ID, 1, false, &Torn).unwrap_err();
+    assert_eq!(refused.code, "reconciliation_in_progress");
+    assert!(!refused.committed);
+    let quarantine = writer
+        .acquire_local(&fixture.package("noop2", ID, "2.0.0"))
+        .unwrap();
+    let refused = writer.update(ID, 1, quarantine, &Torn).unwrap_err();
+    assert_eq!(refused.code, "reconciliation_in_progress");
+    assert_eq!(fixture.revision(), 1);
+}
+
+/// LOW-1: a disable→enable pair committed before any pass ran is the operator
+/// transition that clears restart history (§10.4). A service left `unhealthy`
+/// by its first failure (no `on-failure` policy) must be spawned again, not
+/// kept blocked by the preserved history.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn disable_then_enable_before_a_pass_clears_restart_history() {
+    let _guard = AUTO_CONVENE_ENV_LOCK.lock().await;
+    let _restore = TestEnvRestore::capture(&["OCEAN_CONFIG_DIR", "OCEAN_MODEL", "OCEAN_YOLO"]);
+    let fixture = Fixture::new();
+    let mut state = fake_convene_state(&fixture.config);
+    let supervisor = with_supervisor(&mut state, fixture.config.path()).await;
+    let app = router(state);
+
+    // Fails once (exit before hello), then behaves. `$HOME` is the package's
+    // persistent assigned data root.
+    let path = fixture.package("flaky", ID, "1.0.0");
+    let service = FsPath::new(&path).join("services/lifecycle");
+    let body = fs::read_to_string(&service).unwrap();
+    fs::write(
+        &service,
+        body.replacen(
+            "#!/bin/sh\n",
+            "#!/bin/sh\nif [ ! -e \"$HOME/failed-once\" ]; then : > \"$HOME/failed-once\"; exit 1; fi\n",
+            1,
+        ),
+    )
+    .unwrap();
+    let (_, installed) = install_local(&app, 0, &path).await;
+    let digest = installed["mutation"]["digest"].as_str().unwrap().to_owned();
+    let (status, trusted) = trust_noop(&app, ID, 1, &digest).await;
+    assert_eq!(status, StatusCode::OK, "{trusted}");
+    let (status, enabled) = scope(&app, ID, "enable", 2).await;
+    assert_eq!(status, StatusCode::OK, "{enabled}");
+    wait_for_status(&app, ID, |body| body["services"][0]["state"] == "unhealthy").await;
+
+    let gate = Arc::new(tokio::sync::Semaphore::new(0));
+    supervisor.gate_passes_for_test(Arc::clone(&gate));
+    let disable = tokio::spawn({
+        let app = app.clone();
+        async move { scope(&app, ID, "disable", 3).await }
+    });
+    wait_until(|| fixture.revision() == 4).await;
+    let enable = tokio::spawn({
+        let app = app.clone();
+        async move { scope(&app, ID, "enable", 4).await }
+    });
+    wait_until(|| fixture.revision() == 5).await;
+    gate.add_permits(64);
+    assert_eq!(disable.await.unwrap().0, StatusCode::OK);
+    assert_eq!(enable.await.unwrap().0, StatusCode::OK);
+
+    let (pid, _) = healthy_pid(&app, ID).await;
+    assert!(process_alive(pid));
+    let (_, status) = get_json(&app, &format!("/v1/extensions/{ID}/status")).await;
+    assert_eq!(status["services"][0]["restart_count"], 0, "{status}");
+    supervisor.shutdown().await;
+}
+
+/// LOW-3: a mutation task that dies cannot claim either outcome.
+#[tokio::test]
+async fn a_dead_mutation_task_answers_outcome_unknown() {
+    use http_body_util::BodyExt;
+    let response = detached(async { panic!("simulated post-commit panic") }).await;
+    assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    let body: Value =
+        serde_json::from_slice(&response.into_body().collect().await.unwrap().to_bytes()).unwrap();
+    assert_eq!(body["ok"], false);
+    assert_eq!(body["mutation"]["committed"], Value::Null);
+    assert_eq!(body["mutation"]["state_revision"], Value::Null);
+    assert_eq!(body["error"]["code"], "outcome_unknown");
+    assert!(body["error"].get("retryable").is_none());
+}
+
+/// NIT: mutation bodies must be `application/json`, checked after the
+/// credential (an unauthenticated caller still learns only that) and before
+/// the body is read.
+#[tokio::test]
+async fn mutation_bodies_require_json_after_authentication() {
+    use tower::ServiceExt;
+    let _guard = AUTO_CONVENE_ENV_LOCK.lock().await;
+    let _restore = TestEnvRestore::capture(&["OCEAN_CONFIG_DIR", "OCEAN_MODEL", "OCEAN_YOLO"]);
+    let fixture = Fixture::new();
+    let app = router(fake_convene_state(&fixture.config));
+    let body = json!({"expected_state_revision": 0, "source": {"kind": "local-path", "path": fixture.package("noop", ID, "1.0.0")}});
+    let request = |operator: bool, content_type: &str| {
+        let mut request = Request::builder()
+            .method(Method::POST)
+            .uri("/v1/extensions/install")
+            .header("content-type", content_type);
+        if operator {
+            request = request.header("x-ocean-operator", OPERATOR);
+        }
+        request
+            .body(axum::body::Body::from(serde_json::to_vec(&body).unwrap()))
+            .unwrap()
+    };
+    let status = |response: axum::response::Response| response.status();
+    assert_eq!(
+        status(
+            app.clone()
+                .oneshot(request(false, "text/plain"))
+                .await
+                .unwrap()
+        ),
+        StatusCode::SERVICE_UNAVAILABLE
+    );
+    assert_eq!(
+        status(
+            app.clone()
+                .oneshot(request(true, "text/plain"))
+                .await
+                .unwrap()
+        ),
+        StatusCode::UNSUPPORTED_MEDIA_TYPE
+    );
+    assert!(!fixture.root().exists());
+    assert_eq!(
+        status(
+            app.clone()
+                .oneshot(request(true, "application/json; charset=utf-8"))
+                .await
+                .unwrap()
+        ),
+        StatusCode::ACCEPTED
+    );
+}

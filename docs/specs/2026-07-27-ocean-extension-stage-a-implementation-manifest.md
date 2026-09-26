@@ -1116,8 +1116,10 @@ choices:
   the existing local operator principal (`room_operator.rs`): header-only
   `X-Ocean-Operator`, cookie and foreign-origin refusal before comparison, 503
   when the key or header is absent and 403 for invalid/ambient/foreign authority.
-  Handlers extract only headers, the raw path result, and raw body bytes, so the
-  credential really is checked before the path or body is parsed. The reasons are the parent's "trust is
+  Handlers extract only headers, the raw path result, and the unread body, so
+  the order is exactly: credential, then `Content-Type: application/json`
+  (else 415 `unsupported_media_type`), then path, and only then is the body
+  (capped at 1 MiB) read and parsed. The reasons are the parent's "trust is
   operator-owned" invariant, that trust+enable grants daemon-user-equivalent
   native execution, and that every other authority-granting daemon mutation uses
   this principal. Refusals use the §15 pre-commit envelope with
@@ -1148,7 +1150,11 @@ choices:
   ledger consulted: `reap` is then `pending` exactly when the package is no
   longer registry-effective but still owns a process or temp root. A committed
   retention cleanup the writer deferred to the next recovery is also reported as
-  `reap: pending`. Any pass that was blocked or left cleanup unproven — the
+  `reap: pending`. If the task running a mutation dies (a panic that may be
+  after the commit point), the answer is HTTP 500 with `committed: null` and the
+  fixed code `outcome_unknown` ("reinspect by revision before retrying"), never
+  a `committed: false` guess; the CLI exits 5 for it and never retries. Any pass
+  that was blocked or left cleanup unproven — the
   startup pass included — is re-run by the supervisor itself with exponential
   backoff (0.5 s doubling to 30 s) until one completes.
 - *Failure isolation.* Stops always run. A retained cleanup authority that still
@@ -1162,9 +1168,15 @@ choices:
   unrelated commit (another package's install) never restarts a running
   service. Instead it carries a boot-local per-package activation generation:
   the committed revision of the package's last disable, trust, update, or
-  remove, reported by the committing route. A disable→enable pair committed
-  before any pass ran therefore still mints a new epoch and process (§7.2,
-  §10.4) instead of collapsing to "unchanged". The cached `activation_revision`
+  remove, recorded in a shared map by `reconcile_registry` BEFORE its command is
+  queued (so a send timeout can never lose it) and read by every pass when it
+  starts. A disable→enable pair committed before any pass ran therefore still
+  mints a new epoch and process (§7.2, §10.4) instead of collapsing to
+  "unchanged", and such a reset also discards restart/backoff/circuit history
+  (history survives only same-digest reconfiguration with no reset since the
+  service spawned), so the circuit closes as §10.4 requires; the replacement is
+  stopped with reason `disabled` after a disable/remove and `reconfigure` after
+  a trust/update. The cached `activation_revision`
   is exactly the one the child received in `host_hello`. A service that is no
   longer effective anywhere is stopped with `shutdown` reason `disabled`; one
   whose activation identity changed, `reconfigure`.
@@ -1175,7 +1187,11 @@ choices:
   temp root, so a bounded reap failure keeps update/remove refused with
   `extension_active`. A reconciliation pass registers itself BEFORE its
   shared-lock registry read and until it finishes the writer refuses update and
-  remove with the distinct, retryable `reconciliation_in_progress`
+  remove with the distinct, retryable `reconciliation_in_progress`. The guard
+  takes ONE single-lock snapshot of both facts (pass registration, completion,
+  and every owner acquire/release share that lock, and a pass acquires its
+  spawns before it completes), never two separately locked reads a pass could
+  spawn between
   (`error.retryable: true`; the CLI says to retry), so a remove or update can
   never commit between a pass reading an older (still-enabled) generation and
   spawning from it.
@@ -1210,7 +1226,12 @@ Recorded boundaries, not decided here:
    loopback-only CLI key); all are repaired on the same branch and await delta
    review. Mutation checks (`package_stopped` forced true, `begin_pass`
    removed, startup recovery spawned or commented out, activation generation
-   zeroed) each now fail a test.
+   zeroed) each now fail a test. The delta review judged it merge-ready and
+   asked for five more fixes, all folded in: the single-lock guard snapshot,
+   history reset on generation change, `outcome_unknown`, the generation bump
+   recorded before sending, and the JSON content-type check. The new tests were
+   mutation-checked the same way: separate reads in the guard, a snapshot that
+   ignores in-flight passes, and history kept across a reset each fail a test.
 4. Windows package management (R5 "may manage") remains open: the writer is
    Unix-only, so non-Unix mutation routes answer 409 `unsupported_platform`.
 

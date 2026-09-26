@@ -39,11 +39,8 @@
 use std::collections::HashSet;
 
 use axum::{
-    body::Bytes,
-    extract::{
-        rejection::{BytesRejection, PathRejection},
-        Path, State,
-    },
+    body::Body,
+    extract::{rejection::PathRejection, Path, State},
     http::{HeaderMap, StatusCode},
     response::{IntoResponse, Response},
     Json,
@@ -53,12 +50,14 @@ use serde_json::{json, Value};
 use uuid::Uuid;
 
 use super::SupervisorReconcile;
+#[cfg(unix)]
+use crate::extension_service::ActivationReset;
 use crate::AppState;
 
 #[cfg(unix)]
 use super::transaction::{
-    EnablementScope, MutationError, MutationOutcome, RegistryWriter, ServiceActivity, TrustRequest,
-    TrustResult,
+    ActivitySnapshot, EnablementScope, MutationError, MutationOutcome, RegistryWriter,
+    ServiceActivity, TrustRequest, TrustResult,
 };
 
 /// Codes a caller may simply retry after a short wait: nothing was written.
@@ -209,6 +208,10 @@ pub(crate) fn committed_status(reconciliation: Reconciliation, reap: Reap) -> St
 fn route_message(code: &str) -> Option<&'static str> {
     Some(match code {
         "invalid_request" => "request body is malformed or has unknown fields",
+        "unsupported_media_type" => "mutation bodies must be application/json",
+        "outcome_unknown" => {
+            "the mutation outcome is unknown; reinspect by revision before retrying"
+        }
         "extension_state_busy" => "extension registry is busy; retry shortly",
         "git_connection_pinning_unavailable" => {
             "pinned public Git acquisition is not available in this daemon"
@@ -273,6 +276,7 @@ pub(crate) fn precommit_status(code: &str) -> StatusCode {
         | "host_incompatible"
         | "unsupported_platform" => StatusCode::CONFLICT,
         "acquisition_capacity" => StatusCode::TOO_MANY_REQUESTS,
+        "unsupported_media_type" => StatusCode::UNSUPPORTED_MEDIA_TYPE,
         "extension_state_busy"
         | "operator_identity_unavailable"
         | "operator_credential_missing" => StatusCode::SERVICE_UNAVAILABLE,
@@ -363,8 +367,29 @@ fn authorize(state: &AppState, headers: &HeaderMap) -> Result<(), Refusal> {
         .map_err(|error| error.code())
 }
 
-fn parse_body<T: DeserializeOwned>(body: Result<Bytes, BytesRejection>) -> Result<T, Refusal> {
-    let bytes = body.map_err(|_| "invalid_request")?;
+/// Largest mutation body read. A trust body at the §12.1 limits (256
+/// bindings per service) is far below this.
+const MAX_BODY_BYTES: usize = 1024 * 1024;
+
+/// `application/json` (parameters such as `charset` allowed), checked after
+/// authentication and before a single body byte is read.
+fn json_content_type(headers: &HeaderMap) -> Result<(), Refusal> {
+    let is_json = headers
+        .get(axum::http::header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.split(';').next())
+        .is_some_and(|mime| mime.trim().eq_ignore_ascii_case("application/json"));
+    if is_json {
+        Ok(())
+    } else {
+        Err("unsupported_media_type")
+    }
+}
+
+async fn parse_body<T: DeserializeOwned>(body: Body) -> Result<T, Refusal> {
+    let bytes = axum::body::to_bytes(body, MAX_BODY_BYTES)
+        .await
+        .map_err(|_| "invalid_request")?;
     serde_json::from_slice(&bytes).map_err(|_| "invalid_request")
 }
 
@@ -374,32 +399,45 @@ fn parse_path(path: Result<Path<String>, PathRejection>) -> Result<String, Refus
 
 /// Authenticate, then parse. The returned values are only ever produced for an
 /// authorized caller.
-fn intake<T: DeserializeOwned>(
+async fn intake<T: DeserializeOwned>(
     state: &AppState,
     headers: &HeaderMap,
     path: Option<Result<Path<String>, PathRejection>>,
-    body: Result<Bytes, BytesRejection>,
+    body: Body,
 ) -> Result<(Option<String>, T), Refusal> {
+    // Order is the contract: credential, then media type, then path, and only
+    // then is the body read at all.
     authorize(state, headers)?;
+    json_content_type(headers)?;
     let id = path.map(parse_path).transpose()?;
-    let body = parse_body(body)?;
+    let body = parse_body(body).await?;
     Ok((id, body))
+}
+
+/// The task running a mutation died (panicked) where it may already have
+/// crossed the commit point. Nothing about the outcome can be asserted, so the
+/// §15 envelope says so: `committed: null`, fixed code `outcome_unknown`. The
+/// caller must reinspect by revision before deciding anything; the CLI never
+/// retries it.
+fn outcome_unknown() -> Response {
+    (
+        StatusCode::INTERNAL_SERVER_ERROR,
+        Json(json!({
+            "ok": false,
+            "mutation": {"operation_id": null, "committed": null, "state_revision": null},
+            "error": error_object("outcome_unknown"),
+        })),
+    )
+        .into_response()
 }
 
 /// Run the authorized operation in a detached task and await it. Dropping the
 /// handler future (client disconnect) cannot cancel the commit or the
 /// post-commit reconciliation request that follows it.
 async fn detached(work: impl std::future::Future<Output = Response> + Send + 'static) -> Response {
-    tokio::spawn(work).await.unwrap_or_else(|_| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(json!({
-                "ok": false,
-                "error": {"code": "extension_state_unavailable", "message": message_for("extension_state_unavailable")}
-            })),
-        )
-            .into_response()
-    })
+    tokio::spawn(work)
+        .await
+        .unwrap_or_else(|_| outcome_unknown())
 }
 
 // ---------------------------------------------------------------------------
@@ -426,6 +464,16 @@ impl ServiceActivity for SupervisorActivity {
             .as_ref()
             .is_some_and(|ledger| ledger.reconciliation_in_progress())
     }
+    fn snapshot(&self, package_id: &str) -> ActivitySnapshot {
+        let (stopped, reconciling) = self
+            .0
+            .as_ref()
+            .map_or((true, false), |ledger| ledger.snapshot(package_id));
+        ActivitySnapshot {
+            stopped,
+            reconciling,
+        }
+    }
 }
 
 #[cfg(unix)]
@@ -447,7 +495,9 @@ async fn blocking<T: Send + 'static>(
     let config_dir = state.runtime.config_dir().to_path_buf();
     match tokio::task::spawn_blocking(move || operation(RegistryWriter::new(config_dir))).await {
         Ok(result) => result.map_err(mutation_error),
-        Err(_) => Err(refuse("extension_state_unavailable")),
+        // A panic inside the writer may have happened after the commit
+        // point; never claim `committed: false` for it.
+        Err(_) => Err(outcome_unknown()),
     }
 }
 
@@ -463,7 +513,7 @@ async fn registered_projects(state: &AppState) -> Result<HashSet<Uuid>, Response
 
 /// Reconcile the supervisor to the committed revision and answer with the
 /// common committed envelope. Never retried here and never turned into an
-/// error: the commit already happened. `resets_activation` marks commits that
+/// error: the commit already happened. `reset` marks commits that
 /// changed the package's trust or may have ended its effectiveness, so the
 /// supervisor mints a new activation epoch even if a later commit restored an
 /// identical descriptor before any pass ran.
@@ -471,12 +521,12 @@ async fn registered_projects(state: &AppState) -> Result<HashSet<Uuid>, Response
 async fn committed(
     state: &AppState,
     outcome: MutationOutcome,
-    resets_activation: bool,
+    reset: Option<ActivationReset>,
 ) -> Response {
     let reconcile = match &state.extension_supervisor {
         Some(supervisor) => {
             supervisor
-                .reconcile_registry(outcome.state_revision, &outcome.id, resets_activation)
+                .reconcile_registry(outcome.state_revision, &outcome.id, reset)
                 .await
         }
         None => SupervisorReconcile::Blocked { owned: false },
@@ -528,11 +578,11 @@ fn enablement_scope(scope: ScopeRequest) -> EnablementScope {
 #[cfg(unix)]
 async fn commit_and_reconcile(
     state: AppState,
-    resets_activation: bool,
+    reset: Option<ActivationReset>,
     operation: impl FnOnce(RegistryWriter) -> Result<MutationOutcome, MutationError> + Send + 'static,
 ) -> Response {
     match blocking(&state, operation).await {
-        Ok(outcome) => committed(&state, outcome, resets_activation).await,
+        Ok(outcome) => committed(&state, outcome, reset).await,
         Err(refusal) => refusal,
     }
 }
@@ -551,9 +601,9 @@ fn unsupported() -> Response {
 pub(crate) async fn install(
     State(state): State<AppState>,
     headers: HeaderMap,
-    body: Result<Bytes, BytesRejection>,
+    body: Body,
 ) -> Response {
-    let request: InstallRequest = match intake(&state, &headers, None, body) {
+    let request: InstallRequest = match intake(&state, &headers, None, body).await {
         Ok((_, request)) => request,
         Err(code) => return refuse(code),
     };
@@ -564,7 +614,7 @@ pub(crate) async fn install(
             Err(code) => return refuse(code),
         };
         let expected = request.expected_state_revision;
-        detached(commit_and_reconcile(state, false, move |writer| {
+        detached(commit_and_reconcile(state, None, move |writer| {
             let quarantine = writer.acquire_local(&path)?;
             writer.install(expected, quarantine)
         }))
@@ -583,10 +633,10 @@ pub(crate) async fn update(
     State(state): State<AppState>,
     headers: HeaderMap,
     path: Result<Path<String>, PathRejection>,
-    body: Result<Bytes, BytesRejection>,
+    body: Body,
 ) -> Response {
     let (id, request): (Option<String>, UpdateRequest) =
-        match intake(&state, &headers, Some(path), body) {
+        match intake(&state, &headers, Some(path), body).await {
             Ok(parsed) => parsed,
             Err(code) => return refuse(code),
         };
@@ -602,10 +652,14 @@ pub(crate) async fn update(
         };
         let expected = request.expected_state_revision;
         let activity = activity(&state);
-        detached(commit_and_reconcile(state, true, move |writer| {
-            let quarantine = writer.acquire_local(&path)?;
-            writer.update(&id, expected, quarantine, &activity)
-        }))
+        detached(commit_and_reconcile(
+            state,
+            Some(ActivationReset::Reconfigured),
+            move |writer| {
+                let quarantine = writer.acquire_local(&path)?;
+                writer.update(&id, expected, quarantine, &activity)
+            },
+        ))
         .await
     }
     #[cfg(not(unix))]
@@ -622,10 +676,10 @@ pub(crate) async fn trust(
     State(state): State<AppState>,
     headers: HeaderMap,
     path: Result<Path<String>, PathRejection>,
-    body: Result<Bytes, BytesRejection>,
+    body: Body,
 ) -> Response {
     let (id, request): (Option<String>, TrustBody) =
-        match intake(&state, &headers, Some(path), body) {
+        match intake(&state, &headers, Some(path), body).await {
             Ok(parsed) => parsed,
             Err(code) => return refuse(code),
         };
@@ -652,7 +706,9 @@ pub(crate) async fn trust(
                     })),
                 )
                     .into_response(),
-                Ok(TrustResult::Applied(outcome)) => committed(&state, outcome, true).await,
+                Ok(TrustResult::Applied(outcome)) => {
+                    committed(&state, outcome, Some(ActivationReset::Reconfigured)).await
+                }
                 Err(refusal) => refusal,
             }
         })
@@ -670,7 +726,7 @@ pub(crate) async fn enable(
     State(state): State<AppState>,
     headers: HeaderMap,
     path: Result<Path<String>, PathRejection>,
-    body: Result<Bytes, BytesRejection>,
+    body: Body,
 ) -> Response {
     scope_mutation(state, headers, path, body, true).await
 }
@@ -682,7 +738,7 @@ pub(crate) async fn disable(
     State(state): State<AppState>,
     headers: HeaderMap,
     path: Result<Path<String>, PathRejection>,
-    body: Result<Bytes, BytesRejection>,
+    body: Body,
 ) -> Response {
     scope_mutation(state, headers, path, body, false).await
 }
@@ -691,11 +747,11 @@ async fn scope_mutation(
     state: AppState,
     headers: HeaderMap,
     path: Result<Path<String>, PathRejection>,
-    body: Result<Bytes, BytesRejection>,
+    body: Body,
     enable: bool,
 ) -> Response {
     let (id, request): (Option<String>, ScopeMutationRequest) =
-        match intake(&state, &headers, Some(path), body) {
+        match intake(&state, &headers, Some(path), body).await {
             Ok(parsed) => parsed,
             Err(code) => return refuse(code),
         };
@@ -711,7 +767,8 @@ async fn scope_mutation(
             let scope = enablement_scope(request.scope);
             // Disable may end effectiveness; enable never needs a reset (a
             // restart it requires shows up as a changed descriptor).
-            commit_and_reconcile(state, !enable, move |writer| {
+            let reset = (!enable).then_some(ActivationReset::Disabled);
+            commit_and_reconcile(state, reset, move |writer| {
                 if enable {
                     writer.enable(&id, expected, scope, &projects)
                 } else {
@@ -736,10 +793,10 @@ pub(crate) async fn remove(
     State(state): State<AppState>,
     headers: HeaderMap,
     path: Result<Path<String>, PathRejection>,
-    body: Result<Bytes, BytesRejection>,
+    body: Body,
 ) -> Response {
     let (id, request): (Option<String>, RemoveRequest) =
-        match intake(&state, &headers, Some(path), body) {
+        match intake(&state, &headers, Some(path), body).await {
             Ok(parsed) => parsed,
             Err(code) => return refuse(code),
         };
@@ -749,9 +806,11 @@ pub(crate) async fn remove(
         let expected = request.expected_state_revision;
         let purge = request.purge_state;
         let activity = activity(&state);
-        detached(commit_and_reconcile(state, true, move |writer| {
-            writer.remove(&id, expected, purge, &activity)
-        }))
+        detached(commit_and_reconcile(
+            state,
+            Some(ActivationReset::Disabled),
+            move |writer| writer.remove(&id, expected, purge, &activity),
+        ))
         .await
     }
     #[cfg(not(unix))]

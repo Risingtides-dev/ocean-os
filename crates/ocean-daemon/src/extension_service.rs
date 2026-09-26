@@ -416,11 +416,27 @@ struct ProjectSnapshotCommand {
 /// reconciliation — project or registry — is applied by one task in order.
 struct RegistryReconcileCommand {
     committed_revision: u64,
-    package_id: String,
-    /// The commit changed this package's trust or could have ended its
-    /// effectiveness: bump its activation generation before the pass.
-    resets_activation: bool,
     completed: oneshot::Sender<Result<ReconcileReport, ProjectSnapshotError>>,
+}
+
+/// Why a commit reset a package's activation generation; it becomes the
+/// `shutdown` reason when the pass replaces a still-desired service.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ActivationReset {
+    /// Disable or remove: the package stopped being effective in between.
+    Disabled,
+    /// Trust or update: the package's authority changed.
+    Reconfigured,
+}
+
+/// A package's activation generation: the committed revision of its last
+/// reset and why. Boot-local and shared, written by `reconcile_registry`
+/// BEFORE its command is queued, so a send timeout or a dropped command can
+/// never lose the bump; every pass reads the whole map when it starts.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct PackageGeneration {
+    revision: u64,
+    reason: ActivationReset,
 }
 
 enum SupervisorCommand {
@@ -473,6 +489,9 @@ struct ReconcilePass(ServiceActivityLedger);
 
 impl Drop for ReconcilePass {
     fn drop(&mut self) {
+        // Under the owners lock, like registration and every spawn/release,
+        // so `snapshot` observes pass count and owners at one instant.
+        let _owners = self.0.lock();
         self.0.passes.fetch_sub(1, Ordering::SeqCst);
     }
 }
@@ -488,6 +507,19 @@ impl ServiceActivityLedger {
     pub(crate) fn reconciliation_in_progress(&self) -> bool {
         let _owners = self.lock();
         self.passes.load(Ordering::SeqCst) > 0
+    }
+
+    /// `(stopped, reconciling)` for `package_id` under ONE lock. Pass
+    /// registration/completion and owner acquire/release all happen under the
+    /// same lock, and a pass acquires its spawns before it completes, so a
+    /// snapshot that sees no pass in flight also sees every spawn any earlier
+    /// pass made.
+    pub(crate) fn snapshot(&self, package_id: &str) -> (bool, bool) {
+        let owners = self.lock();
+        (
+            !owners.contains_key(package_id),
+            self.passes.load(Ordering::SeqCst) > 0,
+        )
     }
 
     fn begin_pass(&self) -> ReconcilePass {
@@ -544,6 +576,7 @@ pub(crate) struct ExtensionSupervisor {
     project_rx: Mutex<Option<mpsc::Receiver<SupervisorCommand>>>,
     retained_cleanup: Arc<Mutex<Vec<RetainedCleanup>>>,
     activity: ServiceActivityLedger,
+    generations: std::sync::Mutex<BTreeMap<String, PackageGeneration>>,
     /// Test-only seam: when set, every pass waits for one permit right after
     /// registering in the activity ledger, so tests can hold a real pass open.
     #[cfg(test)]
@@ -562,6 +595,7 @@ impl ExtensionSupervisor {
             project_rx: Mutex::new(Some(project_rx)),
             retained_cleanup: Arc::new(Mutex::new(Vec::new())),
             activity: ServiceActivityLedger::default(),
+            generations: std::sync::Mutex::new(BTreeMap::new()),
             #[cfg(test)]
             pass_gate: std::sync::Mutex::new(None),
         })
@@ -592,15 +626,32 @@ impl ExtensionSupervisor {
         &self,
         committed_revision: u64,
         package_id: &str,
-        resets_activation: bool,
+        reset: Option<ActivationReset>,
     ) -> SupervisorReconcile {
+        if let Some(reason) = reset {
+            // Recorded before anything can time out or be dropped.
+            let mut generations = self
+                .generations
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let entry = generations
+                .entry(package_id.to_owned())
+                .or_insert(PackageGeneration {
+                    revision: 0,
+                    reason,
+                });
+            if committed_revision >= entry.revision {
+                *entry = PackageGeneration {
+                    revision: committed_revision,
+                    reason,
+                };
+            }
+        }
         let update = async {
             let (completed, wait) = oneshot::channel();
             self.project_tx
                 .send(SupervisorCommand::Registry(RegistryReconcileCommand {
                     committed_revision,
-                    package_id: package_id.to_owned(),
-                    resets_activation,
                     completed,
                 }))
                 .await
@@ -837,7 +888,6 @@ impl ExtensionSupervisor {
         &self,
         config_dir: &Path,
         projects: &HashSet<Uuid>,
-        generations: &BTreeMap<String, u64>,
         services: &mut BTreeMap<ServiceKey, ManagedService>,
     ) -> Result<ReconcileReport, ProjectSnapshotError> {
         // Registered before the registry read; see `ServiceActivityLedger`.
@@ -858,7 +908,16 @@ impl ExtensionSupervisor {
             revision,
             ..ReconcileReport::default()
         };
-        let generation = |package_id: &str| generations.get(package_id).copied().unwrap_or(0);
+        let generations = self
+            .generations
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone();
+        let generation = |package_id: &str| {
+            generations
+                .get(package_id)
+                .map_or(0, |generation| generation.revision)
+        };
         let mut desired = BTreeMap::new();
         for activation in activations {
             let key = ServiceKey {
@@ -886,17 +945,34 @@ impl ExtensionSupervisor {
         let mut preserved_histories = BTreeMap::new();
         for key in stale {
             if let Some(managed) = services.remove(&key) {
-                if desired.get(&key).is_some_and(|activation| {
-                    managed.descriptor.package_digest == activation.package_digest
-                }) {
+                let reset = generations
+                    .get(&key.package_id)
+                    .filter(|generation| generation.revision != managed.descriptor.generation);
+                // Restart/backoff/circuit history survives only a scope or
+                // other same-digest reconfiguration. A reset since this
+                // service was spawned (disable→enable, retrust) is the
+                // operator transition §10.4 says clears it, even when the
+                // pass never saw the disabled generation.
+                if reset.is_none()
+                    && desired.get(&key).is_some_and(|activation| {
+                        managed.descriptor.package_digest == activation.package_digest
+                    })
+                {
                     preserved_histories.insert(key.clone(), Arc::clone(&managed.history));
                 }
-                // A service no longer effective anywhere is being disabled;
-                // one whose activation identity changed is being reconfigured.
-                let reason = if desired.contains_key(&key) {
-                    ShutdownReason::Reconfigure
-                } else {
-                    ShutdownReason::Disabled
+                // A service no longer effective anywhere, or one whose package
+                // was disabled since it spawned, is being disabled; one whose
+                // activation identity otherwise changed is being reconfigured.
+                let reason = match (desired.contains_key(&key), reset) {
+                    (false, _) => ShutdownReason::Disabled,
+                    (
+                        true,
+                        Some(PackageGeneration {
+                            reason: ActivationReset::Disabled,
+                            ..
+                        }),
+                    ) => ShutdownReason::Disabled,
+                    (true, _) => ShutdownReason::Reconfigure,
                 };
                 match self.stop_managed(managed, reason).await {
                     Ok(()) => {
@@ -944,7 +1020,6 @@ impl ExtensionSupervisor {
         mut project_rx: mpsc::Receiver<SupervisorCommand>,
     ) {
         let mut services = BTreeMap::new();
-        let mut generations: BTreeMap<String, u64> = BTreeMap::new();
         // A pass that was blocked (registry unreadable) or left cleanup
         // unproven is re-run with bounded exponential backoff until one
         // completes, including the startup pass, so a stale generation never
@@ -963,9 +1038,7 @@ impl ExtensionSupervisor {
         let passed = |result: &Result<ReconcileReport, ProjectSnapshotError>| {
             result.as_ref().is_ok_and(ReconcileReport::complete)
         };
-        let result = self
-            .reconcile(&config_dir, &projects, &generations, &mut services)
-            .await;
+        let result = self.reconcile(&config_dir, &projects, &mut services).await;
         schedule(passed(&result), &mut retry_at);
         loop {
             let scheduled = retry_at;
@@ -979,7 +1052,7 @@ impl ExtensionSupervisor {
                 _ = self.cancel.cancelled() => break,
                 () = retry => {
                     let result = self
-                        .reconcile(&config_dir, &projects, &generations, &mut services)
+                        .reconcile(&config_dir, &projects, &mut services)
                         .await;
                     schedule(passed(&result), &mut retry_at);
                 }
@@ -989,7 +1062,7 @@ impl ExtensionSupervisor {
                         SupervisorCommand::Projects(command) => {
                             projects = command.projects;
                             let result = self
-                                .reconcile(&config_dir, &projects, &generations, &mut services)
+                                .reconcile(&config_dir, &projects, &mut services)
                                 .await;
                             schedule(passed(&result), &mut retry_at);
                             let result = result.and_then(|report| {
@@ -1002,17 +1075,11 @@ impl ExtensionSupervisor {
                             let _ = command.completed.send(result);
                         }
                         SupervisorCommand::Registry(command) => {
-                            if command.resets_activation {
-                                let generation = generations
-                                    .entry(command.package_id.clone())
-                                    .or_default();
-                                *generation = (*generation).max(command.committed_revision);
-                            }
                             // Serialized with every other pass on this one
                             // task; each reads the newest coherent generation,
                             // which is at least the committed revision.
                             let result = self
-                                .reconcile(&config_dir, &projects, &generations, &mut services)
+                                .reconcile(&config_dir, &projects, &mut services)
                                 .await;
                             let reached = result
                                 .as_ref()
@@ -4641,8 +4708,12 @@ done
         let pass = ledger.begin_pass();
         assert!(ledger.reconciliation_in_progress());
         assert!(ledger.package_stopped("example.b"));
+        // The guard's single-lock reading carries both facts together.
+        assert_eq!(ledger.snapshot("example.b"), (true, true));
+        assert_eq!(ledger.snapshot("example.a"), (false, true));
         drop(pass);
         assert!(!ledger.reconciliation_in_progress());
+        assert_eq!(ledger.snapshot("example.b"), (true, false));
         ledger.release("example.a");
         assert!(!ledger.package_stopped("example.a"));
         ledger.release("example.a");
