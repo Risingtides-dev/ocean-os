@@ -23,6 +23,15 @@ The measurements are Rust tests that drive production code. Fast tests run in CI
 | `crates/ocean-daemon/src/retained_size_measurements.rs` | The production `AgentEventBus`, `EventBus`, `RoomWakeBus`, `RoomAccessWakeBus`, and `RoomReadCursorWakeBus` at their production capacities. Events are published through `emit_agent`, the same function the turn bridge uses, so both rails see what they see in production. SSE clients connect over real TCP sockets to the production router: `app_router(cors_layer(..))`, served by `axum::serve`. |
 | `crates/ocean-agent/src/session_retained_size_measurements.rs` | The real `compact_history`, `cap_session_history`, and `session::save` functions, called in the same load → compact → accept-save → round-checkpoint saves → final-save order that `run_turn_inner` uses. |
 
+> **Correction (2026-09-26), C1:** the row above is wrong about the turn bridge. The bridge does not use `emit_agent`. It calls `AgentEventBus::emit` directly (`bridge_bus` at `crates/ocean-daemon/src/main.rs:6985`, then `bridge_bus.emit(..)` from `main.rs:7010` onward). Bridged runtime events — deltas, tool calls, and tool results — therefore reach **only** the agent rail and never the legacy `/v1/events` rail. `emit_agent` (`main.rs:9098`) is used only for events the daemon emits itself:
+>
+> - `SessionCreated` at `main.rs:6959`;
+> - `TurnStarted` at `main.rs:6970`;
+> - `TurnFinished` at `main.rs:6061`, inside `record_prompt_result_with_lifecycle`;
+> - the advisor `Extension` at `main.rs:7597`.
+>
+> The measurements themselves published through `emit_agent`, so the legacy-rail figures in §1 are an upper bound for production. In production, bridged `ToolCallStarted`/`ToolCallFinished` never reach the legacy history. See "Corrections" at the end.
+
 **Synthetic turn.** One turn is 210 events:
 
 - `TurnStarted`
@@ -141,6 +150,8 @@ A production receiver always exists. The Observatory durability pump subscribes 
 
 Observed lock hold for a plain connect was **0.9–1.2 ms with the full ring and 0.7–1.1 µs with an empty ring** across four runs (debug build, this machine; not asserted). A `?replay=1` connect for the heavy session also holds its serialized frames, so it peaks at roughly 2 × 31 MiB until the replay is written out. Concurrent reconnects multiply this per connection.
 
+> **Correction (2026-09-26), C2:** the 0.9–1.2 ms lock hold above now applies **only** to a `?replay=1&session_id=` full-replay connect. That is the one connect that still clones the whole ring. Since #496 (`merged_refs`, see the Follow-up section), a plain connect builds no merged view. Re-running `connect_materializes_the_whole_replay_ring` at `bd2f9abb` measured a plain-connect lock hold of **320 ns with the full ring and 233 ns with an empty ring** (debug build, this machine, one run, not asserted). Failure mode 3 and the "about 1 ms per connect" wording in the 2026-09-25 `events.md` entry should be read with this scope.
+
 ### 5. Slow SSE clients through the real router
 
 `slow_sse_clients_lag_and_drop_without_backpressure`: a burst of 3,072 × 4 KiB `ToolCallChunk` events at production capacity 1,024, with 16 KiB socket buffers requested.
@@ -236,3 +247,10 @@ still clones the whole ring under the lock. `connect_materializes_the_whole_repl
 still runs and reports the new plain-connect timing next to the full-replay
 cost. The stalled-reader finding (1,024 events pinned outside the byte
 budget) is unchanged and remains an input to the channel-policy decision.
+
+## Corrections (2026-09-26)
+
+Appended corrections; the original 2026-09-25 text above is left unchanged. The inline notes C1 and C2 are marked in place. Both were found while writing [`2026-09-26-bounded-turn-event-channel-proposal.md`](2026-09-26-bounded-turn-event-channel-proposal.md).
+
+- **C1: the bridge publish path.** The turn bridge calls `AgentEventBus::emit` directly (`crates/ocean-daemon/src/main.rs:6985`, `7010`ff), not `emit_agent`. Bridged runtime events never reach the legacy rail. Only the daemon's own `SessionCreated` (`main.rs:6959`), `TurnStarted` (`main.rs:6970`), `TurnFinished` (`main.rs:6061`) and advisor emits (`main.rs:7597`) go through `emit_agent` (`main.rs:9098`), which mirrors them onto the legacy rail.
+- **C2: the connect lock hold.** "About 1 ms per connect" applies only to `?replay=1&session_id=`. A plain connect holds the history lock for about 320 ns since #496.

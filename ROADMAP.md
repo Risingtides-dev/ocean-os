@@ -201,7 +201,10 @@ Ocean ports mechanisms into current owners rather than reproducing OMP package b
 
 - [ ] Design a bounded policy for the runtime-to-daemon per-turn event channel;
       replay retention is bounded, but the live per-turn MPSC design remains a
-      separate decision.
+      separate decision. PROPOSED, awaiting operator yes/no:
+      [`docs/specs/2026-09-26-bounded-turn-event-channel-proposal.md`](docs/specs/2026-09-26-bounded-turn-event-channel-proposal.md)
+      (both unbounded hops become one backpressured 8 MiB / 1,024-item channel
+      that coalesces adjacent deltas and changes nothing on the wire).
 - [ ] Establish artifact-backed large tool results before increasing retained
       event or transcript payload limits.
 - [ ] Add end-to-end retained-size and slow-client measurements before changing
