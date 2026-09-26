@@ -83,7 +83,11 @@ answer, whose text the TUI matches to wait and retry). `client_type` is an
 open set: the daemon accepts and echoes any string, and the published `known`
 values are the ones `HarnessProfile::from_client_type` maps (anything else
 runs with the CLI profile). The test proves both by source and by creating a
-session with an unlisted value. The create body's optional `title` is a
+session with an unlisted value. Every live Ocean Surface host is in `known`:
+the browser/PWA sends `surface-web`, the Chrome extension `surface-extension`,
+the Tauri desktop `surface-tauri` (all three the Web profile), and voice turns
+from any of them `leo-voice` (Voice).
+The create body's optional `title` is a
 display-title hint. The daemon adopts it the way it adopts a first-turn title:
 whitespace squashed, truncated to the switcher length, a blank hint ignored,
 and the first title written wins, so the first turn does not relabel it. The

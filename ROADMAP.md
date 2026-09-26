@@ -9,11 +9,6 @@ approved design or permission to alter public contracts.
 
 ## Near-term integration gaps
 
-- [ ] Decide the Tauri effective harness classification. `ocean-agent` now maps
-      `client_type = "surface-tauri"` to the `TAURI` prompt identity and native-
-      shell component guidance, while the daemon harness seam intentionally
-      retains CLI-compatible hashline/artifact gates pending cross-repo policy.
-      Draft PR #525 proposes the Web profile and awaits the operator's yes.
 - [ ] Decide whether the daemon consumes Surface's per-turn `canvas`
       snapshot (accept and inject it as turn context, or have Surface stop
       sending it). The daemon drops it today; see "Fields Surface sends that

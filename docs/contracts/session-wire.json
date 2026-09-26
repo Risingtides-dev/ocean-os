@@ -64,6 +64,7 @@
       "cli",
       "leo-voice",
       "surface-extension",
+      "surface-tauri",
       "surface-web",
       "tui"
     ]
