@@ -5,9 +5,11 @@
 //! reads the daemon's handlers: it pulls out the literals Buddy puts on the
 //! wire (the client-secret route and body keys, the `purpose` it asks for,
 //! the response keys it decodes, the tool names it dispatches on, and the
-//! handoff route, body, role and kind) and holds each one inside the
-//! published contract. A literal the scan cannot find fails the test rather
-//! than passing vacuously.
+//! handoff route, body, role and kind, the `write_handoff` argument it reads,
+//! and the event ingress route and the event, attachment, response and card
+//! shapes it encodes and decodes) and holds each one inside the published
+//! contract. A literal the scan cannot find fails the test rather than
+//! passing vacuously.
 
 use std::collections::BTreeSet;
 
@@ -22,6 +24,13 @@ const MODELS: &str =
 const BROKER: &str = include_str!(
     "../../../integrations/ocean-buddy/Sources/OceanBuddyCore/RealtimeToolBroker.swift"
 );
+const BACKEND_CLIENT: &str = include_str!(
+    "../../../integrations/ocean-buddy/Sources/OceanBuddyCore/HTTPBuddyBackendClient.swift"
+);
+const EVENT_MODELS: &str =
+    include_str!("../../../integrations/ocean-buddy/Sources/OceanBuddyCore/Models.swift");
+const FLOW: &str =
+    include_str!("../../../integrations/ocean-buddy/Sources/OceanBuddyCore/OceanBuddyFlow.swift");
 
 fn contract() -> Value {
     serde_json::from_str(CONTRACT).expect("voice-wire.json parses")
@@ -121,6 +130,41 @@ fn dictionary(literal: &str) -> Vec<(String, Option<String>)> {
         .collect();
     assert!(!pairs.is_empty(), "the scan found the dictionary pairs");
     pairs
+}
+
+/// The wire names a Swift `CodingKeys` enum or `String` raw-value enum
+/// declares: `case a, b` is `a` and `b`, `case a = "x"` is `x`.
+fn case_names(declaration: &str) -> BTreeSet<String> {
+    let names: BTreeSet<String> = declaration
+        .lines()
+        .filter_map(|line| line.trim().strip_prefix("case "))
+        .flat_map(|cases| cases.split(','))
+        .map(|case| match case.split_once('=') {
+            Some((_, raw)) => raw.trim().trim_matches('"').to_string(),
+            None => case.trim().to_string(),
+        })
+        .collect();
+    assert!(!names.is_empty(), "the scan found the cases");
+    names
+}
+
+/// The `CodingKeys` wire names of `public struct {name}: Codable`.
+fn coding_keys(name: &str) -> BTreeSet<String> {
+    let declaration = section(
+        EVENT_MODELS,
+        &format!("public struct {name}: Codable"),
+        "\n}\n",
+    );
+    case_names(section(declaration, "enum CodingKeys", "}"))
+}
+
+/// The raw values of `public enum {name}: String`.
+fn raw_values(name: &str) -> BTreeSet<String> {
+    case_names(section(
+        EVENT_MODELS,
+        &format!("public enum {name}: String"),
+        "\n}\n",
+    ))
 }
 
 /// `POST /v1/voice/realtime/client-secret`: Buddy mints on a published route,
@@ -305,4 +349,86 @@ fn buddy_handoff_is_inside_the_published_voice_wire() {
             "Buddy reads unpublished handoff key {key}"
         );
     }
+}
+
+/// `write_handoff`: the only argument Buddy reads off the tool call is one the
+/// daemon declares for that tool.
+#[test]
+fn buddy_write_handoff_arguments_are_inside_the_published_voice_wire() {
+    let wire = contract();
+    let declared = list(&wire["realtime"]["tool_arguments"]["write_handoff"]);
+    let write = section(
+        BROKER,
+        "private func writeHandoff(",
+        "private func jsonOutput(",
+    );
+    let read = section(write, "JSONSerialization.jsonObject", "else {");
+    let arguments = quoted_after(read, "object[\"");
+    assert!(!arguments.is_empty(), "the scan found the argument reads");
+    for argument in arguments {
+        assert!(
+            declared.contains(&argument),
+            "Buddy reads undeclared write_handoff argument {argument}"
+        );
+    }
+}
+
+/// `POST /v1/ocean-buddy/events`: Buddy sends its events to the published
+/// route with published fields and states, its mock capture matches what the
+/// daemon accepts, and it decodes only published response and card keys. The
+/// card kinds are a closed Swift enum, so they equal the published kinds.
+#[test]
+fn buddy_events_are_inside_the_published_voice_wire() {
+    let wire = contract();
+    let events = &wire["buddy_events"];
+
+    let endpoint = section(BACKEND_CLIENT, "endpoint = baseURL", "endpointAllowed =");
+    let send = section(BACKEND_CLIENT, "public func send(", "let encoder");
+    let method = section(send, "request.httpMethod", "\n");
+    assert_eq!(
+        route(&format!("{endpoint}{method}")),
+        events["route"].as_str().unwrap()
+    );
+
+    let within = |sent: BTreeSet<String>, field: &str, what: &str| {
+        let published = list(&events[field]);
+        for name in sent {
+            assert!(published.contains(&name), "Buddy {what} unpublished {name}");
+        }
+    };
+    within(
+        coding_keys("BuddyEvent"),
+        "request_fields",
+        "sends event field",
+    );
+    within(raw_values("BuddyEventState"), "states", "sends state");
+    within(
+        coding_keys("BuddyAttachment"),
+        "attachment_fields",
+        "sends attachment field",
+    );
+    within(
+        coding_keys("BuddyEventResponse"),
+        "response_fields",
+        "decodes response field",
+    );
+    within(
+        coding_keys("BuddyCard"),
+        "card_fields",
+        "decodes card field",
+    );
+    assert_eq!(
+        raw_values("BuddyComponentKind"),
+        list(&events["card_kinds"])
+    );
+
+    let accepted = |value: &Value| value.as_str().unwrap().to_string();
+    assert!(raw_values("BuddyEventState").contains(&accepted(&events["accepted_state"])));
+    assert!(raw_values("BuddyAttachmentTarget").contains(&accepted(&events["accepted_target"])));
+    let capture = section(FLOW, "public func capturePhoto(", "\n    }\n");
+    assert_eq!(
+        quoted_after(capture, "mimeType: \""),
+        vec![accepted(&events["accepted_mime_type"])],
+        "Buddy's mock capture carries the accepted mime type"
+    );
 }

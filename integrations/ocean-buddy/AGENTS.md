@@ -26,8 +26,12 @@ Watch apps while Ocean OS remains the session, credential, and tool authority.
 
 - The voice wire literals in `RealtimeSecretClient.swift`,
   `RealtimeModels.swift` and `RealtimeToolBroker.swift` (route, body keys,
-  `purpose`, decoded response keys, tool names, handoff route/body/role/kind,
-  `ok` acknowledgement) are held inside `docs/contracts/voice-wire.json` by
+  `purpose`, decoded response keys, tool names, the `write_handoff` `note`
+  argument, handoff route/body/role/kind, `ok` acknowledgement) and the event
+  ingress in `HTTPBuddyBackendClient.swift`, `Models.swift` and
+  `OceanBuddyFlow.swift` (route, `CodingKeys` and raw values of the event,
+  state, attachment, response and card types, the mock capture's mime type)
+  are held inside `docs/contracts/voice-wire.json` by
   `crates/ocean-daemon/tests/buddy_voice_contract.rs`, which scans this Swift
   source. Keep them as plain string literals in those shapes; renaming or
   moving one means updating that scan in the same change, and `cargo test -p

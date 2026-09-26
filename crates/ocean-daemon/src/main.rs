@@ -15185,7 +15185,7 @@ mod tests {
         let state = capped_turn_state(1);
         let workspace = tempfile::tempdir().expect("workspace");
         let (status, created) = agent_sessions_create(
-            State(state),
+            State(state.clone()),
             Json(AgentSessionCreateRequest {
                 workspace_root: workspace.path().to_string_lossy().into_owned(),
                 project_id: None,
@@ -15204,6 +15204,240 @@ mod tests {
             .collect();
         response_keys.sort();
         assert_eq!(names("session_create_response_keys"), response_keys);
+
+        // Every fact in the artifact is one this test checks.
+        let list = |value: &serde_json::Value| -> Vec<String> {
+            let mut list: Vec<String> = value
+                .as_array()
+                .unwrap_or_else(|| panic!("{value} is a list"))
+                .iter()
+                .map(|v| v.as_str().unwrap().to_string())
+                .collect();
+            list.sort();
+            list
+        };
+        let keys = |value: &serde_json::Value| -> Vec<String> {
+            let mut keys: Vec<String> = value.as_object().unwrap().keys().cloned().collect();
+            keys.sort();
+            keys
+        };
+        let strings = |items: &[&str]| -> Vec<String> {
+            let mut list: Vec<String> = items.iter().map(|s| (*s).to_string()).collect();
+            list.sort();
+            list
+        };
+        let codes = |value: &serde_json::Value| -> Vec<u64> {
+            value
+                .as_array()
+                .unwrap_or_else(|| panic!("{value} is a list"))
+                .iter()
+                .map(|v| v.as_u64().unwrap())
+                .collect()
+        };
+        assert_eq!(
+            keys(&artifact),
+            strings(&[
+                "agent_event_tag",
+                "agent_event_types",
+                "agent_events_error",
+                "agent_events_route",
+                "note",
+                "session_changed_extension",
+                "session_config",
+                "session_create_client_types",
+                "session_create_request_fields",
+                "session_create_response_keys",
+                "session_sync",
+                "version",
+            ])
+        );
+        assert_eq!(artifact["version"], 1);
+        let source = production_main_source();
+        let registered = source_registered_routes();
+
+        // GET /v1/agent/events: a data frame is named after its `type`, and the
+        // one literal frame name the handler writes is the reset-required
+        // error, whose payload is `AgentReplayGap`.
+        let stream_route = artifact["agent_events_route"].as_str().unwrap();
+        assert_eq!(registered_handler(stream_route), "agent_events");
+        let stream = source_fn_body(source, "agent_events");
+        assert!(
+            stream.contains(".event(event_type)"),
+            "data frames are named after their agent event type"
+        );
+        let error = &artifact["agent_events_error"];
+        assert_eq!(keys(error), strings(&["codes", "event", "fields"]));
+        let mut literal_frames = source_quoted_after(stream, ".event(\"");
+        literal_frames.sort();
+        literal_frames.dedup();
+        assert_eq!(
+            literal_frames,
+            vec![error["event"].as_str().unwrap().to_string()]
+        );
+        assert!(
+            !names("agent_event_types").contains(&literal_frames[0]),
+            "the error frame name cannot collide with an agent event type"
+        );
+        assert_eq!(
+            list(&error["fields"]),
+            serde_wire_names::<ocean_core::AgentReplayGap>()
+        );
+        assert_eq!(
+            list(&error["codes"]),
+            serde_wire_names::<ocean_core::AgentReplayGapCode>()
+        );
+
+        // The generic sync invalidation: a scoped `extension` event with an
+        // empty payload, from the one helper every mutation calls.
+        let (_, mut live) = state.agent_events.subscribe_with_replay(None);
+        emit_session_changed(&state.agent_events, created.session_id);
+        match live.try_recv().expect("the invalidation is emitted").event {
+            AgentTurnEvent::Extension {
+                extension,
+                payload,
+                scope,
+            } => {
+                assert_eq!(artifact["session_changed_extension"], extension);
+                assert_eq!(scope, Some(created.session_id));
+                assert_eq!(payload, json!({}));
+            }
+            other => panic!("session_changed emitted {other:?}"),
+        }
+
+        // `client_type` is an open set: the known values are the ones the
+        // harness profile maps, and any other string is accepted and echoed.
+        let client_types = &artifact["session_create_client_types"];
+        assert_eq!(keys(client_types), strings(&["known", "open"]));
+        let profile = source_section(
+            include_str!("harness_profile.rs"),
+            "pub fn from_client_type(",
+            "\n    }\n",
+        );
+        let mut known = source_quoted_after(profile, "Some(\"");
+        known.sort();
+        known.dedup();
+        assert_eq!(list(&client_types["known"]), known);
+        assert!(
+            profile.contains("_ => Self::Cli"),
+            "an unmapped client type falls back rather than failing"
+        );
+        assert_eq!(client_types["open"], true);
+        let unlisted = "contract-probe-unlisted-client";
+        assert!(!known.contains(&unlisted.to_string()));
+        let (status, echoed) = agent_sessions_create(
+            State(state.clone()),
+            Json(AgentSessionCreateRequest {
+                workspace_root: workspace.path().to_string_lossy().into_owned(),
+                project_id: None,
+                model: None,
+                client_type: Some(unlisted.to_owned()),
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(echoed.client_type.as_deref(), Some(unlisted));
+
+        // GET /v1/sessions/{id}/sync
+        let sync = &artifact["session_sync"];
+        assert_eq!(
+            keys(sync),
+            strings(&[
+                "fence_fields",
+                "response_fields",
+                "route",
+                "snapshot_fields",
+                "statuses",
+            ])
+        );
+        let sync_route = sync["route"].as_str().unwrap();
+        assert!(
+            registered.contains(sync_route),
+            "{sync_route} is registered"
+        );
+        let sync_handler = registered_handler(sync_route);
+        assert_eq!(
+            codes(&sync["statuses"]),
+            source_status_codes(source_fn_body(source, &sync_handler))
+        );
+        assert_eq!(
+            list(&sync["response_fields"]),
+            serde_wire_names::<ocean_core::SessionSyncResponse>()
+        );
+        assert_eq!(
+            list(&sync["snapshot_fields"]),
+            serde_wire_names::<ocean_core::SessionSyncSnapshot>()
+        );
+        assert_eq!(
+            list(&sync["fence_fields"]),
+            serde_wire_names::<ocean_core::SessionEventFence>()
+        );
+
+        // GET/PATCH /v1/agent/sessions/{id}/config
+        let config = &artifact["session_config"];
+        assert_eq!(
+            keys(config),
+            strings(&[
+                "busy",
+                "error_key",
+                "patch_request_fields",
+                "response_keys",
+                "routes",
+                "statuses",
+            ])
+        );
+        let config_routes: Vec<String> = registered
+            .iter()
+            .filter(|route| route.ends_with(" /v1/agent/sessions/{id}/config"))
+            .cloned()
+            .collect();
+        assert_eq!(list(&config["routes"]), config_routes);
+        assert_eq!(keys(&config["statuses"]), config_routes);
+        let error_key = config["error_key"].as_str().unwrap();
+        for route in &config_routes {
+            let handler = registered_handler(route);
+            let body = source_fn_body(source, &handler);
+            assert_eq!(
+                codes(&config["statuses"][route]),
+                source_status_codes(body),
+                "{route} ({handler}) statuses"
+            );
+            assert!(
+                body.contains("Json(session_config_json(&state, session_id, &config))"),
+                "{route} answers the shared config projection"
+            );
+            for (at, _) in body.match_indices("json!({") {
+                let literal = &body[at..at + body[at..].find("})").unwrap()];
+                assert!(
+                    literal.contains(&format!("\"{error_key}\"")),
+                    "{route}: error body {literal} lacks {error_key:?}"
+                );
+            }
+        }
+        assert_eq!(
+            list(&config["patch_request_fields"]),
+            serde_wire_names::<AgentSessionConfigPatchRequest>()
+        );
+        let (status, projected) = agent_session_config_get(
+            State(state.clone()),
+            axum::extract::Path(created.session_id),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(list(&config["response_keys"]), keys(&projected.0));
+        let busy = &config["busy"];
+        assert_eq!(keys(busy), strings(&["error", "status"]));
+        let patch = source_fn_body(
+            source,
+            &registered_handler("PATCH /v1/agent/sessions/{id}/config"),
+        );
+        let conflict = &patch[patch
+            .find("StatusCode::CONFLICT")
+            .expect("PATCH answers a busy session")..];
+        assert_eq!(busy["status"], 409);
+        assert_eq!(
+            source_quoted_after(conflict, &format!("\"{error_key}\": \""))[0],
+            busy["error"].as_str().unwrap()
+        );
     }
 
     /// Records the field (struct) or variant (enum) names a `Deserialize`
@@ -15248,6 +15482,125 @@ mod tests {
             bytes byte_buf option unit unit_struct newtype_struct seq tuple
             tuple_struct map identifier ignored_any
         }
+    }
+
+    /// `main.rs` without its test module, so a scan of the production
+    /// source cannot be satisfied by a test's own text.
+    fn production_main_source() -> &'static str {
+        include_str!("main.rs")
+            .split("\n#[cfg(test)]\nmod tests {")
+            .next()
+            .unwrap()
+    }
+
+    /// The body of `fn name(` (async or not) in `source`, up to the first
+    /// line that closes a top-level item.
+    fn source_fn_body<'a>(source: &'a str, name: &str) -> &'a str {
+        let start = [format!("async fn {name}("), format!("fn {name}(")]
+            .iter()
+            .find_map(|marker| source.find(marker.as_str()))
+            .unwrap_or_else(|| panic!("fn {name} is defined"));
+        let tail = &source[start..];
+        &tail[..tail.find("\n}\n").expect("fn body closes")]
+    }
+
+    /// The string literal right after each `needle`.
+    fn source_quoted_after(haystack: &str, needle: &str) -> Vec<String> {
+        haystack
+            .match_indices(needle)
+            .map(|(at, lit)| {
+                let rest = &haystack[at + lit.len()..];
+                rest[..rest.find('"').unwrap()].to_string()
+            })
+            .collect()
+    }
+
+    /// The status codes a handler body names through `StatusCode::*`, sorted
+    /// and deduplicated. An unmapped name panics so a new code is not missed.
+    fn source_status_codes(body: &str) -> Vec<u64> {
+        let mut found: Vec<u64> = body
+            .match_indices("StatusCode::")
+            .map(|(at, lit)| {
+                let name: String = body[at + lit.len()..]
+                    .chars()
+                    .take_while(|c| c.is_ascii_uppercase() || *c == '_')
+                    .collect();
+                match name.as_str() {
+                    "OK" => 200,
+                    "CREATED" => 201,
+                    "ACCEPTED" => 202,
+                    "BAD_REQUEST" => 400,
+                    "NOT_FOUND" => 404,
+                    "CONFLICT" => 409,
+                    "UNPROCESSABLE_ENTITY" => 422,
+                    "INTERNAL_SERVER_ERROR" => 500,
+                    "BAD_GATEWAY" => 502,
+                    "SERVICE_UNAVAILABLE" => 503,
+                    other => panic!("map StatusCode::{other} in source_status_codes"),
+                }
+            })
+            .collect();
+        found.sort_unstable();
+        found.dedup();
+        found
+    }
+
+    /// The keys of a flat `json!({ "k": v, ... })` literal: every string
+    /// literal followed by a `:`, sorted.
+    fn source_json_literal_keys(literal: &str) -> Vec<String> {
+        let mut keys = Vec::new();
+        let mut rest = literal;
+        while let Some(open) = rest.find('"') {
+            let after = &rest[open + 1..];
+            let close = after.find('"').expect("string literal closes");
+            let tail = after[close + 1..].trim_start();
+            if tail.starts_with(':') {
+                keys.push(after[..close].to_string());
+            }
+            rest = &after[close + 1..];
+        }
+        keys.sort();
+        keys
+    }
+
+    /// The handler a registered `METHOD /path` dispatches to, read from the
+    /// same router sections `source_registered_routes` parses.
+    fn registered_handler(route: &str) -> String {
+        let (method, path) = route.split_once(' ').expect("METHOD /path");
+        let method = method.to_ascii_lowercase();
+        let source = include_str!("main.rs");
+        let sections = [
+            source_section(source, "fn app_router(", "#[tokio::main]"),
+            source_section(source, "fn room_routes(", "fn longhouse_routes("),
+            source_section(
+                source,
+                "fn longhouse_routes(",
+                "/// Request body for `POST /v1/longhouse/convene`.",
+            ),
+        ];
+        let needle = format!("{method}(");
+        let found: Vec<String> = sections
+            .into_iter()
+            .flat_map(route_calls)
+            .filter(|call| call.trim_start().starts_with(&format!("\"{path}\"")))
+            .filter_map(|call| {
+                call.match_indices(&needle)
+                    .find(|(index, _)| {
+                        *index == 0
+                            || !call.as_bytes()[index - 1].is_ascii_alphanumeric()
+                                && call.as_bytes()[index - 1] != b'_'
+                    })
+                    .map(|(index, _)| {
+                        call[index + needle.len()..]
+                            .chars()
+                            .take_while(|c| c.is_ascii_alphanumeric() || *c == '_' || *c == ':')
+                            .collect::<String>()
+                    })
+            })
+            .collect();
+        assert_eq!(found.len(), 1, "{route} has one registered handler");
+        let handler = found.into_iter().next().unwrap();
+        handler.rsplit("::").next().unwrap().to_string()
     }
 
     fn serde_wire_names<T: serde::de::DeserializeOwned>() -> Vec<String> {
@@ -15308,6 +15661,7 @@ mod tests {
                 "agent_voice",
                 "error_key",
                 "handler_statuses",
+                "buddy_events",
                 "handoff",
                 "handoff_route",
                 "note",
@@ -15488,6 +15842,7 @@ mod tests {
                 "purposes",
                 "request_fields",
                 "response_keys",
+                "tool_arguments",
                 "tools",
             ])
         );
@@ -15557,6 +15912,36 @@ mod tests {
             list(&tools["planner"]),
             tool_names(voice_realtime::planner_upstream_body("m", "i"))
         );
+        // The arguments each tool declares, in every mode that offers it. A
+        // tool whose parameters declare no properties (render_component takes
+        // any object) has no entry.
+        let mut arguments: BTreeMap<String, Vec<String>> = BTreeMap::new();
+        for body in [
+            voice_realtime::upstream_body("m", "i", false),
+            voice_realtime::upstream_body("m", "i", true),
+            voice_realtime::planner_upstream_body("m", "i"),
+        ] {
+            for tool in body["session"]["tools"].as_array().unwrap() {
+                let Some(properties) = tool["parameters"]["properties"].as_object() else {
+                    continue;
+                };
+                let name = tool["name"].as_str().unwrap().to_string();
+                let names = sorted(properties.keys().cloned().collect());
+                if let Some(previous) = arguments.insert(name.clone(), names.clone()) {
+                    assert_eq!(
+                        previous, names,
+                        "{name} takes one argument set in every mode"
+                    );
+                }
+            }
+        }
+        assert_eq!(
+            keys(&realtime["tool_arguments"]),
+            arguments.keys().cloned().collect::<Vec<_>>()
+        );
+        for (tool, names) in &arguments {
+            assert_eq!(&list(&realtime["tool_arguments"][tool]), names, "{tool}");
+        }
 
         // POST /v1/voice/stt
         let stt = &artifact["stt"];
@@ -15646,6 +16031,102 @@ mod tests {
             );
         }
         assert_eq!(list(&handoff["response_keys"]), ok_body_keys(append_body));
+
+        // POST /v1/ocean-buddy/events (Buddy's narrow first ingress)
+        use ocean_agent_sdk::buddy::{
+            BuddyAttachment, BuddyAttachmentTarget, BuddyCard, BuddyComponentKind, BuddyEvent,
+            BuddyEventResponse, BuddyEventState,
+        };
+        let buddy = &artifact["buddy_events"];
+        assert_eq!(
+            keys(buddy),
+            strings(&[
+                "accepted_mime_type",
+                "accepted_state",
+                "accepted_target",
+                "attachment_fields",
+                "card_fields",
+                "card_kinds",
+                "rejection_keys",
+                "request_fields",
+                "response_fields",
+                "route",
+                "states",
+                "statuses",
+            ])
+        );
+        let buddy_route = buddy["route"].as_str().unwrap();
+        assert!(
+            registered.contains(buddy_route),
+            "{buddy_route} is registered"
+        );
+        let buddy_source = include_str!("ocean_buddy.rs")
+            .split("\n#[cfg(test)]\nmod tests")
+            .next()
+            .unwrap();
+        let buddy_handler = source_fn_body(buddy_source, &registered_handler(buddy_route));
+        assert!(
+            buddy_handler.contains("Ok(Json(BuddyEventResponse {"),
+            "an accepted event answers 200 with the typed response"
+        );
+        let mut buddy_statuses = source_status_codes(buddy_handler);
+        buddy_statuses.push(200);
+        buddy_statuses.sort_unstable();
+        let pinned_statuses: Vec<u64> = buddy["statuses"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_u64().unwrap())
+            .collect();
+        assert_eq!(pinned_statuses, buddy_statuses);
+        assert_eq!(
+            list(&buddy["request_fields"]),
+            serde_wire_names::<BuddyEvent>()
+        );
+        assert_eq!(
+            list(&buddy["states"]),
+            serde_wire_names::<BuddyEventState>()
+        );
+        assert!(buddy_handler.contains("event.state != BuddyEventState::Attached"));
+        assert_eq!(buddy["accepted_state"], json!(BuddyEventState::Attached));
+        assert!(buddy_handler
+            .contains("event.target != Some(BuddyAttachmentTarget::CurrentOceanContext)"));
+        assert_eq!(
+            buddy["accepted_target"],
+            json!(BuddyAttachmentTarget::CurrentOceanContext)
+        );
+        assert_eq!(
+            list(&buddy["attachment_fields"]),
+            serde_wire_names::<BuddyAttachment>()
+        );
+        assert_eq!(
+            quoted_after(buddy_handler, "attachment.mime_type != \""),
+            vec![buddy["accepted_mime_type"].as_str().unwrap().to_string()]
+        );
+        assert_eq!(
+            list(&buddy["response_fields"]),
+            serde_wire_names::<BuddyEventResponse>()
+        );
+        assert_eq!(list(&buddy["card_fields"]), serde_wire_names::<BuddyCard>());
+        assert_eq!(
+            list(&buddy["card_kinds"]),
+            serde_wire_names::<BuddyComponentKind>()
+        );
+        let rejections: Vec<&str> = buddy_handler
+            .match_indices("json!({")
+            .map(|(at, _)| &buddy_handler[at..at + buddy_handler[at..].find("})").unwrap()])
+            .collect();
+        assert!(
+            !rejections.is_empty(),
+            "the scan found the rejection bodies"
+        );
+        for literal in rejections {
+            assert_eq!(
+                list(&buddy["rejection_keys"]),
+                source_json_literal_keys(literal),
+                "{literal}"
+            );
+        }
     }
 
     #[tokio::test]
@@ -22824,6 +23305,234 @@ mod tests {
             let keys = sorted(body.as_object().unwrap().keys().cloned().collect());
             assert_eq!(names(field), keys, "{path}");
         }
+
+        // Every fact in the artifact is one this test checks.
+        assert_eq!(
+            sorted(artifact.as_object().unwrap().keys().cloned().collect()),
+            sorted(
+                [
+                    "access_fields",
+                    "access_states",
+                    "inspect_agent_execution_keys",
+                    "inspect_agent_keys",
+                    "inspect_credential_slot_keys",
+                    "inspect_execution_keys",
+                    "inspect_keys",
+                    "inspect_resource_keys",
+                    "list_keys",
+                    "message_fields",
+                    "message_kinds",
+                    "message_post_keys",
+                    "message_post_queued_keys",
+                    "not_open",
+                    "note",
+                    "participant_fields",
+                    "participant_kinds",
+                    "resources_keys",
+                    "room_fields",
+                    "snapshot_keys",
+                    "sse_events",
+                    "transcript_keys",
+                    "version",
+                ]
+                .map(str::to_string)
+                .to_vec()
+            )
+        );
+        assert_eq!(artifact["version"], 1);
+        let object_keys = |value: &serde_json::Value| -> Vec<String> {
+            sorted(value.as_object().unwrap().keys().cloned().collect())
+        };
+        let within = |value: &serde_json::Value, field: &str| {
+            let published = names(field);
+            for key in object_keys(value) {
+                assert!(published.contains(&key), "{key} is not in {field}");
+            }
+        };
+
+        // Row, participant and room shapes, from the serde derives.
+        assert_eq!(
+            names("message_fields"),
+            serde_wire_names::<ocean_core::RoomMessage>()
+        );
+        assert_eq!(
+            names("participant_fields"),
+            serde_wire_names::<ocean_core::RoomParticipant>()
+        );
+        assert_eq!(names("room_fields"), serde_wire_names::<ocean_core::Room>());
+        assert_eq!(
+            names("access_fields"),
+            serde_wire_names::<ocean_core::RoomAccessProjection>()
+        );
+        assert!(
+            source.contains(
+                "fn projected_transcript(messages: Vec<RoomMessage>) -> Vec<RoomMessage>"
+            ),
+            "transcript rows are RoomMessage values"
+        );
+
+        // POST .../messages: the local answer from a real post, the queued
+        // (federated) answer from the handler's literal.
+        let (status, _, _) = persistent_room_http_request(
+            app.clone(),
+            axum::http::Method::POST,
+            "/v1/rooms/persistent/wire-contract/participants",
+            Some(json!({ "id": "alice", "display_name": "Alice" }).to_string()),
+            true,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let (status, _, raw) = persistent_room_http_request(
+            app.clone(),
+            axum::http::Method::POST,
+            "/v1/rooms/persistent/wire-contract/messages",
+            Some(
+                json!({ "author_id": "alice", "body": "hello", "thread_parent_seq": null })
+                    .to_string(),
+            ),
+            true,
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED);
+        let posted = persistent_room_http_json(&raw);
+        assert_eq!(names("message_post_keys"), object_keys(&posted));
+        within(&posted["message"], "message_fields");
+        let post_handler = source_fn_body(production, "room_post_message");
+        let literal_after = |marker: &str| -> Vec<String> {
+            let at = post_handler
+                .find(marker)
+                .unwrap_or_else(|| panic!("room_post_message answers {marker}"));
+            let rest = &post_handler[at..];
+            let open = rest.find("json!({").expect("a literal body follows");
+            let literal = &rest[open..open + rest[open..].find("})").unwrap()];
+            source_json_literal_keys(literal)
+        };
+        assert_eq!(
+            names("message_post_keys"),
+            literal_after("StatusCode::CREATED")
+        );
+        assert_eq!(
+            names("message_post_queued_keys"),
+            literal_after("StatusCode::ACCEPTED")
+        );
+
+        // GET /v1/rooms/persistent
+        let (status, _, raw) = persistent_room_http_request(
+            app.clone(),
+            axum::http::Method::GET,
+            "/v1/rooms/persistent",
+            None,
+            false,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let listed = persistent_room_http_json(&raw);
+        assert_eq!(names("list_keys"), object_keys(&listed));
+        let listed_room = &listed["rooms"][0];
+        within(listed_room, "room_fields");
+        assert_eq!(
+            names("participant_fields"),
+            object_keys(&listed_room["participants"][0])
+        );
+
+        // Snapshot rows after the post.
+        let (_, _, raw) = persistent_room_http_request(
+            app.clone(),
+            axum::http::Method::GET,
+            "/v1/rooms/persistent/wire-contract/snapshot",
+            None,
+            false,
+        )
+        .await;
+        let snapshot = persistent_room_http_json(&raw);
+        let rows = snapshot["transcript"].as_array().unwrap();
+        assert!(!rows.is_empty(), "the post is in the snapshot");
+        for row in rows {
+            within(row, "message_fields");
+        }
+
+        // GET .../inspect and GET .../resources
+        let (status, _, raw) = persistent_room_http_request(
+            app.clone(),
+            axum::http::Method::GET,
+            "/v1/rooms/persistent/wire-contract/inspect",
+            None,
+            false,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let inspected = persistent_room_http_json(&raw);
+        assert_eq!(names("inspect_keys"), object_keys(&inspected));
+        assert_eq!(
+            names("inspect_execution_keys"),
+            object_keys(&inspected["execution"])
+        );
+        within(&inspected["access"], "access_fields");
+        let (status, _, raw) = persistent_room_http_request(
+            app.clone(),
+            axum::http::Method::GET,
+            "/v1/rooms/persistent/wire-contract/resources",
+            None,
+            false,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            names("resources_keys"),
+            object_keys(&persistent_room_http_json(&raw))
+        );
+
+        // The inspect list entries are empty on a fresh room, so their shapes
+        // come from the projections that build them.
+        let json_keys = |body: &str| -> Vec<String> {
+            let mut keys: Vec<String> = body
+                .match_indices("json!({")
+                .flat_map(|(at, _)| {
+                    source_json_literal_keys(&body[at..at + body[at..].find("})").unwrap()])
+                })
+                .collect();
+            keys.sort();
+            keys.dedup();
+            keys
+        };
+        let inspect_source = include_str!("room_inspect.rs");
+        let inspect_handler = source_fn_body(inspect_source, "room_inspect");
+        let mut agent_keys = json_keys(source_fn_body(
+            include_str!("room_agent_authority.rs"),
+            "binding_projection",
+        ));
+        assert!(inspect_handler.contains("let mut projection = binding_projection(binding);"));
+        agent_keys.extend(source_quoted_after(inspect_handler, "projection[\""));
+        agent_keys.sort();
+        assert_eq!(names("inspect_agent_keys"), agent_keys);
+        let resources_source = include_str!("room_resources.rs");
+        assert!(inspect_handler.contains("projection[\"execution\"] = turn_cwd.projection();"));
+        let turn_cwd = source_section(resources_source, "impl TurnCwd {", "\n}\n");
+        assert_eq!(
+            names("inspect_agent_execution_keys"),
+            json_keys(
+                &turn_cwd[turn_cwd
+                    .find("fn projection(")
+                    .expect("TurnCwd::projection")..]
+            )
+        );
+        assert!(inspect_handler
+            .contains("\"resources\": crate::room_resources::resources_projection(&grants),"));
+        assert_eq!(
+            names("inspect_resource_keys"),
+            json_keys(source_fn_body(resources_source, "resource_projection"))
+        );
+        let slot = crate::room_profile::SlotStatus {
+            name: "slot".into(),
+            required: true,
+            status: "resolved",
+            resolver: Some("env:SLOT".into()),
+        };
+        assert_eq!(
+            names("inspect_credential_slot_keys"),
+            object_keys(&serde_json::to_value(slot).unwrap())
+        );
+
         let (status, _, raw) = persistent_room_http_request(
             app,
             axum::http::Method::GET,

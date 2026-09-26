@@ -2145,7 +2145,8 @@ impl App {
                             extension,
                             scope: Some(scope),
                             ..
-                        } if extension == "ocean.session_changed" && scope == session_id
+                        } if extension == crate::shell::client::SESSION_CHANGED_EXTENSION
+                            && scope == session_id
                     );
                     if matches!(
                         &**event,

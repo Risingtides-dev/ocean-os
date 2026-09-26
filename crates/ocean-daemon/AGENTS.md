@@ -49,17 +49,31 @@ This crate owns the long-running Ocean HTTP service on `:4780`, including API ro
   or live linked worktree. Return that canonical root with the secret for frozen
   Surface fulfillment; never accept a browser/model-nominated conversation root,
   and keep project-less/session-less conversations on render + handoff only.
-- The voice routes above, `POST /v1/agent/voice`, and the handoff append are
-  published as `docs/contracts/voice-wire.json`. The test
+- The voice routes above, `POST /v1/agent/voice`, the handoff append, and
+  Buddy's `POST /v1/ocean-buddy/events` are published as
+  `docs/contracts/voice-wire.json`. The test
   `voice_wire_contract_matches_the_daemon` holds that file equal to the code.
   It covers the route set, each handler's status codes, the serde request
-  fields and purposes, the response keys, the realtime tool names, the STT WAV
-  types, the TTS default voice, and the handoff kinds. A change to any of
+  fields and purposes, the response keys, the realtime tool names and their
+  declared arguments, the STT WAV types, the TTS default voice, the handoff
+  kinds, and the Buddy event, attachment, response and card shapes with the
+  one state, target and mime type the mock slice accepts. A change to any of
   these updates the artifact in the same commit.
+- `session_wire_contract_matches_the_daemon` also pins the agent-stream
+  route and its `event: error` reset frame (`AgentReplayGap`), the
+  `ocean.session_changed` invalidation, the open `client_type` set with the
+  values `HarnessProfile` maps, `/v1/sessions/{id}/sync`, and the session
+  config routes, bodies, statuses and busy answer.
+  `room_wire_contract_matches_the_daemon` also pins the transcript row,
+  participant, room and access fields, and the list, post, inspect (with its
+  agent, execution, credential-slot and resource entries) and resources
+  response keys. Each checks every key of its artifact.
 - `tests/buddy_voice_contract.rs` is the consumer half for Ocean Buddy: it
   reads Buddy's Swift source and holds its client-secret route, body keys,
-  `purpose`, decoded response keys, tool names, and handoff route, body, role,
-  kind and acknowledgement inside `voice-wire.json`. It lives here only
+  `purpose`, decoded response keys, tool names, the `write_handoff` argument
+  it reads, the handoff route, body, role, kind and acknowledgement, and the
+  event ingress route and event/attachment/response/card shapes inside
+  `voice-wire.json`. It lives here only
   because the daemon crate owns the contract and the workspace cannot compile
   Swift; the other in-repo consumers pin themselves in their own crates (see
   `docs/contracts/README.md`).

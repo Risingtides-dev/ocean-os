@@ -253,7 +253,7 @@ impl DaemonClient {
         // the subscription lands after the turn's first deltas. A resumed chat
         // already loaded its transcript from disk — replay would duplicate it.
         let url = format!(
-            "{}/v1/agent/events?session_id={}{}",
+            "{}{AGENT_EVENTS_PATH}?session_id={}{}",
             self.base,
             session_id,
             if replay_first { "&replay=1" } else { "" }
@@ -285,7 +285,7 @@ impl DaemonClient {
                             if let Some(id) = parse_sse_id(&frame) {
                                 last_event_id = Some(id);
                             }
-                            if parse_sse_event(&frame) == Some("error") {
+                            if parse_sse_event(&frame) == Some(AGENT_STREAM_ERROR_EVENT) {
                                 let _ = actions.send(Action::BoundAgentReplayResetRequired {
                                     session_id,
                                     binding_generation,
@@ -529,7 +529,11 @@ impl DaemonClient {
     ) -> Result<SessionSyncResponse, CompactFailure> {
         let response = self
             .http
-            .get(format!("{}/v1/sessions/{}/sync", self.base, session_id.0))
+            .get(format!(
+                "{}{}",
+                self.base,
+                SESSION_SYNC_PATH.replace("{id}", &session_id.0.to_string())
+            ))
             .timeout(Duration::from_secs(10))
             .send()
             .await
@@ -826,6 +830,7 @@ pub struct ModelsResponse {
 }
 /// Authoritative model pin for one daemon-owned session.
 #[derive(Debug, Clone, serde::Deserialize)]
+#[cfg_attr(test, derive(serde::Serialize))]
 pub struct SessionConfigResponse {
     pub session_id: AgentSessionId,
     pub model: String,
@@ -838,7 +843,27 @@ struct SessionModelPatch<'a> {
     model: &'a str,
 }
 
+// The session wire this client depends on beyond session create. Each literal
+// is held inside `docs/contracts/session-wire.json` by
+// `session_stream_sync_and_config_are_inside_the_published_session_wire`.
+const AGENT_EVENTS_PATH: &str = "/v1/agent/events";
+/// The SSE frame name of the agent stream's reset-required signal.
+const AGENT_STREAM_ERROR_EVENT: &str = "error";
+/// The scoped extension that tells a synchronized client to call `/sync`.
+pub(crate) const SESSION_CHANGED_EXTENSION: &str = "ocean.session_changed";
+const TUI_CLIENT_TYPE: &str = "tui";
+const SESSION_SYNC_PATH: &str = "/v1/sessions/{id}/sync";
+const SESSION_CONFIG_PATH: &str = "/v1/agent/sessions/{id}/config";
+const SESSION_CONFIG_ERROR_KEY: &str = "error";
+/// The daemon's answer to a PATCH while the session's operation lease is held.
 const SESSION_ACTIVE_OPERATION: &str = "session has an active operation; try again shortly";
+
+fn session_config_url(base: &str, session_id: AgentSessionId) -> String {
+    format!(
+        "{base}{}",
+        SESSION_CONFIG_PATH.replace("{id}", &session_id.to_string())
+    )
+}
 const SESSION_MODEL_RETRY_DELAY: Duration = Duration::from_millis(if cfg!(test) { 5 } else { 500 });
 
 /// One retained memory from `GET /v1/memory`, for the `/memory` browser.
@@ -877,10 +902,7 @@ impl DaemonClient {
         session_id: AgentSessionId,
     ) -> Result<SessionConfigResponse, String> {
         self.http
-            .get(format!(
-                "{}/v1/agent/sessions/{session_id}/config",
-                self.base
-            ))
+            .get(session_config_url(&self.base, session_id))
             .send()
             .await
             .and_then(|response| response.error_for_status())
@@ -899,10 +921,7 @@ impl DaemonClient {
     ) -> Result<SessionConfigResponse, String> {
         let response = self
             .http
-            .patch(format!(
-                "{}/v1/agent/sessions/{session_id}/config",
-                self.base
-            ))
+            .patch(session_config_url(&self.base, session_id))
             .json(&SessionModelPatch { model })
             .send()
             .await
@@ -914,7 +933,7 @@ impl DaemonClient {
             .map_err(|error| format!("invalid session model response: {error}"))?;
         if !status.is_success() {
             return Err(payload
-                .get("error")
+                .get(SESSION_CONFIG_ERROR_KEY)
                 .and_then(serde_json::Value::as_str)
                 .unwrap_or("daemon rejected session model")
                 .to_string());
@@ -1095,7 +1114,7 @@ fn session_create_request(workspace_root: &str, model: Option<&str>) -> AgentSes
         workspace_root: workspace_root.to_string(),
         project_id: None,
         model: model.map(str::to_string),
-        client_type: Some("tui".into()),
+        client_type: Some(TUI_CLIENT_TYPE.into()),
     }
 }
 
@@ -1256,6 +1275,96 @@ mod tests {
                 "the TUI decodes unpublished session-create key {key}"
             );
         }
+    }
+
+    /// Consumer half of the rest of the session contract: the agent stream
+    /// route and its reset-required frame name, the sync invalidation
+    /// extension, the client type, and the sync and config routes, bodies,
+    /// error key and busy answer the TUI relies on.
+    #[test]
+    fn session_stream_sync_and_config_are_inside_the_published_session_wire() {
+        let session = contract(include_str!("../../../../docs/contracts/session-wire.json"));
+        assert_eq!(
+            session["agent_events_route"],
+            format!("GET {AGENT_EVENTS_PATH}")
+        );
+        assert_eq!(
+            session["agent_events_error"]["event"],
+            AGENT_STREAM_ERROR_EVENT
+        );
+        assert_eq!(
+            session["session_changed_extension"],
+            SESSION_CHANGED_EXTENSION
+        );
+        assert!(
+            strings(&session["session_create_client_types"]["known"])
+                .contains(&TUI_CLIENT_TYPE.to_string()),
+            "{TUI_CLIENT_TYPE} is a published client type"
+        );
+
+        let sync = &session["session_sync"];
+        assert_eq!(sync["route"], format!("GET {SESSION_SYNC_PATH}"));
+        let decoded = serde_json::to_value(SessionSyncResponse {
+            ok: true,
+            session_id: uuid::Uuid::nil(),
+            snapshot: Some(ocean_core::SessionSyncSnapshot {
+                session_id: uuid::Uuid::nil(),
+                model: "m".into(),
+                provider: "p".into(),
+                config_revision: 1,
+                transcript: Vec::new(),
+                truncated_messages: 1,
+                truncated_text_bytes: 1,
+            }),
+            fence: Some(ocean_core::SessionEventFence {
+                event_id: Some(uuid::Uuid::nil()),
+            }),
+            error: Some("e".into()),
+        })
+        .unwrap();
+        for (value, field) in [
+            (&decoded, "response_fields"),
+            (&decoded["snapshot"], "snapshot_fields"),
+            (&decoded["fence"], "fence_fields"),
+        ] {
+            let published = strings(&sync[field]);
+            for key in object_keys(value.clone()) {
+                assert!(
+                    published.contains(&key),
+                    "the TUI decodes unpublished sync key {key} ({field})"
+                );
+            }
+        }
+
+        let config = &session["session_config"];
+        let routes = strings(&config["routes"]);
+        for method in ["GET", "PATCH"] {
+            let route = format!("{method} {SESSION_CONFIG_PATH}");
+            assert!(routes.contains(&route), "{route} is published");
+        }
+        let request_fields = strings(&config["patch_request_fields"]);
+        for key in object_keys(serde_json::to_value(SessionModelPatch { model: "m" }).unwrap()) {
+            assert!(
+                request_fields.contains(&key),
+                "the TUI sends unpublished config field {key}"
+            );
+        }
+        let response_keys = strings(&config["response_keys"]);
+        let decoded = serde_json::to_value(SessionConfigResponse {
+            session_id: AgentSessionId(uuid::Uuid::nil()),
+            model: "m".into(),
+            config_revision: 1,
+        })
+        .unwrap();
+        for key in object_keys(decoded) {
+            assert!(
+                response_keys.contains(&key),
+                "the TUI decodes unpublished config key {key}"
+            );
+        }
+        assert_eq!(config["error_key"], SESSION_CONFIG_ERROR_KEY);
+        assert_eq!(config["busy"]["status"], 409);
+        assert_eq!(config["busy"]["error"], SESSION_ACTIVE_OPERATION);
     }
 
     #[test]

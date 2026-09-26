@@ -569,8 +569,8 @@ mod contract_tests {
     use super::*;
 
     /// Consumer half of the session contract: the create body the bridge
-    /// sends and the create response it decodes (it relies on `cwd`) stay
-    /// inside the published keys.
+    /// sends, its `client_type`, and the create response it decodes (it
+    /// relies on `cwd`) stay inside the published contract.
     #[test]
     fn session_create_is_inside_the_published_session_wire() {
         let wire: serde_json::Value =
@@ -592,6 +592,16 @@ mod contract_tests {
                 "the bridge sends unpublished session-create field {key}"
             );
         }
+        let known = wire["session_create_client_types"]["known"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_str().unwrap().to_string())
+            .collect::<Vec<_>>();
+        assert!(
+            known.contains(&CLIENT_TYPE.to_string()),
+            "{CLIENT_TYPE} is a published client type"
+        );
         let response_keys = published("session_create_response_keys");
         assert!(response_keys.contains(&"cwd".to_string()));
         let decoded = serde_json::to_value(AgentSessionCreateResponse {
