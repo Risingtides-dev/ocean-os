@@ -16,8 +16,10 @@ approved design or permission to alter public contracts.
 - [ ] Keep cross-repository session, voice, component, and room contracts under
       executable drift checks rather than prose-only synchronization. Room,
       session, component and voice contracts are published in
-      `docs/contracts/` and pinned to the code. What remains is each consumer
-      vendoring them.
+      `docs/contracts/` and pinned to the code, and the in-repo consumers
+      (TUI, ACP, the MCP bridge and Ocean Buddy) are pinned to them (see the
+      consumer table in `docs/contracts/README.md`). What remains is
+      ocean-surface vendoring them; #225 covers `room-wire.json` there.
 
 ## Ocean Rooms distributed workspace
 

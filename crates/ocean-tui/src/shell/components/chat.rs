@@ -5035,6 +5035,66 @@ mod tests {
     use serde_json::json;
     use uuid::Uuid;
 
+    /// Consumer half of the component contract. `component_lines` and the
+    /// pinned-height table branch on component kinds; every kind they name
+    /// must be a published kind, and both must keep a fallback arm so a
+    /// published kind they do not project still renders.
+    #[test]
+    fn component_kinds_are_inside_the_published_component_wire() {
+        let wire: serde_json::Value = serde_json::from_str(include_str!(
+            "../../../../../docs/contracts/component-wire.json"
+        ))
+        .expect("component-wire.json parses");
+        let published: Vec<&str> = wire["kinds"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_str().unwrap())
+            .collect();
+        let source = include_str!("chat.rs");
+        let source = source.split("\n#[cfg(test)]\nmod tests {").next().unwrap();
+        let quoted = |line: &str| -> Vec<String> {
+            line.split("=>")
+                .next()
+                .unwrap()
+                .split('"')
+                .skip(1)
+                .step_by(2)
+                .map(str::to_string)
+                .collect()
+        };
+
+        let start = source
+            .find("fn component_lines(")
+            .expect("component_lines is defined");
+        let body = &source[start..];
+        let body = &body[..body.find("\n}\n").unwrap()];
+        let arm = |line: &&str| line.starts_with("        \"") && line.contains("=>");
+        let projected: Vec<String> = body.lines().filter(arm).flat_map(quoted).collect();
+        assert!(projected.len() > 5, "the scan found the projection arms");
+        assert!(
+            body.lines().any(|line| line.starts_with("        _ =>")),
+            "component_lines keeps a fallback arm"
+        );
+
+        let start = source
+            .find("Some(Turn::Component { kind, .. }) => match kind.as_str() {")
+            .expect("the pinned-height table is defined");
+        let table = &source[start..];
+        let table = &table[..table
+            .find("_ =>")
+            .expect("the pinned table keeps a fallback arm")];
+        let pinned: Vec<String> = table.lines().skip(1).flat_map(quoted).collect();
+        assert!(!pinned.is_empty(), "the scan found the pinned arms");
+
+        for kind in projected.iter().chain(&pinned) {
+            assert!(
+                published.contains(&kind.as_str()),
+                "the TUI branches on unpublished component kind {kind}"
+            );
+        }
+    }
+
     /// A chat with the composer pre-filled — avoids the `field_reassign_with_default`
     /// clippy lint that fires on `let mut c = default(); c.input = …`.
     fn chat_with(input: &str) -> ChatComponent {

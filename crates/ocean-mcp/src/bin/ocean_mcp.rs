@@ -326,12 +326,31 @@ fn arg_u64(args: &Value, key: &str) -> Option<u64> {
 /// A room message row as the model should read it. System audit rows carry a
 /// JSON body; the daemon already projects them as readable labels on newer
 /// builds, and we fall back to the `type` field on older ones.
+/// The room wire literals this bridge reads or sends. Each one is held inside
+/// `docs/contracts/room-wire.json` by
+/// `room_literals_are_inside_the_published_room_wire`.
+mod room_wire {
+    /// `/snapshot` keys `ocean_room_read` reads.
+    pub const SNAPSHOT_TRANSCRIPT: &str = "transcript";
+    pub const SNAPSHOT_HAS_MORE: &str = "has_more";
+    pub const SNAPSHOT_PREV_SEQ: &str = "prev_seq";
+    /// Message kinds `render_row` branches on.
+    pub const MESSAGE_KIND_MESSAGE: &str = "message";
+    pub const MESSAGE_KIND_SYSTEM: &str = "system";
+    /// Participant kinds the bridge sends (posts, joins) or reads (room list).
+    pub const PARTICIPANT_HUMAN: &str = "human";
+    pub const PARTICIPANT_AGENT: &str = "agent";
+}
+
 fn render_row(row: &Value) -> String {
     let seq = row.get("seq").and_then(Value::as_u64).unwrap_or(0);
     let author = row.get("author_id").and_then(Value::as_str).unwrap_or("?");
-    let kind = row.get("kind").and_then(Value::as_str).unwrap_or("message");
+    let kind = row
+        .get("kind")
+        .and_then(Value::as_str)
+        .unwrap_or(room_wire::MESSAGE_KIND_MESSAGE);
     let body = row.get("body").and_then(Value::as_str).unwrap_or("");
-    let body = if kind == "system" {
+    let body = if kind == room_wire::MESSAGE_KIND_SYSTEM {
         serde_json::from_str::<Value>(body)
             .ok()
             .and_then(|v| {
@@ -385,7 +404,11 @@ async fn call_tool(daemon: &Daemon, name: &str, args: &Value) -> Result<String> 
                                 format!(
                                     "{}{}",
                                     p["id"].as_str().unwrap_or("?"),
-                                    if p["kind"] == "agent" { " (agent)" } else { "" }
+                                    if p["kind"] == room_wire::PARTICIPANT_AGENT {
+                                        " (agent)"
+                                    } else {
+                                        ""
+                                    }
                                 )
                             })
                             .collect()
@@ -414,7 +437,7 @@ async fn call_tool(daemon: &Daemon, name: &str, args: &Value) -> Result<String> 
                 ))
                 .await?;
             let rows = v
-                .get("transcript")
+                .get(room_wire::SNAPSHOT_TRANSCRIPT)
                 .and_then(Value::as_array)
                 .cloned()
                 .unwrap_or_default();
@@ -422,8 +445,11 @@ async fn call_tool(daemon: &Daemon, name: &str, args: &Value) -> Result<String> 
                 "room {} — {} rows{}\n",
                 room,
                 rows.len(),
-                if v["has_more"] == true {
-                    format!(" (more before seq {})", v["prev_seq"].as_u64().unwrap_or(0))
+                if v[room_wire::SNAPSHOT_HAS_MORE] == true {
+                    format!(
+                        " (more before seq {})",
+                        v[room_wire::SNAPSHOT_PREV_SEQ].as_u64().unwrap_or(0)
+                    )
                 } else {
                     String::new()
                 }
@@ -440,7 +466,7 @@ async fn call_tool(daemon: &Daemon, name: &str, args: &Value) -> Result<String> 
             let member = daemon.member()?;
             let mut req = json!({
                 "author_id": member,
-                "author_kind": "human",
+                "author_kind": room_wire::PARTICIPANT_HUMAN,
                 "body": body,
             });
             if let Some(parent) = arg_u64(args, "thread_parent_seq") {
@@ -473,7 +499,7 @@ async fn call_tool(daemon: &Daemon, name: &str, args: &Value) -> Result<String> 
                     &format!("/v1/rooms/persistent/{room}/participants"),
                     json!({
                         "id": member,
-                        "kind": "human",
+                        "kind": room_wire::PARTICIPANT_HUMAN,
                         "display_name": member,
                     }),
                     Duration::from_secs(30),
@@ -923,6 +949,32 @@ fn identity_line(member: Option<&str>, daemon_identity: &Result<Value>) -> Strin
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Consumer half of the room contract: every snapshot key, message kind
+    /// and participant kind the bridge depends on is one the daemon publishes.
+    #[test]
+    fn room_literals_are_inside_the_published_room_wire() {
+        let wire: Value =
+            serde_json::from_str(include_str!("../../../../docs/contracts/room-wire.json"))
+                .expect("room-wire.json parses");
+        let published = |field: &str, literal: &str| {
+            assert!(
+                wire[field]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|v| v.as_str() == Some(literal)),
+                "{literal} is not a published {field} entry"
+            );
+        };
+        published("snapshot_keys", room_wire::SNAPSHOT_TRANSCRIPT);
+        published("snapshot_keys", room_wire::SNAPSHOT_HAS_MORE);
+        published("snapshot_keys", room_wire::SNAPSHOT_PREV_SEQ);
+        published("message_kinds", room_wire::MESSAGE_KIND_MESSAGE);
+        published("message_kinds", room_wire::MESSAGE_KIND_SYSTEM);
+        published("participant_kinds", room_wire::PARTICIPANT_HUMAN);
+        published("participant_kinds", room_wire::PARTICIPANT_AGENT);
+    }
     use axum::{routing::get, routing::post, Json, Router};
 
     #[test]

@@ -115,12 +115,7 @@ impl DaemonClient {
     /// lazily, held only in memory) was lost on restart.
     pub async fn create_session(&self, cwd: &str) -> Result<AgentSessionCreateResponse> {
         let url = format!("{}/v1/agent/sessions", self.base_url);
-        let body = AgentSessionCreateRequest {
-            workspace_root: cwd.to_string(),
-            project_id: None,
-            model: None,
-            client_type: Some(CLIENT_TYPE.to_string()),
-        };
+        let body = session_create_request(cwd);
         let resp = self
             .http
             .post(&url)
@@ -476,6 +471,18 @@ impl OceanEventStream {
     }
 }
 
+/// The `POST /v1/agent/sessions` body the bridge sends. Its keys are held
+/// inside `docs/contracts/session-wire.json` by
+/// `session_create_is_inside_the_published_session_wire`.
+fn session_create_request(cwd: &str) -> AgentSessionCreateRequest {
+    AgentSessionCreateRequest {
+        workspace_root: cwd.to_string(),
+        project_id: None,
+        model: None,
+        client_type: Some(CLIENT_TYPE.to_string()),
+    }
+}
+
 fn parse_session_id(s: &str) -> Result<uuid::Uuid> {
     uuid::Uuid::parse_str(s).with_context(|| format!("invalid session id: {s:?}"))
 }
@@ -555,4 +562,49 @@ struct ModelSetResponse {
     model: Option<String>,
     #[serde(default)]
     error: Option<String>,
+}
+
+#[cfg(test)]
+mod contract_tests {
+    use super::*;
+
+    /// Consumer half of the session contract: the create body the bridge
+    /// sends and the create response it decodes (it relies on `cwd`) stay
+    /// inside the published keys.
+    #[test]
+    fn session_create_is_inside_the_published_session_wire() {
+        let wire: serde_json::Value =
+            serde_json::from_str(include_str!("../../../docs/contracts/session-wire.json"))
+                .expect("session-wire.json parses");
+        let published = |field: &str| -> Vec<String> {
+            wire[field]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|v| v.as_str().unwrap().to_string())
+                .collect()
+        };
+        let request_fields = published("session_create_request_fields");
+        let sent = serde_json::to_value(session_create_request("/w")).unwrap();
+        for key in sent.as_object().unwrap().keys() {
+            assert!(
+                request_fields.contains(key),
+                "the bridge sends unpublished session-create field {key}"
+            );
+        }
+        let response_keys = published("session_create_response_keys");
+        assert!(response_keys.contains(&"cwd".to_string()));
+        let decoded = serde_json::to_value(AgentSessionCreateResponse {
+            session_id: ocean_agent_sdk::AgentSessionId(uuid::Uuid::nil()),
+            cwd: "/w".into(),
+            client_type: Some(CLIENT_TYPE.into()),
+        })
+        .unwrap();
+        for key in decoded.as_object().unwrap().keys() {
+            assert!(
+                response_keys.contains(key),
+                "the bridge decodes unpublished session-create key {key}"
+            );
+        }
+    }
 }
