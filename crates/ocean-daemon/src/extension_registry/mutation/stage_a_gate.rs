@@ -2224,10 +2224,13 @@ async fn stage_a_gate_crash_resume_backoff_circuit_and_explicit_retry() {
         3,
         "three crash starts before the circuit opened"
     );
+    // The upper slack stays under 1000 ms so a 1 s -> 2 s backoff step still
+    // fails (M11b), but it absorbs hosted-runner scheduling: ubuntu CI once
+    // measured 1629 ms for the 1 s step against the earlier +500 ms slack.
     for (gap, delay) in stamps.windows(2).zip([1000u64, 2000]) {
         let gap = gap[1].duration_since(gap[0]).as_millis() as u64;
         assert!(
-            gap + 60 >= delay && gap < delay + 500,
+            gap + 60 >= delay && gap < delay + 900,
             "backoff gap {gap} ms is not the ratified {delay} ms"
         );
     }
