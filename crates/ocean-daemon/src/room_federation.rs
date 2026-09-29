@@ -3032,6 +3032,10 @@ struct MessagePayload {
 #[serde(deny_unknown_fields)]
 struct MembersEnvelope {
     members: Vec<WireMember>,
+    // Additive Bedrock metadata, not a substitute for the room credential's
+    // local_human_member_id. Older coordinators omit it.
+    #[serde(default, rename = "caller_member_ids")]
+    _caller_member_ids: Vec<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -4640,6 +4644,26 @@ mod tests {
     use tokio_stream::wrappers::ReceiverStream;
 
     static ENV_LOCK: StdMutex<()> = StdMutex::new(());
+
+    #[test]
+    fn room_roster_accepts_typed_caller_metadata_without_relaxing_schema() {
+        for body in [
+            json!({"members": []}),
+            json!({"members": [], "caller_member_ids": []}),
+            json!({"members": [], "caller_member_ids": ["owner", "agent"]}),
+        ] {
+            assert!(serde_json::from_value::<MembersEnvelope>(body).is_ok());
+        }
+        for body in [
+            json!({"members": [], "caller_member_ids": null}),
+            json!({"members": [], "caller_member_ids": "owner"}),
+            json!({"members": [], "caller_member_ids": [1]}),
+            json!({"members": [], "unexpected": []}),
+            json!({"caller_member_ids": []}),
+        ] {
+            assert!(serde_json::from_value::<MembersEnvelope>(body).is_err());
+        }
+    }
 
     #[test]
     fn p2c_room_keys_and_control_member_invariants_are_strict() {
@@ -10350,6 +10374,7 @@ mod tests {
         let mut access_rx = access_wakes.test_subscribe();
         let fake = FakeBedrock::new(key.as_str(), "secret-bearer");
         *fake.members.lock().await = json!({
+            "caller_member_ids": [local_human],
             "members": [
                 {
                     "member_id": local_human,
