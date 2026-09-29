@@ -214,6 +214,13 @@ This crate owns the long-running Ocean HTTP service on `:4780`, including API ro
 
 ## Work Guidance
 
+- Bedrock roster envelopes accept optional typed `caller_member_ids` metadata
+  while retaining strict unknown-field rejection. This metadata never replaces
+  credential-owned local identity or grants authority; older servers may omit it.
+  `room_roster_accepts_typed_caller_metadata_without_relaxing_schema` pins both
+  shapes, and `sender_and_receiver_use_durable_sse_rail` exercises the current
+  envelope through roster hydration, presence, and confirmed live delivery.
+
 - If any unread event on a room-list page has legacy-unknown mention metadata,
   omit the additive `attention` array for that page while retaining `rooms` and
   `read_states`. Existing Surface clients interpret absence as unknown; never
