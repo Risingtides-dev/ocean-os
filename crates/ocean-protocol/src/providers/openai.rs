@@ -143,10 +143,18 @@ fn is_blocking_empty_turn(stop: StopReason, has_usable_content: bool) -> bool {
 ///
 /// Returns the text with the block(s) removed plus `(name, arguments)` pairs.
 /// Both the true unicode token (`｜` U+FF5C) and the ASCII-pipe fallback some
-/// serving stacks detokenize to are recognized. A missing closing tag
+/// serving stacks detokenize to are recognized, each with a single or doubled bar. A missing closing tag
 /// (truncated emission) still salvages: the final block extends to end-of-text.
 pub(crate) fn salvage_dsml_tool_calls(text: &str) -> Option<(String, Vec<(String, Value)>)> {
-    const MARKS: [(&str, &str); 2] = [("<｜DSML｜", "</｜DSML｜"), ("<|DSML|", "</|DSML|")];
+    // deepseek-v4-pro on 2026-09-30 leaked the token with a DOUBLED bar
+    // (`<｜｜DSML｜｜tool_calls>`); the single-bar forms missed it and every such
+    // turn ended with the call printed as text and never run.
+    const MARKS: [(&str, &str); 4] = [
+        ("<｜DSML｜", "</｜DSML｜"),
+        ("<|DSML|", "</|DSML|"),
+        ("<｜｜DSML｜｜", "</｜｜DSML｜｜"),
+        ("<||DSML||", "</||DSML||"),
+    ];
     for (open, close) in MARKS {
         let start_tag = format!("{open}tool_calls>");
         let end_tag = format!("{close}tool_calls>");
@@ -1308,6 +1316,23 @@ mod tests {
         assert_eq!(args["limit"], serde_json::json!(100));
         assert_eq!(args["offset"], serde_json::json!(1793));
         assert_eq!(args["path"], serde_json::json!("/tmp/x/src/components.rs"));
+    }
+
+    #[test]
+    fn dsml_salvage_recovers_doubled_bar_tokens() {
+        // Verbatim shape from a seeno deepseek-v4-pro turn, 2026-09-30.
+        let text = "<｜｜DSML｜｜tool_calls>\n<｜｜DSML｜｜invoke name=\"bash\">\n<｜｜DSML｜｜parameter name=\"command\" string=\"true\">cd /tmp && git show df1db3eef --stat</｜｜DSML｜｜parameter>\n</｜｜DSML｜｜invoke>\n</｜｜DSML｜｜tool_calls>";
+        let (cleaned, calls) = salvage_dsml_tool_calls(text).expect("doubled-bar block salvaged");
+        assert!(cleaned.is_empty());
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].0, "bash");
+        assert_eq!(
+            calls[0].1["command"],
+            "cd /tmp && git show df1db3eef --stat"
+        );
+        let ascii = "<||DSML||tool_calls><||DSML||invoke name=\"read\"><||DSML||parameter name=\"path\" string=\"true\">a.rs</||DSML||parameter></||DSML||invoke></||DSML||tool_calls>";
+        let (_, calls) = salvage_dsml_tool_calls(ascii).expect("doubled ascii block salvaged");
+        assert_eq!(calls[0].0, "read");
     }
 
     #[test]
