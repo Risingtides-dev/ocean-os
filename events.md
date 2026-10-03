@@ -11415,3 +11415,40 @@ area:      [backend]
 
 Production shared-room clients recovered repeatedly because Bedrock's members response includes caller_member_ids while MembersEnvelope denied that additive field. Accept the optional typed string array without using it for identity or authorization, preserving strict unknown-field rejection. Add malformed/legacy-envelope coverage and exercise the current envelope through the existing durable SSE integration test. Formatting and diff checks pass; compilation, independent review, and production verification are in progress. The canonical ledger entry is carried unchanged into the feature branch for review.
 _________________________________________________________________________________ 12:28 codex/rooms-roster-caller-ids
+time:      [20:57] [02-10-26]
+agent:     [claude code], [claude-fable-5-1]
+worktree:  fix/oauth-refresh-resnapshot
+type:      [bug report]
+area:      [backend]
+
+Deployed `origin/main` 0abb558 to the operator host (daemon via
+`ops/install-ocean-daemon.sh`, TUI via `ops/install-ocean-tui.sh`, both from a
+clean detached worktree; `/health` reports rev 0abb558179af, the TUI symlink
+flipped to `ocean-0abb558179af`). The running daemon had been f4f9730a (the
+#453 merge, 102 commits behind) and the TUI a 19-07-26 build. First Claude turn
+after the restart exposed a credential bug: the `claude-code` OAuth block had
+expired while the daemon was down, so `set_model`/startup stored a snapshot
+with NO credential; the turn-top `oauth_refresh::ensure_fresh` then refreshed
+the block on disk (log: `refreshed OAuth token block=claude-code`) but the
+turn still read `snapshot().provider_config`, saw "missing credential", and
+routed to a fallback — and `/ready` kept reporting `MISSING_CREDENTIAL` while
+`/v1/models` (which re-resolves from the file) said ready. Re-POSTing
+`/v1/model` with the same id cleared it, which proved the snapshot was the
+stale part. The same path meant a token that ROTATED after selection kept
+streaming the old bearer (`RuntimeState.api_key` is what the stream sends).
+Fix in `ocean-agent`: `refreshed_global_snapshot(&env)` re-resolves the
+stored selection from the turn env after `ensure_fresh`, adopts the result
+only when the selection is identical and a credential resolved, and writes it
+back so `/ready` and later turns agree; any failure keeps the stored snapshot
+so no turn that ran before can regress. Three tests cover expired-at-select,
+rotated-after-select, and vanished-file. Verified live after the fix pattern:
+a `claude-code-fable-5-1` turn through the new daemon returned `ok:true`.
+Also found, fixed separately: the default fallback order's `gpt-5.4` now
+answers 400 "not supported when using Codex with a ChatGPT account". Codex
+tokens in `~/.config/ocean-rs/auth.json` and `~/.codex/auth.json` both
+refreshed; the operator's `gpt-5.6-sol` default was restored after the test
+turns. `cargo test -p ocean-agent` (255/255 green), `cargo clippy -p
+ocean-agent --all-targets -- -D warnings` (clean), `cargo fmt --check`
+(clean), `cargo check -p ocean-daemon` (clean) all pass on top of
+`origin/main` 0abb558.
+_________________________________________________________________________________ 20:57 fix/oauth-refresh-resnapshot
