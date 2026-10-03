@@ -639,6 +639,47 @@ impl AgentRuntime {
         self.state.read().expect("runtime state poisoned").clone()
     }
 
+    /// The global runtime state for a turn, with its credential re-resolved
+    /// against `env`.
+    ///
+    /// `set_model` resolves the provider config once and stores it, so the
+    /// stored state carries the credential exactly as it was at selection
+    /// time. The turn-top OAuth refresh rewrites auth.json, but nothing
+    /// re-read it: a daemon that (re)started on an expired block kept "missing
+    /// credential" in its snapshot and routed every turn to a fallback until an
+    /// operator re-picked the model, and a token that rotated after selection
+    /// kept streaming the old bearer. Re-resolving the SAME selection from the
+    /// same env the failover decision uses makes the stored credential live;
+    /// the refreshed state is written back so `/ready` and later turns see it
+    /// too.
+    ///
+    /// Only the credential may change here. A resolution that fails, lands on
+    /// a different selection (the alias no longer routes, an `OCEAN_PROVIDER`
+    /// override moved), or finds no credential keeps the stored snapshot
+    /// untouched, so this can never regress a turn that would have run before.
+    fn refreshed_global_snapshot(&self, env: &ProviderEnv) -> RuntimeState {
+        let stored = self.snapshot();
+        let mut probe = env.clone();
+        probe.vars.insert(
+            "OCEAN_MODEL".to_string(),
+            stored.provider_config.selection.model.clone(),
+        );
+        let fresh = match resolve_provider_config(&probe) {
+            Ok(config) if config.selection == stored.provider_config.selection => config,
+            _ => return stored,
+        };
+        if fresh.credential.is_none() || fresh.credential == stored.provider_config.credential {
+            return stored;
+        }
+        match state_from_provider_config(fresh) {
+            Ok(state) => {
+                *self.state.write().expect("runtime state poisoned") = state.clone();
+                state
+            }
+            Err(_) => stored,
+        }
+    }
+
     /// The per-turn environment snapshot driving provider failover (OCEAN-275).
     ///
     /// Production reads the live process environment. In test builds a runtime
@@ -918,13 +959,17 @@ impl AgentRuntime {
                 None => None,
             },
         };
-        let global_snapshot = self.snapshot();
-        let turn_snapshot: RuntimeState = turn_state.unwrap_or_else(|| global_snapshot.clone());
-
         // Resolve the environment ONCE for the whole failover decision (selection
         // + connect-failure), so the fallback list is computed against a single
         // consistent snapshot and the process env is read once per turn.
         let env = self.turn_env();
+
+        // The global model's credential is re-read from `env` here rather than
+        // taken from the stored snapshot: `ensure_fresh` above may have just
+        // rewritten auth.json, and the snapshot is what the stream would
+        // otherwise send (see `refreshed_global_snapshot`).
+        let global_snapshot = self.refreshed_global_snapshot(&env);
+        let turn_snapshot: RuntimeState = turn_state.unwrap_or_else(|| global_snapshot.clone());
 
         // Selection-time failover (OCEAN-275). If the EFFECTIVE provider for this
         // turn is not ready (degraded / missing credential), route to a ready
@@ -5578,6 +5623,116 @@ done
             }),
             account_id: None,
         }
+    }
+
+    /// A claude-code OAuth block at `path`, expiring `expires_in_secs` from
+    /// now (negative = already expired).
+    fn write_claude_code_auth(path: &std::path::Path, access: &str, expires_in_secs: i64) {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64;
+        let expires_ms = (now + expires_in_secs) * 1_000;
+        std::fs::write(
+            path,
+            format!(
+                r#"{{"claude-code":{{"type":"oauth","access":"{access}","refresh":"r","expires":{expires_ms}}}}}"#
+            ),
+        )
+        .unwrap();
+    }
+
+    /// A runtime whose stored snapshot was resolved from `env` for
+    /// `claude-sonnet-5` — i.e. exactly what `set_model` would have stored
+    /// given the auth file as it was at selection time.
+    fn claude_runtime_resolved_from(env: &ProviderEnv, dir: PathBuf) -> AgentRuntime {
+        let mut probe = env.clone();
+        probe
+            .vars
+            .insert("OCEAN_MODEL".to_string(), "claude-sonnet-5".to_string());
+        let stored = resolve_provider_config(&probe).unwrap();
+        runtime_with_env(dir, stored, Some(env.clone()))
+    }
+
+    fn resnapshot_env(name: &str) -> (PathBuf, ProviderEnv) {
+        let dir = std::env::temp_dir().join(format!(
+            "ocean-agent-resnapshot-{name}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let env = ProviderEnv {
+            vars: std::collections::BTreeMap::new(),
+            auth_file: Some(dir.join("auth.json")),
+            codex_auth_file: None,
+        };
+        (dir, env)
+    }
+
+    #[test]
+    fn global_snapshot_picks_up_a_credential_refreshed_after_selection() {
+        // The daemon (re)started while the claude-code block was expired, so
+        // the stored snapshot has NO credential. The turn-top refresh then
+        // rewrote auth.json with a live token. The turn must see that token —
+        // and so must `/ready` afterwards — without anyone re-picking the model.
+        let (dir, env) = resnapshot_env("expired-at-select");
+        let auth = env.auth_file.clone().unwrap();
+        write_claude_code_auth(&auth, "expired-bearer", -60);
+        let rt = claude_runtime_resolved_from(&env, dir.clone());
+        assert!(
+            !rt.provider_readiness().ok,
+            "stored snapshot starts degraded"
+        );
+        assert_eq!(rt.snapshot().api_key, None);
+
+        write_claude_code_auth(&auth, "fresh-bearer", 3_600);
+        let state = rt.refreshed_global_snapshot(&env);
+        assert_eq!(state.api_key.as_deref(), Some("fresh-bearer"));
+        assert_eq!(state.provider_config.selection.model, "claude-sonnet-5");
+        assert!(rt.provider_readiness().ok, "written back: /ready agrees");
+        assert_eq!(rt.snapshot().api_key.as_deref(), Some("fresh-bearer"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn global_snapshot_follows_a_token_rotated_after_selection() {
+        // Ready at selection, then the refresh rotated the bearer on disk. The
+        // stream must send the new one, not the token captured at selection.
+        let (dir, env) = resnapshot_env("rotated");
+        let auth = env.auth_file.clone().unwrap();
+        write_claude_code_auth(&auth, "old-bearer", 3_600);
+        let rt = claude_runtime_resolved_from(&env, dir.clone());
+        assert_eq!(rt.snapshot().api_key.as_deref(), Some("old-bearer"));
+
+        write_claude_code_auth(&auth, "new-bearer", 3_600);
+        assert_eq!(
+            rt.refreshed_global_snapshot(&env).api_key.as_deref(),
+            Some("new-bearer")
+        );
+        assert_eq!(rt.snapshot().api_key.as_deref(), Some("new-bearer"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn global_snapshot_keeps_the_stored_credential_when_none_resolves() {
+        // The auth file vanished (or the block did) after selection. Nothing on
+        // disk is better than what the snapshot holds, so the turn keeps the
+        // stored credential exactly as before this re-resolution existed.
+        let (dir, env) = resnapshot_env("vanished");
+        let auth = env.auth_file.clone().unwrap();
+        write_claude_code_auth(&auth, "stored-bearer", 3_600);
+        let rt = claude_runtime_resolved_from(&env, dir.clone());
+
+        std::fs::remove_file(&auth).unwrap();
+        assert_eq!(
+            rt.refreshed_global_snapshot(&env).api_key.as_deref(),
+            Some("stored-bearer")
+        );
+        assert_eq!(rt.snapshot().api_key.as_deref(), Some("stored-bearer"));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     fn runtime(config_dir: PathBuf, provider_config: ProviderConfig) -> AgentRuntime {
