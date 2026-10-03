@@ -535,7 +535,7 @@ pub const ENV_PROVIDER_FALLBACK: &str = "OCEAN_PROVIDER_FALLBACK";
 /// who wants that can still list `fake` explicitly in the env override).
 pub const DEFAULT_FALLBACK_ORDER: &[&str] = &[
     "claude-sonnet-5",  // claude-code oauth
-    "gpt-5.4",          // openai-codex
+    "gpt-5.5",          // openai-codex
     "deepseek-v4-pro",  // deepseek
     "gemini-2.0-flash", // google
     "kimi-k2.6",        // kimi
@@ -787,9 +787,13 @@ pub fn known_models() -> Vec<KnownModel> {
         m("gpt-5.6-terra", "openai-codex", "GPT-5.6 Terra (Codex)"),
         m("gpt-5.6-luna", "openai-codex", "GPT-5.6 Luna (Codex)"),
         m("gpt-5.5", "openai-codex", "GPT-5.5 (Codex)"),
-        m("gpt-5.4", "openai-codex", "GPT-5.4 (Codex)"),
-        m("gpt-5.4-mini", "openai-codex", "GPT-5.4 Mini (Codex)"),
-        m("gpt-5.3-codex-spark", "openai-codex", "GPT-5.3 Codex Spark"),
+        // `gpt-5.4`, `gpt-5.4-mini` and `gpt-5.3-codex-spark` are retired from
+        // the menu: the Codex backend answers 400 "not supported when using
+        // Codex with a ChatGPT account" for all three (verified live
+        // 2026-10-02; they still answered on 2026-09-04). They stay routable as
+        // legacy arms in `resolve_model_selection` so sessions pinned to them
+        // keep resolving — and then fail over at selection like any other
+        // degraded primary — but the picker must stop offering them.
         m("gpt-4o", "openai", "GPT-4o"),
         m("gpt-4o-mini", "openai", "GPT-4o Mini"),
         // Current Claude generation (verified against api.anthropic.com
@@ -976,6 +980,8 @@ pub fn resolve_model_selection(env: &ProviderEnv) -> Result<ModelSelection, Prov
             400_000,
             128_000,
         )),
+        // LEGACY Codex ids — off the menu (see `known_models`), kept routable
+        // for pinned sessions.
         "gpt-5.4" | "gpt-5-4" => Ok(model_selection(
             ProviderId::OpenAiCodex,
             "gpt-5.4",
@@ -2231,9 +2237,6 @@ mod tests {
             "gpt-5.6-terra",
             "gpt-5.6-luna",
             "gpt-5.5",
-            "gpt-5.4",
-            "gpt-5.4-mini",
-            "gpt-5.3-codex-spark",
             // Current Claude generation (2026-07 refresh + Opus 5 release).
             // The retired 4-6/4-7/4-8 ids stay ROUTABLE (legacy arms, pinned
             // sessions) but are deliberately NOT in the menu, so they're
@@ -2765,6 +2768,25 @@ mod tests {
         assert!(listed.contains("claude-code-fable-5"));
 
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn retired_codex_ids_stay_routable_but_leave_the_menu_and_fallback() {
+        // Codex rejects these three for ChatGPT accounts (400, verified live
+        // 2026-10-02). A session pinned to one must still resolve — the
+        // selection-time failover then routes it — but the picker and the
+        // default fallback order must not steer anyone onto a dead id.
+        let listed: std::collections::BTreeSet<String> =
+            known_models().into_iter().map(|m| m.id).collect();
+        for id in ["gpt-5.4", "gpt-5.4-mini", "gpt-5.3-codex-spark"] {
+            let sel = resolve_model_selection(&env(&[("OCEAN_MODEL", id)])).unwrap();
+            assert_eq!(sel.provider, ProviderId::OpenAiCodex, "{id}");
+            assert_eq!(sel.model, id);
+            assert!(!listed.contains(id), "{id} must be off the menu");
+        }
+        assert!(listed.contains("gpt-5.5"));
+        assert!(DEFAULT_FALLBACK_ORDER.contains(&"gpt-5.5"));
+        assert!(!DEFAULT_FALLBACK_ORDER.contains(&"gpt-5.4"));
     }
 
     #[test]

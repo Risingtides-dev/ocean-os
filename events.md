@@ -11415,3 +11415,27 @@ area:      [backend]
 
 Production shared-room clients recovered repeatedly because Bedrock's members response includes caller_member_ids while MembersEnvelope denied that additive field. Accept the optional typed string array without using it for identity or authorization, preserving strict unknown-field rejection. Add malformed/legacy-envelope coverage and exercise the current envelope through the existing durable SSE integration test. Formatting and diff checks pass; compilation, independent review, and production verification are in progress. The canonical ledger entry is carried unchanged into the feature branch for review.
 _________________________________________________________________________________ 12:28 codex/rooms-roster-caller-ids
+time:      [21:10] [02-10-26]
+agent:     [claude code], [claude-fable-5-1]
+worktree:  fix/retire-dead-codex-ids
+type:      [bug report]
+area:      [backend]
+
+Retired `gpt-5.4`, `gpt-5.4-mini` and `gpt-5.3-codex-spark` from the model
+picker and moved the default fallback order's Codex entry from `gpt-5.4` to
+`gpt-5.5`. Probed every Codex menu id on the operator's ChatGPT Pro
+subscription with a fresh token on 02-10-26: `gpt-5.6-sol`, `gpt-5.6-terra`,
+`gpt-5.6-luna` and `gpt-5.5` return 200; the three retired ids return 400
+"The '<id>' model is not supported when using Codex with a ChatGPT account"
+(all seven had answered on 04-09-26 — the backend dropped them in between). The
+dead `gpt-5.4` fallback was found the hard way: the stale-credential turn that
+PR #527 fixes fell over to it and failed a second time on that 400. The three
+ids stay routable as legacy arms in `resolve_model_selection` so a session
+pinned to one keeps resolving and then fails over at selection like any other
+degraded primary; the picker and `DEFAULT_FALLBACK_ORDER` no longer steer
+anyone onto them. One new test pins all three invariants (routable, off the
+menu, fallback moved); the menu-invariant list drops the three ids.
+`cargo test -p ocean-providers` (53/53 green), `cargo clippy -p
+ocean-providers --all-targets -- -D warnings` (clean) and `cargo fmt --check`
+(clean) pass on top of `origin/main` 0abb558.
+_________________________________________________________________________________ 21:10 fix/retire-dead-codex-ids
