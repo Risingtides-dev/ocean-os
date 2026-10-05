@@ -11587,3 +11587,12 @@ area:      [backend]
 
 PR #532 split-reasoning privacy repair: restrict reasoning-only visible-answer promotion to the intended DeepSeek compatibility route. MiniMax M3/Preview, GLM and OpenAI retain partial length-limited reasoning only as Thinking. Local HTTP streaming regression checks deltas and persisted terminal content across five routes; protocol suite passes. Updated protocol contract; ownership/index unchanged. Full CI and fresh exact-head review follow.
 _________________________________________________________________________________ 14:56 codex/provider-model-refresh-20261005
+
+time:      [15:06] [05-10-26]
+agent:     [codex], [gpt-6]
+worktree:  codex/ocean-max-effort-20261005
+type:      [bug report]: Distinct legacy Claude controls
+area:      [review]
+
+The exact 023f2190 local gate passed 3,717 tests with zero failures and 16 existing ignores. Reconciled provider refresh 1a005a8a, retaining its provider-specific private-reasoning boundary. Removed legacy Claude Xhigh from public capabilities because the output cap makes its budget identical to High; current adaptive Claude controls remain distinct. Catalog regression and new split-reasoning regression pass. Owning crates contract updated; parent ownership and child indexes unchanged. Integrated gate and fresh review follow.
+_________________________________________________________________________________ 15:06 codex/ocean-max-effort-20261005

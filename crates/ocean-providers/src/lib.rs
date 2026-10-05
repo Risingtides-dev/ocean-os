@@ -763,7 +763,7 @@ fn model_reasoning_efforts(id: &str, provider: &str) -> Vec<String> {
         ("claude-code", "claude-opus-5-5" | "claude-code-fable-5-1") => {
             &["low", "medium", "high", "xhigh", "max"]
         }
-        ("claude-code", _) => &["off", "minimal", "low", "medium", "high", "xhigh"],
+        ("claude-code", _) => &["off", "minimal", "low", "medium", "high"],
         ("deepseek", _) => &["off", "high", "max"],
         ("glm", "glm-5.3" | "glm-5.3-flash") => &["low", "high", "max"],
         ("minimax", "MiniMax-M3.1-Flash-Preview") => &["low", "medium", "high", "xhigh"],
@@ -2437,6 +2437,14 @@ mod tests {
             "claude-code-fable-5-1",
         ] {
             assert_eq!(efforts(id), ["low", "medium", "high", "xhigh", "max"]);
+        }
+        for id in [
+            "claude-opus-5",
+            "claude-sonnet-5",
+            "claude-haiku-4-5",
+            "claude-code-fable-5",
+        ] {
+            assert_eq!(efforts(id), ["off", "minimal", "low", "medium", "high"]);
         }
         assert_eq!(efforts("glm-5.3"), ["low", "high", "max"]);
         assert_eq!(efforts("gpt-5.6-sol"), ["minimal", "low", "medium", "high"]);
