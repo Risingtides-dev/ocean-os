@@ -368,7 +368,10 @@ fn build_body_for_model(model: &Model, context: &Context, options: &StreamOption
         if model.id.starts_with("gemini-3.") {
             let thinking = match level {
                 ThinkingLevel::Off | ThinkingLevel::Minimal
-                    if model.id == "gemini-3.1-pro-preview" =>
+                    if matches!(
+                        model.id.as_str(),
+                        "gemini-3.1-pro-preview" | "gemini-3.8-flash"
+                    ) =>
                 {
                     "low"
                 }
@@ -1527,5 +1530,27 @@ mod tests {
         let body = build_body_for_model(&model, &context, &StreamOptions::default());
         assert!(!body.to_string().contains("signed-one"));
         assert!(!body.to_string().contains("private summary"));
+    }
+    #[test]
+    fn current_gemini_models_map_lowest_settings_to_supported_levels() {
+        for (id, expected) in [
+            ("gemini-3.8-flash", "low"),
+            ("gemini-3.1-pro-preview", "low"),
+            ("gemini-3.5-flash-lite", "minimal"),
+        ] {
+            let mut model = Model::gemini_2_0_flash();
+            model.id = id.into();
+            for level in [ThinkingLevel::Off, ThinkingLevel::Minimal] {
+                let options = StreamOptions {
+                    reasoning: Some(level),
+                    ..Default::default()
+                };
+                let body = build_body_for_model(&model, &empty_context(), &options);
+                assert_eq!(
+                    body["generationConfig"]["thinkingConfig"]["thinkingLevel"],
+                    expected
+                );
+            }
+        }
     }
 }

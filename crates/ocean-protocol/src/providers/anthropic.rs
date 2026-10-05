@@ -32,6 +32,7 @@ const ANTHROPIC_VERSION: &str = "2023-06-01";
 /// carries `anthropic-beta: oauth-2025-04-20`. API-key requests never send it
 /// (their wire shape is unchanged). Mirrors OMP's `claudeCode*BetaDefaults`.
 const ANTHROPIC_OAUTH_BETA: &str = "oauth-2025-04-20";
+const THINKING_BINDING_BETA: &str = "thinking-binding-controls-2026-08-01";
 
 /// The Claude Code identity line that must OPEN the system prompt on OAuth
 /// requests — the other half of the OAuth fingerprint (Anthropic validates
@@ -380,7 +381,13 @@ fn build_body(model: &Model, context: &Context, options: &StreamOptions) -> Valu
     );
     if adaptive {
         // Current Claude models reject manual budgets and sampling overrides.
-        body["thinking"] = json!({"type": "adaptive", "block_binding": {"prefix_mismatch_behavior": "drop_block"}});
+        if model.id == "claude-sonnet-5-5" && options.reasoning == Some(ThinkingLevel::Off) {
+            // Sonnet permits no up-front thinking only in between-tools mode,
+            // which cannot carry adaptive block-binding controls.
+            body["thinking"] = json!({"type": "between_tools"});
+        } else {
+            body["thinking"] = json!({"type": "adaptive", "block_binding": {"prefix_mismatch_behavior": "drop_block"}});
+        }
         if let Some(level) = options.reasoning {
             let effort = match level {
                 ThinkingLevel::Off | ThinkingLevel::Minimal | ThinkingLevel::Low => "low",
@@ -487,20 +494,51 @@ enum BlockKind {
 /// path used when the credential is an access token (Claude Code plan OAuth)
 /// rather than an API key. Bearer ALSO sends the mandatory
 /// `anthropic-beta: oauth-2025-04-20` flag: Anthropic rejects oat01 bearers
-/// without it, and API-key requests must not grow new headers.
+/// without it. Model-specific feature betas are merged separately for both auth paths.
 ///
 /// Extracted from the retry closure so the wire shape is directly testable
 /// without an HTTP round-trip; `AnthropicProvider::stream` delegates here.
+fn request_beta(
+    body: &Value,
+    method: AuthMethod,
+    headers: &BTreeMap<String, String>,
+) -> Option<String> {
+    let mut values = Vec::new();
+    if method == AuthMethod::Bearer {
+        values.push(ANTHROPIC_OAUTH_BETA.to_string());
+    }
+    if body.pointer("/thinking/block_binding").is_some() {
+        values.push(THINKING_BINDING_BETA.to_string());
+    }
+    for (key, value) in headers {
+        if key.eq_ignore_ascii_case("anthropic-beta") {
+            for beta in value
+                .split(',')
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+            {
+                if !values.iter().any(|value| value == beta) {
+                    values.push(beta.to_string());
+                }
+            }
+        }
+    }
+    (!values.is_empty()).then(|| values.join(","))
+}
+
 fn apply_auth(
     req: reqwest::RequestBuilder,
     method: AuthMethod,
     secret: &str,
+    beta: Option<&str>,
 ) -> reqwest::RequestBuilder {
-    match method {
+    let req = match method {
         AuthMethod::ApiKey => req.header("x-api-key", secret),
-        AuthMethod::Bearer => req
-            .bearer_auth(secret)
-            .header("anthropic-beta", ANTHROPIC_OAUTH_BETA),
+        AuthMethod::Bearer => req.bearer_auth(secret),
+    };
+    match beta.or_else(|| (method == AuthMethod::Bearer).then_some(ANTHROPIC_OAUTH_BETA)) {
+        Some(beta) => req.header("anthropic-beta", beta),
+        None => req,
     }
 }
 
@@ -544,9 +582,12 @@ impl Provider for AnthropicProvider {
                         .header("anthropic-version", ANTHROPIC_VERSION)
                         .header("accept", "text/event-stream")
                         .header("content-type", "application/json");
-                    req = apply_auth(req, auth, &api_key);
+                    let beta = request_beta(&body, auth, &extra_headers);
+                    req = apply_auth(req, auth, &api_key, beta.as_deref());
                     for (k, v) in extra_headers {
-                        req = req.header(k, v);
+                        if !k.eq_ignore_ascii_case("anthropic-beta") {
+                            req = req.header(k, v);
+                        }
                     }
                     let r = match req.json(&body).send().await {
                         Ok(r) => r,
@@ -1449,7 +1490,7 @@ mod tests {
         let req = client
             .post("https://example.test/v1/messages")
             .header("anthropic-version", ANTHROPIC_VERSION);
-        let built = apply_auth(req, AuthMethod::ApiKey, "sk-test-123")
+        let built = apply_auth(req, AuthMethod::ApiKey, "sk-test-123", None)
             .build()
             .expect("request builds");
         let headers = built.headers();
@@ -1480,7 +1521,7 @@ mod tests {
         let req = client
             .post("https://example.test/v1/messages")
             .header("anthropic-version", ANTHROPIC_VERSION);
-        let built = apply_auth(req, AuthMethod::Bearer, "oauth-token-456")
+        let built = apply_auth(req, AuthMethod::Bearer, "oauth-token-456", None)
             .build()
             .expect("request builds");
         let headers = built.headers();
@@ -1610,5 +1651,73 @@ mod tests {
             thinking_signature: Some("google-parts:[]".into()),
         };
         assert!(content_to_block(&content).is_none());
+    }
+    #[test]
+    fn binding_beta_is_merged_with_auth_and_custom_betas_once() {
+        for id in ["claude-opus-5-5", "claude-sonnet-5-5", "claude-fable-5-1"] {
+            let mut model = Model::anthropic_claude_fable_5_1();
+            model.id = id.into();
+            let body = build_body(&model, &Context::default(), &StreamOptions::default());
+            for auth in [AuthMethod::ApiKey, AuthMethod::Bearer] {
+                let extras = BTreeMap::from([(
+                    "Anthropic-Beta".into(),
+                    format!("custom-beta, {THINKING_BINDING_BETA}"),
+                )]);
+                let beta = request_beta(&body, auth, &extras).unwrap();
+                let request = apply_auth(
+                    reqwest::Client::new().post("https://api.anthropic.com/v1/messages"),
+                    auth,
+                    "test-key",
+                    Some(&beta),
+                )
+                .build()
+                .unwrap();
+                assert_eq!(
+                    request.headers().get_all("anthropic-beta").iter().count(),
+                    1
+                );
+                let values: Vec<_> = request.headers()["anthropic-beta"]
+                    .to_str()
+                    .unwrap()
+                    .split(',')
+                    .collect();
+                assert_eq!(
+                    values
+                        .iter()
+                        .filter(|value| **value == THINKING_BINDING_BETA)
+                        .count(),
+                    1
+                );
+                assert!(values.contains(&"custom-beta"));
+                assert_eq!(
+                    values.contains(&ANTHROPIC_OAUTH_BETA),
+                    auth == AuthMethod::Bearer
+                );
+            }
+        }
+        assert!(request_beta(&json!({}), AuthMethod::ApiKey, &BTreeMap::new()).is_none());
+    }
+    #[test]
+    fn sonnet_off_uses_between_tools_without_adaptive_binding_controls() {
+        for id in ["claude-sonnet-5-5", "claude-opus-5-5", "claude-fable-5-1"] {
+            let mut model = Model::anthropic_claude_fable_5_1();
+            model.id = id.into();
+            let body = build_body(
+                &model,
+                &Context::default(),
+                &StreamOptions {
+                    reasoning: Some(ThinkingLevel::Off),
+                    ..Default::default()
+                },
+            );
+            assert_eq!(body["output_config"]["effort"], "low");
+            if id == "claude-sonnet-5-5" {
+                assert_eq!(body["thinking"], json!({"type": "between_tools"}));
+                assert!(request_beta(&body, AuthMethod::ApiKey, &BTreeMap::new()).is_none());
+            } else {
+                assert_eq!(body["thinking"]["type"], "adaptive");
+                assert!(request_beta(&body, AuthMethod::ApiKey, &BTreeMap::new()).is_some());
+            }
+        }
     }
 }
