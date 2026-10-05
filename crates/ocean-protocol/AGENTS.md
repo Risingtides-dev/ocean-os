@@ -26,6 +26,7 @@ This crate owns the multi-provider LLM wire protocol layer for Anthropic, OpenAI
 - Anthropic extended-thinking requests must keep `budget_tokens` at least 1024
   and strictly below `max_tokens`; preserve explicit output caps by clamping the
   thinking budget rather than raising the cap.
+- Kimi Coding `k3` uses the non-adaptive Anthropic encoder: Off omits thinking; Minimal/Low/Medium/High/Max select 1024/2048/8192/16384/24576-token budgets before output-cap clamping. Raw Moonshot `kimi-k3` has a separate Max-only effort contract.
 - Anthropic assistant thinking history is replayable only with a non-empty
   provider signature. Drop unsigned cross-provider reasoning at wire encoding;
   never convert it into visible text or reject the shared persisted schema.

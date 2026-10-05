@@ -768,7 +768,8 @@ fn model_reasoning_efforts(id: &str, provider: &str) -> Vec<String> {
         ("glm", "glm-5.3" | "glm-5.3-flash") => &["low", "high", "max"],
         ("minimax", "MiniMax-M3.1-Flash-Preview") => &["low", "medium", "high", "xhigh"],
         ("minimax", "MiniMax-M3") => &["off", "high"],
-        ("kimi" | "kimi-coding", "kimi-k3" | "k3") => &["max"],
+        ("kimi", "kimi-k3") => &["max"],
+        ("kimi-coding", "k3") => &["off", "minimal", "low", "medium", "high", "max"],
         ("google", "gemini-3.1-pro-preview" | "gemini-3.8-flash") => &["low", "medium", "high"],
         ("google", id) if id.starts_with("gemini-3.") => &["minimal", "low", "medium", "high"],
         ("google", _) => &["off", "minimal", "low", "medium", "high", "xhigh"],
@@ -2443,6 +2444,11 @@ mod tests {
             ["off", "low", "medium", "high", "xhigh", "max"]
         );
         assert_eq!(efforts("gemini-3.8-flash"), ["low", "medium", "high"]);
+        assert_eq!(efforts("kimi-k3"), ["max"]);
+        assert_eq!(
+            efforts("k3"),
+            ["off", "minimal", "low", "medium", "high", "max"]
+        );
         assert!(efforts("gpt-4o").is_empty());
         assert!(efforts("MiniMax-M2.7").is_empty());
         for model in catalog {

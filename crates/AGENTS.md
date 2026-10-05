@@ -15,6 +15,7 @@ This child doc governs `crates/` and is the canonical ownership, entry-point, an
 - Current GPT-6 and Claude 5.5/Fable 5.1 routes expose and encode all five effort levels through Max. Explicit legacy caps stay provider-owned; no extra wire level is inferred for older models.
 
 - Model picker entries expose `reasoning_efforts` from the production encoders; empty lists mean no operator effort control. Do not infer effort support from credential presence.
+  Kimi Coding `k3` exposes Off through Max manual budgets; raw Moonshot `kimi-k3` exposes Max only.
 
 
 - Treat each package as an ownership boundary.

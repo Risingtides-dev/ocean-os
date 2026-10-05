@@ -858,6 +858,32 @@ mod tests {
         Model::anthropic_claude_sonnet_4_6()
     }
     #[test]
+    fn kimi_coding_efforts_encode_distinct_manual_budgets() {
+        let model = Model::kimi_coding_k3("https://api.kimi.com/coding", 262_144, 32_768);
+        for (level, budget) in [
+            (ThinkingLevel::Off, None),
+            (ThinkingLevel::Minimal, Some(1024)),
+            (ThinkingLevel::Low, Some(2048)),
+            (ThinkingLevel::Medium, Some(8192)),
+            (ThinkingLevel::High, Some(16384)),
+            (ThinkingLevel::Max, Some(24576)),
+        ] {
+            let options = StreamOptions {
+                reasoning: Some(level),
+                ..Default::default()
+            };
+            let body = build_body(&model, &Context::default(), &options);
+            assert!(body.get("output_config").is_none(), "{level:?}");
+            match budget {
+                Some(budget) => {
+                    assert_eq!(body["thinking"]["type"], "enabled", "{level:?}");
+                    assert_eq!(body["thinking"]["budget_tokens"], budget, "{level:?}");
+                }
+                None => assert!(body.get("thinking").is_none()),
+            }
+        }
+    }
+    #[test]
     fn haiku_high_thinking_budget_stays_below_max_tokens() {
         let options = StreamOptions {
             reasoning: Some(ThinkingLevel::High),

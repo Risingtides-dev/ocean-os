@@ -11501,3 +11501,12 @@ area:      [testing]
 Reconciled provider refresh through 40097240, including merged beta-header, Gemini-level and runtime Off corrections. Capability metadata now preserves Sonnet 5.5 Off and omits Gemini 3.8's normalized-away minimal level. All 747 focused protocol/provider/TUI tests pass with four existing ignores; strict changed-crate all-target Clippy, workspace/tests compile, docs, formatting and diff checks pass. Four real isolated Max turns returned exactly OCEAN_OK on GPT-6.1 Sol, GPT-6 Astra, GPT-6 Sol and GPT-6 Luna with fallback, tools and operator memory disabled and separate temporary stores. Claude auth metadata remains expired, so no redundant Claude failure probes were sent. Surface PR #236 hosted gates all passed and is ready for review. TUI release build and final full runtime gate remain pending; review, merge, installed delivery and complete connected-auth acceptance are not claimed. Nearest contracts already reflect this behavior; root/docs ownership and child indexes remain unchanged.
 
 _________________________________________________________________________________ 14:06 codex/ocean-max-effort-20261005
+
+time:      [14:20] [05-10-26]
+agent:     [codex], [gpt-6]
+worktree:  codex/ocean-max-effort-20261005
+type:      [bug report]: Independent review corrections
+area:      [review]
+
+Split Kimi Coding effort capabilities from raw Moonshot after independent PR #533 review. Coding exposes Off/Minimal/Low/Medium/High/Max, pinned against distinct production Anthropic budgets and Off omission. Updated owning crate/protocol contracts; root ownership and child indexes remain unchanged. The previous complete local gate passed 3,708 tests; the corrected candidate gate is rerunning.
+_________________________________________________________________________________ 14:20 codex/ocean-max-effort-20261005
