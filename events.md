@@ -11596,3 +11596,11 @@ area:      [review]
 
 The exact 023f2190 local gate passed 3,717 tests with zero failures and 16 existing ignores. Reconciled provider refresh 1a005a8a, retaining its provider-specific private-reasoning boundary. Removed legacy Claude Xhigh from public capabilities because the output cap makes its budget identical to High; current adaptive Claude controls remain distinct. Catalog regression and new split-reasoning regression pass. Owning crates contract updated; parent ownership and child indexes unchanged. Integrated gate and fresh review follow.
 _________________________________________________________________________________ 15:06 codex/ocean-max-effort-20261005
+time:      [15:05] [05-10-26]
+agent:     [codex], [GPT-6], [primary]
+worktree:  [codex/provider-model-refresh-20261005]
+type:      [bug report]
+area:      [backend]
+
+PR #532 API reasoning repair: public GPT-6 Sol and Luna Off use supported none; subscription routes, GPT-6.1 Sol and Astra retain low. Expanded request regression and protocol tests pass. Updated owning protocol contract; child index/ownership unchanged. Full CI and fresh review follow. The preceding hosted macOS job failed an unrelated extension registry lock test with OS WouldBlock; no unrelated assertion was weakened.
+_________________________________________________________________________________ 15:05 codex/provider-model-refresh-20261005
