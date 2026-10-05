@@ -44,7 +44,21 @@ pub struct Session {
     /// label from the first user message. See [`session_display_title`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub title: Option<String>,
+    /// Terminal status of the most recent turn: "completed" or "failed".
+    /// Set by the daemon after each turn finishes; read by operators to
+    /// distinguish a thinking agent from one whose last turn died silently.
+    /// Old session files predate this field and deserialize as `None`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_turn_status: Option<String>,
+    /// Error text from the most recent turn, when `last_turn_status` is
+    /// "failed". `None` for successful turns. Capped at
+    /// [`LAST_TURN_ERROR_MAX_BYTES`] to keep session files compact.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_turn_error: Option<String>,
 }
+
+/// Byte cap on [`Session::last_turn_error`].
+pub const LAST_TURN_ERROR_MAX_BYTES: usize = 4000;
 
 impl Session {
     /// Mint a session with a fresh random id. Only used by tests today
@@ -71,7 +85,32 @@ impl Session {
             git_commit: None,
             client_type: None,
             title: None,
+            last_turn_status: None,
+            last_turn_error: None,
         }
+    }
+
+    /// Record the terminal outcome of the turn that just finished. A failed
+    /// turn keeps its error text (trimmed, capped on a char boundary, or a
+    /// placeholder when the turn reported none); a completed turn clears it.
+    pub fn record_turn_outcome(&mut self, ok: bool, error: &str) {
+        self.last_turn_status = Some(if ok { "completed" } else { "failed" }.to_string());
+        self.last_turn_error = if ok {
+            None
+        } else {
+            let err = error.trim();
+            Some(if err.is_empty() {
+                "turn failed with no error detail".to_string()
+            } else if err.len() > LAST_TURN_ERROR_MAX_BYTES {
+                let mut cut = LAST_TURN_ERROR_MAX_BYTES;
+                while !err.is_char_boundary(cut) {
+                    cut -= 1;
+                }
+                format!("{}…[truncated]", &err[..cut])
+            } else {
+                err.to_string()
+            })
+        };
     }
 
     /// Tag this session with workspace metadata derived from the caller's cwd.
@@ -1184,6 +1223,8 @@ pub(crate) fn session_detail(session: Session) -> SessionDetail {
         git_branch: session.git_branch,
         git_commit: session.git_commit,
         client_type: session.client_type,
+        last_turn_status: session.last_turn_status,
+        last_turn_error: session.last_turn_error,
         // Resolved by the daemon's `enrich_session_detail` from
         // `workspace_root` (it owns the project store path); the agent layer
         // has no project index, so it leaves the binding unresolved here.
@@ -1430,6 +1471,74 @@ fn truncate_title(text: &str) -> String {
 }
 
 #[cfg(test)]
+mod last_turn_outcome_tests {
+    use super::*;
+
+    #[test]
+    fn failed_turn_records_status_and_error_and_success_clears_the_error() {
+        let mut session = Session::new(&ocean_protocol::Model::codex(
+            "gpt-6.1-sol",
+            272_000,
+            128_000,
+        ));
+        session.record_turn_outcome(false, "  provider said no \n");
+        assert_eq!(session.last_turn_status.as_deref(), Some("failed"));
+        assert_eq!(session.last_turn_error.as_deref(), Some("provider said no"));
+
+        session.record_turn_outcome(true, "ignored on success");
+        assert_eq!(session.last_turn_status.as_deref(), Some("completed"));
+        assert_eq!(session.last_turn_error, None);
+    }
+
+    #[test]
+    fn failed_turn_without_detail_gets_a_placeholder() {
+        let mut session = Session::new(&ocean_protocol::Model::codex(
+            "gpt-6.1-sol",
+            272_000,
+            128_000,
+        ));
+        session.record_turn_outcome(false, "   ");
+        assert_eq!(
+            session.last_turn_error.as_deref(),
+            Some("turn failed with no error detail")
+        );
+    }
+
+    #[test]
+    fn long_error_is_capped_on_a_char_boundary() {
+        let mut session = Session::new(&ocean_protocol::Model::codex(
+            "gpt-6.1-sol",
+            272_000,
+            128_000,
+        ));
+        // A 3-byte char straddling the cap must not panic the truncation.
+        let err = format!("{}€€€", "a".repeat(LAST_TURN_ERROR_MAX_BYTES - 1));
+        session.record_turn_outcome(false, &err);
+        let kept = session.last_turn_error.unwrap();
+        assert!(kept.ends_with("…[truncated]"));
+        assert!(kept.len() <= LAST_TURN_ERROR_MAX_BYTES + "…[truncated]".len());
+    }
+
+    #[test]
+    fn legacy_session_files_load_without_an_outcome() {
+        let session: Session = serde_json::from_value(serde_json::json!({
+            "id": SessionId::new_v4(),
+            "created_ms": 1,
+            "updated_ms": 1,
+            "model": "fake-ok",
+            "provider": "fake",
+            "messages": []
+        }))
+        .unwrap();
+        assert_eq!(session.last_turn_status, None);
+        assert_eq!(session.last_turn_error, None);
+        let detail = session_detail(session);
+        let json = serde_json::to_value(&detail).unwrap();
+        assert!(json.get("last_turn_status").is_none());
+    }
+}
+
+#[cfg(test)]
 mod config_revision_tests {
     use super::*;
 
@@ -1473,6 +1582,8 @@ mod history_search_tests {
             git_commit: None,
             client_type: None,
             title: None,
+            last_turn_status: None,
+            last_turn_error: None,
         }
     }
 
