@@ -11579,3 +11579,11 @@ area:      [review]
 
 Reconciled latest provider refresh through 9683eb9f Sonnet history compatibility; the integrated local gate passed 3,717 tests with zero failures and 16 existing ignores, including 192 protocol tests. Addressed PR #533 diagnostic findings: reject OCEAN_PROVIDER overrides and aggregate failures into a nonzero status after all probes finish. Changed example build and strict Clippy pass. CLI checks prove rejection of a provider override, successful attributed GPT execution, and nonzero mixed success/failure exit after both probes complete. Current MiniMax routes also fail with the existing running-daemon credential. Agent diagnostic contract updated; root ownership and child indexes unchanged.
 _________________________________________________________________________________ 14:58 codex/ocean-max-effort-20261005
+time:      [14:56] [05-10-26]
+agent:     [codex], [GPT-6], [primary]
+worktree:  [codex/provider-model-refresh-20261005]
+type:      [bug report]
+area:      [backend]
+
+PR #532 split-reasoning privacy repair: restrict reasoning-only visible-answer promotion to the intended DeepSeek compatibility route. MiniMax M3/Preview, GLM and OpenAI retain partial length-limited reasoning only as Thinking. Local HTTP streaming regression checks deltas and persisted terminal content across five routes; protocol suite passes. Updated protocol contract; ownership/index unchanged. Full CI and fresh exact-head review follow.
+_________________________________________________________________________________ 14:56 codex/provider-model-refresh-20261005
