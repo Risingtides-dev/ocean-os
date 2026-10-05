@@ -11604,3 +11604,12 @@ area:      [backend]
 
 PR #532 API reasoning repair: public GPT-6 Sol and Luna Off use supported none; subscription routes, GPT-6.1 Sol and Astra retain low. Expanded request regression and protocol tests pass. Updated owning protocol contract; child index/ownership unchanged. Full CI and fresh review follow. The preceding hosted macOS job failed an unrelated extension registry lock test with OS WouldBlock; no unrelated assertion was weakened.
 _________________________________________________________________________________ 15:05 codex/provider-model-refresh-20261005
+
+time:      [15:10] [05-10-26]
+agent:     [codex], [gpt-6]
+worktree:  codex/ocean-max-effort-20261005
+type:      [workflow]: Provider branch reconciliation
+area:      [testing]
+
+Integrated distinct-effort candidate 381bc06a passed the full local gate with 3,718 tests, zero failures and 16 existing ignores. Reconciled parent provider branch through 177a6cbf public API-key Sol Off handling; its focused wire regression passes. Existing protocol contract carries the provider-specific change; root ownership and child indexes remain unchanged. Current merged head requires a fresh complete gate and review before landing.
+_________________________________________________________________________________ 15:10 codex/ocean-max-effort-20261005
