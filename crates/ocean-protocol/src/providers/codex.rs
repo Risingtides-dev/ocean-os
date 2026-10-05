@@ -335,7 +335,8 @@ fn build_body(model: &Model, context: &Context, options: &StreamOptions) -> Valu
         if let Some(effort) = if model.id.starts_with("gpt-6") {
             Some(match level {
                 ThinkingLevel::Off
-                    if model.api == "openai-responses" && model.id == "gpt-6-luna" =>
+                    if model.api == "openai-responses"
+                        && matches!(model.id.as_str(), "gpt-6-luna" | "gpt-6-sol") =>
                 {
                     "none"
                 }
@@ -2178,11 +2179,14 @@ mod tests {
             .any(|event| matches!(event.unwrap(), AssistantMessageEvent::Done { .. })));
     }
     #[test]
-    fn only_public_luna_off_uses_none_effort() {
+    fn public_sol_and_luna_off_use_none_without_broadening_other_routes() {
         for (id, api, expected) in [
             ("gpt-6-luna", "openai-responses", "none"),
+            ("gpt-6-sol", "openai-responses", "none"),
             ("gpt-6-luna", "codex-responses", "low"),
+            ("gpt-6-sol", "codex-responses", "low"),
             ("gpt-6.1-sol", "openai-responses", "low"),
+            ("gpt-6-astra", "openai-responses", "low"),
         ] {
             let mut model = Model::codex(id, 272_000, 128_000);
             model.api = api.into();
