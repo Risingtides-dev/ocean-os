@@ -759,7 +759,8 @@ fn model_reasoning_efforts(id: &str, provider: &str) -> Vec<String> {
             &["low", "medium", "high", "xhigh", "max"]
         }
         ("openai-codex", _) => &["off", "minimal", "low", "medium", "high"],
-        ("claude-code", "claude-opus-5-5" | "claude-sonnet-5-5" | "claude-code-fable-5-1") => {
+        ("claude-code", "claude-sonnet-5-5") => &["off", "low", "medium", "high", "xhigh", "max"],
+        ("claude-code", "claude-opus-5-5" | "claude-code-fable-5-1") => {
             &["low", "medium", "high", "xhigh", "max"]
         }
         ("claude-code", _) => &["off", "minimal", "low", "medium", "high", "xhigh"],
@@ -768,7 +769,7 @@ fn model_reasoning_efforts(id: &str, provider: &str) -> Vec<String> {
         ("minimax", "MiniMax-M3.1-Flash-Preview") => &["low", "medium", "high", "xhigh"],
         ("minimax", "MiniMax-M3") => &["off", "high"],
         ("kimi" | "kimi-coding", "kimi-k3" | "k3") => &["max"],
-        ("google", "gemini-3.1-pro-preview") => &["low", "medium", "high"],
+        ("google", "gemini-3.1-pro-preview" | "gemini-3.8-flash") => &["low", "medium", "high"],
         ("google", id) if id.starts_with("gemini-3.") => &["minimal", "low", "medium", "high"],
         ("google", _) => &["off", "minimal", "low", "medium", "high", "xhigh"],
         _ => &[],
@@ -2437,6 +2438,11 @@ mod tests {
             assert_eq!(efforts(id), ["low", "medium", "high", "xhigh", "max"]);
         }
         assert_eq!(efforts("glm-5.3"), ["low", "high", "max"]);
+        assert_eq!(
+            efforts("claude-sonnet-5-5"),
+            ["off", "low", "medium", "high", "xhigh", "max"]
+        );
+        assert_eq!(efforts("gemini-3.8-flash"), ["low", "medium", "high"]);
         assert!(efforts("gpt-4o").is_empty());
         assert!(efforts("MiniMax-M2.7").is_empty());
         for model in catalog {

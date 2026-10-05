@@ -11490,3 +11490,14 @@ area:      [review] [backend] [testing]
 
 PR #532 fresh review exposed the missing runtime Off propagation. The real agent loop now forwards configured Off unless a StreamOptions override is present; encoders retain ownership of supported wire semantics. Sonnet 5.5 Off uses between_tools at low effort without block binding; API-key GPT-6 Luna Off uses none while Codex/other GPT-6 retain low. Added real-loop option capture and encoder regressions. Protocol/runtime unit and integration suites passed; doctests stopped on local disk exhaustion and are rerun after reclaiming only task-owned build output. Protocol/runtime devlogs updated; parent ownership and indexes unchanged. Prior 94ff04be hosted matrix was all green. Final local/hosted validation and fresh review remain required before merge/install.
 _________________________________________________________________________________ 14:02 codex/provider-model-refresh-20261005
+
+
+time:      [14:06] [05-10-26]
+agent:     [Codex desktop], [GPT-6]
+worktree:  [codex/ocean-max-effort-20261005]
+type:      [workflow]
+area:      [testing]
+
+Reconciled provider refresh through 40097240, including merged beta-header, Gemini-level and runtime Off corrections. Capability metadata now preserves Sonnet 5.5 Off and omits Gemini 3.8's normalized-away minimal level. All 747 focused protocol/provider/TUI tests pass with four existing ignores; strict changed-crate all-target Clippy, workspace/tests compile, docs, formatting and diff checks pass. Four real isolated Max turns returned exactly OCEAN_OK on GPT-6.1 Sol, GPT-6 Astra, GPT-6 Sol and GPT-6 Luna with fallback, tools and operator memory disabled and separate temporary stores. Claude auth metadata remains expired, so no redundant Claude failure probes were sent. Surface PR #236 hosted gates all passed and is ready for review. TUI release build and final full runtime gate remain pending; review, merge, installed delivery and complete connected-auth acceptance are not claimed. Nearest contracts already reflect this behavior; root/docs ownership and child indexes remain unchanged.
+
+_________________________________________________________________________________ 14:06 codex/ocean-max-effort-20261005
