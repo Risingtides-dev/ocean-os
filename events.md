@@ -11622,3 +11622,12 @@ area:      [review]
 
 Exact d61cbe2e integrated local gate passed with 3,718 tests, zero failures and 16 existing ignores. Removed unsupported legacy Google effort controls after review. Google's current deprecation table confirms Gemini 2.0 Flash shutdown on June 1, 2026, so new picker choices omit it while explicit historical pins remain routable. Full provider suite passes; owning crates contract updated, root ownership and child indexes unchanged. Fresh gate/review follows; API-key GPT capability review finding remains open.
 _________________________________________________________________________________ 15:15 codex/ocean-max-effort-20261005
+
+time:      [15:18] [05-10-26]
+agent:     [codex], [gpt-6]
+worktree:  codex/ocean-max-effort-20261005
+type:      [bug report]: Effective provider effort capabilities
+area:      [review]
+
+Daemon-ready model listings now derive provider and effort capabilities from each model's effective configured route. API-key GPT-6 Sol/Luna expose supported Off; subscription routes retain their low floor, and Astra/Sol 6.1 do not advertise Off. Anthropic API-key Claude retains adaptive effort capabilities. Full provider suite and denied-warning all-target Clippy pass; regressions cover both public/subscription GPT routes and Anthropic routing. Owning crates contract updated; root ownership and child indexes unchanged. Full integrated gate and fresh review follow.
+_________________________________________________________________________________ 15:18 codex/ocean-max-effort-20261005

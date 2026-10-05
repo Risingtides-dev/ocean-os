@@ -14,7 +14,7 @@ This child doc governs `crates/` and is the canonical ownership, entry-point, an
 
 - Current GPT-6 and Claude 5.5/Fable 5.1 routes expose and encode all five effort levels through Max. Explicit legacy caps stay provider-owned; no extra wire level is inferred for older models.
 
-- Model picker entries expose `reasoning_efforts` from the production encoders; empty lists mean no operator effort control. Do not infer effort support from credential presence.
+- Model picker entries expose `reasoning_efforts` from the production encoders; empty lists mean no operator effort control. Daemon listings derive provider and effort capabilities from the effective configured route, including explicit provider overrides. API-key Sol/Luna expose Off; subscription Sol/Luna retain their low floor. Do not infer effort support from credential presence.
   Kimi Coding `k3` exposes Off through Max manual budgets; raw Moonshot `kimi-k3` exposes Max only.
   Legacy Codex omits Off because an omitted reasoning parameter keeps server-default reasoning enabled.
   Legacy Claude omits Xhigh because its 16,384-token output cap collapses that budget into High.

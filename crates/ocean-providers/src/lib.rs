@@ -755,15 +755,19 @@ pub struct KnownModel {
 // Advertise distinct effective levels only; never offer a knob a route ignores.
 fn model_reasoning_efforts(id: &str, provider: &str) -> Vec<String> {
     let levels: &[&str] = match (provider, id) {
+        ("openai", "gpt-6-sol" | "gpt-6-luna") => &["off", "low", "medium", "high", "xhigh", "max"],
         ("openai-codex" | "openai", id) if id.starts_with("gpt-6") => {
             &["low", "medium", "high", "xhigh", "max"]
         }
         ("openai-codex", _) => &["minimal", "low", "medium", "high"],
-        ("claude-code", "claude-sonnet-5-5") => &["off", "low", "medium", "high", "xhigh", "max"],
-        ("claude-code", "claude-opus-5-5" | "claude-code-fable-5-1") => {
-            &["low", "medium", "high", "xhigh", "max"]
+        ("claude-code" | "anthropic", "claude-sonnet-5-5") => {
+            &["off", "low", "medium", "high", "xhigh", "max"]
         }
-        ("claude-code", _) => &["off", "minimal", "low", "medium", "high"],
+        (
+            "claude-code" | "anthropic",
+            "claude-opus-5-5" | "claude-code-fable-5-1" | "claude-fable-5-1",
+        ) => &["low", "medium", "high", "xhigh", "max"],
+        ("claude-code" | "anthropic", _) => &["off", "minimal", "low", "medium", "high"],
         ("deepseek", _) => &["off", "high", "max"],
         ("glm", "glm-5.3" | "glm-5.3-flash") => &["low", "high", "max"],
         ("minimax", "MiniMax-M3.1-Flash-Preview") => &["low", "medium", "high", "xhigh"],
@@ -911,19 +915,21 @@ pub fn known_models_with_readiness(env: &ProviderEnv) -> Vec<ReadyModel> {
     let mut by_provider: BTreeMap<String, (bool, Option<CredentialSource>)> = BTreeMap::new();
     known_models()
         .into_iter()
-        .map(|m| {
+        .map(|mut m| {
+            let mut probe = env.clone();
+            probe.vars.insert("OCEAN_MODEL".into(), m.id.clone());
+            if let Ok(selection) = resolve_model_selection(&probe) {
+                m.provider = selection.provider.as_str().into();
+                m.reasoning_efforts = model_reasoning_efforts(&selection.model, &m.provider);
+            }
             let (ready, credential_source) = by_provider
                 .entry(m.provider.clone())
-                .or_insert_with(|| {
-                    let mut probe = env.clone();
-                    probe.vars.insert("OCEAN_MODEL".into(), m.id.clone());
-                    match resolve_provider_config(&probe) {
-                        Ok(cfg) => {
-                            let r = cfg.readiness();
-                            (r.ok, r.credential_source)
-                        }
-                        Err(_) => (false, None),
+                .or_insert_with(|| match resolve_provider_config(&probe) {
+                    Ok(cfg) => {
+                        let r = cfg.readiness();
+                        (r.ok, r.credential_source)
                     }
+                    Err(_) => (false, None),
                 })
                 .clone();
             ReadyModel {
@@ -2416,6 +2422,57 @@ mod tests {
         let raw = resolve_model_selection(&env(&[("OCEAN_MODEL", "kimi-k3")])).unwrap();
         assert_eq!(raw.provider, ProviderId::Kimi);
         assert_eq!(raw.base_url, "https://api.moonshot.ai/v1");
+    }
+
+    #[test]
+    fn readiness_catalog_efforts_follow_effective_api_key_provider() {
+        let api_key = known_models_with_readiness(&env(&[
+            ("OCEAN_PROVIDER", "openai"),
+            ("OPENAI_API_KEY", "test-key"),
+        ]));
+        for id in ["gpt-6-sol", "gpt-6-luna"] {
+            let entry = api_key.iter().find(|entry| entry.model.id == id).unwrap();
+            assert_eq!(entry.model.provider, "openai");
+            assert!(entry.ready);
+            assert_eq!(
+                entry.model.reasoning_efforts,
+                ["off", "low", "medium", "high", "xhigh", "max"]
+            );
+        }
+        for id in ["gpt-6.1-sol", "gpt-6-astra"] {
+            let entry = api_key.iter().find(|entry| entry.model.id == id).unwrap();
+            assert!(!entry
+                .model
+                .reasoning_efforts
+                .iter()
+                .any(|level| level == "off"));
+        }
+        let anthropic = known_models_with_readiness(&env(&[
+            ("OCEAN_PROVIDER", "anthropic"),
+            ("ANTHROPIC_API_KEY", "test-key"),
+        ]));
+        let opus = anthropic
+            .iter()
+            .find(|entry| entry.model.id == "claude-opus-5-5")
+            .unwrap();
+        assert_eq!(opus.model.provider, "anthropic");
+        assert_eq!(
+            opus.model.reasoning_efforts,
+            ["low", "medium", "high", "xhigh", "max"]
+        );
+        let subscription = known_models_with_readiness(&env(&[]));
+        for id in ["gpt-6-sol", "gpt-6-luna"] {
+            let entry = subscription
+                .iter()
+                .find(|entry| entry.model.id == id)
+                .unwrap();
+            assert_eq!(entry.model.provider, "openai-codex");
+            assert!(!entry
+                .model
+                .reasoning_efforts
+                .iter()
+                .any(|level| level == "off"));
+        }
     }
 
     #[test]
