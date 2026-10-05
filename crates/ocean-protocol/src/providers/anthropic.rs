@@ -154,7 +154,12 @@ impl Default for AnthropicProvider {
     }
 }
 
+#[cfg(test)]
 fn convert_messages(messages: &[Message]) -> Vec<Value> {
+    convert_messages_for_model(messages, "")
+}
+
+fn convert_messages_for_model(messages: &[Message], target_model: &str) -> Vec<Value> {
     let mut out = Vec::with_capacity(messages.len());
     for m in messages {
         match m {
@@ -171,6 +176,14 @@ fn convert_messages(messages: &[Message]) -> Vec<Value> {
                 let blocks = a
                     .content
                     .iter()
+                    .filter(|content| {
+                        !matches!(content, Content::Thinking { .. })
+                            || target_model != "claude-sonnet-5-5"
+                            || !(a.model.starts_with("claude-opus-5")
+                                || a.model.starts_with("claude-fable-")
+                                || a.model.starts_with("claude-code-fable-")
+                                || a.model.starts_with("claude-mythos-"))
+                    })
                     .filter_map(content_to_block)
                     .collect::<Vec<_>>();
                 if !blocks.is_empty() {
@@ -316,7 +329,7 @@ fn build_body(model: &Model, context: &Context, options: &StreamOptions) -> Valu
     let mut body = json!({
         "model": model.id,
         "max_tokens": max_tokens,
-        "messages": convert_messages(&context.messages),
+        "messages": convert_messages_for_model(&context.messages, &model.id),
         "stream": true,
     });
 
@@ -1804,6 +1817,69 @@ mod tests {
             assert_eq!(body["messages"][0]["content"][0]["text"], "prior answer");
             assert_eq!(body["messages"][0]["content"].as_array().unwrap().len(), 1);
             assert!(request_beta(&body, AuthMethod::ApiKey, &BTreeMap::new()).is_none());
+        }
+    }
+    #[test]
+    fn sonnet_off_only_counts_compatible_claude_thinking_history() {
+        let mut model = Model::anthropic_claude_fable_5_1();
+        model.id = "claude-sonnet-5-5".into();
+        for (source, compatible) in [
+            ("claude-opus-5", false),
+            ("claude-opus-5-5", false),
+            ("claude-fable-5", false),
+            ("claude-fable-5-1", false),
+            ("claude-code-fable-5-1", false),
+            ("claude-mythos-5-1", false),
+            ("claude-sonnet-5-5", true),
+            ("claude-sonnet-5", true),
+            ("claude-opus-4-8", true),
+            ("claude-haiku-4-5", true),
+        ] {
+            let context = Context {
+                messages: vec![
+                    Message::Assistant(AssistantMessage {
+                        content: vec![
+                            Content::Thinking {
+                                thinking: "prior reasoning".into(),
+                                thinking_signature: Some("sig-abc".into()),
+                            },
+                            Content::text("prior answer"),
+                        ],
+                        api: "anthropic-messages".into(),
+                        provider: "anthropic".into(),
+                        model: source.into(),
+                        usage: Usage::default(),
+                        stop_reason: StopReason::Stop,
+                        error_message: None,
+                        timestamp: now_ms(),
+                    }),
+                    Message::user_text("continue"),
+                ],
+                ..Default::default()
+            };
+            let body = build_body(
+                &model,
+                &context,
+                &StreamOptions {
+                    reasoning: Some(ThinkingLevel::Off),
+                    ..Default::default()
+                },
+            );
+            assert_eq!(
+                body["thinking"]["type"],
+                if compatible {
+                    "adaptive"
+                } else {
+                    "between_tools"
+                },
+                "{source}"
+            );
+            let blocks = body["messages"][0]["content"].as_array().unwrap();
+            assert_eq!(
+                blocks.iter().any(|block| block["type"] == "thinking"),
+                compatible
+            );
+            assert_eq!(blocks.last().unwrap()["text"], "prior answer");
         }
     }
 }

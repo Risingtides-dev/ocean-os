@@ -11505,3 +11505,12 @@ area:      [backend]
 
 PR #532 Gemini parallel-round repair: consecutive tool results are ordered functionResponse parts in one user content, with each image retained inside its matching response. Normal user/model messages delimit groups; legacy encoding remains unchanged. Three-model grouping/media regressions and protocol suite pass. Updated owning contract and unchanged child index. Full CI and fresh review follow. The unrelated Git tree-bomb timing test passed in isolation after a local loaded-run timeout; its deadline/assertions remain unchanged.
 _________________________________________________________________________________ 14:38 codex/provider-model-refresh-20261005
+
+time:      [14:47] [05-10-26]
+agent:     [codex], [GPT-6], [primary]
+worktree:  [codex/provider-model-refresh-20261005]
+type:      [bug report]
+area:      [backend]
+
+PR #532 Claude-family compatibility repair: Sonnet 5.5 encoding omits thinking blocks from documented unreadable Opus 5/5.5, Fable, and Mythos sources before choosing Off mode. Supported older Claude and same-model signed history retain adaptive binding protection. Ten-source compatibility regression and protocol suite pass. Updated protocol contract; ownership/index unchanged. Full final CI and fresh review follow.
+_________________________________________________________________________________ 14:47 codex/provider-model-refresh-20261005
