@@ -439,6 +439,11 @@ fn convert_messages(
 ) -> Vec<Value> {
     let supports_images = model.supports_images;
     let replay_kimi_reasoning = model.supports_dynamic_tools();
+    let replay_minimax_reasoning = model.provider == "minimax"
+        && matches!(
+            model.id.as_str(),
+            "MiniMax-M3" | "MiniMax-M3.1-Flash-Preview"
+        );
     let mut out: Vec<Value> = Vec::new();
     if let Some(sp) = system_prompt {
         out.push(json!({"role": "system", "content": sp}));
@@ -527,9 +532,12 @@ fn convert_messages(
                         // history; every other Chat Completions backend retains
                         // Ocean's explicit private-reasoning drop.
                         Content::Thinking { thinking, .. }
-                            if replay_kimi_reasoning
+                            if (replay_kimi_reasoning
                                 && a.provider == "kimi"
-                                && a.model == "kimi-k3" =>
+                                && a.model == "kimi-k3")
+                                || (replay_minimax_reasoning
+                                    && a.provider == "minimax"
+                                    && a.model == model.id) =>
                         {
                             reasoning.push_str(thinking);
                         }
@@ -692,6 +700,26 @@ fn apply_reasoning(body: &mut Value, model: &Model, level: ThinkingLevel) {
                 body["reasoning_effort"] = json!("max");
             }
         }
+        "minimax" if model.id == "MiniMax-M3.1-Flash-Preview" => {
+            body["reasoning_effort"] = json!(match level {
+                ThinkingLevel::Off | ThinkingLevel::Minimal | ThinkingLevel::Low => "low",
+                ThinkingLevel::Medium => "medium",
+                ThinkingLevel::High => "high",
+                ThinkingLevel::Xhigh => "xhigh",
+            });
+        }
+        "minimax" if model.id == "MiniMax-M3" => {
+            body["thinking"] =
+                json!({"type": if level == ThinkingLevel::Off { "disabled" } else { "adaptive" }});
+        }
+        "glm" if matches!(model.id.as_str(), "glm-5.3" | "glm-5.3-flash") => {
+            body["thinking"] = json!({"type": "enabled"});
+            body["reasoning_effort"] = json!(match level {
+                ThinkingLevel::Off | ThinkingLevel::Minimal | ThinkingLevel::Low => "low",
+                ThinkingLevel::Medium | ThinkingLevel::High => "high",
+                ThinkingLevel::Xhigh => "max",
+            });
+        }
         "deepseek" => match deepseek_reasoning_effort(level) {
             Some(effort) => {
                 body["thinking"] = json!({"type": "enabled", "reasoning_effort": effort});
@@ -759,6 +787,14 @@ fn build_body(model: &Model, context: &Context, options: &StreamOptions) -> Resu
         "stream": true,
         "stream_options": {"include_usage": true},
     });
+    if model.provider == "minimax"
+        && matches!(
+            model.id.as_str(),
+            "MiniMax-M3" | "MiniMax-M3.1-Flash-Preview"
+        )
+    {
+        body["reasoning_split"] = json!(true);
+    }
     if let Some(t) = options.temperature {
         // K3 fixes temperature at 1.0 and documents that clients should omit it.
         if !model.supports_dynamic_tools() {
@@ -777,6 +813,14 @@ fn build_body(model: &Model, context: &Context, options: &StreamOptions) -> Resu
         // than blasting one param everywhere.
         let cap_param = match model.provider.as_str() {
             "openai" => "max_completion_tokens",
+            "minimax"
+                if matches!(
+                    model.id.as_str(),
+                    "MiniMax-M3" | "MiniMax-M3.1-Flash-Preview"
+                ) =>
+            {
+                "max_completion_tokens"
+            }
             "kimi" if model.supports_dynamic_tools() => "max_completion_tokens",
             _ => "max_tokens",
         };
@@ -924,7 +968,12 @@ impl Provider for OpenAiProvider {
         // K3 lifecycle reconstruction keys durable search evidence to the exact
         // routed model. Persist that route identity even if Moonshot reports a
         // dated/snapshot response model string.
-        let preserve_requested_model = model.supports_dynamic_tools();
+        let preserve_requested_model = model.supports_dynamic_tools()
+            || (model.provider == "minimax"
+                && matches!(
+                    model.id.as_str(),
+                    "MiniMax-M3" | "MiniMax-M3.1-Flash-Preview"
+                ));
         let cancel_for_stream = cancel.clone();
 
         let s = stream! {
@@ -1120,22 +1169,11 @@ impl Provider for OpenAiProvider {
                 });
             }
 
-            // Fallback: some reasoning-capable OAI-compat models (notably
-            // DeepSeek v4-pro) stream their entire conversational reply
-            // through `reasoning_content` and never populate `content`.
-            // If we got reasoning but no text AND no tool calls, surface
-            // the reasoning as the assistant's text so the user actually
-            // sees an answer.
-            //
-            // We deliberately skip the promotion when tool calls are
-            // present: in that case the reasoning is the model's plan for
-            // the tool call, not a user-facing reply, and the real text
-            // answer will come on the next agent-loop turn after the tool
-            // results are appended. Promoting prematurely would dump the
-            // private plan into the user's transcript and then duplicate
-            // it again when the real answer arrives.
+            // Only DeepSeek's compatibility fallback treats a reasoning-only
+            // reply as visible text. Split reasoning from other providers can
+            // be a private, truncated thought with no final answer.
             let has_tool_calls = !tool_calls.is_empty();
-            if text_buf.is_empty() && !thinking_buf.is_empty() && !has_tool_calls {
+            if provider == "deepseek" && text_buf.is_empty() && !thinking_buf.is_empty() && !has_tool_calls {
                 let promoted_index = next_block_index;
                 next_block_index += 1;
                 yield Ok(AssistantMessageEvent::TextStart { content_index: promoted_index });
@@ -2828,5 +2866,123 @@ mod tests {
         assert_eq!(tools.len(), 1);
         assert_eq!(tools[0]["function"]["name"], "bash");
         assert_eq!(tools[0]["function"]["parameters"], tool.parameters);
+    }
+    #[test]
+    fn glm53_off_uses_enabled_low_instead_of_invalid_disabled_thinking() {
+        let model = Model::openai_compat(
+            "glm",
+            "glm-5.3",
+            "https://api.z.ai/api/coding/paas/v4",
+            1_000_000,
+            8_192,
+        );
+        let mut body = json!({});
+        apply_reasoning(&mut body, &model, ThinkingLevel::Off);
+        assert_eq!(body["thinking"], json!({"type": "enabled"}));
+        assert_eq!(body["reasoning_effort"], "low");
+    }
+    #[test]
+    fn minimax_preview_keeps_its_thinking_and_drops_other_providers_reasoning() {
+        let model = Model::openai_compat(
+            "minimax",
+            "MiniMax-M3.1-Flash-Preview",
+            "https://api.minimax.io/v1",
+            1_000_000,
+            8_192,
+        );
+        let mut assistant = AssistantMessage {
+            content: vec![
+                Content::Thinking {
+                    thinking: "own reasoning".into(),
+                    thinking_signature: None,
+                },
+                Content::ToolCall {
+                    id: "one".into(),
+                    name: "read".into(),
+                    arguments: json!({"path": "a"}),
+                },
+            ],
+            api: "openai-completions".into(),
+            provider: "minimax".into(),
+            model: model.id.clone(),
+            usage: Usage::default(),
+            stop_reason: StopReason::ToolUse,
+            error_message: None,
+            timestamp: 0,
+        };
+        let own = convert_messages(None, &[Message::Assistant(assistant.clone())], &model, &[]);
+        assert_eq!(own[0]["reasoning_content"], "own reasoning");
+        assistant.provider = "deepseek".into();
+        let foreign = convert_messages(None, &[Message::Assistant(assistant)], &model, &[]);
+        assert!(!serde_json::to_string(&foreign)
+            .unwrap()
+            .contains("own reasoning"));
+        let options = StreamOptions {
+            reasoning: Some(ThinkingLevel::Off),
+            max_tokens: Some(2048),
+            ..Default::default()
+        };
+        let body = build_body(&model, &Context::default(), &options).unwrap();
+        assert_eq!(body["reasoning_effort"], "low");
+        assert_eq!(body["reasoning_split"], true);
+        assert_eq!(body["max_completion_tokens"], 2048);
+        assert!(body.get("max_tokens").is_none());
+    }
+    #[tokio::test]
+    async fn split_reasoning_only_streams_never_become_visible_answers_outside_deepseek() {
+        use std::io::{Read, Write};
+        for (provider, id, promote) in [
+            ("minimax", "MiniMax-M3", false),
+            ("minimax", "MiniMax-M3.1-Flash-Preview", false),
+            ("glm", "glm-5.3", false),
+            ("openai", "gpt-4o", false),
+            ("deepseek", "deepseek-v4-pro", true),
+        ] {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let address = listener.local_addr().unwrap();
+            let data = json!({"choices":[{"index":0,"delta":{"reasoning_content":"private partial thought"},"finish_reason":"length"}]});
+            let thread = std::thread::spawn(move || {
+                let (mut socket, _) = listener.accept().unwrap();
+                let mut bytes = [0; 8192];
+                assert!(socket.read(&mut bytes).unwrap() > 0);
+                let body = format!("data: {data}\n\ndata: [DONE]\n\n");
+                write!(socket, "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}", body.len(), body).unwrap();
+            });
+            let model =
+                Model::openai_compat(provider, id, format!("http://{address}"), 1_000_000, 8192);
+            let options = StreamOptions {
+                api_key: Some("test-key".into()),
+                max_tokens: Some(1),
+                ..Default::default()
+            };
+            let events: Vec<_> = OpenAiProvider::new()
+                .stream(&model, &Context::default(), &options)
+                .await
+                .unwrap()
+                .collect()
+                .await;
+            thread.join().unwrap();
+            let mut visible = String::new();
+            let mut terminal = None;
+            for event in events {
+                match event.unwrap() {
+                    AssistantMessageEvent::TextDelta { delta, .. } => visible.push_str(&delta),
+                    AssistantMessageEvent::Done { message, .. } => terminal = Some(message),
+                    _ => {}
+                }
+            }
+            let message = terminal.expect("terminal message");
+            assert_eq!(!visible.is_empty(), promote, "{id}");
+            assert_eq!(
+                message
+                    .content
+                    .iter()
+                    .any(|content| matches!(content, Content::Text { .. })),
+                promote,
+                "{id}"
+            );
+            assert!(message.content.iter().any(|content| matches!(content, Content::Thinking {thinking, ..} if thinking == "private partial thought")));
+            assert_eq!(message.stop_reason, StopReason::Length);
+        }
     }
 }

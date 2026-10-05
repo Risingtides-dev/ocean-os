@@ -32,6 +32,7 @@ const ANTHROPIC_VERSION: &str = "2023-06-01";
 /// carries `anthropic-beta: oauth-2025-04-20`. API-key requests never send it
 /// (their wire shape is unchanged). Mirrors OMP's `claudeCode*BetaDefaults`.
 const ANTHROPIC_OAUTH_BETA: &str = "oauth-2025-04-20";
+const THINKING_BINDING_BETA: &str = "thinking-binding-controls-2026-08-01";
 
 /// The Claude Code identity line that must OPEN the system prompt on OAuth
 /// requests — the other half of the OAuth fingerprint (Anthropic validates
@@ -153,7 +154,12 @@ impl Default for AnthropicProvider {
     }
 }
 
+#[cfg(test)]
 fn convert_messages(messages: &[Message]) -> Vec<Value> {
+    convert_messages_for_model(messages, "")
+}
+
+fn convert_messages_for_model(messages: &[Message], target_model: &str) -> Vec<Value> {
     let mut out = Vec::with_capacity(messages.len());
     for m in messages {
         match m {
@@ -170,6 +176,14 @@ fn convert_messages(messages: &[Message]) -> Vec<Value> {
                 let blocks = a
                     .content
                     .iter()
+                    .filter(|content| {
+                        !matches!(content, Content::Thinking { .. })
+                            || target_model != "claude-sonnet-5-5"
+                            || !(a.model.starts_with("claude-opus-5")
+                                || a.model.starts_with("claude-fable-")
+                                || a.model.starts_with("claude-code-fable-")
+                                || a.model.starts_with("claude-mythos-"))
+                    })
                     .filter_map(content_to_block)
                     .collect::<Vec<_>>();
                 if !blocks.is_empty() {
@@ -222,7 +236,8 @@ fn content_to_block(c: &Content) -> Option<Value> {
             thinking,
             thinking_signature: Some(signature),
         } if !signature.is_empty()
-            && !signature.starts_with(crate::providers::codex::REASONING_ITEM_MARKER) =>
+            && !signature.starts_with(crate::providers::codex::REASONING_ITEM_MARKER)
+            && !signature.starts_with(crate::providers::google::PARTS_MARKER) =>
         {
             Some(json!({
                 "type": "thinking",
@@ -314,7 +329,7 @@ fn build_body(model: &Model, context: &Context, options: &StreamOptions) -> Valu
     let mut body = json!({
         "model": model.id,
         "max_tokens": max_tokens,
-        "messages": convert_messages(&context.messages),
+        "messages": convert_messages_for_model(&context.messages, &model.id),
         "stream": true,
     });
 
@@ -373,17 +388,49 @@ fn build_body(model: &Model, context: &Context, options: &StreamOptions) -> Valu
             body["system"] = json!(sp);
         }
     }
-    if let Some(t) = options.temperature {
-        body["temperature"] = json!(t);
-    }
-    if let Some(level) = options.reasoning {
-        if let Some(budget) = thinking_budget(level) {
-            // Anthropic requires budget_tokens >= 1024 and strictly below
-            // max_tokens. Preserve the caller's output cap by shrinking the
-            // thinking budget rather than raising max_tokens past that cap.
-            if max_tokens > 1024 {
-                let budget = budget.min(max_tokens - 1);
-                body["thinking"] = json!({"type": "enabled", "budget_tokens": budget});
+    let adaptive = matches!(
+        model.id.as_str(),
+        "claude-opus-5-5" | "claude-sonnet-5-5" | "claude-fable-5-1"
+    );
+    if adaptive {
+        // Only thinking actually replayed on this wire constrains the mode.
+        let has_replayed_thinking = body["messages"].as_array().is_some_and(|messages| {
+            messages.iter().any(|message| {
+                message["content"]
+                    .as_array()
+                    .is_some_and(|blocks| blocks.iter().any(|block| block["type"] == "thinking"))
+            })
+        });
+        // Current Claude models reject manual budgets and sampling overrides.
+        if model.id == "claude-sonnet-5-5"
+            && options.reasoning == Some(ThinkingLevel::Off)
+            && !has_replayed_thinking
+        {
+            // Sonnet permits no up-front thinking only in between-tools mode,
+            // which cannot carry adaptive block-binding controls.
+            body["thinking"] = json!({"type": "between_tools"});
+        } else {
+            body["thinking"] = json!({"type": "adaptive", "block_binding": {"prefix_mismatch_behavior": "drop_block"}});
+        }
+        if let Some(level) = options.reasoning {
+            let effort = match level {
+                ThinkingLevel::Off | ThinkingLevel::Minimal | ThinkingLevel::Low => "low",
+                ThinkingLevel::Medium => "medium",
+                ThinkingLevel::High => "high",
+                ThinkingLevel::Xhigh => "xhigh",
+            };
+            body["output_config"] = json!({"effort": effort});
+        }
+    } else {
+        if let Some(t) = options.temperature {
+            body["temperature"] = json!(t);
+        }
+        if let Some(level) = options.reasoning {
+            if let Some(budget) = thinking_budget(level) {
+                if max_tokens > 1024 {
+                    let budget = budget.min(max_tokens - 1);
+                    body["thinking"] = json!({"type": "enabled", "budget_tokens": budget});
+                }
             }
         }
     }
@@ -470,20 +517,51 @@ enum BlockKind {
 /// path used when the credential is an access token (Claude Code plan OAuth)
 /// rather than an API key. Bearer ALSO sends the mandatory
 /// `anthropic-beta: oauth-2025-04-20` flag: Anthropic rejects oat01 bearers
-/// without it, and API-key requests must not grow new headers.
+/// without it. Model-specific feature betas are merged separately for both auth paths.
 ///
 /// Extracted from the retry closure so the wire shape is directly testable
 /// without an HTTP round-trip; `AnthropicProvider::stream` delegates here.
+fn request_beta(
+    body: &Value,
+    method: AuthMethod,
+    headers: &BTreeMap<String, String>,
+) -> Option<String> {
+    let mut values = Vec::new();
+    if method == AuthMethod::Bearer {
+        values.push(ANTHROPIC_OAUTH_BETA.to_string());
+    }
+    if body.pointer("/thinking/block_binding").is_some() {
+        values.push(THINKING_BINDING_BETA.to_string());
+    }
+    for (key, value) in headers {
+        if key.eq_ignore_ascii_case("anthropic-beta") {
+            for beta in value
+                .split(',')
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+            {
+                if !values.iter().any(|value| value == beta) {
+                    values.push(beta.to_string());
+                }
+            }
+        }
+    }
+    (!values.is_empty()).then(|| values.join(","))
+}
+
 fn apply_auth(
     req: reqwest::RequestBuilder,
     method: AuthMethod,
     secret: &str,
+    beta: Option<&str>,
 ) -> reqwest::RequestBuilder {
-    match method {
+    let req = match method {
         AuthMethod::ApiKey => req.header("x-api-key", secret),
-        AuthMethod::Bearer => req
-            .bearer_auth(secret)
-            .header("anthropic-beta", ANTHROPIC_OAUTH_BETA),
+        AuthMethod::Bearer => req.bearer_auth(secret),
+    };
+    match beta.or_else(|| (method == AuthMethod::Bearer).then_some(ANTHROPIC_OAUTH_BETA)) {
+        Some(beta) => req.header("anthropic-beta", beta),
+        None => req,
     }
 }
 
@@ -527,9 +605,12 @@ impl Provider for AnthropicProvider {
                         .header("anthropic-version", ANTHROPIC_VERSION)
                         .header("accept", "text/event-stream")
                         .header("content-type", "application/json");
-                    req = apply_auth(req, auth, &api_key);
+                    let beta = request_beta(&body, auth, &extra_headers);
+                    req = apply_auth(req, auth, &api_key, beta.as_deref());
                     for (k, v) in extra_headers {
-                        req = req.header(k, v);
+                        if !k.eq_ignore_ascii_case("anthropic-beta") {
+                            req = req.header(k, v);
+                        }
                     }
                     let r = match req.json(&body).send().await {
                         Ok(r) => r,
@@ -1432,7 +1513,7 @@ mod tests {
         let req = client
             .post("https://example.test/v1/messages")
             .header("anthropic-version", ANTHROPIC_VERSION);
-        let built = apply_auth(req, AuthMethod::ApiKey, "sk-test-123")
+        let built = apply_auth(req, AuthMethod::ApiKey, "sk-test-123", None)
             .build()
             .expect("request builds");
         let headers = built.headers();
@@ -1463,7 +1544,7 @@ mod tests {
         let req = client
             .post("https://example.test/v1/messages")
             .header("anthropic-version", ANTHROPIC_VERSION);
-        let built = apply_auth(req, AuthMethod::Bearer, "oauth-token-456")
+        let built = apply_auth(req, AuthMethod::Bearer, "oauth-token-456", None)
             .build()
             .expect("request builds");
         let headers = built.headers();
@@ -1553,5 +1634,252 @@ mod tests {
         assert_eq!(tools.len(), 1);
         assert_eq!(tools[0]["name"], "bash");
         assert_eq!(tools[0]["input_schema"], tool.parameters);
+    }
+    #[test]
+    fn current_claude_models_use_adaptive_thinking_without_sampling_or_manual_budget() {
+        for id in ["claude-sonnet-5-5", "claude-opus-5-5", "claude-fable-5-1"] {
+            let mut model = Model::anthropic_claude_fable_5_1();
+            model.id = id.into();
+            let options = StreamOptions {
+                temperature: Some(0.3),
+                reasoning: Some(ThinkingLevel::Xhigh),
+                ..Default::default()
+            };
+            let body = build_body(&model, &Context::default(), &options);
+            assert_eq!(body["thinking"]["type"], "adaptive");
+            assert_eq!(body["output_config"]["effort"], "xhigh");
+            assert!(body.get("temperature").is_none());
+            assert!(body["thinking"].get("budget_tokens").is_none());
+        }
+        let content = Content::Thinking {
+            thinking: "private".into(),
+            thinking_signature: Some("google-parts:[]".into()),
+        };
+        assert!(content_to_block(&content).is_none());
+    }
+    #[test]
+    fn binding_beta_is_merged_with_auth_and_custom_betas_once() {
+        for id in ["claude-opus-5-5", "claude-sonnet-5-5", "claude-fable-5-1"] {
+            let mut model = Model::anthropic_claude_fable_5_1();
+            model.id = id.into();
+            let body = build_body(&model, &Context::default(), &StreamOptions::default());
+            for auth in [AuthMethod::ApiKey, AuthMethod::Bearer] {
+                let extras = BTreeMap::from([(
+                    "Anthropic-Beta".into(),
+                    format!("custom-beta, {THINKING_BINDING_BETA}"),
+                )]);
+                let beta = request_beta(&body, auth, &extras).unwrap();
+                let request = apply_auth(
+                    reqwest::Client::new().post("https://api.anthropic.com/v1/messages"),
+                    auth,
+                    "test-key",
+                    Some(&beta),
+                )
+                .build()
+                .unwrap();
+                assert_eq!(
+                    request.headers().get_all("anthropic-beta").iter().count(),
+                    1
+                );
+                let values: Vec<_> = request.headers()["anthropic-beta"]
+                    .to_str()
+                    .unwrap()
+                    .split(',')
+                    .collect();
+                assert_eq!(
+                    values
+                        .iter()
+                        .filter(|value| **value == THINKING_BINDING_BETA)
+                        .count(),
+                    1
+                );
+                assert!(values.contains(&"custom-beta"));
+                assert_eq!(
+                    values.contains(&ANTHROPIC_OAUTH_BETA),
+                    auth == AuthMethod::Bearer
+                );
+            }
+        }
+        assert!(request_beta(&json!({}), AuthMethod::ApiKey, &BTreeMap::new()).is_none());
+    }
+    #[test]
+    fn sonnet_off_uses_between_tools_without_adaptive_binding_controls() {
+        for id in ["claude-sonnet-5-5", "claude-opus-5-5", "claude-fable-5-1"] {
+            let mut model = Model::anthropic_claude_fable_5_1();
+            model.id = id.into();
+            let body = build_body(
+                &model,
+                &Context::default(),
+                &StreamOptions {
+                    reasoning: Some(ThinkingLevel::Off),
+                    ..Default::default()
+                },
+            );
+            assert_eq!(body["output_config"]["effort"], "low");
+            if id == "claude-sonnet-5-5" {
+                assert_eq!(body["thinking"], json!({"type": "between_tools"}));
+                assert!(request_beta(&body, AuthMethod::ApiKey, &BTreeMap::new()).is_none());
+            } else {
+                assert_eq!(body["thinking"]["type"], "adaptive");
+                assert!(request_beta(&body, AuthMethod::ApiKey, &BTreeMap::new()).is_some());
+            }
+        }
+    }
+    #[test]
+    fn sonnet_off_with_signed_history_keeps_adaptive_binding_controls() {
+        let mut model = Model::anthropic_claude_fable_5_1();
+        model.id = "claude-sonnet-5-5".into();
+        let context = Context {
+            system_prompt: Some("edited instructions".into()),
+            messages: vec![
+                Message::Assistant(AssistantMessage {
+                    content: vec![
+                        Content::Thinking {
+                            thinking: "prior reasoning".into(),
+                            thinking_signature: Some("sig-abc".into()),
+                        },
+                        Content::text("prior answer"),
+                    ],
+                    api: "anthropic-messages".into(),
+                    provider: "anthropic".into(),
+                    model: model.id.clone(),
+                    usage: Usage::default(),
+                    stop_reason: StopReason::Stop,
+                    error_message: None,
+                    timestamp: now_ms(),
+                }),
+                Message::user_text("continue"),
+            ],
+            ..Default::default()
+        };
+        for level in [ThinkingLevel::Off, ThinkingLevel::Medium] {
+            let body = build_body(
+                &model,
+                &context,
+                &StreamOptions {
+                    reasoning: Some(level),
+                    ..Default::default()
+                },
+            );
+            assert_eq!(body["thinking"]["type"], "adaptive");
+            assert_eq!(
+                body["thinking"]["block_binding"]["prefix_mismatch_behavior"],
+                "drop_block"
+            );
+            assert_eq!(
+                body["output_config"]["effort"],
+                if level == ThinkingLevel::Off {
+                    "low"
+                } else {
+                    "medium"
+                }
+            );
+            assert_eq!(body["messages"][0]["content"][0]["signature"], "sig-abc");
+            assert!(request_beta(&body, AuthMethod::ApiKey, &BTreeMap::new()).is_some());
+        }
+    }
+    #[test]
+    fn sonnet_off_ignores_foreign_reasoning_markers_when_selecting_mode() {
+        let mut model = Model::anthropic_claude_fable_5_1();
+        model.id = "claude-sonnet-5-5".into();
+        for signature in ["google-parts:opaque", "codex-item:opaque", ""] {
+            let context = Context {
+                messages: vec![
+                    Message::Assistant(AssistantMessage {
+                        content: vec![
+                            Content::Thinking {
+                                thinking: "foreign reasoning".into(),
+                                thinking_signature: Some(signature.into()),
+                            },
+                            Content::text("prior answer"),
+                        ],
+                        api: "foreign".into(),
+                        provider: "foreign".into(),
+                        model: "foreign".into(),
+                        usage: Usage::default(),
+                        stop_reason: StopReason::Stop,
+                        error_message: None,
+                        timestamp: now_ms(),
+                    }),
+                    Message::user_text("continue"),
+                ],
+                ..Default::default()
+            };
+            let body = build_body(
+                &model,
+                &context,
+                &StreamOptions {
+                    reasoning: Some(ThinkingLevel::Off),
+                    ..Default::default()
+                },
+            );
+            assert_eq!(body["thinking"], json!({"type":"between_tools"}));
+            assert_eq!(body["messages"][0]["content"][0]["text"], "prior answer");
+            assert_eq!(body["messages"][0]["content"].as_array().unwrap().len(), 1);
+            assert!(request_beta(&body, AuthMethod::ApiKey, &BTreeMap::new()).is_none());
+        }
+    }
+    #[test]
+    fn sonnet_off_only_counts_compatible_claude_thinking_history() {
+        let mut model = Model::anthropic_claude_fable_5_1();
+        model.id = "claude-sonnet-5-5".into();
+        for (source, compatible) in [
+            ("claude-opus-5", false),
+            ("claude-opus-5-5", false),
+            ("claude-fable-5", false),
+            ("claude-fable-5-1", false),
+            ("claude-code-fable-5-1", false),
+            ("claude-mythos-5-1", false),
+            ("claude-sonnet-5-5", true),
+            ("claude-sonnet-5", true),
+            ("claude-opus-4-8", true),
+            ("claude-haiku-4-5", true),
+        ] {
+            let context = Context {
+                messages: vec![
+                    Message::Assistant(AssistantMessage {
+                        content: vec![
+                            Content::Thinking {
+                                thinking: "prior reasoning".into(),
+                                thinking_signature: Some("sig-abc".into()),
+                            },
+                            Content::text("prior answer"),
+                        ],
+                        api: "anthropic-messages".into(),
+                        provider: "anthropic".into(),
+                        model: source.into(),
+                        usage: Usage::default(),
+                        stop_reason: StopReason::Stop,
+                        error_message: None,
+                        timestamp: now_ms(),
+                    }),
+                    Message::user_text("continue"),
+                ],
+                ..Default::default()
+            };
+            let body = build_body(
+                &model,
+                &context,
+                &StreamOptions {
+                    reasoning: Some(ThinkingLevel::Off),
+                    ..Default::default()
+                },
+            );
+            assert_eq!(
+                body["thinking"]["type"],
+                if compatible {
+                    "adaptive"
+                } else {
+                    "between_tools"
+                },
+                "{source}"
+            );
+            let blocks = body["messages"][0]["content"].as_array().unwrap();
+            assert_eq!(
+                blocks.iter().any(|block| block["type"] == "thinking"),
+                compatible
+            );
+            assert_eq!(blocks.last().unwrap()["text"], "prior answer");
+        }
     }
 }

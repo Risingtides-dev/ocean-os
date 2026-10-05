@@ -3630,19 +3630,79 @@ fn state_from_provider_config(provider_config: ProviderConfig) -> anyhow::Result
 
 fn model_from_provider_config(config: &ProviderConfig) -> anyhow::Result<Model> {
     let selection = &config.selection;
+    if matches!(
+        selection.model.as_str(),
+        "claude-opus-5-5" | "claude-sonnet-5-5" | "claude-code-fable-5-1" | "claude-fable-5-1"
+    ) && matches!(
+        selection.provider,
+        ProviderId::Anthropic | ProviderId::ClaudeCode
+    ) {
+        let wire_id = selection.model.replace("claude-code-", "claude-");
+        return Ok(Model {
+            id: wire_id.clone(),
+            name: wire_id,
+            api: "anthropic-messages".into(),
+            provider: "anthropic".into(),
+            base_url: selection.base_url.clone(),
+            reasoning: true,
+            supports_images: true,
+            context_window: selection.context_window,
+            max_tokens: selection.max_output_tokens,
+        });
+    }
+    if selection.provider == ProviderId::Google && selection.model.starts_with("gemini-3.") {
+        return Ok(Model {
+            id: selection.model.clone(),
+            name: selection.model.clone(),
+            api: "google-generative-ai".into(),
+            provider: "google".into(),
+            base_url: selection.base_url.clone(),
+            reasoning: true,
+            supports_images: true,
+            context_window: selection.context_window,
+            max_tokens: selection.max_output_tokens,
+        });
+    }
+    if selection.provider == ProviderId::OpenAi && selection.model.starts_with("gpt-6") {
+        let mut model = Model::codex(
+            &selection.model,
+            selection.context_window,
+            selection.max_output_tokens,
+        );
+        model.api = "openai-responses".into();
+        model.provider = "openai".into();
+        model.base_url.clone_from(&selection.base_url);
+        return Ok(model);
+    }
     match selection.provider {
         ProviderId::DeepSeek
         | ProviderId::OpenAiCompatible
         | ProviderId::MiniMax
         | ProviderId::Kimi
         | ProviderId::Glm
-        | ProviderId::Fake => Ok(Model::openai_compat(
-            selection.provider.as_str(),
-            selection.model.clone(),
-            selection.base_url.clone(),
-            selection.context_window,
-            selection.max_output_tokens,
-        )),
+        | ProviderId::Fake => {
+            let mut model = Model::openai_compat(
+                selection.provider.as_str(),
+                selection.model.clone(),
+                selection.base_url.clone(),
+                selection.context_window,
+                selection.max_output_tokens,
+            );
+            if (selection.provider == ProviderId::MiniMax
+                && matches!(
+                    selection.model.as_str(),
+                    "MiniMax-M3" | "MiniMax-M3.1-Flash-Preview"
+                ))
+                || (selection.provider == ProviderId::Glm && selection.model == "glm-5.3-flash")
+            {
+                model.supports_images = true;
+                model.reasoning = true;
+            }
+            if selection.provider == ProviderId::Glm && selection.model.starts_with("glm-5.3") {
+                model.reasoning = true;
+            }
+            Ok(model)
+        }
         ProviderId::OpenAi => Ok(match selection.model.as_str() {
             "gpt-4o" => Model::openai_gpt_4o(),
             "gpt-4o-mini" => Model::openai_gpt_4o_mini(),
@@ -3920,11 +3980,11 @@ fn should_strip_assistant_thinking(provider: &ProviderId, model: &str) -> bool {
     // cross-provider privacy drop still holds on that route.
     matches!(
         provider,
-        ProviderId::DeepSeek
-            | ProviderId::OpenAi
-            | ProviderId::OpenAiCompatible
-            | ProviderId::MiniMax
-    ) || (*provider == ProviderId::Kimi && model != "kimi-k3")
+        ProviderId::DeepSeek | ProviderId::OpenAi | ProviderId::OpenAiCompatible
+    ) && !(*provider == ProviderId::OpenAi && model.starts_with("gpt-6"))
+        || (*provider == ProviderId::MiniMax
+            && !matches!(model, "MiniMax-M3" | "MiniMax-M3.1-Flash-Preview"))
+        || (*provider == ProviderId::Kimi && model != "kimi-k3")
 }
 
 fn strip_assistant_thinking_content(messages: &mut [Message]) {
@@ -8737,3 +8797,77 @@ done
 }
 
 mod system_prompt;
+
+#[cfg(test)]
+mod refreshed_model_tests {
+    use super::*;
+
+    #[test]
+    fn refreshed_picker_models_reach_runtime_with_the_published_capacities() {
+        for id in [
+            "claude-sonnet-5-5",
+            "claude-opus-5-5",
+            "claude-code-fable-5-1",
+            "gemini-3.8-flash",
+            "gemini-3.5-flash-lite",
+            "MiniMax-M3",
+            "gpt-6-luna",
+        ] {
+            let env = ocean_providers::ProviderEnv {
+                vars: std::collections::BTreeMap::from([("OCEAN_MODEL".into(), id.into())]),
+                ..Default::default()
+            };
+            let config = ocean_providers::resolve_provider_config(&env).unwrap();
+            let model = model_from_provider_config(&config).unwrap();
+            assert_eq!(model.context_window, config.selection.context_window);
+            assert_eq!(model.max_tokens, config.selection.max_output_tokens);
+            assert!(model.reasoning);
+            assert!(model.supports_images);
+        }
+    }
+
+    #[test]
+    fn latest_api_key_openai_uses_responses_and_keeps_encrypted_reasoning() {
+        let env = ocean_providers::ProviderEnv {
+            vars: std::collections::BTreeMap::from([
+                ("OCEAN_MODEL".into(), "gpt-6.1-sol".into()),
+                ("OCEAN_PROVIDER".into(), "openai".into()),
+            ]),
+            ..Default::default()
+        };
+        let config = ocean_providers::resolve_provider_config(&env).unwrap();
+        let model = model_from_provider_config(&config).unwrap();
+        assert_eq!(model.api, "openai-responses");
+        assert_eq!(model.base_url, "https://api.openai.com/v1");
+        assert!(!should_strip_assistant_thinking(
+            &ProviderId::OpenAi,
+            &model.id
+        ));
+        assert!(!should_strip_assistant_thinking(
+            &ProviderId::MiniMax,
+            "MiniMax-M3"
+        ));
+        assert!(should_strip_assistant_thinking(
+            &ProviderId::MiniMax,
+            "MiniMax-M2"
+        ));
+    }
+    #[test]
+    fn minimax_vision_is_limited_to_documented_m3_routes() {
+        for (id, images) in [
+            ("MiniMax-M3", true),
+            ("MiniMax-M3.1-Flash-Preview", true),
+            ("MiniMax-M2.7-highspeed", false),
+        ] {
+            let env = ocean_providers::ProviderEnv {
+                vars: std::collections::BTreeMap::from([("OCEAN_MODEL".into(), id.into())]),
+                ..Default::default()
+            };
+            let config = ocean_providers::resolve_provider_config(&env).unwrap();
+            assert_eq!(
+                model_from_provider_config(&config).unwrap().supports_images,
+                images
+            );
+        }
+    }
+}

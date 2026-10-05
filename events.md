@@ -11442,3 +11442,93 @@ area:      [backend]
 
 gpt-5.5 was registered with a 400k context window, but the Codex backend serves 272k (the same served-vs-advertised gap the gpt-6.1-sol entry above records). A session planning compaction against 400k could overfill and fail mid-turn. The gpt-5.5 / gpt-5-5 arm of resolve_model_selection now returns 272_000; a new test pins both spellings (red on the old value, green now; crate 55/0). Built by a DeepSeek seat (deepseek-v4-pro), gated by lead 16. Not changed: gpt-5.4, gpt-5.4-mini and gpt-5.3-codex-spark still say 400k because nothing in the repo records their served limit, and the openai-codex explicit-provider catch-all still defaults to 400k. The live daemon is untouched until a binary swap.
 _________________________________________________________________________________ 09:47 l16-ctx-fix
+
+time:      [13:19] [05-10-26]
+agent:     [Codex desktop], [GPT-6]
+worktree:  [codex/provider-model-refresh-20261005] [/private/tmp/ocean-models-20261005]
+type:      [feature-request]
+area:      [backend] [testing]
+
+Refreshed current provider models from official catalogues: Claude Opus/Sonnet 5.5 and Fable 5.1, OpenAI GPT-6 routes, Gemini 3, MiniMax M3/plan preview, GLM 5.3, and current Kimi/DeepSeek coverage. Unversioned convenience names and general fallbacks select current releases; explicit versioned pins remain stable and restricted previews stay opt-in. Updated resolver/runtime capacities, adaptive Claude requests, private same-model Gemini signature replay, OpenAI API-key Responses without Codex identity headers, MiniMax reasoning replay and GLM effort compatibility. Removed retired Codex picker entries while preserving their resolver pins. Owning crate devlogs updated; root ownership and child indexes unchanged. Final cargo xtask ci passed locally. No paid model calls, merge, deployment, or account-specific preview acceptance is claimed; fresh review and hosted CI remain required. Dirty canonical checkout preserved; only this ledger entry is appended there and mirrored in the branch.
+_________________________________________________________________________________ 13:19 codex/provider-model-refresh-20261005
+
+time:      [13:49] [05-10-26]
+agent:     [Codex desktop], [GPT-6]
+worktree:  [codex/provider-model-refresh-20261005] [/private/tmp/ocean-models-20261005]
+type:      [bug report]
+area:      [review] [backend] [testing]
+
+Addressed PR #532 review findings: merge the required thinking-binding-controls beta with OAuth and caller betas in one Anthropic header, and map Gemini 3.8 Flash Off/Minimal to supported low effort while keeping 3.5 Flash-Lite minimal. Protocol regression tests pass (176 unit plus 5 integration). Updated protocol devlog; parent ownership and child indexes unchanged. The prior hosted macOS failure was the unrelated extension stalled-service cleanup deadline assertion; no timeout is weakened. Full local/hosted revalidation and fresh review follow before merge/install.
+_________________________________________________________________________________ 13:49 codex/provider-model-refresh-20261005
+
+time:      [14:02] [05-10-26]
+agent:     [Codex desktop], [GPT-6]
+worktree:  [codex/provider-model-refresh-20261005] [/private/tmp/ocean-models-20261005]
+type:      [bug report]
+area:      [review] [backend] [testing]
+
+PR #532 fresh review exposed the missing runtime Off propagation. The real agent loop now forwards configured Off unless a StreamOptions override is present; encoders retain ownership of supported wire semantics. Sonnet 5.5 Off uses between_tools at low effort without block binding; API-key GPT-6 Luna Off uses none while Codex/other GPT-6 retain low. Added real-loop option capture and encoder regressions. Protocol/runtime unit and integration suites passed; doctests stopped on local disk exhaustion and are rerun after reclaiming only task-owned build output. Protocol/runtime devlogs updated; parent ownership and indexes unchanged. Prior 94ff04be hosted matrix was all green. Final local/hosted validation and fresh review remain required before merge/install.
+_________________________________________________________________________________ 14:02 codex/provider-model-refresh-20261005
+
+time:      [14:14] [05-10-26]
+agent:     [codex], [GPT-6], [primary]
+worktree:  [codex/provider-model-refresh-20261005]
+type:      [bug report]
+area:      [backend]
+
+PR #532 Gemini review repairs: current Gemini 3 tool images are ordered FunctionResponse.parts bound to their call id/name, while legacy models retain separate user image content. Gemini 3 omits temperature overrides. Three-model regressions cover images, text-only results, errors, sampling, thinking, and output caps; ocean-protocol tests pass. Updated protocol devlog; parent ownership and child indexes unchanged. Full final CI and fresh review follow.
+_________________________________________________________________________________ 14:14 codex/provider-model-refresh-20261005
+
+time:      [14:24] [05-10-26]
+agent:     [codex], [GPT-6], [primary]
+worktree:  [codex/provider-model-refresh-20261005]
+type:      [bug report]
+area:      [backend]
+
+PR #532 review repairs: Sonnet Off with signed thinking history stays adaptive at low effort with drop_block binding controls; fresh history can use between_tools. GLM 5.3 and Flash reserve published 128K output on both resolver paths. Declined MiniMax Highspeed vision finding against the exact official OpenAI-compatible API contract, which limits image support to M3 variants; added capability regression. Protocol, providers, and agent tests pass. Updated owning devlogs; ownership and child indexes unchanged. Full CI and fresh review follow.
+_________________________________________________________________________________ 14:24 codex/provider-model-refresh-20261005
+
+time:      [14:30] [05-10-26]
+agent:     [codex], [GPT-6], [primary]
+worktree:  [codex/provider-model-refresh-20261005]
+type:      [bug report]
+area:      [backend]
+
+PR #532 Sonnet mode refinement: derive replayed thinking from the encoded Anthropic payload so foreign Google/Codex opaque markers and empty signatures cannot force adaptive mode for Off. Same-wire signed history retains adaptive binding protection. Protocol regressions pass; updated owning contract with unchanged child index. Full CI and fresh exact-head review follow.
+_________________________________________________________________________________ 14:30 codex/provider-model-refresh-20261005
+
+time:      [14:38] [05-10-26]
+agent:     [codex], [GPT-6], [primary]
+worktree:  [codex/provider-model-refresh-20261005]
+type:      [bug report]
+area:      [backend]
+
+PR #532 Gemini parallel-round repair: consecutive tool results are ordered functionResponse parts in one user content, with each image retained inside its matching response. Normal user/model messages delimit groups; legacy encoding remains unchanged. Three-model grouping/media regressions and protocol suite pass. Updated owning contract and unchanged child index. Full CI and fresh review follow. The unrelated Git tree-bomb timing test passed in isolation after a local loaded-run timeout; its deadline/assertions remain unchanged.
+_________________________________________________________________________________ 14:38 codex/provider-model-refresh-20261005
+
+time:      [14:47] [05-10-26]
+agent:     [codex], [GPT-6], [primary]
+worktree:  [codex/provider-model-refresh-20261005]
+type:      [bug report]
+area:      [backend]
+
+PR #532 Claude-family compatibility repair: Sonnet 5.5 encoding omits thinking blocks from documented unreadable Opus 5/5.5, Fable, and Mythos sources before choosing Off mode. Supported older Claude and same-model signed history retain adaptive binding protection. Ten-source compatibility regression and protocol suite pass. Updated protocol contract; ownership/index unchanged. Full final CI and fresh review follow.
+_________________________________________________________________________________ 14:47 codex/provider-model-refresh-20261005
+
+time:      [14:56] [05-10-26]
+agent:     [codex], [GPT-6], [primary]
+worktree:  [codex/provider-model-refresh-20261005]
+type:      [bug report]
+area:      [backend]
+
+PR #532 split-reasoning privacy repair: restrict reasoning-only visible-answer promotion to the intended DeepSeek compatibility route. MiniMax M3/Preview, GLM and OpenAI retain partial length-limited reasoning only as Thinking. Local HTTP streaming regression checks deltas and persisted terminal content across five routes; protocol suite passes. Updated protocol contract; ownership/index unchanged. Full CI and fresh exact-head review follow.
+_________________________________________________________________________________ 14:56 codex/provider-model-refresh-20261005
+
+time:      [15:05] [05-10-26]
+agent:     [codex], [GPT-6], [primary]
+worktree:  [codex/provider-model-refresh-20261005]
+type:      [bug report]
+area:      [backend]
+
+PR #532 API reasoning repair: public GPT-6 Sol and Luna Off use supported none; subscription routes, GPT-6.1 Sol and Astra retain low. Expanded request regression and protocol tests pass. Updated owning protocol contract; child index/ownership unchanged. Full CI and fresh review follow. The preceding hosted macOS job failed an unrelated extension registry lock test with OS WouldBlock; no unrelated assertion was weakened.
+_________________________________________________________________________________ 15:05 codex/provider-model-refresh-20261005

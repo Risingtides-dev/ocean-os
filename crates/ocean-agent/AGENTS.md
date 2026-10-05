@@ -69,13 +69,20 @@ This crate owns Ocean's agent session/history layer and project prompt loading. 
   present, removes ordinary operator memory when attached, and is removed by
   `without_tools()`.
 - `PromptControl` receives exactly two effective harness-profile booleans from the daemon: `hashline_edits` and `artifact_spill`. Direct/legacy callers default both off; do not add declarative profile fields here until production runtime composition actually consumes them.
-- History shaping preserves stored thinking only when the selected route is exact
+- OpenAI-compatible history shaping preserves stored thinking when the selected route is exact
   `kimi`/`kimi-k3` (Moonshot requires same-model `reasoning_content` replay) or
-  `openai-codex` (the codex encoder replays its own marker-signed encrypted
+  `minimax`/`MiniMax-M3*`, API-key `openai`/`gpt-6*`, or
+  `openai-codex` (the Responses encoder replays its own marker-signed encrypted
   reasoning items and MUST receive them back — stripping them degenerates
   gpt-5.x into malformed tool calls across tool rounds). Kimi K2.x and other
   OpenAI-compatible routes retain the existing thinking-strip boundary;
-  provider encoders still drop cross-provider thinking.
+  provider encoders still drop cross-provider thinking. MiniMax replay is exact
+  provider/model only. API-key GPT-6 uses `openai-responses` on api.openai.com;
+  subscription GPT-6 stays on `codex-responses` with its served context limit.
+- MiniMax vision follows the OpenAI-compatible API contract: M3 and M3.1 Flash Preview accept images; M2.7 Highspeed remains text-only.
+- New Claude and Gemini wire models inherit resolver capacities. Google persists
+  the requested canonical model id so versioned response ids cannot disable
+  same-model thought-signature replay.
 - Public `SessionTranscriptEntry.text` and persisted history search project
   visible `Content::Text` only. Provider `Thinking` remains in raw persisted
   messages for compatible same-provider replay and never enters display/search

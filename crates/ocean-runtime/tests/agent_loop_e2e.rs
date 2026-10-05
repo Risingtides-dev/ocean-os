@@ -48,6 +48,7 @@ struct MockProvider {
     contexts: std::sync::Mutex<Vec<Context>>,
     calls: AtomicUsize,
     saw_bound_session_id: AtomicBool,
+    reasoning: std::sync::Mutex<Vec<Option<ocean_protocol::ThinkingLevel>>>,
 }
 
 impl MockProvider {
@@ -57,6 +58,7 @@ impl MockProvider {
             contexts: std::sync::Mutex::new(Vec::new()),
             calls: AtomicUsize::new(0),
             saw_bound_session_id: AtomicBool::new(false),
+            reasoning: std::sync::Mutex::new(Vec::new()),
         }
     }
 
@@ -85,6 +87,7 @@ impl Provider for MockProvider {
             options.session_id.as_deref() == Some("e2e"),
             Ordering::SeqCst,
         );
+        self.reasoning.lock().unwrap().push(options.reasoning);
         self.calls.fetch_add(1, Ordering::SeqCst);
         self.contexts.lock().unwrap().push(context.clone());
         let turn = self.turns.lock().unwrap().pop_front().expect(
@@ -1778,4 +1781,25 @@ async fn kimi_k3_final_synthesis_retains_history_declarations_with_tool_choice_n
     assert_eq!(dynamic_declaration_names(final_context), vec![vec!["echo"]]);
     assert_eq!(final_context.dynamic_tool_declarations[0].before_message, 3);
     assert_eq!(final_context.tool_choice, ocean_protocol::ToolChoice::None);
+}
+
+#[tokio::test]
+async fn explicit_off_reaches_providers_and_stream_option_overrides_are_preserved() {
+    use ocean_protocol::ThinkingLevel;
+    for override_level in [None, Some(ThinkingLevel::High)] {
+        let provider = Arc::new(MockProvider::new(vec![vec![done(
+            vec![Content::text("done")],
+            StopReason::Stop,
+        )]]));
+        let mut config = base_config(provider.clone());
+        config.thinking_level = ThinkingLevel::Off;
+        config.stream_options.reasoning = override_level;
+        ocean_runtime::run_agent(&config, user("finish"), None)
+            .await
+            .unwrap();
+        assert_eq!(
+            *provider.reasoning.lock().unwrap(),
+            vec![Some(override_level.unwrap_or(ThinkingLevel::Off))]
+        );
+    }
 }

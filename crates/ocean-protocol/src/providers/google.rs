@@ -14,7 +14,7 @@ use async_stream::stream;
 use async_trait::async_trait;
 use eventsource_stream::Eventsource;
 use futures::StreamExt;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
 use crate::error::{Error, Result};
@@ -62,16 +62,22 @@ struct CandidateContent {
     parts: Vec<Part>,
 }
 
-#[derive(Deserialize, Debug)]
+#[derive(Deserialize, Serialize, Debug)]
 #[serde(rename_all = "camelCase")]
 struct Part {
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     text: Option<String>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     function_call: Option<FunctionCall>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    thought_signature: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    thought: Option<bool>,
+    #[serde(flatten)]
+    extra: serde_json::Map<String, Value>,
 }
 
-#[derive(Deserialize, Debug)]
+#[derive(Deserialize, Serialize, Debug)]
 #[serde(rename_all = "camelCase")]
 struct FunctionCall {
     // OCEAN-145 (2): Gemini 3 models return a unique `id` on every functionCall;
@@ -79,12 +85,14 @@ struct FunctionCall {
     // into the eventual functionResponse.id (the disambiguation channel for two
     // parallel calls to the SAME tool). Absent → we synthesize a deterministic
     // `call_<n>` in stream order so ordering is still preserved.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     id: Option<String>,
     #[serde(default)]
     name: String,
     #[serde(default)]
     args: Value,
+    #[serde(flatten)]
+    extra: serde_json::Map<String, Value>,
 }
 
 /// Classify a Gemini `finishReason` into the unified `StopReason`, flagging the
@@ -130,9 +138,32 @@ struct UsageMetadata {
     thoughts_token_count: u64,
 }
 
-fn convert_messages(messages: &[Message]) -> Vec<Value> {
+// Persist the exact ordered generateContent parts in the existing opaque
+// thinking-signature slot. Visible text/tool projections remain unchanged.
+// Only Google may replay this marker; other encoders must drop it.
+pub(crate) const PARTS_MARKER: &str = "google-parts:";
+
+fn signed_parts(message: &AssistantMessage, model: &Model) -> Option<Vec<Value>> {
+    if message.provider != "google" || message.model != model.id {
+        return None;
+    }
+    message.content.iter().find_map(|content| {
+        let Content::Thinking {
+            thinking_signature: Some(signature),
+            ..
+        } = content
+        else {
+            return None;
+        };
+        let json = signature.strip_prefix(PARTS_MARKER)?;
+        let parts: Vec<Value> = serde_json::from_str(json).ok()?;
+        parts.iter().all(Value::is_object).then_some(parts)
+    })
+}
+
+fn convert_messages(messages: &[Message], model: &Model) -> Vec<Value> {
     let mut out: Vec<Value> = Vec::new();
-    for m in messages {
+    for (index, m) in messages.iter().enumerate() {
         match m {
             Message::User { content, .. } => {
                 let parts: Vec<Value> = content
@@ -148,6 +179,10 @@ fn convert_messages(messages: &[Message]) -> Vec<Value> {
                 out.push(json!({"role": "user", "parts": parts}));
             }
             Message::Assistant(a) => {
+                if let Some(parts) = signed_parts(a, model) {
+                    out.push(json!({"role": "model", "parts": parts}));
+                    continue;
+                }
                 let mut parts: Vec<Value> = Vec::new();
                 for c in &a.content {
                     match c {
@@ -169,15 +204,8 @@ fn convert_messages(messages: &[Message]) -> Vec<Value> {
                             }
                             parts.push(json!({ "functionCall": call }));
                         }
-                        // OCEAN-140: Gemini only replays model thinking via opaque
-                        // `thoughtSignature` blobs attached to the original parts —
-                        // it does not accept free-form thinking text as a model
-                        // input part, and a raw `text` part would corrupt the
-                        // transcript rather than restore the thought. Ocean's
-                        // Content::Thinking carries an Anthropic-style signature,
-                        // not a Gemini thoughtSignature, so there is nothing valid
-                        // to re-encode. Drop it EXPLICITLY here instead of a silent
-                        // `_ => {}` (kills the OCEAN-101 silent-drop class).
+                        // Signed Google parts were replayed above. Unsigned or
+                        // foreign thinking must never become visible model text.
                         Content::Thinking { .. } => {}
                         // Images never appear in model (assistant) content.
                         Content::Image { .. } => {}
@@ -224,21 +252,6 @@ fn convert_messages(messages: &[Message]) -> Vec<Value> {
                 if !tr.tool_call_id.is_empty() {
                     fr["id"] = json!(tr.tool_call_id);
                 }
-                // The structured/textual tool output stays in the
-                // functionResponse part. The Gemini functionResponse schema
-                // carries the tool's text/JSON result; it has no slot for image
-                // bytes.
-                out.push(json!({
-                    "role": "user",
-                    "parts": [{ "functionResponse": fr }]
-                }));
-                // OCEAN-132: tool-result images (browser / computer-use
-                // screenshots come back as Content::Image) were silently dropped
-                // — only `.as_text()` was collected above, so the model never saw
-                // the screenshot ("I can't see any screenshot"). Gemini reads
-                // images from inlineData parts, so follow the functionResponse
-                // with a user-role content carrying each image as an inlineData
-                // part (mirroring how user-message images are encoded above).
                 let image_parts: Vec<Value> = tr
                     .content
                     .iter()
@@ -249,7 +262,24 @@ fn convert_messages(messages: &[Message]) -> Vec<Value> {
                         _ => None,
                     })
                     .collect();
-                if !image_parts.is_empty() {
+                // Gemini 3 binds media to the corresponding function result.
+                // Legacy models retain the separate user image content.
+                let gemini3 = model.id.starts_with("gemini-3.");
+                if gemini3 && !image_parts.is_empty() {
+                    fr["parts"] = json!(image_parts);
+                }
+                let response = json!({"functionResponse": fr});
+                if gemini3 && index > 0 && matches!(&messages[index - 1], Message::ToolResult(_)) {
+                    // Parallel results belong to the same user turn. Each
+                    // response retains its own id, name, and media parts.
+                    out.last_mut().expect("previous tool result content")["parts"]
+                        .as_array_mut()
+                        .expect("tool result parts")
+                        .push(response);
+                } else {
+                    out.push(json!({"role": "user", "parts": [response]}));
+                }
+                if !gemini3 && !image_parts.is_empty() {
                     out.push(json!({"role": "user", "parts": image_parts}));
                 }
             }
@@ -309,21 +339,49 @@ fn apply_reasoning(body: &mut Value, level: ThinkingLevel) {
     });
 }
 
-fn build_body(context: &Context, options: &StreamOptions) -> Value {
+fn build_body_for_model(model: &Model, context: &Context, options: &StreamOptions) -> Value {
     let mut body = json!({
-        "contents": convert_messages(&context.messages),
+        "contents": convert_messages(&context.messages, model),
     });
     if let Some(sp) = &context.system_prompt {
         body["systemInstruction"] = json!({"role": "system", "parts": [{"text": sp}]});
     }
-    if let Some(t) = options.temperature {
+    if let Some(t) = options
+        .temperature
+        .filter(|_| !model.id.starts_with("gemini-3."))
+    {
         if !body["generationConfig"].is_object() {
             body["generationConfig"] = json!({});
         }
         body["generationConfig"]["temperature"] = json!(t);
     }
+    if !body["generationConfig"].is_object() {
+        body["generationConfig"] = json!({});
+    }
+    if model.id.starts_with("gemini-3.") {
+        body["generationConfig"]["maxOutputTokens"] =
+            json!(options.max_tokens.unwrap_or(model.max_tokens));
+    }
     if let Some(level) = options.reasoning {
-        apply_reasoning(&mut body, level);
+        if model.id.starts_with("gemini-3.") {
+            let thinking = match level {
+                ThinkingLevel::Off | ThinkingLevel::Minimal
+                    if matches!(
+                        model.id.as_str(),
+                        "gemini-3.1-pro-preview" | "gemini-3.8-flash"
+                    ) =>
+                {
+                    "low"
+                }
+                ThinkingLevel::Off | ThinkingLevel::Minimal => "minimal",
+                ThinkingLevel::Low => "low",
+                ThinkingLevel::Medium => "medium",
+                ThinkingLevel::High | ThinkingLevel::Xhigh => "high",
+            };
+            body["generationConfig"]["thinkingConfig"] = json!({"thinkingLevel": thinking});
+        } else {
+            apply_reasoning(&mut body, level);
+        }
     }
     if let Some(m) = options.max_tokens {
         if !body["generationConfig"].is_object() {
@@ -346,6 +404,11 @@ fn build_body(context: &Context, options: &StreamOptions) -> Value {
         body["tools"] = json!([{"functionDeclarations": decls}]);
     }
     body
+}
+
+#[cfg(test)]
+fn build_body(context: &Context, options: &StreamOptions) -> Value {
+    build_body_for_model(&Model::gemini_2_0_flash(), context, options)
 }
 
 pub struct GoogleProvider {
@@ -392,7 +455,7 @@ impl Provider for GoogleProvider {
             model.id,
             api_key,
         );
-        let body = build_body(context, options);
+        let body = build_body_for_model(model, context, options);
         crate::prompt_capture::capture_request_body(&model.api, &model.provider, &model.id, &body);
         let cancel = options.cancel.clone();
         let extra_headers: BTreeMap<String, String> = options.headers.clone();
@@ -466,9 +529,10 @@ impl Provider for GoogleProvider {
             let mut text_started = false;
             let mut text_index: usize = 0;
             let mut tool_blocks: Vec<(String, String, Value)> = Vec::new();
+            let mut replay_parts: Vec<Value> = Vec::new();
+            let mut has_signature = false;
             let mut stop = StopReason::Stop;
             let mut usage = Usage::default();
-            let mut response_model: Option<String> = None;
             // Track an abnormal/blocking finishReason (SAFETY, RECITATION, …) so
             // it surfaces as a real error instead of a clean empty completion.
             let mut block_reason: Option<String> = None;
@@ -489,7 +553,7 @@ impl Provider for GoogleProvider {
                         continue;
                     }
                 };
-                if let Some(m) = chunk.model_version { response_model = Some(m); }
+                let _ = chunk.model_version;
                 if let Some(u) = chunk.usage_metadata {
                     usage.input = u.prompt_token_count;
                     usage.output = u.candidates_token_count;
@@ -511,6 +575,10 @@ impl Provider for GoogleProvider {
                     }
                     if let Some(content) = cand.content {
                         for part in content.parts {
+                            has_signature |= part.thought_signature.as_ref().is_some_and(|s| !s.is_empty());
+                            if let Ok(wire) = serde_json::to_value(&part) { replay_parts.push(wire); }
+                            // Thought summaries are private, never visible answer text.
+                            if part.thought == Some(true) { continue; }
                             if let Some(t) = part.text {
                                 if !t.is_empty() {
                                     if !text_started {
@@ -583,7 +651,7 @@ impl Provider for GoogleProvider {
                         content: vec![],
                         api: api.clone(),
                         provider: provider.clone(),
-                        model: response_model.clone().unwrap_or_else(|| model_id.clone()),
+                        model: model_id.clone(),
                         usage: usage.clone(),
                         stop_reason: StopReason::Error,
                         error_message: Some(format!(
@@ -607,11 +675,17 @@ impl Provider for GoogleProvider {
                 out_content.push(Content::ToolCall { id, name, arguments: args });
             }
             let _ = text_index;
+            if has_signature {
+                out_content.insert(0, Content::Thinking {
+                    thinking: String::new(),
+                    thinking_signature: Some(format!("{PARTS_MARKER}{}", serde_json::to_string(&replay_parts).unwrap_or_default())),
+                });
+            }
             let message = AssistantMessage {
                 content: out_content,
                 api,
                 provider,
-                model: response_model.unwrap_or(model_id),
+                model: model_id,
                 usage,
                 stop_reason: stop,
                 error_message: None,
@@ -652,7 +726,7 @@ mod tests {
             timestamp: now_ms(),
         }];
 
-        let out = convert_messages(&messages);
+        let out = convert_messages(&messages, &Model::gemini_2_0_flash());
         assert_eq!(out.len(), 1);
         let parts = out[0]["parts"].as_array().expect("parts array missing");
 
@@ -688,7 +762,7 @@ mod tests {
             timestamp: now_ms(),
         })];
 
-        let out = convert_messages(&messages);
+        let out = convert_messages(&messages, &Model::gemini_2_0_flash());
 
         // functionResponse still carries the textual output…
         let fr = out
@@ -722,7 +796,7 @@ mod tests {
             timestamp: now_ms(),
         })];
 
-        let out = convert_messages(&messages);
+        let out = convert_messages(&messages, &Model::gemini_2_0_flash());
         assert_eq!(out.len(), 1, "no extra image content should be appended");
         assert_eq!(
             out[0]["parts"][0]["functionResponse"]["response"]["output"],
@@ -737,7 +811,7 @@ mod tests {
 
     // OCEAN-140: a replayed model turn carrying a Content::Thinking block must hit
     // an EXPLICIT match arm, not the old silent `_ => {}`. Gemini replays thinking
-    // only via opaque thoughtSignature blobs (which Ocean does not carry), so the
+    // only via opaque thoughtSignature blobs in original Google parts, so the
     // documented behavior is an intentional drop: the thinking text must NOT appear
     // as a model part, while text and functionCall parts survive in order.
     #[test]
@@ -764,7 +838,7 @@ mod tests {
             timestamp: now_ms(),
         })];
 
-        let out = convert_messages(&messages);
+        let out = convert_messages(&messages, &Model::gemini_2_0_flash());
         assert_eq!(out.len(), 1, "expected a single model content");
         assert_eq!(out[0]["role"], "model");
 
@@ -976,7 +1050,7 @@ mod tests {
             timestamp: now_ms(),
         })];
 
-        let out = convert_messages(&messages);
+        let out = convert_messages(&messages, &Model::gemini_2_0_flash());
         let output = out[0]["parts"][0]["functionResponse"]["response"]["output"]
             .as_str()
             .expect("output text missing");
@@ -1007,7 +1081,7 @@ mod tests {
             timestamp: now_ms(),
         })];
 
-        let out = convert_messages(&messages);
+        let out = convert_messages(&messages, &Model::gemini_2_0_flash());
         assert_eq!(
             out[0]["parts"][0]["functionResponse"]["response"]["output"], "ok",
             "successful result output must be untouched (no ERROR prefix)"
@@ -1170,7 +1244,7 @@ mod tests {
             }),
         ];
 
-        let out = convert_messages(&messages);
+        let out = convert_messages(&messages, &Model::gemini_2_0_flash());
 
         // Replayed functionCalls each carry their id.
         let model_parts = out[0]["parts"].as_array().expect("model parts");
@@ -1203,7 +1277,7 @@ mod tests {
             timestamp: now_ms(),
         })];
 
-        let out = convert_messages(&messages);
+        let out = convert_messages(&messages, &Model::gemini_2_0_flash());
         assert!(
             out[0]["parts"][0]["functionResponse"].get("id").is_none(),
             "an empty tool_call_id must not produce a functionResponse.id field"
@@ -1371,5 +1445,257 @@ mod tests {
         assert_eq!(decls.len(), 1);
         assert_eq!(decls[0]["name"], "bash");
         assert_eq!(decls[0]["parameters"], tool.parameters);
+    }
+    #[test]
+    fn gemini3_uses_levels_and_keeps_lowest_pro_level_valid() {
+        let mut model = Model::gemini_2_0_flash();
+        model.id = "gemini-3.8-flash".into();
+        model.max_tokens = 65_536;
+        let options = StreamOptions {
+            reasoning: Some(ThinkingLevel::Medium),
+            ..Default::default()
+        };
+        let body = build_body_for_model(&model, &empty_context(), &options);
+        assert_eq!(
+            body["generationConfig"]["thinkingConfig"],
+            json!({"thinkingLevel": "medium"})
+        );
+        assert_eq!(body["generationConfig"]["maxOutputTokens"], 65_536);
+        model.id = "gemini-3.1-pro-preview".into();
+        let body = build_body_for_model(
+            &model,
+            &empty_context(),
+            &StreamOptions {
+                reasoning: Some(ThinkingLevel::Off),
+                ..Default::default()
+            },
+        );
+        assert_eq!(
+            body["generationConfig"]["thinkingConfig"],
+            json!({"thinkingLevel": "low"})
+        );
+    }
+
+    #[tokio::test]
+    async fn gemini3_stream_replays_signed_parallel_calls_without_exposing_thoughts() {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let data = json!({"modelVersion": "gemini-3.8-flash-001", "candidates": [{"content": {"parts": [
+            {"text": "private summary", "thought": true},
+            {"functionCall": {"id": "one", "name": "read", "args": {"path": "a"}}, "thoughtSignature": "signed-one"},
+            {"functionCall": {"name": "read", "args": {"path": "b"}}, "futureMetadata": "preserved"}
+        ]}, "finishReason": "STOP"}]});
+        let expected = data["candidates"][0]["content"]["parts"].clone();
+        let thread = std::thread::spawn(move || {
+            let (mut socket, _) = listener.accept().unwrap();
+            let mut bytes = [0; 8192];
+            assert!(socket.read(&mut bytes).unwrap() > 0);
+            let body = format!("data: {data}\n\n");
+            write!(socket, "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}", body.len(), body).unwrap();
+        });
+        let mut model = Model::gemini_2_0_flash();
+        model.id = "gemini-3.8-flash".into();
+        let options = StreamOptions {
+            api_key: Some("test-key".into()),
+            base_url: Some(format!("http://{address}")),
+            ..Default::default()
+        };
+        let events: Vec<_> = GoogleProvider::new()
+            .stream(&model, &empty_context(), &options)
+            .await
+            .unwrap()
+            .collect()
+            .await;
+        thread.join().unwrap();
+        let message = events
+            .into_iter()
+            .find_map(|event| match event.unwrap() {
+                AssistantMessageEvent::Done { message, .. } => Some(message),
+                _ => None,
+            })
+            .expect("terminal message");
+        assert_eq!(message.model, model.id);
+        assert!(!message.content.iter().any(
+            |content| matches!(content, Content::Text { text } if text.contains("private summary"))
+        ));
+        let mut context = empty_context();
+        context.messages = vec![Message::Assistant(message.clone())];
+        let body = build_body_for_model(&model, &context, &StreamOptions::default());
+        assert_eq!(body["contents"][0]["parts"], expected);
+        // A provider/model change must never forward the opaque parts marker.
+        model.id = "gemini-2.0-flash".into();
+        let body = build_body_for_model(&model, &context, &StreamOptions::default());
+        assert!(!body.to_string().contains("signed-one"));
+        assert!(!body.to_string().contains("private summary"));
+    }
+    #[test]
+    fn current_gemini_models_map_lowest_settings_to_supported_levels() {
+        for (id, expected) in [
+            ("gemini-3.8-flash", "low"),
+            ("gemini-3.1-pro-preview", "low"),
+            ("gemini-3.5-flash-lite", "minimal"),
+        ] {
+            let mut model = Model::gemini_2_0_flash();
+            model.id = id.into();
+            for level in [ThinkingLevel::Off, ThinkingLevel::Minimal] {
+                let options = StreamOptions {
+                    reasoning: Some(level),
+                    ..Default::default()
+                };
+                let body = build_body_for_model(&model, &empty_context(), &options);
+                assert_eq!(
+                    body["generationConfig"]["thinkingConfig"]["thinkingLevel"],
+                    expected
+                );
+            }
+        }
+    }
+    #[test]
+    fn gemini3_tool_images_stay_inside_the_matching_function_response() {
+        for id in [
+            "gemini-3.8-flash",
+            "gemini-3.5-flash-lite",
+            "gemini-3.1-pro-preview",
+        ] {
+            let mut model = Model::gemini_2_0_flash();
+            model.id = id.into();
+            for is_error in [false, true] {
+                for with_images in [false, true] {
+                    let mut content = vec![Content::text("captured viewport")];
+                    if with_images {
+                        content.extend([
+                            Content::Image {
+                                data: "AAECAwQ=".into(),
+                                mime_type: "image/png".into(),
+                            },
+                            Content::Image {
+                                data: "AQIDBA==".into(),
+                                mime_type: "image/jpeg".into(),
+                            },
+                        ]);
+                    }
+                    let out = convert_messages(
+                        &[Message::ToolResult(crate::types::ToolResultMessage {
+                            tool_call_id: "call_1".into(),
+                            tool_name: "screenshot".into(),
+                            content,
+                            is_error,
+                            timestamp: now_ms(),
+                        })],
+                        &model,
+                    );
+                    assert_eq!(out.len(), 1);
+                    assert_eq!(out[0]["role"], "user");
+                    assert_eq!(out[0]["parts"].as_array().unwrap().len(), 1);
+                    let fr = &out[0]["parts"][0]["functionResponse"];
+                    assert_eq!(fr["id"], "call_1");
+                    assert_eq!(fr["name"], "screenshot");
+                    assert_eq!(fr["response"]["is_error"], is_error);
+                    assert_eq!(
+                        fr["response"]["output"],
+                        if is_error {
+                            "ERROR: captured viewport"
+                        } else {
+                            "captured viewport"
+                        }
+                    );
+                    if with_images {
+                        assert_eq!(
+                            fr["parts"],
+                            json!([
+                                {"inlineData": {"mimeType": "image/png", "data": "AAECAwQ="}},
+                                {"inlineData": {"mimeType": "image/jpeg", "data": "AQIDBA=="}},
+                            ])
+                        );
+                    } else {
+                        assert!(fr.get("parts").is_none());
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn gemini3_omits_temperature_while_legacy_models_preserve_it() {
+        for id in [
+            "gemini-3.8-flash",
+            "gemini-3.5-flash-lite",
+            "gemini-3.1-pro-preview",
+            "gemini-2.0-flash",
+        ] {
+            let mut model = Model::gemini_2_0_flash();
+            model.id = id.into();
+            model.max_tokens = 65_536;
+            let body = build_body_for_model(
+                &model,
+                &empty_context(),
+                &StreamOptions {
+                    temperature: Some(0.3),
+                    reasoning: Some(ThinkingLevel::High),
+                    ..Default::default()
+                },
+            );
+            if id.starts_with("gemini-3.") {
+                assert!(body["generationConfig"].get("temperature").is_none());
+                assert_eq!(body["generationConfig"]["maxOutputTokens"], 65_536);
+                assert_eq!(
+                    body["generationConfig"]["thinkingConfig"]["thinkingLevel"],
+                    "high"
+                );
+            } else {
+                assert_eq!(body["generationConfig"]["temperature"], json!(0.3_f32));
+                assert_eq!(
+                    body["generationConfig"]["thinkingConfig"]["thinkingBudget"],
+                    16_384
+                );
+            }
+        }
+    }
+    #[test]
+    fn gemini3_groups_parallel_results_without_merging_across_user_turns() {
+        for id in [
+            "gemini-3.8-flash",
+            "gemini-3.5-flash-lite",
+            "gemini-3.1-pro-preview",
+        ] {
+            let mut model = Model::gemini_2_0_flash();
+            model.id = id.into();
+            let result = |call: &str, data: &str| {
+                Message::ToolResult(crate::types::ToolResultMessage {
+                    tool_call_id: call.into(),
+                    tool_name: "screenshot".into(),
+                    content: vec![
+                        Content::text(call),
+                        Content::Image {
+                            data: data.into(),
+                            mime_type: "image/png".into(),
+                        },
+                    ],
+                    is_error: false,
+                    timestamp: now_ms(),
+                })
+            };
+            let messages = vec![
+                result("call_1", "AAECAwQ="),
+                result("call_2", "AQIDBA=="),
+                Message::user_text("next turn"),
+                result("call_3", "BA=="),
+            ];
+            let out = convert_messages(&messages, &model);
+            assert_eq!(out.len(), 3);
+            assert_eq!(out[0]["parts"].as_array().unwrap().len(), 2);
+            for (index, call, data) in [(0, "call_1", "AAECAwQ="), (1, "call_2", "AQIDBA==")] {
+                let fr = &out[0]["parts"][index]["functionResponse"];
+                assert_eq!(fr["id"], call);
+                assert_eq!(fr["name"], "screenshot");
+                assert_eq!(fr["response"]["output"], call);
+                assert_eq!(fr["parts"][0]["inlineData"]["data"], data);
+            }
+            assert_eq!(out[1]["parts"][0]["text"], "next turn");
+            assert_eq!(out[2]["parts"][0]["functionResponse"]["id"], "call_3");
+            let legacy = convert_messages(&messages, &Model::gemini_2_0_flash());
+            assert_eq!(legacy.len(), 7);
+        }
     }
 }
