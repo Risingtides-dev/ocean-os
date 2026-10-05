@@ -39,7 +39,7 @@ const ORIGINATOR: &str = "codex_cli_rs";
 const OPENAI_BETA: &str = "responses=experimental";
 // ChatGPT's Codex backend version-gates newly released models. Keep this aligned
 // with the current open-source Codex CLI wire version.
-const CODEX_VERSION: &str = "0.144.1";
+const CODEX_VERSION: &str = "0.159.2";
 
 fn apply_request_headers(
     request: reqwest::RequestBuilder,

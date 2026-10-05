@@ -11415,3 +11415,12 @@ area:      [backend]
 
 Production shared-room clients recovered repeatedly because Bedrock's members response includes caller_member_ids while MembersEnvelope denied that additive field. Accept the optional typed string array without using it for identity or authorization, preserving strict unknown-field rejection. Add malformed/legacy-envelope coverage and exercise the current envelope through the existing durable SSE integration test. Formatting and diff checks pass; compilation, independent review, and production verification are in progress. The canonical ledger entry is carried unchanged into the feature branch for review.
 _________________________________________________________________________________ 12:28 codex/rooms-roster-caller-ids
+
+time:      [18:30] [04-10-26]
+agent:     [claude], [claude-opus-5-5]
+worktree:  feat/gpt-6.1-sol
+type:      [feature-request]
+area:      [backend]
+
+Registered gpt-6.1-sol (OpenAI, released 2026-09-29) so seats can pick it and failover can route to it; until now the id was rejected and turns failed. Also carried gpt-6-astra over from the unpushed local-main commit d2a2528: the live daemon (fe6399a) routes it and the daemon log shows Astra turns, so a deploy from origin/main without it would break those seats. Both route to the Codex backend with a 272k window and 128k max output. OpenAI's API page lists 1.05M, but the Codex models list (client 0.159.2) serves 272k by default, so compaction plans against that. DEFAULT_FALLBACK_ORDER's codex slot moves from gpt-5.4, which ChatGPT accounts no longer get, to gpt-6.1-sol. The Codex wire version header goes from 0.144.1 to 0.159.2, because the backend version-gates new models and 0.159.2 is the client that lists gpt-6.1-sol. Tests cover the new ids and the codex fallback slot. Local main's other unpushed commits (team manager board route, GLM replay, timeouts) are not part of this change.
+_________________________________________________________________________________ 18:30 feat/gpt-6.1-sol
