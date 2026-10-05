@@ -516,7 +516,7 @@ impl Default for ProviderQuarantine {
 }
 
 /// Env var holding the ordered fallback list (OCEAN-275), comma-separated model
-/// aliases — e.g. `claude-sonnet-4-6,gpt-5.4,deepseek-v4-pro`. Each alias is
+/// aliases — e.g. `claude-sonnet-5,gpt-6.1-sol,deepseek-v4-pro`. Each alias is
 /// resolved through the same [`resolve_provider_config`] path as a primary
 /// selection, so anything valid for `OCEAN_MODEL` is valid here. Unset ⇒
 /// [`DEFAULT_FALLBACK_ORDER`]. Unparseable/unknown entries are skipped (with a
@@ -535,7 +535,7 @@ pub const ENV_PROVIDER_FALLBACK: &str = "OCEAN_PROVIDER_FALLBACK";
 /// who wants that can still list `fake` explicitly in the env override).
 pub const DEFAULT_FALLBACK_ORDER: &[&str] = &[
     "claude-sonnet-5",  // claude-code oauth
-    "gpt-5.4",          // openai-codex
+    "gpt-6.1-sol",      // openai-codex
     "deepseek-v4-pro",  // deepseek
     "gemini-2.0-flash", // google
     "kimi-k2.6",        // kimi
@@ -783,6 +783,8 @@ pub fn known_models() -> Vec<KnownModel> {
         // are about to stop existing.
         m("deepseek-v4-pro", "deepseek", "DeepSeek V4 Pro"),
         m("deepseek-v4-flash", "deepseek", "DeepSeek V4 Flash"),
+        m("gpt-6.1-sol", "openai-codex", "GPT-6.1 Sol (Codex)"),
+        m("gpt-6-astra", "openai-codex", "GPT-6 Astra (Codex)"),
         m("gpt-5.6-sol", "openai-codex", "GPT-5.6 Sol (Codex)"),
         m("gpt-5.6-terra", "openai-codex", "GPT-5.6 Terra (Codex)"),
         m("gpt-5.6-luna", "openai-codex", "GPT-5.6 Luna (Codex)"),
@@ -947,6 +949,24 @@ pub fn resolve_model_selection(env: &ProviderEnv) -> Result<ModelSelection, Prov
             OPENAI_BASE_URL,
             128_000,
             16_384,
+        )),
+        // GPT-6 generation on the Codex backend. OpenAI's API page lists a
+        // 1.05M window for both, but the ChatGPT Codex backend serves a 272k
+        // default window (models list, client 0.159.2, 2026-10-04), so that is
+        // what compaction must plan against. Max output 128k per OpenAI.
+        "gpt-6.1-sol" | "gpt-6-1-sol" => Ok(model_selection(
+            ProviderId::OpenAiCodex,
+            "gpt-6.1-sol",
+            CODEX_BASE_URL,
+            272_000,
+            128_000,
+        )),
+        "gpt-6-astra" => Ok(model_selection(
+            ProviderId::OpenAiCodex,
+            "gpt-6-astra",
+            CODEX_BASE_URL,
+            272_000,
+            128_000,
         )),
         "gpt-5.6-sol" | "gpt-5-6-sol" => Ok(model_selection(
             ProviderId::OpenAiCodex,
@@ -2049,6 +2069,50 @@ mod tests {
     }
 
     #[test]
+    fn gpt_6_codex_models_resolve_with_codex_backend_limits() {
+        for (alias, id) in [
+            ("gpt-6.1-sol", "gpt-6.1-sol"),
+            ("gpt-6-1-sol", "gpt-6.1-sol"),
+            ("gpt-6-astra", "gpt-6-astra"),
+        ] {
+            let s = resolve_model_selection(&env(&[("OCEAN_MODEL", alias)])).unwrap();
+            assert_eq!(s.provider, ProviderId::OpenAiCodex, "{alias}");
+            assert_eq!(s.model, id, "{alias}");
+            assert_eq!(s.base_url, CODEX_BASE_URL, "{alias}");
+            assert_eq!(s.context_window, 272_000, "{alias}");
+            assert_eq!(s.max_output_tokens, 128_000, "{alias}");
+        }
+    }
+
+    #[test]
+    fn default_fallback_routes_codex_to_gpt_6_1_sol() {
+        // gpt-5.4 is no longer served to ChatGPT accounts, so the codex slot in
+        // the default order is gpt-6.1-sol. With only a Codex credential ready,
+        // a degraded deepseek primary fails over to it.
+        let dir = std::env::temp_dir().join(format!("ocean-sol-fallback-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let cli_path = dir.join("codex-auth.json");
+        fs::write(
+            &cli_path,
+            r#"{"tokens":{"access_token":"cli-token","account_id":"cli-acct"}}"#,
+        )
+        .unwrap();
+        let e = ProviderEnv {
+            vars: BTreeMap::from([("OCEAN_MODEL".into(), "deepseek-v4-pro".into())]),
+            auth_file: None,
+            codex_auth_file: Some(cli_path),
+        };
+        assert!(DEFAULT_FALLBACK_ORDER.contains(&"gpt-6.1-sol"));
+        assert!(!DEFAULT_FALLBACK_ORDER.contains(&"gpt-5.4"));
+        let alt = unquarantined_fallback(&e, &ProviderId::DeepSeek)
+            .expect("a ready codex alternate should be found");
+        assert_eq!(alt.selection.provider, ProviderId::OpenAiCodex);
+        assert_eq!(alt.selection.model, "gpt-6.1-sol");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn ocean_auth_file_can_supply_key() {
         let dir = std::env::temp_dir().join(format!("ocean-providers-test-{}", std::process::id()));
         let _ = fs::remove_dir_all(&dir);
@@ -2227,6 +2291,8 @@ mod tests {
             "deepseek-v4-pro",
             "gpt-4o",
             "gpt-4o-mini",
+            "gpt-6.1-sol",
+            "gpt-6-astra",
             "gpt-5.6-sol",
             "gpt-5.6-terra",
             "gpt-5.6-luna",
