@@ -11562,3 +11562,11 @@ area:      [testing]
 
 Removed misleading Off from legacy Codex capabilities after independent review. Corrected Max acceptance diagnostics: blank fallback enables the default order, so previous claims of fallback-disabled proof are withdrawn. Require the unroutable disabled sentinel, verify zero fallback candidates, and compare persisted effective model before a pass. Fresh isolated requests for Sol 6.1, Astra 6, Sol 6 and Luna 6 each passed with matching request-wire model and max effort. Claude Opus 5.5/Fable 5.1 failed with fallback disabled; their auth remains expired. Integrated the latest concurrent provider fixes. The unrelated A4 tree-bomb timeout failed once under load and passed in isolation without changing its bounds; full gate reruns. Owning crate/agent contracts updated; root ownership and child indexes unchanged.
 _________________________________________________________________________________ 14:43 codex/ocean-max-effort-20261005
+time:      [14:47] [05-10-26]
+agent:     [codex], [GPT-6], [primary]
+worktree:  [codex/provider-model-refresh-20261005]
+type:      [bug report]
+area:      [backend]
+
+PR #532 Claude-family compatibility repair: Sonnet 5.5 encoding omits thinking blocks from documented unreadable Opus 5/5.5, Fable, and Mythos sources before choosing Off mode. Supported older Claude and same-model signed history retain adaptive binding protection. Ten-source compatibility regression and protocol suite pass. Updated protocol contract; ownership/index unchanged. Full final CI and fresh review follow.
+_________________________________________________________________________________ 14:47 codex/provider-model-refresh-20261005
