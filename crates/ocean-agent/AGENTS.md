@@ -79,6 +79,7 @@ This crate owns Ocean's agent session/history layer and project prompt loading. 
   provider encoders still drop cross-provider thinking. MiniMax replay is exact
   provider/model only. API-key GPT-6 uses `openai-responses` on api.openai.com;
   subscription GPT-6 stays on `codex-responses` with its served context limit.
+- MiniMax vision follows the OpenAI-compatible API contract: M3 and M3.1 Flash Preview accept images; M2.7 Highspeed remains text-only.
 - New Claude and Gemini wire models inherit resolver capacities. Google persists
   the requested canonical model id so versioned response ids cannot disable
   same-model thought-signature replay.
