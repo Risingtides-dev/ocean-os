@@ -381,7 +381,13 @@ fn build_body(model: &Model, context: &Context, options: &StreamOptions) -> Valu
     );
     if adaptive {
         // Current Claude models reject manual budgets and sampling overrides.
-        body["thinking"] = json!({"type": "adaptive", "block_binding": {"prefix_mismatch_behavior": "drop_block"}});
+        if model.id == "claude-sonnet-5-5" && options.reasoning == Some(ThinkingLevel::Off) {
+            // Sonnet permits no up-front thinking only in between-tools mode,
+            // which cannot carry adaptive block-binding controls.
+            body["thinking"] = json!({"type": "between_tools"});
+        } else {
+            body["thinking"] = json!({"type": "adaptive", "block_binding": {"prefix_mismatch_behavior": "drop_block"}});
+        }
         if let Some(level) = options.reasoning {
             let effort = match level {
                 ThinkingLevel::Off | ThinkingLevel::Minimal | ThinkingLevel::Low => "low",
@@ -1671,5 +1677,28 @@ mod tests {
             }
         }
         assert!(request_beta(&json!({}), AuthMethod::ApiKey, &BTreeMap::new()).is_none());
+    }
+    #[test]
+    fn sonnet_off_uses_between_tools_without_adaptive_binding_controls() {
+        for id in ["claude-sonnet-5-5", "claude-opus-5-5", "claude-fable-5-1"] {
+            let mut model = Model::anthropic_claude_fable_5_1();
+            model.id = id.into();
+            let body = build_body(
+                &model,
+                &Context::default(),
+                &StreamOptions {
+                    reasoning: Some(ThinkingLevel::Off),
+                    ..Default::default()
+                },
+            );
+            assert_eq!(body["output_config"]["effort"], "low");
+            if id == "claude-sonnet-5-5" {
+                assert_eq!(body["thinking"], json!({"type": "between_tools"}));
+                assert!(request_beta(&body, AuthMethod::ApiKey, &BTreeMap::new()).is_none());
+            } else {
+                assert_eq!(body["thinking"]["type"], "adaptive");
+                assert!(request_beta(&body, AuthMethod::ApiKey, &BTreeMap::new()).is_some());
+            }
+        }
     }
 }

@@ -11460,3 +11460,12 @@ area:      [review] [backend] [testing]
 
 Addressed PR #532 review findings: merge the required thinking-binding-controls beta with OAuth and caller betas in one Anthropic header, and map Gemini 3.8 Flash Off/Minimal to supported low effort while keeping 3.5 Flash-Lite minimal. Protocol regression tests pass (176 unit plus 5 integration). Updated protocol devlog; parent ownership and child indexes unchanged. The prior hosted macOS failure was the unrelated extension stalled-service cleanup deadline assertion; no timeout is weakened. Full local/hosted revalidation and fresh review follow before merge/install.
 _________________________________________________________________________________ 13:49 codex/provider-model-refresh-20261005
+
+time:      [14:02] [05-10-26]
+agent:     [Codex desktop], [GPT-6]
+worktree:  [codex/provider-model-refresh-20261005] [/private/tmp/ocean-models-20261005]
+type:      [bug report]
+area:      [review] [backend] [testing]
+
+PR #532 fresh review exposed the missing runtime Off propagation. The real agent loop now forwards configured Off unless a StreamOptions override is present; encoders retain ownership of supported wire semantics. Sonnet 5.5 Off uses between_tools at low effort without block binding; API-key GPT-6 Luna Off uses none while Codex/other GPT-6 retain low. Added real-loop option capture and encoder regressions. Protocol/runtime unit and integration suites passed; doctests stopped on local disk exhaustion and are rerun after reclaiming only task-owned build output. Protocol/runtime devlogs updated; parent ownership and indexes unchanged. Prior 94ff04be hosted matrix was all green. Final local/hosted validation and fresh review remain required before merge/install.
+_________________________________________________________________________________ 14:02 codex/provider-model-refresh-20261005
