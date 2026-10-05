@@ -7469,6 +7469,17 @@ async fn agent_turn(
         // this turn's wall_ms/ok into the metrics (OCEAN-303).
         drop(in_flight);
         bg_state.metrics.record_turn(res.wall_ms, res.ok);
+        // Record the turn outcome on the session so operators (and lane
+        // breakers polling GET /v1/sessions/{id}) can tell a thinking agent from
+        // one whose last turn died. Best-effort: a failing session write must
+        // not kill the terminal TurnFinished.
+        if let Err(e) =
+            bg_state
+                .runtime
+                .record_turn_completed_with_lease(&session_lease, res.ok, &res.stderr)
+        {
+            tracing::warn!(%session_id, error = %e, "agent_turn: failed to record turn outcome on session");
+        }
         // Wait for the bridge to drain (the sender has been dropped by now).
         let _ = bridge.await;
         // Prefer real provider usage; fall back to a visible-text estimate only
@@ -12488,6 +12499,8 @@ mod tests {
             git_commit: None,
             client_type: None,
             owning_project: None,
+            last_turn_status: None,
+            last_turn_error: None,
         }
     }
 
@@ -16983,6 +16996,56 @@ mod tests {
         assert_eq!(status, StatusCode::BAD_REQUEST);
         assert!(!response.ok);
         assert!(state.extension_lifecycle.attach().retained.is_empty());
+    }
+
+    /// Lane breakers (e.g. a 3-strikes stop polling `GET /v1/sessions/{id}`)
+    /// read `last_turn_status`: a turn that fails must leave "failed" plus its
+    /// error on the session, and the next good turn must flip it back.
+    #[tokio::test]
+    async fn agent_turn_records_the_last_turn_outcome_on_the_session() {
+        use std::time::Duration;
+        let state = capped_turn_state(1);
+        let (session_id, _, _) = state
+            .runtime
+            .create_session(env!("CARGO_MANIFEST_DIR"), Some("test".into()))
+            .unwrap();
+        let wait_for = |want: &'static str| {
+            let state = state.clone();
+            async move {
+                tokio::time::timeout(Duration::from_secs(5), async {
+                    loop {
+                        let detail = state.runtime.session_detail(session_id).unwrap();
+                        if detail.last_turn_status.as_deref() == Some(want)
+                            && state.turn_limiter.available_permits() == 1
+                        {
+                            return detail;
+                        }
+                        tokio::time::sleep(Duration::from_millis(5)).await;
+                    }
+                })
+                .await
+                .unwrap_or_else(|_| panic!("last_turn_status never became {want}"))
+            }
+        };
+
+        // An unknown per-turn model is accepted, then fails inside the turn.
+        let mut failing = sample_agent_turn();
+        failing.session_id = Some(AgentSessionId(session_id));
+        failing.model_id = Some("not-a-real-model".into());
+        let (status, ack) = agent_turn(State(state.clone()), Json(failing)).await;
+        assert_eq!(status, StatusCode::ACCEPTED, "{:?}", ack.error);
+        let failed = wait_for("failed").await;
+        assert!(failed
+            .last_turn_error
+            .as_deref()
+            .is_some_and(|e| !e.is_empty()));
+
+        let mut passing = sample_agent_turn();
+        passing.session_id = Some(AgentSessionId(session_id));
+        let (status, _) = agent_turn(State(state.clone()), Json(passing)).await;
+        assert_eq!(status, StatusCode::ACCEPTED);
+        let completed = wait_for("completed").await;
+        assert_eq!(completed.last_turn_error, None);
     }
 
     #[tokio::test]
