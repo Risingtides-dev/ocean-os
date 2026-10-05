@@ -11462,3 +11462,14 @@ area:      [backend] [testing]
 Added production-encoder reasoning_efforts metadata on top of provider refresh PR #532 so Surface draft PR #236 can constrain its combined picker. Empty arrays mark routes whose wire ignores effort; adaptive-only routes omit off/minimal, and discrete encoders advertise distinct effective controls. Preserved readiness and credential-source semantics and legacy deserialization. Provider tests passed 59 cases; focused daemon catalog/session-wire checks, docs and strict changed-crate lint are running. The shared enum still lacks max, so complete current-model effort support and real connected-auth acceptance remain open. Updated the crate index, daemon contract and session-wire field inventory; root/docs ownership and child indexes are unchanged. No merge, installation or live delivery is claimed.
 
 _________________________________________________________________________________ 13:52 codex/ocean-effort-catalog-20261005
+
+
+time:      [14:02] [05-10-26]
+agent:     [Codex desktop], [GPT-6]
+worktree:  [codex/ocean-max-effort-20261005]
+type:      [feature-request]
+area:      [backend] [testing]
+
+Added shared Max effort, exact current GPT-6 Responses and Claude 5.5/Fable 5.1 encodings, TUI command/cycle support and provider capability updates. Explicit Max replaces xhigh aliases for DeepSeek/GLM and the Kimi K3 control; legacy encoders retain their ceiling and restricted preview does not gain unsupported Max. Changed-crate tests passed 743 cases with four existing ignores; the shared workspace/tests compile passed before the final diagnostic example. Added isolated tool-free, operator-memory-free, fallback-disabled Max smoke diagnostics. First live diagnostic compilation and the prior capability full gate were stopped by disk exhaustion, not provider failures; cargo clean removed only this task's generated capability-worktree target and recovered 20 GiB. Updated owning protocol/agent/TUI contracts and crate index; root/docs ownership and child indexes unchanged. Fresh merged-candidate validation, connected-auth acceptance, review and installed delivery remain open.
+
+_________________________________________________________________________________ 14:02 codex/ocean-max-effort-20261005

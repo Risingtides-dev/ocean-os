@@ -12,6 +12,8 @@ This crate owns the multi-provider LLM wire protocol layer for Anthropic, OpenAI
 
 ## Local Contracts
 
+- Shared `ThinkingLevel::Max` serializes as `max`; current GPT-6 Responses and Claude 5.5/Fable 5.1 encode it exactly. Legacy and other-provider encoders retain their documented ceiling, and the public effort catalog advertises only effective controls.
+
 - Keep provider-specific behavior isolated behind protocol abstractions.
 - Do not leak provider quirks into shared `ocean-core` types unless the shared contract intentionally changes.
 - Treat streaming event shape changes as compatibility-sensitive.

@@ -6539,14 +6539,15 @@ fn thinking_label(t: Option<ThinkingLevel>) -> &'static str {
         Some(ThinkingLevel::Medium) => "medium",
         Some(ThinkingLevel::High) => "high",
         Some(ThinkingLevel::Xhigh) => "xhigh",
+        Some(ThinkingLevel::Max) => "max",
     }
 }
 
 /// Cycle the thinking level through `default → off → minimal → low → medium →
-/// high → xhigh` (wrapping both directions). `default` (None) sends nothing so
+/// high → xhigh → max` (wrapping both directions). `default` (None) sends nothing so
 /// the daemon's global setting stays in force.
 fn cycle_thinking(cur: Option<ThinkingLevel>, dir: i8) -> Option<ThinkingLevel> {
-    const ORDER: [Option<ThinkingLevel>; 7] = [
+    const ORDER: [Option<ThinkingLevel>; 8] = [
         None,
         Some(ThinkingLevel::Off),
         Some(ThinkingLevel::Minimal),
@@ -6554,6 +6555,7 @@ fn cycle_thinking(cur: Option<ThinkingLevel>, dir: i8) -> Option<ThinkingLevel> 
         Some(ThinkingLevel::Medium),
         Some(ThinkingLevel::High),
         Some(ThinkingLevel::Xhigh),
+        Some(ThinkingLevel::Max),
     ];
     let i = ORDER.iter().position(|o| *o == cur).unwrap_or(0) as i8;
     let n = ORDER.len() as i8;
@@ -7712,20 +7714,20 @@ mod tests {
         // Forward from default hits every level then wraps home.
         let mut cur = None;
         let mut seen = vec![thinking_label(cur)];
-        for _ in 0..6 {
+        for _ in 0..7 {
             cur = cycle_thinking(cur, 1);
             seen.push(thinking_label(cur));
         }
         assert_eq!(
             seen,
-            vec!["default", "off", "minimal", "low", "medium", "high", "xhigh"]
+            vec!["default", "off", "minimal", "low", "medium", "high", "xhigh", "max"]
         );
-        assert_eq!(cycle_thinking(cur, 1), None, "xhigh wraps to default");
-        // Backward from default wraps to xhigh.
+        assert_eq!(cycle_thinking(cur, 1), None, "max wraps to default");
+        // Backward from default wraps to max.
         assert_eq!(
             thinking_label(cycle_thinking(None, -1)),
-            "xhigh",
-            "default wraps backward to xhigh"
+            "max",
+            "default wraps backward to max"
         );
     }
 

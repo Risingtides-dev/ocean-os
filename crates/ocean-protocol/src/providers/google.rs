@@ -308,7 +308,7 @@ fn thinking_budget(level: ThinkingLevel) -> Option<u32> {
         ThinkingLevel::Low => Some(2048),
         ThinkingLevel::Medium => Some(8192),
         ThinkingLevel::High => Some(16384),
-        ThinkingLevel::Xhigh => Some(24576),
+        ThinkingLevel::Xhigh | ThinkingLevel::Max => Some(24576),
     }
 }
 
@@ -375,7 +375,7 @@ fn build_body_for_model(model: &Model, context: &Context, options: &StreamOption
                 ThinkingLevel::Off | ThinkingLevel::Minimal => "minimal",
                 ThinkingLevel::Low => "low",
                 ThinkingLevel::Medium => "medium",
-                ThinkingLevel::High | ThinkingLevel::Xhigh => "high",
+                ThinkingLevel::High | ThinkingLevel::Xhigh | ThinkingLevel::Max => "high",
             };
             body["generationConfig"]["thinkingConfig"] = json!({"thinkingLevel": thinking});
         } else {

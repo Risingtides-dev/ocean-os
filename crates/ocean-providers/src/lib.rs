@@ -756,18 +756,18 @@ pub struct KnownModel {
 fn model_reasoning_efforts(id: &str, provider: &str) -> Vec<String> {
     let levels: &[&str] = match (provider, id) {
         ("openai-codex" | "openai", id) if id.starts_with("gpt-6") => {
-            &["low", "medium", "high", "xhigh"]
+            &["low", "medium", "high", "xhigh", "max"]
         }
         ("openai-codex", _) => &["off", "minimal", "low", "medium", "high"],
         ("claude-code", "claude-opus-5-5" | "claude-sonnet-5-5" | "claude-code-fable-5-1") => {
-            &["low", "medium", "high", "xhigh"]
+            &["low", "medium", "high", "xhigh", "max"]
         }
         ("claude-code", _) => &["off", "minimal", "low", "medium", "high", "xhigh"],
-        ("deepseek", _) => &["off", "high", "xhigh"],
-        ("glm", "glm-5.3" | "glm-5.3-flash") => &["low", "high", "xhigh"],
+        ("deepseek", _) => &["off", "high", "max"],
+        ("glm", "glm-5.3" | "glm-5.3-flash") => &["low", "high", "max"],
         ("minimax", "MiniMax-M3.1-Flash-Preview") => &["low", "medium", "high", "xhigh"],
         ("minimax", "MiniMax-M3") => &["off", "high"],
-        ("kimi" | "kimi-coding", "kimi-k3" | "k3") => &["high"],
+        ("kimi" | "kimi-coding", "kimi-k3" | "k3") => &["max"],
         ("google", "gemini-3.1-pro-preview") => &["low", "medium", "high"],
         ("google", id) if id.starts_with("gemini-3.") => &["minimal", "low", "medium", "high"],
         ("google", _) => &["off", "minimal", "low", "medium", "high", "xhigh"],
@@ -2434,9 +2434,9 @@ mod tests {
             "claude-opus-5-5",
             "claude-code-fable-5-1",
         ] {
-            assert_eq!(efforts(id), ["low", "medium", "high", "xhigh"]);
+            assert_eq!(efforts(id), ["low", "medium", "high", "xhigh", "max"]);
         }
-        assert_eq!(efforts("glm-5.3"), ["low", "high", "xhigh"]);
+        assert_eq!(efforts("glm-5.3"), ["low", "high", "max"]);
         assert!(efforts("gpt-4o").is_empty());
         assert!(efforts("MiniMax-M2.7").is_empty());
         for model in catalog {

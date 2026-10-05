@@ -636,7 +636,7 @@ fn openai_reasoning_effort(level: ThinkingLevel) -> Option<&'static str> {
         ThinkingLevel::Minimal => Some("minimal"),
         ThinkingLevel::Low => Some("low"),
         ThinkingLevel::Medium => Some("medium"),
-        ThinkingLevel::High | ThinkingLevel::Xhigh => Some("high"),
+        ThinkingLevel::High | ThinkingLevel::Xhigh | ThinkingLevel::Max => Some("high"),
     }
 }
 
@@ -651,7 +651,7 @@ fn deepseek_reasoning_effort(level: ThinkingLevel) -> Option<&'static str> {
         | ThinkingLevel::Low
         | ThinkingLevel::Medium
         | ThinkingLevel::High => Some("high"),
-        ThinkingLevel::Xhigh => Some("max"),
+        ThinkingLevel::Xhigh | ThinkingLevel::Max => Some("max"),
     }
 }
 
@@ -705,7 +705,7 @@ fn apply_reasoning(body: &mut Value, model: &Model, level: ThinkingLevel) {
                 ThinkingLevel::Off | ThinkingLevel::Minimal | ThinkingLevel::Low => "low",
                 ThinkingLevel::Medium => "medium",
                 ThinkingLevel::High => "high",
-                ThinkingLevel::Xhigh => "xhigh",
+                ThinkingLevel::Xhigh | ThinkingLevel::Max => "xhigh",
             });
         }
         "minimax" if model.id == "MiniMax-M3" => {
@@ -717,7 +717,7 @@ fn apply_reasoning(body: &mut Value, model: &Model, level: ThinkingLevel) {
             body["reasoning_effort"] = json!(match level {
                 ThinkingLevel::Off | ThinkingLevel::Minimal | ThinkingLevel::Low => "low",
                 ThinkingLevel::Medium | ThinkingLevel::High => "high",
-                ThinkingLevel::Xhigh => "max",
+                ThinkingLevel::Xhigh | ThinkingLevel::Max => "max",
             });
         }
         "deepseek" => match deepseek_reasoning_effort(level) {
