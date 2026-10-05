@@ -11518,3 +11518,12 @@ area:      [backend]
 
 PR #532 Gemini review repairs: current Gemini 3 tool images are ordered FunctionResponse.parts bound to their call id/name, while legacy models retain separate user image content. Gemini 3 omits temperature overrides. Three-model regressions cover images, text-only results, errors, sampling, thinking, and output caps; ocean-protocol tests pass. Updated protocol devlog; parent ownership and child indexes unchanged. Full final CI and fresh review follow.
 _________________________________________________________________________________ 14:14 codex/provider-model-refresh-20261005
+
+time:      [14:24] [05-10-26]
+agent:     [codex], [GPT-6], [primary]
+worktree:  [codex/provider-model-refresh-20261005]
+type:      [bug report]
+area:      [backend]
+
+PR #532 review repairs: Sonnet Off with signed thinking history stays adaptive at low effort with drop_block binding controls; fresh history can use between_tools. GLM 5.3 and Flash reserve published 128K output on both resolver paths. Declined MiniMax Highspeed vision finding against the exact official OpenAI-compatible API contract, which limits image support to M3 variants; added capability regression. Protocol, providers, and agent tests pass. Updated owning devlogs; ownership and child indexes unchanged. Full CI and fresh review follow.
+_________________________________________________________________________________ 14:24 codex/provider-model-refresh-20261005

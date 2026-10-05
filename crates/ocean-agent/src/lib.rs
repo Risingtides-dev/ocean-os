@@ -8852,4 +8852,22 @@ mod refreshed_model_tests {
             "MiniMax-M2"
         ));
     }
+    #[test]
+    fn minimax_vision_is_limited_to_documented_m3_routes() {
+        for (id, images) in [
+            ("MiniMax-M3", true),
+            ("MiniMax-M3.1-Flash-Preview", true),
+            ("MiniMax-M2.7-highspeed", false),
+        ] {
+            let env = ocean_providers::ProviderEnv {
+                vars: std::collections::BTreeMap::from([("OCEAN_MODEL".into(), id.into())]),
+                ..Default::default()
+            };
+            let config = ocean_providers::resolve_provider_config(&env).unwrap();
+            assert_eq!(
+                model_from_provider_config(&config).unwrap().supports_images,
+                images
+            );
+        }
+    }
 }

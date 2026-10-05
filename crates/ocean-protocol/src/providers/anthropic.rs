@@ -381,7 +381,10 @@ fn build_body(model: &Model, context: &Context, options: &StreamOptions) -> Valu
     );
     if adaptive {
         // Current Claude models reject manual budgets and sampling overrides.
-        if model.id == "claude-sonnet-5-5" && options.reasoning == Some(ThinkingLevel::Off) {
+        if model.id == "claude-sonnet-5-5"
+            && options.reasoning == Some(ThinkingLevel::Off)
+            && !context.messages.iter().any(|m| matches!(m, Message::Assistant(a) if a.content.iter().any(|c| matches!(c, Content::Thinking { thinking_signature: Some(s), .. } if !s.is_empty()))))
+        {
             // Sonnet permits no up-front thinking only in between-tools mode,
             // which cannot carry adaptive block-binding controls.
             body["thinking"] = json!({"type": "between_tools"});
@@ -1744,6 +1747,59 @@ mod tests {
                 assert_eq!(body["thinking"]["type"], "adaptive");
                 assert!(request_beta(&body, AuthMethod::ApiKey, &BTreeMap::new()).is_some());
             }
+        }
+    }
+    #[test]
+    fn sonnet_off_with_signed_history_keeps_adaptive_binding_controls() {
+        let mut model = Model::anthropic_claude_fable_5_1();
+        model.id = "claude-sonnet-5-5".into();
+        let context = Context {
+            system_prompt: Some("edited instructions".into()),
+            messages: vec![
+                Message::Assistant(AssistantMessage {
+                    content: vec![
+                        Content::Thinking {
+                            thinking: "prior reasoning".into(),
+                            thinking_signature: Some("sig-abc".into()),
+                        },
+                        Content::text("prior answer"),
+                    ],
+                    api: "anthropic-messages".into(),
+                    provider: "anthropic".into(),
+                    model: model.id.clone(),
+                    usage: Usage::default(),
+                    stop_reason: StopReason::Stop,
+                    error_message: None,
+                    timestamp: now_ms(),
+                }),
+                Message::user_text("continue"),
+            ],
+            ..Default::default()
+        };
+        for level in [ThinkingLevel::Off, ThinkingLevel::Medium] {
+            let body = build_body(
+                &model,
+                &context,
+                &StreamOptions {
+                    reasoning: Some(level),
+                    ..Default::default()
+                },
+            );
+            assert_eq!(body["thinking"]["type"], "adaptive");
+            assert_eq!(
+                body["thinking"]["block_binding"]["prefix_mismatch_behavior"],
+                "drop_block"
+            );
+            assert_eq!(
+                body["output_config"]["effort"],
+                if level == ThinkingLevel::Off {
+                    "low"
+                } else {
+                    "medium"
+                }
+            );
+            assert_eq!(body["messages"][0]["content"][0]["signature"], "sig-abc");
+            assert!(request_beta(&body, AuthMethod::ApiKey, &BTreeMap::new()).is_some());
         }
     }
 }

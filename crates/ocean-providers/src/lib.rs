@@ -1331,7 +1331,7 @@ pub fn resolve_model_selection(env: &ProviderEnv) -> Result<ModelSelection, Prov
             "glm-5.3",
             glm_base_url(env),
             1_000_000,
-            8_192,
+            128_000,
         )),
         // GLM 5.3 Flash — the fast tier of the 5.3 generation, served by the
         // same Z.AI coding-plan base (verified live 2026-09-04: 200 on
@@ -1341,7 +1341,7 @@ pub fn resolve_model_selection(env: &ProviderEnv) -> Result<ModelSelection, Prov
             "glm-5.3-flash",
             glm_base_url(env),
             1_000_000,
-            8_192,
+            128_000,
         )),
         "glm-4.5" | "glm-4-5" => Ok(model_selection(
             ProviderId::Glm,
@@ -1477,7 +1477,7 @@ fn model_for_explicit_provider(
         "claude-opus-5-5" | "claude-sonnet-5-5" | "claude-fable-5-1" | "claude-code-fable-5-1" => {
             (1_000_000, 128_000)
         }
-        "glm-5.3" | "glm-5.3-flash" => (1_000_000, 8_192),
+        "glm-5.3" | "glm-5.3-flash" => (1_000_000, 128_000),
         "minimax-m3" | "minimax-m3.1-flash-preview" => (1_000_000, 8_192),
         "minimax-m2.7-highspeed" => (204_800, 8_192),
         "gemini-3.8-flash" | "gemini-3.5-flash-lite" | "gemini-3.1-pro-preview" => {
@@ -2990,7 +2990,14 @@ mod tests {
                     200_000
                 }
             );
-            assert_eq!(sel.max_output_tokens, 8_192);
+            assert_eq!(
+                sel.max_output_tokens,
+                if id.starts_with("glm-5.3") {
+                    128_000
+                } else {
+                    8_192
+                }
+            );
             let hyphenated = resolve_model_selection(&env(&[("OCEAN_MODEL", hyphen)])).unwrap();
             assert_eq!(hyphenated.model, id);
             assert_eq!(hyphenated.provider, ProviderId::Glm);
@@ -3287,6 +3294,24 @@ mod model_refresh_tests {
                     ..Default::default()
                 };
                 assert_eq!(resolve_model_selection(&env).unwrap().model, expected);
+            }
+        }
+    }
+    #[test]
+    fn glm53_reserves_published_output_on_both_resolver_paths() {
+        for id in ["glm-5.3", "glm-5.3-flash"] {
+            for explicit_provider in [false, true] {
+                let mut vars = BTreeMap::from([("OCEAN_MODEL".into(), id.into())]);
+                if explicit_provider {
+                    vars.insert("OCEAN_PROVIDER".into(), "glm".into());
+                }
+                let selection = resolve_model_selection(&ProviderEnv {
+                    vars,
+                    ..Default::default()
+                })
+                .unwrap();
+                assert_eq!(selection.context_window, 1_000_000);
+                assert_eq!(selection.max_output_tokens, 128_000);
             }
         }
     }
