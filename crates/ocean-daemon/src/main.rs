@@ -7562,8 +7562,9 @@ async fn agent_turn(
 
         // The terminal SSE frame carries this text once, but subscribers can
         // disconnect and the durable session transcript intentionally excludes
-        // provider failures. Retain the sanitized failure in daemon logs instead
-        // of reducing the only postmortem evidence to `ok=false`.
+        // provider failures (only the latest one survives, capped, as the
+        // session's `last_turn_error`). Retain the sanitized failure in daemon
+        // logs too, so earlier failures are not reduced to `ok=false`.
         if !res.ok {
             tracing::error!(
                 turn_id = %turn_id,
