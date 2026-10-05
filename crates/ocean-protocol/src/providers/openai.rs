@@ -1169,22 +1169,11 @@ impl Provider for OpenAiProvider {
                 });
             }
 
-            // Fallback: some reasoning-capable OAI-compat models (notably
-            // DeepSeek v4-pro) stream their entire conversational reply
-            // through `reasoning_content` and never populate `content`.
-            // If we got reasoning but no text AND no tool calls, surface
-            // the reasoning as the assistant's text so the user actually
-            // sees an answer.
-            //
-            // We deliberately skip the promotion when tool calls are
-            // present: in that case the reasoning is the model's plan for
-            // the tool call, not a user-facing reply, and the real text
-            // answer will come on the next agent-loop turn after the tool
-            // results are appended. Promoting prematurely would dump the
-            // private plan into the user's transcript and then duplicate
-            // it again when the real answer arrives.
+            // Only DeepSeek's compatibility fallback treats a reasoning-only
+            // reply as visible text. Split reasoning from other providers can
+            // be a private, truncated thought with no final answer.
             let has_tool_calls = !tool_calls.is_empty();
-            if text_buf.is_empty() && !thinking_buf.is_empty() && !has_tool_calls {
+            if provider == "deepseek" && text_buf.is_empty() && !thinking_buf.is_empty() && !has_tool_calls {
                 let promoted_index = next_block_index;
                 next_block_index += 1;
                 yield Ok(AssistantMessageEvent::TextStart { content_index: promoted_index });
@@ -2938,5 +2927,62 @@ mod tests {
         assert_eq!(body["reasoning_split"], true);
         assert_eq!(body["max_completion_tokens"], 2048);
         assert!(body.get("max_tokens").is_none());
+    }
+    #[tokio::test]
+    async fn split_reasoning_only_streams_never_become_visible_answers_outside_deepseek() {
+        use std::io::{Read, Write};
+        for (provider, id, promote) in [
+            ("minimax", "MiniMax-M3", false),
+            ("minimax", "MiniMax-M3.1-Flash-Preview", false),
+            ("glm", "glm-5.3", false),
+            ("openai", "gpt-4o", false),
+            ("deepseek", "deepseek-v4-pro", true),
+        ] {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let address = listener.local_addr().unwrap();
+            let data = json!({"choices":[{"index":0,"delta":{"reasoning_content":"private partial thought"},"finish_reason":"length"}]});
+            let thread = std::thread::spawn(move || {
+                let (mut socket, _) = listener.accept().unwrap();
+                let mut bytes = [0; 8192];
+                assert!(socket.read(&mut bytes).unwrap() > 0);
+                let body = format!("data: {data}\n\ndata: [DONE]\n\n");
+                write!(socket, "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}", body.len(), body).unwrap();
+            });
+            let model =
+                Model::openai_compat(provider, id, format!("http://{address}"), 1_000_000, 8192);
+            let options = StreamOptions {
+                api_key: Some("test-key".into()),
+                max_tokens: Some(1),
+                ..Default::default()
+            };
+            let events: Vec<_> = OpenAiProvider::new()
+                .stream(&model, &Context::default(), &options)
+                .await
+                .unwrap()
+                .collect()
+                .await;
+            thread.join().unwrap();
+            let mut visible = String::new();
+            let mut terminal = None;
+            for event in events {
+                match event.unwrap() {
+                    AssistantMessageEvent::TextDelta { delta, .. } => visible.push_str(&delta),
+                    AssistantMessageEvent::Done { message, .. } => terminal = Some(message),
+                    _ => {}
+                }
+            }
+            let message = terminal.expect("terminal message");
+            assert_eq!(!visible.is_empty(), promote, "{id}");
+            assert_eq!(
+                message
+                    .content
+                    .iter()
+                    .any(|content| matches!(content, Content::Text { .. })),
+                promote,
+                "{id}"
+            );
+            assert!(message.content.iter().any(|content| matches!(content, Content::Thinking {thinking, ..} if thinking == "private partial thought")));
+            assert_eq!(message.stop_reason, StopReason::Length);
+        }
     }
 }

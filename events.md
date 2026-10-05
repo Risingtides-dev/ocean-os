@@ -11514,3 +11514,12 @@ area:      [backend]
 
 PR #532 Claude-family compatibility repair: Sonnet 5.5 encoding omits thinking blocks from documented unreadable Opus 5/5.5, Fable, and Mythos sources before choosing Off mode. Supported older Claude and same-model signed history retain adaptive binding protection. Ten-source compatibility regression and protocol suite pass. Updated protocol contract; ownership/index unchanged. Full final CI and fresh review follow.
 _________________________________________________________________________________ 14:47 codex/provider-model-refresh-20261005
+
+time:      [14:56] [05-10-26]
+agent:     [codex], [GPT-6], [primary]
+worktree:  [codex/provider-model-refresh-20261005]
+type:      [bug report]
+area:      [backend]
+
+PR #532 split-reasoning privacy repair: restrict reasoning-only visible-answer promotion to the intended DeepSeek compatibility route. MiniMax M3/Preview, GLM and OpenAI retain partial length-limited reasoning only as Thinking. Local HTTP streaming regression checks deltas and persisted terminal content across five routes; protocol suite passes. Updated protocol contract; ownership/index unchanged. Full CI and fresh exact-head review follow.
+_________________________________________________________________________________ 14:56 codex/provider-model-refresh-20261005
