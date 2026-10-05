@@ -516,7 +516,7 @@ impl Default for ProviderQuarantine {
 }
 
 /// Env var holding the ordered fallback list (OCEAN-275), comma-separated model
-/// aliases — e.g. `claude-sonnet-4-6,gpt-5.4,deepseek-v4-pro`. Each alias is
+/// aliases — e.g. `claude-sonnet-5,gpt-6.1-sol,deepseek-v4-pro`. Each alias is
 /// resolved through the same [`resolve_provider_config`] path as a primary
 /// selection, so anything valid for `OCEAN_MODEL` is valid here. Unset ⇒
 /// [`DEFAULT_FALLBACK_ORDER`]. Unparseable/unknown entries are skipped (with a
