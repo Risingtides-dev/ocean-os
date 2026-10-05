@@ -204,15 +204,8 @@ fn convert_messages(messages: &[Message], model: &Model) -> Vec<Value> {
                             }
                             parts.push(json!({ "functionCall": call }));
                         }
-                        // OCEAN-140: Gemini only replays model thinking via opaque
-                        // `thoughtSignature` blobs attached to the original parts —
-                        // it does not accept free-form thinking text as a model
-                        // input part, and a raw `text` part would corrupt the
-                        // transcript rather than restore the thought. Ocean's
-                        // Content::Thinking carries an Anthropic-style signature,
-                        // not a Gemini thoughtSignature, so there is nothing valid
-                        // to re-encode. Drop it EXPLICITLY here instead of a silent
-                        // `_ => {}` (kills the OCEAN-101 silent-drop class).
+                        // Signed Google parts were replayed above. Unsigned or
+                        // foreign thinking must never become visible model text.
                         Content::Thinking { .. } => {}
                         // Images never appear in model (assistant) content.
                         Content::Image { .. } => {}
@@ -259,21 +252,6 @@ fn convert_messages(messages: &[Message], model: &Model) -> Vec<Value> {
                 if !tr.tool_call_id.is_empty() {
                     fr["id"] = json!(tr.tool_call_id);
                 }
-                // The structured/textual tool output stays in the
-                // functionResponse part. The Gemini functionResponse schema
-                // carries the tool's text/JSON result; it has no slot for image
-                // bytes.
-                out.push(json!({
-                    "role": "user",
-                    "parts": [{ "functionResponse": fr }]
-                }));
-                // OCEAN-132: tool-result images (browser / computer-use
-                // screenshots come back as Content::Image) were silently dropped
-                // — only `.as_text()` was collected above, so the model never saw
-                // the screenshot ("I can't see any screenshot"). Gemini reads
-                // images from inlineData parts, so follow the functionResponse
-                // with a user-role content carrying each image as an inlineData
-                // part (mirroring how user-message images are encoded above).
                 let image_parts: Vec<Value> = tr
                     .content
                     .iter()
@@ -284,7 +262,14 @@ fn convert_messages(messages: &[Message], model: &Model) -> Vec<Value> {
                         _ => None,
                     })
                     .collect();
-                if !image_parts.is_empty() {
+                // Gemini 3 binds media to the corresponding function result.
+                // Legacy models retain the separate user image content.
+                let gemini3 = model.id.starts_with("gemini-3.");
+                if gemini3 && !image_parts.is_empty() {
+                    fr["parts"] = json!(image_parts);
+                }
+                out.push(json!({"role": "user", "parts": [{"functionResponse": fr}]}));
+                if !gemini3 && !image_parts.is_empty() {
                     out.push(json!({"role": "user", "parts": image_parts}));
                 }
             }
@@ -351,7 +336,10 @@ fn build_body_for_model(model: &Model, context: &Context, options: &StreamOption
     if let Some(sp) = &context.system_prompt {
         body["systemInstruction"] = json!({"role": "system", "parts": [{"text": sp}]});
     }
-    if let Some(t) = options.temperature {
+    if let Some(t) = options
+        .temperature
+        .filter(|_| !model.id.starts_with("gemini-3."))
+    {
         if !body["generationConfig"].is_object() {
             body["generationConfig"] = json!({});
         }
@@ -813,7 +801,7 @@ mod tests {
 
     // OCEAN-140: a replayed model turn carrying a Content::Thinking block must hit
     // an EXPLICIT match arm, not the old silent `_ => {}`. Gemini replays thinking
-    // only via opaque thoughtSignature blobs (which Ocean does not carry), so the
+    // only via opaque thoughtSignature blobs in original Google parts, so the
     // documented behavior is an intentional drop: the thinking text must NOT appear
     // as a model part, while text and functionCall parts survive in order.
     #[test]
@@ -1549,6 +1537,107 @@ mod tests {
                 assert_eq!(
                     body["generationConfig"]["thinkingConfig"]["thinkingLevel"],
                     expected
+                );
+            }
+        }
+    }
+    #[test]
+    fn gemini3_tool_images_stay_inside_the_matching_function_response() {
+        for id in [
+            "gemini-3.8-flash",
+            "gemini-3.5-flash-lite",
+            "gemini-3.1-pro-preview",
+        ] {
+            let mut model = Model::gemini_2_0_flash();
+            model.id = id.into();
+            for is_error in [false, true] {
+                for with_images in [false, true] {
+                    let mut content = vec![Content::text("captured viewport")];
+                    if with_images {
+                        content.extend([
+                            Content::Image {
+                                data: "AAECAwQ=".into(),
+                                mime_type: "image/png".into(),
+                            },
+                            Content::Image {
+                                data: "AQIDBA==".into(),
+                                mime_type: "image/jpeg".into(),
+                            },
+                        ]);
+                    }
+                    let out = convert_messages(
+                        &[Message::ToolResult(crate::types::ToolResultMessage {
+                            tool_call_id: "call_1".into(),
+                            tool_name: "screenshot".into(),
+                            content,
+                            is_error,
+                            timestamp: now_ms(),
+                        })],
+                        &model,
+                    );
+                    assert_eq!(out.len(), 1);
+                    assert_eq!(out[0]["role"], "user");
+                    assert_eq!(out[0]["parts"].as_array().unwrap().len(), 1);
+                    let fr = &out[0]["parts"][0]["functionResponse"];
+                    assert_eq!(fr["id"], "call_1");
+                    assert_eq!(fr["name"], "screenshot");
+                    assert_eq!(fr["response"]["is_error"], is_error);
+                    assert_eq!(
+                        fr["response"]["output"],
+                        if is_error {
+                            "ERROR: captured viewport"
+                        } else {
+                            "captured viewport"
+                        }
+                    );
+                    if with_images {
+                        assert_eq!(
+                            fr["parts"],
+                            json!([
+                                {"inlineData": {"mimeType": "image/png", "data": "AAECAwQ="}},
+                                {"inlineData": {"mimeType": "image/jpeg", "data": "AQIDBA=="}},
+                            ])
+                        );
+                    } else {
+                        assert!(fr.get("parts").is_none());
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn gemini3_omits_temperature_while_legacy_models_preserve_it() {
+        for id in [
+            "gemini-3.8-flash",
+            "gemini-3.5-flash-lite",
+            "gemini-3.1-pro-preview",
+            "gemini-2.0-flash",
+        ] {
+            let mut model = Model::gemini_2_0_flash();
+            model.id = id.into();
+            model.max_tokens = 65_536;
+            let body = build_body_for_model(
+                &model,
+                &empty_context(),
+                &StreamOptions {
+                    temperature: Some(0.3),
+                    reasoning: Some(ThinkingLevel::High),
+                    ..Default::default()
+                },
+            );
+            if id.starts_with("gemini-3.") {
+                assert!(body["generationConfig"].get("temperature").is_none());
+                assert_eq!(body["generationConfig"]["maxOutputTokens"], 65_536);
+                assert_eq!(
+                    body["generationConfig"]["thinkingConfig"]["thinkingLevel"],
+                    "high"
+                );
+            } else {
+                assert_eq!(body["generationConfig"]["temperature"], json!(0.3_f32));
+                assert_eq!(
+                    body["generationConfig"]["thinkingConfig"]["thinkingBudget"],
+                    16_384
                 );
             }
         }

@@ -11510,3 +11510,11 @@ area:      [review]
 
 Split Kimi Coding effort capabilities from raw Moonshot after independent PR #533 review. Coding exposes Off/Minimal/Low/Medium/High/Max, pinned against distinct production Anthropic budgets and Off omission. Updated owning crate/protocol contracts; root ownership and child indexes remain unchanged. The previous complete local gate passed 3,708 tests; the corrected candidate gate is rerunning.
 _________________________________________________________________________________ 14:20 codex/ocean-max-effort-20261005
+time:      [14:14] [05-10-26]
+agent:     [codex], [GPT-6], [primary]
+worktree:  [codex/provider-model-refresh-20261005]
+type:      [bug report]
+area:      [backend]
+
+PR #532 Gemini review repairs: current Gemini 3 tool images are ordered FunctionResponse.parts bound to their call id/name, while legacy models retain separate user image content. Gemini 3 omits temperature overrides. Three-model regressions cover images, text-only results, errors, sampling, thinking, and output caps; ocean-protocol tests pass. Updated protocol devlog; parent ownership and child indexes unchanged. Full final CI and fresh review follow.
+_________________________________________________________________________________ 14:14 codex/provider-model-refresh-20261005
