@@ -14,7 +14,7 @@ use async_stream::stream;
 use async_trait::async_trait;
 use eventsource_stream::Eventsource;
 use futures::StreamExt;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
 use crate::error::{Error, Result};
@@ -62,16 +62,22 @@ struct CandidateContent {
     parts: Vec<Part>,
 }
 
-#[derive(Deserialize, Debug)]
+#[derive(Deserialize, Serialize, Debug)]
 #[serde(rename_all = "camelCase")]
 struct Part {
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     text: Option<String>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     function_call: Option<FunctionCall>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    thought_signature: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    thought: Option<bool>,
+    #[serde(flatten)]
+    extra: serde_json::Map<String, Value>,
 }
 
-#[derive(Deserialize, Debug)]
+#[derive(Deserialize, Serialize, Debug)]
 #[serde(rename_all = "camelCase")]
 struct FunctionCall {
     // OCEAN-145 (2): Gemini 3 models return a unique `id` on every functionCall;
@@ -79,12 +85,14 @@ struct FunctionCall {
     // into the eventual functionResponse.id (the disambiguation channel for two
     // parallel calls to the SAME tool). Absent → we synthesize a deterministic
     // `call_<n>` in stream order so ordering is still preserved.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     id: Option<String>,
     #[serde(default)]
     name: String,
     #[serde(default)]
     args: Value,
+    #[serde(flatten)]
+    extra: serde_json::Map<String, Value>,
 }
 
 /// Classify a Gemini `finishReason` into the unified `StopReason`, flagging the
@@ -130,7 +138,30 @@ struct UsageMetadata {
     thoughts_token_count: u64,
 }
 
-fn convert_messages(messages: &[Message]) -> Vec<Value> {
+// Persist the exact ordered generateContent parts in the existing opaque
+// thinking-signature slot. Visible text/tool projections remain unchanged.
+// Only Google may replay this marker; other encoders must drop it.
+pub(crate) const PARTS_MARKER: &str = "google-parts:";
+
+fn signed_parts(message: &AssistantMessage, model: &Model) -> Option<Vec<Value>> {
+    if message.provider != "google" || message.model != model.id {
+        return None;
+    }
+    message.content.iter().find_map(|content| {
+        let Content::Thinking {
+            thinking_signature: Some(signature),
+            ..
+        } = content
+        else {
+            return None;
+        };
+        let json = signature.strip_prefix(PARTS_MARKER)?;
+        let parts: Vec<Value> = serde_json::from_str(json).ok()?;
+        parts.iter().all(Value::is_object).then_some(parts)
+    })
+}
+
+fn convert_messages(messages: &[Message], model: &Model) -> Vec<Value> {
     let mut out: Vec<Value> = Vec::new();
     for m in messages {
         match m {
@@ -148,6 +179,10 @@ fn convert_messages(messages: &[Message]) -> Vec<Value> {
                 out.push(json!({"role": "user", "parts": parts}));
             }
             Message::Assistant(a) => {
+                if let Some(parts) = signed_parts(a, model) {
+                    out.push(json!({"role": "model", "parts": parts}));
+                    continue;
+                }
                 let mut parts: Vec<Value> = Vec::new();
                 for c in &a.content {
                     match c {
@@ -309,9 +344,9 @@ fn apply_reasoning(body: &mut Value, level: ThinkingLevel) {
     });
 }
 
-fn build_body(context: &Context, options: &StreamOptions) -> Value {
+fn build_body_for_model(model: &Model, context: &Context, options: &StreamOptions) -> Value {
     let mut body = json!({
-        "contents": convert_messages(&context.messages),
+        "contents": convert_messages(&context.messages, model),
     });
     if let Some(sp) = &context.system_prompt {
         body["systemInstruction"] = json!({"role": "system", "parts": [{"text": sp}]});
@@ -322,8 +357,30 @@ fn build_body(context: &Context, options: &StreamOptions) -> Value {
         }
         body["generationConfig"]["temperature"] = json!(t);
     }
+    if !body["generationConfig"].is_object() {
+        body["generationConfig"] = json!({});
+    }
+    if model.id.starts_with("gemini-3.") {
+        body["generationConfig"]["maxOutputTokens"] =
+            json!(options.max_tokens.unwrap_or(model.max_tokens));
+    }
     if let Some(level) = options.reasoning {
-        apply_reasoning(&mut body, level);
+        if model.id.starts_with("gemini-3.") {
+            let thinking = match level {
+                ThinkingLevel::Off | ThinkingLevel::Minimal
+                    if model.id == "gemini-3.1-pro-preview" =>
+                {
+                    "low"
+                }
+                ThinkingLevel::Off | ThinkingLevel::Minimal => "minimal",
+                ThinkingLevel::Low => "low",
+                ThinkingLevel::Medium => "medium",
+                ThinkingLevel::High | ThinkingLevel::Xhigh => "high",
+            };
+            body["generationConfig"]["thinkingConfig"] = json!({"thinkingLevel": thinking});
+        } else {
+            apply_reasoning(&mut body, level);
+        }
     }
     if let Some(m) = options.max_tokens {
         if !body["generationConfig"].is_object() {
@@ -346,6 +403,11 @@ fn build_body(context: &Context, options: &StreamOptions) -> Value {
         body["tools"] = json!([{"functionDeclarations": decls}]);
     }
     body
+}
+
+#[cfg(test)]
+fn build_body(context: &Context, options: &StreamOptions) -> Value {
+    build_body_for_model(&Model::gemini_2_0_flash(), context, options)
 }
 
 pub struct GoogleProvider {
@@ -392,7 +454,7 @@ impl Provider for GoogleProvider {
             model.id,
             api_key,
         );
-        let body = build_body(context, options);
+        let body = build_body_for_model(model, context, options);
         crate::prompt_capture::capture_request_body(&model.api, &model.provider, &model.id, &body);
         let cancel = options.cancel.clone();
         let extra_headers: BTreeMap<String, String> = options.headers.clone();
@@ -466,9 +528,10 @@ impl Provider for GoogleProvider {
             let mut text_started = false;
             let mut text_index: usize = 0;
             let mut tool_blocks: Vec<(String, String, Value)> = Vec::new();
+            let mut replay_parts: Vec<Value> = Vec::new();
+            let mut has_signature = false;
             let mut stop = StopReason::Stop;
             let mut usage = Usage::default();
-            let mut response_model: Option<String> = None;
             // Track an abnormal/blocking finishReason (SAFETY, RECITATION, …) so
             // it surfaces as a real error instead of a clean empty completion.
             let mut block_reason: Option<String> = None;
@@ -489,7 +552,7 @@ impl Provider for GoogleProvider {
                         continue;
                     }
                 };
-                if let Some(m) = chunk.model_version { response_model = Some(m); }
+                let _ = chunk.model_version;
                 if let Some(u) = chunk.usage_metadata {
                     usage.input = u.prompt_token_count;
                     usage.output = u.candidates_token_count;
@@ -511,6 +574,10 @@ impl Provider for GoogleProvider {
                     }
                     if let Some(content) = cand.content {
                         for part in content.parts {
+                            has_signature |= part.thought_signature.as_ref().is_some_and(|s| !s.is_empty());
+                            if let Ok(wire) = serde_json::to_value(&part) { replay_parts.push(wire); }
+                            // Thought summaries are private, never visible answer text.
+                            if part.thought == Some(true) { continue; }
                             if let Some(t) = part.text {
                                 if !t.is_empty() {
                                     if !text_started {
@@ -583,7 +650,7 @@ impl Provider for GoogleProvider {
                         content: vec![],
                         api: api.clone(),
                         provider: provider.clone(),
-                        model: response_model.clone().unwrap_or_else(|| model_id.clone()),
+                        model: model_id.clone(),
                         usage: usage.clone(),
                         stop_reason: StopReason::Error,
                         error_message: Some(format!(
@@ -607,11 +674,17 @@ impl Provider for GoogleProvider {
                 out_content.push(Content::ToolCall { id, name, arguments: args });
             }
             let _ = text_index;
+            if has_signature {
+                out_content.insert(0, Content::Thinking {
+                    thinking: String::new(),
+                    thinking_signature: Some(format!("{PARTS_MARKER}{}", serde_json::to_string(&replay_parts).unwrap_or_default())),
+                });
+            }
             let message = AssistantMessage {
                 content: out_content,
                 api,
                 provider,
-                model: response_model.unwrap_or(model_id),
+                model: model_id,
                 usage,
                 stop_reason: stop,
                 error_message: None,
@@ -652,7 +725,7 @@ mod tests {
             timestamp: now_ms(),
         }];
 
-        let out = convert_messages(&messages);
+        let out = convert_messages(&messages, &Model::gemini_2_0_flash());
         assert_eq!(out.len(), 1);
         let parts = out[0]["parts"].as_array().expect("parts array missing");
 
@@ -688,7 +761,7 @@ mod tests {
             timestamp: now_ms(),
         })];
 
-        let out = convert_messages(&messages);
+        let out = convert_messages(&messages, &Model::gemini_2_0_flash());
 
         // functionResponse still carries the textual output…
         let fr = out
@@ -722,7 +795,7 @@ mod tests {
             timestamp: now_ms(),
         })];
 
-        let out = convert_messages(&messages);
+        let out = convert_messages(&messages, &Model::gemini_2_0_flash());
         assert_eq!(out.len(), 1, "no extra image content should be appended");
         assert_eq!(
             out[0]["parts"][0]["functionResponse"]["response"]["output"],
@@ -764,7 +837,7 @@ mod tests {
             timestamp: now_ms(),
         })];
 
-        let out = convert_messages(&messages);
+        let out = convert_messages(&messages, &Model::gemini_2_0_flash());
         assert_eq!(out.len(), 1, "expected a single model content");
         assert_eq!(out[0]["role"], "model");
 
@@ -976,7 +1049,7 @@ mod tests {
             timestamp: now_ms(),
         })];
 
-        let out = convert_messages(&messages);
+        let out = convert_messages(&messages, &Model::gemini_2_0_flash());
         let output = out[0]["parts"][0]["functionResponse"]["response"]["output"]
             .as_str()
             .expect("output text missing");
@@ -1007,7 +1080,7 @@ mod tests {
             timestamp: now_ms(),
         })];
 
-        let out = convert_messages(&messages);
+        let out = convert_messages(&messages, &Model::gemini_2_0_flash());
         assert_eq!(
             out[0]["parts"][0]["functionResponse"]["response"]["output"], "ok",
             "successful result output must be untouched (no ERROR prefix)"
@@ -1170,7 +1243,7 @@ mod tests {
             }),
         ];
 
-        let out = convert_messages(&messages);
+        let out = convert_messages(&messages, &Model::gemini_2_0_flash());
 
         // Replayed functionCalls each carry their id.
         let model_parts = out[0]["parts"].as_array().expect("model parts");
@@ -1203,7 +1276,7 @@ mod tests {
             timestamp: now_ms(),
         })];
 
-        let out = convert_messages(&messages);
+        let out = convert_messages(&messages, &Model::gemini_2_0_flash());
         assert!(
             out[0]["parts"][0]["functionResponse"].get("id").is_none(),
             "an empty tool_call_id must not produce a functionResponse.id field"
@@ -1371,5 +1444,88 @@ mod tests {
         assert_eq!(decls.len(), 1);
         assert_eq!(decls[0]["name"], "bash");
         assert_eq!(decls[0]["parameters"], tool.parameters);
+    }
+    #[test]
+    fn gemini3_uses_levels_and_keeps_lowest_pro_level_valid() {
+        let mut model = Model::gemini_2_0_flash();
+        model.id = "gemini-3.8-flash".into();
+        model.max_tokens = 65_536;
+        let options = StreamOptions {
+            reasoning: Some(ThinkingLevel::Medium),
+            ..Default::default()
+        };
+        let body = build_body_for_model(&model, &empty_context(), &options);
+        assert_eq!(
+            body["generationConfig"]["thinkingConfig"],
+            json!({"thinkingLevel": "medium"})
+        );
+        assert_eq!(body["generationConfig"]["maxOutputTokens"], 65_536);
+        model.id = "gemini-3.1-pro-preview".into();
+        let body = build_body_for_model(
+            &model,
+            &empty_context(),
+            &StreamOptions {
+                reasoning: Some(ThinkingLevel::Off),
+                ..Default::default()
+            },
+        );
+        assert_eq!(
+            body["generationConfig"]["thinkingConfig"],
+            json!({"thinkingLevel": "low"})
+        );
+    }
+
+    #[tokio::test]
+    async fn gemini3_stream_replays_signed_parallel_calls_without_exposing_thoughts() {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let data = json!({"modelVersion": "gemini-3.8-flash-001", "candidates": [{"content": {"parts": [
+            {"text": "private summary", "thought": true},
+            {"functionCall": {"id": "one", "name": "read", "args": {"path": "a"}}, "thoughtSignature": "signed-one"},
+            {"functionCall": {"name": "read", "args": {"path": "b"}}, "futureMetadata": "preserved"}
+        ]}, "finishReason": "STOP"}]});
+        let expected = data["candidates"][0]["content"]["parts"].clone();
+        let thread = std::thread::spawn(move || {
+            let (mut socket, _) = listener.accept().unwrap();
+            let mut bytes = [0; 8192];
+            assert!(socket.read(&mut bytes).unwrap() > 0);
+            let body = format!("data: {data}\n\n");
+            write!(socket, "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}", body.len(), body).unwrap();
+        });
+        let mut model = Model::gemini_2_0_flash();
+        model.id = "gemini-3.8-flash".into();
+        let options = StreamOptions {
+            api_key: Some("test-key".into()),
+            base_url: Some(format!("http://{address}")),
+            ..Default::default()
+        };
+        let events: Vec<_> = GoogleProvider::new()
+            .stream(&model, &empty_context(), &options)
+            .await
+            .unwrap()
+            .collect()
+            .await;
+        thread.join().unwrap();
+        let message = events
+            .into_iter()
+            .find_map(|event| match event.unwrap() {
+                AssistantMessageEvent::Done { message, .. } => Some(message),
+                _ => None,
+            })
+            .expect("terminal message");
+        assert_eq!(message.model, model.id);
+        assert!(!message.content.iter().any(
+            |content| matches!(content, Content::Text { text } if text.contains("private summary"))
+        ));
+        let mut context = empty_context();
+        context.messages = vec![Message::Assistant(message.clone())];
+        let body = build_body_for_model(&model, &context, &StreamOptions::default());
+        assert_eq!(body["contents"][0]["parts"], expected);
+        // A provider/model change must never forward the opaque parts marker.
+        model.id = "gemini-2.0-flash".into();
+        let body = build_body_for_model(&model, &context, &StreamOptions::default());
+        assert!(!body.to_string().contains("signed-one"));
+        assert!(!body.to_string().contains("private summary"));
     }
 }

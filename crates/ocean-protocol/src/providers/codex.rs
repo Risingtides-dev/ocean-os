@@ -87,7 +87,7 @@ impl Default for CodexProvider {
 /// - user/assistant text → `message` items with typed content parts
 /// - assistant tool calls → `function_call` items (arguments as a JSON string)
 /// - tool results → `function_call_output` items
-fn convert_input(messages: &[Message]) -> Vec<Value> {
+fn convert_input_for_model(messages: &[Message], model: Option<&Model>) -> Vec<Value> {
     let mut out: Vec<Value> = Vec::new();
     for m in messages {
         match m {
@@ -148,7 +148,11 @@ fn convert_input(messages: &[Message]) -> Vec<Value> {
                         Content::Thinking {
                             thinking_signature: Some(sig),
                             ..
-                        } if sig.starts_with(REASONING_ITEM_MARKER) => {
+                        } if sig.starts_with(REASONING_ITEM_MARKER)
+                            && model.is_none_or(|model| {
+                                a.provider == model.provider && a.model == model.id
+                            }) =>
+                        {
                             let has_follower = a.content[i + 1..].iter().any(|c| {
                                 matches!(c, Content::ToolCall { .. })
                                     || matches!(c, Content::Text { text } if !text.is_empty())
@@ -236,6 +240,11 @@ fn convert_input(messages: &[Message]) -> Vec<Value> {
     out
 }
 
+#[cfg(test)]
+fn convert_input(messages: &[Message]) -> Vec<Value> {
+    convert_input_for_model(messages, None)
+}
+
 fn reasoning_effort(level: ThinkingLevel) -> Option<&'static str> {
     match level {
         ThinkingLevel::Off => None,
@@ -290,7 +299,7 @@ fn build_body(model: &Model, context: &Context, options: &StreamOptions) -> Valu
     // parallel tool calls like the rest.
     let mut body = json!({
         "model": model.id,
-        "input": convert_input(&context.messages),
+        "input": convert_input_for_model(&context.messages, Some(model)),
         "tool_choice": "auto",
         "store": false,
         "stream": true,
@@ -323,7 +332,16 @@ fn build_body(model: &Model, context: &Context, options: &StreamOptions) -> Valu
     // coherent (see REASONING_ITEM_MARKER).
     body["include"] = json!(["reasoning.encrypted_content"]);
     if let Some(level) = options.reasoning {
-        if let Some(effort) = reasoning_effort(level) {
+        if let Some(effort) = if model.id.starts_with("gpt-6") {
+            Some(match level {
+                ThinkingLevel::Off | ThinkingLevel::Minimal | ThinkingLevel::Low => "low",
+                ThinkingLevel::Medium => "medium",
+                ThinkingLevel::High => "high",
+                ThinkingLevel::Xhigh => "xhigh",
+            })
+        } else {
+            reasoning_effort(level)
+        } {
             body["reasoning"] = json!({"effort": effort, "summary": "auto"});
         }
     }
@@ -795,7 +813,8 @@ impl Provider for CodexProvider {
         let access = options
             .api_key
             .clone()
-            .ok_or_else(|| Error::MissingApiKey("openai-codex".into()))?;
+            .ok_or_else(|| Error::MissingApiKey(model.provider.clone()))?;
+        let public_api = model.api == "openai-responses";
         let account_id = options.headers.get("chatgpt-account-id").cloned();
         let base_url = options
             .base_url
@@ -821,12 +840,20 @@ impl Provider for CodexProvider {
                 let body = body.clone();
                 let session_id = session_id.clone();
                 async move {
-                    let req = apply_request_headers(
-                        client.post(&url),
-                        &access,
-                        &session_id,
-                        account_id.as_deref(),
-                    );
+                    let req = if public_api {
+                        client
+                            .post(&url)
+                            .bearer_auth(&access)
+                            .header("accept", "text/event-stream")
+                            .header("content-type", "application/json")
+                    } else {
+                        apply_request_headers(
+                            client.post(&url),
+                            &access,
+                            &session_id,
+                            account_id.as_deref(),
+                        )
+                    };
                     let r = match req.json(&body).send().await {
                         Ok(r) => r,
                         Err(e) => {
@@ -2095,5 +2122,54 @@ mod tests {
         assert_eq!(tools.len(), 1);
         assert_eq!(tools[0]["name"], "bash");
         assert_eq!(tools[0]["parameters"], tool.parameters);
+    }
+    #[tokio::test]
+    async fn public_openai_responses_uses_api_key_without_codex_identity_headers() {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let thread = std::thread::spawn(move || {
+            let (mut socket, _) = listener.accept().unwrap();
+            let mut bytes = [0; 8192];
+            let length = socket.read(&mut bytes).unwrap();
+            let request = String::from_utf8_lossy(&bytes[..length]).to_lowercase();
+            assert!(request.starts_with("post /responses "));
+            assert!(request.contains("authorization: bearer test-key"));
+            for header in [
+                "originator:",
+                "chatgpt-account-id:",
+                "session_id:",
+                "version:",
+                "openai-beta:",
+            ] {
+                assert!(
+                    !request.contains(header),
+                    "subscription header leaked: {header}"
+                );
+            }
+            let body = "event: response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"delta\":\"ok\"}\n\nevent: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\"}}\n\n";
+            write!(socket, "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}", body.len(), body).unwrap();
+        });
+        let mut model = Model::codex("gpt-6.1-sol", 1_050_000, 128_000);
+        model.api = "openai-responses".into();
+        model.provider = "openai".into();
+        let mut options = StreamOptions {
+            api_key: Some("test-key".into()),
+            base_url: Some(format!("http://{address}")),
+            ..Default::default()
+        };
+        options
+            .headers
+            .insert("chatgpt-account-id".into(), "must-not-leak".into());
+        let events: Vec<_> = CodexProvider::new()
+            .stream(&model, &Context::default(), &options)
+            .await
+            .unwrap()
+            .collect()
+            .await;
+        thread.join().unwrap();
+        assert!(events
+            .into_iter()
+            .any(|event| matches!(event.unwrap(), AssistantMessageEvent::Done { .. })));
     }
 }

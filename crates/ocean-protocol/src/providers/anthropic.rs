@@ -222,7 +222,8 @@ fn content_to_block(c: &Content) -> Option<Value> {
             thinking,
             thinking_signature: Some(signature),
         } if !signature.is_empty()
-            && !signature.starts_with(crate::providers::codex::REASONING_ITEM_MARKER) =>
+            && !signature.starts_with(crate::providers::codex::REASONING_ITEM_MARKER)
+            && !signature.starts_with(crate::providers::google::PARTS_MARKER) =>
         {
             Some(json!({
                 "type": "thinking",
@@ -373,17 +374,32 @@ fn build_body(model: &Model, context: &Context, options: &StreamOptions) -> Valu
             body["system"] = json!(sp);
         }
     }
-    if let Some(t) = options.temperature {
-        body["temperature"] = json!(t);
-    }
-    if let Some(level) = options.reasoning {
-        if let Some(budget) = thinking_budget(level) {
-            // Anthropic requires budget_tokens >= 1024 and strictly below
-            // max_tokens. Preserve the caller's output cap by shrinking the
-            // thinking budget rather than raising max_tokens past that cap.
-            if max_tokens > 1024 {
-                let budget = budget.min(max_tokens - 1);
-                body["thinking"] = json!({"type": "enabled", "budget_tokens": budget});
+    let adaptive = matches!(
+        model.id.as_str(),
+        "claude-opus-5-5" | "claude-sonnet-5-5" | "claude-fable-5-1"
+    );
+    if adaptive {
+        // Current Claude models reject manual budgets and sampling overrides.
+        body["thinking"] = json!({"type": "adaptive", "block_binding": {"prefix_mismatch_behavior": "drop_block"}});
+        if let Some(level) = options.reasoning {
+            let effort = match level {
+                ThinkingLevel::Off | ThinkingLevel::Minimal | ThinkingLevel::Low => "low",
+                ThinkingLevel::Medium => "medium",
+                ThinkingLevel::High => "high",
+                ThinkingLevel::Xhigh => "xhigh",
+            };
+            body["output_config"] = json!({"effort": effort});
+        }
+    } else {
+        if let Some(t) = options.temperature {
+            body["temperature"] = json!(t);
+        }
+        if let Some(level) = options.reasoning {
+            if let Some(budget) = thinking_budget(level) {
+                if max_tokens > 1024 {
+                    let budget = budget.min(max_tokens - 1);
+                    body["thinking"] = json!({"type": "enabled", "budget_tokens": budget});
+                }
             }
         }
     }
@@ -1553,5 +1569,27 @@ mod tests {
         assert_eq!(tools.len(), 1);
         assert_eq!(tools[0]["name"], "bash");
         assert_eq!(tools[0]["input_schema"], tool.parameters);
+    }
+    #[test]
+    fn current_claude_models_use_adaptive_thinking_without_sampling_or_manual_budget() {
+        for id in ["claude-sonnet-5-5", "claude-opus-5-5", "claude-fable-5-1"] {
+            let mut model = Model::anthropic_claude_fable_5_1();
+            model.id = id.into();
+            let options = StreamOptions {
+                temperature: Some(0.3),
+                reasoning: Some(ThinkingLevel::Xhigh),
+                ..Default::default()
+            };
+            let body = build_body(&model, &Context::default(), &options);
+            assert_eq!(body["thinking"]["type"], "adaptive");
+            assert_eq!(body["output_config"]["effort"], "xhigh");
+            assert!(body.get("temperature").is_none());
+            assert!(body["thinking"].get("budget_tokens").is_none());
+        }
+        let content = Content::Thinking {
+            thinking: "private".into(),
+            thinking_signature: Some("google-parts:[]".into()),
+        };
+        assert!(content_to_block(&content).is_none());
     }
 }

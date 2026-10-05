@@ -534,12 +534,12 @@ pub const ENV_PROVIDER_FALLBACK: &str = "OCEAN_PROVIDER_FALLBACK";
 /// to a canned echo would hide an outage rather than route around it (an operator
 /// who wants that can still list `fake` explicitly in the env override).
 pub const DEFAULT_FALLBACK_ORDER: &[&str] = &[
-    "claude-sonnet-5",  // claude-code oauth
-    "gpt-6.1-sol",      // openai-codex
-    "deepseek-v4-pro",  // deepseek
-    "gemini-2.0-flash", // google
-    "kimi-k2.6",        // kimi
-    "minimax-m2",       // minimax
+    "claude-sonnet-5-5", // claude-code oauth
+    "gpt-6.1-sol",       // openai-codex
+    "deepseek-v4-pro",   // deepseek
+    "gemini-3.8-flash",  // google
+    "kimi-k3",           // kimi
+    "minimax-m3",        // minimax
 ];
 
 /// Parse the configured fallback order into a list of model aliases.
@@ -775,6 +775,28 @@ pub fn known_models() -> Vec<KnownModel> {
         label: label.to_string(),
     };
     vec![
+        m("gpt-6-luna", "openai-codex", "GPT-6 Luna (Codex)"),
+        m("gpt-6-sol", "openai-codex", "GPT-6 Sol (Codex)"),
+        m("claude-opus-5-5", "claude-code", "Claude Opus 5.5"),
+        m("claude-sonnet-5-5", "claude-code", "Claude Sonnet 5.5"),
+        m("MiniMax-M3", "minimax", "MiniMax M3"),
+        m(
+            "MiniMax-M3.1-Flash-Preview",
+            "minimax",
+            "MiniMax M3.1 Flash (M Plan Preview)",
+        ),
+        m(
+            "MiniMax-M2.7-highspeed",
+            "minimax",
+            "MiniMax M2.7 Highspeed",
+        ),
+        m("gemini-3.8-flash", "google", "Gemini 3.8 Flash"),
+        m("gemini-3.5-flash-lite", "google", "Gemini 3.5 Flash-Lite"),
+        m(
+            "gemini-3.1-pro-preview",
+            "google",
+            "Gemini 3.1 Pro (Preview)",
+        ),
         // The live DeepSeek API serves exactly these two (verified against
         // GET /models 2026-07-12). `deepseek-chat` / `deepseek-reasoner` were
         // advertised here until DeepSeek scheduled them for hard retirement on
@@ -789,9 +811,6 @@ pub fn known_models() -> Vec<KnownModel> {
         m("gpt-5.6-terra", "openai-codex", "GPT-5.6 Terra (Codex)"),
         m("gpt-5.6-luna", "openai-codex", "GPT-5.6 Luna (Codex)"),
         m("gpt-5.5", "openai-codex", "GPT-5.5 (Codex)"),
-        m("gpt-5.4", "openai-codex", "GPT-5.4 (Codex)"),
-        m("gpt-5.4-mini", "openai-codex", "GPT-5.4 Mini (Codex)"),
-        m("gpt-5.3-codex-spark", "openai-codex", "GPT-5.3 Codex Spark"),
         m("gpt-4o", "openai", "GPT-4o"),
         m("gpt-4o-mini", "openai", "GPT-4o Mini"),
         // Current Claude generation (verified against api.anthropic.com
@@ -902,6 +921,21 @@ pub fn resolve_model_selection(env: &ProviderEnv) -> Result<ModelSelection, Prov
         return Err(ProviderConfigError::NoModelSelected);
     };
     let model = normalize_model_id(chosen);
+    // Unversioned convenience names track the operator-requested current
+    // generation. Explicit versioned ids below remain stable session pins.
+    let model = match model.as_str() {
+        "opus" | "claude-opus" | "claude-code-opus" | "cc-opus" => "claude-opus-5-5".into(),
+        "sonnet" | "claude-sonnet" | "claude-code-sonnet" | "cc-sonnet" => {
+            "claude-sonnet-5-5".into()
+        }
+        "fable" | "claude-code-fable" | "cc-fable" => "claude-code-fable-5-1".into(),
+        "minimax" => "minimax-m3".into(),
+        "kimi" => "kimi-k3".into(),
+        "glm" => "glm-5.3".into(),
+        "gemini" => "gemini-3.8-flash".into(),
+        _ => model,
+    };
+
     let provider_override = env.get("OCEAN_PROVIDER").map(str::trim);
 
     if let Some(provider) = provider_override {
@@ -909,6 +943,52 @@ pub fn resolve_model_selection(env: &ProviderEnv) -> Result<ModelSelection, Prov
     }
 
     match model.as_str() {
+        // Official provider catalogues verified 2026-10-05. Explicit legacy
+        // ids below remain stable; no persisted session is silently retargeted.
+        "gpt-6-luna" | "gpt-6-sol" => Ok(model_selection(
+            ProviderId::OpenAiCodex,
+            model.as_str(),
+            CODEX_BASE_URL,
+            272_000,
+            128_000,
+        )),
+        "claude-opus-5-5" | "claude-sonnet-5-5" => Ok(model_selection(
+            ProviderId::ClaudeCode,
+            model.as_str(),
+            ANTHROPIC_BASE_URL,
+            1_000_000,
+            128_000,
+        )),
+        "minimax-m3.1-flash-preview" => Ok(model_selection(
+            ProviderId::MiniMax,
+            "MiniMax-M3.1-Flash-Preview",
+            minimax_base_url(env),
+            1_000_000,
+            8_192,
+        )),
+        "minimax-m3" => Ok(model_selection(
+            ProviderId::MiniMax,
+            "MiniMax-M3",
+            minimax_base_url(env),
+            1_000_000,
+            8_192,
+        )),
+        "minimax-m2.7-highspeed" => Ok(model_selection(
+            ProviderId::MiniMax,
+            "MiniMax-M2.7-highspeed",
+            minimax_base_url(env),
+            204_800,
+            8_192,
+        )),
+        "gemini-3.8-flash" | "gemini-3.5-flash-lite" | "gemini-3.1-pro-preview" => {
+            Ok(model_selection(
+                ProviderId::Google,
+                model.as_str(),
+                GOOGLE_BASE_URL,
+                1_048_576,
+                65_536,
+            ))
+        }
         // `deepseek-chat` / `deepseek-reasoner` are RETIRED by DeepSeek after
         // 2026-07-24 15:59 UTC — after that they stop resolving at the API and any
         // session pinned to them dies. They are already only aliases for V4 Flash
@@ -1026,14 +1106,14 @@ pub fn resolve_model_selection(env: &ProviderEnv) -> Result<ModelSelection, Prov
         // x-api-key). The convenience aliases ("sonnet", "opus", "haiku") track
         // the newest ids. Direct-API-key auth for these ids is intentionally
         // not wired (provision later if a custom-model API path is needed).
-        "claude-sonnet-5" | "claude-sonnet" | "sonnet" => Ok(model_selection(
+        "claude-sonnet-5" => Ok(model_selection(
             ProviderId::ClaudeCode,
             "claude-sonnet-5",
             ANTHROPIC_BASE_URL,
             200_000,
             16_384,
         )),
-        "claude-opus-5" | "claude-opus" | "opus" => Ok(model_selection(
+        "claude-opus-5" => Ok(model_selection(
             ProviderId::ClaudeCode,
             "claude-opus-5",
             ANTHROPIC_BASE_URL,
@@ -1077,27 +1157,25 @@ pub fn resolve_model_selection(env: &ProviderEnv) -> Result<ModelSelection, Prov
         // pin a session's model replay that id verbatim on later turns — every
         // other Claude arm already accepts its wire id, and fable missing it
         // instant-failed all fable-pinned sessions (2026-07-29 outage).
-        "claude-code-fable-5" | "claude-code-fable" | "cc-fable" | "fable" | "claude-fable-5" => {
-            Ok(model_selection(
-                ProviderId::ClaudeCode,
-                "claude-code-fable-5",
-                ANTHROPIC_BASE_URL,
-                200_000,
-                16_384,
-            ))
-        }
-        // Fable 5.1 — current point release. The plain wire id
-        // `claude-fable-5-1` must resolve (pinned sessions replay it; see the
-        // fable-5 wire-id outage fixed in #362). `fable` stays on 5.0 so a
-        // pinned shorthand does not silently retarget.
-        "claude-code-fable-5-1" | "claude-fable-5-1" => Ok(model_selection(
+        "claude-code-fable-5" | "claude-fable-5" => Ok(model_selection(
             ProviderId::ClaudeCode,
-            "claude-code-fable-5-1",
+            "claude-code-fable-5",
             ANTHROPIC_BASE_URL,
             200_000,
             16_384,
         )),
-        "claude-code-opus-5" | "claude-code-opus" | "cc-opus" => Ok(model_selection(
+        // Fable 5.1 — current point release. The plain wire id
+        // `claude-fable-5-1` must resolve (pinned sessions replay it; see the
+        // fable-5 wire-id outage fixed in #362). Unversioned `fable` now
+        // tracks this current release; explicit 5.0 pins remain stable.
+        "claude-code-fable-5-1" | "claude-fable-5-1" => Ok(model_selection(
+            ProviderId::ClaudeCode,
+            "claude-code-fable-5-1",
+            ANTHROPIC_BASE_URL,
+            1_000_000,
+            128_000,
+        )),
+        "claude-code-opus-5" => Ok(model_selection(
             ProviderId::ClaudeCode,
             "claude-code-opus-5",
             ANTHROPIC_BASE_URL,
@@ -1111,7 +1189,7 @@ pub fn resolve_model_selection(env: &ProviderEnv) -> Result<ModelSelection, Prov
             200_000,
             16_384,
         )),
-        "claude-code-sonnet-5" | "claude-code-sonnet" | "cc-sonnet" => Ok(model_selection(
+        "claude-code-sonnet-5" => Ok(model_selection(
             ProviderId::ClaudeCode,
             "claude-code-sonnet-5",
             ANTHROPIC_BASE_URL,
@@ -1143,7 +1221,7 @@ pub fn resolve_model_selection(env: &ProviderEnv) -> Result<ModelSelection, Prov
         // MiniMax M2 family. `normalize_model_id` lowercases the lookup key, but
         // MiniMax's API expects the original `MiniMax-…` casing, so the value we
         // pass through preserves it.
-        "minimax" | "minimax-m2" => Ok(model_selection(
+        "minimax-m2" => Ok(model_selection(
             ProviderId::MiniMax,
             "MiniMax-M2",
             minimax_base_url(env),
@@ -1158,8 +1236,8 @@ pub fn resolve_model_selection(env: &ProviderEnv) -> Result<ModelSelection, Prov
             8_192,
         )),
         // Moonshot AI / Kimi family. Official OpenAI-compatible base; model ids
-        // are lowercase so casing survives normalization as-is. Keep the bare
-        // `kimi` alias on K2.6 for backward compatibility; K3 is opt-in.
+        // are lowercase so casing survives normalization as-is. Explicit
+        // K2.x pins remain stable; the bare name now tracks K3.
         // Kimi coding SUBSCRIPTION (TASK-19): the "kimi code" plan endpoint,
         // Anthropic-messages, billed against the subscription. Distinct from the
         // raw metered `kimi-k3` below. `k3` is the plan's own model id.
@@ -1177,7 +1255,7 @@ pub fn resolve_model_selection(env: &ProviderEnv) -> Result<ModelSelection, Prov
             KIMI_K3_CONTEXT_WINDOW,
             KIMI_MAX_OUTPUT_TOKENS,
         )),
-        "kimi" | "kimi-k2.6" | "kimi-k2-6" => Ok(model_selection(
+        "kimi-k2.6" | "kimi-k2-6" => Ok(model_selection(
             ProviderId::Kimi,
             "kimi-k2.6",
             MOONSHOT_BASE_URL,
@@ -1196,7 +1274,7 @@ pub fn resolve_model_selection(env: &ProviderEnv) -> Result<ModelSelection, Prov
         // `OCEAN_GLM_BASE_URL` override (non-empty wins, else the default), so
         // every GLM route — bare alias, explicit provider, and any fallback
         // alias — honors the same override.
-        "glm" | "glm-4.6" | "glm-4-6" => Ok(model_selection(
+        "glm-4.6" | "glm-4-6" => Ok(model_selection(
             ProviderId::Glm,
             "glm-4.6",
             glm_base_url(env),
@@ -1221,7 +1299,7 @@ pub fn resolve_model_selection(env: &ProviderEnv) -> Result<ModelSelection, Prov
             ProviderId::Glm,
             "glm-5.3",
             glm_base_url(env),
-            200_000,
+            1_000_000,
             8_192,
         )),
         // GLM 5.3 Flash — the fast tier of the 5.3 generation, served by the
@@ -1231,7 +1309,7 @@ pub fn resolve_model_selection(env: &ProviderEnv) -> Result<ModelSelection, Prov
             ProviderId::Glm,
             "glm-5.3-flash",
             glm_base_url(env),
-            200_000,
+            1_000_000,
             8_192,
         )),
         "glm-4.5" | "glm-4-5" => Ok(model_selection(
@@ -1251,7 +1329,7 @@ pub fn resolve_model_selection(env: &ProviderEnv) -> Result<ModelSelection, Prov
         // Google Gemini family. Routed through ocean-protocol's
         // `google-generative-ai` provider (not OpenAI-compatible). Model ids
         // are lowercase, so casing survives normalization as-is.
-        "gemini" | "gemini-2.0-flash" | "gemini-2-0-flash" => Ok(model_selection(
+        "gemini-2.0-flash" | "gemini-2-0-flash" => Ok(model_selection(
             ProviderId::Google,
             "gemini-2.0-flash",
             GOOGLE_BASE_URL,
@@ -1356,6 +1434,53 @@ fn model_for_explicit_provider(
     model: &str,
     env: &ProviderEnv,
 ) -> Result<ModelSelection, ProviderConfigError> {
+    let (context_window, max_output_tokens) = match model {
+        "gpt-6-astra" | "gpt-6.1-sol" | "gpt-6-luna" | "gpt-6-sol" => (
+            if matches!(provider, "openai-codex" | "codex") {
+                272_000
+            } else {
+                1_050_000
+            },
+            128_000,
+        ),
+        "claude-opus-5-5" | "claude-sonnet-5-5" | "claude-fable-5-1" | "claude-code-fable-5-1" => {
+            (1_000_000, 128_000)
+        }
+        "glm-5.3" | "glm-5.3-flash" => (1_000_000, 8_192),
+        "minimax-m3" | "minimax-m3.1-flash-preview" => (1_000_000, 8_192),
+        "minimax-m2.7-highspeed" => (204_800, 8_192),
+        "gemini-3.8-flash" | "gemini-3.5-flash-lite" | "gemini-3.1-pro-preview" => {
+            (1_048_576, 65_536)
+        }
+        _ => (0, 0),
+    };
+    if context_window != 0 {
+        let route = match provider {
+            "openai" => Some((ProviderId::OpenAi, OPENAI_BASE_URL)),
+            "openai-codex" | "codex" => Some((ProviderId::OpenAiCodex, CODEX_BASE_URL)),
+            "anthropic" => Some((ProviderId::Anthropic, ANTHROPIC_BASE_URL)),
+            "claude-code" => Some((ProviderId::ClaudeCode, ANTHROPIC_BASE_URL)),
+            "glm" | "zhipu" | "zhipuai" => Some((ProviderId::Glm, glm_base_url(env))),
+            "minimax" => Some((ProviderId::MiniMax, minimax_base_url(env))),
+            "google" | "gemini" => Some((ProviderId::Google, GOOGLE_BASE_URL)),
+            _ => None,
+        };
+        if let Some((id, base)) = route {
+            let wire = match model {
+                "minimax-m3" => "MiniMax-M3",
+                "minimax-m3.1-flash-preview" => "MiniMax-M3.1-Flash-Preview",
+                "minimax-m2.7-highspeed" => "MiniMax-M2.7-highspeed",
+                _ => model,
+            };
+            return Ok(model_selection(
+                id,
+                wire,
+                base,
+                context_window,
+                max_output_tokens,
+            ));
+        }
+    }
     match provider {
         "deepseek" => Ok(model_selection(
             ProviderId::DeepSeek,
@@ -1824,10 +1949,10 @@ mod tests {
         assert_eq!(selection.context_window, 1_000_000);
         assert_eq!(selection.max_output_tokens, 8_192);
 
-        let legacy = resolve_model_selection(&env(&[("OCEAN_MODEL", "kimi")])).unwrap();
+        let legacy = resolve_model_selection(&env(&[("OCEAN_MODEL", "kimi-k2.6")])).unwrap();
         assert_eq!(
             legacy.model, "kimi-k2.6",
-            "bare alias remains backward compatible"
+            "explicit old model remains backward compatible"
         );
         assert_eq!(legacy.context_window, 256_000);
     }
@@ -1847,7 +1972,7 @@ mod tests {
     fn gemini_alias_routes_to_google_provider() {
         let selection = resolve_model_selection(&env(&[("OCEAN_MODEL", "gemini")])).unwrap();
         assert_eq!(selection.provider, ProviderId::Google);
-        assert_eq!(selection.model, "gemini-2.0-flash");
+        assert_eq!(selection.model, "gemini-3.8-flash");
     }
 
     #[test]
@@ -2020,16 +2145,24 @@ mod tests {
     }
 
     #[test]
-    fn opus_aliases_track_opus_5_and_legacy_4_8_stays_routable() {
+    fn opus_aliases_track_opus_5_5_and_legacy_4_8_stays_routable() {
         // The convenience aliases follow the newest Opus generation.
         for alias in ["opus", "claude-opus", "claude-opus-5"] {
             let s = resolve_model_selection(&env(&[("OCEAN_MODEL", alias)])).unwrap();
             assert_eq!(s.provider, ProviderId::ClaudeCode, "{alias}");
-            assert_eq!(s.model, "claude-opus-5", "{alias}");
+            assert_eq!(
+                s.model,
+                if alias == "claude-opus-5" {
+                    "claude-opus-5"
+                } else {
+                    "claude-opus-5-5"
+                },
+                "{alias}"
+            );
         }
         for alias in ["claude-code-opus", "cc-opus"] {
             let s = resolve_model_selection(&env(&[("OCEAN_MODEL", alias)])).unwrap();
-            assert_eq!(s.model, "claude-code-opus-5", "{alias}");
+            assert_eq!(s.model, "claude-opus-5-5", "{alias}");
         }
         // Pinned sessions on the retired ids keep resolving (off the menu).
         let legacy = resolve_model_selection(&env(&[("OCEAN_MODEL", "claude-opus-4-8")])).unwrap();
@@ -2056,12 +2189,20 @@ mod tests {
         ] {
             let s = resolve_model_selection(&env(&[("OCEAN_MODEL", alias)])).unwrap();
             assert_eq!(s.provider, ProviderId::ClaudeCode, "{alias}");
-            assert_eq!(s.model, "claude-code-fable-5", "{alias}");
+            assert_eq!(
+                s.model,
+                if alias.ends_with("-5") {
+                    "claude-code-fable-5"
+                } else {
+                    "claude-code-fable-5-1"
+                },
+                "{alias}"
+            );
         }
 
         // 5.1 — current point release. Both the menu alias and the wire id
         // (already pinned by live loops, events.md 02-09-26) resolve to the
-        // 5.1 menu id; `fable` itself stays pinned to 5.0 above.
+        // 5.1 menu id; unversioned `fable` follows this release.
         for alias in ["claude-code-fable-5-1", "claude-fable-5-1"] {
             let s = resolve_model_selection(&env(&[("OCEAN_MODEL", alias)])).unwrap();
             assert_eq!(s.provider, ProviderId::ClaudeCode, "{alias}");
@@ -2299,6 +2440,16 @@ mod tests {
         // arm is added to resolve_model_selection, add it here AND to
         // known_models() — this test is the tripwire that forces that.
         let routable_production_ids = [
+            "gpt-6-luna",
+            "gpt-6-sol",
+            "claude-opus-5-5",
+            "claude-sonnet-5-5",
+            "MiniMax-M3",
+            "MiniMax-M3.1-Flash-Preview",
+            "MiniMax-M2.7-highspeed",
+            "gemini-3.8-flash",
+            "gemini-3.5-flash-lite",
+            "gemini-3.1-pro-preview",
             // `deepseek-chat` / `deepseek-reasoner` are absent for the same reason
             // the retired Claude 4-6/4-7 ids are: DeepSeek retires them 2026-07-24,
             // so they stay ROUTABLE as forward aliases onto v4-flash (pinned
@@ -2313,9 +2464,6 @@ mod tests {
             "gpt-5.6-terra",
             "gpt-5.6-luna",
             "gpt-5.5",
-            "gpt-5.4",
-            "gpt-5.4-mini",
-            "gpt-5.3-codex-spark",
             // Current Claude generation (2026-07 refresh + Opus 5 release).
             // The retired 4-6/4-7/4-8 ids stay ROUTABLE (legacy arms, pinned
             // sessions) but are deliberately NOT in the menu, so they're
@@ -2748,7 +2896,7 @@ mod tests {
     #[test]
     fn current_glm_models_route_and_round_trip_through_known_models() {
         // New GLM ids route to ProviderId::Glm with the coding-plan base and
-        // the shared 200k/8k limits, their hyphen aliases normalize to the same
+        // the published context limits and conservative 8k reply budget, their hyphen aliases normalize to the same
         // canonical id, and they survive the known_models round-trip.
         for (id, hyphen) in [
             ("glm-4.7", "glm-4-7"),
@@ -2760,7 +2908,14 @@ mod tests {
             assert_eq!(sel.provider, ProviderId::Glm);
             assert_eq!(sel.model, id);
             assert_eq!(sel.base_url, GLM_BASE_URL);
-            assert_eq!(sel.context_window, 200_000);
+            assert_eq!(
+                sel.context_window,
+                if id.starts_with("glm-5.3") {
+                    1_000_000
+                } else {
+                    200_000
+                }
+            );
             assert_eq!(sel.max_output_tokens, 8_192);
             let hyphenated = resolve_model_selection(&env(&[("OCEAN_MODEL", hyphen)])).unwrap();
             assert_eq!(hyphenated.model, id);
@@ -2971,5 +3126,94 @@ mod auth_lock_tests {
         assert!(fs2::FileExt::try_lock_exclusive(&other).is_err());
         drop(guard);
         assert!(fs2::FileExt::try_lock_exclusive(&other).is_ok());
+    }
+}
+
+#[cfg(test)]
+mod model_refresh_tests {
+    use super::*;
+
+    #[test]
+    fn current_models_keep_auth_routes_and_served_capacities() {
+        for (model, provider, context) in [
+            ("gpt-6.1-sol", "openai", 1_050_000),
+            ("gpt-6-luna", "openai-codex", 272_000),
+            ("claude-sonnet-5-5", "anthropic", 1_000_000),
+            ("claude-opus-5-5", "claude-code", 1_000_000),
+            ("MiniMax-M3", "minimax", 1_000_000),
+            ("MiniMax-M3.1-Flash-Preview", "minimax", 1_000_000),
+            ("gemini-3.8-flash", "google", 1_048_576),
+            ("glm-5.3", "glm", 1_000_000),
+        ] {
+            let env = ProviderEnv {
+                vars: BTreeMap::from([
+                    ("OCEAN_MODEL".into(), model.into()),
+                    ("OCEAN_PROVIDER".into(), provider.into()),
+                ]),
+                ..Default::default()
+            };
+            let selection = resolve_model_selection(&env).unwrap();
+            assert_eq!(selection.model, model);
+            assert_eq!(selection.provider.as_str(), provider);
+            assert_eq!(selection.context_window, context);
+        }
+    }
+
+    #[test]
+    fn retired_codex_menu_ids_and_fallbacks_stay_routable_for_pinned_sessions() {
+        let menu = known_models();
+        for id in ["gpt-5.4", "gpt-5.4-mini", "gpt-5.3-codex-spark"] {
+            assert!(!menu.iter().any(|model| model.id == id));
+            assert!(!DEFAULT_FALLBACK_ORDER.contains(&id));
+            let env = ProviderEnv {
+                vars: BTreeMap::from([("OCEAN_MODEL".into(), id.into())]),
+                ..Default::default()
+            };
+            assert_eq!(resolve_model_selection(&env).unwrap().model, id);
+        }
+        for id in [
+            "claude-sonnet-5-5",
+            "gpt-6.1-sol",
+            "gemini-3.8-flash",
+            "kimi-k3",
+            "minimax-m3",
+        ] {
+            assert!(DEFAULT_FALLBACK_ORDER.contains(&id));
+        }
+    }
+    #[test]
+    fn convenience_aliases_follow_current_models_without_retargeting_versioned_pins() {
+        for (alias, current, pin, previous) in [
+            ("opus", "claude-opus-5-5", "claude-opus-5", "claude-opus-5"),
+            (
+                "sonnet",
+                "claude-sonnet-5-5",
+                "claude-sonnet-5",
+                "claude-sonnet-5",
+            ),
+            (
+                "fable",
+                "claude-code-fable-5-1",
+                "claude-fable-5",
+                "claude-code-fable-5",
+            ),
+            (
+                "gemini",
+                "gemini-3.8-flash",
+                "gemini-2.0-flash",
+                "gemini-2.0-flash",
+            ),
+            ("minimax", "MiniMax-M3", "MiniMax-M2", "MiniMax-M2"),
+            ("kimi", "kimi-k3", "kimi-k2.6", "kimi-k2.6"),
+            ("glm", "glm-5.3", "glm-4.6", "glm-4.6"),
+        ] {
+            for (input, expected) in [(alias, current), (pin, previous)] {
+                let env = ProviderEnv {
+                    vars: BTreeMap::from([("OCEAN_MODEL".into(), input.into())]),
+                    ..Default::default()
+                };
+                assert_eq!(resolve_model_selection(&env).unwrap().model, expected);
+            }
+        }
     }
 }

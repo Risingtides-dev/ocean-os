@@ -17,6 +17,10 @@ This crate owns the multi-provider LLM wire protocol layer for Anthropic, OpenAI
 - Treat streaming event shape changes as compatibility-sensitive.
 - Codex OAuth requests using the `codex_cli_rs` originator must carry a current
   `version` header; ChatGPT version-gates newly released Codex models.
+- Current Claude Opus/Sonnet 5.5 and Fable 5.1 use adaptive thinking and `output_config.effort`; omit sampling overrides and manual budgets. Client-side history shaping uses `block_binding.prefix_mismatch_behavior=drop_block` so edited prefixes lose invalid thinking rather than failing the turn.
+- Gemini 3 uses `thinkingLevel`, never a legacy budget. Persist exact ordered response parts with their `thoughtSignature` metadata behind the private `google-parts:` marker; replay only on the same Google model. Thought summaries and opaque markers never enter visible text or another provider's request.
+- API-key OpenAI Responses shares the Codex Responses encoder/decoder but sends only ordinary bearer/content headers to api.openai.com. Codex originator, account, version, and session headers remain subscription-only. Encrypted reasoning replay requires the same provider/model, so subscription artifacts cannot cross into API-key turns.
+- MiniMax M3 and M3.1 Flash Preview retain same-model `reasoning_content` across tool rounds. GLM 5.3/Flash always sends enabled thinking when a level is requested; Off means the lowest supported effort, never an unsupported disable request.
 - Anthropic extended-thinking requests must keep `budget_tokens` at least 1024
   and strictly below `max_tokens`; preserve explicit output caps by clamping the
   thinking budget rather than raising the cap.

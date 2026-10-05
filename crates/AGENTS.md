@@ -103,7 +103,10 @@ The workspace currently contains 30 Rust packages.
 - Prefer small, explicit package boundaries.
 - Run the narrowest package check first, then the root completion/merge gate.
 - Session/history changes usually cross `ocean-agent`, `ocean-core`, and `ocean-daemon`; coordinate explicitly.
-- Public picker models are owned by `ocean-providers::known_models`; every advertised id must round-trip through `resolve_model_selection`, and every routable production alias must be listed. Kimi K3 is the exact `kimi-k3` route with a 1M context window; its provider-specific dynamic-tool wire belongs to `ocean-protocol`, while bounded search/dispatch enforcement belongs to `ocean-runtime`.
+- Public picker models are owned by `ocean-providers::known_models`; every advertised id must round-trip through `resolve_model_selection`, and current production ids are listed; legacy pins remain routable without being advertised. Kimi K3 is the exact `kimi-k3` route with a 1M context window; its provider-specific dynamic-tool wire belongs to `ocean-protocol`, while bounded search/dispatch enforcement belongs to `ocean-runtime`.
+
+- Model refreshes verify exact ids and limits against official provider catalogues, then update the picker, provider resolver, agent-to-wire mapping, and model-specific request/history handling together. Keep subscription and API-key endpoints distinct; published API context is not proof of the Codex backend's served limit. Unversioned convenience names track current models; preserve explicit old model pins and leave restricted previews out of general fallbacks.
+- Current text/agent model sources: [OpenAI](https://developers.openai.com/api/docs/models), [Claude](https://platform.claude.com/docs/en/models/overview), [Gemini](https://ai.google.dev/gemini-api/docs/models), [MiniMax](https://platform.minimax.io/docs/guides/models-intro), [Kimi](https://platform.kimi.ai/docs/guide/kimi-k3-quickstart), [GLM](https://docs.z.ai/guides/llm/glm-5.3), and [DeepSeek](https://api-docs.deepseek.com/). Model availability still needs an account-specific successful call; credential presence alone is readiness, not acceptance.
 
 ## Verification
 

@@ -11442,3 +11442,12 @@ area:      [backend]
 
 gpt-5.5 was registered with a 400k context window, but the Codex backend serves 272k (the same served-vs-advertised gap the gpt-6.1-sol entry above records). A session planning compaction against 400k could overfill and fail mid-turn. The gpt-5.5 / gpt-5-5 arm of resolve_model_selection now returns 272_000; a new test pins both spellings (red on the old value, green now; crate 55/0). Built by a DeepSeek seat (deepseek-v4-pro), gated by lead 16. Not changed: gpt-5.4, gpt-5.4-mini and gpt-5.3-codex-spark still say 400k because nothing in the repo records their served limit, and the openai-codex explicit-provider catch-all still defaults to 400k. The live daemon is untouched until a binary swap.
 _________________________________________________________________________________ 09:47 l16-ctx-fix
+
+time:      [13:19] [05-10-26]
+agent:     [Codex desktop], [GPT-6]
+worktree:  [codex/provider-model-refresh-20261005] [/private/tmp/ocean-models-20261005]
+type:      [feature-request]
+area:      [backend] [testing]
+
+Refreshed current provider models from official catalogues: Claude Opus/Sonnet 5.5 and Fable 5.1, OpenAI GPT-6 routes, Gemini 3, MiniMax M3/plan preview, GLM 5.3, and current Kimi/DeepSeek coverage. Unversioned convenience names and general fallbacks select current releases; explicit versioned pins remain stable and restricted previews stay opt-in. Updated resolver/runtime capacities, adaptive Claude requests, private same-model Gemini signature replay, OpenAI API-key Responses without Codex identity headers, MiniMax reasoning replay and GLM effort compatibility. Removed retired Codex picker entries while preserving their resolver pins. Owning crate devlogs updated; root ownership and child indexes unchanged. Final cargo xtask ci passed locally. No paid model calls, merge, deployment, or account-specific preview acceptance is claimed; fresh review and hosted CI remain required. Dirty canonical checkout preserved; only this ledger entry is appended there and mirrored in the branch.
+_________________________________________________________________________________ 13:19 codex/provider-model-refresh-20261005
