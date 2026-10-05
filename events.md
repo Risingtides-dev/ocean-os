@@ -11487,3 +11487,12 @@ area:      [backend]
 
 PR #532 review repairs: Sonnet Off with signed thinking history stays adaptive at low effort with drop_block binding controls; fresh history can use between_tools. GLM 5.3 and Flash reserve published 128K output on both resolver paths. Declined MiniMax Highspeed vision finding against the exact official OpenAI-compatible API contract, which limits image support to M3 variants; added capability regression. Protocol, providers, and agent tests pass. Updated owning devlogs; ownership and child indexes unchanged. Full CI and fresh review follow.
 _________________________________________________________________________________ 14:24 codex/provider-model-refresh-20261005
+
+time:      [14:30] [05-10-26]
+agent:     [codex], [GPT-6], [primary]
+worktree:  [codex/provider-model-refresh-20261005]
+type:      [bug report]
+area:      [backend]
+
+PR #532 Sonnet mode refinement: derive replayed thinking from the encoded Anthropic payload so foreign Google/Codex opaque markers and empty signatures cannot force adaptive mode for Off. Same-wire signed history retains adaptive binding protection. Protocol regressions pass; updated owning contract with unchanged child index. Full CI and fresh exact-head review follow.
+_________________________________________________________________________________ 14:30 codex/provider-model-refresh-20261005

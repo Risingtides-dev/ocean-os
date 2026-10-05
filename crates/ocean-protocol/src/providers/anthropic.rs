@@ -380,10 +380,18 @@ fn build_body(model: &Model, context: &Context, options: &StreamOptions) -> Valu
         "claude-opus-5-5" | "claude-sonnet-5-5" | "claude-fable-5-1"
     );
     if adaptive {
+        // Only thinking actually replayed on this wire constrains the mode.
+        let has_replayed_thinking = body["messages"].as_array().is_some_and(|messages| {
+            messages.iter().any(|message| {
+                message["content"]
+                    .as_array()
+                    .is_some_and(|blocks| blocks.iter().any(|block| block["type"] == "thinking"))
+            })
+        });
         // Current Claude models reject manual budgets and sampling overrides.
         if model.id == "claude-sonnet-5-5"
             && options.reasoning == Some(ThinkingLevel::Off)
-            && !context.messages.iter().any(|m| matches!(m, Message::Assistant(a) if a.content.iter().any(|c| matches!(c, Content::Thinking { thinking_signature: Some(s), .. } if !s.is_empty()))))
+            && !has_replayed_thinking
         {
             // Sonnet permits no up-front thinking only in between-tools mode,
             // which cannot carry adaptive block-binding controls.
@@ -1755,6 +1763,47 @@ mod tests {
             );
             assert_eq!(body["messages"][0]["content"][0]["signature"], "sig-abc");
             assert!(request_beta(&body, AuthMethod::ApiKey, &BTreeMap::new()).is_some());
+        }
+    }
+    #[test]
+    fn sonnet_off_ignores_foreign_reasoning_markers_when_selecting_mode() {
+        let mut model = Model::anthropic_claude_fable_5_1();
+        model.id = "claude-sonnet-5-5".into();
+        for signature in ["google-parts:opaque", "codex-item:opaque", ""] {
+            let context = Context {
+                messages: vec![
+                    Message::Assistant(AssistantMessage {
+                        content: vec![
+                            Content::Thinking {
+                                thinking: "foreign reasoning".into(),
+                                thinking_signature: Some(signature.into()),
+                            },
+                            Content::text("prior answer"),
+                        ],
+                        api: "foreign".into(),
+                        provider: "foreign".into(),
+                        model: "foreign".into(),
+                        usage: Usage::default(),
+                        stop_reason: StopReason::Stop,
+                        error_message: None,
+                        timestamp: now_ms(),
+                    }),
+                    Message::user_text("continue"),
+                ],
+                ..Default::default()
+            };
+            let body = build_body(
+                &model,
+                &context,
+                &StreamOptions {
+                    reasoning: Some(ThinkingLevel::Off),
+                    ..Default::default()
+                },
+            );
+            assert_eq!(body["thinking"], json!({"type":"between_tools"}));
+            assert_eq!(body["messages"][0]["content"][0]["text"], "prior answer");
+            assert_eq!(body["messages"][0]["content"].as_array().unwrap().len(), 1);
+            assert!(request_beta(&body, AuthMethod::ApiKey, &BTreeMap::new()).is_none());
         }
     }
 }
