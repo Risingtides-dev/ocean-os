@@ -11631,3 +11631,12 @@ area:      [review]
 
 Daemon-ready model listings now derive provider and effort capabilities from each model's effective configured route. API-key GPT-6 Sol/Luna expose supported Off; subscription routes retain their low floor, and Astra/Sol 6.1 do not advertise Off. Anthropic API-key Claude retains adaptive effort capabilities. Full provider suite and denied-warning all-target Clippy pass; regressions cover both public/subscription GPT routes and Anthropic routing. Owning crates contract updated; root ownership and child indexes unchanged. Full integrated gate and fresh review follow.
 _________________________________________________________________________________ 15:18 codex/ocean-max-effort-20261005
+
+time:      [15:41] [05-10-26]
+agent:     [codex], [gpt-6]
+worktree:  codex/ocean-effort-catalog-20261005
+type:      [workflow]: Reconcile capability PR with merged model refresh
+area:      [review]
+
+Parent PR #532 merged as 7236a41c, whose entire tree matches original parent 177a6cbf. Reconciled origin/main ancestry into the capability branch; squash-induced protocol conflicts retain the already-integrated tested files. The resolved index is byte-identical to prior 4a327a7e before this ledger append, so the 3,719-test repository gate and prior strict validations still cover the unchanged code. Retarget PR #533 to main and obtain fresh hosted review/checks on the merge head. Devlog pass: owner contracts and child indexes unchanged because no code, ownership or workflow contract changed; canonical dirty checkout preserved.
+_________________________________________________________________________________ 15:41 codex/ocean-effort-catalog-20261005
