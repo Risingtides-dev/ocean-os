@@ -11451,3 +11451,12 @@ area:      [backend] [testing]
 
 Refreshed current provider models from official catalogues: Claude Opus/Sonnet 5.5 and Fable 5.1, OpenAI GPT-6 routes, Gemini 3, MiniMax M3/plan preview, GLM 5.3, and current Kimi/DeepSeek coverage. Unversioned convenience names and general fallbacks select current releases; explicit versioned pins remain stable and restricted previews stay opt-in. Updated resolver/runtime capacities, adaptive Claude requests, private same-model Gemini signature replay, OpenAI API-key Responses without Codex identity headers, MiniMax reasoning replay and GLM effort compatibility. Removed retired Codex picker entries while preserving their resolver pins. Owning crate devlogs updated; root ownership and child indexes unchanged. Final cargo xtask ci passed locally. No paid model calls, merge, deployment, or account-specific preview acceptance is claimed; fresh review and hosted CI remain required. Dirty canonical checkout preserved; only this ledger entry is appended there and mirrored in the branch.
 _________________________________________________________________________________ 13:19 codex/provider-model-refresh-20261005
+
+time:      [13:49] [05-10-26]
+agent:     [Codex desktop], [GPT-6]
+worktree:  [codex/provider-model-refresh-20261005] [/private/tmp/ocean-models-20261005]
+type:      [bug report]
+area:      [review] [backend] [testing]
+
+Addressed PR #532 review findings: merge the required thinking-binding-controls beta with OAuth and caller betas in one Anthropic header, and map Gemini 3.8 Flash Off/Minimal to supported low effort while keeping 3.5 Flash-Lite minimal. Protocol regression tests pass (176 unit plus 5 integration). Updated protocol devlog; parent ownership and child indexes unchanged. The prior hosted macOS failure was the unrelated extension stalled-service cleanup deadline assertion; no timeout is weakened. Full local/hosted revalidation and fresh review follow before merge/install.
+_________________________________________________________________________________ 13:49 codex/provider-model-refresh-20261005
