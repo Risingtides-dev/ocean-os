@@ -8,8 +8,8 @@ use std::time::Duration;
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     anyhow::ensure!(
-        std::env::var("OCEAN_PROVIDER_FALLBACK").as_deref() == Ok(""),
-        "set OCEAN_PROVIDER_FALLBACK='' to prevent a fallback from masking failure"
+        std::env::var("OCEAN_PROVIDER_FALLBACK").as_deref() == Ok("disabled"),
+        "set OCEAN_PROVIDER_FALLBACK=disabled; a blank value enables default fallback"
     );
     anyhow::ensure!(
         std::env::var("OCEAN_MODEL").is_ok_and(|model| !model.is_empty()),
@@ -26,6 +26,15 @@ async fn main() -> anyhow::Result<()> {
         .for_each_concurrent(4, |(model, effort)| async move {
             let stage = std::cell::Cell::new("temporary_store");
             let result = async {
+                let mut env = ocean_providers::ProviderEnv::from_process();
+                env.vars.insert("OCEAN_MODEL".into(), model.clone());
+                let selected = ocean_providers::resolve_model_selection(&env)?;
+                anyhow::ensure!(ocean_providers::fallback_candidates(
+                    &env,
+                    &selected.provider,
+                    &ocean_providers::ProviderQuarantine::default(),
+                    std::time::Instant::now(),
+                ).is_empty(), "live acceptance requires zero fallback candidates");
                 let root = tempfile::tempdir()?;
                 let workspace = root.path().join("workspace");
                 std::fs::create_dir(&workspace)?;
@@ -45,7 +54,21 @@ async fn main() -> anyhow::Result<()> {
                     .with_thinking_level(Some(effort));
                 stage.set("turn");
                 let response = runtime.prompt(request, control).await;
-                Ok::<_, anyhow::Error>(response.ok && response.stdout.trim() == "OCEAN_OK")
+                if !response.ok || response.stdout.trim() != "OCEAN_OK" {
+                    return Ok(false);
+                }
+                stage.set("model_attribution");
+                let actual = runtime
+                    .session_model_config_optional(response.session_id.ok_or_else(|| {
+                        anyhow::anyhow!("successful turn omitted session identity")
+                    })?)?
+                    .ok_or_else(|| anyhow::anyhow!("successful turn omitted persisted session"))?;
+                let expected = ocean_providers::resolve_model_selection(&ocean_providers::ProviderEnv {
+                    vars: std::collections::BTreeMap::from([("OCEAN_MODEL".into(), model.clone())]),
+                    ..Default::default()
+                })?;
+                let wire_model = expected.model.replace("claude-code-", "claude-");
+                Ok::<_, anyhow::Error>(actual.model == wire_model)
             };
             let outcome = match tokio::time::timeout(Duration::from_secs(45), result).await {
                 Ok(Ok(true)) => "passed",

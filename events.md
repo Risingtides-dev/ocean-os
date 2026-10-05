@@ -11553,3 +11553,12 @@ area:      [backend]
 
 PR #532 Gemini parallel-round repair: consecutive tool results are ordered functionResponse parts in one user content, with each image retained inside its matching response. Normal user/model messages delimit groups; legacy encoding remains unchanged. Three-model grouping/media regressions and protocol suite pass. Updated owning contract and unchanged child index. Full CI and fresh review follow. The unrelated Git tree-bomb timing test passed in isolation after a local loaded-run timeout; its deadline/assertions remain unchanged.
 _________________________________________________________________________________ 14:38 codex/provider-model-refresh-20261005
+
+time:      [14:43] [05-10-26]
+agent:     [codex], [gpt-6]
+worktree:  codex/ocean-max-effort-20261005
+type:      [bug report]: Review fixes and attributed live proof
+area:      [testing]
+
+Removed misleading Off from legacy Codex capabilities after independent review. Corrected Max acceptance diagnostics: blank fallback enables the default order, so previous claims of fallback-disabled proof are withdrawn. Require the unroutable disabled sentinel, verify zero fallback candidates, and compare persisted effective model before a pass. Fresh isolated requests for Sol 6.1, Astra 6, Sol 6 and Luna 6 each passed with matching request-wire model and max effort. Claude Opus 5.5/Fable 5.1 failed with fallback disabled; their auth remains expired. Integrated the latest concurrent provider fixes. The unrelated A4 tree-bomb timeout failed once under load and passed in isolation without changing its bounds; full gate reruns. Owning crate/agent contracts updated; root ownership and child indexes unchanged.
+_________________________________________________________________________________ 14:43 codex/ocean-max-effort-20261005

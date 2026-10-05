@@ -758,7 +758,7 @@ fn model_reasoning_efforts(id: &str, provider: &str) -> Vec<String> {
         ("openai-codex" | "openai", id) if id.starts_with("gpt-6") => {
             &["low", "medium", "high", "xhigh", "max"]
         }
-        ("openai-codex", _) => &["off", "minimal", "low", "medium", "high"],
+        ("openai-codex", _) => &["minimal", "low", "medium", "high"],
         ("claude-code", "claude-sonnet-5-5") => &["off", "low", "medium", "high", "xhigh", "max"],
         ("claude-code", "claude-opus-5-5" | "claude-code-fable-5-1") => {
             &["low", "medium", "high", "xhigh", "max"]
@@ -2439,6 +2439,7 @@ mod tests {
             assert_eq!(efforts(id), ["low", "medium", "high", "xhigh", "max"]);
         }
         assert_eq!(efforts("glm-5.3"), ["low", "high", "max"]);
+        assert_eq!(efforts("gpt-5.6-sol"), ["minimal", "low", "medium", "high"]);
         assert_eq!(
             efforts("claude-sonnet-5-5"),
             ["off", "low", "medium", "high", "xhigh", "max"]

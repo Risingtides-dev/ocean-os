@@ -113,7 +113,7 @@ This crate owns Ocean's agent session/history layer and project prompt loading. 
 
 ## Work Guidance
 
-- `examples/max_effort_smoke.rs` is an explicit live acceptance diagnostic. Require a bootstrap model and `OCEAN_PROVIDER_FALLBACK=''`; each tool-free, operator-memory-free Max turn uses a separate temporary store/workspace and emits only fixed outcome metadata. It must never exercise tools or disguise a failed model with fallback.
+- `examples/max_effort_smoke.rs` is an explicit live acceptance diagnostic. Require a bootstrap model and `OCEAN_PROVIDER_FALLBACK=disabled` (an unroutable sentinel; blank restores default fallback). Each tool-free, operator-memory-free Max turn uses a separate temporary store/workspace and emits only fixed outcome metadata. Successful output must also match the persisted effective model. It must never exercise tools or disguise a failed model with fallback.
 
 - Keep prompt-loading behavior deterministic and easy for cold agents to reason about.
 - `src/system_prompt.rs` is one intact cohesion boundary. Prompt wording and literal bytes are behavior; do not mix wording changes with structural extraction.
