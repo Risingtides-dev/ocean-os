@@ -11433,3 +11433,12 @@ area:      [backend]
 
 Ported the session turn-outcome record from the unpushed local-main commit 6c0b84e, so installing origin/main does not break a fleet dependency. After every turn on POST /v1/agent/turns the daemon now stores last_turn_status ("completed" or "failed") and, on failure, last_turn_error on the session, and GET /v1/sessions/{id} returns both. rt/whatsapp-claudebot/tools/lanes/run-kimi.sh reads last_turn_status to stop a lane after 3 failed Kimi turns in a row; on origin/main it read "unknown" and the stop could never trip. Only this part of 6c0b84e is ported; the board route and the rest of the team-manager gate-1 work stay out. One fix over the original: the error cap now cuts on a UTF-8 char boundary, where the old byte slice could panic on a long non-ASCII error. The write is best-effort and runs under the turn's session lease, so a failed write never blocks TurnFinished. Old session files load unchanged (the fields default to absent). Tests: four session unit tests and a daemon test that runs a real failing turn (unknown per-turn model) and then a good one and checks the status flips. With the hook forced to report success, the daemon test goes red.
 _________________________________________________________________________________ 22:08 feat/session-last-turn-status
+
+time:      [09:47] [05-10-26]
+agent:     [claude], [claude-opus-5-5], [lead 16]
+worktree:  l16-ctx-fix
+type:      [bug report]
+area:      [backend]
+
+gpt-5.5 was registered with a 400k context window, but the Codex backend serves 272k (the same served-vs-advertised gap the gpt-6.1-sol entry above records). A session planning compaction against 400k could overfill and fail mid-turn. The gpt-5.5 / gpt-5-5 arm of resolve_model_selection now returns 272_000; a new test pins both spellings (red on the old value, green now; crate 55/0). Built by a DeepSeek seat (deepseek-v4-pro), gated by lead 16. Not changed: gpt-5.4, gpt-5.4-mini and gpt-5.3-codex-spark still say 400k because nothing in the repo records their served limit, and the openai-codex explicit-provider catch-all still defaults to 400k. The live daemon is untouched until a binary swap.
+_________________________________________________________________________________ 09:47 l16-ctx-fix
