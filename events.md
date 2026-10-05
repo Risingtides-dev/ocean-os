@@ -11527,3 +11527,12 @@ area:      [backend]
 
 PR #532 review repairs: Sonnet Off with signed thinking history stays adaptive at low effort with drop_block binding controls; fresh history can use between_tools. GLM 5.3 and Flash reserve published 128K output on both resolver paths. Declined MiniMax Highspeed vision finding against the exact official OpenAI-compatible API contract, which limits image support to M3 variants; added capability regression. Protocol, providers, and agent tests pass. Updated owning devlogs; ownership and child indexes unchanged. Full CI and fresh review follow.
 _________________________________________________________________________________ 14:24 codex/provider-model-refresh-20261005
+
+time:      [14:29] [05-10-26]
+agent:     [codex], [gpt-6]
+worktree:  codex/ocean-max-effort-20261005
+type:      [workflow]: Reconcile reviewed candidate
+area:      [testing]
+
+Reconciled capability/Max work with provider refresh through ade8e31f, including Gemini media/sampling, signed Sonnet history, and GLM output capacity. The prior integrated full gate passed 3,711 tests with zero failures and 16 existing ignores. Latest protocol/provider/agent delta passed 503 tests with three existing ignores. Four current GPT routes already passed real Max turns. Hosted checks, fresh review, and account-specific live acceptance remain separate; nothing is installed or merged.
+_________________________________________________________________________________ 14:29 codex/ocean-max-effort-20261005
