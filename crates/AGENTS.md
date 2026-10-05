@@ -18,6 +18,7 @@ This child doc governs `crates/` and is the canonical ownership, entry-point, an
   Kimi Coding `k3` exposes Off through Max manual budgets; raw Moonshot `kimi-k3` exposes Max only.
   Legacy Codex omits Off because an omitted reasoning parameter keeps server-default reasoning enabled.
   Legacy Claude omits Xhigh because its 16,384-token output cap collapses that budget into High.
+  Retired Gemini 2.0 Flash stays explicitly routable for existing pins, has no effort controls, and is absent from new picker choices.
 
 
 - Treat each package as an ownership boundary.

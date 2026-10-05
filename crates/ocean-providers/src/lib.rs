@@ -772,7 +772,7 @@ fn model_reasoning_efforts(id: &str, provider: &str) -> Vec<String> {
         ("kimi-coding", "k3") => &["off", "minimal", "low", "medium", "high", "max"],
         ("google", "gemini-3.1-pro-preview" | "gemini-3.8-flash") => &["low", "medium", "high"],
         ("google", id) if id.starts_with("gemini-3.") => &["minimal", "low", "medium", "high"],
-        ("google", _) => &["off", "minimal", "low", "medium", "high", "xhigh"],
+        ("google", _) => &[],
         _ => &[],
     };
     levels.iter().map(|level| (*level).to_owned()).collect()
@@ -880,7 +880,6 @@ pub fn known_models() -> Vec<KnownModel> {
         m("glm-4.6", "glm", "GLM 4.6"),
         m("glm-4.5", "glm", "GLM 4.5"),
         m("glm-4.5-flash", "glm", "GLM 4.5 Flash"),
-        m("gemini-2.0-flash", "google", "Gemini 2.0 Flash"),
     ]
 }
 
@@ -2458,6 +2457,11 @@ mod tests {
             efforts("k3"),
             ["off", "minimal", "low", "medium", "high", "max"]
         );
+        assert!(model_reasoning_efforts("gemini-2.0-flash", "google").is_empty());
+        assert!(!catalog.iter().any(|model| model.id == "gemini-2.0-flash"));
+        let retired =
+            resolve_model_selection(&env(&[("OCEAN_MODEL", "gemini-2.0-flash")])).unwrap();
+        assert_eq!(retired.model, "gemini-2.0-flash");
         assert!(efforts("gpt-4o").is_empty());
         assert!(efforts("MiniMax-M2.7").is_empty());
         for model in catalog {
@@ -2571,7 +2575,6 @@ mod tests {
             "glm-4.6",
             "glm-4.5",
             "glm-4.5-flash",
-            "gemini-2.0-flash",
         ];
         let listed: std::collections::BTreeSet<String> =
             known_models().into_iter().map(|m| m.id).collect();

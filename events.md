@@ -11613,3 +11613,12 @@ area:      [testing]
 
 Integrated distinct-effort candidate 381bc06a passed the full local gate with 3,718 tests, zero failures and 16 existing ignores. Reconciled parent provider branch through 177a6cbf public API-key Sol Off handling; its focused wire regression passes. Existing protocol contract carries the provider-specific change; root ownership and child indexes remain unchanged. Current merged head requires a fresh complete gate and review before landing.
 _________________________________________________________________________________ 15:10 codex/ocean-max-effort-20261005
+
+time:      [15:15] [05-10-26]
+agent:     [codex], [gpt-6]
+worktree:  codex/ocean-max-effort-20261005
+type:      [bug report]: Retired Gemini picker route
+area:      [review]
+
+Exact d61cbe2e integrated local gate passed with 3,718 tests, zero failures and 16 existing ignores. Removed unsupported legacy Google effort controls after review. Google's current deprecation table confirms Gemini 2.0 Flash shutdown on June 1, 2026, so new picker choices omit it while explicit historical pins remain routable. Full provider suite passes; owning crates contract updated, root ownership and child indexes unchanged. Fresh gate/review follows; API-key GPT capability review finding remains open.
+_________________________________________________________________________________ 15:15 codex/ocean-max-effort-20261005
