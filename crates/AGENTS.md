@@ -12,6 +12,8 @@ This child doc governs `crates/` and is the canonical ownership, entry-point, an
 
 ## Local Contracts
 
+- Model picker entries expose `reasoning_efforts` from the production encoders; empty lists mean no operator effort control. Do not infer effort support from credential presence.
+
 
 - Treat each package as an ownership boundary.
 - Read the target package's local `AGENTS.md` when the index links one.

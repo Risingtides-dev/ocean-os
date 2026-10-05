@@ -11451,3 +11451,14 @@ area:      [backend] [testing]
 
 Refreshed current provider models from official catalogues: Claude Opus/Sonnet 5.5 and Fable 5.1, OpenAI GPT-6 routes, Gemini 3, MiniMax M3/plan preview, GLM 5.3, and current Kimi/DeepSeek coverage. Unversioned convenience names and general fallbacks select current releases; explicit versioned pins remain stable and restricted previews stay opt-in. Updated resolver/runtime capacities, adaptive Claude requests, private same-model Gemini signature replay, OpenAI API-key Responses without Codex identity headers, MiniMax reasoning replay and GLM effort compatibility. Removed retired Codex picker entries while preserving their resolver pins. Owning crate devlogs updated; root ownership and child indexes unchanged. Final cargo xtask ci passed locally. No paid model calls, merge, deployment, or account-specific preview acceptance is claimed; fresh review and hosted CI remain required. Dirty canonical checkout preserved; only this ledger entry is appended there and mirrored in the branch.
 _________________________________________________________________________________ 13:19 codex/provider-model-refresh-20261005
+
+
+time:      [13:52] [05-10-26]
+agent:     [Codex desktop], [GPT-6]
+worktree:  [codex/ocean-effort-catalog-20261005]
+type:      [feature-request]
+area:      [backend] [testing]
+
+Added production-encoder reasoning_efforts metadata on top of provider refresh PR #532 so Surface draft PR #236 can constrain its combined picker. Empty arrays mark routes whose wire ignores effort; adaptive-only routes omit off/minimal, and discrete encoders advertise distinct effective controls. Preserved readiness and credential-source semantics and legacy deserialization. Provider tests passed 59 cases; focused daemon catalog/session-wire checks, docs and strict changed-crate lint are running. The shared enum still lacks max, so complete current-model effort support and real connected-auth acceptance remain open. Updated the crate index, daemon contract and session-wire field inventory; root/docs ownership and child indexes are unchanged. No merge, installation or live delivery is claimed.
+
+_________________________________________________________________________________ 13:52 codex/ocean-effort-catalog-20261005

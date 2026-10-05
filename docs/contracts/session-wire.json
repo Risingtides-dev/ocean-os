@@ -352,7 +352,8 @@
       "id",
       "label",
       "provider",
-      "ready"
+      "ready",
+      "reasoning_efforts"
     ],
     "response_fields": [
       "current",

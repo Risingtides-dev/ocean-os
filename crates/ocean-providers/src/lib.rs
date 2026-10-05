@@ -746,6 +746,34 @@ pub struct KnownModel {
     pub provider: String,
     /// Short human-facing label for a dropdown.
     pub label: String,
+    /// Ocean effort values this route encodes. Empty means no operator control.
+    #[serde(default)]
+    pub reasoning_efforts: Vec<String>,
+}
+
+// This list describes the production encoders, not credential availability.
+// Advertise distinct effective levels only; never offer a knob a route ignores.
+fn model_reasoning_efforts(id: &str, provider: &str) -> Vec<String> {
+    let levels: &[&str] = match (provider, id) {
+        ("openai-codex" | "openai", id) if id.starts_with("gpt-6") => {
+            &["low", "medium", "high", "xhigh"]
+        }
+        ("openai-codex", _) => &["off", "minimal", "low", "medium", "high"],
+        ("claude-code", "claude-opus-5-5" | "claude-sonnet-5-5" | "claude-code-fable-5-1") => {
+            &["low", "medium", "high", "xhigh"]
+        }
+        ("claude-code", _) => &["off", "minimal", "low", "medium", "high", "xhigh"],
+        ("deepseek", _) => &["off", "high", "xhigh"],
+        ("glm", "glm-5.3" | "glm-5.3-flash") => &["low", "high", "xhigh"],
+        ("minimax", "MiniMax-M3.1-Flash-Preview") => &["low", "medium", "high", "xhigh"],
+        ("minimax", "MiniMax-M3") => &["off", "high"],
+        ("kimi" | "kimi-coding", "kimi-k3" | "k3") => &["high"],
+        ("google", "gemini-3.1-pro-preview") => &["low", "medium", "high"],
+        ("google", id) if id.starts_with("gemini-3.") => &["minimal", "low", "medium", "high"],
+        ("google", _) => &["off", "minimal", "low", "medium", "high", "xhigh"],
+        _ => &[],
+    };
+    levels.iter().map(|level| (*level).to_owned()).collect()
 }
 
 /// The catalogue of models the daemon knows how to route, for clients that
@@ -773,6 +801,7 @@ pub fn known_models() -> Vec<KnownModel> {
         id: id.to_string(),
         provider: provider.to_string(),
         label: label.to_string(),
+        reasoning_efforts: model_reasoning_efforts(id, provider),
     };
     vec![
         m("gpt-6-luna", "openai-codex", "GPT-6 Luna (Codex)"),
@@ -2386,6 +2415,39 @@ mod tests {
         let raw = resolve_model_selection(&env(&[("OCEAN_MODEL", "kimi-k3")])).unwrap();
         assert_eq!(raw.provider, ProviderId::Kimi);
         assert_eq!(raw.base_url, "https://api.moonshot.ai/v1");
+    }
+
+    #[test]
+    fn model_effort_catalog_matches_distinct_production_controls() {
+        let catalog = known_models();
+        let efforts = |id: &str| {
+            catalog
+                .iter()
+                .find(|m| m.id == id)
+                .unwrap()
+                .reasoning_efforts
+                .clone()
+        };
+        for id in [
+            "gpt-6.1-sol",
+            "gpt-6-astra",
+            "claude-opus-5-5",
+            "claude-code-fable-5-1",
+        ] {
+            assert_eq!(efforts(id), ["low", "medium", "high", "xhigh"]);
+        }
+        assert_eq!(efforts("glm-5.3"), ["low", "high", "xhigh"]);
+        assert!(efforts("gpt-4o").is_empty());
+        assert!(efforts("MiniMax-M2.7").is_empty());
+        for model in catalog {
+            let wire = serde_json::to_value(&model).unwrap();
+            assert!(wire["reasoning_efforts"].is_array());
+        }
+        let legacy: KnownModel = serde_json::from_value(serde_json::json!({
+            "id": "legacy", "provider": "legacy", "label": "Legacy"
+        }))
+        .unwrap();
+        assert!(legacy.reasoning_efforts.is_empty());
     }
 
     #[test]
