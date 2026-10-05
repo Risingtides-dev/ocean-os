@@ -163,7 +163,7 @@ fn signed_parts(message: &AssistantMessage, model: &Model) -> Option<Vec<Value>>
 
 fn convert_messages(messages: &[Message], model: &Model) -> Vec<Value> {
     let mut out: Vec<Value> = Vec::new();
-    for m in messages {
+    for (index, m) in messages.iter().enumerate() {
         match m {
             Message::User { content, .. } => {
                 let parts: Vec<Value> = content
@@ -268,7 +268,17 @@ fn convert_messages(messages: &[Message], model: &Model) -> Vec<Value> {
                 if gemini3 && !image_parts.is_empty() {
                     fr["parts"] = json!(image_parts);
                 }
-                out.push(json!({"role": "user", "parts": [{"functionResponse": fr}]}));
+                let response = json!({"functionResponse": fr});
+                if gemini3 && index > 0 && matches!(&messages[index - 1], Message::ToolResult(_)) {
+                    // Parallel results belong to the same user turn. Each
+                    // response retains its own id, name, and media parts.
+                    out.last_mut().expect("previous tool result content")["parts"]
+                        .as_array_mut()
+                        .expect("tool result parts")
+                        .push(response);
+                } else {
+                    out.push(json!({"role": "user", "parts": [response]}));
+                }
                 if !gemini3 && !image_parts.is_empty() {
                     out.push(json!({"role": "user", "parts": image_parts}));
                 }
@@ -1640,6 +1650,52 @@ mod tests {
                     16_384
                 );
             }
+        }
+    }
+    #[test]
+    fn gemini3_groups_parallel_results_without_merging_across_user_turns() {
+        for id in [
+            "gemini-3.8-flash",
+            "gemini-3.5-flash-lite",
+            "gemini-3.1-pro-preview",
+        ] {
+            let mut model = Model::gemini_2_0_flash();
+            model.id = id.into();
+            let result = |call: &str, data: &str| {
+                Message::ToolResult(crate::types::ToolResultMessage {
+                    tool_call_id: call.into(),
+                    tool_name: "screenshot".into(),
+                    content: vec![
+                        Content::text(call),
+                        Content::Image {
+                            data: data.into(),
+                            mime_type: "image/png".into(),
+                        },
+                    ],
+                    is_error: false,
+                    timestamp: now_ms(),
+                })
+            };
+            let messages = vec![
+                result("call_1", "AAECAwQ="),
+                result("call_2", "AQIDBA=="),
+                Message::user_text("next turn"),
+                result("call_3", "BA=="),
+            ];
+            let out = convert_messages(&messages, &model);
+            assert_eq!(out.len(), 3);
+            assert_eq!(out[0]["parts"].as_array().unwrap().len(), 2);
+            for (index, call, data) in [(0, "call_1", "AAECAwQ="), (1, "call_2", "AQIDBA==")] {
+                let fr = &out[0]["parts"][index]["functionResponse"];
+                assert_eq!(fr["id"], call);
+                assert_eq!(fr["name"], "screenshot");
+                assert_eq!(fr["response"]["output"], call);
+                assert_eq!(fr["parts"][0]["inlineData"]["data"], data);
+            }
+            assert_eq!(out[1]["parts"][0]["text"], "next turn");
+            assert_eq!(out[2]["parts"][0]["functionResponse"]["id"], "call_3");
+            let legacy = convert_messages(&messages, &Model::gemini_2_0_flash());
+            assert_eq!(legacy.len(), 7);
         }
     }
 }

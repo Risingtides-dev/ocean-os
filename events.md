@@ -11536,3 +11536,20 @@ area:      [testing]
 
 Reconciled capability/Max work with provider refresh through ade8e31f, including Gemini media/sampling, signed Sonnet history, and GLM output capacity. The prior integrated full gate passed 3,711 tests with zero failures and 16 existing ignores. Latest protocol/provider/agent delta passed 503 tests with three existing ignores. Four current GPT routes already passed real Max turns. Hosted checks, fresh review, and account-specific live acceptance remain separate; nothing is installed or merged.
 _________________________________________________________________________________ 14:29 codex/ocean-max-effort-20261005
+time:      [14:30] [05-10-26]
+agent:     [codex], [GPT-6], [primary]
+worktree:  [codex/provider-model-refresh-20261005]
+type:      [bug report]
+area:      [backend]
+
+PR #532 Sonnet mode refinement: derive replayed thinking from the encoded Anthropic payload so foreign Google/Codex opaque markers and empty signatures cannot force adaptive mode for Off. Same-wire signed history retains adaptive binding protection. Protocol regressions pass; updated owning contract with unchanged child index. Full CI and fresh exact-head review follow.
+_________________________________________________________________________________ 14:30 codex/provider-model-refresh-20261005
+
+time:      [14:38] [05-10-26]
+agent:     [codex], [GPT-6], [primary]
+worktree:  [codex/provider-model-refresh-20261005]
+type:      [bug report]
+area:      [backend]
+
+PR #532 Gemini parallel-round repair: consecutive tool results are ordered functionResponse parts in one user content, with each image retained inside its matching response. Normal user/model messages delimit groups; legacy encoding remains unchanged. Three-model grouping/media regressions and protocol suite pass. Updated owning contract and unchanged child index. Full CI and fresh review follow. The unrelated Git tree-bomb timing test passed in isolation after a local loaded-run timeout; its deadline/assertions remain unchanged.
+_________________________________________________________________________________ 14:38 codex/provider-model-refresh-20261005
