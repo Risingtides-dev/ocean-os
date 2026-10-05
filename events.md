@@ -11570,3 +11570,12 @@ area:      [backend]
 
 PR #532 Claude-family compatibility repair: Sonnet 5.5 encoding omits thinking blocks from documented unreadable Opus 5/5.5, Fable, and Mythos sources before choosing Off mode. Supported older Claude and same-model signed history retain adaptive binding protection. Ten-source compatibility regression and protocol suite pass. Updated protocol contract; ownership/index unchanged. Full final CI and fresh review follow.
 _________________________________________________________________________________ 14:47 codex/provider-model-refresh-20261005
+
+time:      [14:58] [05-10-26]
+agent:     [codex], [gpt-6]
+worktree:  codex/ocean-max-effort-20261005
+type:      [bug report]: Fresh review corrections
+area:      [review]
+
+Reconciled latest provider refresh through 9683eb9f Sonnet history compatibility; the integrated local gate passed 3,717 tests with zero failures and 16 existing ignores, including 192 protocol tests. Addressed PR #533 diagnostic findings: reject OCEAN_PROVIDER overrides and aggregate failures into a nonzero status after all probes finish. Changed example build and strict Clippy pass. CLI checks prove rejection of a provider override, successful attributed GPT execution, and nonzero mixed success/failure exit after both probes complete. Current MiniMax routes also fail with the existing running-daemon credential. Agent diagnostic contract updated; root ownership and child indexes unchanged.
+_________________________________________________________________________________ 14:58 codex/ocean-max-effort-20261005

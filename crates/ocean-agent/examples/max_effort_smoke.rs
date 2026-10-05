@@ -3,10 +3,17 @@ use futures::StreamExt;
 use ocean_agent::{AgentRuntime, PromptControl};
 use ocean_core::PromptRequest;
 use ocean_protocol::ThinkingLevel;
-use std::time::Duration;
+use std::{
+    sync::atomic::{AtomicUsize, Ordering},
+    time::Duration,
+};
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    anyhow::ensure!(
+        std::env::var_os("OCEAN_PROVIDER").is_none(),
+        "unset OCEAN_PROVIDER so probes use their canonical provider routes"
+    );
     anyhow::ensure!(
         std::env::var("OCEAN_PROVIDER_FALLBACK").as_deref() == Ok("disabled"),
         "set OCEAN_PROVIDER_FALLBACK=disabled; a blank value enables default fallback"
@@ -22,6 +29,8 @@ async fn main() -> anyhow::Result<()> {
             .into_iter()
             .map(move |effort| (model.clone(), effort))
     });
+    let failure_count = AtomicUsize::new(0);
+    let failures = &failure_count;
     futures::stream::iter(probes)
         .for_each_concurrent(4, |(model, effort)| async move {
             let stage = std::cell::Cell::new("temporary_store");
@@ -76,11 +85,16 @@ async fn main() -> anyhow::Result<()> {
                 Ok(Err(_)) => "configuration_error",
                 Err(_) => "timeout",
             };
+            if outcome != "passed" {
+                failures.fetch_add(1, Ordering::Relaxed);
+            }
             println!(
                 "{}",
                 serde_json::json!({"model":model,"effort":effort,"outcome":outcome,"stage":stage.get()})
             );
         })
         .await;
+    let failed = failure_count.load(Ordering::Relaxed);
+    anyhow::ensure!(failed == 0, "{failed} Max-effort acceptance probes failed");
     Ok(())
 }
