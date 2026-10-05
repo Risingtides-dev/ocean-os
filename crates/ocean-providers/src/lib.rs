@@ -746,6 +746,40 @@ pub struct KnownModel {
     pub provider: String,
     /// Short human-facing label for a dropdown.
     pub label: String,
+    /// Ocean effort values this route encodes. Empty means no operator control.
+    #[serde(default)]
+    pub reasoning_efforts: Vec<String>,
+}
+
+// This list describes the production encoders, not credential availability.
+// Advertise distinct effective levels only; never offer a knob a route ignores.
+fn model_reasoning_efforts(id: &str, provider: &str) -> Vec<String> {
+    let levels: &[&str] = match (provider, id) {
+        ("openai", "gpt-6-sol" | "gpt-6-luna") => &["off", "low", "medium", "high", "xhigh", "max"],
+        ("openai-codex" | "openai", id) if id.starts_with("gpt-6") => {
+            &["low", "medium", "high", "xhigh", "max"]
+        }
+        ("openai-codex", _) => &["minimal", "low", "medium", "high"],
+        ("claude-code" | "anthropic", "claude-sonnet-5-5") => {
+            &["off", "low", "medium", "high", "xhigh", "max"]
+        }
+        (
+            "claude-code" | "anthropic",
+            "claude-opus-5-5" | "claude-code-fable-5-1" | "claude-fable-5-1",
+        ) => &["low", "medium", "high", "xhigh", "max"],
+        ("claude-code" | "anthropic", _) => &["off", "minimal", "low", "medium", "high"],
+        ("deepseek", _) => &["off", "high", "max"],
+        ("glm", "glm-5.3" | "glm-5.3-flash") => &["low", "high", "max"],
+        ("minimax", "MiniMax-M3.1-Flash-Preview") => &["low", "medium", "high", "xhigh"],
+        ("minimax", "MiniMax-M3") => &["off", "high"],
+        ("kimi", "kimi-k3") => &["max"],
+        ("kimi-coding", "k3") => &["off", "minimal", "low", "medium", "high", "max"],
+        ("google", "gemini-3.1-pro-preview" | "gemini-3.8-flash") => &["low", "medium", "high"],
+        ("google", id) if id.starts_with("gemini-3.") => &["minimal", "low", "medium", "high"],
+        ("google", _) => &[],
+        _ => &[],
+    };
+    levels.iter().map(|level| (*level).to_owned()).collect()
 }
 
 /// The catalogue of models the daemon knows how to route, for clients that
@@ -773,6 +807,7 @@ pub fn known_models() -> Vec<KnownModel> {
         id: id.to_string(),
         provider: provider.to_string(),
         label: label.to_string(),
+        reasoning_efforts: model_reasoning_efforts(id, provider),
     };
     vec![
         m("gpt-6-luna", "openai-codex", "GPT-6 Luna (Codex)"),
@@ -849,7 +884,6 @@ pub fn known_models() -> Vec<KnownModel> {
         m("glm-4.6", "glm", "GLM 4.6"),
         m("glm-4.5", "glm", "GLM 4.5"),
         m("glm-4.5-flash", "glm", "GLM 4.5 Flash"),
-        m("gemini-2.0-flash", "google", "Gemini 2.0 Flash"),
     ]
 }
 
@@ -881,19 +915,21 @@ pub fn known_models_with_readiness(env: &ProviderEnv) -> Vec<ReadyModel> {
     let mut by_provider: BTreeMap<String, (bool, Option<CredentialSource>)> = BTreeMap::new();
     known_models()
         .into_iter()
-        .map(|m| {
+        .map(|mut m| {
+            let mut probe = env.clone();
+            probe.vars.insert("OCEAN_MODEL".into(), m.id.clone());
+            if let Ok(selection) = resolve_model_selection(&probe) {
+                m.provider = selection.provider.as_str().into();
+                m.reasoning_efforts = model_reasoning_efforts(&selection.model, &m.provider);
+            }
             let (ready, credential_source) = by_provider
                 .entry(m.provider.clone())
-                .or_insert_with(|| {
-                    let mut probe = env.clone();
-                    probe.vars.insert("OCEAN_MODEL".into(), m.id.clone());
-                    match resolve_provider_config(&probe) {
-                        Ok(cfg) => {
-                            let r = cfg.readiness();
-                            (r.ok, r.credential_source)
-                        }
-                        Err(_) => (false, None),
+                .or_insert_with(|| match resolve_provider_config(&probe) {
+                    Ok(cfg) => {
+                        let r = cfg.readiness();
+                        (r.ok, r.credential_source)
                     }
+                    Err(_) => (false, None),
                 })
                 .clone();
             ReadyModel {
@@ -2389,6 +2425,114 @@ mod tests {
     }
 
     #[test]
+    fn readiness_catalog_efforts_follow_effective_api_key_provider() {
+        let api_key = known_models_with_readiness(&env(&[
+            ("OCEAN_PROVIDER", "openai"),
+            ("OPENAI_API_KEY", "test-key"),
+        ]));
+        for id in ["gpt-6-sol", "gpt-6-luna"] {
+            let entry = api_key.iter().find(|entry| entry.model.id == id).unwrap();
+            assert_eq!(entry.model.provider, "openai");
+            assert!(entry.ready);
+            assert_eq!(
+                entry.model.reasoning_efforts,
+                ["off", "low", "medium", "high", "xhigh", "max"]
+            );
+        }
+        for id in ["gpt-6.1-sol", "gpt-6-astra"] {
+            let entry = api_key.iter().find(|entry| entry.model.id == id).unwrap();
+            assert!(!entry
+                .model
+                .reasoning_efforts
+                .iter()
+                .any(|level| level == "off"));
+        }
+        let anthropic = known_models_with_readiness(&env(&[
+            ("OCEAN_PROVIDER", "anthropic"),
+            ("ANTHROPIC_API_KEY", "test-key"),
+        ]));
+        let opus = anthropic
+            .iter()
+            .find(|entry| entry.model.id == "claude-opus-5-5")
+            .unwrap();
+        assert_eq!(opus.model.provider, "anthropic");
+        assert_eq!(
+            opus.model.reasoning_efforts,
+            ["low", "medium", "high", "xhigh", "max"]
+        );
+        let subscription = known_models_with_readiness(&env(&[]));
+        for id in ["gpt-6-sol", "gpt-6-luna"] {
+            let entry = subscription
+                .iter()
+                .find(|entry| entry.model.id == id)
+                .unwrap();
+            assert_eq!(entry.model.provider, "openai-codex");
+            assert!(!entry
+                .model
+                .reasoning_efforts
+                .iter()
+                .any(|level| level == "off"));
+        }
+    }
+
+    #[test]
+    fn model_effort_catalog_matches_distinct_production_controls() {
+        let catalog = known_models();
+        let efforts = |id: &str| {
+            catalog
+                .iter()
+                .find(|m| m.id == id)
+                .unwrap()
+                .reasoning_efforts
+                .clone()
+        };
+        for id in [
+            "gpt-6.1-sol",
+            "gpt-6-astra",
+            "claude-opus-5-5",
+            "claude-code-fable-5-1",
+        ] {
+            assert_eq!(efforts(id), ["low", "medium", "high", "xhigh", "max"]);
+        }
+        for id in [
+            "claude-opus-5",
+            "claude-sonnet-5",
+            "claude-haiku-4-5",
+            "claude-code-fable-5",
+        ] {
+            assert_eq!(efforts(id), ["off", "minimal", "low", "medium", "high"]);
+        }
+        assert_eq!(efforts("glm-5.3"), ["low", "high", "max"]);
+        assert_eq!(efforts("gpt-5.6-sol"), ["minimal", "low", "medium", "high"]);
+        assert_eq!(
+            efforts("claude-sonnet-5-5"),
+            ["off", "low", "medium", "high", "xhigh", "max"]
+        );
+        assert_eq!(efforts("gemini-3.8-flash"), ["low", "medium", "high"]);
+        assert_eq!(efforts("kimi-k3"), ["max"]);
+        assert_eq!(
+            efforts("k3"),
+            ["off", "minimal", "low", "medium", "high", "max"]
+        );
+        assert!(model_reasoning_efforts("gemini-2.0-flash", "google").is_empty());
+        assert!(!catalog.iter().any(|model| model.id == "gemini-2.0-flash"));
+        let retired =
+            resolve_model_selection(&env(&[("OCEAN_MODEL", "gemini-2.0-flash")])).unwrap();
+        assert_eq!(retired.model, "gemini-2.0-flash");
+        assert!(efforts("gpt-4o").is_empty());
+        assert!(efforts("MiniMax-M2.7").is_empty());
+        for model in catalog {
+            let wire = serde_json::to_value(&model).unwrap();
+            assert!(wire["reasoning_efforts"].is_array());
+        }
+        let legacy: KnownModel = serde_json::from_value(serde_json::json!({
+            "id": "legacy", "provider": "legacy", "label": "Legacy"
+        }))
+        .unwrap();
+        assert!(legacy.reasoning_efforts.is_empty());
+    }
+
+    #[test]
     fn known_models_are_all_routable() {
         // Every model the public picker advertises must actually route through
         // resolve_model_selection (passed as OCEAN_MODEL, the way a client
@@ -2488,7 +2632,6 @@ mod tests {
             "glm-4.6",
             "glm-4.5",
             "glm-4.5-flash",
-            "gemini-2.0-flash",
         ];
         let listed: std::collections::BTreeSet<String> =
             known_models().into_iter().map(|m| m.id).collect();

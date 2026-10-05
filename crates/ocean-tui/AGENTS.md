@@ -12,6 +12,8 @@ This crate owns the full-screen terminal steering cockpit (`ocean` binary) for i
 
 ## Local Contracts
 
+- `/thinking max` and the footer effort cycle carry the additive shared Max level through the daemon turn request. Provider capabilities remain daemon-owned.
+
 - Every TUI behavior change must compile and test on its feature branch; the
   production-install provenance rule is never a reason to defer a build.
   Before finishing, run `cargo check -p ocean-tui`, focused tests, and

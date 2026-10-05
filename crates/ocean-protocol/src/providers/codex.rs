@@ -251,7 +251,7 @@ fn reasoning_effort(level: ThinkingLevel) -> Option<&'static str> {
         ThinkingLevel::Minimal => Some("minimal"),
         ThinkingLevel::Low => Some("low"),
         ThinkingLevel::Medium => Some("medium"),
-        ThinkingLevel::High | ThinkingLevel::Xhigh => Some("high"),
+        ThinkingLevel::High | ThinkingLevel::Xhigh | ThinkingLevel::Max => Some("high"),
     }
 }
 
@@ -344,6 +344,7 @@ fn build_body(model: &Model, context: &Context, options: &StreamOptions) -> Valu
                 ThinkingLevel::Medium => "medium",
                 ThinkingLevel::High => "high",
                 ThinkingLevel::Xhigh => "xhigh",
+                ThinkingLevel::Max => "max",
             })
         } else {
             reasoning_effort(level)
@@ -1504,6 +1505,36 @@ mod tests {
         }
     }
 
+    #[test]
+    fn current_gpt_models_preserve_max_effort_on_both_responses_routes() {
+        for id in ["gpt-6.1-sol", "gpt-6-astra", "gpt-6-sol", "gpt-6-luna"] {
+            for provider in ["openai-codex", "openai"] {
+                let mut model = codex_model();
+                model.id = id.into();
+                model.provider = provider.into();
+                let options = StreamOptions {
+                    reasoning: Some(serde_json::from_str("\"max\"").unwrap()),
+                    ..Default::default()
+                };
+                let body = build_body(&model, &Context::default(), &options);
+                assert_eq!(body["reasoning"]["effort"], "max", "{provider}/{id}");
+                assert_eq!(body["reasoning"]["summary"], "auto");
+            }
+        }
+        let body = build_body(
+            &codex_model(),
+            &Context::default(),
+            &StreamOptions {
+                reasoning: Some(ThinkingLevel::Max),
+                ..Default::default()
+            },
+        );
+        assert_eq!(
+            body["reasoning"]["effort"], "high",
+            "legacy routes retain their ceiling"
+        );
+    }
+
     // OCEAN-165: the Codex backend speaks the OpenAI Responses API, which allows
     // parallel tool calls by default (parallel_tool_calls defaults to true when
     // omitted). The provider previously hardcoded `parallel_tool_calls: false`,
@@ -1781,8 +1812,8 @@ mod tests {
     }
 
     // OCEAN-198: the reasoning-effort mapper covers every ThinkingLevel — Off →
-    // None (omit the param), and Xhigh folds into "high" since the Responses API
-    // has no distinct level above it.
+    // None (omit the param), and legacy routes cap Xhigh/Max at high.
+    // GPT-6 routes encode their distinct xhigh/max levels in build_body.
     #[test]
     fn reasoning_effort_maps_every_level() {
         assert_eq!(reasoning_effort(ThinkingLevel::Off), None);

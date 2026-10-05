@@ -12,6 +12,8 @@ This crate owns the multi-provider LLM wire protocol layer for Anthropic, OpenAI
 
 ## Local Contracts
 
+- Shared `ThinkingLevel::Max` serializes as `max`; current GPT-6 Responses and Claude 5.5/Fable 5.1 encode it exactly. Legacy and other-provider encoders retain their documented ceiling, and the public effort catalog advertises only effective controls.
+
 - Keep provider-specific behavior isolated behind protocol abstractions.
 - Do not leak provider quirks into shared `ocean-core` types unless the shared contract intentionally changes.
 - Treat streaming event shape changes as compatibility-sensitive.
@@ -25,6 +27,7 @@ This crate owns the multi-provider LLM wire protocol layer for Anthropic, OpenAI
 - Anthropic extended-thinking requests must keep `budget_tokens` at least 1024
   and strictly below `max_tokens`; preserve explicit output caps by clamping the
   thinking budget rather than raising the cap.
+- Kimi Coding `k3` uses the non-adaptive Anthropic encoder: Off omits thinking; Minimal/Low/Medium/High/Max select 1024/2048/8192/16384/24576-token budgets before output-cap clamping. Raw Moonshot `kimi-k3` has a separate Max-only effort contract.
 - Anthropic assistant thinking history is replayable only with a non-empty
   provider signature. Drop unsigned cross-provider reasoning at wire encoding;
   never convert it into visible text or reject the shared persisted schema.

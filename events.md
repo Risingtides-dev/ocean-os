@@ -11452,6 +11452,27 @@ area:      [backend] [testing]
 Refreshed current provider models from official catalogues: Claude Opus/Sonnet 5.5 and Fable 5.1, OpenAI GPT-6 routes, Gemini 3, MiniMax M3/plan preview, GLM 5.3, and current Kimi/DeepSeek coverage. Unversioned convenience names and general fallbacks select current releases; explicit versioned pins remain stable and restricted previews stay opt-in. Updated resolver/runtime capacities, adaptive Claude requests, private same-model Gemini signature replay, OpenAI API-key Responses without Codex identity headers, MiniMax reasoning replay and GLM effort compatibility. Removed retired Codex picker entries while preserving their resolver pins. Owning crate devlogs updated; root ownership and child indexes unchanged. Final cargo xtask ci passed locally. No paid model calls, merge, deployment, or account-specific preview acceptance is claimed; fresh review and hosted CI remain required. Dirty canonical checkout preserved; only this ledger entry is appended there and mirrored in the branch.
 _________________________________________________________________________________ 13:19 codex/provider-model-refresh-20261005
 
+
+time:      [13:52] [05-10-26]
+agent:     [Codex desktop], [GPT-6]
+worktree:  [codex/ocean-effort-catalog-20261005]
+type:      [feature-request]
+area:      [backend] [testing]
+
+Added production-encoder reasoning_efforts metadata on top of provider refresh PR #532 so Surface draft PR #236 can constrain its combined picker. Empty arrays mark routes whose wire ignores effort; adaptive-only routes omit off/minimal, and discrete encoders advertise distinct effective controls. Preserved readiness and credential-source semantics and legacy deserialization. Provider tests passed 59 cases; focused daemon catalog/session-wire checks, docs and strict changed-crate lint are running. The shared enum still lacks max, so complete current-model effort support and real connected-auth acceptance remain open. Updated the crate index, daemon contract and session-wire field inventory; root/docs ownership and child indexes are unchanged. No merge, installation or live delivery is claimed.
+
+_________________________________________________________________________________ 13:52 codex/ocean-effort-catalog-20261005
+
+
+time:      [14:02] [05-10-26]
+agent:     [Codex desktop], [GPT-6]
+worktree:  [codex/ocean-max-effort-20261005]
+type:      [feature-request]
+area:      [backend] [testing]
+
+Added shared Max effort, exact current GPT-6 Responses and Claude 5.5/Fable 5.1 encodings, TUI command/cycle support and provider capability updates. Explicit Max replaces xhigh aliases for DeepSeek/GLM and the Kimi K3 control; legacy encoders retain their ceiling and restricted preview does not gain unsupported Max. Changed-crate tests passed 743 cases with four existing ignores; the shared workspace/tests compile passed before the final diagnostic example. Added isolated tool-free, operator-memory-free, fallback-disabled Max smoke diagnostics. First live diagnostic compilation and the prior capability full gate were stopped by disk exhaustion, not provider failures; cargo clean removed only this task's generated capability-worktree target and recovered 20 GiB. Updated owning protocol/agent/TUI contracts and crate index; root/docs ownership and child indexes unchanged. Fresh merged-candidate validation, connected-auth acceptance, review and installed delivery remain open.
+
+_________________________________________________________________________________ 14:02 codex/ocean-max-effort-20261005
 time:      [13:49] [05-10-26]
 agent:     [Codex desktop], [GPT-6]
 worktree:  [codex/provider-model-refresh-20261005] [/private/tmp/ocean-models-20261005]
@@ -11470,6 +11491,25 @@ area:      [review] [backend] [testing]
 PR #532 fresh review exposed the missing runtime Off propagation. The real agent loop now forwards configured Off unless a StreamOptions override is present; encoders retain ownership of supported wire semantics. Sonnet 5.5 Off uses between_tools at low effort without block binding; API-key GPT-6 Luna Off uses none while Codex/other GPT-6 retain low. Added real-loop option capture and encoder regressions. Protocol/runtime unit and integration suites passed; doctests stopped on local disk exhaustion and are rerun after reclaiming only task-owned build output. Protocol/runtime devlogs updated; parent ownership and indexes unchanged. Prior 94ff04be hosted matrix was all green. Final local/hosted validation and fresh review remain required before merge/install.
 _________________________________________________________________________________ 14:02 codex/provider-model-refresh-20261005
 
+
+time:      [14:06] [05-10-26]
+agent:     [Codex desktop], [GPT-6]
+worktree:  [codex/ocean-max-effort-20261005]
+type:      [workflow]
+area:      [testing]
+
+Reconciled provider refresh through 40097240, including merged beta-header, Gemini-level and runtime Off corrections. Capability metadata now preserves Sonnet 5.5 Off and omits Gemini 3.8's normalized-away minimal level. All 747 focused protocol/provider/TUI tests pass with four existing ignores; strict changed-crate all-target Clippy, workspace/tests compile, docs, formatting and diff checks pass. Four real isolated Max turns returned exactly OCEAN_OK on GPT-6.1 Sol, GPT-6 Astra, GPT-6 Sol and GPT-6 Luna with fallback, tools and operator memory disabled and separate temporary stores. Claude auth metadata remains expired, so no redundant Claude failure probes were sent. Surface PR #236 hosted gates all passed and is ready for review. TUI release build and final full runtime gate remain pending; review, merge, installed delivery and complete connected-auth acceptance are not claimed. Nearest contracts already reflect this behavior; root/docs ownership and child indexes remain unchanged.
+
+_________________________________________________________________________________ 14:06 codex/ocean-max-effort-20261005
+
+time:      [14:20] [05-10-26]
+agent:     [codex], [gpt-6]
+worktree:  codex/ocean-max-effort-20261005
+type:      [bug report]: Independent review corrections
+area:      [review]
+
+Split Kimi Coding effort capabilities from raw Moonshot after independent PR #533 review. Coding exposes Off/Minimal/Low/Medium/High/Max, pinned against distinct production Anthropic budgets and Off omission. Updated owning crate/protocol contracts; root ownership and child indexes remain unchanged. The previous complete local gate passed 3,708 tests; the corrected candidate gate is rerunning.
+_________________________________________________________________________________ 14:20 codex/ocean-max-effort-20261005
 time:      [14:14] [05-10-26]
 agent:     [codex], [GPT-6], [primary]
 worktree:  [codex/provider-model-refresh-20261005]
@@ -11488,6 +11528,14 @@ area:      [backend]
 PR #532 review repairs: Sonnet Off with signed thinking history stays adaptive at low effort with drop_block binding controls; fresh history can use between_tools. GLM 5.3 and Flash reserve published 128K output on both resolver paths. Declined MiniMax Highspeed vision finding against the exact official OpenAI-compatible API contract, which limits image support to M3 variants; added capability regression. Protocol, providers, and agent tests pass. Updated owning devlogs; ownership and child indexes unchanged. Full CI and fresh review follow.
 _________________________________________________________________________________ 14:24 codex/provider-model-refresh-20261005
 
+time:      [14:29] [05-10-26]
+agent:     [codex], [gpt-6]
+worktree:  codex/ocean-max-effort-20261005
+type:      [workflow]: Reconcile reviewed candidate
+area:      [testing]
+
+Reconciled capability/Max work with provider refresh through ade8e31f, including Gemini media/sampling, signed Sonnet history, and GLM output capacity. The prior integrated full gate passed 3,711 tests with zero failures and 16 existing ignores. Latest protocol/provider/agent delta passed 503 tests with three existing ignores. Four current GPT routes already passed real Max turns. Hosted checks, fresh review, and account-specific live acceptance remain separate; nothing is installed or merged.
+_________________________________________________________________________________ 14:29 codex/ocean-max-effort-20261005
 time:      [14:30] [05-10-26]
 agent:     [codex], [GPT-6], [primary]
 worktree:  [codex/provider-model-refresh-20261005]
@@ -11506,6 +11554,14 @@ area:      [backend]
 PR #532 Gemini parallel-round repair: consecutive tool results are ordered functionResponse parts in one user content, with each image retained inside its matching response. Normal user/model messages delimit groups; legacy encoding remains unchanged. Three-model grouping/media regressions and protocol suite pass. Updated owning contract and unchanged child index. Full CI and fresh review follow. The unrelated Git tree-bomb timing test passed in isolation after a local loaded-run timeout; its deadline/assertions remain unchanged.
 _________________________________________________________________________________ 14:38 codex/provider-model-refresh-20261005
 
+time:      [14:43] [05-10-26]
+agent:     [codex], [gpt-6]
+worktree:  codex/ocean-max-effort-20261005
+type:      [bug report]: Review fixes and attributed live proof
+area:      [testing]
+
+Removed misleading Off from legacy Codex capabilities after independent review. Corrected Max acceptance diagnostics: blank fallback enables the default order, so previous claims of fallback-disabled proof are withdrawn. Require the unroutable disabled sentinel, verify zero fallback candidates, and compare persisted effective model before a pass. Fresh isolated requests for Sol 6.1, Astra 6, Sol 6 and Luna 6 each passed with matching request-wire model and max effort. Claude Opus 5.5/Fable 5.1 failed with fallback disabled; their auth remains expired. Integrated the latest concurrent provider fixes. The unrelated A4 tree-bomb timeout failed once under load and passed in isolation without changing its bounds; full gate reruns. Owning crate/agent contracts updated; root ownership and child indexes unchanged.
+_________________________________________________________________________________ 14:43 codex/ocean-max-effort-20261005
 time:      [14:47] [05-10-26]
 agent:     [codex], [GPT-6], [primary]
 worktree:  [codex/provider-model-refresh-20261005]
@@ -11515,6 +11571,14 @@ area:      [backend]
 PR #532 Claude-family compatibility repair: Sonnet 5.5 encoding omits thinking blocks from documented unreadable Opus 5/5.5, Fable, and Mythos sources before choosing Off mode. Supported older Claude and same-model signed history retain adaptive binding protection. Ten-source compatibility regression and protocol suite pass. Updated protocol contract; ownership/index unchanged. Full final CI and fresh review follow.
 _________________________________________________________________________________ 14:47 codex/provider-model-refresh-20261005
 
+time:      [14:58] [05-10-26]
+agent:     [codex], [gpt-6]
+worktree:  codex/ocean-max-effort-20261005
+type:      [bug report]: Fresh review corrections
+area:      [review]
+
+Reconciled latest provider refresh through 9683eb9f Sonnet history compatibility; the integrated local gate passed 3,717 tests with zero failures and 16 existing ignores, including 192 protocol tests. Addressed PR #533 diagnostic findings: reject OCEAN_PROVIDER overrides and aggregate failures into a nonzero status after all probes finish. Changed example build and strict Clippy pass. CLI checks prove rejection of a provider override, successful attributed GPT execution, and nonzero mixed success/failure exit after both probes complete. Current MiniMax routes also fail with the existing running-daemon credential. Agent diagnostic contract updated; root ownership and child indexes unchanged.
+_________________________________________________________________________________ 14:58 codex/ocean-max-effort-20261005
 time:      [14:56] [05-10-26]
 agent:     [codex], [GPT-6], [primary]
 worktree:  [codex/provider-model-refresh-20261005]
@@ -11524,6 +11588,14 @@ area:      [backend]
 PR #532 split-reasoning privacy repair: restrict reasoning-only visible-answer promotion to the intended DeepSeek compatibility route. MiniMax M3/Preview, GLM and OpenAI retain partial length-limited reasoning only as Thinking. Local HTTP streaming regression checks deltas and persisted terminal content across five routes; protocol suite passes. Updated protocol contract; ownership/index unchanged. Full CI and fresh exact-head review follow.
 _________________________________________________________________________________ 14:56 codex/provider-model-refresh-20261005
 
+time:      [15:06] [05-10-26]
+agent:     [codex], [gpt-6]
+worktree:  codex/ocean-max-effort-20261005
+type:      [bug report]: Distinct legacy Claude controls
+area:      [review]
+
+The exact 023f2190 local gate passed 3,717 tests with zero failures and 16 existing ignores. Reconciled provider refresh 1a005a8a, retaining its provider-specific private-reasoning boundary. Removed legacy Claude Xhigh from public capabilities because the output cap makes its budget identical to High; current adaptive Claude controls remain distinct. Catalog regression and new split-reasoning regression pass. Owning crates contract updated; parent ownership and child indexes unchanged. Integrated gate and fresh review follow.
+_________________________________________________________________________________ 15:06 codex/ocean-max-effort-20261005
 time:      [15:05] [05-10-26]
 agent:     [codex], [GPT-6], [primary]
 worktree:  [codex/provider-model-refresh-20261005]
@@ -11532,3 +11604,39 @@ area:      [backend]
 
 PR #532 API reasoning repair: public GPT-6 Sol and Luna Off use supported none; subscription routes, GPT-6.1 Sol and Astra retain low. Expanded request regression and protocol tests pass. Updated owning protocol contract; child index/ownership unchanged. Full CI and fresh review follow. The preceding hosted macOS job failed an unrelated extension registry lock test with OS WouldBlock; no unrelated assertion was weakened.
 _________________________________________________________________________________ 15:05 codex/provider-model-refresh-20261005
+
+time:      [15:10] [05-10-26]
+agent:     [codex], [gpt-6]
+worktree:  codex/ocean-max-effort-20261005
+type:      [workflow]: Provider branch reconciliation
+area:      [testing]
+
+Integrated distinct-effort candidate 381bc06a passed the full local gate with 3,718 tests, zero failures and 16 existing ignores. Reconciled parent provider branch through 177a6cbf public API-key Sol Off handling; its focused wire regression passes. Existing protocol contract carries the provider-specific change; root ownership and child indexes remain unchanged. Current merged head requires a fresh complete gate and review before landing.
+_________________________________________________________________________________ 15:10 codex/ocean-max-effort-20261005
+
+time:      [15:15] [05-10-26]
+agent:     [codex], [gpt-6]
+worktree:  codex/ocean-max-effort-20261005
+type:      [bug report]: Retired Gemini picker route
+area:      [review]
+
+Exact d61cbe2e integrated local gate passed with 3,718 tests, zero failures and 16 existing ignores. Removed unsupported legacy Google effort controls after review. Google's current deprecation table confirms Gemini 2.0 Flash shutdown on June 1, 2026, so new picker choices omit it while explicit historical pins remain routable. Full provider suite passes; owning crates contract updated, root ownership and child indexes unchanged. Fresh gate/review follows; API-key GPT capability review finding remains open.
+_________________________________________________________________________________ 15:15 codex/ocean-max-effort-20261005
+
+time:      [15:18] [05-10-26]
+agent:     [codex], [gpt-6]
+worktree:  codex/ocean-max-effort-20261005
+type:      [bug report]: Effective provider effort capabilities
+area:      [review]
+
+Daemon-ready model listings now derive provider and effort capabilities from each model's effective configured route. API-key GPT-6 Sol/Luna expose supported Off; subscription routes retain their low floor, and Astra/Sol 6.1 do not advertise Off. Anthropic API-key Claude retains adaptive effort capabilities. Full provider suite and denied-warning all-target Clippy pass; regressions cover both public/subscription GPT routes and Anthropic routing. Owning crates contract updated; root ownership and child indexes unchanged. Full integrated gate and fresh review follow.
+_________________________________________________________________________________ 15:18 codex/ocean-max-effort-20261005
+
+time:      [15:41] [05-10-26]
+agent:     [codex], [gpt-6]
+worktree:  codex/ocean-effort-catalog-20261005
+type:      [workflow]: Reconcile capability PR with merged model refresh
+area:      [review]
+
+Parent PR #532 merged as 7236a41c, whose entire tree matches original parent 177a6cbf. Reconciled origin/main ancestry into the capability branch; squash-induced protocol conflicts retain the already-integrated tested files. The resolved index is byte-identical to prior 4a327a7e before this ledger append, so the 3,719-test repository gate and prior strict validations still cover the unchanged code. Retarget PR #533 to main and obtain fresh hosted review/checks on the merge head. Devlog pass: owner contracts and child indexes unchanged because no code, ownership or workflow contract changed; canonical dirty checkout preserved.
+_________________________________________________________________________________ 15:41 codex/ocean-effort-catalog-20261005

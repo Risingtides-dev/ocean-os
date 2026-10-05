@@ -2585,7 +2585,7 @@ impl ChatComponent {
     fn parse_thinking(args: &str) -> Result<Option<ThinkingLevel>, String> {
         let level = args.trim();
         if level.is_empty() {
-            return Err("usage: /thinking default|off|minimal|low|medium|high|xhigh".into());
+            return Err("usage: /thinking default|off|minimal|low|medium|high|xhigh|max".into());
         }
         match level.to_ascii_lowercase().as_str() {
             "default" | "auto" | "daemon" => Ok(None),
@@ -2595,7 +2595,8 @@ impl ChatComponent {
             "medium" | "med" => Ok(Some(ThinkingLevel::Medium)),
             "high" => Ok(Some(ThinkingLevel::High)),
             "xhigh" | "x-high" | "extra-high" => Ok(Some(ThinkingLevel::Xhigh)),
-            _ => Err("usage: /thinking default|off|minimal|low|medium|high|xhigh".into()),
+            "max" => Ok(Some(ThinkingLevel::Max)),
+            _ => Err("usage: /thinking default|off|minimal|low|medium|high|xhigh|max".into()),
         }
     }
 
@@ -5609,6 +5610,10 @@ mod tests {
         match chat.run_slash("/thinking", "high") {
             Some(Action::SetThinking(Some(ThinkingLevel::High))) => {}
             other => panic!("expected SetThinking(high), got {other:?}"),
+        }
+        match chat.run_slash("/thinking", "max") {
+            Some(Action::SetThinking(Some(ThinkingLevel::Max))) => {}
+            other => panic!("expected SetThinking(max), got {other:?}"),
         }
         match chat.run_slash("/thinking", "default") {
             Some(Action::SetThinking(None)) => {}

@@ -12,6 +12,8 @@ This crate owns the long-running Ocean HTTP service on `:4780`, including API ro
 
 ## Local Contracts
 
+- `/v1/models` includes additive `reasoning_efforts` arrays; the session wire contract pins the field.
+
 - Daemon health is `GET /health`, not `/v1/health`.
 - `/v1/auth/providers*` (`provider_auth.rs`, web identity M3, contract in §9 of
   `docs/specs/2026-09-25-ocean-web-identity-and-node-linking-program.md`) is

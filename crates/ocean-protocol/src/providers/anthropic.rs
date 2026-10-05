@@ -276,7 +276,7 @@ fn thinking_budget(level: ThinkingLevel) -> Option<u32> {
         ThinkingLevel::Low => Some(2048),
         ThinkingLevel::Medium => Some(8192),
         ThinkingLevel::High => Some(16384),
-        ThinkingLevel::Xhigh => Some(24576),
+        ThinkingLevel::Xhigh | ThinkingLevel::Max => Some(24576),
     }
 }
 
@@ -418,6 +418,7 @@ fn build_body(model: &Model, context: &Context, options: &StreamOptions) -> Valu
                 ThinkingLevel::Medium => "medium",
                 ThinkingLevel::High => "high",
                 ThinkingLevel::Xhigh => "xhigh",
+                ThinkingLevel::Max => "max",
             };
             body["output_config"] = json!({"effort": effort});
         }
@@ -879,6 +880,32 @@ mod tests {
 
     fn anthropic_model() -> Model {
         Model::anthropic_claude_sonnet_4_6()
+    }
+    #[test]
+    fn kimi_coding_efforts_encode_distinct_manual_budgets() {
+        let model = Model::kimi_coding_k3("https://api.kimi.com/coding", 262_144, 32_768);
+        for (level, budget) in [
+            (ThinkingLevel::Off, None),
+            (ThinkingLevel::Minimal, Some(1024)),
+            (ThinkingLevel::Low, Some(2048)),
+            (ThinkingLevel::Medium, Some(8192)),
+            (ThinkingLevel::High, Some(16384)),
+            (ThinkingLevel::Max, Some(24576)),
+        ] {
+            let options = StreamOptions {
+                reasoning: Some(level),
+                ..Default::default()
+            };
+            let body = build_body(&model, &Context::default(), &options);
+            assert!(body.get("output_config").is_none(), "{level:?}");
+            match budget {
+                Some(budget) => {
+                    assert_eq!(body["thinking"]["type"], "enabled", "{level:?}");
+                    assert_eq!(body["thinking"]["budget_tokens"], budget, "{level:?}");
+                }
+                None => assert!(body.get("thinking").is_none()),
+            }
+        }
     }
     #[test]
     fn haiku_high_thinking_budget_stays_below_max_tokens() {
@@ -1635,6 +1662,24 @@ mod tests {
         assert_eq!(tools[0]["name"], "bash");
         assert_eq!(tools[0]["input_schema"], tool.parameters);
     }
+    #[test]
+    fn current_claude_models_preserve_max_effort_without_manual_budgets() {
+        for id in ["claude-sonnet-5-5", "claude-opus-5-5", "claude-fable-5-1"] {
+            let mut model = Model::anthropic_claude_fable_5_1();
+            model.id = id.into();
+            let options = StreamOptions {
+                reasoning: Some(ThinkingLevel::Max),
+                temperature: Some(0.3),
+                ..Default::default()
+            };
+            let body = build_body(&model, &Context::default(), &options);
+            assert_eq!(body["output_config"]["effort"], "max", "{id}");
+            assert_eq!(body["thinking"]["type"], "adaptive");
+            assert!(body["thinking"].get("budget_tokens").is_none());
+            assert!(body.get("temperature").is_none());
+        }
+    }
+
     #[test]
     fn current_claude_models_use_adaptive_thinking_without_sampling_or_manual_budget() {
         for id in ["claude-sonnet-5-5", "claude-opus-5-5", "claude-fable-5-1"] {
