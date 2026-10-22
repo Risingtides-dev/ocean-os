@@ -1,7 +1,8 @@
 //! Longhouse persisted-title and read-projection mutation HTTP adapters.
 //!
-//! Composition retains routes, state/startup authority, real convene/title
-//! grant-bind/token delivery, storage paths, event-bus/SSE policy, and tests.
+//! Composition retains routes, state/startup authority, storage paths,
+//! event-bus/SSE policy, and tests; real convene/title grant-bind/token
+//! delivery lives in `longhouse_convene.rs`.
 
 use axum::{extract::State, http::StatusCode, Json};
 use ocean_agent_sdk::{AgentRole, LonghouseEvent, Mark, MarkKind};

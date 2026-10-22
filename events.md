@@ -11681,3 +11681,10 @@ area:      [writing]
 
 Observatory docs-truth pass (FQ-013): closed the stale "open" claims left behind after the Gate 1 G1–G5 repair wave landed 2026-09-25 with delta review PASS (PR #486, #487) and the §4.3 WAL checkpoint landed (PR #500). Task 9 review doc: dated Status note on the verdict summary plus §4.3 closure pointers at F10, the hardening-wave open list, and the F10 partial bullet. Observatory architecture doc Status line now records Gate 0 accepted, Gate 1 landed, renderer gate open. Root AGENTS.md, docs/AGENTS.md, and the docs README index now state the repairs landed and passed, keeping renderer work governed by the accepted Gate 0 decisions and Gate 1 manifest. Historical text retained; edits are dated status pointers. cargo xtask docs-check, git diff --check, and node scripts/check-ledger.mjs pass.
 _________________________________________________________________________________ 17:20 factory/fq-013-r1716
+agent:     [zcode], [glm-5.3]
+worktree:  [factory/fq-008]
+type:      [refactor]: Longhouse convene/title grant-bind extraction
+area:      [backend]
+
+Behavior-neutral extraction of the real Longhouse convene boundary (LonghouseConveneRequest, parse_federation, longhouse_convene) from daemon main.rs into private longhouse_convene.rs, per specs/2026-10-22-ocean-daemon-longhouse-convene-extraction-manifest.md. The governance-control deferral lifted with no new seam: characterization drives the deterministic successful path through the production GLM configuration surface (OCEAN_GLM_BASE_URL + OCEAN_GLM_API_KEY) against a loopback OpenAI-compatible endpoint, pinning ready-alias staffing on the wire, awaited convergence, registry-first projection, durable grant plus decision bind proven by a later engine-free claim, wrong-token 403, and token/title-id absence from every bus frame. Mechanical diff of the moved block shows only the two authorized pub(super) additions; full daemon test gate green before push. Devlog pass: daemon contract, mission table/prose/references, docs README updated.
+_________________________________________________________________________________ 17:20 factory/fq-008
