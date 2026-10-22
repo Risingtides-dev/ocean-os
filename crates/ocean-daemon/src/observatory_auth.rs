@@ -231,6 +231,42 @@ mod tests {
             .expect("request")
     }
 
+    /// G5 at the extractor seam: a rejection carries the manifest §7.4
+    /// no-store header set and the exact §7.1 body. With no
+    /// `ObservatoryServices` mounted — unlike the router-level test — this
+    /// also pins `ObservatoryUnauthorized::for_request`'s fallback: cursor 0
+    /// and the auth state's daemon instance id.
+    async fn assert_unauthorized_response(request: Request<axum::body::Body>) {
+        let (mut parts, _) = request.into_parts();
+        parts.extensions.insert(auth_state());
+        let response = ObservatoryAuth::from_request_parts(&mut parts, &())
+            .await
+            .expect_err("rejected")
+            .into_response();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        let headers = response.headers();
+        assert_eq!(
+            headers[header::CACHE_CONTROL],
+            "no-store, no-cache, must-revalidate, private"
+        );
+        assert_eq!(headers[header::PRAGMA], "no-cache");
+        assert_eq!(headers[header::EXPIRES], "0");
+        assert_eq!(headers["x-observatory-cursor"], "0");
+        assert_eq!(headers["x-observatory-instance"], DAEMON_ID);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("body");
+        let body: serde_json::Value = serde_json::from_slice(&body).expect("json");
+        assert_eq!(
+            body,
+            serde_json::json!({
+                "error": "unauthorized",
+                "message": "Missing or invalid observer token",
+                "http_status": 401,
+            })
+        );
+    }
+
     #[tokio::test]
     async fn observatory_auth_extracts_summary_bearer_header() {
         let auth = extract(bearer(ObserverScope::Summary))
@@ -279,24 +315,18 @@ mod tests {
             )
             .body(axum::body::Body::empty())
             .expect("request");
-        assert_eq!(
-            extract(malformed_cookie).await,
-            Err(StatusCode::UNAUTHORIZED)
-        );
+        assert_unauthorized_response(malformed_cookie).await;
 
         let malformed_header = Request::builder()
             .header(header::AUTHORIZATION, "Basic nope")
             .body(axum::body::Body::empty())
             .expect("request");
-        assert_eq!(
-            extract(malformed_header).await,
-            Err(StatusCode::UNAUTHORIZED)
-        );
+        assert_unauthorized_response(malformed_header).await;
 
         let missing = Request::builder()
             .body(axum::body::Body::empty())
             .expect("request");
-        assert_eq!(extract(missing).await, Err(StatusCode::UNAUTHORIZED));
+        assert_unauthorized_response(missing).await;
 
         let wrong_instance_claims =
             ObserverToken::issue(ObserverScope::Summary, "other-daemon", 3_600)
@@ -309,7 +339,7 @@ mod tests {
             .header(header::AUTHORIZATION, format!("Bearer {wrong_instance}"))
             .body(axum::body::Body::empty())
             .expect("request");
-        assert_eq!(extract(request).await, Err(StatusCode::UNAUTHORIZED));
+        assert_unauthorized_response(request).await;
     }
 
     #[tokio::test]

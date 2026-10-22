@@ -11681,3 +11681,11 @@ area:      [writing]
 
 Observatory docs-truth pass (FQ-013): closed the stale "open" claims left behind after the Gate 1 G1–G5 repair wave landed 2026-09-25 with delta review PASS (PR #486, #487) and the §4.3 WAL checkpoint landed (PR #500). Task 9 review doc: dated Status note on the verdict summary plus §4.3 closure pointers at F10, the hardening-wave open list, and the F10 partial bullet. Observatory architecture doc Status line now records Gate 0 accepted, Gate 1 landed, renderer gate open. Root AGENTS.md, docs/AGENTS.md, and the docs README index now state the repairs landed and passed, keeping renderer work governed by the accepted Gate 0 decisions and Gate 1 manifest. Historical text retained; edits are dated status pointers. cargo xtask docs-check, git diff --check, and node scripts/check-ledger.mjs pass.
 _________________________________________________________________________________ 17:20 factory/fq-013-r1716
+time:      [17:19] [22-10-26]
+agent:     [zcode], [GLM-5.3]
+worktree:  [factory/fq-005a]
+type:      [bug report]: Extractor-level G5 rejection coverage gap
+area:      [testing]
+
+FQ-005A close-out of the FQ-005 finding: the extractor-level test observatory_auth_rejects_every_credential_failure_as_401 asserted only the 401 status, leaving the G5 repair's header/body guarantees pinned only by the router-level routes_require_observer_auth. Extended every credential-failure case (malformed cookie, non-Bearer header, missing credential, wrong-instance token) to assert the full manifest §7.4 no-store header set and the exact §7.1 {error, message, http_status: 401} body on ObservatoryUnauthorized's IntoResponse, and to pin for_request's no-ObservatoryServices fallback: X-Observatory-Cursor 0 and the instance id taken from ObservatoryAuthState — a branch the router test never hits. Test-only; no production change. cargo test -p ocean-daemon observatory_auth 7/7; full cargo test -p ocean-daemon 1157 unit + 6 integration passed, 0 failed, 4 pre-existing ignores. Devlog pass: observatory_auth.rs contract text remains accurate; no ownership or index change.
+_________________________________________________________________________________ 17:19 factory/fq-005a
