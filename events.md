@@ -11657,3 +11657,11 @@ area:      [backend]
 
 The first lockfile bump left the LiveKit stack unpaired and the MSRV lane went red in CI: webrtc-sys-build 0.3.20 alone no longer matches webrtc-sys 0.3.33's cxx shims (packet_trailer.h fails with `no template named 'ArrayView' in namespace 'webrtc'`), reproduced locally with RUSTUP_TOOLCHAIN=1.88.0. LiveKit ships the crates in lockstep and only webrtc-sys 0.3.50 pairs with build 0.3.20 and its patched zip 9 line, so the fix moves webrtc-sys 0.3.33 -> 0.3.50 and libwebrtc 0.3.35 -> 0.3.53 together, which also drops the glib/system-deps/toml-writer transitive stack from the lockfile. cargo check -p ocean-call passes on stable and on 1.88.0; cargo deny check 0.20.2 stays clean; no workspace source changed.
 _________________________________________________________________________________ 16:58 feat/onboard-tailscale-serve
+time:      [17:07] [22-10-26]
+agent:     [zcode], [glm-5.3]
+worktree:  feat/onboard-tailscale-serve
+type:      [bug report]: PR #534 webrtc zip advisories scoped, not migrated
+area:      [review]
+
+The lockstep attempt overran its scope: livekit 0.7.44 cannot compile against libwebrtc 0.3.53 (RtcConfiguration grew enable_sctp_snap), and the only patched-zip set — webrtc-sys-build 0.3.20 with zip 9 — pairs with webrtc-sys 0.3.50 / libwebrtc 0.3.53 / livekit 0.9.6 / livekit-api 0.9, a cross-semver migration of the voice stack that ocean-call's pinned livekit 0.7.44 / livekit-api 0.5 set cannot take without source changes and its own review. Reverted the webrtc stack to the known-good 0.7.44 pairing (webrtc-sys 0.3.33, webrtc-sys-build 0.3.18, libwebrtc 0.3.35, zip 0.6.6) and scoped RUSTSEC-2026-0367/0368/0369 in deny.toml instead: zip 0.6.6 is only webrtc-sys-build's build-time extractor of LiveKit's own published libwebrtc archive, never linked or runtime-exposed. The rustls 0.23.46 / rustls-webpki 0.103.16 / webpki-roots 1.0.10 bumps stay; cargo deny check 0.20.2 clean and the livekit-tap feature recompiles on 1.88.0.
+_________________________________________________________________________________ 17:07 feat/onboard-tailscale-serve

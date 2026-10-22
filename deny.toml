@@ -25,6 +25,21 @@ ignore = [
     # timing over the network. Re-check when RustCrypto/RSA#626 lands a
     # constant-time impl, then drop this ignore.
     "RUSTSEC-2023-0071",
+    # zip 0.6.6 (RUSTSEC-2026-0367/0368/0369 — extract-time symlink/SUID
+    # handling) reaches the tree ONLY as webrtc-sys-build 0.3.18's
+    # build-dependency, where it unpacks LiveKit's own published prebuilt
+    # libwebrtc archive from the official download host during `cargo build`.
+    # It is not linked into any shipped binary and never extracts an
+    # attacker-controlled archive at runtime; the advisory scenarios require a
+    # hostile zip input. No patched 0.6.x exists, and the patched line (zip 9,
+    # webrtc-sys-build 0.3.20) pairs only with webrtc-sys 0.3.50 /
+    # libwebrtc 0.3.53 / livekit 0.9.6 — a cross-semver migration of the whole
+    # voice stack that ocean-call's pinned livekit 0.7.44 / livekit-api 0.5
+    # cannot take without source changes. Drop these three ignores when that
+    # migration lands.
+    "RUSTSEC-2026-0367",
+    "RUSTSEC-2026-0368",
+    "RUSTSEC-2026-0369",
 ]
 # Yanked crates warn rather than fail (a yanked transitive dep shouldn't block a
 # hotfix); flip to "deny" once the tree is clean.
