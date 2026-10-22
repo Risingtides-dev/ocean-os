@@ -20330,6 +20330,317 @@ mod tests {
         std::env::remove_var("OCEAN_YOLO");
     }
 
+    // ---- Real convene/title grant-bind characterization ----------------------
+    //
+    // The deterministic successful path through the REAL handler — ready-model
+    // admission, the awaited council over the real `ModelHandle` wire,
+    // registry-first projection, durable title grant plus decision bind, and
+    // raw-token delivery — is reached WITHOUT a new trait, substate, test
+    // seam, or public API: the production provider configuration surface
+    // (`OCEAN_GLM_BASE_URL` + `OCEAN_GLM_API_KEY`, the same env pair an
+    // operator uses to proxy GLM) points the council's OpenAI-compatible
+    // wire at a loopback endpoint serving the scripted council dialogue.
+    // `fake-ok` cannot staff a council: the Fake provider resolves without a
+    // credential by construction, so `ModelHandle::ask` drops those workers
+    // and the council aborts — only a catalog model with an env credential
+    // reaches the provider wire.
+
+    /// A loopback OpenAI-compatible endpoint serving one scripted council. The
+    /// `system` prompt identifies the round (the same constants
+    /// `ocean_longhouse` sends), and the per-model answers stage a converging
+    /// field: two workers commit the same structured answer (round-1
+    /// consolidation folds the duplicate into an endorse of the first), the
+    /// third fields a genuine rival, and every review endorses the leader.
+    /// Returns the bound address plus the captured `Authorization` headers, so
+    /// a test can also pin that the env-resolved credential reached the wire.
+    async fn scripted_council_endpoint() -> (
+        std::net::SocketAddr,
+        Arc<std::sync::Mutex<Vec<String>>>,
+    ) {
+        use axum::routing::post;
+
+        let bearers = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let captured = bearers.clone();
+        let app = axum::Router::new().route(
+            "/v1/chat/completions",
+            post(
+                move |headers: axum::http::HeaderMap,
+                      axum::Json(body): axum::Json<serde_json::Value>| {
+                    let captured = captured.clone();
+                    async move {
+                        captured.lock().unwrap().push(
+                            headers
+                                .get(axum::http::header::AUTHORIZATION)
+                                .and_then(|value| value.to_str().ok())
+                                .unwrap_or("")
+                                .to_string(),
+                        );
+                        let system =
+                            body["messages"][0]["content"].as_str().unwrap_or("");
+                        let user = body["messages"][1]["content"].as_str().unwrap_or("");
+                        let model = body["model"].as_str().unwrap_or("");
+                        let answer = if system.contains("small council answering a question") {
+                            // Round 1: propose. Two models commit the same
+                            // ANSWER key; the third commits a genuine rival.
+                            if model == "glm-4.5-flash" {
+                                "ANSWER: Proposal B\nA different tradeoff with lower cost."
+                                    .to_string()
+                            } else {
+                                "ANSWER: Proposal A\nIt is the safest choice for the fleet."
+                                    .to_string()
+                            }
+                        } else if system.contains("reviewing proposed answers") {
+                            // Review: endorse the leader by its projection
+                            // number in this exact prompt.
+                            let number = user
+                                .lines()
+                                .find(|line| line.contains("Proposal A"))
+                                .and_then(|line| line.trim().split('.').next())
+                                .unwrap_or("1")
+                                .to_string();
+                            format!("ENDORSE {number}: strongest")
+                        } else if system.contains("genuinely different alternative") {
+                            // Rival generation: no further alternatives.
+                            "PASS".to_string()
+                        } else {
+                            // Evidence request: rationale only, no vote.
+                            "Proposal A ships faster and carries less risk.".to_string()
+                        };
+                        let chunk = json!({
+                            "choices": [{
+                                "index": 0,
+                                "delta": { "content": answer },
+                                "finish_reason": null,
+                            }]
+                        });
+                        axum::http::Response::builder()
+                            .status(StatusCode::OK)
+                            .header(axum::http::header::CONTENT_TYPE, "text/event-stream")
+                            .body(axum::body::Body::from(format!(
+                                "data: {chunk}\n\ndata: [DONE]\n\n"
+                            )))
+                            .unwrap()
+                    }
+                },
+            ),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        (address, bearers)
+    }
+
+    /// The full successful convene path, end to end through the real route
+    /// table and the real provider wire: ready models staff the council, the
+    /// handler awaits the council, the converged topic is projected into the
+    /// read-side registry, the firekeeper title is granted into the durable
+    /// registry and bound to the engine's exact decision, and the raw token
+    /// travels ONLY in the HTTP response — a later engine-free claim with
+    /// that token ratifies, a wrong token is refused.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn convene_converged_council_grants_binds_and_delivers_the_raw_token() {
+        use http_body_util::BodyExt;
+        use tower::ServiceExt; // for `oneshot`
+
+        let _guard = AUTO_CONVENE_ENV_LOCK.lock().await;
+        let _env = TestEnvRestore::capture(&[
+            "OCEAN_CONFIG_DIR",
+            "OCEAN_MODEL",
+            "OCEAN_YOLO",
+            "OCEAN_GLM_BASE_URL",
+            "OCEAN_GLM_API_KEY",
+        ]);
+        let (endpoint, bearers) = scripted_council_endpoint().await;
+        std::env::set_var(
+            "OCEAN_GLM_BASE_URL",
+            format!("http://{endpoint}/v1"),
+        );
+        std::env::set_var("OCEAN_GLM_API_KEY", "test-glm-key");
+
+        let tmp = tempfile::tempdir().unwrap();
+        let state = fake_convene_state(&tmp);
+        let (_replay, mut rx) = state.agent_events.subscribe_with_replay(None);
+        let app = longhouse_routes().with_state(state.clone());
+
+        let request = axum::http::Request::builder()
+            .method(axum::http::Method::POST)
+            .uri("/v1/longhouse/convene")
+            .header(axum::http::header::CONTENT_TYPE, "application/json")
+            .body(axum::body::Body::from(
+                json!({
+                    "question": "ship it?",
+                    "federation": "dev",
+                    "models": ["glm-5.3", "glm-5.3-flash", "glm-4.5-flash"],
+                })
+                .to_string(),
+            ))
+            .unwrap();
+        let response = app.clone().oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = response.into_body().collect().await.unwrap().to_bytes();
+        let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+
+        // The handler awaited the council: convergence, the durable title id,
+        // and the raw claim token all arrive in this one response body.
+        assert_eq!(body["ok"], json!(true), "body: {body}");
+        assert_eq!(body["question"], json!("ship it?"), "body: {body}");
+        assert_eq!(body["federation"], json!("dev"), "body: {body}");
+        assert_eq!(body["streaming_on"], json!("/v1/agent/events"));
+        assert_eq!(body["converged"], json!(true), "body: {body}");
+        assert!(
+            body["convergence_basis"].is_string(),
+            "a converged council reports its auditable basis: {body}"
+        );
+        let title_id: Uuid = body["title_id"]
+            .as_str()
+            .and_then(|raw| raw.parse().ok())
+            .expect("title_id is present and a UUID on convergence");
+        let token = body["token"]
+            .as_str()
+            .expect("the raw token is delivered only in this response")
+            .to_string();
+        assert!(!token.is_empty());
+
+        // Provider readiness admitted the exact requested aliases and the
+        // council was staffed with those ready models — proven on the wire.
+        {
+            let captured = bearers.lock().unwrap();
+            assert!(
+                !captured.is_empty(),
+                "the council made real provider-wire calls"
+            );
+            assert!(
+                captured
+                    .iter()
+                    .all(|value| value == "Bearer test-glm-key"),
+                "every council call carried the env-resolved credential: {captured:?}"
+            );
+        }
+        let (topic_id, firekeeper, decision) = {
+            let registry = state.longhouse.lock().unwrap();
+            let topics = registry.topics();
+            assert_eq!(topics.len(), 1, "exactly one topic was convened");
+            let snapshot = &topics[0];
+            let mut members: Vec<&str> = snapshot
+                .members
+                .iter()
+                .map(|member| member.model.as_str())
+                .collect();
+            members.sort_unstable();
+            assert_eq!(
+                members,
+                ["glm-4.5-flash", "glm-5.3", "glm-5.3-flash"],
+                "the roster is the requested ready-model set"
+            );
+            assert!(matches!(
+                snapshot.state,
+                ocean_longhouse::TopicState::Converged
+            ));
+            (
+                snapshot.topic_id,
+                snapshot
+                    .firekeeper
+                    .expect("a converged topic records its firekeeper"),
+                snapshot
+                    .decision
+                    .expect("a converged topic records the engine decision"),
+            )
+        };
+
+        // Durable grant + bind: the title survives the turn in the durable
+        // registry, and the engine's exact decision is bound to it — proven
+        // by a LATER, engine-free claim over HTTP.
+        {
+            let titles = state.titles.lock().unwrap();
+            assert!(
+                titles.lookup(title_id).expect("titles store").is_some(),
+                "the converged council persisted its firekeeper title"
+            );
+        }
+        let claim = app
+            .clone()
+            .oneshot(
+                axum::http::Request::builder()
+                    .method(axum::http::Method::POST)
+                    .uri("/v1/longhouse/claim")
+                    .header(axum::http::header::CONTENT_TYPE, "application/json")
+                    .body(axum::body::Body::from(
+                        json!({
+                            "title_id": title_id.to_string(),
+                            "agent_id": firekeeper.to_string(),
+                            "decision": decision.to_string(),
+                            "token": token,
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(claim.status(), StatusCode::OK);
+        let claim_bytes = claim.into_body().collect().await.unwrap().to_bytes();
+        let claim_body: serde_json::Value = serde_json::from_slice(&claim_bytes).unwrap();
+        assert_eq!(claim_body["ok"], json!(true), "claim body: {claim_body}");
+        assert_eq!(
+            claim_body["decision"],
+            json!(decision.to_string()),
+            "the claim ratifies the engine-bound decision"
+        );
+
+        // A wrong token is refused identically to an unknown title: the
+        // delivered token is the credential, not decoration.
+        let forged = app
+            .clone()
+            .oneshot(
+                axum::http::Request::builder()
+                    .method(axum::http::Method::POST)
+                    .uri("/v1/longhouse/claim")
+                    .header(axum::http::header::CONTENT_TYPE, "application/json")
+                    .body(axum::body::Body::from(
+                        json!({
+                            "title_id": title_id.to_string(),
+                            "agent_id": firekeeper.to_string(),
+                            "decision": decision.to_string(),
+                            "token": "forged-token",
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(forged.status(), StatusCode::FORBIDDEN);
+
+        // Raw-token discipline (OCEAN-229): the secret traveled ONLY in the
+        // direct HTTP response. The bus carries public event data — the topic
+        // itself appears there, but neither the token nor the durable title
+        // id may appear in any published frame.
+        let title_wire = title_id.to_string();
+        let topic_wire = topic_id.to_string();
+        let mut published_frames = 0usize;
+        let mut topic_published = false;
+        while let Ok(envelope) = rx.try_recv() {
+            let wire = serde_json::to_string(&envelope.event).unwrap();
+            assert!(
+                !wire.contains(token.as_str()),
+                "the raw token leaked onto the agent bus: {wire}"
+            );
+            assert!(
+                !wire.contains(&title_wire),
+                "the durable title id leaked onto the agent bus: {wire}"
+            );
+            published_frames += 1;
+            topic_published |= wire.contains(&topic_wire);
+        }
+        assert!(published_frames > 0, "the council published bus events");
+        assert!(
+            topic_published,
+            "the convened topic id itself is public bus data"
+        );
+    }
+
     // ---- Longhouse topic-projection extraction characterization ------------
 
     async fn longhouse_topic_projection_request(
