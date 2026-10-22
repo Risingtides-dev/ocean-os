@@ -68,7 +68,7 @@ This crate owns Ocean's agent session/history layer and project prompt loading. 
   the immutable capability intersection, advertised only when the handle is
   present, removes ordinary operator memory when attached, and is removed by
   `without_tools()`.
-- `PromptControl` receives exactly two effective harness-profile booleans from the daemon: `hashline_edits` and `artifact_spill`. Direct/legacy callers default both off; do not add declarative profile fields here until production runtime composition actually consumes them.
+- `PromptControl` carries the daemon-threaded effective harness-profile booleans: `hashline_edits`, `artifact_spill`, `code_intelligence` (TASK-26; daemon resolves it from the harness matrix, voice turns it off), and `command_output_minimization` (minimizer M2c, mirroring `artifact_spill`). Direct/legacy callers default the three capability gates off and `code_intelligence` on, so legacy turns keep the `lsp` tool. A new profile field belongs here only when a daemon profile resolves it and production runtime composition consumes it.
 - OpenAI-compatible history shaping preserves stored thinking when the selected route is exact
   `kimi`/`kimi-k3` (Moonshot requires same-model `reasoning_content` replay) or
   `minimax`/`MiniMax-M3*`, API-key `openai`/`gpt-6*`, or
