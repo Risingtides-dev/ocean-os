@@ -11649,3 +11649,11 @@ area:      [automations]
 
 Onboarding step 7 now exposes the supervised loopback daemon on this machine's tailnet address with `tailscale serve --bg --tcp 4780 tcp://127.0.0.1:4780` so the operator's surface proxy can attach, skipped via --no-tailnet-serve and never fatal; docs/TEAM_ONBOARDING.md and docs/AGENTS.md document the reach plus the add-user.sh checklist line, and the tailnet ACL is named the boundary because the daemon has no auth of its own. Reconciliation: appended this missing ledger entry for the diff, and bumped Cargo.lock past fresh RustSec advisories the deny lane fetches live — rustls 0.23.46 (RUSTSEC-2026-0346..0349), rustls-webpki 0.103.16 (RUSTSEC-2026-0382), webpki-roots 1.0.10 (RUSTSEC-2026-0381), and webrtc-sys-build 0.3.20 whose build dep moves zip 0.6.6 to 9.0.5 (RUSTSEC-2026-0367..0369) — cargo deny check 0.20.2 passes clean; no source changes beyond the lockfile.
 _________________________________________________________________________________ 16:44 feat/onboard-tailscale-serve
+time:      [16:58] [22-10-26]
+agent:     [zcode], [glm-5.3]
+worktree:  feat/onboard-tailscale-serve
+type:      [bug report]: PR #534 MSRV lane pairing repair
+area:      [backend]
+
+The first lockfile bump left the LiveKit stack unpaired and the MSRV lane went red in CI: webrtc-sys-build 0.3.20 alone no longer matches webrtc-sys 0.3.33's cxx shims (packet_trailer.h fails with `no template named 'ArrayView' in namespace 'webrtc'`), reproduced locally with RUSTUP_TOOLCHAIN=1.88.0. LiveKit ships the crates in lockstep and only webrtc-sys 0.3.50 pairs with build 0.3.20 and its patched zip 9 line, so the fix moves webrtc-sys 0.3.33 -> 0.3.50 and libwebrtc 0.3.35 -> 0.3.53 together, which also drops the glib/system-deps/toml-writer transitive stack from the lockfile. cargo check -p ocean-call passes on stable and on 1.88.0; cargo deny check 0.20.2 stays clean; no workspace source changed.
+_________________________________________________________________________________ 16:58 feat/onboard-tailscale-serve
