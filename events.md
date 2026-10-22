@@ -11699,3 +11699,12 @@ area:      [infra]
 
 Rebased PR #470 onto main through #533. The npm thirteen-file contract had already landed in test-package.sh via #502 (a superset of this PR's hunk there), so that file collapses to main's version; the PR's remaining payload is the release workflow's standalone binary bundle, which main still shipped without ocean-mcp in its tar, chmod, extracted-executable check, publish-job chmod, and ten-file FILES list. The original [20:37] [09-09-26] ledger entry survived the union merge and now sits at its chronological position closed with an identity rule; packaging/AGENTS.md's payload counts corrected from 12-file/nine-file to thirteen-file/ten-file to match the enforced contracts. Verified: check-ledger clean (710 entries), ledger checker tests 18/18, bash -n / sh -n packaging scripts, release.yml YAML parse plus both FILES lists counted (13 npm, 10 binary), cargo xtask docs-check PASS.
 _________________________________________________________________________________ 16:41 cc/release-thirteen-file-contract
+
+time:      [17:21] [22-10-26]
+agent:     [zcode], [glm-5.3]
+worktree:  cc/release-thirteen-file-contract
+type:      [gh actions]: cargo-deny advisory gate on PR #470 rebased head
+area:      [testing]
+
+Rebased head f04789e6 failed the cargo-deny job on nine RUSTSEC vulnerability advisories: rustls 0.23.45 (2026-0346/-0347/-0348/-0349), rustls-webpki 0.103.15 (2026-0382), and webpki-roots 1.0.7 (2026-0381) are fixed with the log-prescribed compatible lockfile bumps to rustls 0.23.46, rustls-webpki 0.103.16, and webpki-roots 1.0.10 (nine-line Cargo.lock diff, no manifest changes, packed-file contracts untouched). zip 0.6.6, a build-time-only transitive of webrtc-sys-build 0.3.18 on the livekit chain, has no compatible patched line (fixes require zip >=9.0.0 while upstream pins ^0.6), so RUSTSEC-2026-0367/-0368/-0369 are ignored in deny.toml with justification: extraction only runs at build time on the prebuilt libwebrtc archive fetched over HTTPS from LiveKit's release servers, zip is never linked into a shipped binary, and it never sees user-supplied archives. Verified locally: cargo deny check all green (advisories, bans, licenses, sources) and cargo metadata --locked clean; operator ratification of the zip ignores requested in PR #470.
+_________________________________________________________________________________ 17:21 cc/release-thirteen-file-contract
