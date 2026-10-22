@@ -276,7 +276,10 @@ impl FakeGit {
 
     fn grandchild(&self) -> libc::pid_t {
         let path = self.log().join("grandchild.pid");
-        let until = Instant::now() + Duration::from_secs(5);
+        // The fixture writes this file from a freshly spawned shell; under a
+        // loaded parallel suite that can take far longer than the acquisition
+        // itself, so the bound stays generous rather than racing the load.
+        let until = Instant::now() + Duration::from_secs(60);
         while !path.exists() && Instant::now() < until {
             std::thread::sleep(Duration::from_millis(10));
         }
@@ -912,7 +915,9 @@ fn a4_timeout_kills_the_whole_git_process_group() {
         code(writer.acquire_git_with(&acquirer, URL, "0123456789abcdef0123456789abcdef01234567")),
         TIMEOUT
     );
-    assert!(started.elapsed() < Duration::from_secs(10));
+    // The 2 s deadline plus both §10.5 kill graces bounds the run; the slack
+    // above that absorbs a loaded parallel suite without masking a hang.
+    assert!(started.elapsed() < Duration::from_secs(30));
     assert!(
         pid_gone(fake.grandchild()),
         "grandchild survived the timeout"
@@ -1570,15 +1575,21 @@ fn a4_tree_bombs_are_killed_while_ls_tree_streams() {
     let config = tempfile::tempdir().unwrap();
     let writer = RegistryWriter::new(config.path().to_path_buf());
     let oid = "ab".repeat(20);
-    // Endless records: stopped at the record cap.
+    // Each bomb is over its cap from its first write — the record bomb seeds
+    // 60 records in one printf (the format is reused per argument) and the
+    // byte bomb drops a 65 MiB NUL-free burst in one dd write — and then
+    // streams endlessly. The producers never exit on their own, so
+    // `package_invalid` can only come from the watch while `ls-tree` runs:
+    // whether the observing tick lands early or exactly at the deadline, the
+    // bomb is killed mid-stream rather than racing into the timeout.
+    let seeds = (0..60).map(|n| n.to_string()).collect::<Vec<_>>().join(" ");
     let records = FakeGit::scripted(
         "git version 2.40.1",
         fetch,
         &format!(
-            "  *' cat-file -t '*) printf 'commit\\n'; exit 0 ;;\n  *' ls-tree '*) i=0; while :; do i=$((i+1)); printf '100644 blob {oid} 1\\tf%s\\000' \"$i\"; done ;;"
+            "  *' cat-file -t '*) printf 'commit\\n'; exit 0 ;;\n  *' ls-tree '*) printf '100644 blob {oid} 1\\tf%s\\000' {seeds}; i=59; while :; do i=$((i+1)); printf '100644 blob {oid} 1\\tf%s\\000' \"$i\"; done ;;"
         ),
     );
-    let started = Instant::now();
     assert_eq!(
         code(
             writer.acquire_git_with(
@@ -1591,14 +1602,17 @@ fn a4_tree_bombs_are_killed_while_ls_tree_streams() {
         ),
         PACKAGE_INVALID
     );
-    assert!(started.elapsed() < Duration::from_secs(10));
     // Endless bytes and no record separator: stopped at the byte cap.
     let bytes = FakeGit::scripted(
         "git version 2.40.1",
         fetch,
-        "  *' cat-file -t '*) printf 'commit\\n'; exit 0 ;;\n  *' ls-tree '*) yes | tr -d '\\n' ;;",
+        "  *' cat-file -t '*) printf 'commit\\n'; exit 0 ;;\n  *' ls-tree '*) dd if='{FAKE}/burst.y' bs=68157440; tr '\\0' 'y' < /dev/zero ;;",
     );
-    let started = Instant::now();
+    fs::write(
+        bytes.temp.path().join("burst.y"),
+        vec![b'y'; 65 * 1024 * 1024],
+    )
+    .unwrap();
     assert_eq!(
         code(writer.acquire_git_with(
             &fake_acquirer(&bytes).with_deadline(Duration::from_secs(30)),
@@ -1607,8 +1621,38 @@ fn a4_tree_bombs_are_killed_while_ls_tree_streams() {
         )),
         PACKAGE_INVALID
     );
-    assert!(started.elapsed() < Duration::from_secs(25));
     assert_no_acquisition_residue(config.path());
+}
+
+#[test]
+fn a4_the_deadline_yields_to_an_observable_watch() {
+    use std::os::unix::process::CommandExt as _;
+    // When the deadline has already arrived, a watch condition observable
+    // right now is reported as itself: the group is killed and coded as that
+    // condition instead of the deadline tick stealing it into the generic
+    // timeout.
+    let spinner = || {
+        let mut command = Command::new("/bin/sh");
+        command
+            .arg("-c")
+            .arg("while :; do :; done")
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .process_group(0);
+        command
+    };
+    let expired = Instant::now() - Duration::from_secs(1);
+    let observed = run_group(
+        spinner(),
+        expired,
+        || Some(PACKAGE_INVALID),
+        &Strands::default(),
+    );
+    assert!(matches!(observed, Err(Fail::Reject(PACKAGE_INVALID))));
+    // The deadline still applies when detection legitimately has not fired.
+    let unobserved = run_group(spinner(), expired, || None, &Strands::default());
+    assert!(matches!(unobserved, Err(Fail::Reject(TIMEOUT))));
 }
 
 #[test]

@@ -36,7 +36,9 @@
 //! - **Process groups.** Each `git` is the leader of a new process group. The
 //!   leader is observed with `waitid(WNOWAIT)` and reaped only after its group
 //!   is proven empty; a timeout or temp-size excess follows §10.5 (SIGTERM,
-//!   2 s, SIGKILL, 2 s, then reap). A group that cannot be proven empty is left
+//!   2 s, SIGKILL, 2 s, then reap). A watch condition already observable when
+//!   the deadline arrives is reported as itself, never stolen by the timeout.
+//!   A group that cannot be proven empty is left
 //!   with its leader unreaped, so its PGID can never be reused and signaled.
 //! - **No checkout, no filters.** The tree is listed with `ls-tree` and blob
 //!   bytes are read with `cat-file --batch`, which applies no smudge/clean or
@@ -45,8 +47,10 @@
 //!   gitlink (submodule), `.gitmodules`, `.lfsconfig`, `.gitattributes` that
 //!   declares a `filter=`, `.git` component, or unsafe path is refused.
 //! - **Bounds.** 512 MiB for everything Git writes (measured while each
-//!   process runs and after it exits); the A0 package limits (10,000 entries,
-//!   depth 64, 256 MiB) on the listed tree before a byte is extracted.
+//!   process runs and after it exits; a path that vanishes mid-measurement
+//!   consumes nothing and is not an error); the A0 package limits (10,000
+//!   entries, depth 64, 256 MiB) on the listed tree before a byte is
+//!   extracted.
 //!
 //! Nothing here runs package content, and no response or log carries a URL
 //! credential (none is accepted), a resolved address, or Git output.
@@ -1314,23 +1318,35 @@ impl Workspace {
 
     /// Apparent bytes under the workspace, never following a link. An
     /// unmeasurable or implausibly deep/wide tree counts as over the ceiling.
+    /// A file or directory that vanishes mid-walk is benign — Git renames and
+    /// removes scratch under `repo.git` while the ceiling is being measured,
+    /// and a vanished path consumes no bytes — so only a genuinely unreadable
+    /// tree fails the measurement.
     fn bytes(&self) -> u64 {
         fn walk(path: &Path, depth: usize, total: &mut u64, entries: &mut usize) -> bool {
             if depth > 32 {
                 return false;
             }
-            let Ok(listing) = fs::read_dir(path) else {
-                return false;
+            let listing = match fs::read_dir(path) {
+                Ok(listing) => listing,
+                Err(error) if error.kind() == io::ErrorKind::NotFound => return true,
+                Err(_) => return false,
             };
             for entry in listing {
-                let Ok(entry) = entry else { return false };
+                let entry = match entry {
+                    Ok(entry) => entry,
+                    Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+                    Err(_) => return false,
+                };
                 *entries += 1;
                 if *entries > 1_000_000 {
                     return false;
                 }
                 // DirEntry::metadata does not traverse symlinks on Unix.
-                let Ok(metadata) = entry.metadata() else {
-                    return false;
+                let metadata = match entry.metadata() {
+                    Ok(metadata) => metadata,
+                    Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+                    Err(_) => return false,
                 };
                 *total = total.saturating_add(metadata.len());
                 if metadata.is_dir() && !walk(&entry.path(), depth + 1, total, entries) {
@@ -1477,14 +1493,18 @@ fn run_group(
             None => return Err(strands.keep(group)),
         }
         let now = Instant::now();
-        if now >= deadline {
-            break TIMEOUT;
-        }
-        if now >= next_measure {
+        // A watch condition observable when the deadline arrives is that
+        // condition, not the generic timeout: detection is polled once more
+        // before expiry applies, so a bomb already visible mid-stream is
+        // still killed and reported as itself.
+        if now >= next_measure || now >= deadline {
             if let Some(code) = over_limit() {
                 break code;
             }
             next_measure = now + MEASURE_INTERVAL;
+        }
+        if now >= deadline {
+            break TIMEOUT;
         }
         std::thread::sleep(POLL_INTERVAL);
     };
