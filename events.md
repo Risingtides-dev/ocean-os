@@ -11640,3 +11640,28 @@ area:      [review]
 
 Parent PR #532 merged as 7236a41c, whose entire tree matches original parent 177a6cbf. Reconciled origin/main ancestry into the capability branch; squash-induced protocol conflicts retain the already-integrated tested files. The resolved index is byte-identical to prior 4a327a7e before this ledger append, so the 3,719-test repository gate and prior strict validations still cover the unchanged code. Retarget PR #533 to main and obtain fresh hosted review/checks on the merge head. Devlog pass: owner contracts and child indexes unchanged because no code, ownership or workflow contract changed; canonical dirty checkout preserved.
 _________________________________________________________________________________ 15:41 codex/ocean-effort-catalog-20261005
+
+time:      [16:44] [22-10-26]
+agent:     [zcode], [glm-5.3]
+worktree:  feat/onboard-tailscale-serve
+type:      [workflow]: PR #534 tailscale-serve onboarding reconciliation
+area:      [automations]
+
+Onboarding step 7 now exposes the supervised loopback daemon on this machine's tailnet address with `tailscale serve --bg --tcp 4780 tcp://127.0.0.1:4780` so the operator's surface proxy can attach, skipped via --no-tailnet-serve and never fatal; docs/TEAM_ONBOARDING.md and docs/AGENTS.md document the reach plus the add-user.sh checklist line, and the tailnet ACL is named the boundary because the daemon has no auth of its own. Reconciliation: appended this missing ledger entry for the diff, and bumped Cargo.lock past fresh RustSec advisories the deny lane fetches live — rustls 0.23.46 (RUSTSEC-2026-0346..0349), rustls-webpki 0.103.16 (RUSTSEC-2026-0382), webpki-roots 1.0.10 (RUSTSEC-2026-0381), and webrtc-sys-build 0.3.20 whose build dep moves zip 0.6.6 to 9.0.5 (RUSTSEC-2026-0367..0369) — cargo deny check 0.20.2 passes clean; no source changes beyond the lockfile.
+_________________________________________________________________________________ 16:44 feat/onboard-tailscale-serve
+time:      [16:58] [22-10-26]
+agent:     [zcode], [glm-5.3]
+worktree:  feat/onboard-tailscale-serve
+type:      [bug report]: PR #534 MSRV lane pairing repair
+area:      [backend]
+
+The first lockfile bump left the LiveKit stack unpaired and the MSRV lane went red in CI: webrtc-sys-build 0.3.20 alone no longer matches webrtc-sys 0.3.33's cxx shims (packet_trailer.h fails with `no template named 'ArrayView' in namespace 'webrtc'`), reproduced locally with RUSTUP_TOOLCHAIN=1.88.0. LiveKit ships the crates in lockstep and only webrtc-sys 0.3.50 pairs with build 0.3.20 and its patched zip 9 line, so the fix moves webrtc-sys 0.3.33 -> 0.3.50 and libwebrtc 0.3.35 -> 0.3.53 together, which also drops the glib/system-deps/toml-writer transitive stack from the lockfile. cargo check -p ocean-call passes on stable and on 1.88.0; cargo deny check 0.20.2 stays clean; no workspace source changed.
+_________________________________________________________________________________ 16:58 feat/onboard-tailscale-serve
+time:      [17:07] [22-10-26]
+agent:     [zcode], [glm-5.3]
+worktree:  feat/onboard-tailscale-serve
+type:      [bug report]: PR #534 webrtc zip advisories scoped, not migrated
+area:      [review]
+
+The lockstep attempt overran its scope: livekit 0.7.44 cannot compile against libwebrtc 0.3.53 (RtcConfiguration grew enable_sctp_snap), and the only patched-zip set — webrtc-sys-build 0.3.20 with zip 9 — pairs with webrtc-sys 0.3.50 / libwebrtc 0.3.53 / livekit 0.9.6 / livekit-api 0.9, a cross-semver migration of the voice stack that ocean-call's pinned livekit 0.7.44 / livekit-api 0.5 set cannot take without source changes and its own review. Reverted the webrtc stack to the known-good 0.7.44 pairing (webrtc-sys 0.3.33, webrtc-sys-build 0.3.18, libwebrtc 0.3.35, zip 0.6.6) and scoped RUSTSEC-2026-0367/0368/0369 in deny.toml instead: zip 0.6.6 is only webrtc-sys-build's build-time extractor of LiveKit's own published libwebrtc archive, never linked or runtime-exposed. The rustls 0.23.46 / rustls-webpki 0.103.16 / webpki-roots 1.0.10 bumps stay; cargo deny check 0.20.2 clean and the livekit-tap feature recompiles on 1.88.0.
+_________________________________________________________________________________ 17:07 feat/onboard-tailscale-serve

@@ -110,8 +110,14 @@ left alone unless `--force`);
 copies the package `ocean-daemon` to `~/.local/libexec/ocean-daemon/current`
 and installs the `dev.risingtides.ocean-daemon` LaunchAgent, which runs the
 repo launcher from `$HOME` with `OCEAN_YOLO=1` and your `OCEAN_MODEL`, then
-waits for `/health`; runs `ocean-mcp setup`; registers the MCP server in
-Claude Code when `claude` is on `PATH`; and prints the checklist for (e)–(h).
+waits for `/health`; forwards this machine's tailnet address to the loopback
+daemon with `tailscale serve --bg --tcp 4780 tcp://127.0.0.1:4780`, so the
+operator's surface at `ocean.agentsworld.org` can attach while local tools keep
+`127.0.0.1` (skip with `--no-tailnet-serve`; an existing forward or a port
+already serving something else is left alone); runs `ocean-mcp setup`;
+registers the MCP server in Claude Code when `claude` is on `PATH`; and prints
+the checklist for (e)–(h), led by the `ops/add-user.sh` line to send the
+operator.
 `--dry-run` prints every mutating step instead of doing it. The manual
 equivalents, should you prefer them: [`../ops/README.md`](../ops/README.md)
 for the LaunchAgent shape, `ocean-mcp setup` for the MCP lines, and the
@@ -244,8 +250,11 @@ state is written down.
 username, password, and the person's tailnet `daemon_url`. The username IS the
 member id above — it is what `--member` writes and what the surface will post
 as — so pick it once. Only the operator can mint one (the roster holds
-passwords); `ops/add-device.sh` in ocean-surface adds further machines to an
-existing entry.
+passwords): `ops/add-user.sh <member> <device> http://<tailnet-ip>:4780` in
+ocean-surface creates the entry with its first machine, and
+`ops/add-device.sh` adds further machines. The daemon has no auth of its own,
+so the tailnet ACL must let only the proxy host reach `:4780` on members'
+machines.
 
 ## Troubleshooting
 

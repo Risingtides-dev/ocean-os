@@ -23,8 +23,12 @@
 #      the repo launcher (deploy/ocean-daemon.sh) from $HOME with OCEAN_YOLO=1
 #      and OCEAN_MODEL; then /health is awaited. Same label, launcher, neutral
 #      cwd, and log path as ops/install-ocean-daemon.sh, minus the cargo build.
-#   7. ocean-mcp setup, and `claude mcp add` when Claude Code is on PATH.
-#   8. Prints the remaining manual checklist (provider login, invite redeem,
+#   7. Tailnet reach: `tailscale serve --tcp 4780` forwards this machine's
+#      tailnet address to the loopback daemon, so the operator's surface proxy
+#      (ocean.agentsworld.org) can attach to it while local tools keep using
+#      127.0.0.1. Skipped with --no-tailnet-serve; never fatal.
+#   8. ocean-mcp setup, and `claude mcp add` when Claude Code is on PATH.
+#   9. Prints the remaining manual checklist (provider login, invite redeem,
 #      doctor).
 #
 # It never prints a token, and it does NOT redeem an invite: the code is yours.
@@ -61,7 +65,7 @@ usage() {
   cat <<USAGE
 Usage:
   ops/onboard-teammate.sh --model MODEL --member ID [--display-name NAME]
-                          [--bedrock-url URL] [--force] [--dry-run]
+                          [--bedrock-url URL] [--no-tailnet-serve] [--force] [--dry-run]
 
   --model MODEL        Required. The model the supervised daemon starts with
                        (OCEAN_MODEL). Ask the operator which alias to use; once the
@@ -74,7 +78,9 @@ Usage:
   --display-name NAME  Optional cosmetic name beside the id ("Eric").
   --bedrock-url URL    Bedrock origin (scheme + host only). Default:
                        $DEFAULT_BEDROCK_URL
-  --force              Replace a federation.env that carries a real owner
+  --no-tailnet-serve   Do not expose the daemon on this machine's tailnet address
+                       (the surface at ocean.agentsworld.org then cannot reach it).
+  --force             Replace a federation.env that carries a real owner
                        credential, a member.toml that names someone else, and a
                        supervised daemon artifact that was built from a repo
                        checkout.
@@ -104,9 +110,10 @@ valid_federation_origin() {
   (( 10#$port <= 65535 ))
 }
 
-MODEL=""; MEMBER_ID=""; DISPLAY_NAME=""; BEDROCK_URL="$DEFAULT_BEDROCK_URL"; FORCE=0; DRY=0
+MODEL=""; MEMBER_ID=""; DISPLAY_NAME=""; BEDROCK_URL="$DEFAULT_BEDROCK_URL"; FORCE=0; DRY=0; TAILNET_SERVE=1
 while [[ $# -gt 0 ]]; do
   case "$1" in
+    --no-tailnet-serve) TAILNET_SERVE=0; shift ;;
     --model) MODEL="${2:-}"; shift 2 ;;
     --member) MEMBER_ID="${2:-}"; shift 2 ;;
     --display-name) DISPLAY_NAME="${2:-}"; shift 2 ;;
@@ -130,7 +137,7 @@ valid_federation_origin "$BEDROCK_URL" || fail "--bedrock-url must be an https o
 [[ -f "$LAUNCHER_SRC" ]] || fail "launcher $LAUNCHER_SRC is missing; run this from an ocean-os checkout" 66
 
 # ── 1. preflight ───────────────────────────────────────────────────────────
-say "[1/8] preflight"
+say "[1/9] preflight"
 [[ "$(uname -s)" == "Darwin" && "$(uname -m)" == "arm64" ]] \
   || fail "this kit is for macOS on Apple silicon; got $(uname -s) $(uname -m)" 64
 note "macOS $(sw_vers -productVersion 2>/dev/null || echo '?') arm64"
@@ -163,7 +170,7 @@ else
 fi
 
 # ── 2. ~/.npmrc ────────────────────────────────────────────────────────────
-say "[2/8] ~/.npmrc — $SCOPE_LINE"
+say "[2/9] ~/.npmrc — $SCOPE_LINE"
 ensure_npmrc() {
   local token tmp
   token="$(gh auth token 2>/dev/null || true)"
@@ -187,7 +194,7 @@ ensure_npmrc() {
 ensure_npmrc
 
 # ── 3. the package ─────────────────────────────────────────────────────────
-say "[3/8] installing $PKG@latest"
+say "[3/9] installing $PKG@latest"
 if command -v bun >/dev/null 2>&1; then
   run bun add -g "$PKG@latest"
 else
@@ -202,7 +209,7 @@ if [[ $DRY -eq 0 ]]; then
 fi
 
 # ── 4. federation.env ──────────────────────────────────────────────────────
-say "[4/8] federation.env — $ENV_FILE"
+say "[4/9] federation.env — $ENV_FILE"
 write_federation_env() {
   local has_credential=0 has_marker=0 url_matches=0 tmp
   if [[ -e "$ENV_FILE" ]]; then
@@ -244,7 +251,7 @@ write_federation_env() {
 write_federation_env
 
 # ── 5. member.toml — who you are ───────────────────────────────────────────
-say "[5/8] member.toml — $MEMBER_FILE (member_id = \"$MEMBER_ID\")"
+say "[5/9] member.toml — $MEMBER_FILE (member_id = \"$MEMBER_ID\")"
 write_member_toml() {
   local current tmp
   if [[ -e "$MEMBER_FILE" ]]; then
@@ -283,7 +290,7 @@ write_member_toml() {
 write_member_toml
 
 # ── 6. the supervised daemon ───────────────────────────────────────────────
-say "[6/8] LaunchAgent $LABEL (package daemon, neutral cwd \$HOME, OCEAN_YOLO=1, OCEAN_MODEL=$MODEL)"
+say "[6/9] LaunchAgent $LABEL (package daemon, neutral cwd \$HOME, OCEAN_YOLO=1, OCEAN_MODEL=$MODEL)"
 package_version() {
   local pkg_json="$1"
   [[ -f "$pkg_json" ]] || { echo unknown; return 0; }
@@ -427,8 +434,54 @@ install_launch_agent() {
 }
 install_launch_agent
 
-# ── 7. ocean-mcp ───────────────────────────────────────────────────────────
-say "[7/8] ocean-mcp — the Ocean skill and MCP server for Claude Code / Codex"
+# ── 7. tailnet reach ───────────────────────────────────────────────────────
+# The daemon stays bound to loopback (TUI, ocean-mcp and local surfaces keep
+# 127.0.0.1:4780); Tailscale forwards this machine's tailnet address to it so
+# the operator's surface proxy can attach. The daemon has no auth of its own:
+# the tailnet ACL is the boundary, and only the proxy host should be allowed
+# to reach :4780 (ocean-surface ops/README.md).
+say "[7/9] tailnet reach — tailscale serve --tcp 4780 -> 127.0.0.1:4780"
+TAILNET_DAEMON_URL=""
+TAILSCALE_APP_CLI="${TAILSCALE_APP_CLI:-/Applications/Tailscale.app/Contents/MacOS/Tailscale}"
+expose_on_tailnet() {
+  local ts="" ip status
+  if [[ $TAILNET_SERVE -eq 0 ]]; then
+    note "skipped (--no-tailnet-serve); the surface cannot reach this daemon"
+    return 0
+  fi
+  if command -v tailscale >/dev/null 2>&1; then
+    ts="$(command -v tailscale)"
+  elif [[ -x "$TAILSCALE_APP_CLI" ]]; then
+    ts="$TAILSCALE_APP_CLI"
+  fi
+  if [[ -z "$ts" ]]; then
+    note "tailscale is not installed; install the Tailscale app, sign in, then re-run"
+    return 0
+  fi
+  ip="$("$ts" ip -4 2>/dev/null | head -n 1 || true)"
+  if [[ -z "$ip" ]]; then
+    note "tailscale is not connected; sign in (tailscale up or the menu-bar app), then re-run"
+    return 0
+  fi
+  status="$("$ts" serve status --json 2>/dev/null | tr -d ' \n\t' || true)"
+  if [[ "$status" == *'"4780":{"TCPForward":"127.0.0.1:4780"'* || "$status" == *'"4780":{"TCPForward":"localhost:4780"'* ]]; then
+    note "already forwarding $ip:4780 -> 127.0.0.1:4780"
+  elif [[ "$status" == *'"4780":'* ]]; then
+    note "tailnet port 4780 is already served by something else; leaving it alone"
+    note "inspect: $ts serve status"
+    return 0
+  elif [[ $DRY -eq 1 ]]; then
+    note "[dry-run] $ts serve --bg --tcp 4780 tcp://127.0.0.1:4780"
+  else
+    "$ts" serve --bg --tcp 4780 tcp://127.0.0.1:4780 >/dev/null
+    note "forwarding $ip:4780 -> 127.0.0.1:4780"
+  fi
+  TAILNET_DAEMON_URL="http://$ip:4780"
+}
+expose_on_tailnet
+
+# ── 8. ocean-mcp ───────────────────────────────────────────────────────────
+say "[8/9] ocean-mcp — the Ocean skill and MCP server for Claude Code / Codex"
 if command -v ocean-mcp >/dev/null 2>&1; then
   run ocean-mcp setup
   if command -v claude >/dev/null 2>&1; then
@@ -445,7 +498,11 @@ else
 fi
 
 # ── 8. what is left for you ────────────────────────────────────────────────
-say "[8/8] done. Next, in this order:"
+say "[9/9] done. Next, in this order:"
+if [[ -n "$TAILNET_DAEMON_URL" ]]; then
+  note "Send the operator this line for your ocean.agentsworld.org login:"
+  note "  ops/add-user.sh $MEMBER_ID $(scutil --get LocalHostName 2>/dev/null || hostname -s) $TAILNET_DAEMON_URL"
+fi
 cat <<CHECKLIST
     1. Sign in to a model provider (browser flow):   ocean      then type   /login
        Models the daemon knows (aliases for --model / /model):
