@@ -11640,3 +11640,12 @@ area:      [review]
 
 Parent PR #532 merged as 7236a41c, whose entire tree matches original parent 177a6cbf. Reconciled origin/main ancestry into the capability branch; squash-induced protocol conflicts retain the already-integrated tested files. The resolved index is byte-identical to prior 4a327a7e before this ledger append, so the 3,719-test repository gate and prior strict validations still cover the unchanged code. Retarget PR #533 to main and obtain fresh hosted review/checks on the merge head. Devlog pass: owner contracts and child indexes unchanged because no code, ownership or workflow contract changed; canonical dirty checkout preserved.
 _________________________________________________________________________________ 15:41 codex/ocean-effort-catalog-20261005
+
+time:      [16:44] [22-10-26]
+agent:     [zcode], [glm-5.3]
+worktree:  feat/onboard-tailscale-serve
+type:      [workflow]: PR #534 tailscale-serve onboarding reconciliation
+area:      [automations]
+
+Onboarding step 7 now exposes the supervised loopback daemon on this machine's tailnet address with `tailscale serve --bg --tcp 4780 tcp://127.0.0.1:4780` so the operator's surface proxy can attach, skipped via --no-tailnet-serve and never fatal; docs/TEAM_ONBOARDING.md and docs/AGENTS.md document the reach plus the add-user.sh checklist line, and the tailnet ACL is named the boundary because the daemon has no auth of its own. Reconciliation: appended this missing ledger entry for the diff, and bumped Cargo.lock past fresh RustSec advisories the deny lane fetches live — rustls 0.23.46 (RUSTSEC-2026-0346..0349), rustls-webpki 0.103.16 (RUSTSEC-2026-0382), webpki-roots 1.0.10 (RUSTSEC-2026-0381), and webrtc-sys-build 0.3.20 whose build dep moves zip 0.6.6 to 9.0.5 (RUSTSEC-2026-0367..0369) — cargo deny check 0.20.2 passes clean; no source changes beyond the lockfile.
+_________________________________________________________________________________ 16:44 feat/onboard-tailscale-serve
