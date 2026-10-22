@@ -2,7 +2,7 @@
 
 **Date:** 2026-07-17
 **Type:** cross-repository product and runtime architecture proposal
-**Status:** Proposed direction; implementation is not yet approved
+**Status:** Status (2026-10-22): Gate 0 accepted 2026-07-17 (`2026-07-17-observatory-gate0-decisions.md`); Gate 1 landed — tasks 2–8, the Task 9 review, its G1–G5 repair wave with delta review PASS (PR #486, #487), and the §4.3 WAL checkpoint (PR #500), repairs 2026-09-25; production Ocean Floor renderer gate open
 **Owners:** Ocean OS (observation authority), Ocean Surface (product experience), orchestration extensions (subagent graph semantics)
 **Concept name:** Ocean Observatory; Ocean Floor is its topology view
 

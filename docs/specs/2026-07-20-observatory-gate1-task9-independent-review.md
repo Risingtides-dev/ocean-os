@@ -35,6 +35,13 @@ production Ocean Floor renderer consumes the snapshot/replay/live contracts.
 Auth, redaction, admission library logic, and the extension-ownership invariant
 are production-quality as landed.
 
+**Status (2026-10-22):** the paragraph above records the 2026-07-20 review
+state. All five gating findings were repaired and the delta review passed on
+2026-09-25 (ocean-os PR #486, follow-up #487) — see "Repair wave (2026-09-25)"
+below — and the §4.3 checkpoint task landed the same day in PR #500 (see
+"§4.3 WAL checkpoint (2026-09-25)" below). The renderer precondition this
+summary describes is satisfied; the ROADMAP renderer gate is open.
+
 ## Gating findings (repair before Surface renderer work)
 
 - **G1 — `snapshot_at` is not a point-in-time projection.**
@@ -143,7 +150,8 @@ Ordered by severity; category in brackets.
 - **F10 (minor, persistence):** no `PRAGMA busy_timeout`; cursor is burned if
   `tx.commit()` fails after allocation (`store.rs:68-90`) with no persisted
   gap record; `retention_archive.from_cursor` hardcoded to 1 (`store.rs:208`);
-  §4.3's 60 s/16 MiB checkpoint task unimplemented.
+  §4.3's 60 s/16 MiB checkpoint task unimplemented (at review time; closed
+  2026-09-25 in PR #500 — see "§4.3 WAL checkpoint (2026-09-25)" below).
 - **F11 (nit, auth):** no parent-directory fsync after secret hardlink / token
   rename; rotation failure only logs (add a counter + escalated log);
   `expires_at == issued_at` accepted; unix-only secret handling.
@@ -279,7 +287,9 @@ the in-memory watermark ahead of the durable log
 The cheap non-gating items landed on branch `fix/observatory-hardening`, each
 with a regression test. F2, F7, F8, F11, F12 and the §4.3 checkpoint task stay
 open. (F2 later closed; see "F2 migration (2026-09-25)" below. F11 and F12
-later closed; see "F11/F12 (2026-09-25)" below.)
+later closed; see "F11/F12 (2026-09-25)" below. The §4.3 checkpoint task
+later closed in PR #500; see "§4.3 WAL checkpoint (2026-09-25)" below. F7 and
+F8 remain open.)
 
 - **F1** — every Observatory store call except the in-memory `latest_cursor`
   runs on Tokio's blocking pool through `observatory::off_executor`
@@ -315,7 +325,8 @@ later closed; see "F11/F12 (2026-09-25)" below.)
   Tests: `an_append_waits_out_a_competing_writer`,
   `retention_archive_records_each_passes_real_from_cursor`. (The burned cursor on
   a failed commit was already closed by the repair wave's cursor-after-commit
-  fix.) The §4.3 checkpoint task remains open.
+  fix.) The §4.3 checkpoint task has since landed (2026-09-25, PR #500; see
+  "§4.3 WAL checkpoint (2026-09-25)" below).
 
 ## F2 migration (2026-09-25)
 
