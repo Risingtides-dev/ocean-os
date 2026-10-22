@@ -11673,3 +11673,11 @@ area:      [backend]
 
 Threaded command_output_minimization daemon -> PromptControl -> SessionContext per the reviewed design matrix (TUI/CLI/ACP/web and the room/heartbeat/missing/unknown/unmapped CLI fallback on; voice off; direct callers default off), landing the M2b review's gate-ON prerequisites: argv mode refuses any argv[0] outside the six bare M1 names via Program::from_bare_name (single source of truth), resolves executables through the login-shell PATH (bash -lc 'type -P'), and permission previews render argv calls. Live events, checkpoints, and session history stay raw; only active-run provider request clones receive the turn-pinned minimized projection. ocean-minimizer moved into workspace default-members; crates/AGENTS.md rationale, ocean-runtime/ocean-daemon/ocean-minimizer contracts, ROADMAP, and the design status updated. Narrow gates green: minimizer tests+clippy, ocean-runtime tests (m2a/m2b reworked for refusal semantics and hermetic login-PATH HOME), agent tests, daemon harness_profile tests, daemon check+clippy, docs-check, fmt.
 _________________________________________________________________________________ 17:15 factory/fq-007
+time:      [17:20] [22-10-26]
+agent:     [zcode], [GLM-5.3]
+worktree:  [factory/fq-013-r1716]
+type:      [bug report]
+area:      [writing]
+
+Observatory docs-truth pass (FQ-013): closed the stale "open" claims left behind after the Gate 1 G1–G5 repair wave landed 2026-09-25 with delta review PASS (PR #486, #487) and the §4.3 WAL checkpoint landed (PR #500). Task 9 review doc: dated Status note on the verdict summary plus §4.3 closure pointers at F10, the hardening-wave open list, and the F10 partial bullet. Observatory architecture doc Status line now records Gate 0 accepted, Gate 1 landed, renderer gate open. Root AGENTS.md, docs/AGENTS.md, and the docs README index now state the repairs landed and passed, keeping renderer work governed by the accepted Gate 0 decisions and Gate 1 manifest. Historical text retained; edits are dated status pointers. cargo xtask docs-check, git diff --check, and node scripts/check-ledger.mjs pass.
+_________________________________________________________________________________ 17:20 factory/fq-013-r1716
