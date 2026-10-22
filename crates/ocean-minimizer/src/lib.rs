@@ -23,6 +23,38 @@ pub enum Program {
     Pytest,
 }
 
+impl Program {
+    /// The bare executable name this program minimizes for.
+    #[must_use]
+    pub fn bare_name(self) -> &'static str {
+        match self {
+            Program::Cargo => "cargo",
+            Program::Git => "git",
+            Program::Gh => "gh",
+            Program::Npm => "npm",
+            Program::Npx => "npx",
+            Program::Pytest => "pytest",
+        }
+    }
+
+    /// The program a bare executable token selects, if any. Slash-containing
+    /// or differently-cased tokens never match; this is the single source of
+    /// truth for M1 invocation identity, shared with the runtime argv gate.
+    #[must_use]
+    pub fn from_bare_name(name: &str) -> Option<Self> {
+        [
+            Self::Cargo,
+            Self::Git,
+            Self::Gh,
+            Self::Npm,
+            Self::Npx,
+            Self::Pytest,
+        ]
+        .into_iter()
+        .find(|program| program.bare_name() == name)
+    }
+}
+
 /// An already-tokenized process invocation.
 ///
 /// `args` excludes the executable name. No shell expansion or command-string
@@ -226,6 +258,27 @@ mod tests {
         );
         assert_eq!(output.text, capture);
         assert!(output.original_text.is_none());
+    }
+
+    #[test]
+    fn bare_name_round_trips_and_rejects_non_bare_tokens() {
+        for program in [
+            Program::Cargo,
+            Program::Git,
+            Program::Gh,
+            Program::Npm,
+            Program::Npx,
+            Program::Pytest,
+        ] {
+            assert_eq!(Program::from_bare_name(program.bare_name()), Some(program));
+        }
+        for name in ["/usr/bin/git", "./cargo", "bin/pytest", "Git", "git ", ""] {
+            assert_eq!(
+                Program::from_bare_name(name),
+                None,
+                "{name:?} is not a bare M1 name"
+            );
+        }
     }
 
     #[test]

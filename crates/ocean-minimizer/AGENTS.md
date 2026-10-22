@@ -11,9 +11,11 @@ human command output from already-tokenized invocations.
 - **Parent contracts:** `../../AGENTS.md` and `../AGENTS.md`
 - **Does not own:** shell parsing/execution, daemon/runtime/agent/TUI wiring,
   harness policy, capture, configuration, artifacts, or persistence
-- **Consumer:** `ocean-runtime` output-economy wrapper (minimizer M2), reached
-  only behind the default-off `SessionContext::command_output_minimization`
-  gate that no production path sets yet; the dependency is one-way
+- **Consumer:** `ocean-runtime` output-economy wrapper (minimizer M2). Daemon
+  turns whose harness profile enables `command_output_minimization` (TUI, CLI,
+  ACP, web, and the room/heartbeat/missing/unknown/unmapped CLI fallback; never
+  voice) set the runtime gate; direct runtime callers still default off. The
+  dependency is one-way
 
 ## Local Contracts
 
@@ -29,8 +31,8 @@ human command output from already-tokenized invocations.
 ## Work Guidance
 
 Prefer passthrough when a shape cannot be proven safe. Runtime integration
-lives in `ocean-runtime` (M2, default-off); profile enablement (M2c) is a
-separate reviewed checkpoint and must not be smuggled into filter work.
+lives in `ocean-runtime`; harness-profile enablement (M2c) is wired in
+`ocean-daemon` per the reviewed design matrix.
 
 ## Verification
 

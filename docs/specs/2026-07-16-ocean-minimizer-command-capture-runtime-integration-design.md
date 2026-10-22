@@ -2,7 +2,7 @@
 
 - **Date:** 2026-07-16
 - **Type:** bounded runtime integration design
-- **Status:** Reviewed and accepted design. M2a characterization and the M2b runtime mechanism are implemented in `ocean-runtime` behind the default-off `SessionContext::command_output_minimization` gate (branch `feat/minimizer-m2-checkpoint`, pending fresh review); M2c profile wiring is not started, so nothing is live.
+- **Status:** Reviewed and accepted design. M2a characterization and the M2b runtime mechanism merged (PR #493, reviewed 2026-09-25: approve, gate-OFF byte-for-byte; `SpillingTool::concurrency` forwarding in PR #494). M2c profile wiring landed: the third effective capability threads daemon → `PromptControl` → `SessionContext` per the §3.8 matrix, with the review's gate-ON refinements — argv mode refuses any `argv[0]` that is not one of the six bare M1 names (refining §3.3.6 from "runs unminimized" to "refused before spawn") and resolves executables through the login-shell PATH, and permission previews render argv calls. `ocean-minimizer` is a workspace default member (§3.2). Direct runtime callers still default off.
 - **Owner:** Ocean OS
 - **Authoring baseline:** `ocean-os` `5b9e23a8a99aacf216cd0c93e66fef5de163e9df`
 - **Mechanism baseline:** `ocean-minimizer` M1, merged by PR #298 at `c21f45a8f2052b3a89d4204603c7b5ca98002077`

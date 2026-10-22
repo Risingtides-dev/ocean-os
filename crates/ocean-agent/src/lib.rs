@@ -2332,6 +2332,7 @@ impl AgentRuntime {
             hashline_edits,
             artifact_spill,
             code_intelligence,
+            command_output_minimization,
             // Already consumed above (session label at the first durable save);
             // named here so the destructure stays exhaustive.
             display_title: _,
@@ -2345,10 +2346,9 @@ impl AgentRuntime {
             hashline: hashline_edits,
             artifacts: artifact_spill,
             code_intelligence,
-            // Minimizer M2 is a runtime-only, default-off checkpoint: no
-            // `PromptControl`/harness-profile field feeds this gate until the
-            // separately reviewed M2c profile wiring lands.
-            command_output_minimization: false,
+            // Minimizer M2c: threaded from the daemon's effective harness
+            // profile; direct callers keep the runtime's default-off gate.
+            command_output_minimization,
         };
         let tools = self.capabilities.tools_for_session(&tool_ctx).await;
         // `tools_disabled` is a fail-closed authorization boundary. Unlike an
@@ -2901,6 +2901,16 @@ pub struct PromptControl {
     /// TRUE in `PromptControl::new` so direct/legacy callers keep today's
     /// behavior unchanged.
     pub code_intelligence: bool,
+    /// Minimizer M2c command-output-minimization harness capability. When
+    /// true (together with the artifact capability and a bound session),
+    /// eligible explicitly tokenized Bash argv results receive a provider-only
+    /// minimized projection with a turn-pinned `read artifact://<id>`
+    /// recovery footer; live events, checkpoints, and saved history always
+    /// keep the raw tool text. Set by the daemon from the surface's effective
+    /// `HarnessProfile` (on everywhere artifact spill is on, off for voice);
+    /// `false` for every direct legacy caller (defaults off in
+    /// `PromptControl::new`).
+    pub command_output_minimization: bool,
     /// Human-facing session label for the first-turn case: the ORIGINAL user
     /// prompt, captured by the daemon BEFORE any prompt composition (room /
     /// operator guidance, folder-as-agent instructions, the Longhouse advisory,
@@ -3024,6 +3034,9 @@ impl PromptControl {
             // TRUE by default: direct/legacy callers keep today's behavior; only
             // the daemon's profile resolution turns it off (voice) — TASK-26.
             code_intelligence: true,
+            // Minimizer M2c: daemon-granted capability, never a direct-caller
+            // default.
+            command_output_minimization: false,
             display_title: None,
         }
     }
@@ -3054,6 +3067,14 @@ impl PromptControl {
     /// surface's effective `HarnessProfile` capabilities on the daemon side.
     pub fn with_artifact_spill(mut self, on: bool) -> Self {
         self.artifact_spill = on;
+        self
+    }
+
+    /// Enable command-output minimization for this turn (minimizer M2c).
+    /// Set from the surface's effective `HarnessProfile` capabilities on the
+    /// daemon side; mirrors artifact spill.
+    pub fn with_command_output_minimization(mut self, on: bool) -> Self {
+        self.command_output_minimization = on;
         self
     }
 
@@ -4269,18 +4290,30 @@ mod tests {
         let default = PromptControl::yolo(false);
         assert!(!default.hashline_edits);
         assert!(!default.artifact_spill);
+        assert!(!default.command_output_minimization);
 
         let profiled = PromptControl::yolo(false)
             .with_hashline_edits(true)
             .with_artifact_spill(true);
         assert!(profiled.hashline_edits);
         assert!(profiled.artifact_spill);
+        assert!(!profiled.command_output_minimization);
 
         let web_like = PromptControl::yolo(false)
             .with_hashline_edits(false)
-            .with_artifact_spill(true);
+            .with_artifact_spill(true)
+            .with_command_output_minimization(true);
         assert!(!web_like.hashline_edits);
         assert!(web_like.artifact_spill);
+        assert!(web_like.command_output_minimization);
+
+        // M2c mirrors artifact spill: minimization never runs without the
+        // recovery capability the runtime also requires.
+        let voice_like = PromptControl::yolo(false)
+            .with_artifact_spill(false)
+            .with_command_output_minimization(false);
+        assert!(!voice_like.artifact_spill);
+        assert!(!voice_like.command_output_minimization);
     }
 
     #[test]

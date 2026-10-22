@@ -181,16 +181,16 @@ Ocean ports mechanisms into current owners rather than reproducing OMP package b
       characterization + M2b runtime mechanism in `ocean-runtime`). It sits behind
       `SessionContext::command_output_minimization`, which defaults off and which no daemon or
       agent path sets, so nothing is live; the argv schema is offered only under that gate.
-- [ ] Minimizer M2c: after fresh review of the M2b checkpoint and its recorded open decisions
-      (argv exposure policy, `default-members`; `SpillingTool::concurrency` forwarding is repaired), thread
-      the third effective capability daemon → `PromptControl` → `SessionContext` per the design
-      matrix. Only this step may describe minimization as live. The M2b review
-      (2026-09-25, PR #493: approve, gate-OFF byte-for-byte) adds gate-ON
-      prerequisites: argv mode must refuse non-eligible `argv[0]` and resolve
-      PATH the way `bash -lc` does (a launchd daemon's bare PATH finds
-      `/usr/bin/git`, not Homebrew's, and no `cargo`); permission prompts must
-      render an argv call (they read `args.command` today). The concurrency
-      forwarding (design line 165) landed as its own checkpoint.
+- [x] Minimizer M2c: thread the third effective capability daemon → `PromptControl` → `SessionContext`
+      per the design matrix (TUI/CLI/ACP/web and the room/heartbeat/missing/unknown/unmapped CLI fallback
+      on; voice off; direct callers still default off), together with the M2b review's (2026-09-25,
+      PR #493) gate-ON prerequisites: argv mode refuses any `argv[0]` that is not one of the six bare
+      M1 names (`Program::from_bare_name` is the single source of truth) and resolves executables
+      through the login-shell PATH (`bash -lc 'type -P'`), and permission previews render argv calls.
+      Live events, checkpoints, and session history stay raw; only active-run provider request clones
+      receive the minimized projection with its turn-pinned `read artifact://<id>` recovery footer.
+      `ocean-minimizer` moved into workspace `default-members` (design §3.2). The concurrency
+      forwarding (design line 165) had landed as its own checkpoint.
 - [x] Port the standalone shared walker mechanism as an independent M1 crate. It is
       intentionally outside `default-members`; only the standalone typed-search crate consumes it,
       and neither crate is wired into production runtime capabilities.

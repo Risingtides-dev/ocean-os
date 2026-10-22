@@ -506,7 +506,23 @@ fn humanize_preview(name: &str, args: &serde_json::Value) -> String {
             .join(" ")
     };
     let summary = match name {
-        "bash" => s("command").to_string(),
+        // `command` is the shell source; an argv-mode call has no `command`,
+        // so render its tokens joined (M2c: permission previews must show
+        // what an argv call runs, not an empty line).
+        "bash" => {
+            let argv = args
+                .get("argv")
+                .and_then(|v| v.as_array())
+                .map(|tokens| {
+                    tokens
+                        .iter()
+                        .filter_map(|t| t.as_str())
+                        .collect::<Vec<_>>()
+                        .join(" ")
+                })
+                .filter(|joined| !joined.is_empty());
+            argv.unwrap_or_else(|| s("command").to_string())
+        }
         "glob" | "grep" => joined(vec![s("pattern"), s("path")]),
         "read" | "ls" => s("path").to_string(),
         // Mutating file tools: path only in the collapsed preview. Content and
@@ -5500,6 +5516,16 @@ mod tests {
         assert!(!bash.contains('\n'), "preview must be one line");
         assert!(bash.contains("echo hi"));
         assert!(bash.contains("rm x"));
+        // bash argv mode → the tokens joined (M2c: an argv approval preview
+        // must render the call, not fall through to an empty header).
+        assert_eq!(
+            humanize_preview("bash", &json!({ "argv": ["git", "status"] })),
+            "git status"
+        );
+        assert_eq!(
+            humanize_preview("bash", &json!({ "argv": ["cargo", "test\n--workspace"] })),
+            "cargo test --workspace"
+        );
         // grep → pattern + path joined; write → path only, NEVER content.
         assert_eq!(
             humanize_preview("grep", &json!({ "pattern": "TODO", "path": "/src" })),

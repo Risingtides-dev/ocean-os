@@ -32,7 +32,7 @@ members = [
   "xtask",
 ]
 # ocean-ast, ocean-walker, and ocean-search are standalone, unwired libraries;
-# ocean-minimizer is reached only through ocean-runtime's default-off M2 gate; xtask is a dev-only task runner (the cargo-xtask pattern). They compile under
+# xtask is a dev-only task runner (the cargo-xtask pattern). They compile under
 # workspace commands, but bare `cargo build` / `cargo test` skips them via
 # default-members.
 # Invoke xtask explicitly:
@@ -62,6 +62,7 @@ default-members = [
   "crates/ocean-context",
   "crates/ocean-memory",
   "crates/ocean-hashline",
+  "crates/ocean-minimizer",
   "crates/ocean-oauth",
   "crates/ocean-observatory",
 ]
