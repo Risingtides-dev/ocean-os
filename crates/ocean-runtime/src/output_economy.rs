@@ -36,18 +36,11 @@ const WIDEST_ARTIFACT_ID: &str = "a18446744073709551615";
 
 /// Map validated direct argv to an M1 invocation. Only an executable token that
 /// is exactly one of the six bare M1 names is eligible; paths and every other
-/// program are ineligible.
+/// program are ineligible. `Program::from_bare_name` is the single source of
+/// truth shared with the argv-mode validation in `tools/bash.rs`.
 pub(crate) fn invocation_for_argv(argv: &[String]) -> Option<Invocation> {
     let (program, args) = argv.split_first()?;
-    let program = match program.as_str() {
-        "cargo" => Program::Cargo,
-        "git" => Program::Git,
-        "gh" => Program::Gh,
-        "npm" => Program::Npm,
-        "npx" => Program::Npx,
-        "pytest" => Program::Pytest,
-        _ => return None,
-    };
+    let program = Program::from_bare_name(program.as_str())?;
     Some(Invocation::new(program, args.iter().cloned()))
 }
 

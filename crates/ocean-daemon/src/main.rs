@@ -7009,6 +7009,7 @@ async fn agent_turn(
         ?harness_profile,
         hashline_edits = harness_caps.hashline_edits,
         artifact_spill = harness_caps.artifact_spill,
+        command_output_minimization = harness_caps.command_output_minimization,
         "agent_turn: resolved effective harness profile"
     );
 
@@ -7393,6 +7394,10 @@ async fn agent_turn(
     // W3 harness profile: surfaces whose effective profile grants it spill
     // oversized output to session artifacts; voice stays plain.
     .with_artifact_spill(harness_caps.artifact_spill)
+    // Minimizer M2c: surfaces whose effective profile grants it minimize
+    // eligible tokenized Bash argv output in active provider requests only,
+    // pinning exact recovery artifacts for the run; voice stays plain.
+    .with_command_output_minimization(harness_caps.command_output_minimization)
     // TASK-26: voice turns don't get the `lsp` tool — spoken replies can't
     // carry definitions/references/diagnostics.
     .with_code_intelligence(harness_caps.code_intelligence)

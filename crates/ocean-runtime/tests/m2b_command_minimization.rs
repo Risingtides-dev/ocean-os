@@ -3,12 +3,16 @@
 //! Drives the real `CapabilityRegistry` → built-in argv-mode `BashTool` →
 //! output-economy wrapper → agent loop with the default-off
 //! `SessionContext::command_output_minimization` gate explicitly enabled.
-//! Eligible programs are operator-provided executables selected by `PATH`
-//! (design §3.3: the direct argv token is invocation identity, not a vendor
-//! attestation), so this binary prepends a scratch directory of scripted
-//! `cargo`/`git`/`gh`/`npm`/`npx`/`pytest` stand-ins to `PATH`.
+//! Eligible programs are operator-provided executables selected the way
+//! `bash -lc` selects them — through the login-shell PATH (design §3.3 plus
+//! the M2b review gate-ON prerequisite: a launchd daemon's bare inherited PATH
+//! is not trustworthy), so this binary installs a scratch `HOME` whose
+//! `.bash_profile` exposes scripted `cargo`/`git`/`gh`/`npm`/`npx`/`pytest`
+//! stand-ins to login shells. The scratch stand-ins are reachable ONLY through
+//! that profile, so every argv execution in this file proves the login-PATH
+//! resolution.
 //!
-//! `PATH` is process-global, so everything runs inside ONE `#[test]`, which
+//! `HOME` is process-global, so everything runs inside ONE `#[test]`, which
 //! sets it before any runtime thread or child process exists.
 
 use std::collections::VecDeque;
@@ -31,6 +35,8 @@ use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
 const PROGRAMS: [&str; 6] = ["cargo", "git", "gh", "npm", "npx", "pytest"];
+const REFUSAL: &str =
+    "'argv' executable must be one of: cargo, git, gh, npm, npx, pytest (use 'command' otherwise)";
 
 struct Harness {
     bin: PathBuf,
@@ -40,7 +46,8 @@ struct Harness {
 impl Harness {
     fn new() -> Self {
         let root = std::env::temp_dir().join(format!("ocean-m2b-{}", std::process::id()));
-        let bin = root.join("bin");
+        let home = root.join("home");
+        let bin = home.join("bin");
         let cwd = root.join("work");
         std::fs::create_dir_all(&bin).unwrap();
         std::fs::create_dir_all(&cwd).unwrap();
@@ -57,13 +64,44 @@ impl Harness {
                 std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
             }
         }
+        // The only PATH enrichment is the login-shell profile: no process PATH
+        // is set, so argv resolution MUST go through `bash -lc` like `command`
+        // mode does.
+        std::fs::write(
+            home.join(".bash_profile"),
+            format!("export PATH='{}':\"$PATH\"\n", bin.display()),
+        )
+        .unwrap();
+        std::env::set_var("HOME", &home);
         Self { bin, cwd }
     }
 
-    /// Script what `program` prints (stdout) and its exit code.
+    /// Script what `program` prints (stdout) and its exit code. Also restores
+    /// the standard stand-in executable, undoing any [`Harness::raw_script`].
     fn script(&self, program: &str, output: &str, code: i32) {
         std::fs::write(self.bin.join(format!("{program}.out")), output).unwrap();
         std::fs::write(self.bin.join(format!("{program}.code")), code.to_string()).unwrap();
+        self.raw_script(
+            program,
+            &format!(
+                "cat '{dir}/{program}.out'\nexit \"$(cat '{dir}/{program}.code')\"",
+                dir = self.bin.display(),
+                program = program
+            ),
+        );
+    }
+
+    /// Replace one stand-in with an arbitrary script body (still executed
+    /// directly, under its eligible bare name).
+    fn raw_script(&self, program: &str, body: &str) {
+        let script = format!("#!/bin/sh\n{body}\n");
+        let path = self.bin.join(program);
+        std::fs::write(&path, script).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
     }
 
     fn ctx(&self, session: &str, gate: bool, artifacts: bool) -> SessionContext {
@@ -158,8 +196,6 @@ fn npx_first_run() -> String {
 #[test]
 fn gated_command_output_minimization_end_to_end() {
     let harness = Harness::new();
-    let path = std::env::var("PATH").unwrap_or_default();
-    std::env::set_var("PATH", format!("{}:{path}", harness.bin.display()));
 
     tokio::runtime::Builder::new_multi_thread()
         .enable_all()
@@ -255,42 +291,57 @@ async fn argv_validation_and_direct_execution(h: &Harness) {
         (json!({"argv": []}), "'argv' must not be empty"),
         (json!({"argv": [""]}), "'argv' executable must not be empty"),
         (
-            json!({"argv": ["touch", 1]}),
+            json!({"argv": ["git", 1]}),
             "'argv' must be an array of strings",
         ),
         (
-            json!({"argv": "touch x"}),
+            json!({"argv": "git status"}),
             "'argv' must be an array of strings",
         ),
         (json!({"command": 5}), "'command' must be a string"),
+        // Gate-ON prerequisite: only the six bare M1 names are executable in
+        // argv mode. Other programs, paths, and case variants are refused
+        // before spawn so the model falls back to `command`.
+        (json!({"argv": ["touch", touch]}), REFUSAL),
+        (json!({"argv": ["printf", "x"]}), REFUSAL),
+        (json!({"argv": ["sh", "-c", "touch x"]}), REFUSAL),
+        (json!({"argv": ["Git", "status"]}), REFUSAL),
+        (json!({"argv": ["/usr/bin/git", "status"]}), REFUSAL),
+        (
+            json!({"argv": [h.bin.join("git").to_string_lossy().to_string(), "status"]}),
+            REFUSAL,
+        ),
     ] {
         let error = bash.execute("c", args.clone()).await.expect_err("invalid");
         assert_eq!(error, message, "{args}");
     }
     assert!(!marker.exists(), "validation fails before spawn");
+    assert_eq!(store_len(&store), 0);
 
-    // Direct execution: no expansion, globbing, or shell metacharacters.
+    // Direct execution through the login-shell PATH: the stand-ins are only
+    // reachable via the scratch HOME profile, never the inherited PATH.
+    h.raw_script("git", "printf '%s|' \"$@\"");
     let out = bash
-        .execute("c", json!({"argv": ["printf", "%s|", "$HOME", "*", "a;b"]}))
+        .execute("c", json!({"argv": ["git", "$HOME", "*", "a;b"]}))
         .await
         .unwrap();
     assert_eq!(text(&out.content), "$HOME|*|a;b|\n[exit 0]");
 
     // Same envelope, cwd, and exit contract as command mode.
     let script = "printf o; printf e >&2; exit 3";
-    let argv = bash
-        .execute("c", json!({"argv": ["sh", "-c", script]}))
-        .await
-        .unwrap();
+    h.raw_script("git", script);
+    let argv = bash.execute("c", json!({"argv": ["git"]})).await.unwrap();
     let command = bash.execute("c", json!({"command": script})).await.unwrap();
     assert_eq!(text(&argv.content), "o\n[stderr]\ne\n[exit 3]");
     assert_eq!(argv.content, command.content);
-    let pwd = bash.execute("c", json!({"argv": ["pwd"]})).await.unwrap();
+    h.raw_script("git", "pwd");
+    let pwd = bash.execute("c", json!({"argv": ["git"]})).await.unwrap();
     assert!(text(&pwd.content).contains("m2b"), "turn cwd is shared");
 
     // Timeout keeps the existing error and never projects.
+    h.raw_script("git", "sleep 5");
     let error = bash
-        .execute_for_run("c", json!({"argv": ["sleep", "5"], "timeout_ms": 200}))
+        .execute_for_run("c", json!({"argv": ["git"], "timeout_ms": 200}))
         .await
         .expect_err("times out");
     assert_eq!(error, "command timed out after 200ms");
@@ -409,17 +460,10 @@ async fn positive_programs(h: &Harness) {
 
 async fn passthrough_via_real_execution(h: &Harness) {
     let status = fixture("git/status-long.raw");
-    let git_path = h.bin.join("git").to_string_lossy().to_string();
     let cases: Vec<(Value, &str, String, i32)> = vec![
         (json!({"command": "git status"}), "git", status.clone(), 0),
         (
             json!({"command": "git status | cat"}),
-            "git",
-            status.clone(),
-            0,
-        ),
-        (
-            json!({"argv": [git_path, "status"]}),
             "git",
             status.clone(),
             0,
@@ -463,9 +507,10 @@ async fn passthrough_via_real_execution(h: &Harness) {
             .await
             .unwrap();
         assert!(!execution.has_provider_projection(), "{args}");
-        // Command strings run through `bash -lc`, whose login startup files may
-        // rewrite PATH (so the shadowing stand-in need not even run) — exactly
-        // why shell source is never eligible. Compare against the legacy tool.
+        // Command strings run through `bash -lc`, whose login startup files
+        // decide the executable — never a classification input, exactly why
+        // shell source is ineligible. Compare against the legacy tool, which
+        // resolves through the same login shell.
         let expected = if args.get("command").is_some() {
             let legacy = BashTool::for_cwd(h.cwd.clone())
                 .execute("c", args.clone())

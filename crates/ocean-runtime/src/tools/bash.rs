@@ -29,7 +29,8 @@ pub struct BashTool {
 const ARGV_MODE_DESCRIPTION: &str =
     "Run a command. Provide exactly one of `command` (shell source run via \
 `bash -lc <cmd>`) or `argv` (a program and its arguments executed directly, \
-with no shell). Returns combined stdout/stderr and exit code.";
+with no shell; the program must be cargo, git, gh, npm, npx, or pytest). \
+Returns combined stdout/stderr and exit code.";
 
 /// The provider-portable plain-object schema offered in argv mode: optional
 /// `command`, optional string-array `argv`, optional `timeout_ms`, no
@@ -46,7 +47,7 @@ pub fn argv_mode_parameters() -> Value {
             "argv": {
                 "type": "array",
                 "items": {"type": "string"},
-                "description": "Program and arguments executed directly without a shell: no aliases, functions, expansion, redirection, or pipes. Provide exactly one of `command` or `argv`."
+                "description": "Program and arguments executed directly without a shell: no aliases, functions, expansion, redirection, or pipes. The program must be cargo, git, gh, npm, npx, or pytest. Provide exactly one of `command` or `argv`."
             },
             "timeout_ms": {"type": "integer", "default": 120000}
         }
@@ -58,6 +59,13 @@ enum Invocation<'a> {
     Command(&'a str),
     Argv(Vec<&'a str>),
 }
+
+/// The argv-mode executable allow-list: exactly the six bare M1 program names
+/// (M2b review gate-ON prerequisite). Anything else — other programs,
+/// slash-containing paths, differently-cased tokens — is refused before spawn
+/// so the model falls back to `command`; the argv channel exists only for
+/// minimizable invocations.
+const ARGV_MODE_ELIGIBLE: &str = "cargo, git, gh, npm, npx, pytest";
 
 /// Validate the argv-mode XOR contract before anything is spawned.
 fn parse_argv_mode_args(args: &Value) -> Result<Invocation<'_>, String> {
@@ -81,7 +89,14 @@ fn parse_argv_mode_args(args: &Value) -> Result<Invocation<'_>, String> {
             match tokens.first() {
                 None => Err("'argv' must not be empty".into()),
                 Some(&"") => Err("'argv' executable must not be empty".into()),
-                Some(_) => Ok(Invocation::Argv(tokens)),
+                Some(&program) => {
+                    if ocean_minimizer::Program::from_bare_name(program).is_none() {
+                        return Err(format!(
+                            "'argv' executable must be one of: {ARGV_MODE_ELIGIBLE} (use 'command' otherwise)"
+                        ));
+                    }
+                    Ok(Invocation::Argv(tokens))
+                }
             }
         }
     }
@@ -236,8 +251,16 @@ impl AgentTool for BashTool {
                 Invocation::Command(cmd) => shell_command(cmd),
                 Invocation::Argv(tokens) => {
                     // Direct execution: no shell, alias, function, expansion,
-                    // redirection, pipeline, or re-tokenization.
-                    let mut command = Command::new(tokens[0]);
+                    // redirection, pipeline, or re-tokenization. The executable
+                    // resolves through the login-shell PATH exactly like the
+                    // `command` mode's `bash -lc` would (M2b review gate-ON
+                    // prerequisite: a launchd daemon's bare inherited PATH finds
+                    // `/usr/bin/git` instead of Homebrew's, and no `cargo`).
+                    let program = resolve_login_path(tokens[0]).await;
+                    let mut command = match program {
+                        Some(program) => Command::new(program),
+                        None => Command::new(tokens[0]),
+                    };
                     command.args(&tokens[1..]);
                     command
                 }
@@ -257,6 +280,32 @@ fn shell_command(cmd: &str) -> Command {
     let mut command = Command::new("bash");
     command.arg("-lc").arg(cmd);
     command
+}
+
+/// Resolve one already-validated bare program name the way `bash -lc` does:
+/// ask a login bash for the PATH-resolved executable. `type -P` reports only
+/// the disk file bash would execute — never a builtin, function, or alias —
+/// so no startup-file definition can replace the program. `program` is always
+/// one of the six validated bare names, so the interpolation cannot inject
+/// shell source. Any failure falls back to `None`, leaving the caller on the
+/// ordinary inherited-PATH spawn (and its ordinary not-found error).
+async fn resolve_login_path(program: &str) -> Option<PathBuf> {
+    let output = Command::new("bash")
+        .arg("-lc")
+        .arg(format!("type -P -- {program}"))
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .kill_on_drop(true)
+        .output()
+        .await
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let resolved = String::from_utf8_lossy(&output.stdout);
+    let first = resolved.lines().next()?.trim();
+    (!first.is_empty()).then(|| PathBuf::from(first))
 }
 
 impl BashTool {
